@@ -1087,6 +1087,15 @@ _VIDEO_EDIT_RUNTIME_SCRIPTS = frozenset({
     "cloud_render_business.py",
     "normalize.py",
 })
+_CAMERA_RUNTIME_SCRIPT = "camera_connector.py"
+_CAMERA_RUNTIME_RELATIVE_PATH = Path(
+    "skills/camsnap/scripts/camera_connector.py"
+)
+_CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH = Path("skills/camsnap/manifest.yaml")
+_CAMERA_RUNTIME_CAPABILITY = "zettlab.camera.actions.v1"
+_CAMERA_RUNTIME_MAX_MANIFEST_BYTES = 64 * 1024
+_CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS = 80
+_CAMERA_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
 _CONNECTOR_RUNTIME_SHELL_GROUP_START = "{"
@@ -4607,6 +4616,13 @@ class _VideoEditRuntimeCommand:
     script_identity: tuple[int, int]
 
 
+@dataclass(frozen=True)
+class _CameraRuntimeCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+
+
 def _video_edit_runtime_timeout(
     parsed: _VideoEditRuntimeCommand,
     requested_timeout: int,
@@ -4764,6 +4780,154 @@ def _parse_video_edit_runtime_command(command: str) -> Optional[_VideoEditRuntim
         root_identity=anchor.identity,
         script_identity=script_identity,
     )
+
+
+def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
+        return None
+    relative_text: Optional[str] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative_text = raw_path[len(prefix):]
+            break
+    if relative_text is None:
+        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).absolute()
+        for allowed_root in (anchor.configured_root, anchor.resolved_root):
+            try:
+                relative_text = str(expanded.relative_to(allowed_root))
+                break
+            except ValueError:
+                continue
+    if relative_text is None or Path(relative_text) != _CAMERA_RUNTIME_RELATIVE_PATH:
+        return None
+    candidate = anchor.resolved_root / _CAMERA_RUNTIME_RELATIVE_PATH
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(anchor.resolved_root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file() or not _connector_runtime_path_is_trusted(
+        candidate,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        return None
+    return resolved
+
+
+def _camera_runtime_arguments_allowed(arguments: list[str]) -> bool:
+    if arguments == ["list"]:
+        return True
+    if (
+        len(arguments) == 3
+        and arguments[0] in {"snap", "doctor"}
+        and arguments[1] == "--camera-id"
+        and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
+    ):
+        return True
+    if (
+        len(arguments) in {3, 5}
+        and arguments[0] == "clip"
+        and arguments[1] == "--camera-id"
+        and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
+    ):
+        if len(arguments) == 3:
+            return True
+        return (
+            arguments[3] == "--duration"
+            and arguments[4].isdigit()
+            and 1 <= int(arguments[4]) <= 60
+        )
+    return False
+
+
+def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeCommand]:
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if (
+        len(tokens) < 3
+        or not _is_python_executable_token(tokens[0])
+        or Path(tokens[1]).name != _CAMERA_RUNTIME_SCRIPT
+        or any(
+            token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+            for token in tokens
+        )
+        or not _camera_runtime_arguments_allowed(tokens[2:])
+    ):
+        return None
+    script = _resolve_camera_runtime_script(tokens[1])
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if script is None or anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _CameraRuntimeCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _camera_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool:
+    manifest = anchor.resolved_root / _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH
+    try:
+        manifest_digest = anchor.file_digests.get(
+            _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH.as_posix()
+        )
+        if manifest_digest is None or not _connector_runtime_path_is_trusted(
+            manifest,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        ):
+            return False
+        raw = _read_connector_runtime_script_bytes(
+            manifest,
+            expected_identity=_path_identity(manifest),
+            expected_digest=manifest_digest,
+        )
+        if len(raw) > _CAMERA_RUNTIME_MAX_MANIFEST_BYTES:
+            return False
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        return bool(
+            isinstance(loaded, dict)
+            and loaded.get("id") == "camsnap"
+            and loaded.get("required_scopes") == ["hardware.camera:read"]
+            and _CAMERA_RUNTIME_CAPABILITY
+            in (loaded.get("runtime_capabilities") or [])
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def _camera_runtime_shell_guard_result(command: str) -> Optional[str]:
+    if _CAMERA_RUNTIME_SCRIPT not in command:
+        return None
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": (
+            "Camera actions must run as one exact foreground Python helper "
+            "command with a registered camera_id and no shell operators, "
+            "wrappers, host, credential, URL, output path, discovery, or watch input."
+        ),
+        "camera_runtime_direct": False,
+        "camera_runtime_blocked": True,
+    }, ensure_ascii=False)
 
 
 def _agent_creator_segment_contains_invocation(segment: list[str]) -> bool:
@@ -5609,6 +5773,102 @@ def _run_video_edit_runtime_command_if_allowed(
             "exit_code": -1,
             "error": f"Trusted video-edit execution failed: {type(exc).__name__}: {exc}",
             "video_edit_runtime_direct": True,
+        }, ensure_ascii=False)
+
+
+def _run_camera_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_camera_runtime_command(command)
+    if parsed is None:
+        return _camera_runtime_shell_guard_result(command)
+    if not _ensure_sensitive_runtime_boundary():
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "Camera runtime process memory boundary is unavailable",
+            "camera_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(parsed.argv[1])
+    expected_digest: Optional[str] = None
+    try:
+        expected_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
+        identities_match = (
+            anchor is not None
+            and expected_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+            and _camera_runtime_manifest_allows(anchor)
+        )
+    except (OSError, AttributeError):
+        identities_match = False
+    if not identities_match:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "Camera runtime package identity or capability is unavailable",
+            "camera_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=expected_digest,
+        )
+        from tools.environments.local import build_camera_runtime_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        trusted_env = build_camera_runtime_env()
+        trusted_secrets = {
+            key: trusted_env.pop(key)
+            for key in (
+                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+            )
+        }
+        secret_values = list(trusted_secrets.values())
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=Path(run_cwd),
+            base_env={},
+            injected_env=trusted_env,
+            injected_secrets=trusted_secrets,
+            timeout=max(1, min(timeout, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            secret_values=secret_values,
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+        payload = json.loads(_connector_runtime_result_json(
+            command=command,
+            output=completed.output,
+            returncode=completed.returncode,
+            secret_values=secret_values,
+            timed_out=completed.timed_out,
+        ))
+        payload.pop("connector_runtime_direct", None)
+        payload["camera_runtime_direct"] = True
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Camera runtime execution failed: {type(exc).__name__}",
+            "camera_runtime_direct": True,
         }, ensure_ascii=False)
 
 
@@ -7031,6 +7291,13 @@ def terminal_tool(
                 }, ensure_ascii=False)
 
         if not background and not pty:
+            camera_runtime_result = _run_camera_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if camera_runtime_result is not None:
+                return camera_runtime_result
             video_edit_runtime_result = _run_video_edit_runtime_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -7053,6 +7320,9 @@ def terminal_tool(
             if connector_runtime_result is not None:
                 return connector_runtime_result
         else:
+            camera_runtime_result = _camera_runtime_shell_guard_result(command)
+            if camera_runtime_result is not None:
+                return camera_runtime_result
             video_edit_runtime_result = _video_edit_runtime_shell_guard_result(command)
             if video_edit_runtime_result is not None:
                 return video_edit_runtime_result

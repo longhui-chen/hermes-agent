@@ -256,7 +256,11 @@ class _PluginBothProvider(ImageGenProvider):
         return "both-v1"
 
     def capabilities(self) -> Dict[str, Any]:
-        return {"modalities": ["text", "image"], "max_reference_images": 5}
+        return {
+            "modalities": ["text", "image"],
+            "max_reference_images": 5,
+            "image_input_description": "Use an absolute local image path; remote URLs are unsupported.",
+        }
 
     def generate(self, prompt, aspect_ratio="landscape", *, image_url=None,
                  reference_image_urls=None, **kwargs):
@@ -276,6 +280,44 @@ class TestDynamicSchema:
         assert "text-to-image" in desc and "image-to-image" in desc
         assert "routes automatically" in desc
 
+    def test_fal_text_only_model_warns(self, cfg_home, monkeypatch):
+        from tools.image_generation_tool import _build_dynamic_image_schema
+
+        _write_cfg(cfg_home, {"image_gen": {"model": "fal-ai/z-image/turbo"}})
+        desc = _build_dynamic_image_schema()["description"]
+        assert "text-to-image only" in desc
+        assert "NOT capable of image-to-image" in desc
+
+    def test_plugin_both_provider_advertises_refs(self, cfg_home, monkeypatch):
+        from tools.image_generation_tool import _build_dynamic_image_schema
+        from agent import image_gen_registry as reg
+
+        _write_cfg(cfg_home, {"image_gen": {"provider": "both"}})
+        reg.register_provider(_PluginBothProvider())
+        self._no_discovery(monkeypatch)
+
+        schema = _build_dynamic_image_schema()
+        desc = schema["description"]
+        assert "image-to-image / editing" in desc
+        assert "up to 5 reference image(s)" in desc
+        assert (
+            schema["parameters"]["properties"]["image_url"]["description"]
+            == "Use an absolute local image path; remote URLs are unsupported."
+        )
+
+    def test_provider_without_references_overrides_reference_schema(self, monkeypatch):
+        from tools import image_generation_tool as tool
+
+        monkeypatch.setattr(tool, "_active_image_capabilities", lambda: {
+            "modalities": ["text", "image"],
+            "max_reference_images": 0,
+            "image_input_description": "Use a provider-specific local source.",
+        })
+
+        schema = tool._build_dynamic_image_schema()
+        assert "omit reference_image_urls" in (
+            schema["parameters"]["properties"]["reference_image_urls"]["description"]
+        )
 
     def test_builder_wired_into_registry(self):
         from tools.registry import discover_builtin_tools, registry

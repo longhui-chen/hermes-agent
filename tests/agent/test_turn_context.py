@@ -457,33 +457,51 @@ description: Trusted video-edit execution flow test
             "_video_edit_command_policy",
             lambda _args: (True, False),
         )
+        terminal_args = {"command": "python3 trusted-workflow_state.py"}
         assert trusted_skill_operation_block_message(
             agent,
             function_name="terminal",
-            function_args={"command": "python3 trusted-workflow_state.py"},
+            function_args=terminal_args,
         ) is None
 
         business_token = session_context_module._BUSINESS_EXECUTION_TOKEN.set("")
         session_key_token = session_context_module._SESSION_KEY.set("")
         empty_secret_token = secret_scope_module.set_secret_scope({})
         try:
-            runtime_env = build_video_edit_runtime_env({})
+            assert response_mode.trusted_video_edit_runtime_receipt() == {}
+
+            def _dispatch():
+                runtime_env = build_video_edit_runtime_env({})
+                assert runtime_env["ZET_AGENT_ID"] == "main"
+                assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
+                assert (
+                    runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
+                    == "business-token"
+                )
+                assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
+                assert (
+                    runtime_env["HERMES_SESSION_KEY"]
+                    == "zettlab:user:main:session"
+                )
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": 0,
+                        "video_edit_runtime_direct": True,
+                    }
+                )
+
+            response_mode.dispatch_trusted_skill_operation(
+                agent,
+                function_name="terminal",
+                function_args=terminal_args,
+                dispatch=_dispatch,
+            )
+            assert response_mode.trusted_video_edit_runtime_receipt() == {}
         finally:
             secret_scope_module.reset_secret_scope(empty_secret_token)
             session_context_module._SESSION_KEY.reset(session_key_token)
             session_context_module._BUSINESS_EXECUTION_TOKEN.reset(business_token)
-
-        assert runtime_env["ZET_AGENT_ID"] == "main"
-        assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
-        assert (
-            runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
-            == "business-token"
-        )
-        assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
-        assert (
-            runtime_env["HERMES_SESSION_KEY"]
-            == "zettlab:user:main:session"
-        )
     finally:
         response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
         clear_turn_vars(turn_tokens)
@@ -1237,6 +1255,147 @@ def test_transport_skill_selection_is_separate_from_user_text_flow():
         clear_turn_vars(turn_tokens)
 
 
+def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.environments.local import build_camera_runtime_env
+
+    presets_dir = tmp_path / "presets"
+    video_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    camera_dir = presets_dir / "skills" / "camsnap"
+    video_dir.mkdir(parents=True)
+    camera_dir.mkdir(parents=True)
+    video_bytes = b"# trusted video edit skill\n"
+    camera_bytes = b"# trusted camsnap skill\n"
+    (video_dir / "SKILL.md").write_bytes(video_bytes)
+    (camera_dir / "SKILL.md").write_bytes(camera_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=video_bytes,
+        monkeypatch=monkeypatch,
+        extra_files={"skills/camsnap/SKILL.md": camera_bytes},
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+    monkeypatch.setattr(
+        response_mode,
+        "_camera_runtime_argv",
+        lambda _args: ["python3", "camera_connector.py", "list"],
+    )
+
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:camera-session",
+        session_id="zettlab:user:main:camera-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="camera-turn",
+        business_execution_token="business-token",
+    )
+    try:
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
+
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(agent, "查看下我的摄像头")
+        result = skills_tool_module.skill_view("camsnap")
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == {"terminal"}
+        assert trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args={"command": "python3 camera_connector.py list"},
+        ) is None
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
+
+        def _dispatch():
+            frozen = build_camera_runtime_env()
+            assert frozen == {
+                "ZET_AGENT_ID": "main",
+                "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+                "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-token",
+                "HERMES_TURN_ID": "camera-turn",
+                "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
+                "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",
+            }
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": 0,
+                    "camera_runtime_direct": True,
+                }
+            )
+
+        response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="terminal",
+            function_args={"command": "python3 camera_connector.py list"},
+            dispatch=_dispatch,
+        )
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
+    finally:
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_camsnap_skill_cannot_activate_for_unrelated_task_flow(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "presets"
+    video_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    camera_dir = presets_dir / "skills" / "camsnap"
+    video_dir.mkdir(parents=True)
+    camera_dir.mkdir(parents=True)
+    video_bytes = b"# trusted video edit skill\n"
+    camera_bytes = b"# trusted camsnap skill\n"
+    (video_dir / "SKILL.md").write_bytes(video_bytes)
+    (camera_dir / "SKILL.md").write_bytes(camera_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=video_bytes,
+        monkeypatch=monkeypatch,
+        extra_files={"skills/camsnap/SKILL.md": camera_bytes},
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+    turn_tokens = set_turn_vars(turn_id="unrelated-turn")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(agent, "总结今天的会议")
+        result = skills_tool_module.skill_view("camsnap")
+        assert not apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == frozenset()
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
 def test_clarify_requires_nonempty_user_response_to_rearm_trusted_scope_flow():
     turn_tokens = set_turn_vars(turn_id="clarify-turn")
     try:
@@ -1375,9 +1534,10 @@ def test_runtime_main_sync_happens_after_restore():
 
     assert calls == [
         (
-            ("anthropic", "primary-model"),
-            {
-                "base_url": "https://api.anthropic.com",
+                ("anthropic", "primary-model"),
+                {
+                    "requested_provider": "openrouter",
+                    "base_url": "https://api.anthropic.com",
                 "api_key": "primary-key",
                 "api_mode": "anthropic_messages",
                 "auth_mode": "",

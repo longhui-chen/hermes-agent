@@ -20,7 +20,8 @@ import stat
 import threading
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
+from urllib.request import url2pathname
 
 import requests
 from agent.secret_scope import get_secret
@@ -34,10 +35,14 @@ MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 MAX_MEDIA_REQUEST_BYTES = 7 * 1024 * 1024
 MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
 MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+LOCAL_IMAGE_READ_TIMEOUT = 30.0
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 MAX_MEDIA_HTTP_WORKERS = 2
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=MAX_MEDIA_HTTP_WORKERS)
+_SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
+_IMAGE_READ_CHUNK_BYTES = 48 * 1024
+_MAX_LOCAL_IMAGE_PATH_CHARS = 4096
 
 
 class ZettlabMediaError(RuntimeError):
@@ -49,9 +54,55 @@ class ZettlabMediaDeadlineError(ZettlabMediaError):
 
 
 def _watch_parent(parent_pid: int) -> None:
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        while parent.is_alive():
+            time.sleep(0.2)
+        os._exit(1)
     while os.getppid() == parent_pid:
         time.sleep(0.2)
     os._exit(1)
+
+
+def _dispose_worker_process(process: Any, *, force: bool) -> None:
+    alive = False
+    try:
+        alive = process.is_alive()
+    except (AssertionError, OSError, ValueError):
+        pass
+    if force and alive:
+        try:
+            process.terminate()
+        except (AssertionError, OSError, ValueError):
+            pass
+    try:
+        process.join(timeout=0.2)
+    except (AssertionError, OSError, ValueError):
+        pass
+    try:
+        alive = process.is_alive()
+    except (AssertionError, OSError, ValueError):
+        alive = False
+    if alive:
+        try:
+            process.kill()
+        except (AssertionError, OSError, ValueError):
+            pass
+        try:
+            process.join(timeout=0.2)
+        except (AssertionError, OSError, ValueError):
+            pass
+    try:
+        process.close()
+    except (AssertionError, OSError, ValueError):
+        pass
+
+
+def _safe_close_worker_resource(resource: Any) -> None:
+    try:
+        resource.close()
+    except (OSError, ValueError):
+        pass
 
 
 def _media_http_worker(connection: Any, parent_pid: int, request_buffer: Any, request_length: int) -> None:
@@ -263,44 +314,11 @@ class _MediaHTTPWorker:
 
     @staticmethod
     def _dispose_process(process: Any, *, force: bool) -> None:
-        alive = False
-        try:
-            alive = process.is_alive()
-        except (AssertionError, OSError, ValueError):
-            pass
-        if force and alive:
-            try:
-                process.terminate()
-            except (AssertionError, OSError, ValueError):
-                pass
-        try:
-            process.join(timeout=0.2)
-        except (AssertionError, OSError, ValueError):
-            pass
-        try:
-            alive = process.is_alive()
-        except (AssertionError, OSError, ValueError):
-            alive = False
-        if alive:
-            try:
-                process.kill()
-            except (AssertionError, OSError, ValueError):
-                pass
-            try:
-                process.join(timeout=0.2)
-            except (AssertionError, OSError, ValueError):
-                pass
-        try:
-            process.close()
-        except (AssertionError, OSError, ValueError):
-            pass
+        _dispose_worker_process(process, force=force)
 
     @staticmethod
     def _safe_close(resource: Any) -> None:
-        try:
-            resource.close()
-        except (OSError, ValueError):
-            pass
+        _safe_close_worker_resource(resource)
 
     @staticmethod
     def _response_from_result(url: str, result: Dict[str, Any]) -> requests.Response:
@@ -316,6 +334,403 @@ class _MediaHTTPWorker:
         response.url = url
         response.raw = io.BytesIO(result.get("body") or b"")
         return response
+
+
+def _prepare_local_image_path(
+    source: str,
+    task_id: Optional[str],
+) -> tuple[str, str, str, tuple[str, ...], Optional[str]]:
+    raw = str(source or "").strip()
+    if not raw or len(raw) > _MAX_LOCAL_IMAGE_PATH_CHARS or "\x00" in raw:
+        raise ZettlabMediaError("local image input path is invalid")
+    _reject_windows_network_or_device_path(raw)
+
+    if os.path.isabs(raw):
+        candidate = raw
+    else:
+        parsed = urlparse(raw)
+        if parsed.scheme.casefold() != "file":
+            if parsed.scheme or parsed.netloc:
+                raise ZettlabMediaError("image input URL must use HTTP or HTTPS")
+            raise ZettlabMediaError("local image input must use an absolute path")
+        if parsed.netloc.casefold() not in {"", "localhost"}:
+            raise ZettlabMediaError("network file URLs are not supported for image input")
+        if parsed.query or parsed.fragment:
+            raise ZettlabMediaError("local image file URL must not include query or fragment")
+        candidate = url2pathname(unquote(parsed.path))
+        if not candidate:
+            raise ZettlabMediaError("local image input path is invalid")
+
+    _reject_windows_network_or_device_path(candidate)
+    if not os.path.isabs(candidate):
+        raise ZettlabMediaError("local image input must use an absolute path")
+    normalized_task_id = str(task_id or "default").strip() or "default"
+    try:
+        from hermes_constants import get_hermes_home_override
+        from tools.file_tools import local_host_read_context_for_task
+
+        terminal_backend, managed_hermes_roots = local_host_read_context_for_task(
+            normalized_task_id
+        )
+        hermes_home_override = get_hermes_home_override()
+    except ValueError as exc:
+        raise ZettlabMediaError(str(exc)) from exc
+    return (
+        os.path.normpath(candidate),
+        normalized_task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+    )
+
+
+def _read_authorized_media_file(
+    path: str,
+    limit: int,
+    expected_identity: tuple[int, int],
+    result_buffer: Any,
+) -> int:
+    """Open one authorized regular file and copy it into the bounded buffer."""
+    from agent.file_safety import raise_if_read_blocked
+
+    if (
+        not path
+        or len(path) > _MAX_LOCAL_IMAGE_PATH_CHARS
+        or "\x00" in path
+        or not os.path.isabs(path)
+    ):
+        raise ZettlabMediaError("local image worker requires an absolute path")
+    _reject_windows_network_or_device_path(path)
+    raise_if_read_blocked(path)
+    source_stat = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ZettlabMediaError("local image input must be a regular file")
+    source_identity = (source_stat.st_dev, source_stat.st_ino)
+    if source_identity != expected_identity:
+        raise ZettlabMediaError("local image input changed after authorization")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as image_file:
+        file_stat = os.fstat(image_file.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ZettlabMediaError("local image input must be a regular file")
+        if (file_stat.st_dev, file_stat.st_ino) != source_identity:
+            raise ZettlabMediaError("local image input changed while opening")
+        if (file_stat.st_dev, file_stat.st_ino) != expected_identity:
+            raise ZettlabMediaError("local image input changed after authorization")
+        if file_stat.st_size <= 0:
+            raise ZettlabMediaError("local image input must contain image bytes")
+        if file_stat.st_size > limit:
+            raise ZettlabMediaError("inline image input exceeds maximum size")
+        total = 0
+        while True:
+            chunk = image_file.read(min(_IMAGE_READ_CHUNK_BYTES, limit - total + 1))
+            if not chunk:
+                break
+            new_total = total + len(chunk)
+            if new_total > limit:
+                raise ZettlabMediaError("inline image input exceeds maximum size")
+            result_buffer[total:new_total] = chunk
+            total = new_total
+        final_stat = os.fstat(image_file.fileno())
+        initial_signature = (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+        )
+        final_signature = (
+            final_stat.st_dev,
+            final_stat.st_ino,
+            final_stat.st_size,
+            final_stat.st_mtime_ns,
+        )
+        if final_signature != initial_signature:
+            raise ZettlabMediaError("local image input changed while reading")
+    if total <= 0:
+        raise ZettlabMediaError("local image input must contain image bytes")
+    return total
+
+
+def _media_file_worker(
+    connection: Any,
+    parent_pid: int,
+    source: str,
+    limit: int,
+    task_id: str,
+    terminal_backend: str,
+    managed_hermes_roots: tuple[str, ...],
+    hermes_home_override: Optional[str],
+    result_buffer: Any,
+) -> None:
+    threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
+    result: Dict[str, Any]
+    override_token: Any = None
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.file_tools import resolve_host_read_path_for_task
+
+        if hermes_home_override:
+            override_token = set_hermes_home_override(hermes_home_override)
+        resolved, expected_identity = resolve_host_read_path_for_task(
+            source,
+            task_id,
+            terminal_backend=terminal_backend,
+            managed_hermes_roots=managed_hermes_roots,
+        )
+        path = str(resolved)
+        total = _read_authorized_media_file(
+            path,
+            limit,
+            expected_identity,
+            result_buffer,
+        )
+        result = {"length": total}
+    except ValueError as exc:
+        result = {"error": "blocked", "message": str(exc)}
+    except ZettlabMediaError as exc:
+        result = {"error": "media", "message": str(exc)}
+    except OSError as exc:
+        result = {"error": "media", "message": f"unable to read local image input: {exc}"}
+    except Exception as exc:
+        result = {"error": "internal", "message": str(exc)}
+    finally:
+        if override_token is not None:
+            try:
+                reset_hermes_home_override(override_token)
+            except Exception:
+                pass
+    try:
+        connection.send(result)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+    finally:
+        connection.close()
+
+
+class _MediaFileWorker:
+    def __init__(self) -> None:
+        self._context = multiprocessing.get_context("spawn")
+        self._lock = threading.Lock()
+        self._process: Any = None
+        self._connection: Any = None
+        self._buffer: Any = None
+
+    def read(
+        self,
+        source: str,
+        limit: int,
+        *,
+        deadline: float,
+        task_id: str = "default",
+        terminal_backend: str = "local",
+        managed_hermes_roots: tuple[str, ...] = (),
+        hermes_home_override: Optional[str] = None,
+    ) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            raise ZettlabMediaDeadlineError(
+                "local image read deadline exceeded while waiting"
+            )
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ZettlabMediaDeadlineError(
+                    "local image read deadline exceeded before start"
+                )
+            self._ensure_started(
+                source,
+                limit,
+                task_id,
+                terminal_backend,
+                managed_hermes_roots,
+                hermes_home_override,
+                deadline,
+            )
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._reset(force=True)
+                    raise ZettlabMediaDeadlineError("local image read deadline exceeded")
+                if is_interrupted():
+                    self._reset(force=True)
+                    raise ZettlabMediaError("media generation interrupted")
+                try:
+                    ready = self._connection.poll(min(0.1, remaining))
+                except (EOFError, OSError) as exc:
+                    self._reset(force=True)
+                    raise ZettlabMediaError("local image worker poll failed") from exc
+                if not ready:
+                    if not self._process.is_alive():
+                        try:
+                            if self._connection.poll(0):
+                                result = self._connection.recv()
+                                try:
+                                    return self._value_from_result(result, limit)
+                                finally:
+                                    self._reset(force=False)
+                        except (EOFError, OSError) as exc:
+                            self._reset(force=True)
+                            raise ZettlabMediaError(
+                                "local image worker result read failed"
+                            ) from exc
+                        self._reset(force=True)
+                        raise ZettlabMediaError("local image worker exited unexpectedly")
+                    continue
+                try:
+                    result = self._connection.recv()
+                except (EOFError, OSError) as exc:
+                    self._reset(force=True)
+                    raise ZettlabMediaError("local image worker closed unexpectedly") from exc
+                try:
+                    return self._value_from_result(result, limit)
+                finally:
+                    self._reset(force=False)
+        finally:
+            self._lock.release()
+
+    def close(self) -> None:
+        self._reset(force=True)
+
+    def _ensure_started(
+        self,
+        source: str,
+        limit: int,
+        task_id: str,
+        terminal_backend: str,
+        managed_hermes_roots: tuple[str, ...],
+        hermes_home_override: Optional[str],
+        deadline: float,
+    ) -> None:
+        if self._process is not None and self._process.is_alive():
+            return
+        self._reset(force=True)
+        if limit <= 0 or time.monotonic() >= deadline:
+            raise ZettlabMediaDeadlineError("local image process start deadline exceeded")
+        finished = threading.Event()
+        cancelled = threading.Event()
+        state_lock = threading.Lock()
+        state: Dict[str, Any] = {}
+
+        def cleanup(resources: Dict[str, Any]) -> None:
+            parent = resources.get("parent")
+            child = resources.get("child")
+            process = resources.get("process")
+            if parent is not None:
+                _safe_close_worker_resource(parent)
+            if child is not None:
+                _safe_close_worker_resource(child)
+            if process is not None:
+                _dispose_worker_process(process, force=True)
+
+        def start_process() -> None:
+            resources: Dict[str, Any] = {}
+            try:
+                result_buffer = self._context.RawArray("B", limit)
+                parent, child = self._context.Pipe()
+                resources.update(parent=parent, child=child, buffer=result_buffer)
+                process = self._context.Process(
+                    target=_media_file_worker,
+                    args=(
+                        child,
+                        os.getpid(),
+                        source,
+                        limit,
+                        task_id,
+                        terminal_backend,
+                        managed_hermes_roots,
+                        hermes_home_override,
+                        result_buffer,
+                    ),
+                    daemon=True,
+                )
+                resources["process"] = process
+                process.start()
+            except Exception as exc:
+                resources["failure"] = exc
+            finally:
+                try:
+                    with state_lock:
+                        should_cleanup = cancelled.is_set()
+                        if not should_cleanup:
+                            state.update(resources)
+                        finished.set()
+                    if should_cleanup or resources.get("failure") is not None:
+                        cleanup(resources)
+                finally:
+                    _STARTER_CAPACITY.release()
+
+        if not _STARTER_CAPACITY.acquire(blocking=False):
+            raise ZettlabMediaDeadlineError("local image process starter capacity exhausted")
+        try:
+            threading.Thread(
+                target=start_process,
+                name="zettlab-media-file-spawn",
+                daemon=True,
+            ).start()
+        except Exception:
+            _STARTER_CAPACITY.release()
+            raise
+        while not finished.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline or is_interrupted():
+                with state_lock:
+                    cancelled.set()
+                    cleanup_now = dict(state) if finished.is_set() else None
+                if cleanup_now:
+                    cleanup(cleanup_now)
+                if is_interrupted():
+                    raise ZettlabMediaError("media generation interrupted")
+                raise ZettlabMediaDeadlineError(
+                    "local image process start deadline exceeded"
+                )
+        if time.monotonic() >= deadline:
+            cleanup(state)
+            raise ZettlabMediaDeadlineError("local image process start deadline exceeded")
+        if state.get("failure") is not None:
+            raise ZettlabMediaError("local image process failed to start") from state["failure"]
+        _safe_close_worker_resource(state["child"])
+        self._connection = state["parent"]
+        self._process = state["process"]
+        self._buffer = state["buffer"]
+
+    def _reset(self, *, force: bool) -> None:
+        connection, process = self._connection, self._process
+        self._connection = None
+        self._process = None
+        self._buffer = None
+        if connection is not None:
+            _safe_close_worker_resource(connection)
+        if process is not None:
+            _dispose_worker_process(process, force=force)
+
+    def _value_from_result(
+        self,
+        result: Dict[str, Any],
+        limit: int,
+    ) -> bytes:
+        error = result.get("error")
+        if error == "blocked":
+            raise ValueError(result.get("message") or "local image read denied")
+        if error:
+            raise ZettlabMediaError(result.get("message") or "local image read failed")
+        length = result.get("length")
+        if (
+            not isinstance(length, int)
+            or isinstance(length, bool)
+            or length <= 0
+            or length > limit
+            or self._buffer is None
+        ):
+            raise ZettlabMediaError("local image worker returned an invalid result")
+        return bytes(self._buffer[:length])
 
 
 class _MediaHTTPSession:
@@ -381,8 +796,10 @@ class _MediaHTTPSession:
             worker.close()
 
 
+_FILE_WORKER = _MediaFileWorker()
 _SESSION = _MediaHTTPSession()
 atexit.register(_SESSION.close)
+atexit.register(_FILE_WORKER.close)
 
 
 def _config_section(media_type: str) -> Dict[str, Any]:
@@ -560,7 +977,14 @@ def list_models(media_type: str) -> List[Dict[str, Any]]:
     models = section.get("models")
     if not isinstance(models, list):
         return []
-    return [m for m in models if isinstance(m, dict) and isinstance(m.get("id"), str)]
+    out: List[Dict[str, Any]] = []
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            continue
+        normalized = dict(model)
+        normalized["modalities"] = supported_modalities(section, model)
+        out.append(normalized)
+    return out
 
 
 def default_model(media_type: str) -> Optional[str]:
@@ -641,7 +1065,16 @@ def is_available(media_type: str) -> bool:
         section = type_capability(media_type)
     except Exception:
         return False
-    return bool(section.get("enabled")) and bool(section.get("models"))
+    models = section.get("models")
+    return (
+        bool(section.get("enabled"))
+        and isinstance(models, list)
+        and any(
+            supported_modalities(section, model)
+            for model in models
+            if isinstance(model, dict)
+        )
+    )
 
 
 def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
@@ -691,33 +1124,45 @@ def remote_inputs(
     return out
 
 
+def _effective_inline_image_limit(limits: Any) -> Optional[int]:
+    limit = limits.get("max_inline_image_bytes") if isinstance(limits, dict) else None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    return min(limit, MAX_INLINE_IMAGE_BYTES)
+
+
 def normalized_modalities(model_capability: Optional[Dict[str, Any]]) -> List[str]:
-    """Return the gateway modalities Hermes can safely act on."""
     raw = model_capability.get("modalities") if isinstance(model_capability, dict) else None
-    if raw is None:
-        return ["text"]
-    out: List[str] = []
+    modalities: List[str] = []
     if isinstance(raw, list):
         for value in raw:
             normalized = value.strip().casefold() if isinstance(value, str) else ""
-            if normalized in {"text", "image"} and normalized not in out:
-                out.append(normalized)
-    return out
+            if normalized in {"text", "image"} and normalized not in modalities:
+                modalities.append(normalized)
+    elif raw is None:
+        modalities.append("text")
+    return modalities
+
+
+def supported_modalities(
+    type_section: Optional[Dict[str, Any]],
+    model_capability: Optional[Dict[str, Any]],
+) -> List[str]:
+    modalities = normalized_modalities(model_capability)
+    limits = type_section.get("limits") if isinstance(type_section, dict) else None
+    if "image" in modalities and _effective_inline_image_limit(limits) is None:
+        modalities.remove("image")
+    return modalities
 
 
 def _inline_image_limit(model_capability: Optional[Dict[str, Any]]) -> int:
     limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
-    declared = limits.get("max_inline_image_bytes") if isinstance(limits, dict) else None
-    if (
-        "image" not in normalized_modalities(model_capability)
-        or not isinstance(declared, int)
-        or isinstance(declared, bool)
-        or declared <= 0
-    ):
+    limit = _effective_inline_image_limit(limits)
+    if "image" not in normalized_modalities(model_capability) or limit is None:
         raise ZettlabMediaError(
-            "Inline image input is not enabled for this Zettlab image generation model"
+            "Inline image input is not enabled for this Zettlab media generation model"
         )
-    return min(declared, MAX_INLINE_IMAGE_BYTES)
+    return limit
 
 
 def _sniff_image_mime(raw: bytes) -> Optional[str]:
@@ -732,26 +1177,129 @@ def _sniff_image_mime(raw: bytes) -> Optional[str]:
 
 def validate_inline_image_data_uri(value: str, *, max_bytes: int) -> str:
     """Validate one bounded PNG/JPEG/WebP base64 data URI."""
-    header, separator, encoded = str(value or "").strip().partition(",")
+    normalized = str(value or "").strip()
+    header, separator, encoded = normalized.partition(",")
     if not separator or not header.startswith("data:image/") or not header.endswith(";base64"):
-        raise ZettlabMediaError("inline image input must be a PNG, JPEG, or WebP data URI")
-    declared_mime = header[len("data:") : -len(";base64")].lower()
-    if declared_mime not in {"image/png", "image/jpeg", "image/webp"}:
-        raise ZettlabMediaError("inline image input must use PNG, JPEG, or WebP")
-    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+        raise ZettlabMediaError(
+            "image input must be a local image path or data URI using PNG, JPEG, or WebP"
+        )
+    declared_mime = header[len("data:"):-len(";base64")].lower()
+    if declared_mime not in _SUPPORTED_IMAGE_MIMES:
+        raise ZettlabMediaError("image data URI must use PNG, JPEG, or WebP")
     if not encoded or len(encoded) % 4 != 0:
-        raise ZettlabMediaError("inline image input must contain valid base64")
-    decoded_size = len(encoded) // 4 * 3 - padding
-    if decoded_size <= 0 or decoded_size > min(max_bytes, MAX_INLINE_IMAGE_BYTES):
+        raise ZettlabMediaError("image data URI must contain valid base64")
+
+    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+    decoded_length = len(encoded) // 4 * 3 - padding
+    if decoded_length <= 0:
+        raise ZettlabMediaError("image data URI must contain image bytes")
+    if decoded_length > min(max_bytes, MAX_INLINE_IMAGE_BYTES):
         raise ZettlabMediaError("inline image input exceeds maximum size")
     try:
         raw = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ZettlabMediaError("inline image input must contain valid base64") from exc
+        raise ZettlabMediaError("image data URI must contain valid base64") from exc
     detected_mime = _sniff_image_mime(raw)
-    if detected_mime is None or detected_mime != declared_mime:
-        raise ZettlabMediaError("inline image input MIME type does not match its bytes")
-    return str(value).strip()
+    if detected_mime is None:
+        raise ZettlabMediaError("image data URI does not contain a supported image")
+    if detected_mime != declared_mime:
+        raise ZettlabMediaError("image data URI MIME type does not match its bytes")
+    return normalized
+
+
+def _validate_image_data_uri(value: str, limit: int) -> str:
+    return validate_inline_image_data_uri(value, max_bytes=limit)
+
+
+def _reject_windows_network_or_device_path(source: str) -> None:
+    normalized = source.replace("/", "\\")
+    folded = normalized.casefold()
+    if (
+        normalized.startswith("\\\\")
+        or folded.startswith("\\??\\")
+        or folded.startswith("\\device\\")
+        or folded.startswith("\\global??\\")
+    ):
+        raise ZettlabMediaError(
+            "Windows network and device paths are not supported for image input"
+        )
+
+
+def _local_image_data_uri(
+    source: str,
+    limit: int,
+    task_id: str,
+    terminal_backend: str,
+    managed_hermes_roots: tuple[str, ...],
+    hermes_home_override: Optional[str],
+) -> str:
+    try:
+        raw = _FILE_WORKER.read(
+            source,
+            limit,
+            deadline=time.monotonic() + LOCAL_IMAGE_READ_TIMEOUT,
+            task_id=task_id,
+            terminal_backend=terminal_backend,
+            managed_hermes_roots=managed_hermes_roots,
+            hermes_home_override=hermes_home_override,
+        )
+    except ValueError as exc:
+        raise ZettlabMediaError(str(exc)) from exc
+    mime = _sniff_image_mime(raw[:16])
+    if mime is None:
+        raise ZettlabMediaError("local image input must be a PNG, JPEG, or WebP file")
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def inline_image_input(
+    image_url: Optional[str],
+    reference_image_urls: Optional[List[str]],
+    model_capability: Optional[Dict[str, Any]],
+    *,
+    task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return one bounded inline image accepted by the gateway's v1 contract."""
+    if isinstance(reference_image_urls, str):
+        references = [reference_image_urls]
+    elif isinstance(reference_image_urls, (list, tuple)):
+        references = list(reference_image_urls)
+    else:
+        references = []
+    candidates = [
+        str(value).strip()
+        for value in [image_url, *references]
+        if value is not None and str(value).strip()
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ZettlabMediaError("exactly one image input is supported")
+    limit = _inline_image_limit(model_capability)
+    source = candidates[0]
+    if source.startswith("data:"):
+        return _validate_image_data_uri(source, limit)
+    _reject_windows_network_or_device_path(source)
+    parsed = urlparse(source)
+    if parsed.scheme.casefold() in {"http", "https"}:
+        raise ZettlabMediaError(
+            "HTTP(S) image URLs are not enabled for Zettlab yet; use a base64 "
+            "data URI or an absolute local image path"
+        )
+    (
+        prepared_source,
+        normalized_task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+    ) = _prepare_local_image_path(source, task_id)
+    return _local_image_data_uri(
+        prepared_source,
+        limit,
+        normalized_task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+    )
 
 
 def image_path_data_uri(path: os.PathLike[str] | str, *, max_bytes: int = MAX_INLINE_IMAGE_BYTES) -> str:
@@ -778,32 +1326,6 @@ def image_path_data_uri(path: os.PathLike[str] | str, *, max_bytes: int = MAX_IN
     if mime is None:
         raise ZettlabMediaError("generated image input must be PNG, JPEG, or WebP")
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-
-
-def split_image_inputs(
-    image_url: Optional[str],
-    reference_image_urls: Optional[List[str]],
-    model_capability: Optional[Dict[str, Any]],
-) -> tuple[Optional[str], List[Dict[str, str]]]:
-    """Route one inline image or HTTPS references without mixing contracts."""
-    candidates = [
-        str(value).strip()
-        for value in [image_url, *(reference_image_urls or [])]
-        if value is not None and str(value).strip()
-    ]
-    if not candidates:
-        return None, []
-    inline = [value for value in candidates if value.startswith("data:")]
-    remote = [value for value in candidates if not value.startswith("data:")]
-    if inline and remote:
-        raise ZettlabMediaError("inline and remote image inputs cannot be mixed")
-    if inline:
-        if len(inline) != 1:
-            raise ZettlabMediaError("exactly one inline image input is supported")
-        return validate_inline_image_data_uri(
-            inline[0], max_bytes=_inline_image_limit(model_capability)
-        ), []
-    return None, remote_inputs(image_url, reference_image_urls)
 
 
 def create_and_wait(
@@ -1029,7 +1551,11 @@ def first_asset_local_path(job: Dict[str, Any]) -> str:
     )
 
 
-def first_asset_location(job: Dict[str, Any], *, prefer_local: bool) -> str:
+def first_asset_location(
+    job: Dict[str, Any],
+    *,
+    prefer_local: bool,
+) -> str:
     if prefer_local:
         try:
             return first_asset_local_path(job)

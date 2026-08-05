@@ -38,7 +38,12 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    classify_api_error,
+    content_policy_fallback_disabled,
+)
+from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1644,12 +1649,140 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
+def _transcript_without_refused_turn(
+    messages: List[Dict],
+    user_message: Any,
+    current_turn_user_idx: int,
+) -> List[Dict]:
+    """Return the transcript with this turn's refused exchange removed.
+
+    A content-policy block must not enter the model's context. Two reasons,
+    both practical rather than legal:
+
+    * The refused text stays in the prompt of every later turn, so one blocked
+      message keeps being re-submitted — to the moderation gateway too, which
+      bills per call.
+    * The model reads its own refusal as precedent and starts hedging on
+      neighbouring topics for the rest of the session.
+
+    The exchange is NOT lost to the user: zettlab-local-server records the turn
+    (and its error code) in its own transcript from the WS path, independent of
+    what hermes persists, so the App still shows which messages were blocked.
+    The two histories diverge here by design — the user sees the attempt, the
+    model does not.
+
+    Trimming has to be done on the returned list, not just skipped at the
+    persist call: the gateway writes ``result["messages"]`` to the session DB
+    itself (zet_agent), so a skipped persist alone would leave the refused turn
+    to be written by the other path.
+
+    ``current_turn_user_idx`` can be stale when compaction rebuilt the list
+    mid-turn, so it is validated and re-anchored. If the turn still cannot be
+    located, everything from the last user message on is dropped — over-trimming
+    one turn is recoverable, keeping refused content is not.
+    """
+    # 只校验 role 是不够的：压缩重建 messages 之后，旧索引可能仍在范围内、
+    # 也确实是一条 user 行，但那是**另一条**——压缩追加的 todo snapshot，或
+    # 被保留下来的历史用户轮。索引一旦落在本轮被拒消息之后，下面的裁剪就会
+    # 把被拒内容留在返回的 transcript 里，下一轮继续提交给审核网关和模型。
+    # 所以内容对不上也要重新锚定，reanchor 本身就是优先按内容匹配的。
+    # user_message 的约定是「本轮 user 消息的 content」（reanchor 就是这么比的），
+    # 但调用方偶尔会把整条 message dict 传进来。两种都接受，否则内容校验会因为
+    # 类型不同而永远判为不匹配，把每一次裁剪都推进保守兜底。
+    wanted = user_message.get("content") if isinstance(user_message, dict) else user_message
+
+    idx = current_turn_user_idx
+    if (
+        not (0 <= idx < len(messages))
+        or messages[idx].get("role") != "user"
+        or messages[idx].get("content") != wanted
+    ):
+        # reanchor 优先按内容匹配，但**没有 exact match 时它会退回最后一条 user
+        # 行** —— 那可能是压缩追加的 todo snapshot，排在被拒消息之后。按它裁剪
+        # 就把被拒内容留下了。所以这里只接受内容对得上的锚点；对不上就当没找到，
+        # 走下面更保守的兜底。
+        candidate = reanchor_current_turn_user_idx(messages, wanted)
+        idx = candidate if (
+            0 <= candidate < len(messages)
+            and messages[candidate].get("content") == wanted
+        ) else -1
+    if not (0 <= idx < len(messages)):
+        # 定位不到本轮：从**最后一条 assistant 之后**全部裁掉。
+        #
+        # 被拒的那一轮拿不到助手回复，所以最后一条 assistant 之后的所有行都属于
+        # 当前轮（可能是被压缩改写过的 user、也可能是 todo snapshot 之类的
+        # synthetic 行）。按「最后一条 user 行」裁是不够的——尾部有多条 user 时
+        # 它只裁掉最后那条，被改写过的被拒消息原样留下。
+        #
+        # 宁可多裁一轮（用户在 App 里仍看得见那一轮、可以改了重发），也不能把
+        # 被拒内容留在上下文里：它会在之后每一轮被重新提交给审核网关和模型。
+        # 整个会话里根本没有 user 行（例如只有 system prompt）：没有本轮可裁，
+        # 原样返回。裁成空会把 system prompt 一起丢掉。
+        if not any(m.get("role") == "user" for m in messages):
+            return list(messages)
+        # 边界必须是**上一轮**的完成点，不能是最后一条 assistant。
+        #
+        # 审核 400 也可能在本轮的工具调用之后才回来，这时最后一条 assistant
+        # 正是本轮刚产生的 assistant(tool_calls) —— 按它裁会把被拒的 user 连同
+        # 它的 tool-call scaffolding 一起留下。
+        #
+        # 上一轮的完成点 = 最后一条**不带 tool_calls 且不是 tool 结果**的
+        # assistant：带 tool_calls 的 assistant 后面必然还有 tool 回合，说明它
+        # 属于一段没走完的交互；只有干净收尾的 assistant 才代表一轮真的结束了。
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if m.get("role") != "assistant":
+                continue
+            if m.get("tool_calls"):
+                continue
+            return messages[: i + 1]
+        return []
+    return messages[:idx]
+
+
+def _purge_refused_rows_from_session_db(agent, messages: List[Dict], kept: int) -> None:
+    """Delete the refused turn's already-persisted rows from the session DB.
+
+    ``build_turn_context`` writes the current user message to SQLite before the
+    first model call, so by the time a refusal comes back the row is already
+    durable and carries a ``_db_message_id``. Trimming the in-memory list and
+    re-persisting only rewrites the JSON log and the live list — the DB row
+    survives, and the next turn restores it through
+    ``get_messages_as_conversation()``. The refused content then goes back to
+    the moderation gateway (billed) and the user is blocked again on text they
+    can no longer see a way to change.
+
+    Best-effort by design: a store without ``delete_message`` (or a delete that
+    fails) must not turn a content refusal into a crashed turn. The in-memory
+    trim still keeps the refused text out of THIS process's context.
+    """
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    delete = getattr(session_db, "delete_message", None)
+    if session_db is None or not session_id or not callable(delete):
+        return
+    for msg in messages[kept:]:
+        if not isinstance(msg, dict):
+            continue
+        row_id = msg.get("_db_message_id")
+        if not isinstance(row_id, int) or row_id <= 0:
+            continue
+        try:
+            delete(session_id, row_id)
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            logger.warning(
+                "content refusal: failed to delete persisted message row %s: %s",
+                row_id, exc,
+            )
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
     *,
     final_response: str,
     error_detail: str,
+    provider_error: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the terminal turn result for a content-policy block.
 
@@ -1658,8 +1791,13 @@ def _content_policy_blocked_result(
     exception-path handler return the identical shape — a failed, non-completed
     turn carrying the user-facing message and a ``content_policy_blocked:``
     prefixed error — so they funnel through this one builder.
+
+    ``provider_error`` must be supplied whenever the caller can build one: the
+    chat gateway reads ``result["provider_error"]["code"]`` to pick the wire
+    error code, and without it the turn degrades to a bare ``agent_error`` that
+    downstream clients cannot map to a "your content was refused" message.
     """
-    return {
+    result: Dict[str, Any] = {
         "final_response": final_response,
         "messages": messages,
         "api_calls": api_call_count,
@@ -1667,6 +1805,9 @@ def _content_policy_blocked_result(
         "failed": True,
         "error": f"content_policy_blocked: {error_detail}",
     }
+    if provider_error:
+        result["provider_error"] = provider_error
+    return result
 
 
 def _compression_deferred_result(
@@ -3675,11 +3816,14 @@ def run_conversation(
                     # Deterministic for the unchanged prompt — never retry.
                     # Try a configured fallback once (a different model may not
                     # refuse); otherwise surface the refusal terminally.
-                    if agent._has_pending_fallback():
+                    # Compliance deployments opt out of the failover entirely —
+                    # see content_policy_fallback_disabled().
+                    _may_failover = not content_policy_fallback_disabled()
+                    if _may_failover and agent._has_pending_fallback():
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if _may_failover and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3716,12 +3860,42 @@ def run_conversation(
                     )
 
                     agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
+                    # The refused exchange must not survive into the model's
+                    # context — see _transcript_without_refused_turn.
+                    _kept_messages = _transcript_without_refused_turn(
+                        messages, user_message, current_turn_user_idx
+                    )
+                    # 内存里裁掉还不够：user 消息在首次模型调用之前就已经写进
+                    # SQLite 了，不删行的话下一轮 get_messages_as_conversation()
+                    # 会把它恢复回来重新提交。
+                    _purge_refused_rows_from_session_db(
+                        agent, messages, len(_kept_messages)
+                    )
+                    agent._persist_session(_kept_messages, conversation_history)
+                    # No ClassifiedError here — this refusal arrived as a
+                    # well-formed HTTP 200 whose finish_reason is
+                    # ``content_filter``, so there is no exception to classify.
+                    # Build the equivalent payload by hand and keep ``code`` in
+                    # sync with normalized_provider_error_code's mapping for
+                    # FailoverReason.content_policy_blocked.
+                    _refusal_provider_error: Dict[str, Any] = {
+                        "code": "content_blocked",
+                        "reason": FailoverReason.content_policy_blocked.value,
+                        "retryable": False,
+                        "recoverable": False,
+                    }
+                    if getattr(agent, "provider", None):
+                        _refusal_provider_error["provider"] = agent.provider
+                    if getattr(agent, "model", None):
+                        _refusal_provider_error["model"] = agent.model
+                    if _refusal_text:
+                        _refusal_provider_error["provider_message"] = _refusal_text[:500]
                     return _content_policy_blocked_result(
-                        messages,
+                        _kept_messages,
                         api_call_count,
                         final_response=_refusal_response,
                         error_detail=_refusal_text or "model declined (content_filter)",
+                        provider_error=_refusal_provider_error,
                     )
 
                 if finish_reason == "length":
@@ -3846,7 +4020,54 @@ def run_conversation(
                         _cf_terminated = getattr(
                             response, "_content_filter_terminated", False
                         )
-                        if (
+                        # 合规部署下不许 fallback。输出层安全过滤以 stream stall
+                        # 形式回来时（MiniMax new_sensitive / Azure content_filter），
+                        # 这里原来无条件换模型重试 —— 被拒内容就转到了用户自己配置
+                        # 的模型上，那条调用根本不过我们的审核网关。和普通
+                        # finish_reason="content_filter" 分支同一套规则。
+                        if _cf_terminated and content_policy_fallback_disabled():
+                            # 必须在这里终止，不能只打日志。上一版就是只 _vprint
+                            # 然后 fall through 到下面的 length continuation ——
+                            # 被拒上下文继续送给供应商和审核网关，最后还只暴露成
+                            # 截断错误而不是 content_blocked。走和普通
+                            # finish_reason="content_filter" 完全相同的收尾：裁掉
+                            # 被拒的一轮、删掉已落盘的行、返回 content_blocked。
+                            agent._vprint(
+                                f"{agent.log_prefix}🛡️  Content filter terminated "
+                                f"stream — fallback disabled by content policy; "
+                                f"ending the turn.",
+                                force=True,
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            _cf_kept = _transcript_without_refused_turn(
+                                messages, user_message, current_turn_user_idx
+                            )
+                            _purge_refused_rows_from_session_db(
+                                agent, messages, len(_cf_kept)
+                            )
+                            agent._persist_session(_cf_kept, conversation_history)
+                            _cf_provider_error: Dict[str, Any] = {
+                                "code": "content_blocked",
+                                "reason": FailoverReason.content_policy_blocked.value,
+                                "retryable": False,
+                                "recoverable": False,
+                            }
+                            if getattr(agent, "provider", None):
+                                _cf_provider_error["provider"] = agent.provider
+                            if getattr(agent, "model", None):
+                                _cf_provider_error["model"] = agent.model
+                            return _content_policy_blocked_result(
+                                _cf_kept,
+                                api_call_count,
+                                final_response=(
+                                    "⚠️  The provider's output safety filter blocked "
+                                    "this response (not a Hermes/gateway failure).\n\n"
+                                    f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                                ),
+                                error_detail="output content filter terminated the stream",
+                                provider_error=_cf_provider_error,
+                            )
+                        elif (
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
                         ):
@@ -5964,6 +6185,18 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
+                # 合规拦截不得走 fallback。classified.should_fallback 已经被
+                # content_policy_fallback_disabled() 置为 False，但下面这段从来
+                # 不读它 —— 只要还有 pending fallback 就照样调
+                # _try_activate_fallback()，于是合规网关已经拒绝的请求被路由到
+                # 用户自配的备用模型，并且可能真的拿到回答。
+                #
+                # 只跳过「尝试 fallback」这一步，后面的终止/上报路径要照常走：
+                # 这一轮必须以内容拦截结束，而不是悄悄中止。
+                _policy_no_fallback = (
+                    classified.reason == FailoverReason.content_policy_blocked
+                    and not classified.should_fallback
+                )
                 if is_client_error:
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
@@ -5997,14 +6230,14 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if agent._has_pending_fallback() and not _policy_no_fallback:
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not _policy_no_fallback and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6151,6 +6384,25 @@ def run_conversation(
                     # Persisting the failed user message would make the
                     # session even larger, causing the same failure on the
                     # next attempt. (#1630)
+                    _content_refused = (
+                        classified.reason == FailoverReason.content_policy_blocked
+                    )
+                    # A refused turn is trimmed out of the transcript rather
+                    # than persisted — see _transcript_without_refused_turn.
+                    _kept_messages = (
+                        _transcript_without_refused_turn(
+                            messages, user_message, current_turn_user_idx
+                        )
+                        if _content_refused
+                        else messages
+                    )
+                    if _content_refused:
+                        # 同上：DB 里那条已落盘的 user 行也要删掉。放在
+                        # persist 之前，因为大 session 会跳过 persist —— 但
+                        # 被拒的行无论如何都得清。
+                        _purge_refused_rows_from_session_db(
+                            agent, messages, len(_kept_messages)
+                        )
                     if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
@@ -6158,8 +6410,8 @@ def run_conversation(
                             force=True,
                         )
                     else:
-                        agent._persist_session(messages, conversation_history)
-                    if classified.reason == FailoverReason.content_policy_blocked:
+                        agent._persist_session(_kept_messages, conversation_history)
+                    if _content_refused:
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
                             "(not a Hermes/gateway failure).\n\n"
@@ -6167,10 +6419,13 @@ def run_conversation(
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )
                         return _content_policy_blocked_result(
-                            messages,
+                            _kept_messages,
                             api_call_count,
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
+                            provider_error=agent._provider_error_payload(
+                                classified, api_error
+                            ),
                         )
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as

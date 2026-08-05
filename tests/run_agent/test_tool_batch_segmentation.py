@@ -27,7 +27,7 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     _should_parallelize_tool_batch,
 )
-from agent.prompt_builder import STEER_MARKER_OPEN
+from agent.prompt_builder import STEER_USER_PREFIX
 from tools.budget_config import BudgetConfig
 
 
@@ -97,6 +97,27 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["b1", "r3"]
 
+    def test_adjacent_barriers_merge_into_one_sequential_segment(self):
+        calls = [
+            _tc("terminal", '{"command":"a"}', call_id="b1"),
+            _tc("terminal", '{"command":"b"}', call_id="b2"),
+            _tc("web_search", call_id="r1"),
+            _tc("web_search", call_id="r2"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["sequential", "parallel"]
+        assert [tc.id for tc in segments[0][1]] == ["b1", "b2"]
+
+    def test_terminal_and_todo_are_both_sequential_barriers(self):
+        calls = [
+            _tc("terminal", '{"command":"render"}', call_id="terminal-1"),
+            _tc("todo", '{"action":"read"}', call_id="todo-1"),
+        ]
+
+        segments = _plan_tool_batch_segments(calls)
+
+        assert _kinds(segments) == ["sequential"]
+        assert [tc.id for tc in segments[0][1]] == ["terminal-1", "todo-1"]
 
     def test_never_parallel_tool_is_a_barrier(self):
         calls = [
@@ -469,7 +490,49 @@ class TestSegmentedDispatchIntegration:
         conc.assert_called_once()
         seq.assert_not_called()
 
+    def test_homogeneous_unsafe_batch_still_uses_plain_sequential_path(self, agent):
+        calls = [
+            _tc("terminal", '{"command":"a"}'),
+            _tc("terminal", '{"command":"b"}'),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
 
+        with (
+            patch.object(agent, "_execute_tool_calls_concurrent") as conc,
+            patch.object(agent, "_execute_tool_calls_sequential") as seq,
+        ):
+            agent._execute_tool_calls(msg, [], "task-1")
+
+        seq.assert_called_once()
+        conc.assert_not_called()
+
+    def test_terminal_and_todo_batch_uses_sequential_executor(self, agent):
+        calls = [
+            _tc("terminal", '{"command":"render"}'),
+            _tc("todo", '{"action":"read"}'),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+
+        with (
+            patch.object(agent, "_execute_tool_calls_concurrent") as conc,
+            patch.object(agent, "_execute_tool_calls_sequential") as seq,
+        ):
+            agent._execute_tool_calls(msg, [], "task-1")
+
+        seq.assert_called_once()
+        conc.assert_not_called()
+
+    def test_single_call_uses_sequential_path(self, agent):
+        msg = SimpleNamespace(content="", tool_calls=[_tc("web_search", '{"query":"a"}')])
+
+        with (
+            patch.object(agent, "_execute_tool_calls_concurrent") as conc,
+            patch.object(agent, "_execute_tool_calls_sequential") as seq,
+        ):
+            agent._execute_tool_calls(msg, [], "task-1")
+
+        seq.assert_called_once()
+        conc.assert_not_called()
 
     def test_interrupt_during_barrier_drains_later_segments(self, agent):
         """Interrupt raised while the barrier tool runs: the trailing parallel
@@ -504,9 +567,8 @@ class TestSegmentedDispatchIntegration:
         for m in messages[-2:]:
             assert "cancelled" in m["content"] or "skipped" in m["content"]
 
-    def test_steer_lands_exactly_once_in_mixed_batch(self, agent):
-        """The whole-batch finalizer drains steer once, so the marker cannot
-        be duplicated by segment boundaries."""
+    def test_steer_stays_pending_until_next_api_call_in_mixed_batch(self, agent):
+        """Segment boundaries must not consume a steer before the next API call."""
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),
             _tc("web_search", '{"query":"b"}', call_id="s2"),
@@ -522,9 +584,14 @@ class TestSegmentedDispatchIntegration:
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")
 
+        assert agent._pending_steer == "focus on the tests"
         contents = [m["content"] for m in messages]
-        hits = [c for c in contents if "focus on the tests" in c]
+        assert not [c for c in contents if "focus on the tests" in c]
+
+        agent._drain_steer_for_next_api_call(messages)
+        hits = [m["content"] for m in messages if "focus on the tests" in m["content"]]
         assert len(hits) == 1
+        assert messages[-1]["role"] == "user"
 
     @pytest.mark.parametrize(
         ("calls", "expected_segment_kinds"),
@@ -565,12 +632,12 @@ class TestSegmentedDispatchIntegration:
     def test_steer_survives_turn_budget_in_every_dispatch_path(
         self, agent, calls, expected_segment_kinds
     ):
-        """A steer must be appended after aggregate budgeting in direct
+        """A steer must stay pending through aggregate budgeting in direct
         concurrent, direct sequential, and segmented mixed batches.
 
         The large result forces ``enforce_turn_budget()`` to replace it.
-        Before the fix, the per-tool drain consumed the steer first, so that
-        replacement silently discarded the canonical marker.
+        Tool execution must not consume the steer; the conversation loop's
+        pre-API drain appends the canonical user message afterward.
         """
         messages = []
         msg = SimpleNamespace(content="", tool_calls=calls)
@@ -596,8 +663,13 @@ class TestSegmentedDispatchIntegration:
 
         large_result_index = next(i for i, call in enumerate(calls) if call.id.endswith("large"))
         assert "Truncated:" in messages[large_result_index]["content"]
-        steer_messages = [m for m in messages if STEER_MARKER_OPEN in m["content"]]
+        assert agent._pending_steer == "preserve this steer after budget enforcement"
+        assert not [m for m in messages if STEER_USER_PREFIX in m["content"]]
+
+        agent._drain_steer_for_next_api_call(messages)
+        steer_messages = [m for m in messages if STEER_USER_PREFIX in m["content"]]
         assert steer_messages == [messages[-1]]
+        assert messages[-1]["role"] == "user"
         assert "preserve this steer after budget enforcement" in steer_messages[0]["content"]
 
     def test_steer_survives_turn_budget_after_malformed_arguments(self, agent):
@@ -624,8 +696,14 @@ class TestSegmentedDispatchIntegration:
 
         assert len(messages) == 1
         assert "Truncated:" in messages[0]["content"]
-        assert messages[0]["content"].count(STEER_MARKER_OPEN) == 1
-        assert "preserve malformed-call steer after budget enforcement" in messages[0]["content"]
+        assert agent._pending_steer == "preserve malformed-call steer after budget enforcement"
+        assert STEER_USER_PREFIX not in messages[0]["content"]
+
+        agent._drain_steer_for_next_api_call(messages)
+        assert len(messages) == 2
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"].count(STEER_USER_PREFIX) == 1
+        assert "preserve malformed-call steer after budget enforcement" in messages[-1]["content"]
 
 
 class TestPathCanonicalization:

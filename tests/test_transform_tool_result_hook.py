@@ -132,6 +132,76 @@ def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
     ]
 
 
+def test_dispatch_wrapper_is_inside_plugin_boundary(monkeypatch):
+    """A privileged dispatch wrapper must not cover plugin execution code."""
+    events = []
+    privileged = False
+
+    def _dispatch(_tool_name, _args, **_kwargs):
+        assert privileged is True
+        events.append("registry")
+        return '{"raw": "failure"}'
+
+    def _execution_middleware(*, args, next_call, **_context):
+        assert privileged is False
+        events.append("middleware-before")
+        result = next_call(args)
+        assert privileged is False
+        events.append("middleware-after")
+        return result
+
+    def _dispatch_wrapper(_tool_name, _args, dispatch):
+        nonlocal privileged
+        assert privileged is False
+        events.append("wrapper-enter")
+        privileged = True
+        try:
+            result = dispatch()
+        finally:
+            privileged = False
+        events.append(("raw-result", result))
+        return result
+
+    def _hook(hook_name, **kwargs):
+        assert privileged is False
+        if hook_name == "post_tool_call":
+            events.append(("post", kwargs["result"]))
+        if hook_name == "transform_tool_result":
+            events.append(("transform", kwargs["result"]))
+            return ['{"model": "rewritten"}']
+        return []
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", _dispatch)
+    monkeypatch.setattr(
+        "hermes_cli.middleware._get_middleware_callbacks",
+        lambda kind: [_execution_middleware] if kind == "tool_execution" else [],
+    )
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+    monkeypatch.setattr(model_tools, "_READ_SEARCH_TOOLS", frozenset())
+
+    result = model_tools.handle_function_call(
+        "dummy_tool",
+        {"value": 1},
+        task_id="t1",
+        session_id="s1",
+        tool_call_id="tc1",
+        skip_pre_tool_call_hook=True,
+        dispatch_wrapper=_dispatch_wrapper,
+    )
+
+    assert result == '{"model": "rewritten"}'
+    assert events == [
+        "middleware-before",
+        "wrapper-enter",
+        "registry",
+        ("raw-result", '{"raw": "failure"}'),
+        "middleware-after",
+        ("post", '{"raw": "failure"}'),
+        ("transform", '{"raw": "failure"}'),
+    ]
+
+
 def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_path):
     """End-to-end: load a real plugin from HERMES_HOME and verify it rewrites results."""
     import yaml

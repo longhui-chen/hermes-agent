@@ -254,11 +254,21 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.auth
         assert result.should_fallback is True
 
-
-
+    def test_xai_403_structured_spending_limit_code_classified_as_billing(self):
+        """xAI reports exhausted Grok credits as a provider-specific 403 code."""
+        e = MockAPIError(
+            "Error code: 403",
+            status_code=403,
+            body={
+                "code": "personal-team-blocked:spending-limit",
+                "error": (
+                    "You have run out of credits or need a Grok subscription. "
+                    "Add credits at Grok or upgrade at Grok."
+                ),
+            },
+        )
 
         result = classify_api_error(e, provider="xai-oauth")
-
         assert result.reason == FailoverReason.billing
         assert result.provider_error_code == "personal-team-blocked:spending-limit"
         assert result.retryable is False
@@ -479,6 +489,67 @@ class TestClassifyApiError:
 
 
 
+    def test_zettlab_moderation_gateway_block(self):
+        # The CN compliance gateway puts the machine token in ``error.code``
+        # and a localized sentence in ``error.message``. Nothing in the message
+        # matches an English pattern, so this only classifies correctly if the
+        # code is searched too — without that it fell through to the status
+        # default and surfaced as ``provider_bad_request``.
+        e = MockAPIError(
+            "内容不合规",
+            status_code=400,
+            body={
+                "error": {
+                    "code": "moderation_input_blocked",
+                    "type": "content_policy_violation",
+                    "message": "内容不合规",
+                    "request_id": "req-1",
+                }
+            },
+        )
+        result = classify_api_error(e, provider="zettlab", model="glm-5")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
+        assert normalized_provider_error_code(result) == "content_blocked"
+
+    def test_content_policy_blocked_maps_to_content_blocked_code(self):
+        # Provider-side safety refusals share the wire code with the gateway's
+        # block: the user-facing meaning ("this content was refused") is the
+        # same, and the client renders one message for both.
+        e = MockAPIError(
+            "Your request was flagged by our safety system",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="anthropic", model="claude-x")
+        assert normalized_provider_error_code(result) == "content_blocked"
+
+    def test_content_policy_failover_opt_out(self, monkeypatch):
+        # Compliance deployments must not fail over to a second model: every
+        # cloud model sits behind the same gateway (identical verdict, one more
+        # billed moderation call), and a user-configured custom model does not
+        # sit behind it at all.
+        e = MockAPIError(
+            "内容不合规",
+            status_code=400,
+            body={"error": {"code": "moderation_input_blocked", "message": "内容不合规"}},
+        )
+
+        monkeypatch.delenv("HERMES_CONTENT_POLICY_NO_FALLBACK", raising=False)
+        assert classify_api_error(e, provider="zettlab").should_fallback is True
+
+        monkeypatch.setenv("HERMES_CONTENT_POLICY_NO_FALLBACK", "1")
+        assert classify_api_error(e, provider="zettlab").should_fallback is False
+
+    def test_404_model_not_found_still_works(self):
+        # Regression guard: the new policy-block check must not swallow
+        # genuine model_not_found 404s.
+        e = MockAPIError(
+            "openrouter/nonexistent-model is not a valid model ID",
+            status_code=404,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.model_not_found
+        assert result.should_fallback is True
 
     # ── Payload too large ──
 
@@ -1170,6 +1241,4 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
-
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import multiprocessing
 import os
@@ -15,6 +16,9 @@ import requests
 from plugins.image_gen.zettlab import ZettlabImageGenProvider, _gateway_aspect_ratio, register
 
 
+PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(
+    b"\x89PNG\r\n\x1a\nsource"
+).decode("ascii")
 TINY_PNG_DATA_URL = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
@@ -68,7 +72,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
                     "display_name": "Seedream V4",
                     "modalities": ["text", "image"],
                 }],
-                "limits": {"max_remote_media_inputs": 4},
+                "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
             },
             "video": {"enabled": False, "models": []},
         })
@@ -79,7 +83,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
     assert provider.is_available() is True
     assert provider.default_model() == "seedream-v4"
     assert provider.list_models()[0]["display"] == "Seedream V4"
-    assert provider.capabilities()["max_reference_images"] == 3
+    assert provider.capabilities()["max_reference_images"] == 0
 
 
 def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch):
@@ -101,13 +105,30 @@ def test_zettlab_image_capabilities_preserve_image_only_modality(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
-        "limits": {"max_remote_media_inputs": 1},
+        "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
     }, {
         "id": "image-only",
-        "modalities": ["image"],
+        "modalities": [" IMAGE "],
     }))
 
     assert ZettlabImageGenProvider().capabilities()["modalities"] == ["image"]
+
+
+@pytest.mark.parametrize("invalid_limit", [None, 0, -1, True, "5242880"])
+def test_zettlab_image_capabilities_hide_image_with_invalid_inline_limit(
+    monkeypatch,
+    invalid_limit,
+):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
+        "limits": {"max_inline_image_bytes": invalid_limit},
+    }, {
+        "id": "image-only",
+        "modalities": [" IMAGE "],
+    }))
+
+    assert ZettlabImageGenProvider().capabilities()["modalities"] == []
 
 
 def test_zettlab_provider_uses_gateway_default_model(monkeypatch):
@@ -190,6 +211,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
                 "limits": {
                     "provider_timeout_seconds": 300,
                     "finalization_timeout_seconds": 600,
+                    "max_inline_image_bytes": 5 * 1024 * 1024,
                 },
             },
         })
@@ -217,8 +239,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     got = ZettlabImageGenProvider().generate(
         "make a product shot",
         aspect_ratio="square",
-        image_url="https://example.com/source.png",
-        reference_image_urls=["https://example.com/ref.png"],
+        image_url=PNG_DATA_URI,
         model="seedream-v4",
         num_images=2,
     )
@@ -237,11 +258,8 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     assert captured["json"]["output_count"] == 1
     assert captured["json"]["aspect_ratio"] == "1:1"
     assert captured["json"]["resolution"] == "2K"
-    assert captured["json"]["remote_media_inputs"] == [
-        {"url": "https://example.com/source.png", "role": "source"},
-        {"url": "https://example.com/ref.png", "role": "reference"},
-    ]
-    assert "input_image" not in captured["json"]
+    assert captured["json"]["input_image"] == PNG_DATA_URI
+    assert "remote_media_inputs" not in captured["json"]
 
 
 def test_zettlab_image_generate_routes_data_uri_to_inline_input(monkeypatch):
@@ -304,7 +322,7 @@ def test_zettlab_image_generate_rejects_mixed_inline_and_remote_without_http(mon
     )
 
     assert got["success"] is False
-    assert "cannot be mixed" in got["error"]
+    assert "exactly one image input" in got["error"]
 
 
 def test_generated_image_data_uri_rejects_symbolic_links(tmp_path):
@@ -357,27 +375,53 @@ def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monke
     assert captured["model"] == "seedream-default"
 
 
-def test_zettlab_image_rejects_non_https_remote_input(monkeypatch):
+def test_zettlab_image_rejects_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
-        lambda media_type, requested=None: ("seedream-v4", {"id": "seedream-v4", "modalities": ["text", "image"]}),
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
     )
     got = ZettlabImageGenProvider().generate("make image", image_url="http://example.com/a.png")
     assert got["success"] is False
     assert got["error_type"] == "ZettlabMediaError"
-    assert "https URL" in got["error"]
+    assert "not enabled" in got["error"]
 
 
-def test_zettlab_image_only_model_requires_image_input(monkeypatch):
+@pytest.mark.parametrize(
+    ("modalities", "expected_error"),
+    [
+        ([" IMAGE "], "missing_image"),
+        (["future-mode"], "unsupported_capability"),
+        ([], "unsupported_capability"),
+    ],
+)
+def test_zettlab_image_model_without_text_input_never_sends(
+    monkeypatch,
+    modalities,
+    expected_error,
+):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
-        lambda media_type, requested=None: ("image-only", {"id": "image-only", "modalities": ["image"]}),
+        lambda media_type, requested=None: (
+            "image-only",
+            {
+                "id": "image-only",
+                "modalities": modalities,
+                "_type_limits": {"max_inline_image_bytes": True},
+            },
+        ),
     )
     monkeypatch.setattr(
         client,
@@ -388,7 +432,7 @@ def test_zettlab_image_only_model_requires_image_input(monkeypatch):
     got = ZettlabImageGenProvider().generate("edit this image")
 
     assert got["success"] is False
-    assert got["error_type"] == "missing_image"
+    assert got["error_type"] == expected_error
 
 
 @pytest.mark.parametrize("value", [
