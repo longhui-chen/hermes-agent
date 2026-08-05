@@ -1455,6 +1455,56 @@ class ZetAgentAdapter(APIServerAdapter):
     _ATTACHMENT_MAX_BYTES = 256 * 1024
     _ATTACHMENT_ACTION_QUEUE_MAX = 64
     _ATTACHMENT_ACTION_WORKERS = 4
+    _MEMORY_CITATION_MAX_ITEMS = 8
+
+    @classmethod
+    def _push_memory_citations(
+        cls,
+        stream_q: Any,
+        turn_id: Any,
+        session_id: Any,
+        items: list,
+    ) -> bool:
+        """Push one turn-level memory.citations attachment (需求 3.1).
+
+        同 turn 恒定附件 id（upsert 语义）：重复 flush 覆盖而非叠卡。无 actions、
+        state 恒 active——客户端渲染为回答尾部的折叠角标行。背压/超限直接放弃
+        （引用展示是旁路产物）。
+        """
+        try:
+            if stream_q.qsize() > cls._ATTACHMENT_STREAM_BACKLOG_MAX:
+                return False
+            trimmed = [
+                {
+                    "id": str(item.get("id") or "")[:64],
+                    "source": str(item.get("source") or "")[:120],
+                    "excerpt": str(item.get("excerpt") or "")[:240],
+                }
+                for item in items[: cls._MEMORY_CITATION_MAX_ITEMS]
+                if isinstance(item, dict) and item.get("id")
+            ]
+            if not trimmed:
+                return False
+            anchor = str(turn_id or "").strip() or uuid.uuid5(
+                uuid.NAMESPACE_OID, f"mc:{session_id}"
+            ).hex[:12]
+            stream_q.put((
+                "__tool_progress__",
+                {
+                    "type": "hermes.attachment",
+                    "attachment": {
+                        "id": f"mc-{anchor}",
+                        "kind": "memory.citations",
+                        "v": 1,
+                        "state": "active",
+                        "payload": {"items": trimmed},
+                    },
+                },
+            ))
+            return True
+        except Exception:
+            logger.warning("[zet_agent] memory citations push failed", exc_info=True)
+            return False
 
     @classmethod
     def _make_delegation_progress_cb(cls, stream_q: Any):
@@ -2096,6 +2146,20 @@ class ZetAgentAdapter(APIServerAdapter):
                         )
             except Exception:
                 logger.debug("[zet_agent] early-return steer salvage failed", exc_info=True)
+            # memory.citations（需求 3.1）：本轮 search_memory 命中的记忆条目
+            # 汇总成一张附件（agent 侧 dispatch 采集到 _zet_memory_citations）。
+            # 仍在 agent_task 内（None 哨兵未落），push 一定会被 drain。采集/
+            # 发射失败一律静默——引用展示是旁路，绝不影响回答。
+            try:
+                _cit_agent = agent_ref[0] if agent_ref else None
+                citations = getattr(_cit_agent, "_zet_memory_citations", None)
+                if stream_q is not None and isinstance(citations, dict) and citations:
+                    self._push_memory_citations(
+                        stream_q, turn_id, session_id, list(citations.values())
+                    )
+                    _cit_agent._zet_memory_citations = {}
+            except Exception:
+                logger.debug("[zet_agent] memory citations push failed", exc_info=True)
             # Goal loop post-turn hook (ZET goal driver): if this session has
             # an active persistent goal, evaluate the finished turn off the
             # event loop and report the verdict (+ continuation) to

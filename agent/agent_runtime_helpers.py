@@ -2501,10 +2501,33 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             # tool's store=). None (no external provider) falls back to the
             # built-in curated MEMORY.md/USER.md search inside the tool.
             from tools.search_memory_tool import search_memory_tool as _search_memory_tool
-            return _finish_agent_tool(
-                _search_memory_tool(next_args, memory_manager=agent._memory_manager),
-                next_args,
-            )
+            raw = _search_memory_tool(next_args, memory_manager=agent._memory_manager)
+            # memory.citations 采集（需求 3.1）：命中条目记到 agent 上的有界
+            # 容器，zet_agent 在 turn 收尾把它汇总成一张 memory.citations
+            # 附件（同 id upsert）。采集失败静默——引用展示是旁路产物，
+            # 绝不影响工具结果本身。
+            try:
+                parsed = json.loads(raw)
+                items = parsed.get("items") if isinstance(parsed, dict) else None
+                if isinstance(items, list) and items:
+                    sink = getattr(agent, "_zet_memory_citations", None)
+                    if sink is None:
+                        sink = {}
+                        agent._zet_memory_citations = sink
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        item_id = str(item.get("id") or "")
+                        if not item_id or len(sink) >= 32:
+                            continue
+                        sink.setdefault(item_id, {
+                            "id": item_id[:64],
+                            "source": str(item.get("source") or "")[:120],
+                            "excerpt": str(item.get("excerpt") or "")[:240],
+                        })
+            except Exception:
+                pass
+            return _finish_agent_tool(raw, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)

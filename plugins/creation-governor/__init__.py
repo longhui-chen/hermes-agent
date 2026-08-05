@@ -61,6 +61,10 @@ CONNECTION_TYPES = {"channel", "connector"}
 RECOMMENDABLE_CHANNEL_KINDS = {"feishu", "wecom", "wechat", "telegram", "discord", "slack"}
 # connector 连接态里视为"未连接、可推荐"的状态值（projection UnifiedAuthState 的窄投影）。
 CONNECTOR_RECOMMENDABLE_STATES = {"not_connected", "expired", "revoked", "disconnected"}
+ARTIFACT_TYPE = "artifact"
+# attachment 通道交付的全部品类（连接推荐 + artifact 推荐）；agent/skill/task
+# 保持文本信封通道不变。
+ATTACHMENT_DELIVERED_TYPES = CONNECTION_TYPES | {ARTIFACT_TYPE}
 CONNECTION_INVENTORY_TTL_SECONDS = 600.0
 MAX_EMITTED_CONNECTION_PROPOSALS = 256
 RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
@@ -143,7 +147,9 @@ def _semantic_dedup_key(value: Any, creation_type: str, suggested_name: str) -> 
     slug = re.sub(r"[^a-z0-9._:-]+", "-", raw).strip("-")
     prefix = (
         creation_type
-        if creation_type in CREATION_TYPES or creation_type in CONNECTION_TYPES
+        if creation_type in CREATION_TYPES
+        or creation_type in CONNECTION_TYPES
+        or creation_type == ARTIFACT_TYPE
         else "proposal"
     )
     if slug:
@@ -646,7 +652,7 @@ _DETECTOR_SCHEMA = {
     "properties": {
         "decision": {
             "type": "string",
-            "enum": ["agent", "skill", "task", "channel", "connector", "none"],
+            "enum": ["agent", "skill", "task", "channel", "connector", "artifact", "none"],
         },
         "suggested_name": {"type": "string"},
         "reason": {"type": "string"},
@@ -671,7 +677,7 @@ _DETECTOR_SCHEMA = {
 
 _DETECTOR_INSTRUCTIONS = """Perform one high-recall zero-shot product judgment.
 
-Return exactly one of agent, skill, task, channel, connector, or none. Do not classify by topic words and do not use
+Return exactly one of agent, skill, task, channel, connector, artifact, or none. Do not classify by topic words and do not use
 memorized examples. A single substantive request is enough when a reasonable user would benefit
 from reusing the capability. Do not require the user to mention repetition, frequency, saving, or
 creation. Ask whether a durable capability would materially reduce friction or improve judgment
@@ -695,6 +701,11 @@ Definitions and conflict order:
 6. connector: completing this class of request materially needs the user's own external data
    (mail, notes, code, calendar, ...) and the inventory lists that provider under "connectors
    recommendable". Set target to that exact provider id.
+
+7. artifact: the most valuable durable outcome of this conversation is an openable product —
+   a page, mini-app, dashboard, or report the user would revisit or share — rather than a
+   capability. Prefer skill when the value is a reusable method; prefer artifact when the value
+   is the produced thing itself. suggested_name is the artifact title in the user's language.
 
 Grounding rule for channel/connector: these two decisions are FORBIDDEN unless the evidence
 contains a `[connection-inventory]` line that explicitly lists the target as recommendable.
@@ -736,7 +747,9 @@ none。先判断需求所涉及的账户、项目、业务环境或信息是否�
 channel 与 connector 的中文规则相同：只有当证据里存在 [connection-inventory] 行、且目标
 明确出现在 recommendable 列表中时才允许返回这两类；已连接的渠道或数据源绝不重复推荐；
 target 必须逐字取自清单，禁止猜测或泛化。channel 用于"提醒/结果需要直达用户的 IM"，
-connector 用于"这类任务实质上需要用户自己的外部数据"。"""
+connector 用于"这类任务实质上需要用户自己的外部数据"。artifact 用于"这段对话最有价值的
+沉淀是一件可打开的作品（页面/小应用/报告）而非一种能力"——方法可复用选 skill，产物本身
+有长期价值选 artifact。"""
 
 
 def _run_forced_evaluation(
@@ -853,7 +866,11 @@ def _normalize_candidate(
     )
     if decision == "none":
         return None, "none"
-    if decision not in CREATION_TYPES and decision not in CONNECTION_TYPES:
+    if (
+        decision not in CREATION_TYPES
+        and decision not in CONNECTION_TYPES
+        and decision != ARTIFACT_TYPE
+    ):
         return None, "unsupported_creation_type"
 
     suggested_name = _text(args.get("suggested_name"), 80)
@@ -1258,11 +1275,12 @@ def _action_result_envelope(result: dict[str, Any]) -> str:
     return f"<!--creation-recommendation-action-result {encoded}-->"
 
 
-def _emit_connection_attachment(session_key: str, proposal: dict[str, Any]) -> bool:
-    """Deliver a channel/connector proposal as a structured chat attachment.
+def _emit_recommendation_attachment(session_key: str, proposal: dict[str, Any]) -> bool:
+    """Deliver a channel/connector/artifact proposal as a structured attachment.
 
-    需求 6.2：wire 只带语义（kind/payload/action id），文案由客户端 i18n 决定。
-    发射失败（无活跃流 / 老客户端链路）静默降级——连接推荐是锦上添花，绝不
+    需求 6.2：wire 只带语义（kind/payload/action id），推荐卡文案由客户端
+    i18n 决定（artifact 的 title/reason 是模型按用户语言产出的内容字段）。
+    发射失败（无活跃流 / 老客户端链路）静默降级——推荐是锦上添花，绝不
     进入正文文本通道。
     """
     ctx = _plugin_ctx
@@ -1271,17 +1289,29 @@ def _emit_connection_attachment(session_key: str, proposal: dict[str, Any]) -> b
     creation_type = proposal.get("creation_type")
     target = _text(proposal.get("target"), 80).lower()
     proposal_id = _text(proposal.get("proposal_id"), 80)
-    if creation_type not in CONNECTION_TYPES or not target or not proposal_id:
+    if creation_type not in ATTACHMENT_DELIVERED_TYPES or not proposal_id:
+        return False
+    if creation_type in CONNECTION_TYPES and not target:
         return False
     attachment_id = f"cg-{proposal_id}"
     if creation_type == "channel":
         kind = "channel.connect"
         payload: dict[str, Any] = {"channel_kind": target}
-    else:
+        actions = [{"id": "dismiss"}, {"id": "connect", "style": "primary"}]
+    elif creation_type == "connector":
         kind = "connector.connect"
         # 推荐永远是非阻塞的（需求 5.1）；强依赖场景的 blocking 卡由执行路径
         # 自己发，不走推荐通道。
         payload = {"provider": target, "blocking": False}
+        actions = [{"id": "dismiss"}, {"id": "connect", "style": "primary"}]
+    else:
+        kind = "artifact.recommendation"
+        payload = {
+            "title": _text(proposal.get("suggested_name"), 80),
+            "reason": _text(proposal.get("reason"), 400),
+            "confidence": proposal.get("confidence"),
+        }
+        actions = [{"id": "dismiss"}, {"id": "accept", "style": "primary"}]
     expires_at = proposal.get("expires_at")
     attachment = {
         "id": attachment_id,
@@ -1289,7 +1319,7 @@ def _emit_connection_attachment(session_key: str, proposal: dict[str, Any]) -> b
         "v": 1,
         "state": "active",
         "payload": payload,
-        "actions": [{"id": "dismiss"}, {"id": "connect", "style": "primary"}],
+        "actions": actions,
         "dedup_key": proposal.get("dedup_key") or "",
         **(
             {"expires_at": int(float(expires_at) * 1000)}
@@ -1435,12 +1465,13 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     if _is_session_muted(session_id):
         return sanitized_response if (result_suffix or stripped_forged_action_result) else None
-    if proposal.get("creation_type") in CONNECTION_TYPES:
-        # 连接推荐走结构化 attachment 通道（channel.connect / connector.connect
-        # 卡），不追加文本信封；发射失败（无活跃流）静默降级，正文原样返回。
-        emitted = _emit_connection_attachment(session_id, proposal)
+    if proposal.get("creation_type") in ATTACHMENT_DELIVERED_TYPES:
+        # 连接/artifact 推荐走结构化 attachment 通道（channel.connect /
+        # connector.connect / artifact.recommendation 卡），不追加文本信封；
+        # 发射失败（无活跃流）静默降级，正文原样返回。
+        emitted = _emit_recommendation_attachment(session_id, proposal)
         logger.info(
-            "connection recommendation %s type=%s target=%s turn=%s",
+            "attachment recommendation %s type=%s target=%s turn=%s",
             "emitted" if emitted else "skipped (no active stream)",
             proposal.get("creation_type"),
             _text(proposal.get("target"), 80),

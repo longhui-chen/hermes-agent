@@ -554,7 +554,7 @@ def test_optional_tool_accepts_none_and_rejects_invalid_or_low_confidence():
     ) == {"status": "no_candidate", "reason": "none"}
     assert json.loads(
         plugin._detect_creation_opportunity(
-            _candidate(decision="artifact"), session_id="invalid"
+            _candidate(decision="workflow"), session_id="invalid"
         )
     ) == {"status": "not_proposed", "reason": "unsupported_creation_type"}
     assert json.loads(
@@ -607,6 +607,7 @@ def test_tool_schema_is_zero_shot_and_supports_all_outcomes():
         "task",
         "channel",
         "connector",
+        "artifact",
         "none",
     ]
 

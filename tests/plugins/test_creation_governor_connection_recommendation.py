@@ -222,3 +222,55 @@ def test_attachment_action_hook_registered():
     plugin.register(ctx)
     hook_names = [args[0] for args, _ in ctx.hooks]
     assert "attachment_action" in hook_names
+
+
+def _artifact_candidate():
+    return {
+        "decision": "artifact",
+        "suggested_name": "华东销售季报页面",
+        "reason": "这份分析整理成可打开的页面后可以反复查看和分享。",
+        "evidence_turn_ids": ["evidence-1"],
+        "confidence": 0.8,
+        "dedup_key": "east-sales-quarterly",
+        "proposal_text": "要做成一个页面吗？",
+    }
+
+
+def test_artifact_candidate_emits_artifact_recommendation(monkeypatch):
+    plugin = _load_plugin()
+    ctx = _Context(_FakeLlm([_artifact_candidate()]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    transformed = _drive_turn(plugin, "s-artifact", "帮我把这季度华东销售数据整理分析一下")
+
+    assert transformed is None  # 不进文本信封
+    assert len(ctx.emitted) == 1
+    attachment = ctx.emitted[0]
+    assert attachment["kind"] == "artifact.recommendation"
+    assert attachment["payload"]["title"] == "华东销售季报页面"
+    assert attachment["payload"]["reason"].startswith("这份分析")
+    assert [a["id"] for a in attachment["actions"]] == ["dismiss", "accept"]
+    assert attachment["dedup_key"] == "artifact:east-sales-quarterly"
+
+
+def test_artifact_dismiss_latches(monkeypatch):
+    plugin = _load_plugin()
+    ctx = _Context(_FakeLlm([_artifact_candidate(), _artifact_candidate()]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+    monkeypatch.setattr(plugin, "PROMPT_COOLDOWN_TURNS", -1)
+
+    _drive_turn(plugin, "s-art-dismiss", "帮我把这季度华东销售数据整理分析一下")
+    assert len(ctx.emitted) == 1
+    plugin._on_attachment_action(
+        session_id="s-art-dismiss",
+        attachment_id=ctx.emitted[0]["id"],
+        action_id="dismiss",
+        action_token="tok-a",
+        turn_id="",
+        payload=None,
+        profile_name="default",
+    )
+    _drive_turn(plugin, "s-art-dismiss", "这个分析结果再帮我看一眼")
+    assert len(ctx.emitted) == 1
