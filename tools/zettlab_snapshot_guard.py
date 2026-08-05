@@ -1057,6 +1057,7 @@ _TRUSTED_VIDEO_EDIT_WRITE_OPTIONS = frozenset({
     "--state-file",
     "--workflow-state",
 })
+_TRUSTED_CAMERA_SCRIPT_NAME = "camera_connector.py"
 
 
 def _trusted_video_edit_write_paths(
@@ -1130,6 +1131,37 @@ def _trusted_video_edit_write_paths(
     return paths
 
 
+def _trusted_camera_write_paths(command: str) -> Optional[list[str]]:
+    """Return no user-file writes for an exact trusted camera action.
+
+    ``terminal_tool`` intercepts these commands before shell execution. The
+    helper only calls the device-local CameraService with a fixed action and a
+    registered camera ID; any snapshot or clip is allocated as a new service-
+    owned attachment. Reuse the runtime's strict parser so arbitrary Python,
+    wrapped shell commands, and unsupported camera arguments retain the generic
+    cwd protection path.
+    """
+    if _TRUSTED_CAMERA_SCRIPT_NAME not in command:
+        return None
+    try:
+        from tools.terminal_tool import _parse_camera_runtime_command
+
+        parsed = _parse_camera_runtime_command(command)
+    except Exception as exc:
+        logger.debug(
+            "zettlab snapshot guard: trusted camera parse unavailable: %s",
+            exc,
+        )
+        return None
+    if (
+        parsed is None
+        or len(parsed.argv) < 2
+        or os.path.basename(str(parsed.argv[1])) != _TRUSTED_CAMERA_SCRIPT_NAME
+    ):
+        return None
+    return []
+
+
 def _extract_v4a_paths(patch_body: str) -> list[str]:
     """按 patch_parser 的等价规则抽取 V4A patch 触达的所有路径。"""
     paths: list[str] = []
@@ -1161,6 +1193,9 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
 
     if tool_name == "terminal":
         command = str(arguments.get("command") or "")
+        trusted_camera_paths = _trusted_camera_write_paths(command)
+        if trusted_camera_paths is not None:
+            return trusted_camera_paths
         trusted_video_paths = _trusted_video_edit_write_paths(
             command,
             arguments,
