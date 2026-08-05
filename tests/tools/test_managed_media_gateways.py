@@ -244,6 +244,39 @@ def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatc
     assert captured["close_calls"] == 1
 
 
+def test_zettlab_tts_auto_selects_local_gateway_and_product_model(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured)
+    # A device image may also carry a direct OpenAI key. The board-local path
+    # still owns managed TTS so provider credentials and billing stay cloud-side.
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-key-must-not-win")
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    assert tts_tool._get_provider({}) == "openai"
+    assert tts_tool._get_provider({"provider": "edge", "_provider_is_default": True}) == "openai"
+    assert tts_tool._get_provider({"provider": "edge"}) == "edge"
+
+    output_path = tmp_path / "speech.mp3"
+    tts_tool._generate_openai_tts(
+        "hello world",
+        str(output_path),
+        {"openai": {"model": "tts-1-hd", "voice": "nova", "speed": 3.0}},
+    )
+
+    assert captured["api_key"] == "local-action-token"
+    assert captured["base_url"] == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+    assert captured["client_kwargs"]["http_client"]._trust_env is False
+    assert captured["speech_kwargs"]["model"] == "zettlab-tts"
+    assert captured["speech_kwargs"]["voice"] == "alloy"
+    assert captured["speech_kwargs"]["speed"] == 2.0
+
+
 def test_openai_tts_coerces_direct_only_model_on_managed_gateway(monkeypatch, tmp_path):
     """A tts.openai.model valid only for direct OpenAI (e.g. tts-1-hd) must be
     coerced to a managed-supported model, else the gateway 400s with

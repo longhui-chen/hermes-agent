@@ -70,6 +70,7 @@ def get_env_value(name, default=None):
     value = _get_env_value(name)
     return default if value is None else value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.zettlab_tool_gateway import resolve_zettlab_tool_gateway
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
@@ -172,11 +173,7 @@ DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
-# The managed OpenAI audio gateway (Nous portal proxy) only proxies these speech
-# models. A user's tts.openai.model set for *direct* OpenAI (e.g. "tts-1-hd")
-# is rejected with a 400 "Unsupported managed OpenAI speech model", so it must be
-# coerced to a supported model when routing through the gateway.
-MANAGED_OPENAI_TTS_MODELS = frozenset({"gpt-4o-mini-tts"})
+ZETTLAB_OPENAI_TTS_MODEL = "zettlab-tts"
 DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
@@ -341,9 +338,20 @@ def _load_tts_config() -> Dict[str, Any]:
     for any missing fields.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config, read_raw_config
         config = load_config()
-        return config.get("tts") or {}
+        tts_config = config.get("tts") or {}
+        if not isinstance(tts_config, dict):
+            return {}
+        # load_config deep-merges DEFAULT_CONFIG, whose provider is "edge".
+        # Preserve whether that value actually came from the user's file so a
+        # Zettlab session can replace only the default—not an explicit choice.
+        raw_config = read_raw_config()
+        raw_tts = raw_config.get("tts") if isinstance(raw_config, dict) else None
+        raw_provider = raw_tts.get("provider") if isinstance(raw_tts, dict) else None
+        if not isinstance(raw_provider, str) or not raw_provider.strip():
+            tts_config["_provider_is_default"] = True
+        return tts_config
     except ImportError:
         logger.debug("hermes_cli.config not available, using default TTS config")
         return {}
@@ -353,13 +361,21 @@ def _load_tts_config() -> Dict[str, Any]:
 
 
 def _get_provider(tts_config: Dict[str, Any]) -> str:
-    """Get the explicitly configured TTS provider or the free default.
+    """Get the explicitly configured TTS provider or the environment default.
 
     Inference credentials do not imply consent to paid speech generation.
-    Users opt into cloud TTS by setting ``tts.provider`` (normally through
-    ``hermes tools``); otherwise the historical Edge backend remains active.
+    A Zettlab device is different: local-server injects a per-agent capability
+    specifically for managed tools, so an otherwise-unconfigured built-in TTS
+    uses that product path. Explicit user configuration always wins; outside a
+    Zettlab session the historical free Edge backend remains active.
     """
-    return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+    configured = tts_config.get("provider")
+    provider_is_default = tts_config.get("_provider_is_default") is True
+    if configured and not provider_is_default:
+        return str(configured).lower().strip()
+    if resolve_zettlab_tool_gateway("openai-audio") is not None:
+        return "openai"
+    return str(configured or DEFAULT_PROVIDER).lower().strip()
 
 
 # ===========================================================================
@@ -1070,10 +1086,10 @@ def _generate_openai_tts(
     # credentials. OpenAI-compatible backends (DeepInfra) pass api_key /
     # base_url / model / voice through and never hit the managed-gateway path.
     fallback_base: Optional[str] = None
-    is_managed = False
+    managed_model: Optional[str] = None
     explicit_base_url = base_url is not None
     if api_key is None:
-        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
+        api_key, fallback_base, managed_model = _resolve_openai_audio_client_config()
 
     # ``tts.openai: null`` in YAML yields None — coalesce so .get() is safe.
     oai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
@@ -1093,28 +1109,46 @@ def _generate_openai_tts(
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
 
-    # The managed OpenAI audio gateway only proxies MANAGED_OPENAI_TTS_MODELS.
-    # A model set for direct OpenAI (e.g. "tts-1-hd") 400s there with
-    # "Unsupported managed OpenAI speech model", so coerce it — unless the user
-    # redirected base_url to their own endpoint, in which case respect it.
+    managed_contract_active = bool(
+        managed_model and not explicit_base_url and not config_base_url
+    )
+    # Managed gateways expose one product model. A model set for direct OpenAI
+    # would be rejected there, so coerce it unless the user explicitly
+    # redirected base_url to their own endpoint.
     if (
-        is_managed
-        and not explicit_base_url
-        and not config_base_url
-        and model not in MANAGED_OPENAI_TTS_MODELS
+        managed_contract_active
+        and model != managed_model
     ):
         logger.warning(
-            "TTS: managed OpenAI audio gateway does not support model %r; "
-            "falling back to %s. Set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY "
-            "to use %r directly.",
-            model, DEFAULT_OPENAI_MODEL, model,
+            "TTS: managed audio gateway requires model %r; replacing %r",
+            managed_model, model,
         )
-        model = DEFAULT_OPENAI_MODEL
+        model = managed_model
+    if managed_contract_active and managed_model == ZETTLAB_OPENAI_TTS_MODEL:
+        if voice != DEFAULT_OPENAI_VOICE:
+            logger.warning(
+                "TTS: Zettlab managed audio uses voice alias %r; replacing %r",
+                DEFAULT_OPENAI_VOICE, voice,
+            )
+        voice = DEFAULT_OPENAI_VOICE
+        speed = max(0.5, min(2.0, speed))
 
     response_format = _tts_response_format_from_path(output_path)
 
     OpenAIClient = _import_openai_client()
-    client = OpenAIClient(api_key=api_key, base_url=base_url)
+    client_kwargs: Dict[str, Any] = {}
+    if managed_contract_active and managed_model == ZETTLAB_OPENAI_TTS_MODEL:
+        # Board-local traffic must never inherit HTTP(S)_PROXY: otherwise
+        # httpx sends 127.0.0.1 to the desktop/system proxy and the managed
+        # route fails before it reaches local-server. Keep the OpenAI SDK's
+        # long audio timeout shape while disabling only environment proxies.
+        import httpx
+        client_kwargs["http_client"] = httpx.Client(
+            trust_env=False,
+            timeout=httpx.Timeout(600.0, connect=5.0),
+            follow_redirects=True,
+        )
+    client = OpenAIClient(api_key=api_key, base_url=base_url, **client_kwargs)
     try:
         create_kwargs: Dict[str, Any] = {
             "model": model,
@@ -2679,17 +2713,26 @@ def check_tts_requirements() -> bool:
         return False
 
 
-def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
-    """Return ``(api_key, base_url, is_managed)`` for the OpenAI audio client.
+def _resolve_openai_audio_client_config() -> tuple[str, str, Optional[str]]:
+    """Return ``(api_key, base_url, managed_model)`` for OpenAI audio.
 
-    ``is_managed`` is True when the config resolves to the Nous managed audio
-    gateway (a restricted proxy), so callers can coerce the request to what the
-    gateway supports. When ``tts.use_gateway`` is set the gateway is preferred
-    even if direct OpenAI credentials are present.
+    The Zettlab board-local gateway takes precedence over direct credentials:
+    local-server consumes its action token, replaces it with IoT auth, and the
+    cloud gateway owns regional provider selection plus billing. Outside a
+    Zettlab session, direct OpenAI keeps its historical precedence unless
+    ``tts.use_gateway`` selects the Nous managed path.
     """
+    zettlab_gateway = resolve_zettlab_tool_gateway("openai-audio")
+    if zettlab_gateway is not None:
+        return (
+            zettlab_gateway.token,
+            urljoin(f"{zettlab_gateway.gateway_origin.rstrip('/')}/", "v1"),
+            ZETTLAB_OPENAI_TTS_MODEL,
+        )
+
     direct_api_key = resolve_openai_audio_api_key()
     if direct_api_key and not prefers_gateway("tts"):
-        return direct_api_key, DEFAULT_OPENAI_BASE_URL, False
+        return direct_api_key, DEFAULT_OPENAI_BASE_URL, None
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:
@@ -2706,7 +2749,7 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
     return (
         managed_gateway.nous_user_token,
         urljoin(f"{managed_gateway.gateway_origin.rstrip('/')}/", "v1"),
-        True,
+        DEFAULT_OPENAI_MODEL,
     )
 
 
