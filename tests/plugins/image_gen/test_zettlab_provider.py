@@ -494,12 +494,22 @@ def test_zettlab_remote_input_requires_structural_https_url(value):
 
 @pytest.mark.parametrize("value", [
     "https://localhost/a.png",
+    "https://images.localhost/a.png",
     "https://127.0.0.1/a.png",
+    "https://[::1]/a.png",
     "https://example.com:8443/a.png?token=signed-value",
 ])
-def test_zettlab_remote_input_leaves_fetch_policy_to_upstream(value):
+def test_zettlab_remote_input_rejects_local_ip_and_non_default_port(value):
     from plugins import zettlab_media_client as client
 
+    with pytest.raises(client.ZettlabMediaError):
+        client.validate_remote_url(value, label="image_url")
+
+
+def test_zettlab_remote_input_preserves_signed_default_port_url():
+    from plugins import zettlab_media_client as client
+
+    value = "https://images.example.com:443/a.png?token=signed-value"
     assert client.validate_remote_url(value, label="image_url") == value
 
 

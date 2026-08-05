@@ -1086,11 +1086,16 @@ def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
         return None
     try:
         parsed = urlparse(raw)
-        host = parsed.hostname
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        port = parsed.port
     except ValueError as exc:
         raise ZettlabMediaError(
             f"{label} must be a valid HTTPS URL for Zettlab media generation"
         ) from exc
+    try:
+        is_ip_literal = bool(host) and ipaddress.ip_address(host) is not None
+    except ValueError:
+        is_ip_literal = False
     if (
         parsed.scheme.casefold() != "https"
         or not parsed.netloc
@@ -1099,6 +1104,10 @@ def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
         or parsed.password is not None
         or parsed.fragment
         or any(character.isspace() for character in raw)
+        or port not in {None, 443}
+        or host == "localhost"
+        or host.endswith(".localhost")
+        or is_ip_literal
     ):
         raise ZettlabMediaError(
             f"{label} must be a valid HTTPS URL for Zettlab media generation"

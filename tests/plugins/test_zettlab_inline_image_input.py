@@ -143,6 +143,11 @@ def test_inline_image_input_fails_closed_when_url_capability_is_missing():
         "https://user:pass@images.example.com/source.png",
         "https://images.example.com/source.png#fragment",
         "https://images.example.com/source image.png",
+        "https://localhost/source.png",
+        "https://images.localhost/source.png",
+        "https://10.0.0.5/source.png",
+        "https://[::1]/source.png",
+        "https://images.example.com:8443/source.png",
     ],
 )
 def test_inline_image_input_rejects_invalid_remote_url(value):
