@@ -2948,3 +2948,96 @@ def test_foreground_ancillary_missing_target_probes_restore(monkeypatch, tmp_pat
 
     assert blocked is not None, "前台新建文件同样不能落进正在还原的目录"
     assert str(new_file) in rec.requests[-1]["body"]["paths"]
+
+def test_quoted_ampersand_is_not_backgrounding(monkeypatch, tmp_path):
+    """引号里的字面 `&` 不是后台操作符（Codex review P1）。
+
+    原先 `_shell_self_backgrounds` 先用裸正则扫原始字符串，`printf 'R&D' > f`、
+    带 query string 的 URL 都会被误判成自后台化 → 跳过 ensure → 用户静默失去本该
+    有的写入前恢复点。
+    """
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "notes.txt").write_text("x")
+
+    for cmd in (
+        "printf 'R&D' > notes.txt",
+        'curl "http://x/?a=1&b=2" -o out.bin',
+        "grep 'Tom & Jerry' in.txt > out.txt",
+    ):
+        guard.reset_for_test()
+        rec = _install(monkeypatch, {"ready": True, "operations": []})
+        out = guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        )
+        assert out is None, f"{cmd} 被误判成后台化，跳过了 ensure"
+        assert rec.requests, f"{cmd} 没有走 ensure，恢复点静默丢失"
+
+
+def test_real_backgrounding_operators_still_detected(monkeypatch, tmp_path):
+    """真正的后台操作符照常识别——修误判不能把漏判换进来。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+
+    for cmd in (
+        "rm -rf data &",
+        "cp a b & cp c d",
+        "echo A&B > f",          # 未加引号：bash 里确实是「A 后台 + B」
+        "(rm -rf data)&",        # 贴括号：shlex 把 `)` 与 `&` 合成一个标点 token
+        "{ rm -f x; }&",
+        "nohup sh -c 'rm -f x'",
+        "setsid rm -f x",
+    ):
+        guard.reset_for_test()
+        rec = _install(monkeypatch)
+        out = guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        )
+        # #18：后台化不再阻断，断言改为「放行 + 归因 background_write + 不走 ensure」。
+        assert_allowed_unprotected(out, rec, "background_write"), cmd
+        assert_no_ensure(rec, cmd)
+
+
+def test_non_backgrounding_ampersand_forms_still_ensure(monkeypatch, tmp_path):
+    """`&&` / `2>&1` / `&>` 不是后台化。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+
+    for cmd in ("rm -f x && rm -f y", "rm -f x 2>&1", "rm -f x &> log"):
+        guard.reset_for_test()
+        rec = _install(monkeypatch, {"ready": True, "operations": []})
+        assert guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        ) is None, cmd
+        assert rec.requests, cmd
+
+
+# ⚠️ 已撤销（Codex review P1 ×3）：曾把 ssh 到 localhost / 本机 hostname 识别成
+# 本机以便照常 ensure。被击穿三条：TERMINAL_SSH_PORT 可把 localhost 转发进 VM；
+# ~/.ssh/config 的 HostName 可重映射到别的机器；即使真是本机，ssh 默认 cwd 是目标
+# 用户的 ~，与守卫按本进程 cwd 算出的 ensure 路径对不上。host 字面量推不出「写入
+# 落在守卫算出的那些路径上」，对着算错的路径 ensure 会拍出假恢复点。ssh 一律按
+# 远端处置，见 _terminal_backend_is_remote 的注释。
+
+
+def test_ssh_backend_is_remote_even_for_loopback_host(monkeypatch, tmp_path):
+    """ssh 一律按远端处置——host 写着 localhost 也不例外（理由见上）。"""
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    for host in ("localhost", "127.0.0.1", "192.168.1.50"):
+        guard.reset_for_test()
+        monkeypatch.setattr(guard, "_terminal_env_type", lambda: "ssh")
+        monkeypatch.setenv("TERMINAL_SSH_HOST", host)
+        rec = _install(monkeypatch)
+        out = guard.maybe_require_snapshot(
+            "write_file", {"path": str(target)}, turn_id="turn_1")
+        # #18：远端后端不再阻断，断言改为「放行 + 归因 remote_backend + 零请求」。
+        assert_allowed_unprotected(out, rec, "remote_backend")
+        assert rec.requests == [], f"ssh({host}) 不该向本机 ensure"
+
+

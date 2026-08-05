@@ -383,6 +383,15 @@ def _terminal_backend_is_remote() -> bool:
 
     远端文件系统不在本机快照的覆盖面内，按本机路径 ensure 只会造出假恢复点
     （Codex review P1）。
+
+    ⚠️ **ssh 一律按远端处置，包括 host 写着 localhost 的**。曾尝试把 loopback /
+    本机 hostname 识别成本机以便照常 ensure，review 击穿了三条（Codex review
+    P1 ×3）：`TERMINAL_SSH_PORT` 可能把 localhost 转发进 VM / 容器；
+    `~/.ssh/config` 的 HostName 可以把任意别名重映射到别的机器；即使真是本机，
+    ssh 的默认 cwd 是目标用户的 `~`，与守卫按本进程 cwd 算出的 ensure 路径对不
+    上。三条的共同点：**host 字面量推不出「写入落在守卫算出的那些路径上」**，
+    而对着算错的路径 ensure 会拍出一张护不住实际写入的假恢复点——比诚实记成
+    无保护更糟。
     """
     return _terminal_env_type() == "ssh"
 
@@ -650,9 +659,6 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     )
 
 
-# 单个 `&`（非 `&&` / `2>&1` / `&>`）把命令甩到后台。
-_SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
-
 # nohup / setsid 把子进程甩出保护窗口；env / command / exec / nice 一类包裹层
 # 不改变「最终执行谁」，判定时逐层剥掉再看真正的命令头。值集合列出的 flag 会
 # 吃掉后面一个参数词（nice -n 10、env -u VAR）。
@@ -765,6 +771,11 @@ def _segment_daemonizes(words: list[str]) -> bool:
     return False
 
 
+# 单个 `&`（非 `&&` / `2>&1` / `&>` / `|&`）把命令甩到后台。只用于扫描 shlex 切
+# 出的**标点 token**，不再扫原始字符串——那会把引号里的字面 `&` 也当成操作符。
+_SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
+
+
 def _shell_self_backgrounds(command: str) -> bool:
     """报告一条 shell 命令是否会自行后台化（`cmd &`、nohup / setsid 包裹）。
 
@@ -775,14 +786,30 @@ def _shell_self_backgrounds(command: str) -> bool:
     作符重新分段判定。引号不配对等解析不了的形态 fail-closed 按自后台化处理
     ——识别不准就不放行。
     """
-    if _SHELL_AMP_BACKGROUND_RE.search(command):
-        return True
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:
         return True
+    # 单个 `&`（不是 `&&` / `&>` / `>&`）把命令甩到后台。**必须按 shell word 语义
+    # 判**：原先这里先用裸正则扫原始字符串，把引号里的字面 `&` 也当成操作符——
+    # `printf 'R&D' > notes.txt`、带 query string 的 URL 都会被误判成自后台化，
+    # 于是跳过 ensure，用户静默失去本该有的写入前恢复点（Codex review P1）。
+    #
+    # shlex 的 punctuation_chars 模式已经把这几种形态分得很干净：`&&` / `&>` /
+    # `>&` 各是独立 token，引号里的 `&` 留在 word 内部，后台操作符只出现在**标点
+    # token** 里。未加引号的 `echo A&B` 判成后台化是**对的**——bash 里它确实是
+    # 「A 后台执行、再跑 B」。
+    #
+    # 不能只认 `word == "&"`：贴括号的子 shell 后台化（`(rm -rf data)&`）会把
+    # 相邻标点合成一个 token `)&`（Codex review P1）。对标点 token 整体跑一遍
+    # 「`&` 且不是 `&&` / `&>` / `>&` / `|&` 的一部分」的判定——正则只扫操作符
+    # token，引号里的字面 `&` 在普通 word 里，到不了这里。
+    for word in words:
+        if word and all(ch in _SHELL_PUNCT_CHARS for ch in word):
+            if _SHELL_AMP_BACKGROUND_RE.search(word):
+                return True
     segment: list[str] = []
     segments = [segment]
     for word in words:
