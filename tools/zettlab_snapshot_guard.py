@@ -52,6 +52,9 @@ _ACTION_TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
 
 _ENSURE_PATH = "/api/v1/internal/snapshot/agent-protection/ensure"
 _FINISH_PATH = "/api/v1/internal/snapshot/agent-protection/finish"
+# 只读还原互斥探测：不建 operation、不拍快照、不占 pin。给那些**本来就不走
+# ensure** 的放行分支用，见 _restore_probe_blocks。
+_PROBE_PATH = "/api/v1/internal/snapshot/agent-protection/restore-probe"
 
 # 服务端 ensure 的同步上限是 30s，客户端留一点余量再放弃。
 # PRD 附录 B #18：降级为记录器后，Agent 不该为一张可有可无的快照长时间干等——
@@ -59,6 +62,9 @@ _FINISH_PATH = "/api/v1/internal/snapshot/agent-protection/finish"
 # btrfs CoW 正常在毫秒级完成，3s 已覆盖健康路径；超时即按 broker_unavailable 放行。
 _ENSURE_TIMEOUT = 3.0
 _FINISH_TIMEOUT = 10.0
+# 探测只读两张表、不碰 btrfs，而调用它的全是「本来就要放行」的分支——让那些写入
+# 为一次探测卡住得不偿失。超时按放行处理（服务端 ProbeTimeout 是 2s）。
+_PROBE_TIMEOUT = 2.5
 
 # 响应体上限：正常载荷只有几个 ID 和状态字符串。
 _MAX_RESPONSE_BYTES = 256 * 1024
@@ -1584,12 +1590,19 @@ def maybe_require_snapshot(
         return _unprotected("remote_backend", tool=tool_name, started=started)
     if tool_name == "terminal" and bool(arguments.get("background")):
         # 后台破坏性命令会跑到 turn 结束、pin 释放之后，恢复点可能在写入完成前
-        # 就被清理；保护窗口对不上（Codex review P1）。#18 起放行。
+        # 就被清理；保护窗口对不上（Codex review P1）。#18 起放行，但**放行前仍
+        # 要过还原互斥**——见 _restore_probe_blocks。
+        blocked = _restore_probe_blocks(paths, tool_name, started)
+        if blocked is not None:
+            return blocked
         return _unprotected("background_write", tool=tool_name, started=started)
     if tool_name == "terminal" and _shell_self_backgrounds(str(arguments.get("command") or "")):
         # shell 自行后台化（结尾 `&`、nohup / setsid 包裹）与 background=true
         # 同罪：finish 解 pin 时子进程可能仍在写（Codex review P1）。只对非只
         # 读命令生效——只读命令在 _paths_for 就被放行了。#18 起放行。
+        blocked = _restore_probe_blocks(paths, tool_name, started)
+        if blocked is not None:
+            return blocked
         return _unprotected("background_write", tool=tool_name, started=started)
 
     ambiguous_turn = False
@@ -1605,6 +1618,10 @@ def maybe_require_snapshot(
     if not turn:
         if ancillary_only:
             return None  # 加餐保护做不了幂等就不做，不阻断
+        # 这两条同样绕开了 ensure，放行前补还原互斥探测（见 _restore_probe_blocks）。
+        blocked = _restore_probe_blocks(paths, tool_name, started)
+        if blocked is not None:
+            return blocked
         if ambiguous_turn:
             # 共享容器里多轮并发：折叠 key 分不清这次写入属于哪一轮，归错轮
             # 会随对方 finish 提前解 pin（Codex review P1）。#18 起放行。
@@ -1737,6 +1754,36 @@ def _is_blocked_by_restore(data: Optional[dict], err: str = "") -> bool:
         and isinstance(data.get("_error"), dict)
         and str(data["_error"].get("code") or "") == "SNAPSHOT_AGENT_BLOCKED_BY_RESTORE"
     )
+
+
+def _restore_probe_blocks(
+    paths: list[str], tool_name: str, started: float
+) -> Optional[str]:
+    """给**不走 ensure 的放行分支**补上还原互斥检查。
+
+    后台命令（``background=true`` / shell 自后台化）、归属不明的轮、拿不到 turn
+    标识的写入——这些分支在 PRD 附录 B #18 之前是**硬阻断**（`cc9daf5f4` 起），
+    #18 改成放行之后就绕开了还原互斥这道唯一保留的守卫：写入照样会落进全量还原
+    `rename(target→bak)` 与 `rename(tmp→target)` 之间那个目标目录不存在的窗口，
+    让还原失败且回滚也失败，用户原始数据滞留在 `.bak`（Codex review P1）。
+
+    不能改走 ensure 代替：那会为后台命令拍一张保护窗口对不上的快照并占 pin
+    （pin 在 finish 时释放，而后台进程还在写），等于用一个新问题去修另一个。
+
+    **只在探测到「确有还原在跑」时才阻断**，其余一律放行：
+    - 老 local-server 没有这个端点（404 → ``not_supported``）
+    - 探测超时 / 断连 / 500
+
+    这三种下服务端本来就管不了这批写入，为它们 fail-closed 会把整批后台命令挂死
+    在一个环境问题上。与 LS 侧「查不出来就当有还原」的取舍不同——那边是已经确定
+    要查某个 target、只是查询失败；这边是连服务端都联系不上。
+    """
+    if not paths:
+        return None
+    data, err = _post(_PROBE_PATH, {"paths": paths}, _PROBE_TIMEOUT)
+    if _is_blocked_by_restore(data, err):
+        return _restore_conflict_error(tool_name, started)
+    return None
 
 
 def _restore_conflict_error(tool_name: str, started: float) -> str:

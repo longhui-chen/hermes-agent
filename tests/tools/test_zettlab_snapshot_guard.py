@@ -96,6 +96,23 @@ def assert_allowed_unprotected(result, rec, *reasons):
         )
 
 
+def assert_no_ensure(rec, ctx=""):
+    """断言这次 dispatch 没走 ensure——**只读探测不算**。
+
+    这些用例原本断言「一个请求都不发」，意图是「不该拍快照 / 不该建 operation /
+    不该占 pin」。pre-ensure 的放行分支现在会先发一次 restore-probe 再放行（见
+    `_restore_probe_blocks`），那条通道不建 operation、不拍快照、不占 pin，不违反
+    原意图，所以断言收窄到「不走 ensure」。
+    """
+    ensured = ensure_requests(rec)
+    assert ensured == [], f"不该走 ensure（会拍快照 / 占 pin）{ctx}: {ensured}"
+
+
+def ensure_requests(rec):
+    """rec 里真正走了 ensure 的那些请求。只读探测不算——见 assert_no_ensure。"""
+    return [r for r in rec.requests if "/agent-protection/ensure" in r["url"]]
+
+
 def test_unguarded_tools_are_ignored(monkeypatch, tmp_path):
     rec = _install(monkeypatch)
     target = tmp_path / "a.txt"
@@ -219,7 +236,9 @@ def test_missing_turn_id_is_fail_closed(monkeypatch, tmp_path):
 
     blocked = guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="")
     assert_allowed_unprotected(blocked, rec, "missing_turn_id")
-    assert rec.requests == []
+    # 没有轮标识仍然**不 ensure**（会把每次写入变成一张新快照，刷爆列表），
+    # 但还原互斥的只读探测照发——见 test_missing_turn_id_probes_restore_and_blocks。
+    assert_no_ensure(rec)
 
 
 def test_same_turn_created_files_are_exempt(monkeypatch, tmp_path):
@@ -890,13 +909,14 @@ def test_background_destructive_terminal_is_blocked(monkeypatch, tmp_path):
     )
     assert_allowed_unprotected(blocked, rec, "background_write")
     assert_allowed_unprotected(blocked, rec, "background_write")
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
     # 只读后台命令不受影响。
+    before = len(rec.requests)
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "ls -la", "background": True}, turn_id="turn_1"
     ) is None
-    assert rec.requests == []
+    assert len(rec.requests) == before, "只读命令在 _paths_for 就放行了，连探测都不该发"
 
 
 def test_absolute_targets_outside_cwd_get_ancillary_protection(monkeypatch, tmp_path):
@@ -1410,7 +1430,7 @@ def test_self_backgrounding_write_commands_are_blocked(monkeypatch, tmp_path):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
         assert_allowed_unprotected(blocked, rec, "background_write"), cmd
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
     # `&&` / `2>&1` / `&>` 不是后台化；只读命令带 & 也不进这条路。
     guard.reset_for_test()
@@ -1422,7 +1442,7 @@ def test_self_backgrounding_write_commands_are_blocked(monkeypatch, tmp_path):
     guard.reset_for_test()
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "ls -la &"}, turn_id="turn_1") is None
-    assert len(rec.requests) == 2, "非后台写入命令照常走保护"
+    assert len(ensure_requests(rec)) == 2, "非后台写入命令照常走保护"
 
 
 def test_docker_volume_paths_map_back_to_host_longest_prefix(monkeypatch, tmp_path):
@@ -1530,12 +1550,12 @@ def test_amp_separated_write_segment_is_not_readonly(monkeypatch, tmp_path):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
         assert_allowed_unprotected(blocked, rec, "background_write"), cmd
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
     # 纯只读的管道 / 链不受影响。
     for cmd in ("cat a.txt | grep foo", "ls -la && wc -l a.txt"):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
 
 def test_home_expansion_uses_subprocess_home(monkeypatch, tmp_path):
@@ -1834,13 +1854,13 @@ def test_quoted_or_wrapped_daemonizers_are_blocked(monkeypatch, tmp_path):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
         assert_allowed_unprotected(blocked, rec, "background_write"), cmd
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
     # `command -v setsid` 只查名字不执行；普通写入命令照常走保护。
     guard.reset_for_test()
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "command -v setsid && rm -f x"}, turn_id="turn_1") is None
-    assert len(rec.requests) == 1, "非后台写入命令照常走保护"
+    assert len(ensure_requests(rec)) == 1, "非后台写入命令照常走保护"
 
 
 def test_adjacent_quoted_path_segments_are_concatenated(monkeypatch, tmp_path):
@@ -1950,13 +1970,13 @@ def test_env_split_string_daemonizers_are_blocked(monkeypatch, tmp_path):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
         assert_allowed_unprotected(blocked, rec, "background_write"), cmd
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
     # -S 里没有 daemonizer 的照常走保护。
     guard.reset_for_test()
     assert guard.maybe_require_snapshot(
         "terminal", {"command": 'env -S "sh -c" \'rm -f x\''}, turn_id="turn_1") is None
-    assert len(rec.requests) == 1, "无 daemonizer 的 env -S 命令照常走保护"
+    assert len(ensure_requests(rec)) == 1, "无 daemonizer 的 env -S 命令照常走保护"
 
 
 def test_ssh_backend_write_commands_fail_closed(monkeypatch, tmp_path):
@@ -2024,7 +2044,7 @@ def test_coproc_backgrounding_is_blocked(monkeypatch, tmp_path):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
         assert_allowed_unprotected(blocked, rec, "background_write"), cmd
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
 
 def test_diff_is_no_longer_readonly(monkeypatch, tmp_path):
@@ -2181,13 +2201,13 @@ def test_sh_dash_c_daemonizers_are_blocked(monkeypatch, tmp_path):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
         assert_allowed_unprotected(blocked, rec, "background_write"), cmd
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
     # 没有 daemonizer 的 sh -c 照常走保护。
     guard.reset_for_test()
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "sh -c 'rm -f x'"}, turn_id="turn_1") is None
-    assert len(rec.requests) == 1
+    assert len(ensure_requests(rec)) == 1
 
 
 def test_bash_dash_c_option_terminator_daemonizers_are_blocked(monkeypatch, tmp_path):
@@ -2202,13 +2222,13 @@ def test_bash_dash_c_option_terminator_daemonizers_are_blocked(monkeypatch, tmp_
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
         assert_allowed_unprotected(blocked, rec, "background_write"), cmd
-    assert rec.requests == []
+    assert_no_ensure(rec)
 
     # `--` 后没有 daemonizer 的照常走保护，不误伤。
     guard.reset_for_test()
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "bash -c -- 'rm -f x'"}, turn_id="turn_1") is None
-    assert len(rec.requests) == 1
+    assert len(ensure_requests(rec)) == 1
 
 
 def test_container_backend_disables_readonly_shortcut(monkeypatch, tmp_path):
@@ -2486,3 +2506,124 @@ def test_ancillary_per_path_retry_restore_conflict_blocks(monkeypatch, tmp_path)
     # 已经建成的那条要能被 finish 收走，否则它的 pin 只能等 TTL 过期。
     guard.finish_turn("completed", turn_id="turn_1")
     assert rec.requests[-1]["url"].endswith("/agent-protection/finish")
+
+
+# --- pre-ensure 放行分支的还原互斥探测 ---
+#
+# 后台命令、归属不明的轮、拿不到 turn 标识的写入在 #18 之前是**硬阻断**
+# （`cc9daf5f4` 起），改成放行之后就绕开了还原互斥这道唯一保留的守卫。它们不能
+# 改走 ensure（那会为后台命令拍一张保护窗口对不上的快照并占 pin），所以走
+# local-server 的只读探测端点。
+
+
+def test_background_command_probes_restore_and_blocks(monkeypatch, tmp_path):
+    """`background=true` 的破坏性命令撞上还原必须阻断（Codex review P1）。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    rec = _install(monkeypatch, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -rf .", "workdir": str(cwd), "background": True},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "后台命令同样不能写进正在还原的目录"
+    assert "restore" in json.loads(blocked)["error"].lower()
+    assert rec.unprotected == []
+    assert rec.requests[0]["url"].endswith("/agent-protection/restore-probe"), (
+        "探测必须走只读端点——走 ensure 会给后台命令拍一张保护窗口对不上的快照并占 pin"
+    )
+
+
+def test_shell_self_backgrounded_command_probes_restore_and_blocks(monkeypatch, tmp_path):
+    """shell 自行后台化（结尾 `&`）与 background=true 同罪。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    rec = _install(monkeypatch, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -rf ./data &", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None
+    assert "restore" in json.loads(blocked)["error"].lower()
+    assert rec.unprotected == []
+
+
+def test_missing_turn_id_probes_restore_and_blocks(monkeypatch, tmp_path):
+    """拿不到 turn 标识时不 ensure（会刷爆快照列表），但还原互斥仍要过。"""
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    rec = _install(monkeypatch, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="", task_id="")
+
+    assert blocked is not None, "没有轮标识不代表可以写进正在还原的目录"
+    assert rec.unprotected == []
+    assert rec.requests[0]["url"].endswith("/agent-protection/restore-probe")
+
+
+def test_background_command_still_allowed_when_no_restore(monkeypatch, tmp_path):
+    """探测 clear 时照常放行——#18 的主语义不能被这道补查带偏。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    rec = _install(monkeypatch, {"clear": True})
+
+    out = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -rf .", "workdir": str(cwd), "background": True},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert_allowed_unprotected(out, rec, "background_write")
+
+
+def test_background_command_allowed_when_probe_unsupported(monkeypatch, tmp_path):
+    """老 local-server 没有探测端点（404）时放行。
+
+    与服务端「查不出来就当有还原」的取舍不同：那边是已经确定要查某个 target、只是
+    查询失败；这边是**连服务端都不支持这条通道**。为它 fail-closed 会把整批后台
+    命令挂死在一个版本差异上。
+    """
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    not_found = urllib.error.HTTPError(
+        "http://x", 404, "not found", {}, io.BytesIO(b"{}"))
+    rec = _install(monkeypatch, not_found)
+
+    out = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -rf .", "workdir": str(cwd), "background": True},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert_allowed_unprotected(out, rec, "background_write")
+
+
+def test_background_command_allowed_when_probe_errors(monkeypatch, tmp_path):
+    """探测断连 / 超时同样放行——服务端本来就管不了这批写入。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    rec = _install(monkeypatch, urllib.error.URLError("down"))
+
+    out = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -rf .", "workdir": str(cwd), "background": True},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert_allowed_unprotected(out, rec, "background_write")
+
+
+def test_remote_backend_does_not_probe(monkeypatch, tmp_path):
+    """ssh backend 的写入在**远端主机**——本机 target 的还原与它无关，不该探测。"""
+    monkeypatch.setattr(guard, "_terminal_backend_is_remote", lambda: True)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    rec = _install(monkeypatch)
+
+    out = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="turn_1")
+    assert_allowed_unprotected(out, rec, "remote_backend")
+    assert rec.requests == [], "远端写入不该为本机 target 发探测"
