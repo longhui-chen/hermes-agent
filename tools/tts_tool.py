@@ -2748,6 +2748,9 @@ def check_tts_requirements() -> bool:
         return False
 
 
+check_tts_requirements._profile_scope_sensitive = True  # type: ignore[attr-defined]
+
+
 def _resolve_openai_audio_client_config() -> tuple[str, str, Optional[str]]:
     """Return ``(api_key, base_url, managed_model)`` for OpenAI audio.
 

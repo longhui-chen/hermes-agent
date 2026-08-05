@@ -299,6 +299,34 @@ def test_zettlab_tts_requirements_accept_gateway_without_direct_key(monkeypatch)
     assert tts_tool.check_tts_requirements() is True
 
 
+def test_zettlab_tts_visibility_is_rechecked_across_multiplex_profiles(monkeypatch):
+    _install_fake_tools_package()
+    _install_fake_openai_module({})
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    from tools import registry as tool_registry
+
+    selected_profile = {"has_backend": False}
+    monkeypatch.setattr(
+        tts_tool,
+        "_load_tts_config",
+        lambda: {"provider": "openai"},
+    )
+    monkeypatch.setattr(
+        tts_tool,
+        "_has_openai_audio_backend",
+        lambda _config: selected_profile["has_backend"],
+    )
+    monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+
+    tool_registry._check_fn_cache.clear()
+    tool_registry._check_fn_last_good.clear()
+    assert tool_registry.registry.get_definitions({"text_to_speech"}) == []
+
+    selected_profile["has_backend"] = True
+    definitions = tool_registry.registry.get_definitions({"text_to_speech"})
+    assert [item["function"]["name"] for item in definitions] == ["text_to_speech"]
+
+
 def test_zettlab_tts_preserves_managed_scope_provider(monkeypatch, tmp_path):
     user_home = tmp_path / "user"
     managed_dir = tmp_path / "managed"
