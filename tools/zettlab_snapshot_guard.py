@@ -1629,7 +1629,11 @@ def maybe_require_snapshot(
                     ambiguous_turn = True
     if not turn:
         if ancillary_only:
-            return None  # 加餐保护做不了幂等就不做，不阻断
+            # 加餐保护做不了幂等就不做（ensure 会把每次写入变成一张新快照），但
+            # 还原互斥仍要过：strict execute_code 的脚本照样能写正在还原的目录
+            # （Codex review P1）。paths 为空，目标全部来自代码文本提取。
+            return _restore_probe_blocks(
+                paths, tool_name, arguments, task, started)
         # 这两条同样绕开了 ensure，放行前补还原互斥探测（见 _restore_probe_blocks）。
         blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
         if blocked is not None:
@@ -1947,7 +1951,19 @@ def _ensure_ancillary(
     是常态。范围外路径两种模式下都只跳过——脚本引用 /etc 一类范围外文件多是只读。
     成功后标记本轮 ensured，finish 才会释放这些 operation 的 pin。
     """
-    extras = _ancillary_targets(tool_name, arguments, exclude, task)
+    # 一次提取、按存在性划分——提取跑两遍会把 glob 枚举等开销也翻倍（HR1）。
+    targets_all = _ancillary_targets(
+        tool_name, arguments, exclude, task, include_missing=True)
+    extras = [p for p in targets_all if os.path.lexists(p)]
+    # **尚不存在**的加餐目标不进 ensure（纯新增没有原始状态可存），但还原互斥要
+    # 单独过：`touch <正在还原的目录>/new.txt` 的新文件会被还原直接丢掉，而它不在
+    # ensure 请求里、服务端连 fence 都不会建（Codex review P1）。
+    missing = [p for p in targets_all if p not in extras]
+    if missing:
+        blocked = _restore_probe_blocks(
+            missing, tool_name, arguments, task, started, expand_ancillary=False)
+        if blocked is not None:
+            return blocked
     if not extras:
         return None
     data, err = _post(
