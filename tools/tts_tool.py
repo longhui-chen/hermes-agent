@@ -357,10 +357,21 @@ def _load_tts_config() -> Dict[str, Any]:
         managed_provider = (
             managed_tts.get("provider") if isinstance(managed_tts, dict) else None
         )
+        # use_gateway is a normal mergeable setting, so consult the effective
+        # value after managed scope has overridden the user layer. Unlike the
+        # provider default, it has no DEFAULT_CONFIG value to disambiguate.
+        effective_use_gateway = tts_config.get("use_gateway")
+        gateway_opted_out = (
+            effective_use_gateway is False
+            or (
+                isinstance(effective_use_gateway, str)
+                and effective_use_gateway.strip().lower() == "false"
+            )
+        )
         provider_is_explicit = any(
             isinstance(value, str) and value.strip()
             for value in (raw_provider, managed_provider)
-        )
+        ) or gateway_opted_out
         if not provider_is_explicit:
             tts_config["_provider_is_default"] = True
         return tts_config
@@ -2695,7 +2706,7 @@ def check_tts_requirements() -> bool:
             _import_openai_client()
         except ImportError:
             return False
-        return _has_openai_audio_backend()
+        return _has_openai_audio_backend(tts_config)
     if provider == "deepinfra":
         try:
             _import_openai_client()
@@ -2777,9 +2788,20 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, Optional[str]]:
     )
 
 
-def _has_openai_audio_backend() -> bool:
-    """Return True when OpenAI audio can use direct credentials or the managed gateway."""
-    return bool(resolve_openai_audio_api_key() or resolve_managed_tool_gateway("openai-audio"))
+def _has_openai_audio_backend(tts_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether the same credential path used by OpenAI TTS can run."""
+    oai_config = (
+        tts_config.get("openai")
+        if isinstance(tts_config, dict)
+        else None
+    ) or {}
+    if oai_config.get("base_url"):
+        return bool(resolve_openai_audio_api_key())
+    return bool(
+        resolve_zettlab_tool_gateway("openai-tts")
+        or resolve_openai_audio_api_key()
+        or resolve_managed_tool_gateway("openai-audio")
+    )
 
 
 # ===========================================================================

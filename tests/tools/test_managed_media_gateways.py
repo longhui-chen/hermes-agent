@@ -277,6 +277,28 @@ def test_zettlab_tts_auto_selects_local_gateway_and_product_model(monkeypatch, t
     assert captured["speech_kwargs"]["speed"] == 2.0
 
 
+def test_zettlab_tts_requirements_accept_gateway_without_direct_key(monkeypatch):
+    _install_fake_tools_package()
+    _install_fake_openai_module({})
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    monkeypatch.setattr(
+        tts_tool,
+        "_load_tts_config",
+        lambda: {"provider": "edge", "_provider_is_default": True},
+    )
+
+    assert tts_tool.check_tts_requirements() is True
+
+
 def test_zettlab_tts_preserves_managed_scope_provider(monkeypatch, tmp_path):
     user_home = tmp_path / "user"
     managed_dir = tmp_path / "managed"
@@ -302,6 +324,59 @@ def test_zettlab_tts_preserves_managed_scope_provider(monkeypatch, tmp_path):
 
     tts_config = tts_tool._load_tts_config()
     assert tts_tool._get_provider(tts_config) == "edge"
+
+
+def test_zettlab_tts_preserves_user_gateway_opt_out(monkeypatch, tmp_path):
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    (user_home / "config.yaml").write_text("tts:\n  use_gateway: false\n")
+    monkeypatch.setenv("HERMES_HOME", str(user_home))
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    from hermes_cli import config, managed_scope
+
+    config._LOAD_CONFIG_CACHE.clear()
+    config._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    _install_fake_tools_package()
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+
+    tts_config = tts_tool._load_tts_config()
+    assert tts_tool._get_provider(tts_config) == "edge"
+
+
+def test_zettlab_tts_managed_gateway_opt_in_overrides_user_opt_out(
+    monkeypatch,
+    tmp_path,
+):
+    user_home = tmp_path / "user"
+    managed_dir = tmp_path / "managed"
+    user_home.mkdir()
+    managed_dir.mkdir()
+    (user_home / "config.yaml").write_text("tts:\n  use_gateway: false\n")
+    (managed_dir / "config.yaml").write_text("tts:\n  use_gateway: true\n")
+    monkeypatch.setenv("HERMES_HOME", str(user_home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    from hermes_cli import config, managed_scope
+
+    config._LOAD_CONFIG_CACHE.clear()
+    config._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    _install_fake_tools_package()
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+
+    tts_config = tts_tool._load_tts_config()
+    assert tts_tool._get_provider(tts_config) == "openai"
 
 
 def test_zettlab_tts_never_sends_action_token_to_custom_endpoint(monkeypatch, tmp_path):

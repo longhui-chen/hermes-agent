@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent.secret_scope import reset_secret_scope, set_secret_scope
 from tools.zettlab_tool_gateway import (
     local_server_gateway_url,
     resolve_zettlab_tool_gateway,
@@ -80,6 +81,50 @@ def test_returns_none_for_malformed_callback_url(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-browser-use")
     assert local_server_gateway_url("browser-use") == ""
     assert resolve_zettlab_tool_gateway("browser-use") is None
+
+
+@pytest.mark.parametrize(
+    "callback_url",
+    (
+        "https://example.com/api/v1/internal/chat/append",
+        "http://192.0.2.10:9090/api/v1/internal/chat/append",
+        "ftp://127.0.0.1:9090/api/v1/internal/chat/append",
+    ),
+)
+def test_rejects_non_loopback_or_non_http_callback_url(
+    monkeypatch: pytest.MonkeyPatch,
+    callback_url: str,
+) -> None:
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", callback_url)
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "must-not-leave-device")
+
+    assert resolve_zettlab_tool_gateway("openai-tts") is None
+
+
+def test_resolves_profile_scoped_local_server_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9999/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "stale-profile-token")
+    scope = set_secret_scope(
+        {
+            "ZET_CHAT_APPEND_URL": (
+                "http://127.0.0.1:9420/api/v1/internal/chat/append"
+            ),
+            "ZETTLAB_AGENT_ACTION_TOKEN": "active-profile-token",
+        }
+    )
+    try:
+        cfg = resolve_zettlab_tool_gateway("openai-tts")
+    finally:
+        reset_secret_scope(scope)
+
+    assert cfg is not None
+    assert cfg.gateway_origin == "http://127.0.0.1:9420/api/v1/ai-proxy"
+    assert cfg.token == "active-profile-token"
 
 
 def test_never_falls_back_to_nous_default(monkeypatch: pytest.MonkeyPatch) -> None:
