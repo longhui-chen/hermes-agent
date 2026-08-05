@@ -605,6 +605,8 @@ def test_tool_schema_is_zero_shot_and_supports_all_outcomes():
         "agent",
         "skill",
         "task",
+        "channel",
+        "connector",
         "none",
     ]
 

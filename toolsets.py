@@ -75,6 +75,10 @@ _HERMES_CORE_TOOLS = [
     # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
     "list_my_channels",
     "send_channel_message",
+    # List the user's authorized business-data connectors (gated on zet_agent
+    # env via check_fn). Has a zettlab_connectors catalog entry so the
+    # non-configurable recovery walk keeps it reachable on the real path.
+    "list_my_connectors",
     # Main-only, session-bound read-only unified calendar.
     "get_personal_calendar",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -271,6 +275,16 @@ TOOLSETS = {
     "zettlab_apphost": {
         "description": "Manage device-hosted generated applications via the local App Host (zettlab)",
         "tools": ["app_host"],
+        "includes": []
+    },
+
+    # Same load-bearing pattern as zettlab_apphost above: without this catalog
+    # entry the reverse-mapping in _get_platform_tools would silently drop the
+    # tool from the zet_agent real path (see the zettlab_channels /
+    # personal_calendar known gaps in tests/test_toolsets.py).
+    "zettlab_connectors": {
+        "description": "List the user's authorized business-data connectors via local-server (zettlab)",
+        "tools": ["list_my_connectors"],
         "includes": []
     },
 

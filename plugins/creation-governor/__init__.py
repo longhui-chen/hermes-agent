@@ -50,6 +50,19 @@ PROMPT_COOLDOWN_TURNS = 10
 SESSION_STATE_TTL_SECONDS = 24 * 60 * 60
 MAX_SESSION_STATES = 512
 CREATION_TYPES = {"agent", "skill", "task"}
+# Connection recommendations (Zettlab 需求 2/5)：channel/connector 走结构化
+# attachment 通道（ctx.emit_attachment → channel.connect / connector.connect 卡），
+# 与 agent/skill/task 的文本信封通道并行；共用同一套评估节奏 / 冷却 / 去重 /
+# 拒绝闩锁（展示节奏三控不变）。
+CONNECTION_TYPES = {"channel", "connector"}
+# 可推荐的 IM 渠道 kind 白名单：App/Web 绑定向导都支持的交集。连接态本身来自
+# local-server 真实清单（list_my_channels），这里只约束"平台支持范围"——
+# TODO: 等 local-server 内部端点回传 supported kinds 后改为服务端下发。
+RECOMMENDABLE_CHANNEL_KINDS = {"feishu", "wecom", "wechat", "telegram", "discord", "slack"}
+# connector 连接态里视为"未连接、可推荐"的状态值（projection UnifiedAuthState 的窄投影）。
+CONNECTOR_RECOMMENDABLE_STATES = {"not_connected", "expired", "revoked", "disconnected"}
+CONNECTION_INVENTORY_TTL_SECONDS = 600.0
+MAX_EMITTED_CONNECTION_PROPOSALS = 256
 RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
 SESSION_PREFERENCES_DB = "creation_governor.db"
 UNSUPPORTED_API_MODES = {"codex_app_server"}
@@ -61,8 +74,12 @@ _dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _muted_sessions: OrderedDict[str, float] = OrderedDict()
 _known_unmuted_sessions: OrderedDict[str, float] = OrderedDict()
+# attachment_id → (scoped_session_key, dedup_key)：attachment_action hook 的
+# dismiss 回执靠它落 30 天闩锁（有界，最老先逐出）。
+_emitted_connection_proposals: OrderedDict[str, tuple[str, str]] = OrderedDict()
 _state_lock = threading.Lock()
 _plugin_llm: Any = None
+_plugin_ctx: Any = None
 _invocation_scope: ContextVar[tuple[str, str, str | None, str] | None] = ContextVar(
     "creation_governor_invocation_scope",
     default=None,
@@ -124,7 +141,11 @@ def _normalize_creation_type(value: Any) -> str:
 def _semantic_dedup_key(value: Any, creation_type: str, suggested_name: str) -> str:
     raw = unicodedata.normalize("NFKC", str(value or "")).strip().lower()
     slug = re.sub(r"[^a-z0-9._:-]+", "-", raw).strip("-")
-    prefix = creation_type if creation_type in CREATION_TYPES else "proposal"
+    prefix = (
+        creation_type
+        if creation_type in CREATION_TYPES or creation_type in CONNECTION_TYPES
+        else "proposal"
+    )
     if slug:
         if not slug.startswith(f"{prefix}:"):
             slug = f"{prefix}:{slug}"
@@ -515,12 +536,121 @@ def _conversation_evidence(history: Any, user_message: str) -> str:
     return "\n".join(rendered)[:6000]
 
 
+def _fetch_connection_inventory() -> dict[str, Any]:
+    """Fetch the REAL connection state from local-server via the two read-only
+    tools (需求 2.2：可推荐范围来自实际清单，不由模型猜测)。
+
+    Any failure degrades to ``fetched=False`` — connection recommendations are
+    then disabled for the round instead of blocking or guessing.  Runs inside
+    the evaluation checkpoint only (first turn + every third turn), and the
+    result is cached per session for CONNECTION_INVENTORY_TTL_SECONDS.
+    """
+    inventory: dict[str, Any] = {
+        "fetched": False,
+        "channels_connected": [],
+        "channels_recommendable": [],
+        "connectors_connected": [],
+        "connectors_recommendable": [],
+    }
+    try:
+        from tools.list_my_channels_tool import (
+            _check_list_my_channels,
+            list_my_channels_tool,
+        )
+
+        if _check_list_my_channels():
+            parsed = json.loads(list_my_channels_tool({}))
+            channels = parsed.get("installed_channels")
+            if isinstance(channels, list):
+                connected = set()
+                for item in channels:
+                    if not isinstance(item, dict):
+                        continue
+                    kind = _text(
+                        item.get("kind") or item.get("channel_kind") or item.get("platform"),
+                        40,
+                    ).lower()
+                    if kind:
+                        connected.add(kind)
+                inventory["channels_connected"] = sorted(connected)
+                inventory["channels_recommendable"] = sorted(
+                    RECOMMENDABLE_CHANNEL_KINDS - connected
+                )
+                inventory["fetched"] = True
+    except Exception:
+        logger.debug("connection inventory: channel fetch failed", exc_info=True)
+    try:
+        from tools.list_my_connectors_tool import (
+            _check_list_my_connectors,
+            list_my_connectors_tool,
+        )
+
+        if _check_list_my_connectors():
+            parsed = json.loads(list_my_connectors_tool({}))
+            connectors = parsed.get("connectors")
+            if isinstance(connectors, list):
+                connected: list[str] = []
+                recommendable: list[str] = []
+                for item in connectors:
+                    if not isinstance(item, dict):
+                        continue
+                    provider = _text(item.get("provider"), 80).lower()
+                    state = _text(item.get("state"), 40).lower()
+                    if not provider:
+                        continue
+                    if state in CONNECTOR_RECOMMENDABLE_STATES:
+                        recommendable.append(provider)
+                    else:
+                        connected.append(provider)
+                inventory["connectors_connected"] = sorted(set(connected))
+                inventory["connectors_recommendable"] = sorted(set(recommendable))
+                inventory["fetched"] = True
+    except Exception:
+        logger.debug("connection inventory: connector fetch failed", exc_info=True)
+    return inventory
+
+
+def _connection_inventory(session_id: str, now: float) -> dict[str, Any]:
+    with _state_lock:
+        state = _state_locked(session_id, now)
+        cached = state.get("connection_inventory")
+        if (
+            isinstance(cached, dict)
+            and now - float(cached.get("_at") or float("-inf")) < CONNECTION_INVENTORY_TTL_SECONDS
+        ):
+            return cached
+    inventory = _fetch_connection_inventory()
+    inventory["_at"] = now
+    with _state_lock:
+        _state_locked(session_id, now)["connection_inventory"] = inventory
+    return inventory
+
+
+def _connection_inventory_context(inventory: dict[str, Any]) -> str:
+    if not inventory.get("fetched"):
+        return (
+            "[connection-inventory] unavailable — channel and connector "
+            "decisions are forbidden this round."
+        )
+    return (
+        "[connection-inventory] "
+        f"channels connected: {', '.join(inventory['channels_connected']) or '(none)'}; "
+        f"channels recommendable: {', '.join(inventory['channels_recommendable']) or '(none)'}; "
+        f"connectors connected: {', '.join(inventory['connectors_connected']) or '(none)'}; "
+        f"connectors recommendable: {', '.join(inventory['connectors_recommendable']) or '(none)'}"
+    )
+
+
 _DETECTOR_SCHEMA = {
     "type": "object",
     "properties": {
-        "decision": {"type": "string", "enum": ["agent", "skill", "task", "none"]},
+        "decision": {
+            "type": "string",
+            "enum": ["agent", "skill", "task", "channel", "connector", "none"],
+        },
         "suggested_name": {"type": "string"},
         "reason": {"type": "string"},
+        "target": {"type": "string"},
         "evidence_turn_ids": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "dedup_key": {"type": "string"},
@@ -541,7 +671,7 @@ _DETECTOR_SCHEMA = {
 
 _DETECTOR_INSTRUCTIONS = """Perform one high-recall zero-shot product judgment.
 
-Return exactly one of agent, skill, task, or none. Do not classify by topic words and do not use
+Return exactly one of agent, skill, task, channel, connector, or none. Do not classify by topic words and do not use
 memorized examples. A single substantive request is enough when a reasonable user would benefit
 from reusing the capability. Do not require the user to mention repetition, frequency, saving, or
 creation. Ask whether a durable capability would materially reduce friction or improve judgment
@@ -559,6 +689,20 @@ Definitions and conflict order:
 4. none: small talk, a trivial transformation, a low-value closed-world fact lookup, an explicit
    request to create/configure/schedule something through Hermes' native flow, or no reasonable
    reuse value.
+5. channel: the durable value of this need depends on reminders, results, or notifications
+   reaching the user inside an IM app, and a `[connection-inventory]` line in the evidence lists
+   that channel kind under "channels recommendable". Set target to that exact channel kind.
+6. connector: completing this class of request materially needs the user's own external data
+   (mail, notes, code, calendar, ...) and the inventory lists that provider under "connectors
+   recommendable". Set target to that exact provider id.
+
+Grounding rule for channel/connector: these two decisions are FORBIDDEN unless the evidence
+contains a `[connection-inventory]` line that explicitly lists the target as recommendable.
+Never invent, guess, or generalize a channel kind or provider that is not in the inventory;
+already-connected entries must never be recommended again. When both a creation decision
+(agent/skill/task) and a connection decision seem plausible, prefer the one the user most
+needs next; never return multiple objects. channel/connector recommendations are delivered
+as a card by the client — proposal_text should be one sentence asking whether to connect.
 
 High-recall boundary: a substantive request to inspect, compare, diagnose, research, optimize, or
 make a judgment about an ongoing external work domain should normally be agent rather than none,
@@ -587,18 +731,26 @@ none。先判断需求所涉及的账户、项目、业务环境或信息是否�
 选择 task。如果输入会变化但处理方法相对稳定，选择 skill。只有寒暄、低价值封闭事实、微小的一次性
 转换、用户已经明确要求创建，或 Agent/Skill/Task 三种长期价值都确实不存在时，才选择 none。
 “今天”“最近”“当前”只是本次数据范围，不等于没有长期价值。缺少授权、连接器或数据只影响本次
-执行，不能作为返回 none 的理由。名称、原因和询问是否创建的 proposal_text 使用用户的语言。"""
+执行，不能作为返回 none 的理由。名称、原因和询问是否创建的 proposal_text 使用用户的语言。
+
+channel 与 connector 的中文规则相同：只有当证据里存在 [connection-inventory] 行、且目标
+明确出现在 recommendable 列表中时才允许返回这两类；已连接的渠道或数据源绝不重复推荐；
+target 必须逐字取自清单，禁止猜测或泛化。channel 用于"提醒/结果需要直达用户的 IM"，
+connector 用于"这类任务实质上需要用户自己的外部数据"。"""
 
 
 def _run_forced_evaluation(
     *,
     user_message: str,
     conversation_history: Any,
+    connection_context: str = "",
 ) -> dict[str, Any] | None:
     llm = _plugin_llm
     if llm is None:
         return None
     evidence = _conversation_evidence(conversation_history, user_message)
+    if connection_context:
+        evidence = f"{evidence}\n{connection_context}"
 
     # Prefer an ordinary bounded JSON completion.  Some OpenAI-compatible
     # gateways accept ``response_format`` but collapse optional semantic
@@ -701,7 +853,7 @@ def _normalize_candidate(
     )
     if decision == "none":
         return None, "none"
-    if decision not in CREATION_TYPES:
+    if decision not in CREATION_TYPES and decision not in CONNECTION_TYPES:
         return None, "unsupported_creation_type"
 
     suggested_name = _text(args.get("suggested_name"), 80)
@@ -716,13 +868,31 @@ def _normalize_candidate(
     if not suggested_name or not reason or not proposal_text:
         return None, "missing_candidate_fields"
 
+    target = ""
+    if decision in CONNECTION_TYPES:
+        # 事后过滤是硬闸（prompt 只是引导）：target 必须逐字命中真实库存的
+        # recommendable 集合；库存缺失/为空 → 该轮禁止连接类推荐。
+        inventory = state.get("connection_inventory") or {}
+        target = _text(args.get("target"), 80).lower()
+        pool_key = (
+            "channels_recommendable" if decision == "channel" else "connectors_recommendable"
+        )
+        pool = inventory.get(pool_key) if inventory.get("fetched") else None
+        if not target or not isinstance(pool, list) or target not in pool:
+            return None, "connection_target_unavailable"
+
     evidence_turn_ids = args.get("evidence_turn_ids")
     if not isinstance(evidence_turn_ids, list):
         evidence_turn_ids = []
     evidence_turn_ids = [
         _text(value, 80) for value in evidence_turn_ids[:8] if _text(value, 80)
     ]
-    dedup_key = _semantic_dedup_key(args.get("dedup_key"), decision, suggested_name)
+    if decision in CONNECTION_TYPES:
+        # 连接类账本键与模型给的 dedup_key 解耦：同一渠道/数据源 30 天拒绝
+        # 闩锁必须稳定命中，不能被下次评估换个说法绕开。
+        dedup_key = _semantic_dedup_key(target, decision, suggested_name)
+    else:
+        dedup_key = _semantic_dedup_key(args.get("dedup_key"), decision, suggested_name)
     return {
         "creation_type": decision,
         "suggested_name": suggested_name,
@@ -731,6 +901,7 @@ def _normalize_candidate(
         "confidence": confidence,
         "dedup_key": dedup_key,
         "proposal_text": proposal_text,
+        **({"target": target} if target else {}),
         "current_request": _text(state.get("last_user_message"), 1000),
         "source_turn_id": _text(state.get("last_turn_id"), 160),
     }, "candidate"
@@ -1000,9 +1171,11 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     if evaluation_due:
         with _state_lock:
             _state_locked(session_id, now)["last_evaluation_turn"] = turn
+        inventory = _connection_inventory(session_id, now)
         candidate = _run_forced_evaluation(
             user_message=user_message,
             conversation_history=kwargs.get("conversation_history"),
+            connection_context=_connection_inventory_context(inventory),
         )
         if candidate is not None:
             candidate_result = _consider_candidate(session_id, candidate, now)
@@ -1083,6 +1256,85 @@ def _action_result_envelope(result: dict[str, Any]) -> str:
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     return f"<!--creation-recommendation-action-result {encoded}-->"
+
+
+def _emit_connection_attachment(session_key: str, proposal: dict[str, Any]) -> bool:
+    """Deliver a channel/connector proposal as a structured chat attachment.
+
+    需求 6.2：wire 只带语义（kind/payload/action id），文案由客户端 i18n 决定。
+    发射失败（无活跃流 / 老客户端链路）静默降级——连接推荐是锦上添花，绝不
+    进入正文文本通道。
+    """
+    ctx = _plugin_ctx
+    if ctx is None or not hasattr(ctx, "emit_attachment"):
+        return False
+    creation_type = proposal.get("creation_type")
+    target = _text(proposal.get("target"), 80).lower()
+    proposal_id = _text(proposal.get("proposal_id"), 80)
+    if creation_type not in CONNECTION_TYPES or not target or not proposal_id:
+        return False
+    attachment_id = f"cg-{proposal_id}"
+    if creation_type == "channel":
+        kind = "channel.connect"
+        payload: dict[str, Any] = {"channel_kind": target}
+    else:
+        kind = "connector.connect"
+        # 推荐永远是非阻塞的（需求 5.1）；强依赖场景的 blocking 卡由执行路径
+        # 自己发，不走推荐通道。
+        payload = {"provider": target, "blocking": False}
+    expires_at = proposal.get("expires_at")
+    attachment = {
+        "id": attachment_id,
+        "kind": kind,
+        "v": 1,
+        "state": "active",
+        "payload": payload,
+        "actions": [{"id": "dismiss"}, {"id": "connect", "style": "primary"}],
+        "dedup_key": proposal.get("dedup_key") or "",
+        **(
+            {"expires_at": int(float(expires_at) * 1000)}
+            if isinstance(expires_at, (int, float)) and expires_at > 0
+            else {}
+        ),
+    }
+    try:
+        emitted = bool(ctx.emit_attachment(attachment))
+    except Exception:
+        logger.warning("connection recommendation emit failed", exc_info=True)
+        return False
+    if emitted:
+        with _state_lock:
+            _emitted_connection_proposals[attachment_id] = (
+                session_key,
+                str(proposal.get("dedup_key") or ""),
+            )
+            while len(_emitted_connection_proposals) > MAX_EMITTED_CONNECTION_PROPOSALS:
+                _emitted_connection_proposals.popitem(last=False)
+    return emitted
+
+
+def _on_attachment_action(**kwargs: Any) -> None:
+    """attachment_action hook：连接推荐卡的回执入账本。
+
+    dismiss → 30 天拒绝闩锁（同 dedup_key 不再推荐）；connect → 不闩锁——
+    授权完成后库存自然把该目标移出 recommendable，未完成则冷却窗口后允许
+    再推。回执与发射同进程（per-agent gateway），映射表按 attachment_id 定位。
+    """
+    attachment_id = _text(kwargs.get("attachment_id"), 160)
+    action_id = _text(kwargs.get("action_id"), 40).lower()
+    if not attachment_id or action_id != "dismiss":
+        return None
+    with _state_lock:
+        entry = _emitted_connection_proposals.get(attachment_id)
+    if not entry:
+        return None
+    session_key, dedup_key = entry
+    if dedup_key:
+        _latch_dismissal(session_key, dedup_key, time.monotonic())
+        logger.info(
+            "connection recommendation dismissed; latched dedup_key=%s", dedup_key
+        )
+    return None
 
 
 def _transform_llm_output(**kwargs: Any) -> str | None:
@@ -1183,6 +1435,18 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     if _is_session_muted(session_id):
         return sanitized_response if (result_suffix or stripped_forged_action_result) else None
+    if proposal.get("creation_type") in CONNECTION_TYPES:
+        # 连接推荐走结构化 attachment 通道（channel.connect / connector.connect
+        # 卡），不追加文本信封；发射失败（无活跃流）静默降级，正文原样返回。
+        emitted = _emit_connection_attachment(session_id, proposal)
+        logger.info(
+            "connection recommendation %s type=%s target=%s turn=%s",
+            "emitted" if emitted else "skipped (no active stream)",
+            proposal.get("creation_type"),
+            _text(proposal.get("target"), 80),
+            current_turn,
+        )
+        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     logger.info(
         "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
         proposal.get("creation_type"),
@@ -1209,19 +1473,22 @@ def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
 
 
 def _reset_state_for_tests() -> None:
-    global _plugin_llm
+    global _plugin_llm, _plugin_ctx
     with _state_lock:
         _recent_proposals.clear()
         _dismissed_proposals.clear()
         _session_states.clear()
         _muted_sessions.clear()
         _known_unmuted_sessions.clear()
+        _emitted_connection_proposals.clear()
     _plugin_llm = None
+    _plugin_ctx = None
     _invocation_scope.set(None)
 
 
 def register(ctx: Any) -> None:
-    global _plugin_llm
+    global _plugin_llm, _plugin_ctx
+    _plugin_ctx = ctx
     try:
         _plugin_llm = ctx.llm
     except Exception:
@@ -1238,6 +1505,9 @@ def register(ctx: Any) -> None:
     )
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
+    # 连接推荐卡（channel.connect / connector.connect）的按钮回执：dismiss
+    # 落 30 天拒绝闩锁。hook 由 zet_agent 的 attachment/action 入站派发。
+    ctx.register_hook("attachment_action", _on_attachment_action)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset="creation_governor",
