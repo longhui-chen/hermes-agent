@@ -2343,3 +2343,101 @@ def test_padded_agent_output_alias_is_not_resolved(monkeypatch, tmp_path):
         turn_id="turn_2",
     )
     assert rec.requests[0]["body"]["paths"] == [str(output)]
+
+
+def test_quoted_ampersand_is_not_backgrounding(monkeypatch, tmp_path):
+    """引号里的字面 `&` 不是后台操作符（Codex review P1）。
+
+    原先 `_shell_self_backgrounds` 先用裸正则扫原始字符串，`printf 'R&D' > f`、
+    带 query string 的 URL 都会被误判成自后台化 → 跳过 ensure → 用户静默失去本该
+    有的写入前恢复点。
+    """
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "notes.txt").write_text("x")
+
+    for cmd in (
+        "printf 'R&D' > notes.txt",
+        'curl "http://x/?a=1&b=2" -o out.bin',
+        "grep 'Tom & Jerry' in.txt > out.txt",
+    ):
+        guard.reset_for_test()
+        rec = _install(monkeypatch, {"ready": True, "operations": []})
+        out = guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        )
+        assert out is None, f"{cmd} 被误判成后台化，跳过了 ensure"
+        assert rec.requests, f"{cmd} 没有走 ensure，恢复点静默丢失"
+
+
+def test_real_backgrounding_operators_still_detected(monkeypatch, tmp_path):
+    """真正的后台操作符照常识别——修误判不能把漏判换进来。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+
+    for cmd in (
+        "rm -rf data &",
+        "cp a b & cp c d",
+        "echo A&B > f",          # 未加引号：bash 里确实是「A 后台 + B」
+        "nohup sh -c 'rm -f x'",
+        "setsid rm -f x",
+    ):
+        guard.reset_for_test()
+        rec = _install(monkeypatch)
+        out = guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        )
+        assert out is not None, f"{cmd} 是真后台化，不该走 ensure"
+
+
+def test_non_backgrounding_ampersand_forms_still_ensure(monkeypatch, tmp_path):
+    """`&&` / `2>&1` / `&>` 不是后台化。"""
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+
+    for cmd in ("rm -f x && rm -f y", "rm -f x 2>&1", "rm -f x &> log"):
+        guard.reset_for_test()
+        rec = _install(monkeypatch, {"ready": True, "operations": []})
+        assert guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        ) is None, cmd
+        assert rec.requests, cmd
+
+
+def test_loopback_ssh_backend_is_not_remote(monkeypatch, tmp_path):
+    """ssh 到本机时写入仍落在本机受保护目录，不能按 remote_backend 放行。
+
+    原先只看 `TERMINAL_ENV=ssh` 就放行且不做还原互斥探测，用户正在还原时 Agent
+    仍会通过 ssh 写进 rename 窗口（Codex review P1）。
+    """
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+
+    for host in ("localhost", "127.0.0.1", "::1"):
+        guard.reset_for_test()
+        monkeypatch.setattr(guard, "_terminal_env_type", lambda: "ssh")
+        monkeypatch.setenv("TERMINAL_SSH_HOST", host)
+        rec = _install(monkeypatch, {"ready": True, "operations": []})
+        out = guard.maybe_require_snapshot(
+            "write_file", {"path": str(target)}, turn_id="turn_1")
+        assert out is None, f"ssh 到 {host} 的写入落在本机，ensure 该成功"
+        assert rec.requests, f"ssh 到 {host} 被当成远端，跳过了 ensure"
+
+
+def test_real_remote_ssh_backend_still_skips_ensure(monkeypatch, tmp_path):
+    """真正的远端主机照常按 remote_backend 放行——本机快照护不住远端文件。"""
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    monkeypatch.setattr(guard, "_terminal_env_type", lambda: "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "192.168.1.50")
+    rec = _install(monkeypatch)
+
+    out = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="turn_1")
+    assert out is not None, "真正的远端主机上，本机快照护不住那些文件"
+    assert rec.requests == [], "远端写入不该向本机 ensure"
