@@ -10,6 +10,7 @@ log line anywhere — the model then told users the capability did not exist.
 from __future__ import annotations
 
 import logging
+import time
 
 import pytest
 import requests
@@ -159,6 +160,71 @@ def test_probe_timeout_is_env_overridable(client, monkeypatch):
     monkeypatch.setenv("ZETTLAB_MEDIA_CAPABILITY_TIMEOUT", "12.5")
     client.get_capabilities("image")
     assert seen["timeout"] == 12.5
+
+
+def test_cache_is_bounded(client, monkeypatch):
+    """Keys embed the profile-scoped base URL, so the key space is not fixed.
+
+    An unbounded resident cache of 256KB documents is exactly what the 2GB
+    device budget forbids.
+    """
+    urls = iter([f"http://127.0.0.1:{19090 + i}/api/v1/ai-proxy/v1" for i in range(50)])
+    monkeypatch.setattr(client, "base_url", lambda media_type: next(urls))
+    monkeypatch.setattr(client._CAPABILITY_SESSION, "get", lambda *a, **k: _Resp(CAPABILITIES))
+
+    for _ in range(50):
+        client.get_capabilities("image")
+
+    assert len(client._capability_cache) <= client.MAX_CAPABILITY_CACHE_ENTRIES
+
+
+def test_slow_dribbling_body_hits_the_wall_clock_deadline(client, monkeypatch):
+    """`requests` only bounds socket idle time, not total elapsed time.
+
+    A peer that keeps sending one byte resets that timer forever. Without an
+    explicit budget this stalls agent construction, which is worse for the user
+    than the missing-tool symptom this PR set out to fix.
+    """
+
+    class _Dribbling:
+        def read(self, _n, decode_content=False):
+            time.sleep(0.02)
+            return b"x"
+
+    def _stream_resp():
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.raw = _Dribbling()
+        return resp
+
+    monkeypatch.setattr(client, "_capability_timeout", lambda: 0.2)
+    monkeypatch.setattr(client._CAPABILITY_SESSION, "get", lambda *a, **k: _stream_resp())
+
+    started = time.monotonic()
+    with pytest.raises(client.ZettlabMediaDeadlineError):
+        client.get_capabilities("image")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5.0, "read must abort on the wall-clock budget, not run on"
+
+
+def test_oversized_body_is_still_rejected(client, monkeypatch):
+    """The chunked reader must keep the original size cap."""
+
+    class _Flood:
+        def read(self, n, decode_content=False):
+            return b"x" * n
+
+    def _stream_resp():
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.raw = _Flood()
+        return resp
+
+    monkeypatch.setattr(client._CAPABILITY_SESSION, "get", lambda *a, **k: _stream_resp())
+
+    with pytest.raises(client.ZettlabMediaError):
+        client.get_capabilities("image")
 
 
 def test_probe_failure_is_logged(client, monkeypatch, caplog):

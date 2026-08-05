@@ -48,6 +48,13 @@ _STARTER_CAPACITY = threading.BoundedSemaphore(value=MAX_MEDIA_HTTP_WORKERS)
 # tool-definition pass (twice: image + video), so without a cache each turn pays
 # a fresh round-trip for a value that only changes when the cloud catalog does.
 CAPABILITY_CACHE_TTL = 60.0
+# Hard cap on cached capability documents. Keys are (base URL, media type) and
+# the base URL is profile-scoped, so a long-lived multiplexed gateway could
+# otherwise accumulate one 256KB document per profile/config permutation and
+# never release them — an unbounded resident cache under a 2GB device budget.
+MAX_CAPABILITY_CACHE_ENTRIES = 8
+# Chunk size for the deadline-checked capability body read.
+_CAPABILITY_READ_CHUNK_BYTES = 32 * 1024
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 _IMAGE_READ_CHUNK_BYTES = 48 * 1024
 _MAX_LOCAL_IMAGE_PATH_CHARS = 4096
@@ -919,15 +926,17 @@ def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
         if cached is not None and now - cached[0] < CAPABILITY_CACHE_TTL:
             return copy.deepcopy(cached[1])
 
+    timeout = _capability_timeout()
+    deadline = time.monotonic() + timeout
     resp = _CAPABILITY_SESSION.get(
         url,
-        timeout=_capability_timeout(),
+        timeout=timeout,
         allow_redirects=False,
         stream=True,
     )
     try:
         _raise_for_status(resp)
-        data = _bounded_response_json(resp, MAX_CAPABILITY_RESPONSE_BYTES)
+        data = _bounded_capability_json(resp, MAX_CAPABILITY_RESPONSE_BYTES, deadline)
     finally:
         _close_response(resp)
     if not isinstance(data, dict):
@@ -938,7 +947,22 @@ def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
         # tool hidden for the full TTL after a single blip — the exact failure
         # mode this change exists to remove.
         _capability_cache[cache_key] = (time.monotonic(), data)
+        _evict_capability_cache_locked()
     return copy.deepcopy(data)
+
+
+def _evict_capability_cache_locked() -> None:
+    """Drop expired entries, then the oldest ones over the cap."""
+    now = time.monotonic()
+    for key in [k for k, (ts, _) in _capability_cache.items()
+                if now - ts >= CAPABILITY_CACHE_TTL]:
+        _capability_cache.pop(key, None)
+    excess = len(_capability_cache) - MAX_CAPABILITY_CACHE_ENTRIES
+    if excess <= 0:
+        return
+    oldest = sorted(_capability_cache.items(), key=lambda item: item[1][0])
+    for key, _ in oldest[:excess]:
+        _capability_cache.pop(key, None)
 
 
 def invalidate_capability_cache() -> None:
@@ -977,6 +1001,50 @@ def _bounded_response_json(resp: requests.Response, limit: int) -> Any:
         return json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ZettlabMediaError("media generation response is not valid JSON") from exc
+
+
+def _bounded_capability_json(resp: Any, limit: int, deadline: float) -> Any:
+    """Bounded JSON read under a wall-clock budget.
+
+    ``requests`` enforces a socket-idle timeout, not a total deadline: a peer
+    that dribbles bytes keeps resetting that timer and can stall a single
+    ``read()`` indefinitely. The media worker pool exists to make such a stall
+    killable, but this path deliberately stays in-process, so enforce the bound
+    here instead — read in chunks and re-check the clock between them.
+
+    Worst case overshoot is one socket timeout (the chunk in flight when the
+    deadline passes), which is bounded, unlike the underlying read.
+    """
+    if not isinstance(resp, requests.Response):
+        try:
+            return resp.json()
+        except (ValueError, UnicodeError) as exc:
+            raise ZettlabMediaError("media capability response is not valid JSON") from exc
+    raw = getattr(resp, "raw", None)
+    if raw is None or not hasattr(raw, "read"):
+        raise ZettlabMediaError("media capability response body is unavailable")
+
+    chunks: List[bytes] = []
+    total = 0
+    while total <= limit:
+        if time.monotonic() >= deadline:
+            raise ZettlabMediaDeadlineError("media capability read deadline exceeded")
+        want = min(_CAPABILITY_READ_CHUNK_BYTES, limit + 1 - total)
+        try:
+            chunk = raw.read(want, decode_content=True)
+        except TypeError:
+            chunk = raw.read(want)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+
+    if total > limit:
+        raise ZettlabMediaError("media capability response exceeds maximum size")
+    try:
+        return json.loads(b"".join(chunks))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ZettlabMediaError("media capability response is not valid JSON") from exc
 
 
 def _close_response(resp: Any) -> None:
