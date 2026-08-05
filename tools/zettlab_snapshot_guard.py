@@ -1592,7 +1592,7 @@ def maybe_require_snapshot(
         # 后台破坏性命令会跑到 turn 结束、pin 释放之后，恢复点可能在写入完成前
         # 就被清理；保护窗口对不上（Codex review P1）。#18 起放行，但**放行前仍
         # 要过还原互斥**——见 _restore_probe_blocks。
-        blocked = _restore_probe_blocks(paths, tool_name, started)
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
         if blocked is not None:
             return blocked
         return _unprotected("background_write", tool=tool_name, started=started)
@@ -1600,7 +1600,7 @@ def maybe_require_snapshot(
         # shell 自行后台化（结尾 `&`、nohup / setsid 包裹）与 background=true
         # 同罪：finish 解 pin 时子进程可能仍在写（Codex review P1）。只对非只
         # 读命令生效——只读命令在 _paths_for 就被放行了。#18 起放行。
-        blocked = _restore_probe_blocks(paths, tool_name, started)
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
         if blocked is not None:
             return blocked
         return _unprotected("background_write", tool=tool_name, started=started)
@@ -1619,7 +1619,7 @@ def maybe_require_snapshot(
         if ancillary_only:
             return None  # 加餐保护做不了幂等就不做，不阻断
         # 这两条同样绕开了 ensure，放行前补还原互斥探测（见 _restore_probe_blocks）。
-        blocked = _restore_probe_blocks(paths, tool_name, started)
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
         if blocked is not None:
             return blocked
         if ambiguous_turn:
@@ -1756,8 +1756,40 @@ def _is_blocked_by_restore(data: Optional[dict], err: str = "") -> bool:
     )
 
 
+def _ancillary_targets(
+    tool_name: str,
+    arguments: dict[str, Any],
+    exclude: list[str],
+    task: str,
+) -> list[str]:
+    """命令 / 脚本文本里 cwd 之外的**已存在**写入目标。
+
+    ensure 与还原互斥探测共用这一套提取：两侧各自推导必然漂移，而漏掉的那一侧
+    就是 Agent 写进正在还原的目录（Codex review P1）。只对 terminal /
+    execute_code 有意义——文件工具的目标已经全在 paths 里。
+
+    结果受 `_MAX_ANCILLARY_PATHS` 界住（HR1）。
+    """
+    if tool_name not in ("terminal", "execute_code"):
+        return []
+    text = str(arguments.get("command") or arguments.get("code") or "")
+    readonly_sources = (
+        _managed_readonly_python_sources(text) if tool_name == "terminal" else set()
+    )
+    return _ancillary_abs_paths(
+        text,
+        exclude,
+        base_dir=_terminal_workdir(arguments, task),
+        readonly_sources=readonly_sources,
+    )
+
+
 def _restore_probe_blocks(
-    paths: list[str], tool_name: str, started: float
+    paths: list[str],
+    tool_name: str,
+    arguments: dict[str, Any],
+    task: str,
+    started: float,
 ) -> Optional[str]:
     """给**不走 ensure 的放行分支**补上还原互斥检查。
 
@@ -1777,10 +1809,19 @@ def _restore_probe_blocks(
     这三种下服务端本来就管不了这批写入，为它们 fail-closed 会把整批后台命令挂死
     在一个环境问题上。与 LS 侧「查不出来就当有还原」的取舍不同——那边是已经确定
     要查某个 target、只是查询失败；这边是连服务端都联系不上。
+
+    ⚠️ 探测范围**必须与实际写入范围一致**：`paths` 对 terminal 只有主 workdir，
+    而 `rm -rf /home/user/Documents/a &` 真正写的是命令文本里那个绝对路径。只查主
+    workdir 会 clear 后放行，Agent 照样写进正在还原的目录（Codex review P1）。所以
+    这里合并 `_ancillary_targets`——与 `_ensure_ancillary` 同一套提取。
     """
-    if not paths:
+    targets = list(paths)
+    for extra in _ancillary_targets(tool_name, arguments, list(paths), task):
+        if extra not in targets:
+            targets.append(extra)
+    if not targets:
         return None
-    data, err = _post(_PROBE_PATH, {"paths": paths}, _PROBE_TIMEOUT)
+    data, err = _post(_PROBE_PATH, {"paths": targets}, _PROBE_TIMEOUT)
     if _is_blocked_by_restore(data, err):
         return _restore_conflict_error(tool_name, started)
     return None
@@ -1840,16 +1881,7 @@ def _ensure_ancillary(
     是常态。范围外路径两种模式下都只跳过——脚本引用 /etc 一类范围外文件多是只读。
     成功后标记本轮 ensured，finish 才会释放这些 operation 的 pin。
     """
-    text = str(arguments.get("command") or arguments.get("code") or "")
-    readonly_sources = (
-        _managed_readonly_python_sources(text) if tool_name == "terminal" else set()
-    )
-    extras = _ancillary_abs_paths(
-        text,
-        exclude,
-        base_dir=_terminal_workdir(arguments, task),
-        readonly_sources=readonly_sources,
-    )
+    extras = _ancillary_targets(tool_name, arguments, exclude, task)
     if not extras:
         return None
     data, err = _post(

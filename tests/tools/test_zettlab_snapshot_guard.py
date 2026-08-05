@@ -2627,3 +2627,60 @@ def test_remote_backend_does_not_probe(monkeypatch, tmp_path):
         "write_file", {"path": str(target)}, turn_id="turn_1")
     assert_allowed_unprotected(out, rec, "remote_backend")
     assert rec.requests == [], "远端写入不该为本机 target 发探测"
+
+
+def test_background_command_probes_ancillary_targets(monkeypatch, tmp_path):
+    """探测范围必须覆盖命令文本里 cwd 之外的绝对目标（Codex review P1）。
+
+    `paths` 对 terminal 只有主 workdir。只拿它去探测，
+    `rm -rf /home/user/Documents/a &` 会 clear 后放行——而真正被写的是命令文本里
+    那个绝对路径，它正在被还原。探测范围与实际写入范围必须一致。
+    """
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    doc = outside / "a.txt"
+    doc.write_text("x")
+    rec = _install(monkeypatch, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -rf {doc} &", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "命令文本里的绝对目标正在还原，必须阻断"
+    assert "restore" in json.loads(blocked)["error"].lower()
+    probed = rec.requests[0]["body"]["paths"]
+    assert str(doc) in probed, f"探测漏了命令文本里的绝对目标：{probed}"
+    assert str(cwd) in probed, f"探测漏了主 workdir：{probed}"
+
+
+def test_missing_turn_id_probe_covers_ancillary_targets(monkeypatch, tmp_path):
+    """拿不到 turn 标识时同理——探测仍要覆盖命令文本里的绝对目标。"""
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    doc = outside / "a.txt"
+    doc.write_text("x")
+    rec = _install(monkeypatch, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {doc}", "workdir": str(cwd)},
+        turn_id="", task_id="")
+
+    assert blocked is not None
+    assert str(doc) in rec.requests[0]["body"]["paths"]
+
+
+def test_probe_does_not_expand_ancillary_for_file_tools(monkeypatch, tmp_path):
+    """文件工具的目标已经全在 paths 里，不该跑命令文本提取。"""
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    rec = _install(monkeypatch, {"clear": True})
+
+    out = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="", task_id="")
+    assert_allowed_unprotected(out, rec, "missing_turn_id")
+    assert rec.requests[0]["body"]["paths"] == [str(target)]
