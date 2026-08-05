@@ -1657,18 +1657,7 @@ def maybe_require_snapshot(
         # 在这里看到 403。分开记，好在灰度期区分「入口是老的」和「入口挂了」。
         if _is_blocked_by_restore(data, err):
             # #18 唯一保留的阻断，见 _is_blocked_by_restore 的注释。
-            elapsed_ms = int((time.monotonic() - started) * 1000) if started else -1
-            logger.warning(
-                "zettlab snapshot guard blocked a write: outcome=blocked_by_restore "
-                "tool=%s duration_ms=%d",
-                tool_name or "unknown",
-                elapsed_ms,
-            )
-            return json.dumps({"error": (
-                "A restore is running on this folder right now; writing to it would "
-                "corrupt the restore and can lose the user's data. The file was NOT "
-                "modified. Wait for the restore to finish and try again."
-            )}, ensure_ascii=False)
+            return _restore_conflict_error(tool_name, started)
         reason = (
             "outside_scope"
             if _is_out_of_scope(data, err)
@@ -1750,6 +1739,27 @@ def _is_blocked_by_restore(data: Optional[dict], err: str = "") -> bool:
     )
 
 
+def _restore_conflict_error(tool_name: str, started: float) -> str:
+    """#18 唯一保留的阻断的统一出口：记 WARN 并返回给模型的错误串。
+
+    抽成函数是为了让主 ensure 与 ancillary ensure 走**同一条**出口——两侧各自
+    处理必然漂移，而漏判的那一侧会让 Agent 在还原换目录的窗口里写文件，正是这道
+    豁免要防的那件事（Codex review P1）。
+    """
+    elapsed_ms = int((time.monotonic() - started) * 1000) if started else -1
+    logger.warning(
+        "zettlab snapshot guard blocked a write: outcome=blocked_by_restore "
+        "tool=%s duration_ms=%d",
+        tool_name or "unknown",
+        elapsed_ms,
+    )
+    return json.dumps({"error": (
+        "A restore is running on this folder right now; writing to it would "
+        "corrupt the restore and can lose the user's data. The file was NOT "
+        "modified. Wait for the restore to finish and try again."
+    )}, ensure_ascii=False)
+
+
 def _is_out_of_scope(data: Optional[dict], err: str = "") -> bool:
     """报告一次 ensure 失败是否为范围外路径。
 
@@ -1805,6 +1815,13 @@ def _ensure_ancillary(
         with _lock:
             _state_for_locked(turn).ensured = True
         return None
+    # 还原互斥先于一切降级判定：这批加餐路径里只要有一个正在被还原，整条命令就
+    # 不能跑——它写进去会让还原的 rename 撞非空目标而失败、回滚也失败，用户原始
+    # 数据滞留在 .bak。归成 snapshot_failed 放行等于服务端拒了客户端照写，这道
+    # 豁免完全没生效（Codex review P1）。与 required 无关：required 在 #18 之后
+    # 只决定日志级别，而这里决定的是用户数据的死活。
+    if _is_blocked_by_restore(data, err):
+        return _restore_conflict_error(tool_name, started)
     if err in ("unconfigured", "not_supported"):
         return None  # 不是设备环境 / 老 local-server：本机制不适用
     if not required:
@@ -1828,6 +1845,13 @@ def _ensure_ancillary(
                 continue
             if e2 in ("unconfigured", "not_supported") or _is_out_of_scope(d2, e2):
                 continue
+            if _is_blocked_by_restore(d2, e2):
+                # 逐路径重试同样要阻断（同上）。已经拍成的那些先标 ensured，
+                # 否则 finish 收不到它们、pin 只能等 TTL 过期。
+                if ensured_any:
+                    with _lock:
+                        _state_for_locked(turn).ensured = True
+                return _restore_conflict_error(tool_name, started)
             # 逐路径重试里的失败：记一笔继续跑完剩下的路径。#18 之前这里 return
             # 阻断，顺带把**后面还没试的路径**一并跳过；现在既然不阻断，就没有
             # 理由半途而废——每条路径都值得尝试建恢复点。

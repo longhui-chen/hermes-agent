@@ -2393,3 +2393,96 @@ def test_turn_finished_409_still_degrades(monkeypatch, tmp_path):
     out = guard.maybe_require_snapshot(
         "write_file", {"path": str(target)}, turn_id="turn_1")
     assert_allowed_unprotected(out, rec, "broker_unavailable")
+
+
+def _restore_conflict_error():
+    """服务端在还原进行中返回的 409——#18 唯一保留的阻断的线上形态。"""
+    body = json.dumps({
+        "error": {"code": "SNAPSHOT_AGENT_BLOCKED_BY_RESTORE",
+                  "message": "target has a running restore task"},
+    }).encode("utf-8")
+    return urllib.error.HTTPError(
+        "http://127.0.0.1:19090/api/v1/internal/snapshot/agent-protection/ensure",
+        409, "Conflict", None, io.BytesIO(body),
+    )
+
+
+def test_ancillary_restore_conflict_blocks_the_command(monkeypatch, tmp_path):
+    """加餐路径撞还原冲突同样要阻断（Codex review P1）。
+
+    主 cwd 已经 ensure 成功，但命令还会写另一个绝对路径，而那个目录正在被还原。
+    把这条 409 归成 snapshot_failed 放行，等于服务端拒了、客户端照写——写入会落
+    进还原 `rename(target→bak)` 与 `rename(tmp→target)` 之间那个目标目录不存在的
+    窗口，让还原失败且回滚也失败，用户原始数据滞留在 `.bak`。
+    """
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    doc = outside / "a.txt"
+    doc.write_text("x")
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},   # 主 cwd：建成
+        _restore_conflict_error(),           # 加餐路径：正在还原
+    )
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {doc}", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "加餐路径正在还原，整条命令必须阻断"
+    assert "restore" in json.loads(blocked)["error"].lower()
+    assert rec.unprotected == [], "阻断不是无保护放行，不该记成 unprotected"
+
+
+def test_strict_execute_code_ancillary_restore_conflict_blocks(monkeypatch, tmp_path):
+    """strict execute_code 的唯一保护就是这次加餐 ensure：撞还原冲突要阻断。"""
+    code_tool = pytest.importorskip("tools.code_execution_tool")
+    monkeypatch.setattr(code_tool, "_get_execution_mode", lambda: "strict")
+    target = tmp_path / "Documents" / "a.txt"
+    target.parent.mkdir()
+    target.write_text("x")
+    rec = _install(monkeypatch, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "execute_code", {"code": f"open('{target}','w').write('y')"},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "还原进行中必须阻断"
+    assert "restore" in json.loads(blocked)["error"].lower()
+    assert rec.unprotected == []
+
+
+def test_ancillary_per_path_retry_restore_conflict_blocks(monkeypatch, tmp_path):
+    """逐路径重试里撞还原冲突也要阻断——那条分支原先把它归成 snapshot_failed
+    后继续跑完剩下的路径并放行。"""
+    code_tool = pytest.importorskip("tools.code_execution_tool")
+    monkeypatch.setattr(code_tool, "_get_execution_mode", lambda: "strict")
+    first = tmp_path / "Documents" / "a.txt"
+    first.parent.mkdir()
+    first.write_text("x")
+    second = tmp_path / "Pictures" / "b.txt"
+    second.parent.mkdir()
+    second.write_text("x")
+
+    rec = _install(
+        monkeypatch,
+        _scope_denied_error(),               # 批量：整批 403，触发逐路径重试
+        {"ready": True, "operations": []},   # 逐路径：第一条建成
+        _restore_conflict_error(),           # 逐路径：第二条正在还原
+    )
+    code = f"open('{first}','w').write('y'); open('{second}','w').write('y')"
+    blocked = guard.maybe_require_snapshot(
+        "execute_code", {"code": code}, turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "逐路径重试撞还原冲突同样必须阻断"
+    assert "restore" in json.loads(blocked)["error"].lower()
+    assert rec.unprotected == []
+
+    # 已经建成的那条要能被 finish 收走，否则它的 pin 只能等 TTL 过期。
+    guard.finish_turn("completed", turn_id="turn_1")
+    assert rec.requests[-1]["url"].endswith("/agent-protection/finish")
