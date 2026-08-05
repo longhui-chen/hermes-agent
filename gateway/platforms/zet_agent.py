@@ -294,6 +294,48 @@ _ZET_PLAN_FIRST_MANUAL = """\
 
 简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
 
+# workdir 契约：设备上终端的相对路径没人供给锚点时会兜底到 scope 外的目录，
+# 而契约不进 prompt 模型只能靠撞墙学习，所以在平台层显式声明。
+_ZET_WORKDIR_SECTION = """\
+## 工作目录与路径
+
+- 读写用户文件：一律用绝对路径（如 `/volume1/subvol/data/...`），不要依赖相对路径。
+- 相对路径没有稳定含义：文件工具在你还没跑过终端命令时把它解析到你自己的产出目录，一旦终端 `cd` 过或带 `workdir` 跑过命令，就改成跟着那个目录走。所以要落临时产物，写绝对路径，别靠相对路径。
+- 终端命令的锚点也不与文件工具共用：命令里的脚本、输入、输出参数都写绝对路径。刚用 write_file 写出的文件，交给命令时也要给绝对路径。"""
+
+# 只有终端工具真的能解析 `agent_output` 时才教这个姿势。别名尚未落地的运行时
+# 会把它当普通路径原样 `cd`，命令直接失败——教一个用不了的姿势比不教更糟。
+_ZET_WORKDIR_ALIAS_LINE = (
+    "- 跑脚本、落临时产物：终端调用传 `workdir='agent_output'`，"
+    "那是你自己的可写产出目录——只有传了它，命令里的相对路径才和文件工具落在同一处。"
+)
+
+
+def _agent_output_alias_available() -> bool:
+    """Report whether ``workdir='agent_output'`` will actually work right now.
+
+    Both halves have to hold: the terminal tool must know the alias *and* the
+    platform must have provisioned the directory it resolves to. A device whose
+    agent runtime is newer than its local-server has the first without the
+    second, and teaching the alias there produces a command that fails on every
+    use. Staying quiet costs nothing — the model falls back to absolute paths,
+    which work either way.
+    """
+
+    try:
+        from tools.runtime_workdir import agent_output_dir
+
+        return bool(agent_output_dir())
+    except Exception:
+        return False
+
+
+def _zet_workdir_section() -> str:
+    if not _agent_output_alias_available():
+        return _ZET_WORKDIR_SECTION
+    # 别名行放最后：它是上一条「终端参数写绝对路径」的例外，紧跟着读才不歧义。
+    return f"{_ZET_WORKDIR_SECTION}\n{_ZET_WORKDIR_ALIAS_LINE}"
+
 _ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言
 
@@ -313,7 +355,9 @@ def _zettlab_workflow_addendum(auto_execute: bool) -> str:
     PLAN_SCHEMA so no side effect runs before the user confirms.
     """
     plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
-    return "\n\n".join((_ZET_ADDENDUM_HEAD, plan_first, _ZET_ADDENDUM_TAIL)) + "\n"
+    return "\n\n".join(
+        (_ZET_ADDENDUM_HEAD, plan_first, _zet_workdir_section(), _ZET_ADDENDUM_TAIL)
+    ) + "\n"
 
 
 _DELEGATION_ADVANCE_ENV = "ZET_DELEGATION_ADVANCE_URL"

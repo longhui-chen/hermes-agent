@@ -270,6 +270,44 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
+def _managed_gateway_output_dir() -> str | None:
+    """受管网关下平台供给的 agent output 目录，作为相对路径的兜底锚点。
+
+    multiplex 网关形态没有终端 live cwd、注册的 session cwd 和 ``$TERMINAL_CWD``
+    可供锚定，原兜底会落到 root 守护进程的 HOME（scope 外）：相对路径写入必被
+    守卫 403 拦截，读取则报出误导性的 ``/root/...`` 路径。锚到 agent 自己的可写
+    地盘在安全上成立——文件工具的目标始终是显式路径，藏不住任何写入，用户文件
+    必然走绝对路径、保护照常；它也不像终端 cwd 那样兼任 project-context 加载根。
+
+    tools/runtime_workdir.py 合入后本 helper 自然收敛到那份共享实现；在此之前
+    保留一份语义一致的内联实现（profile scope 优先，须为已存在的绝对目录）。
+    任何异常都视为不可用、沿用原兜底，绝不让文件工具因此抛错（HR2）。
+    """
+    if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+        return None
+    try:
+        try:
+            from tools.runtime_workdir import agent_output_dir
+        except ImportError:
+            pass
+        else:
+            value = agent_output_dir()
+            return str(value) if value else None
+        # 受管网关是 multiplex 单进程：进程级 os.environ 里的
+        # ZET_AGENT_OUTPUT_DIR 可能是**另一个 profile** 留下的，拿它当锚点会让
+        # 相对读写落到别人的产出目录（HR3）。所以 scope 取不到就当不可用，
+        # 沿用原兜底，绝不回落进程环境。
+        from agent.secret_scope import get_secret
+
+        value = get_secret("ZET_AGENT_OUTPUT_DIR", "")
+        value = str(value or "").strip()
+        if value and os.path.isabs(value) and os.path.isdir(value):
+            return value
+        return None
+    except Exception:
+        return None
+
+
 def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root for divergence checks.
 
@@ -319,7 +357,9 @@ def _resolve_base_dir(
       3. A sentinel-free, absolute ``$TERMINAL_CWD`` (the worktree path set by
          ``cli.py``/``main.py`` for ``-w`` sessions). Used even before any
          terminal command has populated the live cwd registry.
-      4. The process cwd.
+      4. Managed multiplex gateway only (host paths): the platform-provisioned
+         agent output directory — see :func:`_managed_gateway_output_dir`.
+      5. The process cwd.
 
     The returned base is ALWAYS absolute. This is the core invariant that
     prevents the worktree-cwd divergence bug: a relative or sentinel
@@ -334,6 +374,11 @@ def _resolve_base_dir(
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
+    if not root and not container_paths:
+        # 受管网关下前三层锚点均无人供给，落到进程 cwd 会指向 root 守护进程的
+        # HOME（scope 外），故先锚到平台 output 目录；容器路径语义在沙箱内，
+        # host 目录对其无意义，保持原兜底不动。
+        root = _managed_gateway_output_dir()
     if root:
         base_text = _expand_tilde(root)
     else:
@@ -360,6 +405,36 @@ def _resolve_base_dir(
         # cwd once, here, so the result no longer depends on cwd at resolve().
         base = Path(os.getcwd()) / base
     return base.resolve()
+
+
+def _ops_uses_resolved_paths(task_id: str = "default") -> bool:
+    """Whether the ops layer should be handed this layer's resolved paths.
+
+    Passing the resolved path is what keeps the scope check, the dedup
+    bookkeeping and the actual I/O describing one file — but only while the
+    filesystem this process resolved against is the one the ops layer acts on.
+    Local is that case, and it is also the only backend the snapshot guard
+    protects, so it is the whole reason the alignment matters.
+
+    Every other backend executes elsewhere. An ssh session's ``notes.md`` must
+    stay relative so the remote shell anchors it against the remote cwd; a
+    container backend's must stay relative because the base this layer picks is
+    a host notion — :func:`_authoritative_workspace_root` falls through to a
+    raw ``$TERMINAL_CWD`` that is never mapped into the namespace, while
+    ``terminal_tool`` normalizes the container's own cwd to ``/workspace`` or
+    ``/root``. Handing either one a host absolute path names a different file
+    or none at all, so they keep the pre-existing raw-path behaviour.
+    """
+
+    return _terminal_env_type_for_task(task_id) == "local"
+
+
+def _ops_path(path: str, resolved: object, task_id: str = "default") -> str:
+    """Pick the path to hand the ops layer for an already-checked *path*."""
+
+    if not resolved or not _ops_uses_resolved_paths(task_id):
+        return path
+    return str(resolved)
 
 
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
@@ -672,6 +747,28 @@ def _managed_sibling_profile_error(
                 f"Refusing access to managed sibling profile path: {filepath}\n"
                 "Agent file tools are confined to the active profile."
             )
+
+    # 同一条约束的另一半：agent 产出树。受管终端把每个 agent 的 output 归自己的
+    # UID、0700，所以 shell 天然进不去别人的产出；但文件工具跑在 root 网关进程里
+    # 没有这层保护，而相对路径此刻正锚在自己的 output 上——`../../agent-b/output/x`
+    # 就直接读到隔壁 agent 的产物（HR3）。绝对路径不受影响：它们不用这个锚点，
+    # 照常走 scope gate。
+    own_output = _managed_gateway_output_dir()
+    if own_output:
+        own_output = os.path.normpath(os.path.realpath(own_output))
+        agents_root = os.path.dirname(os.path.dirname(own_output))
+        own_agent_dir = os.path.dirname(own_output)
+        if os.path.isabs(agents_root) and os.path.basename(own_output) == "output":
+            for candidate in candidates:
+                if not _path_within(candidate, agents_root):
+                    continue
+                if _path_within(candidate, own_agent_dir):
+                    continue
+                return (
+                    f"Refusing access to another agent's data directory: {filepath}\n"
+                    "Relative paths are anchored to this agent's own output "
+                    "directory; pass an absolute path for files elsewhere."
+                )
     return None
 
 
@@ -1581,8 +1678,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
+        # Read the path we just validated, not the raw argument: the ops layer
+        # anchors a relative path against the terminal cwd, which is not the
+        # base this function resolved against. Letting the two differ means the
+        # block check, dedup and staleness bookkeeping all describe a different
+        # file than the one actually read. ``_ops_path`` keeps a remote
+        # backend's relative paths relative — see its docstring.
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        result = file_ops.read_file(_ops_path(path, _resolved, task_id), offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -1966,6 +2069,42 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
+_V4A_FILE_HEADER = r'^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+)$'
+_V4A_MOVE_HEADER = r'^(\*\*\*\s*Move\s+File:\s*)(.+?)(\s*->\s*)(.+)$'
+
+
+def _rewrite_v4a_header_paths(patch: str, resolved: dict[str, str]) -> str:
+    """Replace V4A header paths with the absolute paths already resolved here.
+
+    Header paths are what the shell layer acts on, and it anchors a relative one
+    against its own cwd — a different base than this layer used for locking and
+    the scope pre-check. Rewriting keeps one answer for "which file". Headers
+    whose path did not resolve are left untouched so the existing error path
+    still reports them.
+    """
+
+    if not resolved:
+        return patch
+    import re as _re
+
+    def _swap(raw: str) -> str:
+        return resolved.get(raw.strip()) or raw
+
+    def _file_header(match: "re.Match[str]") -> str:
+        return match.group(1) + _swap(match.group(2))
+
+    def _move_header(match: "re.Match[str]") -> str:
+        return (
+            match.group(1)
+            + _swap(match.group(2))
+            + match.group(3)
+            + _swap(match.group(4))
+        )
+
+    patch = _re.sub(_V4A_MOVE_HEADER, _move_header, patch, flags=_re.MULTILINE)
+    return _re.sub(_V4A_FILE_HEADER, _file_header, patch, flags=_re.MULTILINE)
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -2089,7 +2228,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                # Same reason as ``replace`` above: the headers carry the paths
+                # the shell layer will act on, and it resolves a relative one
+                # against its own cwd. Rewrite them to the paths this layer
+                # already resolved, locked and scope-checked, so both layers
+                # agree on which files the patch touches.
+                result = file_ops.patch_v4a(
+                    _rewrite_v4a_header_paths(
+                        patch,
+                        _path_to_resolved
+                        if _ops_uses_resolved_paths(task_id)
+                        else {},
+                    )
+                )
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -2216,9 +2367,16 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
 
+        # Search the path the block check just cleared. A relative path handed
+        # to the ops layer anchors against the terminal cwd instead, so the
+        # scope decision above would describe a different tree than the one
+        # actually walked. ``_ops_path`` keeps a remote backend's relative
+        # paths relative — see its docstring.
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern,
+            path=_ops_path(path, resolved_path, task_id),
+            target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)

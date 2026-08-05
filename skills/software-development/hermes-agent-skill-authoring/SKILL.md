@@ -84,6 +84,20 @@ Common quality failures:
 - **Sprawl** — too much always-visible material; push branch-specific reference behind pointers.
 - **No-op prose** — generic advice the agent would already follow without the skill.
 
+## Invoking Bundled Scripts (hard requirement)
+
+A skill must never reference its own scripts by a relative path: the working
+directory a command runs in is not the skill package, so `python scripts/x.py`
+simply does not find the file. The same asymmetry applies to a command's data
+arguments — a file one tool wrote is not necessarily where another tool looks.
+
+The exact syntax, the quoting rule, and the two places substitution does not
+reach are in `references/script-paths.md`. Read it before writing any step that
+runs a shipped script. It is a supporting file rather than part of this body
+because template substitution rewrites placeholders in SKILL.md bodies — spelled
+out here, the examples would arrive as one machine's absolute path instead of
+the syntax they are meant to teach.
+
 ## Peer-Matched Structure
 
 Every in-repo skill follows roughly:
