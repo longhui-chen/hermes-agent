@@ -5880,7 +5880,7 @@ Environment state persists: activate a virtualenv or export variables once per s
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
 Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
-Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
+Working directory: use 'workdir' for per-command cwd. On the local backend, managed platform runtimes may expose the semantic 'agent_output' workdir for the current agent's output directory. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
 PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
 """
 
@@ -7145,6 +7145,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    _runtime_agent_output_workdir: bool = False,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -7190,9 +7191,46 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        try:
+            from tools.runtime_workdir import (
+                AGENT_OUTPUT_WORKDIR,
+                resolve_runtime_workdir,
+            )
+
+            requested_agent_output = (
+                _runtime_agent_output_workdir or workdir == AGENT_OUTPUT_WORKDIR
+            )
+            workdir = resolve_runtime_workdir(workdir)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": str(exc),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+        if requested_agent_output and env_type != "local":
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "workdir 'agent_output' is available only with the local "
+                        "terminal backend; configure an explicit backend-visible "
+                        "workdir for container or remote execution"
+                    ),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -8340,7 +8378,7 @@ TERMINAL_SCHEMA = {
             },
             "workdir": {
                 "type": "string",
-                "description": "Working directory for this command (absolute path). Defaults to the session working directory."
+                "description": "Working directory for this command (absolute path), or 'agent_output' when the platform exposes a managed output directory for the current agent and the local terminal backend is active. Defaults to the session working directory."
             },
             "pty": {
                 "type": "boolean",
@@ -8364,6 +8402,10 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
+    from tools.runtime_workdir import AGENT_OUTPUT_ARG
+
+    # registry 解析层注入的内部标记到此为止：pop 掉避免作为业务参数外溢。
+    runtime_agent_output = bool(args.pop(AGENT_OUTPUT_ARG, False))
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -8374,6 +8416,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        _runtime_agent_output_workdir=runtime_agent_output,
     )
 
 

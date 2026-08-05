@@ -1,8 +1,10 @@
 import os
+import shutil
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,6 +156,429 @@ def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
     assert run_env["TMPDIR"] == "/tmp"
     assert run_env["TMP"] == "/tmp"
     assert run_env["TEMP"] == "/tmp"
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root POSIX ownership semantics",
+)
+def test_managed_profile_runtime_exposes_only_active_skills_and_output(
+    monkeypatch, request
+):
+    tmp_path = Path(tempfile.mkdtemp(prefix="hermes-runtime-test-", dir="/run"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
+    os.chmod(tmp_path, 0o755)
+    hermes_root = tmp_path / "hermes_home"
+    profiles_root = hermes_root / "profiles"
+    profile_home = profiles_root / "agent-a"
+    skills_root = profile_home / "skills"
+    sibling_home = profiles_root / "agent-b"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    skills_root.mkdir(parents=True)
+    sibling_home.mkdir()
+    output.mkdir(parents=True)
+    private_skill_dir = skills_root / "support-suite" / "scripts"
+    private_skill_dir.mkdir(parents=True)
+    private_skill = private_skill_dir / "onboard.py"
+    private_skill.write_text("print('ok')")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "must-not-be-chowned.txt"
+    outside_file.write_text("protected")
+    os.chmod(outside_file, 0o600)
+    output_link = output / "outside-link"
+    output_link.symlink_to(outside, target_is_directory=True)
+    hermes_alias = tmp_path / "hermes-alias"
+    hermes_alias.symlink_to(hermes_root, target_is_directory=True)
+    lexical_profile_home = hermes_alias / "profiles" / "agent-a"
+    lexical_skill = (
+        lexical_profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+    )
+    for path in (hermes_root, profiles_root, profile_home, skills_root, sibling_home):
+        os.chmod(path, 0o700)
+    # Installed board packages may arrive as root-owned 707/607. Preparation
+    # must safely tighten those modes instead of rejecting the entrypoint.
+    os.chmod(private_skill_dir.parent, 0o707)
+    os.chmod(private_skill_dir, 0o707)
+    os.chmod(private_skill, 0o607)
+    os.chmod(output, 0o755)
+
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    env = {
+        "HERMES_HOME": str(lexical_profile_home),
+        "ZET_AGENT_OUTPUT_DIR": str(output),
+    }
+
+    local_module._prepare_managed_profile_runtime(env)
+    command = f'python3 "{lexical_skill}"'
+    local_module._prepare_managed_command_skill_sources(command, env)
+    uid, gid = local_module._managed_terminal_identity(env)
+
+    assert stat.S_IMODE(hermes_root.stat().st_mode) == 0o711
+    assert stat.S_IMODE(profiles_root.stat().st_mode) == 0o711
+    assert profile_home.stat().st_gid == gid
+    assert stat.S_IMODE(profile_home.stat().st_mode) == 0o710
+    assert skills_root.stat().st_gid == gid
+    assert stat.S_IMODE(skills_root.stat().st_mode) == 0o750
+    assert private_skill_dir.stat().st_gid == gid
+    assert stat.S_IMODE(private_skill_dir.stat().st_mode) == 0o750
+    assert private_skill.stat().st_gid == gid
+    assert stat.S_IMODE(private_skill.stat().st_mode) == 0o640
+
+    os.chmod(private_skill, 0o600)
+    local_module._prepare_managed_command_skill_sources(command, env)
+    assert private_skill.stat().st_gid == gid
+    assert stat.S_IMODE(private_skill.stat().st_mode) == 0o640
+    assert output.stat().st_uid == uid
+    assert output.stat().st_gid == gid
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert os.lstat(output_link).st_uid == 0
+    assert outside_file.stat().st_uid == 0
+    assert stat.S_IMODE(outside_file.stat().st_mode) == 0o600
+    assert outside_file.read_text() == "protected"
+    assert stat.S_IMODE(sibling_home.stat().st_mode) == 0o700
+    assert local_module._managed_identity_can_traverse(
+        str(skills_root), uid=uid, gid=gid
+    )
+    assert not local_module._managed_identity_can_traverse(
+        str(sibling_home), uid=uid, gid=gid
+    )
+
+    os.chmod(private_skill, 0o622)
+    local_module._prepare_managed_command_skill_sources(command, env)
+    assert stat.S_IMODE(private_skill.stat().st_mode) == 0o640
+
+    state_dir = output / "support-suite-state"
+    state_file = state_dir / "onboarding.json"
+    state_dir.mkdir()
+    state_file.write_text("{}")
+    os.chown(state_dir, uid, gid)
+    os.chown(state_file, uid, gid)
+    os.chmod(state_dir, 0o700)
+    os.chmod(state_file, 0o600)
+    monkeypatch.setenv("ZET_AGENT_KEY", "rotated-device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+
+    local_module._prepare_managed_profile_runtime(env)
+    rotated_uid, rotated_gid = local_module._managed_terminal_identity(env)
+
+    assert rotated_uid == uid
+    assert rotated_gid == gid
+    assert state_dir.stat().st_uid == uid
+    assert state_file.stat().st_uid == uid
+    assert state_file.stat().st_gid == gid
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root POSIX ownership semantics",
+)
+def test_managed_profile_runtime_restores_non_python_skill_packages(
+    monkeypatch, request
+):
+    tmp_path = Path(tempfile.mkdtemp(prefix="hermes-skilltree-test-", dir="/run"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
+    os.chmod(tmp_path, 0o755)
+    hermes_root = tmp_path / "hermes_home"
+    profiles_root = hermes_root / "profiles"
+    profile_home = profiles_root / "agent-a"
+    skills_root = profile_home / "skills"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    shell_pkg = skills_root / "shell-suite"
+    shell_script = shell_pkg / "run.sh"
+    shell_doc = shell_pkg / "SKILL.md"
+    bad_pkg = skills_root / "bad-suite"
+    bad_file = bad_pkg / "keep.txt"
+    shell_pkg.mkdir(parents=True)
+    bad_pkg.mkdir()
+    output.mkdir(parents=True)
+    shell_script.write_text("echo ok")
+    shell_doc.write_text("# doc")
+    bad_file.write_text("keep")
+    for path in (hermes_root, profiles_root, profile_home, skills_root, shell_pkg):
+        os.chmod(path, 0o700)
+    os.chmod(shell_script, 0o600)
+    os.chmod(shell_doc, 0o600)
+    # 非 root 属主的包会被 normalize 拒绝，用来验证坏包不连累别人
+    os.chown(bad_pkg, 1001, 1001)
+    os.chmod(output, 0o755)
+
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+    env = {
+        "HERMES_HOME": str(profile_home),
+        "ZET_AGENT_OUTPUT_DIR": str(output),
+    }
+
+    # 不给命令解析任何 python <脚本> 线索：bash/cat 等形态也要拿到放权
+    local_module._prepare_managed_profile_runtime(env)
+    uid, gid = local_module._managed_terminal_identity(env)
+
+    assert shell_pkg.stat().st_gid == gid
+    assert stat.S_IMODE(shell_pkg.stat().st_mode) == 0o750
+    assert shell_script.stat().st_gid == gid
+    assert stat.S_IMODE(shell_script.stat().st_mode) == 0o640
+    assert shell_doc.stat().st_gid == gid
+    assert stat.S_IMODE(shell_doc.stat().st_mode) == 0o640
+    assert bad_pkg.stat().st_uid == 1001
+    assert bad_file.stat().st_gid != gid
+    assert output.stat().st_uid == uid
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+
+
+def test_managed_skill_tree_cache_skips_repeat_walks(monkeypatch, tmp_path):
+    skills_root = tmp_path / "skills"
+    (skills_root / "pkg-a").mkdir(parents=True)
+    (skills_root / "pkg-b").mkdir()
+    calls = []
+    monkeypatch.setattr(
+        local_module,
+        "_normalize_managed_skill_package",
+        lambda package, gid: calls.append((package.name, gid)),
+    )
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    assert sorted(name for name, _gid in calls) == ["pkg-a", "pkg-b"]
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    assert len(calls) == 2
+
+    # 指纹变化（新装/卸载技能改动 skills 根目录）→ 重新全量放权。
+    # +1s 而不是 +1ns：NTFS 时间戳粒度 100ns，会把 +1ns 截没
+    info = os.stat(skills_root)
+    os.utime(
+        skills_root, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000)
+    )
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    assert len(calls) == 4
+
+    # 身份轮换后旧的放权结果不可信
+    local_module._prepare_managed_skill_tree(skills_root, 100002)
+    assert len(calls) == 6
+    assert calls[-1][1] == 100002
+
+
+def test_managed_skill_tree_cache_notices_in_package_updates(
+    monkeypatch, tmp_path
+):
+    """技能热更新通常只落在包内子目录，顶层包的时间戳不会动。"""
+
+    skills_root = tmp_path / "skills"
+    scripts = skills_root / "pkg-a" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "run.sh").write_text("echo old\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        local_module,
+        "_normalize_managed_skill_package",
+        lambda package, gid: calls.append((package.name, gid)),
+    )
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    assert len(calls) == 1
+    package_mtime = os.stat(skills_root / "pkg-a").st_mtime_ns
+
+    (scripts / "extra.py").write_text("print(1)\n", encoding="utf-8")
+    # +1s 而不是 +1ns：NTFS 时间戳粒度 100ns，会把 +1ns 截没
+    info = os.stat(scripts)
+    os.utime(scripts, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+    # 顶层包自己没被动过——只按包判定的旧指纹正是在这里恒命中缓存
+    assert os.stat(skills_root / "pkg-a").st_mtime_ns == package_mtime
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    assert len(calls) == 2
+
+
+def test_managed_skill_tree_oversized_tree_never_caches(monkeypatch, tmp_path):
+    """指纹装不下就不缓存：每次重新放权很慢，但不会静默停止放权。"""
+
+    skills_root = tmp_path / "skills"
+    (skills_root / "pkg-a" / "scripts").mkdir(parents=True)
+    monkeypatch.setattr(local_module, "_MANAGED_SKILL_TREE_MAX_ENTRIES", 1)
+    calls = []
+    monkeypatch.setattr(
+        local_module,
+        "_normalize_managed_skill_package",
+        lambda package, gid: calls.append((package.name, gid)),
+    )
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+
+    assert len(calls) == 2
+    assert str(skills_root) not in local_module._MANAGED_SKILL_TREE_PREPARED
+
+
+def test_managed_skill_tree_bad_package_does_not_block_others(
+    monkeypatch, tmp_path
+):
+    skills_root = tmp_path / "skills"
+    (skills_root / "bad-suite").mkdir(parents=True)
+    (skills_root / "good-suite").mkdir()
+    normalized = []
+
+    def fake_normalize(package, gid):
+        if package.name == "bad-suite":
+            raise OSError("managed profile skill entry is not trusted")
+        normalized.append(package.name)
+
+    monkeypatch.setattr(
+        local_module, "_normalize_managed_skill_package", fake_normalize
+    )
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+
+    assert normalized == ["good-suite"]
+
+
+@pytest.mark.skipif(
+    os.name == "nt"
+    or not hasattr(os, "geteuid")
+    or os.geteuid() != 0
+    or not Path("/usr/bin/setpriv").is_file()
+    or not Path("/usr/bin/unshare").is_file(),
+    reason="requires the production root/Linux namespace boundary",
+)
+def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
+    monkeypatch,
+):
+    root = Path(tempfile.mkdtemp(prefix="hermes-managed-test-", dir="/run"))
+    try:
+        os.chmod(root, 0o755)
+        hermes_root = root / "hermes_home"
+        profile_home = hermes_root / "profiles" / "agent-a"
+        script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+        output = root / "agents" / "data" / "agent-a" / "output"
+        script.parent.mkdir(parents=True)
+        output.mkdir(parents=True)
+        legacy_output = output / "legacy-owner.txt"
+        legacy_output.write_text("historical")
+        os.chown(legacy_output, 1001, 1001)
+        original = (
+            "from pathlib import Path\n"
+            "source = Path(__file__)\n"
+            "try:\n"
+            "    source.write_text('tampered')\n"
+            "except OSError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise SystemExit('skill source was writable')\n"
+            "Path(__import__('os').environ['ZET_AGENT_OUTPUT_DIR'], "
+            "'state.txt').write_text('ok')\n"
+        )
+        script.write_text(original)
+        for path in (
+            hermes_root,
+            profile_home.parent,
+            profile_home,
+            profile_home / "skills",
+            script.parent.parent,
+            script.parent,
+        ):
+            os.chmod(path, 0o700)
+        os.chmod(script, 0o600)
+        os.chmod(output, 0o755)
+        monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+        local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+        env = os.environ.copy()
+        env.update(
+            {
+                "HERMES_HOME": str(profile_home),
+                "ZET_AGENT_OUTPUT_DIR": str(output),
+            }
+        )
+        local_module._prepare_managed_profile_runtime(env)
+        local_module._prepare_managed_command_skill_sources(
+            f'python3 "{script}"', env
+        )
+        uid, gid = local_module._managed_terminal_identity(env)
+        private_tmp = root / "private-tmp"
+        private_var_tmp = root / "private-var-tmp"
+        private_tmp.mkdir()
+        private_var_tmp.mkdir()
+        for path in (private_tmp, private_var_tmp):
+            os.chown(path, uid, gid)
+            os.chmod(path, 0o700)
+
+        argv = [
+            "/usr/bin/setpriv",
+            f"--reuid={uid}",
+            f"--regid={gid}",
+            "--clear-groups",
+            "--bounding-set=-all",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--no-new-privs",
+            "--",
+            "/usr/bin/unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--fork",
+            "--kill-child=KILL",
+            "--",
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
+            str(private_tmp),
+            str(private_var_tmp),
+            "/usr/bin/python3",
+            str(script),
+        ]
+        result = subprocess.run(
+            argv,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert script.read_text() == original
+        assert (output / "state.txt").read_text() == "ok"
+        assert legacy_output.read_text() == "historical"
+        assert legacy_output.stat().st_uid == uid
+        assert legacy_output.stat().st_gid == gid
+    finally:
+        shutil.rmtree(root)
+
+
+def test_managed_terminal_mounts_skill_source_read_only():
+    helper = local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
+
+    compile(helper, "<managed-private-tmp-enter>", "exec")
+    assert "skill_root=os.path.join(hermes_home,'skills')" in helper
+    assert "mount(encoded,encoded,4096|16384)" in helper
+    # MS_REMOUNT 不递归：子挂载必须经 mountinfo 收集后从深到浅逐点补只读
+    assert "open('/proc/self/mountinfo','rb')" in helper
+    assert "point==skill_root or point.startswith(skill_root+'/')" in helper
+    assert "sorted(points,key=len,reverse=True)" in helper
+    assert "mount(None,os.fsencode(point),32|4096|1|2|4)" in helper
+
+
+def test_managed_terminal_skill_mount_requires_absolute_hermes_home():
+    helper = local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
+
+    # HERMES_HOME 为空/相对路径时不得把子进程 cwd 下的同名目录挂成只读
+    assert "hermes_home=os.environ.get('HERMES_HOME','')" in helper
+    assert (
+        "if os.path.isabs(hermes_home) and os.path.isdir(skill_root):" in helper
+    )
+    assert "if skill_root and os.path.isdir(skill_root):" not in helper
 
 
 def test_managed_terminal_fails_closed_without_trusted_setpriv(monkeypatch):
@@ -728,3 +1153,133 @@ def test_generic_subprocess_scrubs_managed_gateway_key(monkeypatch):
     assert "HERMES_MANAGED_GATEWAY" not in sanitized
     assert "HERMES_MANAGED_CGROUP_UNIT" not in sanitized
     assert "HERMES_MANAGED_CGROUP_ROOT" not in sanitized
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root POSIX ownership semantics",
+)
+def test_managed_profile_runtime_migrates_previous_identity_output(
+    monkeypatch, request
+):
+    """升级板的 output 属于上一版算法派生的旧 UID，必须走迁移而不是被判不可信。
+
+    _migrate_managed_output_tree 本就是为「历史 output 属于另一个数字 UID」写
+    的；调用方只认 (0, uid) 会把它挡在门外，agent 从此写不进自己的产出目录。
+    """
+    tmp_path = Path(tempfile.mkdtemp(prefix="hermes-migrate-test-", dir="/run"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
+    os.chmod(tmp_path, 0o755)
+    hermes_root = tmp_path / "hermes_home"
+    profiles_root = hermes_root / "profiles"
+    profile_home = profiles_root / "agent-a"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    profile_home.mkdir(parents=True)
+    output.mkdir(parents=True)
+    carried = output / "report.md"
+    carried.write_text("earlier run")
+    for path in (hermes_root, profiles_root, profile_home):
+        os.chmod(path, 0o700)
+
+    # 上一版身份算法派生出来的旧 UID：在受管段内，但既不是 root 也不是新身份。
+    stale_uid = local_module._MANAGED_TERMINAL_UID_MIN + 4242
+    os.chown(carried, stale_uid, stale_uid)
+    os.chown(output, stale_uid, stale_uid)
+    os.chmod(output, 0o700)
+
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+    env = {
+        "HERMES_HOME": str(profile_home),
+        "ZET_AGENT_OUTPUT_DIR": str(output),
+    }
+
+    local_module._prepare_managed_profile_runtime(env)
+    uid, gid = local_module._managed_terminal_identity(env)
+
+    assert uid != stale_uid
+    assert output.stat().st_uid == uid
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    # 存量产出跟着换主，不是被删或跳过。
+    assert carried.read_text() == "earlier run"
+    assert carried.stat().st_uid == uid
+    assert carried.stat().st_gid == gid
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root POSIX ownership semantics",
+)
+def test_managed_profile_runtime_grants_skills_without_output(monkeypatch, request):
+    """output 是可选能力，skills 放权不是。
+
+    平台没注入 ZET_AGENT_OUTPUT_DIR 时提前返回会连带跳过 skills 放权，非
+    `python <abs>` 的技能入口拿不到 per-command 兜底，在设备上 permission denied。
+    """
+    tmp_path = Path(tempfile.mkdtemp(prefix="hermes-nooutput-test-", dir="/run"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
+    os.chmod(tmp_path, 0o755)
+    hermes_root = tmp_path / "hermes_home"
+    profiles_root = hermes_root / "profiles"
+    profile_home = profiles_root / "agent-a"
+    skills_root = profile_home / "skills"
+    shell_pkg = skills_root / "shell-suite"
+    shell_script = shell_pkg / "run.sh"
+    shell_pkg.mkdir(parents=True)
+    shell_script.write_text("echo ok")
+    for path in (hermes_root, profiles_root, profile_home, skills_root, shell_pkg):
+        os.chmod(path, 0o700)
+    os.chmod(shell_script, 0o600)
+
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+    env = {"HERMES_HOME": str(profile_home)}  # 平台未注入 output
+
+    local_module._prepare_managed_profile_runtime(env)
+    _uid, gid = local_module._managed_terminal_identity(env)
+
+    assert stat.S_IMODE(hermes_root.stat().st_mode) == 0o711
+    assert stat.S_IMODE(profiles_root.stat().st_mode) == 0o711
+    assert profile_home.stat().st_gid == gid
+    assert skills_root.stat().st_gid == gid
+    assert stat.S_IMODE(skills_root.stat().st_mode) == 0o750
+    assert shell_pkg.stat().st_gid == gid
+    assert shell_script.stat().st_gid == gid
+    assert stat.S_IMODE(shell_script.stat().st_mode) == 0o640
+
+
+def test_managed_fallback_cwd_reads_profile_scope_when_env_lacks_output(
+    monkeypatch, tmp_path
+):
+    """multiplex 下 ZET_AGENT_OUTPUT_DIR 只活在 per-turn secret scope 里。
+
+    平台把它投在 profile .env，由 _profile_runtime_scope 装成 scope；os.environ
+    和终端 run env 都没有。只查 env 会让受管形态恒取不到值、退回 profile HOME，
+    而那不在任何快照目标内，破坏性命令又回到全线阻断。
+    """
+    from tests.tools._profile_scope import mux_profile_scope
+
+    output = tmp_path / "output"
+    output.mkdir()
+    os.chmod(output, 0o700)
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setattr(
+        local_module,
+        "_managed_output_is_trusted",
+        lambda candidate: candidate == str(output),
+    )
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
+
+    # run env 里没有这个键——真实 multiplex 就是这样。
+    with mux_profile_scope(monkeypatch, {"ZET_AGENT_OUTPUT_DIR": str(output)}):
+        assert local_module.managed_fallback_cwd({}, home="/profile-home") == str(output)
+
+    # scope 也没有时才退回 home。
+    assert local_module.managed_fallback_cwd({}, home="/profile-home") == "/profile-home"

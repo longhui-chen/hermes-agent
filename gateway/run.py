@@ -2309,6 +2309,7 @@ if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
         ).lower()
         in {"true", "1", "yes"},
         home_fallback=str(Path.home()),
+        managed_gateway=os.environ.get("HERMES_MANAGED_GATEWAY") == "1",
     )
     if _resolved_cwd is None:
         os.environ.pop("TERMINAL_CWD", None)

@@ -307,6 +307,72 @@ def test_make_run_env_keeps_profile_scoped_connector_runtime_out_of_popen_env(mo
     assert "ZET_AGENT_ID" not in env
 
 
+def test_terminal_env_injects_only_profile_scoped_agent_output(monkeypatch, tmp_path):
+    """Model shell receives the current profile's public output path, not tokens."""
+    from agent import secret_scope as ss
+
+    output = tmp_path / "agent-a" / "output"
+    output.mkdir(parents=True)
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(tmp_path / "foreign-output"))
+    token = ss.set_secret_scope(
+        {
+            "ZET_AGENT_OUTPUT_DIR": str(output),
+            "ZETTLAB_CONNECTORS_AUTH_TOKEN": "connector-secret",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-secret",
+        }
+    )
+    try:
+        foreground = _make_run_env({})
+        background = _sanitize_subprocess_env({})
+        local_env_module._apply_profile_secret_scope_env(background, inject=True)
+    finally:
+        ss.reset_secret_scope(token)
+
+    for env in (foreground, background):
+        assert env["ZET_AGENT_OUTPUT_DIR"] == str(output)
+        assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+        assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
+
+
+def test_foreground_terminal_observes_live_profile_output(monkeypatch, tmp_path):
+    """Shell snapshot scrubbing must restore the current public profile value."""
+    from agent import secret_scope as ss
+
+    output = tmp_path / "agent-a" / "output"
+    output.mkdir(parents=True)
+    monkeypatch.delenv("HERMES_MANAGED_GATEWAY", raising=False)
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({"ZET_AGENT_OUTPUT_DIR": str(output)})
+    environment = None
+    try:
+        environment = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        result = environment.execute('printf "%s" "$ZET_AGENT_OUTPUT_DIR"')
+    finally:
+        if environment is not None:
+            environment.cleanup()
+        ss.reset_secret_scope(token)
+
+    assert result["returncode"] == 0
+    assert result["output"].strip() == str(output)
+
+
+@pytest.mark.parametrize("value", ["relative/output", "bad\x00output", ""])
+def test_terminal_env_rejects_invalid_profile_output(monkeypatch, value):
+    """Malformed profile values never replace the scrubbed process-global value."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", "/foreign/output")
+    token = ss.set_secret_scope({"ZET_AGENT_OUTPUT_DIR": value})
+    try:
+        env = _make_run_env({})
+    finally:
+        ss.reset_secret_scope(token)
+
+    assert "ZET_AGENT_OUTPUT_DIR" not in env
+
+
 def test_make_run_env_strips_connector_runtime_without_profile_scope(monkeypatch):
     """Multiplex mode must not inherit stale connector env without a scope."""
     from agent import secret_scope as ss
@@ -355,6 +421,7 @@ def test_local_snapshot_wrapper_unsets_connector_runtime_before_and_after_comman
     env._cwd_file = "/tmp/hermes-cwd-test.txt"
     env._cwd_marker = "__HERMES_CWD_snapshot_test__"
     env._snapshot_ready = True
+    env._snapshot_passthrough_names = set()
 
     script = env._wrap_command("printf done", "/tmp")
 
@@ -365,7 +432,7 @@ def test_local_snapshot_wrapper_unsets_connector_runtime_before_and_after_comman
         "unset ZETTLAB_CONNECTORS_AUTH_TOKEN",
         first_unset_idx + 1,
     )
-    dump_idx = script.index("export -p >")
+    dump_idx = script.index("export -p;")
 
     assert source_idx < first_unset_idx < eval_idx
     assert eval_idx < second_unset_idx < dump_idx
@@ -380,6 +447,7 @@ def test_local_snapshot_wrapper_preserves_unengaged_cli_fallback(monkeypatch):
     env._cwd_file = "/tmp/hermes-cwd-cli-test.txt"
     env._cwd_marker = "__HERMES_CWD_snapshot_cli_test__"
     env._snapshot_ready = True
+    env._snapshot_passthrough_names = set()
     env.env = {}
 
     script = env._wrap_command(
@@ -399,6 +467,7 @@ def test_local_snapshot_bootstrap_unsets_connector_runtime_before_first_dump():
     env._cwd_file = "/tmp/hermes-cwd-bootstrap.txt"
     env._cwd_marker = "__HERMES_CWD_bootstrap_test__"
     env._snapshot_timeout = 5
+    env._snapshot_passthrough_names = set()
     captured: dict[str, str] = {}
 
     class _Proc:
@@ -412,7 +481,7 @@ def test_local_snapshot_bootstrap_unsets_connector_runtime_before_first_dump():
     script = captured["script"]
 
     unset_idx = script.index("unset ZETTLAB_CONNECTORS_AUTH_TOKEN")
-    dump_idx = script.index("export -p >")
+    dump_idx = script.index("export -p;")
 
     assert unset_idx < dump_idx
 

@@ -529,6 +529,39 @@ def _resolve_write_path(path: Any, task_id: str) -> str:
     return _map_container_path(_abs_path(raw))
 
 
+def _managed_output_fallback() -> str:
+    """受管网关下的平台 output 目录；不可用返回空串。仅用于措辞判断。"""
+    try:
+        from tools.environments.local import managed_fallback_cwd
+
+        return str(managed_fallback_cwd(None) or "")
+    except Exception:
+        return ""
+
+
+def _managed_effective_workdir(cwd: str) -> str:
+    """把候选 cwd 过一遍执行侧同一个解析器，返回命令真正会跑的目录。
+
+    必须调用 ``_managed_terminal_cwd`` 用的那个函数，而不是在兜底链里另插一
+    层：终端的默认 cwd 是硬编码的 ``/root``（0700 root），受管身份穿不进去，
+    执行侧本来就会回退到平台 output 目录。守卫若按 ``/root`` 请求快照，就会被
+    scope 判定 403、把所有非只读命令整条拦死——根因是锚点无主，不是该放行。
+    两边各自推导则会漂移成「快照拍在 A、命令跑在 B」，那正是本守卫要防的裂缝。
+    非受管 / Windows / 模块缺失时原样返回，绝不抛。
+    """
+    # 只有 local backend 的命令才会经过 _managed_terminal_cwd。容器 / 远端
+    # backend 下套用本机解析，会把已映射的容器 cwd 判成不可用而改锚到本机
+    # output 目录——命令仍在容器里跑，快照却拍在宿主机，正是要防的分叉。
+    if _terminal_env_type() != "local":
+        return cwd
+    try:
+        from tools.environments.local import managed_effective_cwd
+
+        return str(managed_effective_cwd(cwd) or cwd)
+    except Exception:
+        return cwd
+
+
 def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     """破坏性 shell 命令报工作目录而不是解析命令行里的路径。
 
@@ -562,7 +595,22 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     if session_cwd:
         session_cwd = _map_container_path(_abs_path(session_cwd))
 
-    explicit = str(arguments.get("workdir") or "").strip()
+    raw_workdir = arguments.get("workdir")
+    explicit = str(raw_workdir or "").strip()
+    if explicit:
+        try:
+            from tools.runtime_workdir import resolve_runtime_workdir
+
+            # 别名匹配必须用未预处理的原值。registry.dispatch 和 terminal_tool
+            # 都对 `agent_output` 做精确比较，这里先 strip 会让 " agent_output "
+            # 只在守卫侧解析成平台 output 目录，而命令仍 `cd` 进那个字面相对
+            # 路径——快照拍在 A、破坏性命令改的是 B，正是本 gate 要防的分叉。
+            explicit = str(resolve_runtime_workdir(raw_workdir) or "").strip()
+        except ValueError:
+            # Registry dispatch rejects an unavailable semantic alias before
+            # this gate. Direct guard calls still fail safe by protecting the
+            # fallback cwd; the terminal handler will reject the same alias.
+            explicit = ""
     if explicit:
         # `~` 按工具子进程实际生效的 HOME 展开：workdir 的 `cd` 由 shell 按子
         # 进程 $HOME 解释，home_mode=profile / 缺 HOME fallback 时它是
@@ -585,13 +633,15 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
             base = session_cwd or _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
             p = _map_container_path(os.path.normpath(os.path.join(base, expanded)))
         if os.path.isdir(p):
-            return p
+            return _managed_effective_workdir(p)
     if session_cwd and os.path.isdir(session_cwd):
-        return session_cwd
+        return _managed_effective_workdir(session_cwd)
     # TERMINAL_CWD 本身可能就是容器口径（config 把 cwd 写成 /workspace）：显式
     # workdir 与 session_cwd 都做了反解，fallback 不反解会给本机字面 /workspace
     # 建快照，真实被写的是 bind 到它的 host 目录（Codex review P1）。
-    return _map_container_path(_abs_path(os.getenv("TERMINAL_CWD") or os.getcwd()))
+    return _managed_effective_workdir(
+        _map_container_path(_abs_path(os.getenv("TERMINAL_CWD") or os.getcwd()))
+    )
 
 
 # 单个 `&`（非 `&&` / `2>&1` / `&>`）把命令甩到后台。
@@ -869,7 +919,71 @@ def _command_is_probably_readonly(command: str) -> bool:
     return True
 
 
-def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> list[str]:
+def _managed_readonly_python_sources(text: str) -> set[str]:
+    """Return active-profile Python entrypoints mounted read-only for terminal.
+
+    Only the first script operand is exempted. Every later absolute argument is
+    still a possible write target and remains covered by ancillary snapshots.
+    """
+
+    if (
+        os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+        or _terminal_env_type() != "local"
+    ):
+        return set()
+    # 豁免根必须与执行侧只读挂载同源：挂载脚本读的是 backend run_env 里的
+    # HERMES_HOME，其注入顺序是 per-profile 的 context override 覆盖进程 env
+    # （_inject_hermes_home_env）。这里按同一顺序取值；get_hermes_home() 只
+    # 作末位兜底——它在两者都缺时会退回平台默认目录，而那棵树从未被挂成只
+    # 读，按它豁免就是免检洞。相对路径在挂载侧同样不生效，一律不豁免。
+    hermes_home = ""
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        hermes_home = str(get_hermes_home_override() or "").strip()
+    except Exception:
+        hermes_home = ""
+    if not hermes_home:
+        try:
+            hermes_home = _scoped_env("HERMES_HOME", "").strip()
+        except _UnresolvableScope:
+            return set()
+    if not hermes_home:
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = str(get_hermes_home())
+        except Exception:
+            return set()
+    if not hermes_home or not os.path.isabs(hermes_home):
+        return set()
+    try:
+        from pathlib import Path
+
+        skills_root = (Path(hermes_home) / "skills").resolve(strict=True)
+    except (OSError, RuntimeError):
+        return set()
+
+    try:
+        from tools.environments.local import _managed_python_skill_sources
+
+        return {
+            str(resolved)
+            for _lexical, resolved in _managed_python_skill_sources(
+                text, skills_root.parent
+            )
+        }
+    except Exception:
+        return set()
+
+
+def _ancillary_abs_paths(
+    text: str,
+    primary: list[str],
+    base_dir: str = "",
+    *,
+    readonly_sources: Optional[set[str]] = None,
+) -> list[str]:
     """从命令 / 脚本文本里抽出**已存在**的写入目标，作为 cwd 之外的附加保护。
 
     覆盖绝对路径、home 前缀（~ / $HOME / ${HOME}，按当前 profile 的 home 展
@@ -983,6 +1097,7 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
             candidates.append(tok)
     out: list[str] = []
     seen = set(primary)
+    readonly = {os.path.realpath(path) for path in (readonly_sources or set())}
     for cand in candidates:
         p = _normalize_pathish(cand, base_dir)
         if p:
@@ -1016,6 +1131,8 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
             expanded = ([parent] if parent else []) + matches
         for item in expanded:
             if not item or item in seen or not os.path.lexists(item):
+                continue
+            if os.path.realpath(item) in readonly:
                 continue
             seen.add(item)
             out.append(item)
@@ -1543,10 +1660,25 @@ def maybe_require_snapshot(
         detail = ""
         if isinstance(data, dict) and isinstance(data.get("_error"), dict):
             detail = str(data["_error"].get("message") or "")
+        # scope 越界的阻断本身是条死胡同：output 目录可用时给模型指一条能走通
+        # 的路；不可用时不加——别教一个必然失败的姿势。只对 terminal 说，
+        # write_file / patch 没有 workdir 参数，对它们提这句同样是死胡同。
+        hint = ""
+        if (
+            tool_name == "terminal"
+            and _is_out_of_scope(data, err)
+            and _managed_output_fallback()
+        ):
+            hint = (
+                " If the working directory is outside the agent-writable scope, "
+                "retry with workdir='agent_output' to run in the agent's "
+                "writable output directory."
+            )
         return _blocked(
             "Could not create a protection snapshot before modifying files"
             + (f" ({detail})" if detail else "")
-            + ". The file was NOT modified. Tell the user the change did not happen; do not retry blindly.",
+            + ". The file was NOT modified. Tell the user the change did not happen; do not retry blindly."
+            + hint,
             outcome=f"ensure_{err or 'bad_response'}", tool=tool_name, started=started,
         )
 
@@ -1642,9 +1774,16 @@ def _ensure_ancillary(
     范围外的**写入**本就不在保护范围承诺内。成功后标记本轮 ensured，finish
     才会释放这些 operation 的 pin。
     """
+    text = str(arguments.get("command") or arguments.get("code") or "")
+    readonly_sources = (
+        _managed_readonly_python_sources(text) if tool_name == "terminal" else set()
+    )
     extras = _ancillary_abs_paths(
-        str(arguments.get("command") or arguments.get("code") or ""), exclude,
-        base_dir=_terminal_workdir(arguments, task))
+        text,
+        exclude,
+        base_dir=_terminal_workdir(arguments, task),
+        readonly_sources=readonly_sources,
+    )
     if not extras:
         return None
     data, err = _post(

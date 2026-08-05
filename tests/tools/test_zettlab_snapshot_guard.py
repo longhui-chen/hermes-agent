@@ -882,6 +882,73 @@ def test_absolute_targets_outside_cwd_get_ancillary_protection(monkeypatch, tmp_
     assert rec.requests[1]["body"]["paths"] == [str(outside)]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
+def test_managed_python_skill_entry_is_not_treated_as_a_write_target(
+    monkeypatch, tmp_path
+):
+    """A managed terminal may read its active profile's skill entrypoint.
+
+    The cwd still gets the normal recovery point, while the read-only Python
+    source is omitted from ancillary write targets so an out-of-scope skill
+    path cannot reject an otherwise valid command.
+    """
+    profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
+    script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    script.parent.mkdir(parents=True)
+    output.mkdir(parents=True)
+    script.write_text("print('ok')")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    rec = _install(monkeypatch, {"ready": True, "operations": []})
+
+    allowed = guard.maybe_require_snapshot(
+        "terminal",
+        {"command": f'python3 "{script}"', "workdir": str(output)},
+        turn_id="turn_1",
+    )
+
+    assert allowed is None
+    assert len(rec.requests) == 1
+    assert rec.requests[0]["body"]["paths"] == [str(output)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
+def test_managed_python_skill_user_file_argument_remains_protected(
+    monkeypatch, tmp_path
+):
+    """Only the interpreter source is read-only; later path args may be writes."""
+    profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
+    script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    target = tmp_path / "user-data" / "settings.json"
+    script.parent.mkdir(parents=True)
+    output.mkdir(parents=True)
+    target.parent.mkdir()
+    script.write_text("print('ok')")
+    target.write_text("{}")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},
+        {"ready": True, "operations": []},
+    )
+
+    allowed = guard.maybe_require_snapshot(
+        "terminal",
+        {
+            "command": f'python3 "{script}" --config "{target}"',
+            "workdir": str(output),
+        },
+        turn_id="turn_1",
+    )
+
+    assert allowed is None
+    assert len(rec.requests) == 2
+    assert rec.requests[1]["body"]["paths"] == [str(target)]
+
+
 def test_ancillary_ensure_failure_does_not_block(monkeypatch, tmp_path):
     """附加保护是加餐：范围外 403 / 服务错误只跳过，不影响已就绪的 cwd 保护。"""
     outside = tmp_path / "other" / "f.txt"
@@ -1051,6 +1118,153 @@ def test_strict_execute_code_skips_out_of_scope_but_requires_in_scope(monkeypatc
     # in_scope 建成过恢复点：finish 要释放它的 pin。
     guard.finish_turn("completed", turn_id="turn_1")
     assert rec.requests[-1]["url"].endswith("/agent-protection/finish")
+
+
+def test_managed_gateway_fallback_protects_platform_output_dir(monkeypatch, tmp_path):
+    """受管网关下无显式 workdir、无 session cwd 时，保护目标必须是平台 output
+    目录（与执行侧 managed_fallback_cwd 同源），而不是进程 cwd / HOME——板上
+    那是 /root，永远 403、整条命令 fail-closed。"""
+    local_mod = pytest.importorskip("tools.environments.local")
+    monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+    output = tmp_path / "agents-data" / "output"
+    output.mkdir(parents=True)
+    monkeypatch.setattr(
+        local_mod,
+        "_managed_output_is_trusted",
+        lambda candidate: candidate == str(output),
+    )
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
+    rec = _install(monkeypatch, {"ready": True, "operations": []})
+
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f x"}, turn_id="turn_1"
+    ) is None
+    assert rec.requests[0]["body"]["paths"] == [str(output)]
+
+
+def test_managed_gateway_without_output_keeps_env_cwd_fallback(monkeypatch, tmp_path):
+    """平台没注入 output 目录时沿用原有兜底链（TERMINAL_CWD），行为不回归。"""
+    local_mod = pytest.importorskip("tools.environments.local")
+    monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot("terminal", {"command": "rm -f x"}, turn_id="turn_1")
+    assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
+
+
+def test_unmanaged_process_ignores_platform_output_dir(monkeypatch, tmp_path):
+    """非受管环境不锚 output：命令实际跑在 TERMINAL_CWD，锚去 output 就是
+    「快照拍在 A、命令跑在 B」。"""
+    output = tmp_path / "output"
+    output.mkdir()
+    monkeypatch.delenv("HERMES_MANAGED_GATEWAY", raising=False)
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot("terminal", {"command": "rm -f x"}, turn_id="turn_1")
+    assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
+
+
+def test_out_of_scope_block_includes_agent_output_hint(monkeypatch, tmp_path):
+    """scope 越界的阻断不该是死胡同：output 可用时引导模型改用
+    workdir='agent_output' 重试。"""
+    local_mod = pytest.importorskip("tools.environments.local")
+    monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+    output = tmp_path / "output"
+    output.mkdir()
+    monkeypatch.setattr(
+        local_mod,
+        "_managed_output_is_trusted",
+        lambda candidate: candidate == str(output),
+    )
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
+    _install(monkeypatch, _scope_denied_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f a.txt"}, turn_id="turn_1"
+    )
+    assert blocked is not None
+    assert "workdir='agent_output'" in json.loads(blocked)["error"]
+
+
+def test_out_of_scope_block_without_output_has_no_hint(monkeypatch, tmp_path):
+    """output 不可用时不加指引——别教一个用不了的姿势。"""
+    monkeypatch.delenv("HERMES_MANAGED_GATEWAY", raising=False)
+    monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
+    _install(monkeypatch, _scope_denied_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f a.txt"}, turn_id="turn_1"
+    )
+    assert blocked is not None
+    assert "agent_output" not in json.loads(blocked)["error"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
+def test_relative_hermes_home_yields_no_readonly_exemption(monkeypatch, tmp_path):
+    """HERMES_HOME 为相对路径时不产生任何豁免：执行侧挂载脚本对相对路径同样
+    不生效，豁免一棵没挂成只读的树就是免检洞——skill 入口按普通附加写入目标
+    保护。"""
+    script = tmp_path / "hermes_home" / "skills" / "suite" / "scripts" / "onboard.py"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    script.parent.mkdir(parents=True)
+    output.mkdir(parents=True)
+    script.write_text("print('ok')")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_HOME", "hermes_home/profiles/agent-a")
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},
+        {"ready": True, "operations": []},
+    )
+
+    allowed = guard.maybe_require_snapshot(
+        "terminal",
+        {"command": f'python3 "{script}"', "workdir": str(output)},
+        turn_id="turn_1",
+    )
+
+    assert allowed is None
+    assert len(rec.requests) == 2
+    assert rec.requests[1]["body"]["paths"] == [str(script)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
+def test_profile_override_hermes_home_drives_readonly_exemption(monkeypatch, tmp_path):
+    """豁免根跟执行侧 run_env 的注入源走：per-profile 的 context override 覆盖
+    进程 env（_inject_hermes_home_env 同序），豁免错树就是免检洞。"""
+    import hermes_constants
+
+    profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
+    script = profile_home / "skills" / "suite" / "scripts" / "onboard.py"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    other_home = tmp_path / "other-home"
+    script.parent.mkdir(parents=True)
+    output.mkdir(parents=True)
+    (other_home / "skills").mkdir(parents=True)
+    script.write_text("print('ok')")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    # 进程 env 指向另一棵树：exec 侧实际挂只读的是 override 指的树。
+    monkeypatch.setenv("HERMES_HOME", str(other_home))
+    rec = _install(monkeypatch, {"ready": True, "operations": []})
+
+    token = hermes_constants.set_hermes_home_override(str(profile_home))
+    try:
+        allowed = guard.maybe_require_snapshot(
+            "terminal",
+            {"command": f'python3 "{script}"', "workdir": str(output)},
+            turn_id="turn_1",
+        )
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+    assert allowed is None
+    assert len(rec.requests) == 1
+    assert rec.requests[0]["body"]["paths"] == [str(output)]
 
 
 def test_quoted_absolute_paths_with_spaces_are_protected(monkeypatch, tmp_path):
@@ -2104,3 +2318,38 @@ def test_registry_dispatch_direct_path_is_gated(monkeypatch, tmp_path):
     out2 = registry.dispatch("write_file", {"path": str(target), "content": "y"})
     assert "error" in json.loads(out2)
     assert target.read_text() == "x"
+
+
+def test_padded_agent_output_alias_is_not_resolved(monkeypatch, tmp_path):
+    """带首尾空白的 workdir 不是别名。
+
+    registry.dispatch 和 terminal_tool 都对 `agent_output` 做精确比较，守卫
+    先 strip 再匹配就会单方面解析成平台 output 目录，而命令仍 `cd` 进那个字面
+    相对路径——快照拍在 A、破坏性命令改的是 B。
+    """
+    output = tmp_path / "output"
+    output.mkdir()
+    session = tmp_path / "session"
+    session.mkdir()
+    monkeypatch.chdir(session)
+    monkeypatch.delenv("HERMES_MANAGED_GATEWAY", raising=False)
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "terminal",
+        {"command": "rm -f x", "workdir": " agent_output "},
+        turn_id="turn_1",
+    )
+
+    protected = rec.requests[0]["body"]["paths"]
+    assert str(output) not in protected
+
+    # 未加空白的原值仍照常解析成 output 目录。
+    rec.requests.clear()
+    guard.maybe_require_snapshot(
+        "terminal",
+        {"command": "rm -f x", "workdir": "agent_output"},
+        turn_id="turn_2",
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(output)]

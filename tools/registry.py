@@ -422,6 +422,37 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
         return None
 
 
+def _resolve_runtime_tool_args(name: str, args: dict) -> dict:
+    """Resolve platform-owned semantic arguments before any execution gate."""
+    if not isinstance(args, dict):
+        return args
+
+    from tools.runtime_workdir import (
+        AGENT_OUTPUT_ARG,
+        AGENT_OUTPUT_WORKDIR,
+        resolve_runtime_workdir,
+    )
+
+    # HR3：AGENT_OUTPUT_ARG 只允许由本函数注入。模型可控入参可能自带同名
+    # key 冒充「平台已解析」，所以所有分支一律先剥（拷贝、不就地改调用方
+    # dict），只有真正解析了 alias 才重新注入。标记走字典带内传递而非对象
+    # 属性，是为了让中间层的 dict(args) 浅拷贝不弄丢它。
+    if AGENT_OUTPUT_ARG in args:
+        args = {k: v for k, v in args.items() if k != AGENT_OUTPUT_ARG}
+
+    if name != "terminal":
+        return args
+
+    workdir = args.get("workdir")
+    if workdir != AGENT_OUTPUT_WORKDIR:
+        return args
+    resolved_workdir = resolve_runtime_workdir(workdir)
+    resolved_args = dict(args)
+    resolved_args[AGENT_OUTPUT_ARG] = True
+    resolved_args["workdir"] = resolved_workdir
+    return resolved_args
+
+
 class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
@@ -818,6 +849,21 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        # Runtime aliases must become one stable physical path before both the
+        # snapshot gate and handler. Resolving twice would allow a concurrent
+        # environment update to snapshot one directory and execute in another.
+        try:
+            args = _resolve_runtime_tool_args(name, args)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "error": str(exc),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+
         # Zettlab file-change protection：registry.dispatch 是所有工具执行的
         # 统一汇聚点，gate 必须在这里——除 model_tools.handle_function_call
         # 外，插件公开 API ctx.dispatch_tool()（slash command / hook）也直连
