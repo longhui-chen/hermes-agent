@@ -720,13 +720,24 @@ class ZetAgentAdapter(APIServerAdapter):
         finally:
             pop_zettlab_browser_session_token(token)
 
-    def _bind_turn_session_context(self, session_id: str) -> None:
+    def _bind_turn_session_context(
+        self,
+        session_id: str,
+        *,
+        session_key: Optional[str] = None,
+    ) -> None:
         """Rebind session contextvars for this turn's agent build.
 
         ZettClaw — 让 cronjob tool 自动设 origin: 把当前 chat session_id 注入
         contextvars，cronjob_tools._origin_from_env 会读到 platform/chat_id
         自动填到 cron job.origin。否则 cron 触发时 OriginStrategy 找不到 chat
         → 走 NewSession 兜底创 phantom session, APP 看不到推送。
+
+        ``session_id`` is the public App chat id persisted into cron origins;
+        ``session_key`` may be the profile-scoped internal multiplex key used
+        by approval/clarify routing.  Keeping them separate prevents an
+        internal ``<profile_home>|<session_id>`` key from leaking into a job
+        that SessionDB can only resolve by its public id.
 
         tokens 不显式 reset — contextvars 是 task-local，task 结束自动清；
         同 task 内多次 _create_agent 后 set 会覆盖前值，符合预期。
@@ -750,7 +761,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 thread_id="",
                 user_id="",
                 user_name="",
-                session_key=session_id,
+                session_key=session_key or session_id,
                 async_delivery=self.supports_async_delivery,
             )
         except Exception as _e:
@@ -2391,11 +2402,13 @@ class ZetAgentAdapter(APIServerAdapter):
         )
 
         # cron origin + async-delivery capability（见 helper docstring）。
-        # local-server sends the stable App session as X-Hermes-Session-Key.
-        # Prefer it over the lineage tip so task-local browser ownership keeps
-        # its zettlab:<user>:<agent> scope after Hermes compaction rotates the
-        # continuation id to api-*.
-        self._bind_turn_session_context(gateway_session_key or session_id)
+        # ZetAgent's _run_agent keeps the public App session in session_id and
+        # passes a profile-scoped multiplex key as gateway_session_key.  Cron
+        # must persist the former while approval/clarify routing uses the latter.
+        self._bind_turn_session_context(
+            session_id or gateway_session_key or "",
+            session_key=gateway_session_key,
+        )
 
         from run_agent import AIAgent
         from gateway.run import (

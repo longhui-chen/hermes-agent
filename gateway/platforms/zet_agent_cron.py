@@ -269,18 +269,49 @@ def _handle_channel_delivery(job: dict, content: str):
     return combined, remaining, True
 
 
+def _is_public_zet_agent_session_id(value: str) -> bool:
+    """Return whether value has the public zettlab user/agent/session shape."""
+    parts = value.split(":", 3)
+    return len(parts) == 4 and parts[0] == "zettlab" and all(parts[1:])
+
+
+def _normalize_zet_agent_chat_id(value: str) -> str:
+    """Strip this profile's internal multiplex prefix from a public chat id.
+
+    Older ZetAgent builds accidentally persisted
+    ``<profile_home>|zettlab:<user>:<agent>:<session>`` as ``origin.chat_id``.
+    Only accept the exact active profile home and a valid public id tail; a
+    foreign/arbitrary prefix remains unchanged so routing stays fail-closed.
+    """
+    raw = str(value or "").strip()
+    if _is_public_zet_agent_session_id(raw):
+        return raw
+    profile_home, separator, candidate = raw.rpartition("|")
+    if not separator or not _is_public_zet_agent_session_id(candidate):
+        return raw
+    try:
+        from hermes_constants import get_hermes_home
+
+        if Path(profile_home) != get_hermes_home():
+            return raw
+    except Exception as exc:
+        _dbg(f"_normalize_zet_agent_chat_id: profile resolution FAILED: {exc!r}")
+        return raw
+    return candidate
+
+
 def _resolve_zet_agent_chat_id(job: dict) -> str:
     origin = job.get("origin") or {}
     if isinstance(origin, dict):
         chat_id = str(origin.get("chat_id", "") or "").strip()
         platform = origin.get("platform")
         if chat_id and (not platform or _is_zet_agent_platform(platform)):
-            return chat_id
+            return _normalize_zet_agent_chat_id(chat_id)
     try:
         import cron.scheduler as _sched
         for target in _sched._resolve_delivery_targets(job):
             if _is_zet_agent_platform(target.get("platform")):
-                return str(target.get("chat_id", "") or "").strip()
+                return _normalize_zet_agent_chat_id(target.get("chat_id", ""))
     except Exception as _e:
         _dbg(f"_resolve_zet_agent_chat_id: target resolution FAILED: {_e!r}")
     return ""
@@ -1354,6 +1385,28 @@ def _try_persist_to_session(
     if not origin_chat_id:
         _dbg(f"_try_persist: job {job_id} no origin.chat_id, skip (deliver={job.get('deliver')!r})")
         return None
+
+    # Self-heal jobs written by the old multiplex binding.  Persistence can
+    # proceed even if the best-effort rewrite fails, because resolution above
+    # already produced the public SessionDB id for this run.
+    origin = job.get("origin") or {}
+    if isinstance(origin, dict):
+        stored_chat_id = str(origin.get("chat_id", "") or "").strip()
+        if stored_chat_id and stored_chat_id != origin_chat_id:
+            normalized = _normalize_zet_agent_chat_id(stored_chat_id)
+            if normalized == origin_chat_id:
+                try:
+                    from cron.jobs import update_job
+
+                    healed_origin = dict(origin)
+                    healed_origin["chat_id"] = origin_chat_id
+                    update_job(job_id, {"origin": healed_origin})
+                    _dbg(
+                        f"_try_persist: healed scoped origin for job {job_id} "
+                        f"to {origin_chat_id}"
+                    )
+                except Exception as exc:
+                    _dbg(f"_try_persist: heal job.origin FAILED: {exc!r}")
 
     try:
         from hermes_state import SessionDB

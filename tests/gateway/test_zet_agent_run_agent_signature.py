@@ -119,8 +119,11 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
     monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
 
+    public_session_id = "zettlab:userA:main:session-1"
+    scoped_session_key = f"/profiles/main|{public_session_id}"
     agent = adapter._create_agent(
-        session_id="session-1",
+        session_id=public_session_id,
+        gateway_session_key=scoped_session_key,
         requested_model="request/model",
         requested_provider="request-provider",
         model_options={"reasoning_effort": "high", "service_tier": "priority"},
@@ -133,6 +136,11 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
+
+    from gateway.session_context import get_session_env
+
+    assert get_session_env("HERMES_SESSION_CHAT_ID") == public_session_id
+    assert get_session_env("HERMES_SESSION_KEY") == scoped_session_key
 
 
 @pytest.mark.asyncio

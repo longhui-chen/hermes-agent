@@ -569,6 +569,29 @@ def test_turn_rebind_keeps_async_delivery_off_without_env(monkeypatch):
         clear_session_vars(tokens)
 
 
+def test_turn_rebind_keeps_public_chat_id_separate_from_profile_scoped_key(
+    monkeypatch,
+):
+    from gateway.session_context import clear_session_vars, get_session_env
+    from tools.cronjob_tools import _origin_from_env
+
+    monkeypatch.delenv(_ADVANCE_ENV, raising=False)
+    adapter = _adapter(monkeypatch)
+    public_session_id = "zettlab:userA:main:session-1"
+    scoped_key = f"/profiles/main|{public_session_id}"
+    tokens = _with_api_server_binding()
+    try:
+        adapter._bind_turn_session_context(
+            public_session_id,
+            session_key=scoped_key,
+        )
+        assert get_session_env("HERMES_SESSION_CHAT_ID") == public_session_id
+        assert get_session_env("HERMES_SESSION_KEY") == scoped_key
+        assert _origin_from_env()["chat_id"] == public_session_id
+    finally:
+        clear_session_vars(tokens)
+
+
 @pytest.mark.asyncio
 async def test_scoped_delivery_propagates_transient(tmp_path):
     """A transient probe failure inside the OWNING profile's scope must
