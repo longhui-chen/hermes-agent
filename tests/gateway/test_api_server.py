@@ -60,6 +60,42 @@ class TestCheckRequirements:
 
 
 class TestToolCompletionPayload:
+    def test_projects_bounded_browser_state_without_raw_snapshot(self):
+        payload = _tool_completion_payload(
+            "call_browser_state",
+            "browser_navigate",
+            json.dumps(
+                {
+                    "success": True,
+                    "url": "https://user:pass@Example.com/account?token=private#fragment",
+                    "title": "Account",
+                    "snapshot": '- heading "Account" [e1]\n- button "Save" [e2]',
+                    "element_count": 2,
+                    "ui_hint": {
+                        "type": "takeover_browser",
+                        "agent_id": "agent-1",
+                        "browser_session_id": "session-1",
+                        "tab_id": "tab-1",
+                    },
+                },
+            ),
+        )
+
+        assert payload["browserState"] == {
+            "version": 1,
+            "source": "navigate",
+            "browserSessionId": "session-1",
+            "url": {"hostname": "example.com", "path": "/account"},
+            "title": "Account",
+            "elements": [
+                {"role": "heading", "label": "Account"},
+                {"role": "button", "label": "Save"},
+            ],
+            "summary": "Account",
+            "elementCount": 2,
+        }
+        assert "snapshot" not in payload
+
     def test_emits_only_bounded_takeover_hint_for_live_clients(self):
         payload = _tool_completion_payload(
             "call_browser_1",
@@ -4592,3 +4628,74 @@ class TestTakeoverUIHintOverSSE:
             "browser_session_id": "chat-1",
             "tab_id": "tab-agent-1",
         }
+
+    @pytest.mark.asyncio
+    async def test_browser_state_preview_reaches_the_sse_stream(self, adapter):
+        app = _create_app(adapter)
+        result = json.dumps(
+            {
+                "success": True,
+                "url": "https://example.com/login?return_to=private",
+                "title": "Sign in",
+                "snapshot": '- heading "Sign in" [e1]\n- textbox "Email" [e2]: private@example.com',
+                "element_count": 2,
+            }
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+
+            async def _mock_run_agent(**kwargs):
+                start = kwargs.get("tool_start_callback")
+                complete = kwargs.get("tool_complete_callback")
+                if start:
+                    start(
+                        "call_state",
+                        "browser_navigate",
+                        {"url": "https://example.com/login"},
+                    )
+                if complete:
+                    complete(
+                        "call_state",
+                        "browser_navigate",
+                        {"url": "https://example.com/login"},
+                        result,
+                    )
+                return (
+                    {"final_response": "Opened.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(
+                    adapter, "_response_format_transport_error", return_value=None
+                ),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "open login"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        events = [
+            json.loads(line[len("data: ") :])
+            for block in body.split("\n\n")
+            if "event: hermes.tool.progress" in block
+            for line in block.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed = [e for e in events if e.get("status") == "completed"]
+        assert len(completed) == 1
+        state = completed[0]["browserState"]
+        assert state["url"] == {"hostname": "example.com", "path": "/login"}
+        assert state["elements"] == [
+            {"role": "heading", "label": "Sign in"},
+            {"role": "textbox", "label": "Email"},
+        ]
+        assert "private@example.com" not in json.dumps(completed[0])
+        assert "snapshot" not in completed[0]
