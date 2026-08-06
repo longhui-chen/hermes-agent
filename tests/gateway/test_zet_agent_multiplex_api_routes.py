@@ -936,6 +936,59 @@ async def test_prefixed_responses_holds_profile_lease_until_agent_finishes(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_responses_worker_keeps_profile_lease_until_thread_exits(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "cancelled-responses-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    with adapter._profile_api_scope("coder"):
+        agent_task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancelled-responses-session",
+            )
+        )
+    assert await asyncio.to_thread(started.wait, 2)
+
+    agent_task.cancel()
+    await asyncio.sleep(0)
+    assert not agent_task.done()
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+    async with TestClient(TestServer(app)) as cli:
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert blocked.status == 409
+        assert (await blocked.json())["active_api_runs"] == 1
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await agent_task
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
 async def test_prefixed_runs_holds_profile_lease_until_background_task_finishes(
     profile_homes,
     monkeypatch,
@@ -994,6 +1047,127 @@ async def test_prefixed_runs_holds_profile_lease_until_background_task_finishes(
         assert run_id not in adapter._active_run_tasks
 
     assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runs_worker_keeps_profile_lease_until_thread_exits(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "cancelled-runs-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    unregistered_approvals = []
+    monkeypatch.setattr(
+        approval,
+        "unregister_gateway_notify",
+        lambda session_key: unregistered_approvals.append(session_key),
+    )
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/runs",
+        adapter._profile_handler(adapter._handle_runs),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        started_response = await cli.post(
+            "/p/coder/v1/runs",
+            json={"input": "hello", "session_id": "cancelled-public-session"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert started_response.status == 202
+        run_id = (await started_response.json())["run_id"]
+        assert await asyncio.to_thread(started.wait, 2)
+
+        run_task = adapter._active_run_tasks[run_id]
+        run_task.cancel()
+        await asyncio.sleep(0)
+        assert not run_task.done()
+        assert run_id in unregistered_approvals
+        assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert blocked.status == 409
+        assert (await blocked.json())["active_api_runs"] == 1
+
+        release.set()
+        for _ in range(100):
+            if run_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert run_task.done()
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_profile_unload_barrier_rejects_new_agent_request_during_teardown(
+    profile_homes,
+    monkeypatch,
+):
+    unload_entered = asyncio.Event()
+    release_unload = asyncio.Event()
+
+    class FakeRunner:
+        async def unload_profile_runtime(self, profile):
+            assert profile == "coder"
+            unload_entered.set()
+            await release_unload.wait()
+            return {"evicted_sessions": 0, "disconnected_adapters": 0}
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = FakeRunner()
+    monkeypatch.setattr(
+        adapter,
+        "_create_agent",
+        lambda **_kwargs: pytest.fail("blocked request constructed an agent"),
+    )
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/responses",
+        adapter._profile_handler(adapter._handle_responses),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        unload_task = asyncio.create_task(
+            cli.post(
+                "/p/coder/v1/profile/unload",
+                headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+            )
+        )
+        await asyncio.wait_for(unload_entered.wait(), timeout=2)
+        assert adapter._runtime_import_profile_is_blocked(profile_homes["coder"])
+
+        rejected = await cli.post(
+            "/p/coder/v1/responses",
+            json={"input": "must not enter"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        rejected_data = await rejected.json()
+        assert rejected.status == 409
+        assert rejected_data["error"]["code"] == "profile_unloading"
+
+        release_unload.set()
+        unloaded = await unload_task
+        assert unloaded.status == 200
 
 
 @pytest.mark.asyncio

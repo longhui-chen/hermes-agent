@@ -1588,7 +1588,44 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
-_api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
+async def _run_in_executor_with_completion_barrier(
+    loop, func, /, *args, on_cancel=None
+):
+    """Preserve cancellation without outliving executor-thread side effects.
+
+    Cancelling the asyncio Future returned by ``run_in_executor`` does not
+    stop its worker thread.  Agent runs keep profile-owned runtime and DB
+    objects live, so their caller must not release the profile lease until the
+    worker has truly exited.  Repeated cancellation remains sticky while the
+    completion barrier waits, and the original cancellation is re-raised once
+    the worker result (or exception) has been observed.
+    """
+    worker = loop.run_in_executor(None, func, *args)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        if on_cancel is not None:
+            try:
+                on_cancel()
+            except Exception:
+                logger.debug(
+                    "Executor cancellation release hook failed", exc_info=True
+                )
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            worker.result()
+        except BaseException:
+            pass
+        raise cancelled
+
+
+_api_agent_request_reservation: ContextVar[Optional[dict[str, Any]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
 
@@ -1611,7 +1648,26 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        reservation = {"active": True}
+        # Acquire the profile lease in the same non-awaiting admission window
+        # as the drain reservation.  ZetAgent overrides this operation with
+        # the same lock used to mark a profile unloading, closing the
+        # check-then-teardown race between /v1/profile/unload and a new API
+        # turn.  Base API-server adapters never reject this reservation.
+        profile_run_key = self._begin_profile_chat_run()
+        if not profile_run_key:
+            return web.json_response(
+                _openai_error(
+                    "Profile is unloading; retry after it has been reloaded.",
+                    code="profile_unloading",
+                ),
+                status=409,
+                headers={"Retry-After": "1"},
+            )
+        reservation = {
+            "active": True,
+            "profile_run_key": profile_run_key,
+            "profile_run_transferred": False,
+        }
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
         try:
@@ -1620,6 +1676,8 @@ def _admit_api_agent_request(handler):
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+            if not reservation["profile_run_transferred"]:
+                self._end_profile_chat_run(profile_run_key)
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -2042,6 +2100,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if reservation and reservation["active"]:
             reservation["active"] = False
             self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+
+    def _claim_admitted_profile_run(self) -> str:
+        """Transfer the request's profile lease to its real agent lifecycle."""
+        reservation = _api_agent_request_reservation.get()
+        if reservation and not reservation.get("profile_run_transferred"):
+            profile_run_key = str(reservation.get("profile_run_key") or "")
+            if profile_run_key:
+                reservation["profile_run_transferred"] = True
+                return profile_run_key
+
+        # Direct/internal callers do not pass through the HTTP admission
+        # decorator.  Preserve their old behavior while still respecting a
+        # multiplex adapter's unload barrier.
+        profile_run_key = self._begin_profile_chat_run()
+        if not profile_run_key:
+            raise RuntimeError("profile is unloading")
+        return profile_run_key
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
@@ -8101,14 +8176,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     set_zettlab_turn_id("")
                     set_zettlab_connector_route_capability("")
 
-        profile_run_key = self._begin_profile_chat_run()
+        profile_run_key = self._claim_admitted_profile_run()
         self._activate_admitted_request()
         from contextvars import copy_context
 
         ctx = copy_context()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, ctx.run, _run)
+            return await _run_in_executor_with_completion_barrier(
+                loop, ctx.run, _run
+            )
         finally:
             self._inflight_agent_runs -= 1
             self._end_profile_chat_run(profile_run_key)
@@ -8367,7 +8444,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
-        profile_run_key = self._begin_profile_chat_run()
+        profile_run_key = self._claim_admitted_profile_run()
 
         def _release_profile_run() -> None:
             nonlocal profile_run_key
@@ -8512,7 +8589,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                def _release_cancelled_approval_wait() -> None:
+                    # An executor thread may be blocked in an approval Event.
+                    # Release that wait before the cancellation barrier starts
+                    # waiting for the worker itself; otherwise cancellation
+                    # and profile unload can deadlock each other.
+                    from tools.approval import unregister_gateway_notify
+
+                    unregister_gateway_notify(approval_session_key)
+
+                result, usage = await _run_in_executor_with_completion_barrier(
+                    asyncio.get_running_loop(),
+                    _run_sync,
+                    on_cancel=_release_cancelled_approval_wait,
+                )
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -8615,11 +8705,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
-                # If the asyncio wrapper is cancelled (for example via
-                # /stop), the executor thread can still be blocked waiting
-                # on an approval Event.  Unregistering here releases those
-                # waits immediately; the in-thread unregister is harmlessly
-                # idempotent on normal completion.
+                # The completion barrier has observed the executor thread's
+                # real exit before cleanup reaches this point.  The in-thread
+                # unregister and the cancellation hook above are idempotent.
                 try:
                     from tools.approval import unregister_gateway_notify
 

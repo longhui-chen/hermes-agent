@@ -558,6 +558,38 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return self._api_key
 
+    def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
+        """Atomically enter a profile unless unload already owns its barrier."""
+        key = self._profile_home_key(profile_home)
+        if not key:
+            return ""
+        with self._runtime_import_operation_lock:
+            if self._runtime_import_barriers_locked(key):
+                return ""
+            self._active_chat_runs_by_home[key] = (
+                self._active_chat_runs_by_home.get(key, 0) + 1
+            )
+        return key
+
+    def _end_profile_chat_run(self, profile_home_key: str) -> None:
+        if not profile_home_key:
+            return
+        with self._runtime_import_operation_lock:
+            remaining = (
+                self._active_chat_runs_by_home.get(profile_home_key, 0) - 1
+            )
+            if remaining > 0:
+                self._active_chat_runs_by_home[profile_home_key] = remaining
+            else:
+                self._active_chat_runs_by_home.pop(profile_home_key, None)
+
+    def _active_profile_chat_runs(self, profile_home: Optional[Any] = None) -> int:
+        key = self._profile_home_key(profile_home)
+        if not key:
+            return 0
+        with self._runtime_import_operation_lock:
+            return int(self._active_chat_runs_by_home.get(key, 0) or 0)
+
     @staticmethod
     def _profile_directory_identity(key: str) -> Optional[tuple[int, int]]:
         try:
@@ -612,19 +644,20 @@ class ZetAgentAdapter(APIServerAdapter):
 
     def _block_runtime_import_profile(
         self, profile_home: Optional[Any]
-    ) -> tuple[int, Optional[int]]:
+    ) -> tuple[int, int, Optional[int]]:
         key = self._profile_home_key(profile_home)
         with self._runtime_import_operation_lock:
-            active = int(self._runtime_import_operations.get(key, 0) or 0)
-            if active:
-                return active, None
+            active_imports = int(self._runtime_import_operations.get(key, 0) or 0)
+            active_api_runs = int(self._active_chat_runs_by_home.get(key, 0) or 0)
+            if active_imports or active_api_runs:
+                return active_imports, active_api_runs, None
             self._runtime_import_barriers_locked(key)
             self._runtime_import_barrier_generation += 1
             owner = self._runtime_import_barrier_generation
             self._runtime_import_unload_barriers.setdefault(key, {})[owner] = (
                 self._profile_directory_identity(key), False
             )
-            return 0, owner
+            return 0, 0, owner
 
     def _complete_runtime_import_profile_unload(
         self, profile_home: Optional[Any], owner: Optional[int]
@@ -6579,9 +6612,21 @@ class ZetAgentAdapter(APIServerAdapter):
                 },
                 status=409,
             )
-        active_imports, unload_barrier_owner = self._block_runtime_import_profile(
-            profile_home
-        )
+        (
+            active_imports,
+            active_api_runs,
+            unload_barrier_owner,
+        ) = self._block_runtime_import_profile(profile_home)
+        if active_api_runs:
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": active_api_runs,
+                    "active_api_runs": active_api_runs,
+                },
+                status=409,
+            )
         if active_imports:
             return web.json_response(
                 {

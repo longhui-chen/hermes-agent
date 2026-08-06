@@ -1000,10 +1000,11 @@ def _load_nemo_relay() -> Any:
 
 
 def _core_relay_enabled() -> bool:
-    """Keep upstream Relay behavior unless an embedding explicitly opts out."""
+    """Select the Relay default for upstream and managed-device embeddings."""
     raw = os.environ.get("HERMES_NEMO_RELAY_CORE_ENABLED")
     if raw is None:
-        return True
+        managed_gateway = os.environ.get("HERMES_MANAGED_GATEWAY", "")
+        return managed_gateway.strip().lower() not in {"1", "true", "yes", "on"}
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 

@@ -45,7 +45,6 @@ export HERMES_BUNDLED_LOCALES="$APP_ROOT/lib/hermes-agent/locales"
 export HERMES_LAZY_INSTALL_TARGET="$APP_BASE/data/lazy-packages"
 export HERMES_MANAGED_GATEWAY=1
 export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service
-export HERMES_NEMO_RELAY_CORE_ENABLED="${HERMES_NEMO_RELAY_CORE_ENABLED:-false}"
 unset HERMES_MANAGED_CGROUP_ROOT
 
 # systemd EnvironmentFile values override Environment= values regardless of

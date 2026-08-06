@@ -15,7 +15,6 @@ Environment=HERMES_BUNDLED_PLUGINS=__APP_BASE__/current/lib/hermes-agent/plugins
 Environment=HERMES_BUNDLED_LOCALES=__APP_BASE__/current/lib/hermes-agent/locales
 Environment=HERMES_MANAGED_GATEWAY=1
 Environment=HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service
-Environment=HERMES_NEMO_RELAY_CORE_ENABLED=false
 Environment=PATH=/zettos/main/apps/com.zettlab.local-server/current/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=GATEWAY_MULTIPLEX_PROFILES=true
 Environment=ZET_AGENT_ENABLED=true

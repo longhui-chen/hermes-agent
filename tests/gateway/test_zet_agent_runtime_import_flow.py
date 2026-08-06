@@ -884,8 +884,11 @@ def test_runtime_import_barrier_allows_only_a_recreated_profile_generation(tmp_p
     profile_home.mkdir(parents=True)
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
 
-    active, owner = adapter._block_runtime_import_profile(profile_home)
-    assert active == 0
+    active_imports, active_api_runs, owner = adapter._block_runtime_import_profile(
+        profile_home
+    )
+    assert active_imports == 0
+    assert active_api_runs == 0
     adapter._complete_runtime_import_profile_unload(profile_home, owner)
     assert adapter._begin_runtime_import_operation(profile_home) is None
     profile_home.rmdir()
