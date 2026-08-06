@@ -35,19 +35,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 RuntimeDirectory=zettlab-claw
 RuntimeDirectoryMode=0755
-# Only the root gateway audits process UIDs before reserving an ephemeral worker
-# identity. CAP_SYS_PTRACE lets that broker see hidden procfs entries; every
-# model-controlled child drops its full capability bounding set before exec.
+# CAP_SYS_PTRACE lets the root service audit hidden procfs entries.
 ProtectProc=invisible
-ProtectSystem=strict
 CapabilityBoundingSet=~CAP_SYS_ADMIN
 Delegate=pids memory
-ReadOnlyPaths=/zettos/main/apps
-ReadWritePaths=__APP_BASE__/data
-ReadWritePaths=-/volume1/subvol/agents/data
-ReadWritePaths=-/volume1/agents/data
-ReadOnlyPaths=-/volume1/subvol/agents/zettlab-presets
-ReadOnlyPaths=-/volume1/agents/zettlab-presets
 
 [Install]
 WantedBy=multi-user.target

@@ -557,12 +557,10 @@ def _resolve_write_path(path: Any, task_id: str) -> str:
 def _managed_effective_workdir(cwd: str) -> str:
     """把候选 cwd 过一遍执行侧同一个解析器，返回命令真正会跑的目录。
 
-    必须调用 ``_managed_terminal_cwd`` 用的那个函数，而不是在兜底链里另插一
-    层：终端的默认 cwd 是硬编码的 ``/root``（0700 root），受管身份穿不进去，
-    执行侧本来就会回退到平台 output 目录。守卫若按 ``/root`` 请求快照，就会被
-    scope 判定 403、把所有非只读命令整条拦死——根因是锚点无主，不是该放行。
-    两边各自推导则会漂移成「快照拍在 A、命令跑在 B」，那正是本守卫要防的裂缝。
-    非受管 / Windows / 模块缺失时原样返回，绝不抛。
+    必须调用 ``_managed_terminal_cwd`` 使用的同一个函数，确保已存在的 cwd 继续
+    作为 root 命令和恢复点的共同锚点，不存在的 cwd 才回退到平台 output。两边
+    各自推导会漂移成「快照拍在 A、命令跑在 B」，那正是本守卫要防的裂缝。非
+    受管 / Windows / 模块缺失时原样返回，绝不抛。
     """
     # 只有 local backend 的命令才会经过 _managed_terminal_cwd。容器 / 远端
     # backend 下套用本机解析，会把已映射的容器 cwd 判成不可用而改锚到本机
@@ -952,70 +950,11 @@ def _command_is_probably_readonly(command: str) -> bool:
     return True
 
 
-def _managed_readonly_python_sources(text: str) -> set[str]:
-    """Return active-profile Python entrypoints mounted read-only for terminal.
-
-    Only the first script operand is exempted. Every later absolute argument is
-    still a possible write target and remains covered by ancillary snapshots.
-    """
-
-    if (
-        os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
-        or _terminal_env_type() != "local"
-    ):
-        return set()
-    # 豁免根必须与执行侧只读挂载同源：挂载脚本读的是 backend run_env 里的
-    # HERMES_HOME，其注入顺序是 per-profile 的 context override 覆盖进程 env
-    # （_inject_hermes_home_env）。这里按同一顺序取值；get_hermes_home() 只
-    # 作末位兜底——它在两者都缺时会退回平台默认目录，而那棵树从未被挂成只
-    # 读，按它豁免就是免检洞。相对路径在挂载侧同样不生效，一律不豁免。
-    hermes_home = ""
-    try:
-        from hermes_constants import get_hermes_home_override
-
-        hermes_home = str(get_hermes_home_override() or "").strip()
-    except Exception:
-        hermes_home = ""
-    if not hermes_home:
-        try:
-            hermes_home = _scoped_env("HERMES_HOME", "").strip()
-        except _UnresolvableScope:
-            return set()
-    if not hermes_home:
-        try:
-            from hermes_constants import get_hermes_home
-
-            hermes_home = str(get_hermes_home())
-        except Exception:
-            return set()
-    if not hermes_home or not os.path.isabs(hermes_home):
-        return set()
-    try:
-        from pathlib import Path
-
-        skills_root = (Path(hermes_home) / "skills").resolve(strict=True)
-    except (OSError, RuntimeError):
-        return set()
-
-    try:
-        from tools.environments.local import _managed_python_skill_sources
-
-        return {
-            str(resolved)
-            for _lexical, resolved in _managed_python_skill_sources(
-                text, skills_root.parent
-            )
-        }
-    except Exception:
-        return set()
-
-
 def _ancillary_abs_paths(
     text: str,
     primary: list[str],
     base_dir: str = "",
     *,
-    readonly_sources: Optional[set[str]] = None,
     include_missing: bool = False,
 ) -> list[str]:
     """从命令 / 脚本文本里抽出**已存在**的写入目标，作为 cwd 之外的附加保护。
@@ -1137,7 +1076,6 @@ def _ancillary_abs_paths(
             candidates.append(tok)
     out: list[str] = []
     seen = set(primary)
-    readonly = {os.path.realpath(path) for path in (readonly_sources or set())}
     for cand in candidates:
         p = _normalize_pathish(cand, base_dir)
         if p:
@@ -1173,8 +1111,6 @@ def _ancillary_abs_paths(
             if not item or item in seen:
                 continue
             if not include_missing and not os.path.lexists(item):
-                continue
-            if os.path.realpath(item) in readonly:
                 continue
             seen.add(item)
             out.append(item)
@@ -1852,14 +1788,10 @@ def _ancillary_targets(
     if tool_name not in ("terminal", "execute_code"):
         return []
     text = str(arguments.get("command") or arguments.get("code") or "")
-    readonly_sources = (
-        _managed_readonly_python_sources(text) if tool_name == "terminal" else set()
-    )
     return _ancillary_abs_paths(
         text,
         exclude,
         base_dir=_terminal_workdir(arguments, task),
-        readonly_sources=readonly_sources,
         include_missing=include_missing,
     )
 

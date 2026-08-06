@@ -935,15 +935,10 @@ def test_absolute_targets_outside_cwd_get_ancillary_protection(monkeypatch, tmp_
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
-def test_managed_python_skill_entry_is_not_treated_as_a_write_target(
+def test_managed_python_skill_entry_remains_protected(
     monkeypatch, tmp_path
 ):
-    """A managed terminal may read its active profile's skill entrypoint.
-
-    The cwd still gets the normal recovery point, while the read-only Python
-    source is omitted from ancillary write targets so an out-of-scope skill
-    path cannot reject an otherwise valid command.
-    """
+    """Root terminal commands can mutate skill sources, so protect them too."""
     profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
     script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
     output = tmp_path / "agents" / "data" / "agent-a" / "output"
@@ -961,15 +956,16 @@ def test_managed_python_skill_entry_is_not_treated_as_a_write_target(
     )
 
     assert allowed is None
-    assert len(rec.requests) == 1
+    assert len(rec.requests) == 2
     assert rec.requests[0]["body"]["paths"] == [str(output)]
+    assert rec.requests[1]["body"]["paths"] == [str(script)]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
-def test_managed_python_skill_user_file_argument_remains_protected(
+def test_managed_python_skill_and_user_file_arguments_remain_protected(
     monkeypatch, tmp_path
 ):
-    """Only the interpreter source is read-only; later path args may be writes."""
+    """The writable skill source and later file arguments are both targets."""
     profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
     script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
     output = tmp_path / "agents" / "data" / "agent-a" / "output"
@@ -998,7 +994,7 @@ def test_managed_python_skill_user_file_argument_remains_protected(
 
     assert allowed is None
     assert len(rec.requests) == 2
-    assert rec.requests[1]["body"]["paths"] == [str(target)]
+    assert rec.requests[1]["body"]["paths"] == [str(script), str(target)]
 
 
 def test_ancillary_ensure_failure_does_not_block(monkeypatch, tmp_path):
@@ -1172,10 +1168,8 @@ def test_strict_execute_code_skips_out_of_scope_but_requires_in_scope(monkeypatc
     assert rec.requests[-1]["url"].endswith("/agent-protection/finish")
 
 
-def test_managed_gateway_fallback_protects_platform_output_dir(monkeypatch, tmp_path):
-    """受管网关下无显式 workdir、无 session cwd 时，保护目标必须是平台 output
-    目录（与执行侧 managed_fallback_cwd 同源），而不是进程 cwd / HOME——板上
-    那是 /root，永远 403、整条命令 fail-closed。"""
+def test_managed_gateway_keeps_existing_root_workdir(monkeypatch, tmp_path):
+    """受管命令继承服务 root；已存在的进程 cwd 同时是执行和保护目标。"""
     local_mod = pytest.importorskip("tools.environments.local")
     monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
     output = tmp_path / "agents-data" / "output"
@@ -1187,7 +1181,7 @@ def test_managed_gateway_fallback_protects_platform_output_dir(monkeypatch, tmp_
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "rm -f x"}, turn_id="turn_1"
     ) is None
-    assert rec.requests[0]["body"]["paths"] == [str(output)]
+    assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
 
 
 def test_managed_gateway_without_output_keeps_env_cwd_fallback(monkeypatch, tmp_path):
@@ -1204,10 +1198,8 @@ def test_managed_gateway_without_output_keeps_env_cwd_fallback(monkeypatch, tmp_
     assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
 
 
-def test_relative_hermes_home_yields_no_readonly_exemption(monkeypatch, tmp_path):
-    """HERMES_HOME 为相对路径时不产生任何豁免：执行侧挂载脚本对相对路径同样
-    不生效，豁免一棵没挂成只读的树就是免检洞——skill 入口按普通附加写入目标
-    保护。"""
+def test_relative_hermes_home_does_not_exempt_skill_source(monkeypatch, tmp_path):
+    """HERMES_HOME 的形态不影响可写 skill 入口的附加保护。"""
     script = tmp_path / "hermes_home" / "skills" / "suite" / "scripts" / "onboard.py"
     output = tmp_path / "agents" / "data" / "agent-a" / "output"
     script.parent.mkdir(parents=True)
@@ -1233,9 +1225,10 @@ def test_relative_hermes_home_yields_no_readonly_exemption(monkeypatch, tmp_path
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
-def test_profile_override_hermes_home_drives_readonly_exemption(monkeypatch, tmp_path):
-    """豁免根跟执行侧 run_env 的注入源走：per-profile 的 context override 覆盖
-    进程 env（_inject_hermes_home_env 同序），豁免错树就是免检洞。"""
+def test_profile_override_does_not_exempt_writable_skill_source(
+    monkeypatch, tmp_path
+):
+    """Profile override 不能把 root 命令可写的 skill source 排除在保护外。"""
     import hermes_constants
 
     profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
@@ -1247,7 +1240,7 @@ def test_profile_override_hermes_home_drives_readonly_exemption(monkeypatch, tmp
     (other_home / "skills").mkdir(parents=True)
     script.write_text("print('ok')")
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    # 进程 env 指向另一棵树：exec 侧实际挂只读的是 override 指的树。
+    # 进程 env 指向另一棵树，override 指向实际 profile。
     monkeypatch.setenv("HERMES_HOME", str(other_home))
     rec = _install(monkeypatch, {"ready": True, "operations": []})
 
@@ -1262,8 +1255,9 @@ def test_profile_override_hermes_home_drives_readonly_exemption(monkeypatch, tmp
         hermes_constants.reset_hermes_home_override(token)
 
     assert allowed is None
-    assert len(rec.requests) == 1
+    assert len(rec.requests) == 2
     assert rec.requests[0]["body"]["paths"] == [str(output)]
+    assert rec.requests[1]["body"]["paths"] == [str(script)]
 
 
 def test_quoted_absolute_paths_with_spaces_are_protected(monkeypatch, tmp_path):
@@ -3039,5 +3033,4 @@ def test_ssh_backend_is_remote_even_for_loopback_host(monkeypatch, tmp_path):
         # #18：远端后端不再阻断，断言改为「放行 + 归因 remote_backend + 零请求」。
         assert_allowed_unprotected(out, rec, "remote_backend")
         assert rec.requests == [], f"ssh({host}) 不该向本机 ensure"
-
 
