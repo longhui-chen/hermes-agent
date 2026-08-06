@@ -5754,7 +5754,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    event_data = json.dumps(item[1])
+                    # Keep browserState's wire representation identical to its
+                    # UTF-8 byte-budget calculation.  ASCII escaping can triple
+                    # CJK text and turn a bounded preview into an oversized SSE.
+                    event_data = json.dumps(
+                        item[1], ensure_ascii=False, separators=(",", ":")
+                    )
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )

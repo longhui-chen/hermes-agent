@@ -28,6 +28,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.browser_state_preview import MAX_PREVIEW_BYTES
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import (
@@ -4654,8 +4655,8 @@ class TestTakeoverUIHintOverSSE:
             {
                 "success": True,
                 "url": "https://example.com/login?return_to=private",
-                "title": "Sign \ud800in",
-                "snapshot": '- heading "Sign in" [e1]\n- textbox "Email" [e2]: private@example.com',
+                "title": "Sign \ud800in 状态🦞",
+                "snapshot": '- heading "Sign in 状态🦞" [e1]\n- textbox "Email" [e2]: private@example.com',
                 "element_count": 2,
             }
         )
@@ -4700,22 +4701,32 @@ class TestTakeoverUIHintOverSSE:
                 assert resp.status == 200
                 body = await resp.text()
 
-        events = [
-            json.loads(line[len("data: ") :])
+        event_data = [
+            line[len("data: ") :]
             for block in body.split("\n\n")
             if "event: hermes.tool.progress" in block
             for line in block.splitlines()
             if line.startswith("data: ")
         ]
+        events = [json.loads(data) for data in event_data]
         completed = [e for e in events if e.get("status") == "completed"]
         assert len(completed) == 1
         state = completed[0]["browserState"]
         assert state["url"] == {"hostname": "example.com"}
-        assert state["title"] == "Sign ?in"
+        assert state["title"] == "Sign ?in 状态🦞"
         assert state["truncated"] is True
         assert state["elements"] == [
-            {"role": "heading", "label": "Sign in"},
+            {"role": "heading", "label": "Sign in 状态🦞"},
             {"role": "textbox", "label": "Email"},
         ]
+        completed_wire = next(
+            data for data in event_data if json.loads(data).get("status") == "completed"
+        )
+        state_wire = json.dumps(
+            state, ensure_ascii=False, separators=(",", ":")
+        )
+        assert state_wire in completed_wire
+        assert "状态🦞" in completed_wire
+        assert len(state_wire.encode("utf-8")) <= MAX_PREVIEW_BYTES
         assert "private@example.com" not in json.dumps(completed[0])
         assert "snapshot" not in completed[0]
