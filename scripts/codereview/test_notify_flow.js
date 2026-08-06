@@ -43,6 +43,7 @@ const {
   encodeThreadState,
   enqueueEventRef,
   enqueueOfficialCodexEvent,
+  notifyFromCheckRun,
   consumeCodexWorkflowRunWakeup,
   findDeliveryInFeishuHistory,
   isTrustedMarkerComment,
@@ -62,6 +63,9 @@ const {
   withGithubRetry,
   githubGraphqlWithTimeout,
   MAX_GITHUB_RETRY_DELAY_MS,
+  FEISHU_RATE_LIMIT_MAX_ATTEMPTS,
+  FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS,
+  FEISHU_RATE_LIMIT_MAX_RETRY_AFTER_MS,
   MAX_RESOLVED_EVENT_REFS,
   CODEX_CAPTURE_WORKFLOW_NAME,
   CODEX_CAPTURE_WORKFLOW_PATH,
@@ -78,8 +82,16 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function response(json, status = 200) {
-  return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(json) };
+function response(json, status = 200, headers = {}) {
+  const normalizedHeaders = Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [name.toLowerCase(), String(value)]),
+  );
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => normalizedHeaders[String(name).toLowerCase()] || null },
+    text: async () => JSON.stringify(json),
+  };
 }
 
 function makeCore() {
@@ -133,7 +145,8 @@ function makeReview(id = 701) {
 }
 
 function makeGithub({
-  comments = [], checks = new Map(), reviews = new Map(), reviewComments = [], associated = [], openPulls = [],
+  comments = [], checks = new Map(), reviews = new Map(), reviewComments = [], associated = null, openPulls = [],
+  associationFailure = null,
   workflowRun = null, workflowPath = CODEX_CAPTURE_WORKFLOW_PATH,
   dispatchFails = false, callOrder = null,
   checkpointCreateLosesResponse = false,
@@ -168,8 +181,11 @@ function makeGithub({
   const github = {
     dispatches,
     pullListPages: [],
+    prReads: [],
     commentReads: 0,
     checkReads: new Map(),
+    reviewReads: [],
+    associationReads: [],
     failThreadRelease: threadReleaseFails,
     graphql: async (_query, variables) => {
       assert(variables.request && variables.request.signal instanceof AbortSignal,
@@ -206,7 +222,22 @@ function makeGithub({
       repos: {
         listPullRequestsAssociatedWithCommit: async (options) => {
           assert(options.request.timeout === GITHUB_REQUEST_TIMEOUT_MS, 'associated API timeout');
-          return { data: associated };
+          github.associationReads.push(options.commit_sha);
+          if (associationFailure) {
+            const error = new Error(associationFailure === 'timeout'
+              ? 'simulated association timeout' : 'simulated association 503');
+            error.status = associationFailure === 'timeout' ? 0 : 503;
+            if (associationFailure === 'timeout') error.name = 'AbortError';
+            error.response = { headers: { 'Retry-After': '0' } };
+            throw error;
+          }
+          if (associated !== null) return { data: associated };
+          const unique = new Map();
+          for (const checkRun of checks.values()) {
+            if (checkRun.head_sha !== options.commit_sha) continue;
+            for (const pr of checkRun.pull_requests || []) unique.set(Number(pr.number), pr);
+          }
+          return { data: [...unique.values()] };
         },
         createDispatchEvent: async (options) => {
           assert(options.request.timeout === GITHUB_REQUEST_TIMEOUT_MS, 'dispatch API timeout');
@@ -227,16 +258,22 @@ function makeGithub({
           const start = (Number(options.page || 1) - 1) * Number(options.per_page || openPulls.length || 1);
           return { data: openPulls.slice(start, start + Number(options.per_page || openPulls.length || 1)) };
         },
-        get: async (options) => ({ data: {
-          number: options.pull_number,
-          title: '测试 PR',
-          html_url: `https://github.com/zettlab/demo/pull/${options.pull_number}`,
-          user: { login: 'owner' },
-          base: { ref: 'main' },
-          head: { ref: 'feature/test', sha: HEAD },
-          state: 'open',
-        } }),
-        getReview: async (options) => ({ data: reviews.get(String(options.review_id)) }),
+        get: async (options) => {
+          github.prReads.push(options.pull_number);
+          return { data: {
+            number: options.pull_number,
+            title: '测试 PR',
+            html_url: `https://github.com/zettlab/demo/pull/${options.pull_number}`,
+            user: { login: 'owner' },
+            base: { ref: 'main' },
+            head: { ref: 'feature/test', sha: HEAD },
+            state: 'open',
+          } };
+        },
+        getReview: async (options) => {
+          github.reviewReads.push({ pullNumber: options.pull_number, reviewId: options.review_id });
+          return { data: reviews.get(String(options.review_id)) };
+        },
         listReviews: async (options) => {
           if (callOrder) callOrder.push(`reviews:${options.page || 1}`);
           const items = [...reviews.values()];
@@ -362,6 +399,9 @@ async function main() {
     assert(HISTORY_MAX_ATTEMPTS === 8 && HISTORY_MAX_AGE_MS === 24 * 60 * 60 * 1000,
       'history 恢复以 8 次或 24h 为硬上限');
     assert(DEFINITE_SEND_MAX_ATTEMPTS === 3, 'definitely-not-sent 最多发送三次');
+    assert(FEISHU_RATE_LIMIT_MAX_ATTEMPTS === 3 && FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS === 30000 &&
+      FEISHU_RATE_LIMIT_MAX_RETRY_AFTER_MS === 60 * 60 * 1000,
+    'Feishu 429 同请求最多3次、单轮最多等30s，服务端Retry-After持久化上限1h');
     const retryError = new Error('limited');
     retryError.response = { headers: { 'Retry-After': '90' } };
     assert(parseRetryAfterMs(retryError, 0) === MAX_GITHUB_RETRY_DELAY_MS, 'Retry-After clamp 30s');
@@ -473,7 +513,10 @@ async function main() {
       check_run: makeCheck(502),
     };
     const officialComments = [];
-    const officialGithub = makeGithub({ comments: officialComments });
+    const officialGithub = makeGithub({
+      comments: officialComments,
+      checks: new Map([[String(eventPayload.check_run.id), eventPayload.check_run]]),
+    });
     await enqueueOfficialCodexEvent({
       github: officialGithub,
       context: context('check_run', eventPayload),
@@ -484,7 +527,10 @@ async function main() {
 
     const multiCheck = makeCheck(550);
     multiCheck.pull_requests = [{ number: 42 }, { number: 43 }];
-    const multiGithub = makeGithub({ associated: [{ number: 43 }, { number: 44 }] });
+    const multiGithub = makeGithub({
+      checks: new Map([['550', multiCheck]]),
+      associated: [{ number: 42 }, { number: 43 }, { number: 42 }, { number: 44 }],
+    });
     const multiCore = makeCore();
     const multiRefs = await resolveOfficialCodexEventRefs(
       multiGithub, context('check_run', { check_run: multiCheck }), multiCore,
@@ -492,7 +538,7 @@ async function main() {
     assert(MAX_RESOLVED_EVENT_REFS === 20 && multiCore.failures.length === 0 &&
       JSON.stringify(multiRefs.map((ref) => ref.pr)) === JSON.stringify([42, 43, 44]) &&
       new Set(multiRefs.map((ref) => ref.eventKey)).size === 3,
-    'check_run union embedded+associated PR，逐个 get/filter 后输出有序有界独立 refs');
+    'check_run 仅信任 commit association，去重后输出有序有界独立 refs');
     for (const ref of multiRefs) {
       await scheduleQueuedCodexDrain({ github: multiGithub, context: context(), core: makeCore(), ref });
     }
@@ -501,7 +547,61 @@ async function main() {
       payload.event_ref.eventKey === multiRefs[index].eventKey),
     'resolver refs 即使不依赖 enqueue output 也逐 PR 原样闭环到 dispatch payload');
 
+    const trustedDirectCheck = makeCheck(551, { headSha: 'c'.repeat(40) });
+    const rawSpoofedCheck = {
+      id: 551, name: 'attacker', status: 'completed', head_sha: 'd'.repeat(40),
+      completed_at: CREATED, pull_requests: [{ number: 999 }],
+      app: { slug: 'attacker' }, check_suite: { app: { slug: 'attacker' } },
+    };
+    const directSpoofComments = [];
+    const directSpoofGithub = makeGithub({
+      comments: directSpoofComments, checks: new Map([['551', trustedDirectCheck]]),
+      associationFailure: '5xx',
+    });
+    const directSpoofContext = context('check_run', {
+      check_run: rawSpoofedCheck, pull_request: { number: 999 },
+    });
+    const directSpoofCore = makeCore();
+    const directSpoofRefs = await resolveOfficialCodexEventRefs(
+      directSpoofGithub, directSpoofContext, directSpoofCore,
+    );
+    const directSpoofPr = await resolvePrNumber(directSpoofGithub, directSpoofContext, directSpoofCore);
+    await enqueueOfficialCodexEvent({
+      github: directSpoofGithub, context: directSpoofContext, core: directSpoofCore,
+    });
+    const directSpoofQueue = await readEventQueue({
+      github: directSpoofGithub, context: context(), core: makeCore(), prNum: 42,
+    });
+    let legacyStrictPosts = 0;
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        legacyStrictPosts += 1;
+        return response({ code: 0, data: { message_id: 'om_3535353535353535' } });
+      }
+      throw new Error(`unexpected legacy strict check request ${value}`);
+    };
+    await notifyFromCheckRun({
+      github: directSpoofGithub, context: directSpoofContext, core: directSpoofCore,
+    });
+    const legacyStrictLedger = await readDeliveryLedger({
+      github: directSpoofGithub, context: context(), core: makeCore(), prNum: 42,
+    });
+    assert(directSpoofCore.failures.length === 0 && directSpoofPr === 42 &&
+      directSpoofRefs.length === 1 && directSpoofRefs[0].pr === 42 &&
+      directSpoofRefs[0].headSha === trustedDirectCheck.head_sha &&
+      directSpoofQueue.events.length === 1 && directSpoofQueue.events[0].ref.pr === 42 &&
+      directSpoofQueue.events[0].ref.headSha === trustedDirectCheck.head_sha &&
+      directSpoofGithub.prReads.every((number) => number === 42) && legacyStrictPosts === 1 &&
+      legacyStrictLedger.latest.get(directSpoofRefs[0].eventKey).state === 'done' &&
+      directSpoofCore.warnings.some((message) => message.includes('降级使用')),
+    'association 503 时 direct/legacy check 降级到 fresh embedded；raw 伪 head/identity/PR 仍无法入队或投递');
+
     const wakeReview = makeReview(801);
+    wakeReview.commit_id = 'b'.repeat(40);
     const wakeRun = {
       id: 9001, workflow_id: 77, status: 'completed', conclusion: 'success',
       event: 'pull_request_review', display_title: 'codex-feishu-capture:review:42:801',
@@ -513,9 +613,15 @@ async function main() {
     });
     const wakeContext = context('workflow_run', { workflow_run: { id: 9001, workflow_id: 77 } });
     const wakeRefs = await consumeCodexWorkflowRunWakeup({ github: wakeGithub, context: wakeContext, core: makeCore() });
+    const wakeRef = decodeEventRef(wakeComments[0].body);
+    const expectedWakeRef = canonicalEventRef({
+      version: 1, eventType: 'pull_request_review', eventId: '801', repo: 'zettlab/demo', pr: 42,
+      headSha: wakeReview.commit_id, createdAt: wakeReview.submitted_at,
+    });
     assert(wakeRefs && wakeRefs.length === 1 && wakeGithub.dispatches.length === 1 &&
-      decodeEventRef(wakeComments[0].body).eventId === '801',
-    'workflow_run run-name 仅作 hint；API 重验固定 workflow id/path 与 official review 后 durable enqueue 再 dispatch');
+      wakeRef.eventKey === expectedWakeRef.eventKey && wakeRef.headSha === wakeReview.commit_id &&
+      wakeGithub.reviewReads.length === 2 && wakeGithub.reviewReads.every((read) => read.pullNumber === 42),
+    'workflow_run hint 无 head；scoped API 重验 hint PR 的 official review 后按 fetched commit/id 构造 immutable ref，current head 前进仍入队');
     const forbiddenComments = [];
     const forbiddenGithub = makeGithub({
       comments: forbiddenComments, reviews: new Map([['801', wakeReview]]), workflowRun: wakeRun,
@@ -540,13 +646,73 @@ async function main() {
     assert(wrongPathRefs === null && wrongPathCore.failures.some((message) => message.includes('id/name/path')),
       'workflow_run name 不构成信任；workflow_id 必须经 API 映射到固定 capture path');
 
+    const oldCheckSha = 'c'.repeat(40);
+    const oldCheck = makeCheck(803, { headSha: oldCheckSha });
+    oldCheck.pull_requests = [{ number: 42 }];
+    const oldCheckRun = {
+      id: 9002, workflow_id: 77, status: 'completed', conclusion: 'success',
+      event: 'check_run', display_title: 'codex-feishu-capture:check:0:803',
+      repository: { full_name: 'zettlab/demo' },
+    };
+    const oldCheckComments = [];
+    const oldCheckGithub = makeGithub({
+      comments: oldCheckComments, checks: new Map([['803', oldCheck]]),
+      associationFailure: 'timeout', workflowRun: oldCheckRun,
+    });
+    const oldCheckContext = context('workflow_run', { workflow_run: { id: 9002, workflow_id: 77 } });
+    const oldCheckCore = makeCore();
+    const oldCheckRefs = await consumeCodexWorkflowRunWakeup({
+      github: oldCheckGithub, context: oldCheckContext, core: oldCheckCore,
+    });
+    assert(oldCheckRefs && oldCheckRefs.length === 1 && oldCheckRefs[0].pr === 42 &&
+      oldCheckRefs[0].headSha === oldCheckSha && oldCheckGithub.dispatches.length === 1 &&
+      oldCheckGithub.associationReads.length === 6 && oldCheckCore.failures.length === 0 &&
+      oldCheckCore.warnings.some((message) => message.includes('降级使用')) &&
+      oldCheckGithub.associationReads.every((sha) => sha === oldCheckSha),
+    'association timeout 三次耗尽时，workflow source/rehydrate 均降级到 fresh embedded，旧 head 仍入队并 dispatch');
+    const spoofedCheck = makeCheck(804, { headSha: oldCheckSha });
+    spoofedCheck.pull_requests = [];
+    const spoofedCheckCore = makeCore();
+    const spoofedCheckRefs = await resolveCodexWorkflowRunRefs({
+      github: makeGithub({
+        checks: new Map([['804', spoofedCheck]]), associated: [],
+        workflowRun: { ...oldCheckRun, id: 9003, display_title: 'codex-feishu-capture:check:0:804' },
+      }),
+      context: context('workflow_run', { workflow_run: { id: 9003, workflow_id: 77 } }),
+      core: spoofedCheckCore,
+    });
+    assert(spoofedCheckRefs && spoofedCheckRefs.length === 0 && spoofedCheckCore.failures.length === 0,
+      'check_run embedded pull_requests 不构成关联证明，commit association API 无结果时不可伪造入队');
+
+    const unavailableCheck = makeCheck(805, { headSha: oldCheckSha });
+    unavailableCheck.pull_requests = [];
+    const unavailableRun = {
+      ...oldCheckRun, id: 9004, display_title: 'codex-feishu-capture:check:0:805',
+    };
+    const unavailableComments = [];
+    const unavailableGithub = makeGithub({
+      comments: unavailableComments, checks: new Map([['805', unavailableCheck]]),
+      associationFailure: 'timeout', workflowRun: unavailableRun,
+    });
+    const unavailableCore = makeCore();
+    const unavailableRefs = await consumeCodexWorkflowRunWakeup({
+      github: unavailableGithub,
+      context: context('workflow_run', { workflow_run: { id: 9004, workflow_id: 77 } }),
+      core: unavailableCore,
+    });
+    assert(unavailableRefs === null && unavailableComments.length === 0 &&
+      unavailableGithub.dispatches.length === 0 && unavailableGithub.associationReads.length === 3 &&
+      unavailableCore.failures.some((message) => message.includes('fresh embedded PR 为空') && message.includes('retry')),
+    'association timeout 且 fresh embedded 为空时显式 retry failure，不静默成功或丢事件');
+
     const oldReview = makeReview(802);
     oldReview.commit_id = 'b'.repeat(40);
     const oldReviewRef = canonicalEventRef({
       version: 1, eventType: 'pull_request_review', eventId: '802', repo: 'zettlab/demo', pr: 42,
-      headSha: HEAD, createdAt: CREATED,
+      headSha: oldReview.commit_id, createdAt: CREATED,
     });
-    const oldReviewGithub = makeGithub({ reviews: new Map([['802', oldReview]]) });
+    const oldReviewComments = [];
+    const oldReviewGithub = makeGithub({ comments: oldReviewComments, reviews: new Map([['802', oldReview]]) });
     const oldReviewCore = makeCore();
     process.env.RESOLVED_EVENT_REFS = JSON.stringify([oldReviewRef]);
     await enqueueOfficialCodexEvent({
@@ -554,8 +720,21 @@ async function main() {
       core: oldReviewCore,
     });
     delete process.env.RESOLVED_EVENT_REFS;
-    assert(oldReviewCore.failures.some((message) => message.includes('绑定不一致')),
-      '旧 review 重放 fail closed：fetched review.commit_id 必须等于 ref/current PR head');
+    assert(oldReviewCore.failures.length === 0 &&
+      oldReviewComments.some((comment) => decodeEventRef(comment.body)?.eventKey === oldReviewRef.eventKey),
+    '旧 review rehydrate 验 fetched review.commit_id===immutable ref，PR current head 前进不丢事件');
+    const tamperedOldReviewCore = makeCore();
+    process.env.RESOLVED_EVENT_REFS = JSON.stringify([canonicalEventRef({
+      version: oldReviewRef.version, eventType: oldReviewRef.eventType, eventId: oldReviewRef.eventId,
+      repo: oldReviewRef.repo, pr: oldReviewRef.pr, headSha: HEAD, createdAt: oldReviewRef.createdAt,
+    })]);
+    await enqueueOfficialCodexEvent({
+      github: oldReviewGithub, context: context('repository_dispatch', { client_payload: { pr_number: '42' } }),
+      core: tamperedOldReviewCore,
+    });
+    delete process.env.RESOLVED_EVENT_REFS;
+    assert(tamperedOldReviewCore.failures.some((message) => message.includes('绑定不一致')),
+      '旧 review immutable ref 的 commit 被篡改时仍 fail closed');
 
     const legacyComments = [
       { id: 1, body: legacyBody('om_1111111111111111'), author_association: 'MEMBER', user: { login: 'one', type: 'User' } },
@@ -658,7 +837,7 @@ async function main() {
     const firstDelivery = await readDeliveryLedger({ github: flowGithub, context: flowContext, core: firstDeliveryCore, prNum: 42 });
     const firstDeliveryState = firstDelivery.latest.get(flowRef.eventKey);
     assert(firstDeliveryState && firstDeliveryState.state === 'uncertain',
-      `429/5xx/disconnect 进入 durable uncertain: ${JSON.stringify(firstDeliveryCore.failures)}`);
+      `5xx/disconnect 进入 durable uncertain: ${JSON.stringify(firstDeliveryCore.failures)}`);
     const immediateCore = makeCore();
     await drainQueuedCodexEvents({ github: flowGithub, context: flowContext, core: immediateCore });
     assert(rootPosts === 1 && immediateCore.failures.length > 0, '未到 history retry 时间绝不重发');
@@ -969,6 +1148,332 @@ async function main() {
       replyDoneLedger.latest.get(replyRetryRef.eventKey).state === 'done' && replyRetryPosts === 2,
     '已有 root 的 reply 明确未发送 400 保持 retryable，同 root 有界重试成功而不落 failed/skipped');
 
+    const rootMissingRef = eventRef('628', '2026-08-05T12:02:08Z');
+    const rootMissingComments = [
+      botComment(1, encodeEventRef(rootMissingRef)),
+      botComment(2, encodeThreadState({
+        version: 2, state: 'final', repo: 'zettlab/demo', pr: 42, generation: 1,
+        claimId: '28282828282828282828282828282828', messageId: 'om_2828282828282828',
+      })),
+    ];
+    const rootMissingGithub = makeGithub({
+      comments: rootMissingComments,
+      checks: new Map([[rootMissingRef.eventId, makeCheck(Number(rootMissingRef.eventId), {
+        createdAt: rootMissingRef.createdAt,
+      })]]),
+    });
+    let missingReplyPosts = 0;
+    let replacementRootPosts = 0;
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.endsWith('/reply')) {
+        missingReplyPosts += 1;
+        return response({ code: 230011 }, 400);
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        replacementRootPosts += 1;
+        return response({ code: 0, data: { message_id: 'om_2929292929292929' } });
+      }
+      throw new Error(`unexpected root-missing request ${value}`);
+    };
+    await drainQueuedCodexEvents({ github: rootMissingGithub, context: flowContext, core: makeCore() });
+    const rootMissingLedger = await readDeliveryLedger({
+      github: rootMissingGithub, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const replacementThread = await readThreadState({
+      github: rootMissingGithub, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const replacementRecord = rootMissingLedger.latest.get(rootMissingRef.eventKey);
+    assert(missingReplyPosts === 1 && replacementRootPosts === 1 && replacementRecord.state === 'done' &&
+      replacementRecord.mode === 'root' && replacementRecord.attempt === 2 &&
+      replacementThread.kind === 'final' && replacementThread.generation === 2,
+    '可信 root_missing 唯一允许 reply/not_sent 跨kind到 attempt+1 root/preparing，并reserve替代话题发送完成');
+
+    const transient429Ref = eventRef('629', '2026-08-05T12:02:09Z');
+    const transient429Comments = [botComment(1, encodeEventRef(transient429Ref))];
+    const transient429Github = makeGithub({
+      comments: transient429Comments,
+      checks: new Map([[transient429Ref.eventId, makeCheck(Number(transient429Ref.eventId), {
+        createdAt: transient429Ref.createdAt,
+      })]]),
+    });
+    const transient429Uuids = [];
+    global.fetch = async (url, options = {}) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        transient429Uuids.push(JSON.parse(options.body).uuid);
+        if (transient429Uuids.length === 1) return response({ code: 99991429 }, 429, { 'Retry-After': '0' });
+        return response({ code: 0, data: { message_id: 'om_3030303030303030' } });
+      }
+      throw new Error(`unexpected transient 429 request ${value}`);
+    };
+    await drainQueuedCodexEvents({ github: transient429Github, context: flowContext, core: makeCore() });
+    const transient429Ledger = await readDeliveryLedger({
+      github: transient429Github, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const transient429States = transient429Comments.map((comment) => decodeDeliveryRecord(comment.body)).filter(Boolean);
+    assert(transient429Uuids.length === 2 && transient429Uuids[0] === transient429Uuids[1] &&
+      transient429Ledger.latest.get(transient429Ref.eventKey).state === 'done' &&
+      transient429States.every((record) => !['uncertain', 'manual'].includes(record.state)),
+    'HTTP 429→success 在同root/token/uuid内有界重试，不进入history/manual');
+
+    const persistent429Ref = eventRef('630', '2026-08-05T12:02:10Z');
+    const persistent429Comments = [botComment(1, encodeEventRef(persistent429Ref))];
+    const persistent429Github = makeGithub({
+      comments: persistent429Comments,
+      checks: new Map([[persistent429Ref.eventId, makeCheck(Number(persistent429Ref.eventId), {
+        createdAt: persistent429Ref.createdAt,
+      })]]),
+    });
+    let persistent429Posts = 0;
+    let persistentHistoryCalls = 0;
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('container_id_type=chat')) {
+        persistentHistoryCalls += 1;
+        return response({ code: 0, data: { has_more: false, items: [] } });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        persistent429Posts += 1;
+        return response({ code: 99991429 }, 429, { 'Retry-After': '0' });
+      }
+      throw new Error(`unexpected persistent 429 request ${value}`);
+    };
+    await drainQueuedCodexEvents({ github: persistent429Github, context: flowContext, core: makeCore() });
+    const persistent429Ledger = await readDeliveryLedger({
+      github: persistent429Github, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const persisted429 = persistent429Ledger.latest.get(persistent429Ref.eventKey);
+    const oldDateNow429 = Date.now;
+    Date.now = () => Date.parse(persisted429.nextCheckAt) + 1;
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        persistent429Posts += 1;
+        return response({ code: 0, data: { message_id: 'om_3131313131313131' } });
+      }
+      throw new Error(`unexpected recovered 429 request ${value}`);
+    };
+    await drainQueuedCodexEvents({ github: persistent429Github, context: flowContext, core: makeCore() });
+    Date.now = oldDateNow429;
+    const recovered429Ledger = await readDeliveryLedger({
+      github: persistent429Github, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const persistent429States = persistent429Comments.map((comment) => decodeDeliveryRecord(comment.body)).filter(Boolean);
+    assert(persistent429Posts === FEISHU_RATE_LIMIT_MAX_ATTEMPTS + 1 && persistentHistoryCalls === 0 &&
+      persisted429.state === 'not_sent' && persisted429.reason === 'rate_limited' && persisted429.nextCheckAt &&
+      recovered429Ledger.latest.get(persistent429Ref.eventKey).state === 'done' &&
+      persistent429States.every((record) => !['uncertain', 'manual'].includes(record.state)),
+    '持续429耗尽后durable rate_limited/not_sent，watchdog到期跨run续投且绝不进入history/manual');
+
+    const oversized429Ref = eventRef('632', '2026-08-05T12:02:12Z');
+    const oversized429Comments = [botComment(1, encodeEventRef(oversized429Ref))];
+    const oversized429Github = makeGithub({
+      comments: oversized429Comments,
+      checks: new Map([[oversized429Ref.eventId, makeCheck(Number(oversized429Ref.eventId), {
+        createdAt: oversized429Ref.createdAt,
+      })]]),
+    });
+    let oversized429Posts = 0;
+    let oversized429ResponseAt = 0;
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        oversized429Posts += 1;
+        oversized429ResponseAt = Date.now();
+        return response({ code: 99991429 }, 429, { 'Retry-After': '120' });
+      }
+      throw new Error(`unexpected oversized 429 request ${value}`);
+    };
+    const oversizedStart = Date.now();
+    await drainQueuedCodexEvents({ github: oversized429Github, context: flowContext, core: makeCore() });
+    const oversized429Ledger = await readDeliveryLedger({
+      github: oversized429Github, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const oversized429 = oversized429Ledger.latest.get(oversized429Ref.eventKey);
+    assert(oversized429Posts === 1 && oversized429ResponseAt >= oversizedStart &&
+      oversized429.state === 'not_sent' &&
+      Date.parse(oversized429.nextCheckAt) - oversized429ResponseAt >= 120000 &&
+      Date.parse(oversized429.nextCheckAt) - oversized429ResponseAt <= 121000,
+    'Retry-After=120s超过单轮inline cap时不sleep/提前POST，完整持久化nextCheckAt留给watchdog');
+
+    const transientTokenRef = eventRef('633', '2026-08-05T12:02:13Z');
+    const transientTokenComments = [botComment(1, encodeEventRef(transientTokenRef))];
+    let transientTokenCalls = 0;
+    let transientTokenMessagePosts = 0;
+    let sendingObservedAfterTokenCalls = 0;
+    const transientTokenGithub = makeGithub({
+      comments: transientTokenComments,
+      checks: new Map([[transientTokenRef.eventId, makeCheck(Number(transientTokenRef.eventId), {
+        createdAt: transientTokenRef.createdAt,
+      })]]),
+      onCreateComment: ({ body }) => {
+        if (decodeDeliveryRecord(body)?.state === 'sending') {
+          sendingObservedAfterTokenCalls = transientTokenCalls;
+        }
+      },
+    });
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        transientTokenCalls += 1;
+        if (transientTokenCalls === 1) return response({ code: 99991429 }, 429, { 'Retry-After': '0' });
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        transientTokenMessagePosts += 1;
+        return response({ code: 0, data: { message_id: 'om_3232323232323232' } });
+      }
+      throw new Error(`unexpected transient token 429 request ${value}`);
+    };
+    await drainQueuedCodexEvents({
+      github: transientTokenGithub, context: flowContext, core: makeCore(),
+    });
+    const transientTokenLedger = await readDeliveryLedger({
+      github: transientTokenGithub, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    assert(transientTokenCalls === 2 && transientTokenMessagePosts === 1 &&
+      sendingObservedAfterTokenCalls === 2 &&
+      transientTokenLedger.latest.get(transientTokenRef.eventKey).state === 'done',
+    'tenant token 429→success 在落 sending 前完成有界重试，消息只 POST 一次');
+
+    const persistentTokenRef = eventRef('634', '2026-08-05T12:02:14Z');
+    const persistentTokenComments = [botComment(1, encodeEventRef(persistentTokenRef))];
+    let persistentTokenCalls = 0;
+    let persistentTokenMessagePosts = 0;
+    const persistentTokenGithub = makeGithub({
+      comments: persistentTokenComments,
+      checks: new Map([[persistentTokenRef.eventId, makeCheck(Number(persistentTokenRef.eventId), {
+        createdAt: persistentTokenRef.createdAt,
+      })]]),
+    });
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        persistentTokenCalls += 1;
+        return response({ code: 99991429 }, 429, { 'Retry-After': '0' });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        persistentTokenMessagePosts += 1;
+        throw new Error('token 429 后不应 POST 消息');
+      }
+      throw new Error(`unexpected persistent token 429 request ${value}`);
+    };
+    await drainQueuedCodexEvents({
+      github: persistentTokenGithub, context: flowContext, core: makeCore(),
+    });
+    const persistentTokenLedger = await readDeliveryLedger({
+      github: persistentTokenGithub, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const persistedToken429 = persistentTokenLedger.latest.get(persistentTokenRef.eventKey);
+    const sendingBeforeTokenRecovery = persistentTokenComments.some((comment) =>
+      decodeDeliveryRecord(comment.body)?.state === 'sending');
+    const oldDateNowToken429 = Date.now;
+    Date.now = () => Date.parse(persistedToken429.nextCheckAt) + 1;
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        persistentTokenCalls += 1;
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('receive_id_type=chat_id')) {
+        persistentTokenMessagePosts += 1;
+        return response({ code: 0, data: { message_id: 'om_3434343434343434' } });
+      }
+      throw new Error(`unexpected recovered token 429 request ${value}`);
+    };
+    await drainQueuedCodexEvents({
+      github: persistentTokenGithub, context: flowContext, core: makeCore(),
+    });
+    Date.now = oldDateNowToken429;
+    const recoveredTokenLedger = await readDeliveryLedger({
+      github: persistentTokenGithub, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    assert(persistentTokenCalls === FEISHU_RATE_LIMIT_MAX_ATTEMPTS + 1 &&
+      persistentTokenMessagePosts === 1 && !sendingBeforeTokenRecovery &&
+      persistedToken429.state === 'not_sent' && persistedToken429.reason === 'rate_limited' &&
+      persistedToken429.historyAttempts === 0 &&
+      recoveredTokenLedger.latest.get(persistentTokenRef.eventKey).state === 'done' &&
+      persistentTokenComments.map((comment) => decodeDeliveryRecord(comment.body)).filter(Boolean)
+        .every((record) => !['uncertain', 'manual'].includes(record.state)),
+    '持续 tenant token 429 首轮持久化 not_sent/nextCheckAt 且零消息 POST，跨 run 到期后发送完成');
+
+    const history429Ref = eventRef('635', '2026-08-05T12:02:15Z');
+    const history429Claim = 'e'.repeat(32);
+    const history429Now = Date.now();
+    const history429SentAt = new Date(history429Now - 60000).toISOString();
+    const history429Base = {
+      version: 1, repo: history429Ref.repo, pr: history429Ref.pr,
+      eventKey: history429Ref.eventKey, attempt: 1, mode: 'root', targetRoot: null,
+      threadGeneration: 1, threadClaimId: history429Claim,
+      token: deliveryToken(history429Ref.eventKey), messageId: null, candidateMessageIds: [],
+    };
+    const history429Comments = [
+      botComment(1, encodeEventRef(history429Ref)),
+      botComment(2, encodeDeliveryRecord({
+        ...history429Base, state: 'preparing', sentAt: null, historyAttempts: 0,
+        nextCheckAt: null, reason: null,
+      })),
+      botComment(3, encodeThreadState({
+        version: 2, state: 'pending', repo: history429Ref.repo, pr: history429Ref.pr,
+        generation: 1, claimId: history429Claim, messageId: null,
+      })),
+      botComment(4, encodeDeliveryRecord({
+        ...history429Base, state: 'sending', sentAt: history429SentAt, historyAttempts: 0,
+        nextCheckAt: null, reason: null,
+      })),
+      botComment(5, encodeDeliveryRecord({
+        ...history429Base, state: 'uncertain', sentAt: history429SentAt, historyAttempts: 7,
+        nextCheckAt: new Date(history429Now - 1000).toISOString(), reason: 'ambiguous',
+      })),
+    ];
+    const history429Github = makeGithub({ comments: history429Comments });
+    let history429Calls = 0;
+    let history429ResponseAt = 0;
+    global.fetch = async (url) => {
+      const value = String(url);
+      if (value.endsWith('/auth/v3/tenant_access_token/internal')) {
+        return response({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      if (value.includes('container_id_type=chat')) {
+        history429Calls += 1;
+        history429ResponseAt = Date.now();
+        return response({ code: 99991429 }, 429, { 'Retry-After': '120' });
+      }
+      throw new Error(`unexpected history 429 request ${value}`);
+    };
+    const history429Core = makeCore();
+    await drainQueuedCodexEvents({
+      github: history429Github, context: flowContext, core: history429Core,
+    });
+    const history429Ledger = await readDeliveryLedger({
+      github: history429Github, context: flowContext, core: makeCore(), prNum: 42,
+    });
+    const deferredHistory429 = history429Ledger.latest.get(history429Ref.eventKey);
+    assert(history429Calls === 1 && deferredHistory429.state === 'uncertain' &&
+      deferredHistory429.reason === 'history_rate_limited' && deferredHistory429.historyAttempts === 7 &&
+      Date.parse(deferredHistory429.nextCheckAt) - history429ResponseAt >= 120000 &&
+      Date.parse(deferredHistory429.nextCheckAt) - history429ResponseAt <= 121000 &&
+      history429Comments.map((comment) => decodeDeliveryRecord(comment.body)).filter(Boolean)
+        .every((record) => record.state !== 'manual') &&
+      history429Core.outputs.continuation_mode === 'retry',
+    'history GET 429 不消耗 ambiguity attempt、不转 manual，仅按完整 Retry-After 延期');
+
     const retryRef = eventRef('622', '2026-08-05T12:02:02Z');
     const retryBase = cloneManualSequence(retryRef, 'root');
     const retryPreparing = retryBase.find((record) => record.state === 'preparing');
@@ -1257,8 +1762,8 @@ async function main() {
     const cursorSecondCore = makeCore();
     await drainQueuedCodexEvents({ github: cursorGithub, context: flowContext, core: cursorSecondCore });
     const cursorLedger = await readDeliveryLedger({ github: cursorGithub, context: flowContext, core: makeCore(), prNum: 42 });
-    assert(cursorGithub.commentReads === 3 && cursorLedger.latest.get(cursorLast.eventKey).state === 'skipped',
-      '第二批从 durable cursor 继续，越过 50 条头部 terminal，队尾事件不饥饿');
+    assert(cursorGithub.commentReads === 1 && cursorLedger.latest.get(cursorLast.eventKey).state === 'skipped',
+      '第二批从 durable cursor 继续且有效 checkpoint 不重扫 legacy prefix，越过 50 条头部 terminal 后队尾事件不饥饿');
     assert(cursorComments.filter((comment) => String(comment.body).includes(checkpointMark)).length >= 2,
       '超过单页的账本由 tail-located append-only checkpoint revisions 持续压缩');
     const tailRef = eventRef('2999', new Date(Date.parse(CREATED) - 120000).toISOString());
@@ -1489,6 +1994,52 @@ async function main() {
     assert(graphqlAbortObserved && graphqlTimedOut,
       'GraphQL Octokit 请求由真实 AbortController signal 取消并进入 retryable timeout');
 
+    const checkpointHighCreatedAt = new Date(Date.parse(CREATED) + 549000).toISOString();
+    const validCheckpointComments = Array.from({ length: 550 }, (_value, index) => ({
+      id: index + 1, body: `checkpoint-old-${index}`,
+      created_at: new Date(Date.parse(CREATED) + index * 1000).toISOString(),
+      author_association: 'NONE', user: { login: 'user', type: 'User' },
+    }));
+    validCheckpointComments.push({
+      ...botComment(551, encodeCheckpoint({
+        version: 1, revision: 1, repo: 'zettlab/demo', pr: 42,
+        highCommentId: 550, highCreatedAt: checkpointHighCreatedAt, parentHash: null, entries: [],
+      })),
+      created_at: new Date(Date.parse(checkpointHighCreatedAt) + 1000).toISOString(),
+    });
+    const checkpointIncrementalRef = eventRef(
+      '7299', new Date(Date.parse(checkpointHighCreatedAt) + 2000).toISOString(),
+    );
+    validCheckpointComments.push({
+      ...botComment(552, encodeEventRef(checkpointIncrementalRef)),
+      created_at: checkpointIncrementalRef.createdAt,
+    });
+    let validCheckpointNow = 0;
+    let validCheckpointGraphqlCalls = 0;
+    let validCheckpointRestCalls = 0;
+    let validCheckpointPrefixCalls = 0;
+    const validCheckpointGithub = makeGithub({
+      comments: validCheckpointComments,
+      onGraphql: () => {
+        validCheckpointGraphqlCalls += 1;
+        validCheckpointNow += GITHUB_REQUEST_TIMEOUT_MS;
+      },
+      onListComments: (options) => {
+        validCheckpointRestCalls += 1;
+        if (!options.since) validCheckpointPrefixCalls += 1;
+        validCheckpointNow += GITHUB_REQUEST_TIMEOUT_MS;
+      },
+    });
+    const validCheckpointSnapshot = await withGithubAttemptBudget(() => readThreadMarkerComments({
+      github: validCheckpointGithub, context: flowContext, core: makeCore(), prNum: 42,
+      nowFn: () => validCheckpointNow,
+    }), { deadlineMs: GITHUB_ATTEMPT_BUDGET_MS, nowFn: () => validCheckpointNow });
+    assert(validCheckpointSnapshot && validCheckpointSnapshot._checkpoint.checkpoint &&
+      validCheckpointSnapshot.some((comment) => Number(comment.id) === 552) &&
+      validCheckpointGraphqlCalls === 1 && validCheckpointRestCalls === 1 &&
+      validCheckpointPrefixCalls === 0 && validCheckpointNow === 2 * GITHUB_REQUEST_TIMEOUT_MS,
+    `valid checkpoint 只做 tail 定位和 high-watermark since 增量，不再读取 legacy REST prefix: ${JSON.stringify({ graphql: validCheckpointGraphqlCalls, rest: validCheckpointRestCalls, prefix: validCheckpointPrefixCalls, now: validCheckpointNow })}`);
+
     const bootstrapComments = Array.from({ length: 620 }, (_value, index) => ({
       id: index + 1,
       body: `ordinary-${index}`,
@@ -1577,9 +2128,15 @@ async function main() {
     }));
     let budgetNow = 0;
     let budgetGraphqlCalls = 0;
+    let budgetRestCalls = 0;
+    let budgetPrefixCalls = 0;
     const budgetGithub = makeGithub({
       comments: budgetComments,
-      onListComments: () => { budgetNow += GITHUB_REQUEST_TIMEOUT_MS; },
+      onListComments: (options) => {
+        budgetRestCalls += 1;
+        if (!options.since) budgetPrefixCalls += 1;
+        budgetNow += GITHUB_REQUEST_TIMEOUT_MS;
+      },
       onCreateComment: (options) => {
         if (String(options.body).includes(BOOTSTRAP_MARK)) budgetNow += GITHUB_REQUEST_TIMEOUT_MS;
       },
@@ -1599,8 +2156,9 @@ async function main() {
     const budgetProgress = budgetProgressComment && decodeBootstrapProgress(budgetProgressComment.body);
     assert(budgetCore.failures.length === 0 && budgetSnapshot &&
       budgetSnapshot._checkpoint.bootstrapIncomplete && budgetProgress &&
-      budgetProgress.highCommentId === 400 && budgetNow === 165000 && budgetGraphqlCalls === 6,
-    `180s 共享预算预留 create+response-loss confirm 并持久化完整页 high-watermark: ${JSON.stringify({ failures: budgetCore.failures, warnings: budgetCore.warnings, high: budgetProgress && budgetProgress.highCommentId, now: budgetNow, graphql: budgetGraphqlCalls })}`);
+      budgetProgress.highCommentId === 400 && budgetNow === 165000 && budgetGraphqlCalls === 6 &&
+      budgetRestCalls === 4 && budgetPrefixCalls === 4,
+    `180s 共享预算仅在无 checkpoint bootstrap 扫 legacy prefix，并预留 create+response-loss confirm: ${JSON.stringify({ failures: budgetCore.failures, warnings: budgetCore.warnings, high: budgetProgress && budgetProgress.highCommentId, now: budgetNow, graphql: budgetGraphqlCalls, rest: budgetRestCalls, prefix: budgetPrefixCalls })}`);
 
     const siblingProgressA = {
       version: 1, revision: 1, repo: 'zettlab/demo', pr: 42,

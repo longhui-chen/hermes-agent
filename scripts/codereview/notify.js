@@ -38,6 +38,10 @@ const GITHUB_ATTEMPT_BUDGET_MS = 180000;
 // The extra 5s covers JS/runner overhead after full 15s request timeouts.
 const BOOTSTRAP_PROGRESS_RESERVE_MS = (2 * GITHUB_REQUEST_TIMEOUT_MS) + 5000;
 const FEISHU_REQUEST_TIMEOUT_MS = 15000;
+const FEISHU_RATE_LIMIT_MAX_ATTEMPTS = 3;
+const FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS = 30000;
+const FEISHU_RATE_LIMIT_MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+const FEISHU_RATE_LIMIT_PERSIST_RESERVE_MS = 2 * GITHUB_REQUEST_TIMEOUT_MS + 5000;
 const DRAIN_BATCH_SIZE = 5;
 const DRAIN_SCAN_LIMIT = 50;
 const COMMENT_PAGE_SIZE = 100;
@@ -126,11 +130,13 @@ function validEventKey(value) {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
-function parseRetryAfterMs(error, nowMs = Date.now()) {
-  const headers = error && error.response && error.response.headers;
+function parseRetryAfterHeadersMs(headers, nowMs = Date.now(), maxDelayMs = MAX_GITHUB_RETRY_DELAY_MS) {
   if (!headers || typeof headers !== 'object') return null;
-  const key = Object.keys(headers).find((name) => name.toLowerCase() === 'retry-after');
-  let raw = key ? headers[key] : null;
+  let raw = typeof headers.get === 'function' ? headers.get('retry-after') : null;
+  if (raw === null || typeof raw === 'undefined') {
+    const key = Object.keys(headers).find((name) => name.toLowerCase() === 'retry-after');
+    raw = key ? headers[key] : null;
+  }
   if (Array.isArray(raw)) [raw] = raw;
   if (raw === null || typeof raw === 'undefined' || String(raw).trim() === '') return null;
   const value = String(raw).trim();
@@ -141,7 +147,11 @@ function parseRetryAfterMs(error, nowMs = Date.now()) {
     if (!Number.isFinite(retryAt)) return null;
     delay = Math.max(0, retryAt - nowMs);
   }
-  return Math.min(delay, MAX_GITHUB_RETRY_DELAY_MS);
+  return Math.min(delay, maxDelayMs);
+}
+
+function parseRetryAfterMs(error, nowMs = Date.now()) {
+  return parseRetryAfterHeadersMs(error && error.response && error.response.headers, nowMs);
 }
 
 async function withGithubRetry({
@@ -615,18 +625,12 @@ async function readThreadMarkerComments({
   let truncated = false;
   let bootstrapHigh = null;
   if (checkpoint) {
-    // Keep the established checkpoint path behavior stable; only the legacy no-checkpoint
-    // path below changes to a streaming bootstrap.
-    for (let page = 1; page <= COMMENT_MIGRATION_MAX_PAGES; page += 1) {
-      const result = await listCommentPage({ github, context, core, prNum, page });
-      if (!result.ok) return null;
-      if (result.value.data.length < COMMENT_PAGE_SIZE) break;
-    }
     comments = checkpoint.entries.map(virtualCheckpointComment);
     for (let page = 1; page <= COMMENT_INCREMENTAL_MAX_PAGES; page += 1) {
       const result = await listCommentPage({
         github, context, core, prNum, page,
         since: new Date(Date.parse(checkpoint.highCreatedAt) - 1000).toISOString(),
+        nowFn,
       });
       if (!result.ok) return null;
       const fresh = result.value.data.filter((comment) => Number(comment.id) > checkpoint.highCommentId &&
@@ -1395,14 +1399,19 @@ function validateDeliveryRecord(record) {
   if (record.state === 'done') return validFeishuMessageId(record.messageId) && record.nextCheckAt === null && record.reason === null;
   if (record.messageId !== null) return false;
   if (record.state === 'uncertain') {
-    return record.nextCheckAt !== null && ['ambiguous', 'history_zero', 'history_error', 'history_incomplete'].includes(record.reason);
+    return record.nextCheckAt !== null &&
+      ['ambiguous', 'history_zero', 'history_error', 'history_incomplete', 'history_rate_limited'].includes(record.reason);
   }
   if (record.state === 'manual') {
     if (record.nextCheckAt !== null || !['history_multiple', 'history_exhausted', 'definitely_not_sent_exhausted'].includes(record.reason)) return false;
     return record.reason !== 'history_multiple' || record.candidateMessageIds.length >= 2;
   }
   if (record.state === 'retrying') return record.nextCheckAt === null && record.reason === 'operator_retry';
-  if (record.state === 'not_sent') return record.nextCheckAt === null && ['root_missing', 'definitely_not_sent'].includes(record.reason);
+  if (record.state === 'not_sent') {
+    if (record.reason === 'rate_limited') return record.nextCheckAt !== null;
+    if (record.reason === 'root_missing') return record.mode === 'reply' && record.nextCheckAt === null;
+    return record.reason === 'definitely_not_sent' && record.nextCheckAt === null;
+  }
   if (record.state === 'failed') return record.nextCheckAt === null && Boolean(record.reason);
   return record.state === 'sending' && record.nextCheckAt === null && record.reason === null;
 }
@@ -1484,8 +1493,13 @@ function sameDeliveryStaticIdentity(a, b) {
     a.threadGeneration === b.threadGeneration && a.threadClaimId === b.threadClaimId && a.token === b.token;
 }
 
+function isRateLimitedNotSent(record) {
+  return record.state === 'not_sent' && record.reason === 'rate_limited';
+}
+
 function validDeliveryTransition(previous, next) {
-  if (!previous) return ['preparing', 'sending', 'skipped', 'failed'].includes(next.state);
+  if (!previous) return ['preparing', 'sending', 'skipped', 'failed'].includes(next.state) ||
+    isRateLimitedNotSent(next);
   if (JSON.stringify(previous) === JSON.stringify(next)) return true;
   if (['done', 'skipped'].includes(previous.state)) return false;
   if (previous.state === 'failed') return next.state === 'skipped' && sameDeliveryIdentity(previous, next);
@@ -1493,7 +1507,8 @@ function validDeliveryTransition(previous, next) {
   if (previous.state === 'retrying') {
     if (next.state === 'skipped') return sameDeliveryIdentity(previous, next);
     if (previous.mode === 'reply') {
-      return next.state === 'sending' && next.attempt === previous.attempt + 1 &&
+      return ['sending', 'not_sent'].includes(next.state) &&
+        (next.state !== 'not_sent' || isRateLimitedNotSent(next)) && next.attempt === previous.attempt + 1 &&
         sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt }, next);
     }
     return next.state === 'preparing' && next.attempt === previous.attempt + 1 &&
@@ -1505,21 +1520,38 @@ function validDeliveryTransition(previous, next) {
   if (previous.state === 'not_sent') {
     if (next.state === 'skipped') return sameDeliveryIdentity(previous, next);
     if (next.state === 'manual') return sameDeliveryIdentity(previous, next);
+    if (previous.reason === 'rate_limited') {
+      return ['sending', 'not_sent'].includes(next.state) &&
+        (next.state !== 'not_sent' || isRateLimitedNotSent(next)) && next.attempt === previous.attempt + 1 &&
+        sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt }, next);
+    }
+    if (previous.reason === 'root_missing') {
+      return previous.mode === 'reply' && next.state === 'preparing' &&
+        next.attempt === previous.attempt + 1 &&
+        sameDeliveryStaticIdentity({
+          ...previous, attempt: next.attempt, mode: 'root', targetRoot: null,
+          threadGeneration: next.threadGeneration, threadClaimId: next.threadClaimId,
+        }, next);
+    }
     if (previous.mode === 'reply') {
-      return next.state === 'sending' && next.attempt === previous.attempt + 1 &&
+      return ['sending', 'not_sent'].includes(next.state) &&
+        (next.state !== 'not_sent' || isRateLimitedNotSent(next)) && next.attempt === previous.attempt + 1 &&
         sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt }, next);
     }
     return next.state === 'preparing' && next.attempt === previous.attempt + 1 && sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt, mode: 'root', targetRoot: null, threadGeneration: next.threadGeneration, threadClaimId: next.threadClaimId }, next);
   }
   if (previous.state === 'preparing') {
-    return ['sending', 'skipped', 'manual'].includes(next.state) &&
+    return ['sending', 'skipped', 'manual', 'not_sent'].includes(next.state) &&
+      (next.state !== 'not_sent' || isRateLimitedNotSent(next)) &&
       (next.state !== 'sending' || next.sentAt !== null) && sameDeliveryStaticIdentity(previous, next);
   }
   if (!sameDeliveryIdentity(previous, next)) return false;
   if (previous.state === 'sending') return ['uncertain', 'manual', 'done', 'not_sent', 'failed'].includes(next.state);
   if (previous.state === 'uncertain') {
     return ['done', 'manual', 'failed'].includes(next.state) ||
-      (next.state === 'uncertain' && next.historyAttempts > previous.historyAttempts);
+      (next.state === 'uncertain' && (next.historyAttempts > previous.historyAttempts ||
+        (next.historyAttempts === previous.historyAttempts && next.reason === 'history_rate_limited' &&
+         Date.parse(next.nextCheckAt) > Date.parse(previous.nextCheckAt))));
   }
   return false;
 }
@@ -1803,13 +1835,41 @@ async function feishu(apiPath, method, body, token) {
     const text = await resp.text();
     let json;
     try { json = JSON.parse(text); } catch (_error) { json = {}; }
-    return { ok: resp.ok, status: resp.status, json };
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      json,
+      retryAfterMs: parseRetryAfterHeadersMs(resp.headers, Date.now(), FEISHU_RATE_LIMIT_MAX_RETRY_AFTER_MS),
+    };
   } catch (error) {
     const message = error && error.name === 'AbortError' ? 'feishu API timeout (15s)' : errorMessage(error);
     return { ok: false, status: 0, json: { code: 'NETWORK_ERROR', msg: message } };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function feishuWithRateLimit({
+  apiPath, method, body, token, core = noopCore(), sleepFn = sleep, nowFn = Date.now,
+}) {
+  let result = null;
+  for (let attempt = 1; attempt <= FEISHU_RATE_LIMIT_MAX_ATTEMPTS; attempt += 1) {
+    result = await feishu(apiPath, method, body, token);
+    if (Number(result.status) !== 429) return result;
+    const retryAfterMs = result.retryAfterMs === null
+      ? Math.min(GITHUB_RETRY_BASE_MS * (2 ** (attempt - 1)), FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS)
+      : result.retryAfterMs;
+    const remainingMs = Number.isFinite(activeGithubAttemptDeadlineMs)
+      ? activeGithubAttemptDeadlineMs - nowFn()
+      : Infinity;
+    const canRetry = attempt < FEISHU_RATE_LIMIT_MAX_ATTEMPTS &&
+      retryAfterMs <= FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS &&
+      remainingMs >= retryAfterMs + FEISHU_REQUEST_TIMEOUT_MS + FEISHU_RATE_LIMIT_PERSIST_RESERVE_MS;
+    if (!canRetry) return { ...result, rateLimited: true, retryAfterMs };
+    core.warning(`Feishu HTTP 429，第 ${attempt} 次有界重试将在 ${retryAfterMs}ms 后执行`);
+    await sleepFn(retryAfterMs);
+  }
+  return { ...result, rateLimited: true, retryAfterMs: FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS };
 }
 
 function readFeishuEnv(core, required = false) {
@@ -1826,16 +1886,22 @@ function readFeishuEnv(core, required = false) {
 }
 
 async function tenantToken(env, core) {
-  const response = await feishu('/auth/v3/tenant_access_token/internal', 'POST', {
-    app_id: env.appId, app_secret: env.appSecret,
+  const response = await feishuWithRateLimit({
+    apiPath: '/auth/v3/tenant_access_token/internal', method: 'POST',
+    body: { app_id: env.appId, app_secret: env.appSecret }, core,
   });
-  const token = response.json.tenant_access_token;
-  if (!token) {
-    core.setFailed(`取 tenant_access_token 失败: ${feishuFailureSummary(response)}`);
-    return null;
+  const token = response.ok && response.json.code === 0 && response.json.tenant_access_token;
+  if (token) {
+    core.setSecret(token);
+    return { ok: true, token, rateLimited: false, retryAfterMs: null };
   }
-  core.setSecret(token);
-  return token;
+  if (!response.rateLimited) {
+    core.setFailed(`取 tenant_access_token 失败: ${feishuFailureSummary(response)}`);
+  }
+  return {
+    ok: false, token: null, rateLimited: Boolean(response.rateLimited),
+    retryAfterMs: response.rateLimited ? response.retryAfterMs : null,
+  };
 }
 
 function contentWithDeliveryToken(content, token) {
@@ -1859,7 +1925,7 @@ function messageContainsToken(message, token) {
   return containsExactToken(content, token);
 }
 
-async function findDeliveryInFeishuHistory({ env, token, record, nowMs = Date.now() }) {
+async function findDeliveryInFeishuHistory({ env, token, record, core = noopCore(), nowMs = Date.now() }) {
   const sentSeconds = Math.floor(Date.parse(record.sentAt) / 1000);
   const startTime = sentSeconds - HISTORY_CLOCK_SKEW_SECONDS;
   const endTime = sentSeconds + HISTORY_AFTER_SEND_SECONDS;
@@ -1876,7 +1942,15 @@ async function findDeliveryInFeishuHistory({ env, token, record, nowMs = Date.no
       card_msg_content_type: 'user_card_content',
     });
     if (pageToken) params.set('page_token', pageToken);
-    const response = await feishu(`/im/v1/messages?${params.toString()}`, 'GET', null, token);
+    const response = await feishuWithRateLimit({
+      apiPath: `/im/v1/messages?${params.toString()}`, method: 'GET', body: null, token, core,
+    });
+    if (response.rateLimited) {
+      return {
+        ok: false, complete: false, matches: [...matches.values()],
+        reason: feishuFailureSummary(response), rateLimited: true, retryAfterMs: response.retryAfterMs,
+      };
+    }
     if (!response.ok || response.json.code !== 0) {
       return { ok: false, complete: false, matches: [], reason: feishuFailureSummary(response) };
     }
@@ -1940,15 +2014,64 @@ function historyRecoveryExhausted(record, nextAttempts, nowMs = Date.now()) {
   return nextAttempts >= HISTORY_MAX_ATTEMPTS || nowMs - Date.parse(record.sentAt) >= HISTORY_MAX_AGE_MS;
 }
 
+function rateLimitNextCheckAt(retryAfterMs, nowMs = Date.now()) {
+  return new Date(nowMs + Math.max(1000, retryAfterMs || 0)).toISOString();
+}
+
+async function persistRateLimitedNotSent({
+  github, context, core, ref, base, retryAfterMs, session = null, scope,
+}) {
+  const nextCheckAt = rateLimitNextCheckAt(retryAfterMs);
+  const record = canonicalDeliveryRecord({
+    ...base, state: 'not_sent', nextCheckAt, reason: 'rate_limited',
+  });
+  const persisted = await appendDeliveryAndConfirm({
+    github, context, core, prNum: ref.pr, record, session,
+  });
+  core.setFailed(`Feishu ${scope} HTTP 429 有界重试耗尽，已持久化到 ${nextCheckAt} 由 watchdog 续投`);
+  return { complete: false, retry: true, rateLimited: persisted.ok };
+}
+
+async function deferAmbiguousForRateLimit({
+  github, context, core, ref, record, retryAfterMs, nowMs, session = null, scope,
+}) {
+  const nextCheckAt = rateLimitNextCheckAt(retryAfterMs, nowMs);
+  const deferred = canonicalDeliveryRecord({
+    ...record, state: 'uncertain', historyAttempts: record.historyAttempts,
+    nextCheckAt, reason: 'history_rate_limited',
+  });
+  const persisted = await appendDeliveryAndConfirm({
+    github, context, core, prNum: ref.pr, record: deferred, session,
+  });
+  core.setFailed(`Feishu ${scope} HTTP 429；historyAttempts 保持 ${record.historyAttempts}，延期到 ${nextCheckAt}`);
+  return { complete: false, retry: true, rateLimited: persisted.ok };
+}
+
 async function recoverAmbiguousDelivery({ github, context, core, ref, record, env, nowMs = Date.now(), session = null }) {
   const dueAt = record.state === 'uncertain' ? Date.parse(record.nextCheckAt) : Date.parse(record.sentAt) + HISTORY_RETRY_DELAY_MS;
   if (nowMs < dueAt) {
     core.setFailed('Feishu 历史查询尚未到延迟重试时间；保持 uncertain 且不重发');
     return { complete: false, retry: true };
   }
-  const token = await tenantToken(env, core);
-  if (!token) return { complete: false, retry: true };
-  const history = await findDeliveryInFeishuHistory({ env, token, record, nowMs });
+  const tokenResult = await tenantToken(env, core);
+  if (!tokenResult.ok) {
+    if (tokenResult.rateLimited) {
+      return deferAmbiguousForRateLimit({
+        github, context, core, ref, record, retryAfterMs: tokenResult.retryAfterMs,
+        nowMs: Date.now(), session, scope: 'tenant token',
+      });
+    }
+    return { complete: false, retry: true };
+  }
+  const history = await findDeliveryInFeishuHistory({
+    env, token: tokenResult.token, record, core, nowMs,
+  });
+  if (history.rateLimited) {
+    return deferAmbiguousForRateLimit({
+      github, context, core, ref, record, retryAfterMs: history.retryAfterMs,
+      nowMs: Date.now(), session, scope: 'history',
+    });
+  }
   const candidates = [...new Set([
     ...record.candidateMessageIds,
     ...history.matches.map((message) => message.message_id),
@@ -2015,8 +2138,18 @@ async function sendAttempt({ github, context, core, ref, prData, cls, env, attem
     core.setFailed(`生成飞书卡片失败: ${errorMessage(error)}`);
     return { complete: false, retry: false };
   }
-  const token = await tenantToken(env, core);
-  if (!token) return { complete: false, retry: true };
+  const tokenResult = await tenantToken(env, core);
+  if (!tokenResult.ok) {
+    if (tokenResult.rateLimited) {
+      return persistRateLimitedNotSent({
+        github, context, core, ref,
+        base: deliveryBase(ref, attempt, mode, new Date().toISOString(), thread),
+        retryAfterMs: tokenResult.retryAfterMs, session, scope: 'tenant token',
+      });
+    }
+    return { complete: false, retry: true };
+  }
+  const token = tokenResult.token;
   const sentAt = new Date().toISOString();
   const base = deliveryBase(ref, attempt, mode, sentAt, thread);
   const sending = canonicalDeliveryRecord({ ...base, state: 'sending' });
@@ -2029,7 +2162,7 @@ async function sendAttempt({ github, context, core, ref, prData, cls, env, attem
   const body = mode === 'reply'
     ? { msg_type: 'interactive', content, reply_in_thread: true, uuid: requestUuid(ref.eventKey, mode, attempt) }
     : { receive_id: env.chatId, msg_type: 'interactive', content, uuid: requestUuid(ref.eventKey, mode, attempt) };
-  const result = await feishu(apiPath, 'POST', body, token);
+  const result = await feishuWithRateLimit({ apiPath, method: 'POST', body, token, core });
   const messageId = result.json.data && result.json.data.message_id;
   if (result.ok && result.json.code === 0 && validFeishuMessageId(messageId)) {
     if (mode === 'root') {
@@ -2043,6 +2176,13 @@ async function sendAttempt({ github, context, core, ref, prData, cls, env, attem
     const appended = await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: done, session });
     if (appended.ok) core.info(`${mode === 'root' ? '根消息' : '话题回复'}发送成功`);
     return { complete: appended.ok, retry: !appended.ok };
+  }
+
+  if (result.rateLimited) {
+    return persistRateLimitedNotSent({
+      github, context, core, ref, base, retryAfterMs: result.retryAfterMs,
+      session, scope: 'message',
+    });
   }
 
   if (mode === 'reply' && shouldRecreateRootOnReplyFailure(result)) {
@@ -2181,6 +2321,31 @@ async function deliverClassifiedEvent({ github, context, core, ref, prData, cls,
     });
   }
   if (latest && latest.state === 'not_sent') {
+    if (latest.reason === 'rate_limited') {
+      if (Date.now() < Date.parse(latest.nextCheckAt)) {
+        core.setFailed('Feishu 429 retry 尚未到 nextCheckAt；保持 durable not_sent');
+        return { complete: false, retry: true };
+      }
+      if (latest.mode === 'reply') {
+        if (current.kind !== 'final' || current.messageId !== latest.targetRoot) {
+          core.setFailed('rate_limited reply 与当前 thread state 不一致');
+          return { complete: false, retry: false, manual: true };
+        }
+        return sendAttempt({
+          github, context, core, ref, prData, cls, env, attempt,
+          mode: 'reply', thread: { rootMid: latest.targetRoot }, session,
+        });
+      }
+      if (latest.mode !== 'root' || current.kind !== 'pending' ||
+          current.generation !== latest.threadGeneration || current.claimId !== latest.threadClaimId) {
+        core.setFailed('rate_limited root 与 matching pending thread state 不一致');
+        return { complete: false, retry: false, manual: true };
+      }
+      return sendAttempt({
+        github, context, core, ref, prData, cls, env, attempt,
+        mode: 'root', thread: { generation: latest.threadGeneration, claimId: latest.threadClaimId }, session,
+      });
+    }
     if (latest.reason === 'definitely_not_sent') {
       if (latest.attempt >= DEFINITE_SEND_MAX_ATTEMPTS) {
         const manual = canonicalDeliveryRecord({
@@ -2329,35 +2494,19 @@ async function resolvePrNumber(githubOrOptions, contextArg, coreArg) {
     return number;
   }
   const direct = context.payload.pull_request && context.payload.pull_request.number;
-  if (Number.isInteger(direct) && direct > 0) return direct;
+  if (context.eventName !== 'check_run' && Number.isInteger(direct) && direct > 0) return direct;
   const checkRun = context.payload.check_run;
   if (!checkRun) {
     core.setFailed('事件不包含 pull_request、check_run 或受信 drain payload');
     return null;
   }
-  let candidates = [...new Set((checkRun.pull_requests || [])
-    .map((pr) => Number(pr.number)).filter((number) => Number.isInteger(number) && number > 0))];
-  if (candidates.length === 0 && checkRun.head_sha) {
-    const associated = await withGithubRetry({
-      core,
-      label: '按 check SHA 解析 PR',
-      operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
-        owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
-        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
-      }),
-    });
-    if (!associated.ok) return null;
-    candidates = [...new Set((associated.value.data || [])
-      .filter((pr) => pr.state == null || pr.state === 'open')
-      .filter((pr) => !pr.head?.sha || pr.head.sha === checkRun.head_sha)
-      .map((pr) => Number(pr.number))
-      .filter((number) => Number.isInteger(number) && number > 0))];
-  }
-  if (candidates.length !== 1) {
-    core.setFailed(`Codex 事件必须唯一关联一个 PR，实际=${candidates.join(',') || 'none'}`);
+  const refs = await resolveOfficialCodexEventRefs(github, context, core);
+  if (!refs) return null;
+  if (refs.length !== 1) {
+    core.setFailed(`Codex 事件必须唯一关联一个 PR，实际=${refs.map((ref) => ref.pr).join(',') || 'none'}`);
     return null;
   }
-  return candidates[0];
+  return refs[0].pr;
 }
 
 async function resolveOfficialCodexEventRefs(githubOrOptions, contextArg, coreArg) {
@@ -2374,37 +2523,22 @@ async function resolveOfficialCodexEventRefs(githubOrOptions, contextArg, coreAr
     const ref = eventRefFromContext(context, prData, core);
     return ref && ref.headSha === prData.headSha ? [ref] : null;
   }
-  const checkRun = context.payload.check_run;
-  if (!isCodexCheckRun(checkRun) || !checkRun.head_sha) {
-    core.setFailed('check_run Codex identity/head SHA 非法');
+  const hintedId = safePositiveInteger(context.payload.check_run && context.payload.check_run.id);
+  if (!hintedId) {
+    core.setFailed('check_run hint 仅允许 canonical immutable ID');
     return null;
   }
-  const associated = await withGithubRetry({
-    core, label: '按 check SHA 解析全部关联 PR',
-    operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
-      owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
-      per_page: MAX_RESOLVED_EVENT_REFS + 1, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+  const fetched = await withGithubRetry({
+    core, label: `按 source immutable ID 重取 check_run ${hintedId}`,
+    operation: () => github.rest.checks.get({
+      owner: context.repo.owner, repo: context.repo.repo, check_run_id: hintedId,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
-  if (!associated.ok) return null;
-  const numbers = [...new Set([
-    ...(checkRun.pull_requests || []).map((pr) => Number(pr.number)),
-    ...(associated.value.data || []).map((pr) => Number(pr.number)),
-  ].filter((number) => Number.isSafeInteger(number) && number > 0))].sort((a, b) => a - b);
-  if (numbers.length > MAX_RESOLVED_EVENT_REFS || (associated.value.data || []).length > MAX_RESOLVED_EVENT_REFS) {
-    core.setFailed(`check_run 关联 PR 超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
-    return null;
-  }
-  const refs = [];
-  for (const number of numbers) {
-    const prData = await resolvePr(github, context, { number }, core);
-    if (!prData) return null;
-    if (prData.state !== 'open' || prData.base !== 'main' || prData.headSha !== checkRun.head_sha) continue;
-    const ref = eventRefFromContext(context, prData, core);
-    if (!ref) return null;
-    refs.push(ref);
-  }
-  return refs;
+  if (!fetched.ok) return null;
+  return resolveFreshCheckRunRefs({
+    github, context, core, checkRun: fetched.value.data, expectedId: hintedId,
+  });
 }
 
 async function resolvePr(github, context, hint, core = noopCore()) {
@@ -2425,6 +2559,10 @@ async function resolvePr(github, context, hint, core = noopCore()) {
   });
   if (!result.ok) return null;
   const full = result.value.data;
+  if (!full || Number(full.number) !== number) {
+    core.setFailed(`读取 PR #${number} 返回了不匹配的 PR number`);
+    return null;
+  }
   return {
     number: full.number,
     title: full.title,
@@ -2450,6 +2588,60 @@ function isCodexUser(user) {
 function isCodexCheckRun(checkRun) {
   return Boolean(checkRun && checkRun.app && checkRun.app.slug === CODEX_CHECK_APP_SLUG &&
     (!checkRun.check_suite || !checkRun.check_suite.app || checkRun.check_suite.app.slug === CODEX_CHECK_APP_SLUG));
+}
+
+async function resolveFreshCheckRunRefs({ github, context, core = noopCore(), checkRun, expectedId = null }) {
+  const createdAt = checkRun && (checkRun.completed_at || checkRun.updated_at);
+  if (!checkRun || (expectedId !== null && String(checkRun.id) !== String(expectedId)) ||
+      !safePositiveInteger(checkRun.id) || !isCodexCheckRun(checkRun) || checkRun.status !== 'completed' ||
+      !validSha(checkRun.head_sha) || !createdAt) {
+    core.setFailed('fresh check_run immutable ID/Codex identity/status/head/time 非法');
+    return null;
+  }
+  const embeddedPulls = Array.isArray(checkRun.pull_requests) ? checkRun.pull_requests : [];
+  const associated = await withGithubRetry({
+    core, label: `按 fresh check SHA ${checkRun.head_sha} 解析全部关联 PR`,
+    setFailedOnExhausted: false,
+    operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
+      owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
+      page: 1, per_page: MAX_RESOLVED_EVENT_REFS + 1, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  let associatedPulls = [];
+  if (!associated.ok) {
+    const embeddedNumbers = [...new Set(embeddedPulls
+      .map((pr) => Number(pr && pr.number))
+      .filter((number) => Number.isSafeInteger(number) && number > 0))];
+    if (embeddedNumbers.length === 0) {
+      core.setFailed('check_run association API 不可用且 fresh embedded PR 为空；保持 source retry');
+      return null;
+    }
+    core.warning(`check_run association API 不可用，降级使用 ${embeddedNumbers.length} 个 fresh embedded PR`);
+  } else {
+    associatedPulls = Array.isArray(associated.value.data) ? associated.value.data : [];
+  }
+  if (associatedPulls.length > MAX_RESOLVED_EVENT_REFS) {
+    core.setFailed(`check_run association API 结果超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
+    return null;
+  }
+  const numbers = [...new Set([...embeddedPulls, ...associatedPulls]
+    .map((pr) => Number(pr && pr.number))
+    .filter((number) => Number.isSafeInteger(number) && number > 0))].sort((a, b) => a - b);
+  if (numbers.length > MAX_RESOLVED_EVENT_REFS) {
+    core.setFailed(`check_run fresh embedded + association union 超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
+    return null;
+  }
+  const refs = [];
+  for (const number of numbers) {
+    const prData = await resolvePr(github, context, { number }, core);
+    if (!prData) return null;
+    if (prData.state !== 'open' || prData.base !== 'main') continue;
+    refs.push(canonicalEventRef({
+      version: EVENT_VERSION, eventType: 'check_run', eventId: String(checkRun.id),
+      repo: repositoryName(context), pr: prData.number, headSha: checkRun.head_sha, createdAt,
+    }));
+  }
+  return refs;
 }
 
 function isCodexPullRequestReview(review) {
@@ -2486,16 +2678,8 @@ function eventRefFromContext(context, prData, core = noopCore()) {
   const repo = repositoryName(context);
   let input;
   if (context.eventName === 'check_run') {
-    const checkRun = context.payload.check_run;
-    if (!isCodexCheckRun(checkRun)) {
-      core.setFailed('拒绝入队非 Codex check_run');
-      return null;
-    }
-    input = {
-      version: EVENT_VERSION, eventType: 'check_run', eventId: String(checkRun.id || ''),
-      repo, pr: prData.number, headSha: checkRun.head_sha,
-      createdAt: checkRun.completed_at || checkRun.updated_at,
-    };
+    core.setFailed('raw check_run 禁止直接构造 ref；必须使用 checks.get fresh resolver');
+    return null;
   } else if (context.eventName === 'pull_request_review') {
     const review = context.payload.review;
     if (!isCodexPullRequestReview(review)) {
@@ -2535,6 +2719,16 @@ async function enqueueOfficialCodexEventWithinBudget({ github, context, core }) 
     }
     return confirmed;
   }
+  if (context.eventName === 'check_run') {
+    const refs = await resolveOfficialCodexEventRefs(github, context, core);
+    if (!refs) return null;
+    if (refs.length !== 1) {
+      core.setFailed(`direct check_run 入队必须唯一关联一个 OPEN main PR，实际=${refs.map((ref) => ref.pr).join(',') || 'none'}`);
+      return null;
+    }
+    const result = await enqueueEventRef({ github, context, core, ref: refs[0] });
+    return result.ok ? refs[0] : null;
+  }
   const prData = await resolvedPrForNotification(github, context, core);
   if (!prData) return null;
   if (prData.base !== 'main' || prData.state !== 'open') {
@@ -2558,7 +2752,7 @@ async function rehydrateEvent({ github, context, core, ref }) {
   }
   const prData = await resolvePr(github, context, { number: ref.pr }, core);
   if (!prData) return { ok: false, retry: true };
-  if (prData.state !== 'open' || prData.base !== 'main' || prData.headSha !== ref.headSha) {
+  if (prData.state !== 'open' || prData.base !== 'main') {
     return { ok: true, notify: false, reason: 'stale_pr' };
   }
   if (ref.eventType === 'check_run') {
@@ -2575,24 +2769,43 @@ async function rehydrateEvent({ github, context, core, ref }) {
     if (!fetched.ok) return { ok: false, retry: true };
     const checkRun = fetched.value.data;
     const createdAt = checkRun.completed_at || checkRun.updated_at;
-    let linked = (checkRun.pull_requests || []).map((pr) => Number(pr.number));
-    if (!linked.includes(ref.pr)) {
-      const associated = await withGithubRetry({
-        core, label: `重验 check_run ${ref.eventId} 关联 PR`,
-        operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
-          owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
-          per_page: MAX_RESOLVED_EVENT_REFS + 1, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
-        }),
-      });
-      if (!associated.ok) return { ok: false, retry: true };
-      if ((associated.value.data || []).length > MAX_RESOLVED_EVENT_REFS) {
-        core.setFailed(`check_run rehydrate 关联 PR 超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
-        return { ok: false, retry: false, manualReason: 'association_overflow' };
-      }
-      linked = [...new Set([...linked, ...(associated.value.data || []).map((pr) => Number(pr.number))])];
+    if (!checkRun || String(checkRun.id) !== ref.eventId || checkRun.head_sha !== ref.headSha ||
+        createdAt !== ref.createdAt || !isCodexCheckRun(checkRun) || checkRun.status !== 'completed') {
+      core.setFailed('immutable check_run 与队列 ref 的 Codex/head/time 绑定不一致');
+      return { ok: false, retry: false, manualReason: 'immutable_mismatch' };
     }
-    if (String(checkRun.id) !== ref.eventId || checkRun.head_sha !== ref.headSha || createdAt !== ref.createdAt ||
-        !isCodexCheckRun(checkRun) || checkRun.status !== 'completed' || !linked.includes(ref.pr)) {
+    const associated = await withGithubRetry({
+      core, label: `重验 check_run ${ref.eventId} 关联 PR`,
+      setFailedOnExhausted: false,
+      operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
+        owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
+        page: 1, per_page: MAX_RESOLVED_EVENT_REFS + 1, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+      }),
+    });
+    const embeddedPulls = Array.isArray(checkRun.pull_requests) ? checkRun.pull_requests : [];
+    const embeddedNumbers = new Set(embeddedPulls.map((pr) => Number(pr && pr.number))
+      .filter((number) => Number.isSafeInteger(number) && number > 0));
+    let associatedPulls = [];
+    if (!associated.ok) {
+      if (!embeddedNumbers.has(ref.pr)) {
+        core.setFailed('check_run association API 不可用且 fresh embedded 无法证明目标 PR；保持 rehydrate retry');
+        return { ok: false, retry: true };
+      }
+      core.warning(`check_run ${ref.eventId} association API 不可用，降级使用 fresh embedded PR #${ref.pr}`);
+    } else {
+      associatedPulls = Array.isArray(associated.value.data) ? associated.value.data : [];
+    }
+    if (associatedPulls.length > MAX_RESOLVED_EVENT_REFS) {
+      core.setFailed(`check_run rehydrate 关联 PR 超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
+      return { ok: false, retry: false, manualReason: 'association_overflow' };
+    }
+    const linked = new Set([...embeddedPulls, ...associatedPulls].map((pr) => Number(pr && pr.number))
+      .filter((number) => Number.isSafeInteger(number) && number > 0));
+    if (linked.size > MAX_RESOLVED_EVENT_REFS) {
+      core.setFailed(`check_run rehydrate fresh embedded + association union 超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
+      return { ok: false, retry: false, manualReason: 'association_overflow' };
+    }
+    if (!linked.has(ref.pr)) {
       core.setFailed('immutable check_run 与队列 ref 的 Codex/repo/PR/head/time 绑定不一致');
       return { ok: false, retry: false, manualReason: 'immutable_mismatch' };
     }
@@ -2612,7 +2825,7 @@ async function rehydrateEvent({ github, context, core, ref }) {
   if (!fetched.ok) return { ok: false, retry: true };
   const review = fetched.value.data;
   if (String(review.id) !== ref.eventId || review.submitted_at !== ref.createdAt ||
-      review.commit_id !== ref.headSha || prData.headSha !== ref.headSha || !isCodexPullRequestReview(review)) {
+      review.commit_id !== ref.headSha || !isCodexPullRequestReview(review)) {
     core.setFailed('immutable review 与队列 ref 的 Codex/repo/PR/head/time 绑定不一致');
     return { ok: false, retry: false, manualReason: 'immutable_mismatch' };
   }
@@ -3466,13 +3679,13 @@ async function resolveCodexWorkflowRunRefs({ github, context, core = noopCore() 
     if (!fetched.ok) return null;
     const review = fetched.value.data;
     if (!review || String(review.id) !== String(capture.eventId) || !isCodexPullRequestReview(review) ||
-        review.commit_id !== prData.headSha || !review.submitted_at) {
-      core.setFailed('wake-up review 官方身份/commit/current head 绑定非法');
+        !validSha(review.commit_id) || !review.submitted_at) {
+      core.setFailed('wake-up review 官方身份/commit/time 绑定非法');
       return null;
     }
     return [canonicalEventRef({
       version: EVENT_VERSION, eventType: 'pull_request_review', eventId: String(review.id),
-      repo: repositoryName(context), pr: prData.number, headSha: prData.headSha, createdAt: review.submitted_at,
+      repo: repositoryName(context), pr: prData.number, headSha: review.commit_id, createdAt: review.submitted_at,
     })];
   }
   const fetched = await withGithubRetry({
@@ -3489,8 +3702,9 @@ async function resolveCodexWorkflowRunRefs({ github, context, core = noopCore() 
     core.setFailed('wake-up check_run 官方身份/status/head/time 绑定非法');
     return null;
   }
-  const sourceContext = { ...context, eventName: 'check_run', payload: { check_run: checkRun } };
-  return resolveOfficialCodexEventRefs(github, sourceContext, core);
+  return resolveFreshCheckRunRefs({
+    github, context, core, checkRun, expectedId: capture.eventId,
+  });
 }
 
 async function consumeCodexWorkflowRunWakeup(args) {
@@ -3692,19 +3906,25 @@ async function sweepQueuedCodexReviews(args) {
 }
 
 async function notifyFromCheckRunWithinBudget({ github, context, core }) {
-  const { classifyCheckRun, shouldNotify } = require('./report');
-  const checkRun = context.payload.check_run;
-  if (!isCodexCheckRun(checkRun)) { core.info('非 Codex check_run，跳过'); return; }
-  const cls = classifyCheckRun(checkRun, process.env);
-  if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}，不通知`); return; }
-  const prData = await resolvedPrForNotification(github, context, core);
-  if (!prData || prData.base !== 'main' || prData.state !== 'open') return;
-  const ref = eventRefFromContext(context, prData, core);
-  if (!ref) return;
-  const env = readFeishuEnv(core); if (!env) return;
-  const ledger = await readDeliveryLedger({ github, context, core, prNum: ref.pr });
-  if (!ledger.ok) return;
-  await deliverClassifiedEvent({ github, context, core, ref, prData, cls, env, latest: ledger.latest.get(ref.eventKey) });
+  const refs = await resolveOfficialCodexEventRefs(github, context, core);
+  if (!refs) return;
+  let env = null;
+  for (const ref of refs) {
+    const hydrated = await rehydrateEvent({ github, context, core, ref });
+    if (!hydrated.ok) return;
+    if (!hydrated.notify) {
+      core.info(`fresh check_run #${ref.eventId} 不满足通知条件`);
+      continue;
+    }
+    env = env || readFeishuEnv(core);
+    if (!env) return;
+    const ledger = await readDeliveryLedger({ github, context, core, prNum: ref.pr });
+    if (!ledger.ok) return;
+    await deliverClassifiedEvent({
+      github, context, core, ref, prData: hydrated.prData, cls: hydrated.cls,
+      env, latest: ledger.latest.get(ref.eventKey),
+    });
+  }
 }
 
 async function notifyFromPullRequestReviewWithinBudget({ github, context, core }) {
@@ -3838,6 +4058,9 @@ module.exports = {
   GITHUB_ATTEMPT_BUDGET_MS,
   BOOTSTRAP_PROGRESS_RESERVE_MS,
   MAX_GITHUB_RETRY_DELAY_MS,
+  FEISHU_RATE_LIMIT_MAX_ATTEMPTS,
+  FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS,
+  FEISHU_RATE_LIMIT_MAX_RETRY_AFTER_MS,
   DRAIN_BATCH_SIZE,
   HISTORY_MAX_PAGES,
   HISTORY_PAGE_SIZE,
