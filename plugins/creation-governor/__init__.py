@@ -791,6 +791,9 @@ Definitions and conflict order:
 5. channel: the durable value of this need depends on reminders, results, or notifications
    reaching the user inside an IM app, and a `[connection-inventory]` line in the evidence lists
    that channel kind under "channels recommendable". Set target to that exact channel kind.
+   ALSO decide channel (high confidence) when the user EXPLICITLY asks how to connect, use,
+   or message through a specific IM channel that the inventory lists as recommendable — an
+   explicit ask is the strongest possible signal; the card gives them a one-tap path.
 6. connector: completing this class of request materially needs the user's own external data
    (mail, notes, code, calendar, ...) and the inventory lists that provider under "connectors
    recommendable". Set target to that exact provider id.
