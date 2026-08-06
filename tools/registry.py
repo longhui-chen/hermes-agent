@@ -174,25 +174,32 @@ def _profile_scoped_check(fn: Callable) -> bool:
     belongs behind the check (e.g. a cached capability document), not in front
     of the authorization decision.
     """
-    raised = False
     try:
         value = bool(fn())
     except Exception:
-        value = False
-        raised = True
+        # A raise is a malfunction, not an answer: log it here because the
+        # check itself may have had no chance to.
+        logger.warning(
+            "profile-scoped check_fn %s raised; dependent tools are "
+            "unavailable this turn",
+            getattr(fn, "__qualname__", fn),
+            exc_info=True,
+        )
+        return False
 
-    if value:
-        return True
-
-    # Log both failure modes. This used to log only the raising case, so a
-    # check that merely returned False removed its tools without leaving a
-    # single line anywhere — undiagnosable from a device.
-    logger.warning(
-        "profile-scoped check_fn %s %s; dependent tools are unavailable this turn",
-        getattr(fn, "__qualname__", fn),
-        "raised" if raised else "returned False",
-    )
-    return False
+    if not value:
+        # A plain False is the designed answer for every optional tool whose
+        # prerequisite is absent — no grant, no provider configured — and this
+        # runs uncached on every agent construction. Warning here buried the
+        # real alarms in agent.log within minutes. Checks that fail for a
+        # reason the operator needs (the media capability probe timing out,
+        # say) log that reason themselves, where it can be stated.
+        logger.debug(
+            "profile-scoped check_fn %s returned False; dependent tools are "
+            "unavailable this turn",
+            getattr(fn, "__qualname__", fn),
+        )
+    return value
 
 
 def _check_fn_cached(fn: Callable) -> bool:

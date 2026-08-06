@@ -22,14 +22,15 @@ def clear_media_capability_cache():
 def patch_media_get(monkeypatch):
     """Route both media GET paths to one handler.
 
-    Capability probes go through ``_CAPABILITY_SESSION`` (a plain in-process
-    session) while job polling goes through ``_SESSION`` (the subprocess worker
-    pool). Tests generally stub a single handler that serves both, so patch
-    both rather than making every caller know which path it is exercising.
+    Capability probes go through ``_CAPABILITY_TRANSPORT`` (an in-process,
+    cancellable loopback GET) while job polling goes through ``_SESSION`` (the
+    subprocess worker pool). Tests generally stub a single handler that serves
+    both, so patch both rather than making every caller know which path it is
+    exercising.
     """
 
     def _patch(client, handler):
         monkeypatch.setattr(client._SESSION, "get", handler)
-        monkeypatch.setattr(client._CAPABILITY_SESSION, "get", handler)
+        monkeypatch.setattr(client._CAPABILITY_TRANSPORT, "get", handler)
 
     return _patch

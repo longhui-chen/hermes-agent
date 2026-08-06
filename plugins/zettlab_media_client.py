@@ -11,6 +11,7 @@ import atexit
 import base64
 import binascii
 import copy
+import http.client
 import io
 import ipaddress
 import json
@@ -18,6 +19,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import socket
 import stat
 import threading
 import time
@@ -54,14 +56,10 @@ CAPABILITY_CACHE_TTL = 60.0
 # otherwise accumulate one 256KB document per profile/config permutation and
 # never release them — an unbounded resident cache under a 2GB device budget.
 MAX_CAPABILITY_CACHE_ENTRIES = 8
-# How long to wait for a cancelled probe thread to notice the closed response
-# before giving up on it. Short: the thread is a daemon and the caller raises
-# either way; this only avoids leaving an obviously-finishable thread behind.
+# How long to wait for a cancelled probe to unwind after its socket is shut
+# down. Short: the shutdown is what breaks the block, so the thread is expected
+# to end almost immediately; the caller raises either way.
 _CAPABILITY_CANCEL_GRACE = 0.5
-# Bound on concurrently in-flight probe threads. A probe abandoned at its
-# deadline keeps running until its socket timeout fires, so without a cap a
-# persistently stalled peer would let one orphan accumulate per probe.
-_CAPABILITY_PROBE_SLOTS = threading.BoundedSemaphore(2)
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 _IMAGE_READ_CHUNK_BYTES = 48 * 1024
 _MAX_LOCAL_IMAGE_PATH_CHARS = 4096
@@ -818,18 +816,122 @@ class _MediaHTTPSession:
             worker.close()
 
 
+class _CapabilityResponse:
+    """Minimal response view over an ``http.client`` exchange."""
+
+    def __init__(self, conn: Any, raw: Any) -> None:
+        self._conn = conn
+        self._raw = raw
+        self.status_code = int(getattr(raw, "status", 0) or 0)
+        self.reason = getattr(raw, "reason", "")
+
+    def raise_for_status(self) -> None:
+        # requests.HTTPError so the shared _raise_for_status() helper, which
+        # renders the error body, keeps working across both transports.
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code} {self.reason}".strip())
+
+    def json(self) -> Any:
+        # Read one byte past the cap so an oversized body is detected without
+        # ever materialising it.
+        limit = MAX_CAPABILITY_RESPONSE_BYTES
+        body = self._raw.read(limit + 1)
+        if len(body) > limit:
+            raise ZettlabMediaError("media capability response exceeds maximum size")
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ZettlabMediaError("media capability response is not valid JSON") from exc
+
+    def close(self) -> None:
+        _shutdown_connection(self._conn)
+
+
+class _CapabilityTransport:
+    """Loopback GET for the capability probe, cancellable at any phase.
+
+    Deliberately ``http.client`` rather than ``requests``. The probe runs
+    during agent construction under a wall-clock deadline, and enforcing that
+    deadline means another thread has to be able to break the call — but
+    neither library bounds total elapsed time, and a peer that trickles bytes
+    below the socket idle timeout stalls indefinitely without tripping it.
+    ``requests`` keeps its socket inside a connection pool that is not
+    reachable while the request is in flight, so there is nothing to break:
+    ``Session.get()`` stalls in the status-line/headers phase before any
+    response object exists.
+
+    ``HTTPConnection`` is constructed before it connects, so the handle is
+    published to the canceller up front and stays valid through connect,
+    headers and body. Cancellation is ``shutdown()`` on the socket, not merely
+    ``close()`` — closing a descriptor another thread is blocked in does not
+    reliably wake it, while a shutdown does.
+
+    The policy the requests version had to configure is inherent here:
+    ``http.client`` never follows redirects and never reads proxy environment
+    variables, so a probe the caller believes is loopback-only stays that way.
+    """
+
+    def get(
+        self,
+        url: str,
+        timeout: float,
+        allow_redirects: bool = False,
+        stream: bool = True,
+    ) -> _CapabilityResponse:
+        # allow_redirects / stream are accepted to keep one call shape across
+        # both media transports; http.client already behaves that way.
+        parsed = urlparse(url)
+        conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        # timeout bounds each socket operation, including the connect syscall;
+        # the caller's deadline bounds the exchange as a whole.
+        conn = conn_cls(parsed.hostname or "127.0.0.1", parsed.port, timeout=timeout)
+        holder = getattr(_probe_state, "holder", None)
+        if holder is not None:
+            holder["connection"] = conn
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        try:
+            conn.request("GET", target, headers={"Accept": "application/json", "Connection": "close"})
+            return _CapabilityResponse(conn, conn.getresponse())
+        except BaseException:
+            _shutdown_connection(conn)
+            raise
+
+
+def _shutdown_connection(conn: Any) -> None:
+    """Break any phase of an in-flight probe.
+
+    ``shutdown`` first: a blocking recv in another thread is woken by a socket
+    shutdown but not reliably by a close of its descriptor, and waking that
+    thread is the entire point of the call.
+    """
+    if conn is None:
+        return
+    sock = getattr(conn, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 _FILE_WORKER = _MediaFileWorker()
 _SESSION = _MediaHTTPSession()
-# In-process session for the capability probe only (loopback GET, bounded
-# response). ``trust_env`` stays off so a proxy env var cannot redirect a
-# request the caller believes is loopback-only.
-_CAPABILITY_SESSION = requests.Session()
-_CAPABILITY_SESSION.trust_env = False
+_CAPABILITY_TRANSPORT = _CapabilityTransport()
+# Lets the transport hand its connection to whoever is enforcing the deadline:
+# the probe thread points this at its own shared outcome dict before calling.
+_probe_state = threading.local()
 _capability_cache: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
 _capability_cache_lock = threading.Lock()
+_capability_inflight: Dict[str, "_CapabilityProbe"] = {}
+_capability_inflight_lock = threading.Lock()
 atexit.register(_SESSION.close)
 atexit.register(_FILE_WORKER.close)
-atexit.register(_CAPABILITY_SESSION.close)
 
 
 def _config_section(media_type: str) -> Dict[str, Any]:
@@ -1020,72 +1122,116 @@ def _bounded_capability_json(resp: Any, limit: int) -> Any:
         raise ZettlabMediaError("media capability response is not valid JSON") from exc
 
 
-def _fetch_capability_document(url: str, limit: int) -> Any:
-    """Run one capability probe under a cancellable wall-clock budget.
+class _CapabilityProbe:
+    """One in-flight capability request, shared by every waiter on its key.
 
-    The budget has to cover the *whole* exchange, not just the body. Neither
-    ``requests`` nor ``urllib3`` bounds total elapsed time — the timeout is
-    socket-idle only — and both halves can stall without ever tripping it:
+    Runs on a daemon thread so the caller keeps a wall-clock deadline the
+    request itself cannot provide: neither ``requests`` nor ``http.client``
+    bounds total elapsed time — their timeout is socket-idle only — and both
+    the headers phase and the body read stall indefinitely against a peer that
+    trickles bytes below that idle timeout, without control ever returning to
+    check a clock. Since this runs during agent construction, a stall here
+    costs the user the whole turn, which is strictly worse than the
+    missing-tool symptom the cache exists to fix.
 
-    - ``session.get()`` returns once the status line and headers have arrived,
-      so a peer trickling headers stalls there;
-    - ``raw.read(n)`` has ``BufferedReader`` semantics and returns only after
-      *n* bytes or end of stream, so a peer trickling the body stalls there.
-
-    In both cases every individual recv stays under the socket timeout while
-    the call as a whole hangs, and checking a clock around it is useless
-    because control never comes back. Since this runs during agent
-    construction, a hang here costs the user the whole turn — strictly worse
-    than the missing-tool symptom this cache exists to fix.
-
-    So run the entire request on a daemon thread and cap it with
-    ``join(deadline)``. Once a response object exists, closing it is what
-    unblocks a stalled body read; before that (still inside ``get()``) there is
-    nothing to close, and we simply stop waiting — the caller degrades on time
-    either way, and the orphan is a daemon that ends on its own when the socket
-    timeout fires. ``_CAPABILITY_PROBE_SLOTS`` bounds how many such orphans can
-    exist at once so a persistently sick peer cannot accumulate threads.
+    ``cancel()`` is what makes the deadline real rather than merely advisory:
+    it shuts the socket down, which breaks whichever phase the thread is
+    parked in, so an abandoned probe ends instead of lingering. That property
+    is why nothing here needs a cap on concurrent probes — an earlier revision
+    capped them, and the cap became its own outage, because a probe that could
+    not be cancelled never gave its slot back and the tools stayed hidden even
+    after the peer recovered.
     """
-    if not _CAPABILITY_PROBE_SLOTS.acquire(blocking=False):
-        raise ZettlabMediaDeadlineError("media capability probe slots exhausted")
 
-    timeout = _capability_timeout()
-    deadline = time.monotonic() + timeout
-    outcome: Dict[str, Any] = {}
+    def __init__(self, url: str, limit: int, timeout: float) -> None:
+        self._url = url
+        self._limit = limit
+        self._timeout = timeout
+        self._outcome: Dict[str, Any] = {}
+        self.done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="zettlab-capability-probe", daemon=True
+        )
 
-    def _run() -> None:
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
         resp = None
         try:
-            resp = _CAPABILITY_SESSION.get(
-                url,
-                timeout=timeout,
+            _probe_state.holder = self._outcome
+            resp = _CAPABILITY_TRANSPORT.get(
+                self._url,
+                timeout=self._timeout,
                 allow_redirects=False,
                 stream=True,
             )
-            outcome["response"] = resp
+            self._outcome["response"] = resp
             _raise_for_status(resp)
-            outcome["data"] = _bounded_capability_json(resp, limit)
-        except BaseException as exc:  # noqa: BLE001 — relayed to the caller below
-            outcome["error"] = exc
+            self._outcome["data"] = _bounded_capability_json(resp, self._limit)
+        except BaseException as exc:  # noqa: BLE001 — relayed to waiters below
+            self._outcome["error"] = exc
         finally:
             if resp is not None:
                 _close_response(resp)
-            _CAPABILITY_PROBE_SLOTS.release()
+            _shutdown_connection(self._outcome.get("connection"))
+            _probe_state.holder = None
+            self._retire()
+            self.done.set()
 
-    probe = threading.Thread(target=_run, name="zettlab-capability-probe", daemon=True)
-    probe.start()
-    probe.join(max(0.0, deadline - time.monotonic()))
-    if probe.is_alive():
-        resp = outcome.get("response")
-        if resp is not None:
-            _close_response(resp)
-            probe.join(_CAPABILITY_CANCEL_GRACE)
+    def _retire(self) -> None:
+        with _capability_inflight_lock:
+            for key, probe in list(_capability_inflight.items()):
+                if probe is self:
+                    _capability_inflight.pop(key, None)
+
+    def cancel(self) -> None:
+        # Drop out of the in-flight map first so a later caller starts a fresh
+        # probe instead of joining one that is already being torn down.
+        self._retire()
+        _close_response(self._outcome.get("response"))
+        _shutdown_connection(self._outcome.get("connection"))
+
+    def result(self) -> Any:
+        error = self._outcome.get("error")
+        if error is not None:
+            raise error
+        return self._outcome.get("data")
+
+
+def _fetch_capability_document(url: str, limit: int) -> Any:
+    """Run one capability probe under an enforced wall-clock budget.
+
+    Probes are shared per key. A multiplexed gateway builds agents
+    concurrently, and each build probes image and video, so a cold cache would
+    otherwise fire one identical loopback request per agent per media type
+    against the same base URL. Waiters attach to the in-flight probe instead,
+    and each still leaves on its own deadline.
+    """
+    timeout = _capability_timeout()
+    deadline = time.monotonic() + timeout
+
+    with _capability_inflight_lock:
+        probe = _capability_inflight.get(url)
+        started = probe is None
+        if probe is None:
+            probe = _CapabilityProbe(url, limit, timeout)
+            _capability_inflight[url] = probe
+    if started:
+        try:
+            probe.start()
+        except BaseException:
+            # A probe that never ran must not stay in the map: later callers
+            # would attach to a thread that will never set `done` and wait out
+            # their whole deadline for nothing.
+            probe.cancel()
+            raise
+
+    if not probe.done.wait(max(0.0, deadline - time.monotonic())):
+        probe.cancel()
+        probe.done.wait(_CAPABILITY_CANCEL_GRACE)
         raise ZettlabMediaDeadlineError("media capability probe deadline exceeded")
-
-    error = outcome.get("error")
-    if error is not None:
-        raise error
-    return outcome.get("data")
+    return probe.result()
 
 
 def _close_response(resp: Any) -> None:
