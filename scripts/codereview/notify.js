@@ -1,24 +1,66 @@
 // Official Codex code review -> Feishu thread orchestration.
 //
-// A trusted, append-only PR comment ledger is the durable source of truth. A root send is
-// allowed only after a pending generation has been confirmed. final/released terminal records
-// supersede that pending claim; the highest generation always wins and never falls back.
+// Trusted PR comments provide three append-only ledgers:
+// 1. immutable GitHub event references, written before per-PR concurrency;
+// 2. Feishu thread state; and
+// 3. per-event delivery state, including ambiguous-send recovery.
+
+// The queue prevents GitHub Actions' single pending concurrency slot from dropping an event.
+// The delivery token in every card lets a later run reconcile an accepted Feishu request
+// without sending the event a second time.
 
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const zlib = require('zlib');
 
 const FEISHU = 'https://open.feishu.cn/open-apis';
 const MARK = '<!-- codex-review-feishu-thread:';
 const STATE_MARK = '<!-- codex-review-feishu-state:';
+const REPAIR_MARK = '<!-- codex-review-feishu-repair:';
+const THREAD_REPAIR_MARK = '<!-- codex-review-feishu-thread-repair:';
+const DELIVERY_REPAIR_MARK = '<!-- codex-review-feishu-delivery-repair:';
+const DELIVERY_TOMBSTONE_MARK = '<!-- codex-review-feishu-delivery-tombstone:';
+const DRAIN_CURSOR_MARK = '<!-- codex-review-feishu-drain-cursor:';
+const CHECKPOINT_MARK = '<!-- codex-review-feishu-checkpoint:';
+const EVENT_MARK = '<!-- codex-review-feishu-event:';
+const DELIVERY_MARK = '<!-- codex-review-feishu-delivery:';
 const THREAD_STATE_VERSION = 2;
-const RECOVERY_STATE_VERSION = 2;
+const REPAIR_VERSION = 1;
+const EVENT_VERSION = 1;
+const DELIVERY_VERSION = 1;
 const MARKER_IO_ATTEMPTS = 3;
 const GITHUB_REQUEST_TIMEOUT_MS = 15000;
 const GITHUB_RETRY_BASE_MS = 1000;
 const MAX_GITHUB_RETRY_DELAY_MS = 30000;
 const GITHUB_ATTEMPT_BUDGET_MS = 180000;
+const FEISHU_REQUEST_TIMEOUT_MS = 15000;
+const DRAIN_BATCH_SIZE = 5;
+const DRAIN_SCAN_LIMIT = 50;
+const COMMENT_PAGE_SIZE = 100;
+const COMMENT_MIGRATION_MAX_PAGES = 5;
+const COMMENT_INCREMENTAL_MAX_PAGES = 3;
+const CHECKPOINT_MAX_ENTRIES = 2000;
+const CHECKPOINT_MAX_BYTES = 60000;
+const CHECKPOINT_MAX_INFLATED_BYTES = 2 * 1024 * 1024;
+const HISTORY_PAGE_SIZE = 50;
+const HISTORY_MAX_PAGES = 5;
+const HISTORY_CLOCK_SKEW_SECONDS = 120;
+const HISTORY_AFTER_SEND_SECONDS = 600;
+const HISTORY_RETRY_DELAY_MS = 30000;
+const HISTORY_MAX_BACKOFF_MS = 15 * 60 * 1000;
+const HISTORY_MAX_ATTEMPTS = 8;
+const HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFINITE_SEND_MAX_ATTEMPTS = 3;
+const WATCHDOG_PR_PAGE_SIZE = 50;
+const WATCHDOG_MAX_PR_PAGES = 4;
+const WATCHDOG_PAGE_WINDOWS = 8;
+const WATCHDOG_MAX_PRS_PER_RUN = 40;
+const WATCHDOG_MAX_DISPATCHES = 10;
+const WATCHDOG_SHARDS = 4;
+const WATCHDOG_SLOT_MS = 30 * 60 * 1000;
 const GITHUB_ACTIONS_BOT = 'github-actions[bot]';
+const CODEX_REVIEW_USER_ID = '199175422';
+const CODEX_REVIEW_LOGIN = 'chatgpt-codex-connector[bot]';
+const CODEX_CHECK_APP_SLUG = 'chatgpt-codex-connector';
 const LEGACY_TRUSTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 const ROOT_MISSING_CODES = new Set(['230011', '230110']);
 const ROOT_DEFINITELY_NOT_SENT_CODES = new Set([
@@ -26,10 +68,29 @@ const ROOT_DEFINITELY_NOT_SENT_CODES = new Set([
   '230027', '230028', '230035', '230038', '230054', '230055', '232009',
 ]);
 const STATE_KEYS = ['claimId', 'generation', 'messageId', 'pr', 'repo', 'state', 'version'];
+const REPAIR_KEYS = ['claimId', 'generation', 'keyId', 'legacyHash', 'messageId', 'pr', 'repo', 'runId', 'signature', 'version'];
+const EVENT_KEYS = ['createdAt', 'eventId', 'eventKey', 'eventType', 'headSha', 'pr', 'repo', 'version'];
+const DELIVERY_KEYS = [
+  'attempt', 'candidateMessageIds', 'eventKey', 'historyAttempts', 'messageId', 'mode', 'nextCheckAt', 'pr',
+  'reason', 'repo', 'sentAt', 'state', 'targetRoot', 'threadClaimId',
+  'threadGeneration', 'token', 'version',
+];
+const DELIVERY_REPAIR_KEYS = [
+  'action', 'candidateHash', 'eventKey', 'keyId', 'messageId', 'operator', 'pr',
+  'priorManualHash', 'priorReason', 'repo', 'runId', 'signature', 'version',
+];
+const DELIVERY_TOMBSTONE_KEYS = [
+  'createdAt', 'eventCommentId', 'eventId', 'eventKey', 'eventType', 'headSha',
+  'pr', 'repo', 'state', 'version',
+];
+const THREAD_REPAIR_KEYS = [
+  'action', 'keyId', 'messageId', 'operator', 'pr', 'priorThreadHash', 'repo', 'runId', 'signature', 'version',
+];
+const DRAIN_CURSOR_KEYS = ['lastCommentId', 'nextEventKey', 'pr', 'repo', 'version'];
 let activeGithubAttemptDeadlineMs = null;
 
 function noopCore() {
-  return { info() {}, warning() {}, setFailed() {}, setSecret() {} };
+  return { info() {}, warning() {}, setFailed() {}, setSecret() {}, setOutput() {} };
 }
 
 function sleep(ms) {
@@ -38,6 +99,28 @@ function sleep(ms) {
 
 function errorMessage(error) {
   return (error && error.message) || String(error);
+}
+
+function sortedKeysEqual(value, keys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+}
+
+function validRepo(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value);
+}
+
+function validIsoTime(value) {
+  return typeof value === 'string' && /Z$/.test(value) && Number.isFinite(Date.parse(value));
+}
+
+function validSha(value) {
+  return typeof value === 'string' && /^[a-fA-F0-9]{7,64}$/.test(value);
+}
+
+function validEventKey(value) {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
 function parseRetryAfterMs(error, nowMs = Date.now()) {
@@ -72,9 +155,9 @@ async function withGithubRetry({
   let stoppedForBudget = false;
   const hasDeadline = Number.isFinite(deadlineMs);
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const remainingBeforeOperation = hasDeadline ? deadlineMs - nowFn() : Infinity;
-    if (remainingBeforeOperation < GITHUB_REQUEST_TIMEOUT_MS) {
-      lastError = new Error(`GitHub attempt budget 剩余 ${Math.max(0, remainingBeforeOperation)}ms，不足单次 ${GITHUB_REQUEST_TIMEOUT_MS}ms timeout`);
+    const remaining = hasDeadline ? deadlineMs - nowFn() : Infinity;
+    if (remaining < GITHUB_REQUEST_TIMEOUT_MS) {
+      lastError = new Error(`GitHub attempt budget 剩余 ${Math.max(0, remaining)}ms，不足单次 ${GITHUB_REQUEST_TIMEOUT_MS}ms timeout`);
       stoppedForBudget = true;
       break;
     }
@@ -110,6 +193,20 @@ async function withGithubRetry({
   return { ok: false, error: lastError };
 }
 
+async function withGithubAttemptBudget(operation, options = {}) {
+  const previousDeadline = activeGithubAttemptDeadlineMs;
+  const nowFn = options.nowFn || Date.now;
+  const requestedDeadline = Number.isFinite(options.deadlineMs)
+    ? options.deadlineMs
+    : nowFn() + GITHUB_ATTEMPT_BUDGET_MS;
+  activeGithubAttemptDeadlineMs = Number.isFinite(previousDeadline) ? previousDeadline : requestedDeadline;
+  try {
+    return await operation();
+  } finally {
+    activeGithubAttemptDeadlineMs = previousDeadline;
+  }
+}
+
 function validFeishuMessageId(value) {
   return typeof value === 'string' && /^om_[A-Za-z0-9_-]{16,80}$/.test(value);
 }
@@ -118,18 +215,39 @@ function validClaimId(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(value);
 }
 
+function base64urlEncode(value) {
+  return Buffer.from(value, 'utf8').toString('base64')
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function base64urlDecode(value) {
+  const padding = (4 - (value.length % 4)) % 4;
+  return Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat(padding), 'base64').toString('utf8');
+}
+
+function encodeMarker(prefix, value) {
+  return `${prefix}${base64urlEncode(JSON.stringify(value))} -->`;
+}
+
+function decodeSingleMarker(body, markerName) {
+  if (typeof body !== 'string') return null;
+  const escaped = markerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matches = [...body.matchAll(new RegExp(`<!-- ${escaped}:([A-Za-z0-9_-]+) -->`, 'g'))];
+  if (matches.length !== 1) return null;
+  try {
+    return JSON.parse(base64urlDecode(matches[0][1]));
+  } catch (_error) {
+    return null;
+  }
+}
+
 function validateThreadState(state) {
-  if (!state || typeof state !== 'object' || Array.isArray(state)) return false;
-  const keys = Object.keys(state).sort();
-  if (keys.length !== STATE_KEYS.length || keys.some((key, index) => key !== STATE_KEYS[index])) return false;
+  if (!sortedKeysEqual(state, STATE_KEYS)) return false;
   if (state.version !== THREAD_STATE_VERSION) return false;
   if (!['pending', 'final', 'released'].includes(state.state)) return false;
-  if (typeof state.repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(state.repo)) return false;
-  if (!Number.isInteger(state.pr) || state.pr <= 0) return false;
-  if (!Number.isInteger(state.generation) || state.generation < 1) return false;
-  if (!validClaimId(state.claimId)) return false;
-  if (state.state === 'final') return validFeishuMessageId(state.messageId);
-  return state.messageId === null;
+  if (!validRepo(state.repo) || !Number.isInteger(state.pr) || state.pr <= 0) return false;
+  if (!Number.isInteger(state.generation) || state.generation < 1 || !validClaimId(state.claimId)) return false;
+  return state.state === 'final' ? validFeishuMessageId(state.messageId) : state.messageId === null;
 }
 
 function canonicalThreadState(input) {
@@ -146,31 +264,13 @@ function canonicalThreadState(input) {
   return state;
 }
 
-function base64urlEncode(value) {
-  return Buffer.from(value, 'utf8').toString('base64')
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-}
-
-function base64urlDecode(value) {
-  const padding = (4 - (value.length % 4)) % 4;
-  return Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat(padding), 'base64').toString('utf8');
-}
-
 function encodeThreadState(input) {
-  const state = canonicalThreadState(input);
-  return `${STATE_MARK}${base64urlEncode(JSON.stringify(state))} -->`;
+  return encodeMarker(STATE_MARK, canonicalThreadState(input));
 }
 
 function decodeThreadState(body) {
-  if (typeof body !== 'string') return null;
-  const matches = [...body.matchAll(/<!-- codex-review-feishu-state:([A-Za-z0-9_-]+) -->/g)];
-  if (matches.length !== 1) return null;
-  try {
-    const decoded = JSON.parse(base64urlDecode(matches[0][1]));
-    return validateThreadState(decoded) ? decoded : null;
-  } catch (_error) {
-    return null;
-  }
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-state');
+  return validateThreadState(decoded) ? decoded : null;
 }
 
 function legacyMessageId(body) {
@@ -198,31 +298,418 @@ function repositoryName(context) {
   return `${context.repo.owner}/${context.repo.repo}`;
 }
 
-async function readThreadMarkerComments({ github, context, core = noopCore(), prNum }) {
-  const result = await withGithubRetry({
+function canonicalCheckpoint(input) {
+  const checkpoint = {
+    version: input.version,
+    revision: input.revision,
+    repo: input.repo,
+    pr: input.pr,
+    highCommentId: input.highCommentId,
+    highCreatedAt: input.highCreatedAt,
+    parentHash: typeof input.parentHash === 'undefined' ? null : input.parentHash,
+    entries: input.entries,
+  };
+  if (checkpoint.version !== 1 || !Number.isInteger(checkpoint.revision) || checkpoint.revision < 1 ||
+      !validRepo(checkpoint.repo) || !Number.isInteger(checkpoint.pr) || checkpoint.pr <= 0 ||
+      !Number.isSafeInteger(checkpoint.highCommentId) || checkpoint.highCommentId < 0 ||
+      !(checkpoint.parentHash === null || /^[a-f0-9]{64}$/.test(checkpoint.parentHash)) ||
+      !validIsoTime(checkpoint.highCreatedAt) || !Array.isArray(checkpoint.entries) ||
+      checkpoint.entries.length > CHECKPOINT_MAX_ENTRIES) return null;
+  for (const entry of checkpoint.entries) {
+    if (!entry || !Number.isSafeInteger(entry.id) || entry.id <= 0 || typeof entry.body !== 'string' ||
+        entry.body.length > CHECKPOINT_MAX_BYTES || !validIsoTime(entry.createdAt) ||
+        typeof entry.login !== 'string' || entry.login.length > 100 ||
+        !['Bot', 'User'].includes(entry.type) || typeof entry.association !== 'string' ||
+        entry.association.length > 40) return null;
+  }
+  return checkpoint;
+}
+
+function encodeCheckpoint(input) {
+  const checkpoint = canonicalCheckpoint(input);
+  if (!checkpoint) throw new Error('invalid checkpoint');
+  const payload = Buffer.from(JSON.stringify(checkpoint.entries), 'utf8');
+  if (payload.length > CHECKPOINT_MAX_INFLATED_BYTES) throw new Error('checkpoint inflated payload exceeds cap');
+  const envelope = {
+    version: 2,
+    revision: checkpoint.revision,
+    repo: checkpoint.repo,
+    pr: checkpoint.pr,
+    highCommentId: checkpoint.highCommentId,
+    highCreatedAt: checkpoint.highCreatedAt,
+    parentHash: checkpoint.parentHash,
+    entryCount: checkpoint.entries.length,
+    payloadHash: crypto.createHash('sha256').update(payload).digest('hex'),
+    encoding: 'deflate-raw',
+    blob: zlib.deflateRawSync(payload).toString('base64url'),
+  };
+  const body = encodeMarker(CHECKPOINT_MARK, envelope);
+  if (Buffer.byteLength(body, 'utf8') > CHECKPOINT_MAX_BYTES) throw new Error('checkpoint exceeds size cap');
+  return body;
+}
+
+function decodeCheckpoint(body) {
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-checkpoint') || {};
+  if (decoded.version !== 2) return canonicalCheckpoint(decoded);
+  if (!sortedKeysEqual(decoded, [
+    'blob', 'encoding', 'entryCount', 'highCommentId', 'highCreatedAt', 'parentHash',
+    'payloadHash', 'pr', 'repo', 'revision', 'version',
+  ]) || decoded.encoding !== 'deflate-raw' || !Number.isInteger(decoded.entryCount) ||
+      decoded.entryCount < 0 || decoded.entryCount > CHECKPOINT_MAX_ENTRIES ||
+      !/^[a-f0-9]{64}$/.test(decoded.payloadHash || '') || typeof decoded.blob !== 'string' ||
+      decoded.blob.length > CHECKPOINT_MAX_BYTES) return null;
+  try {
+    const payload = zlib.inflateRawSync(Buffer.from(decoded.blob, 'base64url'), {
+      maxOutputLength: CHECKPOINT_MAX_INFLATED_BYTES,
+    });
+    if (crypto.createHash('sha256').update(payload).digest('hex') !== decoded.payloadHash) return null;
+    const entries = JSON.parse(payload.toString('utf8'));
+    if (!Array.isArray(entries) || entries.length !== decoded.entryCount) return null;
+    return canonicalCheckpoint({
+      version: 1, revision: decoded.revision, repo: decoded.repo, pr: decoded.pr,
+      highCommentId: decoded.highCommentId, highCreatedAt: decoded.highCreatedAt,
+      parentHash: decoded.parentHash, entries,
+    });
+  } catch (_error) { return null; }
+}
+
+function virtualCheckpointComment(entry) {
+  return {
+    id: entry.id,
+    body: entry.body,
+    created_at: entry.createdAt,
+    author_association: entry.association,
+    user: { login: entry.login, type: entry.type },
+  };
+}
+
+async function listCommentPage({ github, context, core, prNum, page, since }) {
+  return withGithubRetry({
     core,
-    label: '读取 PR 话题状态',
-    operation: () => github.paginate(github.rest.issues.listComments, {
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      issue_number: prNum,
-      per_page: 100,
+    label: `读取 PR 通知账本 page=${page}`,
+    operation: () => github.rest.issues.listComments({
+      owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum,
+      page, per_page: COMMENT_PAGE_SIZE,
+      ...(since ? { since } : {}),
       request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
-  return result.ok ? result.value : null;
 }
 
-function conflictState(core, message, comments = []) {
-  core.setFailed(message);
-  return { ok: false, kind: 'conflict', comments };
+async function readCheckpointTail({ github, context, core, prNum }) {
+  if (typeof github.graphql !== 'function') return [];
+  let before = null;
+  const found = [];
+  for (let page = 0; page < COMMENT_MIGRATION_MAX_PAGES; page += 1) {
+    const result = await withGithubRetry({
+      core, label: `从 comment tail 定位 checkpoint page=${page + 1}`,
+      operation: () => github.graphql(`query($owner:String!,$repo:String!,$pr:Int!,$before:String){
+        repository(owner:$owner,name:$repo){pullRequest(number:$pr){comments(last:100,before:$before){
+          pageInfo{hasPreviousPage startCursor}
+          nodes{databaseId body createdAt authorAssociation author{login __typename}}
+        }}}
+      }`, { owner: context.repo.owner, repo: context.repo.repo, pr: prNum, before }),
+    });
+    if (!result.ok) return null;
+    const connection = result.value.repository.pullRequest.comments;
+    for (const node of connection.nodes || []) {
+      if (!String(node.body || '').includes(CHECKPOINT_MARK) ||
+          String(node.author && node.author.login || '').toLowerCase() !== GITHUB_ACTIONS_BOT) continue;
+      found.push({
+        id: Number(node.databaseId), body: node.body, created_at: node.createdAt,
+        author_association: node.authorAssociation,
+        user: { login: node.author.login, type: node.author.__typename === 'Bot' ? 'Bot' : 'User' },
+      });
+    }
+    if (found.length || !connection.pageInfo.hasPreviousPage) return found;
+    before = connection.pageInfo.startCursor;
+  }
+  core.setFailed('bounded checkpoint tail locator 超界，停止消费以避免错误迁移');
+  return null;
 }
 
-async function readThreadState({ github, context, core = noopCore(), prNum }) {
-  const comments = await readThreadMarkerComments({ github, context, core, prNum });
+async function readThreadMarkerComments({ github, context, core = noopCore(), prNum }) {
+  const repo = repositoryName(context);
+  const tailCheckpoints = await readCheckpointTail({ github, context, core, prNum });
+  if (tailCheckpoints === null) return null;
+  const prefix = [];
+  let prefixFull = false;
+  for (let page = 1; page <= COMMENT_MIGRATION_MAX_PAGES; page += 1) {
+    const result = await listCommentPage({ github, context, core, prNum, page });
+    if (!result.ok) return null;
+    prefix.push(...result.value.data);
+    prefixFull = result.value.data.length === COMMENT_PAGE_SIZE;
+    if (!prefixFull) break;
+  }
+  const checkpointComments = (tailCheckpoints.length ? tailCheckpoints : prefix).filter((comment) =>
+    isGithubActionsBot(comment) && String(comment.body || '').includes(CHECKPOINT_MARK));
+  const decodedCheckpoints = checkpointComments.map((comment) => ({ comment, checkpoint: decodeCheckpoint(comment.body) }));
+  if (decodedCheckpoints.some(({ checkpoint }) => !checkpoint || checkpoint.repo !== repo || checkpoint.pr !== prNum)) {
+    core.setFailed('可信 checkpoint 损坏或绑定到其他 repo/PR');
+    return null;
+  }
+  const byRevision = new Map();
+  for (const entry of decodedCheckpoints) {
+    if (!byRevision.has(entry.checkpoint.revision)) byRevision.set(entry.checkpoint.revision, []);
+    byRevision.get(entry.checkpoint.revision).push(entry);
+  }
+  const representatives = [];
+  for (const [revision, entries] of [...byRevision.entries()].sort((a, b) => a[0] - b[0])) {
+    const hashes = new Set(entries.map(({ checkpoint }) => canonicalHash(checkpoint)));
+    if (hashes.size !== 1) {
+      core.setFailed(`checkpoint revision=${revision} 存在不同 canonical hash`);
+      return null;
+    }
+    representatives.push(entries[0]);
+  }
+  for (let index = 1; index < representatives.length; index += 1) {
+    const previous = representatives[index - 1].checkpoint;
+    const current = representatives[index].checkpoint;
+    if (current.revision === previous.revision + 1 && current.parentHash !== canonicalHash(previous)) {
+      core.setFailed(`checkpoint revision=${current.revision} parentHash lineage 不一致`);
+      return null;
+    }
+  }
+  const selected = representatives.length ? representatives[representatives.length - 1] : null;
+  const checkpointComment = selected ? selected.comment : null;
+  const checkpoint = selected ? selected.checkpoint : null;
+  let comments = [];
+  let truncated = false;
+  if (checkpoint) {
+    comments = checkpoint.entries.map(virtualCheckpointComment);
+    for (let page = 1; page <= COMMENT_INCREMENTAL_MAX_PAGES; page += 1) {
+      const result = await listCommentPage({
+        github, context, core, prNum, page,
+        since: new Date(Date.parse(checkpoint.highCreatedAt) - 1000).toISOString(),
+      });
+      if (!result.ok) return null;
+      const fresh = result.value.data.filter((comment) => Number(comment.id) > checkpoint.highCommentId &&
+        !String(comment.body || '').includes(CHECKPOINT_MARK));
+      comments.push(...fresh);
+      if (result.value.data.length < COMMENT_PAGE_SIZE) break;
+      if (page === COMMENT_INCREMENTAL_MAX_PAGES) truncated = true;
+    }
+  } else {
+    comments.push(...prefix);
+    truncated = prefix.length === COMMENT_MIGRATION_MAX_PAGES * COMMENT_PAGE_SIZE && prefixFull;
+  }
+  if (truncated && !checkpoint) {
+    core.setFailed('legacy comment migration 超过有界页上限，拒绝创建不完整 checkpoint');
+    return null;
+  }
+  if (truncated) core.warning('incremental comment snapshot 达到有界页上限，仅推进已吸收 high-watermark 并续下一批');
+  comments = [...new Map(comments.map((comment) => [Number(comment.id), comment])).values()]
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  Object.defineProperty(comments, '_checkpoint', {
+    value: { commentId: checkpointComment && Number(checkpointComment.id), checkpoint, truncated }, enumerable: false,
+  });
+  return comments;
+}
+
+function conflictState(core, message, comments = [], options = {}) {
+  if (!options.silent) core.setFailed(message);
+  return { ok: false, kind: options.kind || 'conflict', comments, message, ...options.extra };
+}
+
+function unsignedRepairRecord(input) {
+  return {
+    version: input.version,
+    repo: input.repo,
+    pr: input.pr,
+    legacyHash: input.legacyHash,
+    generation: input.generation,
+    keyId: input.keyId,
+    claimId: input.claimId,
+    messageId: input.messageId,
+    runId: input.runId,
+  };
+}
+
+function parseRepairPublicKeyring(value) {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); } catch (_error) { return null; }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const entries = Object.entries(parsed);
+  if (entries.length < 1 || entries.length > 16) return null;
+  const keyring = {};
+  for (const [keyId, publicKey] of entries) {
+    if (!/^[A-Za-z0-9_.-]{1,40}$/.test(keyId) || typeof publicKey !== 'string' || publicKey.length > 10000) return null;
+    try {
+      if (crypto.createPublicKey(publicKey).asymmetricKeyType !== 'ed25519') return null;
+    } catch (_error) { return null; }
+    keyring[keyId] = publicKey;
+  }
+  return keyring;
+}
+
+function repairPublicKey(keyring, keyId) {
+  const parsed = parseRepairPublicKeyring(keyring);
+  return parsed && parsed[keyId] || null;
+}
+
+function privateKeyMatchesKeyring(privateKey, keyring, keyId) {
+  const expected = repairPublicKey(keyring, keyId);
+  if (!privateKey || !expected) return false;
+  try {
+    const derivedKey = crypto.createPublicKey(privateKey);
+    if (derivedKey.asymmetricKeyType !== 'ed25519') return false;
+    const derived = derivedKey.export({ type: 'spki', format: 'der' });
+    const configured = crypto.createPublicKey(expected).export({ type: 'spki', format: 'der' });
+    return derived.length === configured.length && crypto.timingSafeEqual(derived, configured);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function repairPayload(input) {
+  const payload = JSON.stringify(unsignedRepairRecord(input));
+  return Buffer.from(`codex-review-feishu-legacy-repair:v1\n${payload}`, 'utf8');
+}
+
+function signRepairRecord(input, privateKey) {
+  if (!privateKey) throw new Error('CODEX_FEISHU_REPAIR_PRIVATE_KEY 未设置');
+  return crypto.sign(null, repairPayload(input), privateKey).toString('base64url');
+}
+
+function canonicalRepairRecord(input, key, verifyOnly = false) {
+  const unsigned = unsignedRepairRecord(input);
+  const signature = verifyOnly ? input.signature : signRepairRecord(unsigned, key);
+  const record = { ...unsigned, signature };
+  if (!sortedKeysEqual(record, REPAIR_KEYS) || record.version !== REPAIR_VERSION ||
+      !validRepo(record.repo) || !Number.isInteger(record.pr) || record.pr <= 0 ||
+      !/^[a-f0-9]{64}$/.test(record.legacyHash || '') ||
+      !Number.isInteger(record.generation) || record.generation < 1 ||
+      !/^[A-Za-z0-9_.-]{1,40}$/.test(record.keyId || '') ||
+      !validClaimId(record.claimId) || !validFeishuMessageId(record.messageId) ||
+      !/^[A-Za-z0-9_-]{1,100}$/.test(record.runId || '') ||
+      !/^[A-Za-z0-9_-]{80,120}$/.test(record.signature || '')) return null;
+  if (verifyOnly) {
+    const publicKey = repairPublicKey(key, record.keyId);
+    if (!publicKey) return null;
+    try {
+      if (!crypto.verify(null, repairPayload(unsigned), publicKey, Buffer.from(record.signature, 'base64url'))) return null;
+    } catch (_error) {
+      return null;
+    }
+  }
+  return record;
+}
+
+function encodeRepairRecord(input, privateKey) {
+  const record = canonicalRepairRecord(input, privateKey, false);
+  if (!record) throw new Error('invalid legacy repair record');
+  return encodeMarker(REPAIR_MARK, record);
+}
+
+function decodeRepairRecord(body, publicKey) {
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-repair');
+  return canonicalRepairRecord(decoded || {}, publicKey, true);
+}
+
+function unsignedThreadRepairRecord(input) {
+  return {
+    version: input.version,
+    repo: input.repo,
+    pr: input.pr,
+    priorThreadHash: input.priorThreadHash,
+    action: input.action,
+    messageId: typeof input.messageId === 'undefined' ? null : input.messageId,
+    runId: input.runId,
+    operator: input.operator,
+    keyId: input.keyId,
+  };
+}
+
+function threadRepairPayload(input) {
+  return Buffer.from(`codex-review-feishu-thread-repair:v1\n${JSON.stringify(unsignedThreadRepairRecord(input))}`, 'utf8');
+}
+
+function canonicalThreadRepairRecord(input, key, verifyOnly = false) {
+  const unsigned = unsignedThreadRepairRecord(input);
+  let signature;
+  try {
+    signature = verifyOnly ? input.signature : crypto.sign(null, threadRepairPayload(unsigned), key).toString('base64url');
+  } catch (_error) { return null; }
+  const record = { ...unsigned, signature };
+  if (!sortedKeysEqual(record, THREAD_REPAIR_KEYS) || record.version !== 1 ||
+      !validRepo(record.repo) || !Number.isInteger(record.pr) || record.pr <= 0 ||
+      !/^[a-f0-9]{64}$/.test(record.priorThreadHash || '') ||
+      !['finalize', 'release'].includes(record.action) ||
+      (record.action === 'finalize' ? !validFeishuMessageId(record.messageId) : record.messageId !== null) ||
+      !/^[A-Za-z0-9_-]{1,100}$/.test(record.runId || '') ||
+      !/^[A-Za-z0-9_.-]{1,100}$/.test(record.operator || '') ||
+      !/^[A-Za-z0-9_.-]{1,40}$/.test(record.keyId || '') ||
+      !/^[A-Za-z0-9_-]{80,120}$/.test(record.signature || '')) return null;
+  if (verifyOnly) {
+    const publicKey = repairPublicKey(key, record.keyId);
+    if (!publicKey) return null;
+    try {
+      if (!crypto.verify(null, threadRepairPayload(unsigned), publicKey, Buffer.from(record.signature, 'base64url'))) return null;
+    } catch (_error) { return null; }
+  }
+  return record;
+}
+
+function encodeThreadRepairRecord(input, privateKey) {
+  const record = canonicalThreadRepairRecord(input, privateKey, false);
+  if (!record) throw new Error('invalid thread repair record');
+  return encodeMarker(THREAD_REPAIR_MARK, record);
+}
+
+function decodeThreadRepairRecord(body, keyring) {
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-thread-repair');
+  return canonicalThreadRepairRecord(decoded || {}, keyring, true);
+}
+
+function legacyConflictHash(entries) {
+  const snapshot = entries
+    .map((entry) => `${String(entry.commentId)}:${entry.messageId}`)
+    .sort();
+  return crypto.createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+}
+
+function reduceV2Entries(entries, core, comments) {
+  const byGeneration = new Map();
+  for (const entry of entries) {
+    if (!byGeneration.has(entry.generation)) byGeneration.set(entry.generation, []);
+    byGeneration.get(entry.generation).push(entry);
+  }
+  const reduced = [];
+  for (const [generation, generationEntries] of byGeneration.entries()) {
+    const claims = [...new Set(generationEntries.map((entry) => entry.claimId))];
+    if (claims.length !== 1) return conflictState(core, `generation=${generation} 存在不同 v2 claim，停止通知`, comments);
+    const states = new Set(generationEntries.map((entry) => entry.state));
+    const finalMids = [...new Set(generationEntries.filter((entry) => entry.state === 'final').map((entry) => entry.messageId))];
+    if (finalMids.length > 1 || (states.has('final') && states.has('released'))) {
+      return conflictState(core, `generation=${generation} v2 terminal 冲突，停止通知`, comments);
+    }
+    let kind = 'pending';
+    if (states.has('final')) kind = 'final';
+    else if (states.has('released')) kind = 'released';
+    const exemplar = generationEntries.find((entry) => entry.state === kind) || generationEntries[0];
+    reduced.push({
+      ...exemplar,
+      state: kind,
+      messageId: kind === 'final' ? finalMids[0] : null,
+      commentIds: generationEntries.map((entry) => entry.commentId),
+    });
+  }
+  reduced.sort((a, b) => b.generation - a.generation);
+  return { ok: true, reduced };
+}
+
+async function readThreadState({
+  github, context, core = noopCore(), prNum, allowLegacyConflict = false,
+  repairPublicKey = process.env.CODEX_FEISHU_REPAIR_PUBLIC_KEYS,
+  comments: suppliedComments = null,
+}) {
+  const comments = suppliedComments || await readThreadMarkerComments({ github, context, core, prNum });
   if (!comments) return { ok: false, kind: 'unavailable', comments: [] };
   const repo = repositoryName(context);
-  const entries = [];
+  const v2Entries = [];
+  const legacyEntries = [];
   for (const comment of comments) {
     const body = String(comment.body || '');
     if (body.includes(STATE_MARK)) {
@@ -235,7 +722,28 @@ async function readThreadState({ github, context, core = noopCore(), prNum }) {
       if (decoded.repo !== repo || decoded.pr !== prNum) {
         return conflictState(core, `可信 v2 状态绑定到其他 repo/PR comment_id=${comment.id}`, comments);
       }
-      entries.push({ ...decoded, commentId: comment.id });
+      let repair = null;
+      if (body.includes(REPAIR_MARK)) {
+        repair = decodeRepairRecord(body, repairPublicKey);
+        if (!repair || repair.repo !== repo || repair.pr !== prNum ||
+            repair.generation !== decoded.generation || repair.claimId !== decoded.claimId ||
+            repair.messageId !== decoded.messageId || decoded.state !== 'final') {
+          return conflictState(core, `可信 legacy repair 签名或绑定非法 comment_id=${comment.id}`, comments);
+        }
+      }
+      let threadRepair = null;
+      if (body.includes(THREAD_REPAIR_MARK)) {
+        threadRepair = decodeThreadRepairRecord(body, repairPublicKey);
+        const prior = [...v2Entries].reverse().find((entry) => entry.state === 'pending' &&
+          entry.generation === decoded.generation && entry.claimId === decoded.claimId);
+        const expectedState = threadRepair && threadRepair.action === 'finalize' ? 'final' : 'released';
+        if (!threadRepair || !prior || threadRepair.repo !== repo || threadRepair.pr !== prNum ||
+            threadRepair.priorThreadHash !== canonicalHash(canonicalThreadState(prior)) ||
+            decoded.state !== expectedState || decoded.messageId !== threadRepair.messageId) {
+          return conflictState(core, `可信 thread repair 签名或 prior snapshot 绑定非法 comment_id=${comment.id}`, comments);
+        }
+      }
+      v2Entries.push({ ...decoded, commentId: comment.id, repair, threadRepair });
       continue;
     }
     if (!body.includes(MARK)) continue;
@@ -250,7 +758,7 @@ async function readThreadState({ github, context, core = noopCore(), prNum }) {
       core.warning(`忽略非受信作者的 legacy marker comment_id=${comment.id}`);
       continue;
     }
-    entries.push({
+    legacyEntries.push({
       version: 1,
       state: 'final',
       repo,
@@ -261,35 +769,27 @@ async function readThreadState({ github, context, core = noopCore(), prNum }) {
       commentId: comment.id,
     });
   }
-  if (entries.length === 0) return { ok: true, kind: 'none', generation: 0, comments };
 
-  const byGeneration = new Map();
-  for (const entry of entries) {
-    if (!byGeneration.has(entry.generation)) byGeneration.set(entry.generation, []);
-    byGeneration.get(entry.generation).push(entry);
-  }
-  const reduced = [];
-  for (const [generation, generationEntries] of byGeneration.entries()) {
-    const claims = [...new Set(generationEntries.map((entry) => entry.claimId))];
-    if (claims.length !== 1) {
-      return conflictState(core, `generation=${generation} 存在不同 claim，停止通知`, comments);
+  const v2 = reduceV2Entries(v2Entries, core, comments);
+  if (!v2.ok) return v2;
+  const legacyMids = [...new Set(legacyEntries.map((entry) => entry.messageId))];
+  let reduced = v2.reduced.slice();
+  if (legacyMids.length > 1) {
+    const legacyHash = legacyConflictHash(legacyEntries);
+    const signedMigration = v2Entries.some((entry) => entry.repair && entry.repair.legacyHash === legacyHash);
+    if (!signedMigration) {
+      return conflictState(core, 'generation=0 legacy marker 冲突，需签名 repair', comments, {
+        silent: allowLegacyConflict,
+        kind: 'legacy-conflict',
+        extra: { legacyHash, legacyMessageIds: legacyMids.sort(), legacyEntries, v2Generations: reduced },
+      });
     }
-    const states = new Set(generationEntries.map((entry) => entry.state));
-    const finalMids = [...new Set(generationEntries.filter((entry) => entry.state === 'final').map((entry) => entry.messageId))];
-    if (finalMids.length > 1 || (states.has('final') && states.has('released'))) {
-      return conflictState(core, `generation=${generation} terminal 冲突，停止通知`, comments);
-    }
-    let kind = 'pending';
-    if (states.has('final')) kind = 'final';
-    else if (states.has('released')) kind = 'released';
-    const exemplar = generationEntries.find((entry) => entry.state === kind) || generationEntries[0];
-    reduced.push({
-      ...exemplar,
-      state: kind,
-      messageId: kind === 'final' ? finalMids[0] : null,
-      commentIds: generationEntries.map((entry) => entry.commentId),
-    });
+  } else if (legacyMids.length === 1) {
+    const exemplar = legacyEntries[0];
+    reduced.push({ ...exemplar, commentIds: legacyEntries.map((entry) => entry.commentId) });
   }
+
+  if (reduced.length === 0) return { ok: true, kind: 'none', generation: 0, comments };
   reduced.sort((a, b) => b.generation - a.generation);
   const highest = reduced[0];
   return {
@@ -305,19 +805,23 @@ async function readThreadState({ github, context, core = noopCore(), prNum }) {
   };
 }
 
-function stateCommentBody(state) {
-  const marker = encodeThreadState(state);
+function stateCommentBody(state, repair = null, repairPrivateKey = null, threadRepair = null) {
+  const parts = [encodeThreadState(state)];
+  if (repair) parts.push(encodeRepairRecord(repair, repairPrivateKey));
+  if (threadRepair) parts.push(encodeThreadRepairRecord(threadRepair, repairPrivateKey));
   if (state.state === 'final') {
-    return `${marker}\n${MARK}${state.messageId} -->\n<sub>Codex 代码评审话题锚点（自动维护，请勿删除）</sub>`;
+    parts.push(`${MARK}${state.messageId} -->`);
+    parts.push('<sub>Codex 代码评审话题锚点（自动维护，请勿删除）</sub>');
+  } else {
+    parts.push(`<sub>Codex 代码评审话题状态：${state.state}（自动维护，请勿删除）</sub>`);
   }
-  return `${marker}\n<sub>Codex 代码评审话题状态：${state.state}（自动维护，请勿删除）</sub>`;
+  return parts.join('\n');
 }
 
-async function appendStateAndConfirm({ github, context, core, prNum, expected }) {
-  const body = stateCommentBody(expected);
-  await withGithubRetry({
+async function createComment({ github, context, core, prNum, body, label }) {
+  return withGithubRetry({
     core,
-    label: `追加 ${expected.state} 话题状态`,
+    label,
     setFailedOnExhausted: false,
     operation: () => github.rest.issues.createComment({
       owner: context.repo.owner,
@@ -327,11 +831,36 @@ async function appendStateAndConfirm({ github, context, core, prNum, expected })
       request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
-  const confirmed = await readThreadState({ github, context, core, prNum });
-  const matches = confirmed.ok &&
-    confirmed.kind === expected.state &&
-    confirmed.generation === expected.generation &&
-    confirmed.claimId === expected.claimId &&
+}
+
+async function appendStateAndConfirm({
+  github, context, core = noopCore(), prNum, expected, repair = null,
+  repairPrivateKey = null, repairPublicKey = null, threadRepair = null, session = null,
+}) {
+  const created = await createComment({
+    github, context, core, prNum,
+    body: stateCommentBody(expected, repair, repairPrivateKey, threadRepair),
+    label: `追加 ${expected.state} 话题状态`,
+  });
+  if (session) {
+    if (!created.ok) {
+      core.setFailed(`${expected.state} 状态写入未获 GitHub create response 确认`);
+      return { ok: false, state: session.threadState };
+    }
+    session.threadState = {
+      ok: true,
+      kind: expected.state,
+      generation: expected.generation,
+      claimId: expected.claimId,
+      messageId: expected.messageId,
+      rootMid: expected.messageId,
+      state: expected,
+    };
+    return { ok: true, state: session.threadState };
+  }
+  const confirmed = await readThreadState({ github, context, core, prNum, repairPublicKey: repairPublicKey || undefined });
+  const matches = confirmed.ok && confirmed.kind === expected.state &&
+    confirmed.generation === expected.generation && confirmed.claimId === expected.claimId &&
     (expected.state !== 'final' || confirmed.messageId === expected.messageId);
   if (!matches) {
     core.setFailed(`${expected.state} 状态写入未能通过重读确认`);
@@ -340,103 +869,14 @@ async function appendStateAndConfirm({ github, context, core, prNum, expected })
   return { ok: true, state: confirmed };
 }
 
-function recoveryFileFor(reviewEventKey) {
-  if (!process.env.RUNNER_TEMP) return null;
-  const digest = crypto.createHash('sha256').update(reviewEventKey).digest('hex').slice(0, 32);
-  return path.join(process.env.RUNNER_TEMP, `codex-review-feishu-${digest}.json`);
-}
-
-async function writeRecoveryStateAtomic(file, state) {
-  if (!file) throw new Error('RUNNER_TEMP 未设置');
-  const temporary = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  try {
-    await fs.promises.writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    await fs.promises.rename(temporary, file);
-  } finally {
-    await fs.promises.unlink(temporary).catch((error) => {
-      if (error && error.code !== 'ENOENT') throw error;
-    });
-  }
-}
-
-async function clearRecoveryState(file, core = noopCore()) {
-  if (!file) return;
-  try {
-    await fs.promises.unlink(file);
-  } catch (error) {
-    if (!error || error.code !== 'ENOENT') core.warning(`清理通知恢复状态失败: ${errorMessage(error)}`);
-  }
-}
-
-function recoveryRecord({ repo, prNum, reviewEventKey, generation, claimId, stage, messageId = null }) {
-  return {
-    version: RECOVERY_STATE_VERSION,
-    repo,
-    pr: prNum,
-    reviewEventKey,
-    generation,
-    claimId,
-    stage,
-    messageId,
-  };
-}
-
-async function loadRecoveryState(file, expected, core) {
-  if (!file) return { found: false };
-  let raw;
-  try {
-    raw = await fs.promises.readFile(file, 'utf8');
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return { found: false };
-    core.setFailed(`读取通知恢复状态失败: ${errorMessage(error)}`);
-    return { found: true, valid: false };
-  }
-  let state;
-  try {
-    state = JSON.parse(raw);
-  } catch (error) {
-    core.setFailed(`通知恢复状态损坏: ${errorMessage(error)}`);
-    return { found: true, valid: false };
-  }
-  const valid = state && state.version === RECOVERY_STATE_VERSION &&
-    state.repo === expected.repo && state.pr === expected.pr &&
-    state.reviewEventKey === expected.reviewEventKey &&
-    Number.isInteger(state.generation) && state.generation >= 1 &&
-    validClaimId(state.claimId) &&
-    ['reserving', 'pending-confirmed', 'sending', 'root-sent', 'release-needed'].includes(state.stage) &&
-    (state.messageId === null || validFeishuMessageId(state.messageId));
-  if (!valid) {
-    core.setFailed('通知恢复状态与当前事件不匹配');
-    return { found: true, valid: false };
-  }
-  return { found: true, valid: true, state };
-}
-
 async function reserveThreadGeneration({
-  github,
-  context,
-  core = noopCore(),
-  prNum,
-  generation,
-  claimId,
-  reviewEventKey,
-  recoveryFile,
-  allowFromFinal = false,
+  github, context, core = noopCore(), prNum, generation, claimId, allowFromFinal = false, session = null,
 }) {
-  if (!recoveryFile) {
-    core.setFailed('RUNNER_TEMP 未设置，拒绝在无恢复日志时创建 pending');
-    return { ok: false };
-  }
-  const repo = repositoryName(context);
-  const current = await readThreadState({ github, context, core, prNum });
+  const current = session ? session.threadState : await readThreadState({ github, context, core, prNum });
   if (!current.ok) return { ok: false, state: current };
   if (current.kind === 'pending') {
-    if (current.generation === generation && current.claimId === claimId) {
-      await writeRecoveryStateAtomic(recoveryFile, recoveryRecord({ repo, prNum, reviewEventKey, generation, claimId, stage: 'pending-confirmed' }));
-      return { ok: true, state: current, recovered: true };
-    }
-    core.setFailed(`PR 已有 pending generation=${current.generation}，跨 run 不自动恢复`);
+    if (current.generation === generation && current.claimId === claimId) return { ok: true, state: current, recovered: true };
+    core.setFailed(`PR 已有其他 pending generation=${current.generation}`);
     return { ok: false, state: current };
   }
   if (current.kind === 'final' && !allowFromFinal) {
@@ -449,39 +889,21 @@ async function reserveThreadGeneration({
     return { ok: false, state: current };
   }
   const pending = canonicalThreadState({
-    version: THREAD_STATE_VERSION,
-    state: 'pending',
-    repo,
-    pr: prNum,
-    generation,
-    claimId,
-    messageId: null,
+    version: THREAD_STATE_VERSION, state: 'pending', repo: repositoryName(context), pr: prNum,
+    generation, claimId, messageId: null,
   });
-  try {
-    await writeRecoveryStateAtomic(recoveryFile, recoveryRecord({ repo, prNum, reviewEventKey, generation, claimId, stage: 'reserving' }));
-  } catch (error) {
-    core.setFailed(`pending 前置恢复日志写入失败: ${errorMessage(error)}`);
-    return { ok: false };
-  }
-  const appended = await appendStateAndConfirm({ github, context, core, prNum, expected: pending });
-  if (!appended.ok) return appended;
-  try {
-    await writeRecoveryStateAtomic(recoveryFile, recoveryRecord({ repo, prNum, reviewEventKey, generation, claimId, stage: 'pending-confirmed' }));
-  } catch (error) {
-    core.setFailed(`pending 确认恢复日志写入失败: ${errorMessage(error)}`);
-    return { ok: false, state: appended.state };
-  }
-  return appended;
+  return appendStateAndConfirm({ github, context, core, prNum, expected: pending, session });
 }
 
-async function finalizeThreadGeneration({ github, context, core = noopCore(), prNum, generation, claimId, messageId }) {
+async function finalizeThreadGeneration({ github, context, core = noopCore(), prNum, generation, claimId, messageId, session = null }) {
   if (!validFeishuMessageId(messageId)) {
     core.setFailed('final message_id 格式非法');
     return { ok: false };
   }
-  const current = await readThreadState({ github, context, core, prNum });
+  const current = session ? session.threadState : await readThreadState({ github, context, core, prNum });
   if (!current.ok) return { ok: false, state: current };
-  if (current.kind === 'final' && current.generation === generation && current.claimId === claimId && current.messageId === messageId) {
+  if (current.kind === 'final' && current.generation === generation &&
+      current.claimId === claimId && current.messageId === messageId) {
     return { ok: true, state: current, recovered: true };
   }
   if (current.kind !== 'pending' || current.generation !== generation || current.claimId !== claimId) {
@@ -489,19 +911,14 @@ async function finalizeThreadGeneration({ github, context, core = noopCore(), pr
     return { ok: false, state: current };
   }
   const finalState = canonicalThreadState({
-    version: THREAD_STATE_VERSION,
-    state: 'final',
-    repo: repositoryName(context),
-    pr: prNum,
-    generation,
-    claimId,
-    messageId,
+    version: THREAD_STATE_VERSION, state: 'final', repo: repositoryName(context), pr: prNum,
+    generation, claimId, messageId,
   });
-  return appendStateAndConfirm({ github, context, core, prNum, expected: finalState });
+  return appendStateAndConfirm({ github, context, core, prNum, expected: finalState, session });
 }
 
-async function releaseThreadGeneration({ github, context, core = noopCore(), prNum, generation, claimId }) {
-  const current = await readThreadState({ github, context, core, prNum });
+async function releaseThreadGeneration({ github, context, core = noopCore(), prNum, generation, claimId, session = null }) {
+  const current = session ? session.threadState : await readThreadState({ github, context, core, prNum });
   if (!current.ok) return { ok: false, state: current };
   if (current.kind === 'released' && current.generation === generation && current.claimId === claimId) {
     return { ok: true, state: current, recovered: true };
@@ -511,39 +928,609 @@ async function releaseThreadGeneration({ github, context, core = noopCore(), prN
     return { ok: false, state: current };
   }
   const released = canonicalThreadState({
-    version: THREAD_STATE_VERSION,
-    state: 'released',
-    repo: repositoryName(context),
-    pr: prNum,
-    generation,
-    claimId,
-    messageId: null,
+    version: THREAD_STATE_VERSION, state: 'released', repo: repositoryName(context), pr: prNum,
+    generation, claimId, messageId: null,
   });
-  return appendStateAndConfirm({ github, context, core, prNum, expected: released });
+  return appendStateAndConfirm({ github, context, core, prNum, expected: released, session });
 }
 
-// Compatibility wrapper for existing callers. New production paths use append-only v2 state.
+async function repairLegacyConflict({
+  github, context, core = noopCore(), prNum, messageId, runId, privateKey, keyring, keyId,
+}) {
+  if (!validFeishuMessageId(messageId) || !/^[A-Za-z0-9_-]{1,100}$/.test(String(runId || '')) ||
+      !privateKey || !privateKeyMatchesKeyring(privateKey, keyring, keyId)) {
+    core.setFailed('legacy repair 参数非法，或 private key 与 keyring/keyId 不匹配');
+    return { ok: false };
+  }
+  core.setSecret(privateKey);
+  const current = await readThreadState({
+    github, context, core, prNum, allowLegacyConflict: true, repairPublicKey: keyring,
+  });
+  if (current.kind !== 'legacy-conflict') {
+    core.setFailed('仅允许 repair generation-0 legacy marker 冲突');
+    return { ok: false, state: current };
+  }
+  const v2 = current.v2Generations || [];
+  if (v2.some((entry) => entry.state === 'pending')) {
+    core.setFailed('存在 v2 pending，拒绝用 legacy repair 绕过');
+    return { ok: false, state: current };
+  }
+  const generation = v2.length ? Math.max(...v2.map((entry) => entry.generation)) + 1 : 1;
+  const repo = repositoryName(context);
+  const claimId = crypto.createHash('sha256')
+    .update(`legacy-repair:v1:${repo}#${prNum}:${current.legacyHash}:${generation}:${messageId}:${runId}`)
+    .digest('hex').slice(0, 32);
+  const expected = canonicalThreadState({
+    version: THREAD_STATE_VERSION, state: 'final', repo, pr: prNum, generation, claimId, messageId,
+  });
+  const repair = {
+    version: REPAIR_VERSION, repo, pr: prNum, legacyHash: current.legacyHash,
+    generation, claimId, messageId, runId, keyId,
+  };
+  return appendStateAndConfirm({
+    github, context, core, prNum, expected, repair,
+    repairPrivateKey: privateKey, repairPublicKey: keyring,
+  });
+}
+
+// Compatibility wrapper retained for callers that still write an exact legacy marker.
 async function persistThreadMarker({ github, context, core = noopCore(), markerCommentId, prNum, markBody }) {
   const result = await withGithubRetry({
     core,
     label: '兼容回写 legacy 话题标记',
     operation: () => markerCommentId
       ? github.rest.issues.updateComment({
-        owner: context.repo.owner,
-        repo: context.repo.repo,
-        comment_id: markerCommentId,
-        body: markBody,
-        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+        owner: context.repo.owner, repo: context.repo.repo, comment_id: markerCommentId,
+        body: markBody, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
       })
       : github.rest.issues.createComment({
-        owner: context.repo.owner,
-        repo: context.repo.repo,
-        issue_number: prNum,
-        body: markBody,
-        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+        owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum,
+        body: markBody, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
       }),
   });
   return result.ok;
+}
+
+function eventKeyFor(input) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    input.version, input.eventType, input.eventId, input.repo, input.pr, input.headSha, input.createdAt,
+  ])).digest('hex');
+}
+
+function validateEventRef(ref) {
+  return sortedKeysEqual(ref, EVENT_KEYS) && ref.version === EVENT_VERSION &&
+    ['check_run', 'pull_request_review'].includes(ref.eventType) && /^\d{1,30}$/.test(ref.eventId || '') &&
+    validRepo(ref.repo) && Number.isInteger(ref.pr) && ref.pr > 0 && validSha(ref.headSha) &&
+    validIsoTime(ref.createdAt) && validEventKey(ref.eventKey) && ref.eventKey === eventKeyFor(ref);
+}
+
+function canonicalEventRef(input) {
+  const ref = {
+    version: input.version,
+    eventType: input.eventType,
+    eventId: String(input.eventId),
+    repo: input.repo,
+    pr: input.pr,
+    headSha: input.headSha,
+    createdAt: input.createdAt,
+    eventKey: input.eventKey || '',
+  };
+  if (!ref.eventKey) ref.eventKey = eventKeyFor(ref);
+  if (!validateEventRef(ref)) throw new Error('invalid codex review event ref');
+  return ref;
+}
+
+function encodeEventRef(input) {
+  return encodeMarker(EVENT_MARK, canonicalEventRef(input));
+}
+
+function decodeEventRef(body) {
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-event');
+  return validateEventRef(decoded) ? decoded : null;
+}
+
+function canonicalDrainCursor(input) {
+  const cursor = {
+    version: input.version,
+    repo: input.repo,
+    pr: input.pr,
+    nextEventKey: typeof input.nextEventKey === 'undefined' ? null : input.nextEventKey,
+    lastCommentId: typeof input.lastCommentId === 'undefined' ? null : input.lastCommentId,
+  };
+  if (!sortedKeysEqual(cursor, DRAIN_CURSOR_KEYS) || ![1, 2, 3].includes(cursor.version) || !validRepo(cursor.repo) ||
+      !Number.isInteger(cursor.pr) || cursor.pr <= 0 ||
+      !(cursor.nextEventKey === null || validEventKey(cursor.nextEventKey)) ||
+      (cursor.version >= 3
+        ? !(Number.isSafeInteger(cursor.lastCommentId) && cursor.lastCommentId > 0 && validEventKey(cursor.nextEventKey))
+        : cursor.lastCommentId !== null)) {
+    throw new Error('invalid drain cursor');
+  }
+  return cursor;
+}
+
+function encodeDrainCursor(input) {
+  return encodeMarker(DRAIN_CURSOR_MARK, canonicalDrainCursor(input));
+}
+
+function decodeDrainCursor(body) {
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-drain-cursor');
+  try { return canonicalDrainCursor(decoded || {}); } catch (_error) { return null; }
+}
+
+function readDrainCursor({ comments, context, core = noopCore(), prNum }) {
+  const repo = repositoryName(context);
+  const entries = [];
+  for (const comment of comments || []) {
+    const body = String(comment.body || '');
+    if (!body.includes(DRAIN_CURSOR_MARK)) continue;
+    if (!isGithubActionsBot(comment)) continue;
+    const cursor = decodeDrainCursor(body);
+    if (!cursor || cursor.repo !== repo || cursor.pr !== prNum) {
+      core.setFailed(`可信 drain cursor 格式或绑定非法 comment_id=${comment.id}`);
+      return { ok: false, nextEventKey: null };
+    }
+    entries.push({ cursor, commentId: comment.id });
+  }
+  entries.sort((a, b) => String(a.commentId).localeCompare(String(b.commentId), undefined, { numeric: true }));
+  const latest = entries.length ? entries[entries.length - 1].cursor : null;
+  return {
+    ok: true,
+    version: latest ? latest.version : 3,
+    nextEventKey: latest ? latest.nextEventKey : null,
+    lastCommentId: latest ? latest.lastCommentId : null,
+  };
+}
+
+async function appendDrainCursor({ github, context, core, prNum, nextEventKey, lastCommentId }) {
+  const cursor = canonicalDrainCursor({
+    version: 3, repo: repositoryName(context), pr: prNum, nextEventKey, lastCommentId,
+  });
+  const created = await createComment({
+    github, context, core, prNum,
+    body: `${encodeDrainCursor(cursor)}\n<sub>Codex 队列扫描游标（自动维护，请勿删除）</sub>`,
+    label: '推进 Codex 队列扫描游标',
+  });
+  return created.ok;
+}
+
+async function readEventQueue({ github, context, core = noopCore(), prNum, comments: suppliedComments = null }) {
+  const comments = suppliedComments || await readThreadMarkerComments({ github, context, core, prNum });
+  if (!comments) return { ok: false, events: [] };
+  const repo = repositoryName(context);
+  const byKey = new Map();
+  for (const comment of comments) {
+    const body = String(comment.body || '');
+    if (!body.includes(EVENT_MARK)) continue;
+    if (!isGithubActionsBot(comment)) {
+      core.warning(`忽略非 github-actions bot 的 event ref comment_id=${comment.id}`);
+      continue;
+    }
+    const ref = decodeEventRef(body);
+    if (!ref || ref.repo !== repo || ref.pr !== prNum) {
+      return conflictState(core, `可信 event ref 格式或绑定非法 comment_id=${comment.id}`, comments, {
+        extra: { events: [] },
+      });
+    }
+    const prior = byKey.get(ref.eventKey);
+    if (prior && JSON.stringify(prior.ref) !== JSON.stringify(ref)) {
+      return conflictState(core, `eventKey=${ref.eventKey} 存在不同 immutable ref`, comments, {
+        extra: { events: [] },
+      });
+    }
+    if (!prior) byKey.set(ref.eventKey, { ref, commentId: comment.id });
+  }
+  const events = [...byKey.values()].sort((a, b) =>
+    String(a.commentId).localeCompare(String(b.commentId), undefined, { numeric: true }));
+  return { ok: true, events, comments };
+}
+
+async function enqueueEventRef({ github, context, core = noopCore(), ref }) {
+  const canonical = canonicalEventRef(ref);
+  await createComment({
+    github, context, core, prNum: canonical.pr,
+    body: `${encodeEventRef(canonical)}\n<sub>Codex 代码评审事件队列（自动维护，请勿删除）</sub>`,
+    label: '追加 Codex 评审事件队列',
+  });
+  const queue = await readEventQueue({ github, context, core, prNum: canonical.pr });
+  const found = queue.ok && queue.events.some((entry) => JSON.stringify(entry.ref) === JSON.stringify(canonical));
+  if (!found) {
+    core.setFailed('事件队列写入未能通过重读确认');
+    return { ok: false, queue };
+  }
+  return { ok: true, ref: canonical, queue };
+}
+
+function deliveryToken(eventKey) {
+  return `ZETTLAB-CODEX-DELIVERY:${crypto.createHash('sha256').update(`delivery:v1:${eventKey}`).digest('hex')}`;
+}
+
+function validateDeliveryRecord(record) {
+  if (!sortedKeysEqual(record, DELIVERY_KEYS) || record.version !== DELIVERY_VERSION ||
+      !validRepo(record.repo) || !Number.isInteger(record.pr) || record.pr <= 0 ||
+      !validEventKey(record.eventKey) || record.token !== deliveryToken(record.eventKey) ||
+      !['preparing', 'sending', 'uncertain', 'manual', 'retrying', 'done', 'not_sent', 'skipped', 'failed'].includes(record.state) ||
+      !Number.isInteger(record.attempt) || record.attempt < 0 ||
+      !Number.isInteger(record.historyAttempts) || record.historyAttempts < 0 ||
+      !(record.nextCheckAt === null || validIsoTime(record.nextCheckAt)) ||
+      !(record.sentAt === null || validIsoTime(record.sentAt)) ||
+      !(record.messageId === null || validFeishuMessageId(record.messageId)) ||
+      !(record.targetRoot === null || validFeishuMessageId(record.targetRoot)) ||
+      !(record.threadClaimId === null || validClaimId(record.threadClaimId)) ||
+      !(record.threadGeneration === null || (Number.isInteger(record.threadGeneration) && record.threadGeneration >= 1)) ||
+      !(record.reason === null || /^[a-z0-9_-]{1,64}$/.test(record.reason))) return false;
+  if (!Array.isArray(record.candidateMessageIds) || record.candidateMessageIds.length > 10 ||
+      record.candidateMessageIds.some((mid) => !validFeishuMessageId(mid)) ||
+      JSON.stringify(record.candidateMessageIds) !== JSON.stringify([...new Set(record.candidateMessageIds)].sort())) return false;
+  if (['skipped', 'failed'].includes(record.state) && record.attempt === 0) {
+    return record.mode === 'none' && record.sentAt === null && record.messageId === null &&
+      record.targetRoot === null && record.threadClaimId === null && record.threadGeneration === null &&
+      record.nextCheckAt === null && record.historyAttempts === 0 && Boolean(record.reason) && record.candidateMessageIds.length === 0;
+  }
+  if (!['root', 'reply'].includes(record.mode) || record.attempt < 1) return false;
+  if (record.mode === 'root') {
+    if (record.targetRoot !== null || !validClaimId(record.threadClaimId) || !Number.isInteger(record.threadGeneration)) return false;
+  } else if (!validFeishuMessageId(record.targetRoot) || record.threadClaimId !== null || record.threadGeneration !== null) return false;
+  if (record.state === 'preparing') {
+    return record.mode === 'root' && record.sentAt === null && record.messageId === null &&
+      record.nextCheckAt === null && record.historyAttempts === 0 && record.reason === null && record.candidateMessageIds.length === 0;
+  }
+  if (record.state === 'skipped') {
+    return record.messageId === null && record.nextCheckAt === null && Boolean(record.reason);
+  }
+  if (!record.sentAt) return false;
+  if (record.state === 'done') return validFeishuMessageId(record.messageId) && record.nextCheckAt === null && record.reason === null;
+  if (record.messageId !== null) return false;
+  if (record.state === 'uncertain') {
+    return record.nextCheckAt !== null && ['ambiguous', 'history_zero', 'history_error', 'history_incomplete'].includes(record.reason);
+  }
+  if (record.state === 'manual') {
+    if (record.nextCheckAt !== null || !['history_multiple', 'history_exhausted', 'definitely_not_sent_exhausted'].includes(record.reason)) return false;
+    return record.reason !== 'history_multiple' || record.candidateMessageIds.length >= 2;
+  }
+  if (record.state === 'retrying') return record.nextCheckAt === null && record.reason === 'operator_retry';
+  if (record.state === 'not_sent') return record.nextCheckAt === null && ['root_missing', 'definitely_not_sent'].includes(record.reason);
+  if (record.state === 'failed') return record.nextCheckAt === null && Boolean(record.reason);
+  return record.state === 'sending' && record.nextCheckAt === null && record.reason === null;
+}
+
+function canonicalDeliveryRecord(input) {
+  const record = {
+    version: input.version,
+    state: input.state,
+    repo: input.repo,
+    pr: input.pr,
+    eventKey: input.eventKey,
+    candidateMessageIds: [...new Set(input.candidateMessageIds || [])].sort(),
+    attempt: input.attempt,
+    mode: input.mode,
+    targetRoot: typeof input.targetRoot === 'undefined' ? null : input.targetRoot,
+    threadGeneration: typeof input.threadGeneration === 'undefined' ? null : input.threadGeneration,
+    threadClaimId: typeof input.threadClaimId === 'undefined' ? null : input.threadClaimId,
+    token: input.token || deliveryToken(input.eventKey),
+    sentAt: typeof input.sentAt === 'undefined' ? null : input.sentAt,
+    messageId: typeof input.messageId === 'undefined' ? null : input.messageId,
+    historyAttempts: input.historyAttempts || 0,
+    nextCheckAt: typeof input.nextCheckAt === 'undefined' ? null : input.nextCheckAt,
+    reason: typeof input.reason === 'undefined' ? null : input.reason,
+  };
+  if (!validateDeliveryRecord(record)) throw new Error('invalid codex review delivery record');
+  return record;
+}
+
+function encodeDeliveryRecord(input) {
+  return encodeMarker(DELIVERY_MARK, canonicalDeliveryRecord(input));
+}
+
+function decodeDeliveryRecord(body) {
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-delivery');
+  return validateDeliveryRecord(decoded) ? decoded : null;
+}
+
+function canonicalDeliveryTombstone(input) {
+  let ref;
+  try {
+    ref = canonicalEventRef({
+      version: EVENT_VERSION, repo: input.repo, pr: input.pr, eventKey: input.eventKey,
+      eventType: input.eventType, eventId: input.eventId, headSha: input.headSha, createdAt: input.createdAt,
+    });
+  } catch (_error) { return null; }
+  const tombstone = {
+    version: 1, repo: ref.repo, pr: ref.pr, eventKey: ref.eventKey,
+    eventType: ref.eventType, eventId: ref.eventId, headSha: ref.headSha, createdAt: ref.createdAt,
+    eventCommentId: Number(input.eventCommentId), state: input.state,
+  };
+  if (!sortedKeysEqual(tombstone, DELIVERY_TOMBSTONE_KEYS) ||
+      !Number.isSafeInteger(tombstone.eventCommentId) || tombstone.eventCommentId <= 0 ||
+      !['done', 'skipped'].includes(tombstone.state)) return null;
+  return tombstone;
+}
+
+function encodeDeliveryTombstone(input) {
+  const tombstone = canonicalDeliveryTombstone(input);
+  if (!tombstone) throw new Error('invalid delivery tombstone');
+  return encodeMarker(DELIVERY_TOMBSTONE_MARK, tombstone);
+}
+
+function decodeDeliveryTombstone(body) {
+  return canonicalDeliveryTombstone(
+    decodeSingleMarker(body, 'codex-review-feishu-delivery-tombstone') || {},
+  );
+}
+
+function sameDeliveryIdentity(a, b) {
+  return a.repo === b.repo && a.pr === b.pr && a.eventKey === b.eventKey &&
+    a.attempt === b.attempt && a.mode === b.mode && a.targetRoot === b.targetRoot &&
+    a.threadGeneration === b.threadGeneration && a.threadClaimId === b.threadClaimId &&
+    a.token === b.token && a.sentAt === b.sentAt;
+}
+
+function sameDeliveryStaticIdentity(a, b) {
+  return a.repo === b.repo && a.pr === b.pr && a.eventKey === b.eventKey &&
+    a.attempt === b.attempt && a.mode === b.mode && a.targetRoot === b.targetRoot &&
+    a.threadGeneration === b.threadGeneration && a.threadClaimId === b.threadClaimId && a.token === b.token;
+}
+
+function validDeliveryTransition(previous, next) {
+  if (!previous) return ['preparing', 'sending', 'skipped', 'failed'].includes(next.state);
+  if (JSON.stringify(previous) === JSON.stringify(next)) return true;
+  if (['done', 'skipped'].includes(previous.state)) return false;
+  if (previous.state === 'failed') return next.state === 'skipped' && sameDeliveryIdentity(previous, next);
+  if (previous.state === 'manual') return false;
+  if (previous.state === 'retrying') {
+    if (next.state === 'skipped') return sameDeliveryIdentity(previous, next);
+    return next.state === 'preparing' && next.attempt === previous.attempt + 1 &&
+      sameDeliveryStaticIdentity({
+        ...previous, attempt: next.attempt, mode: 'root', targetRoot: null,
+        threadGeneration: next.threadGeneration, threadClaimId: next.threadClaimId,
+      }, next);
+  }
+  if (previous.state === 'not_sent') {
+    if (next.state === 'skipped') return sameDeliveryIdentity(previous, next);
+    if (next.state === 'manual') return sameDeliveryIdentity(previous, next);
+    return next.state === 'preparing' && next.attempt === previous.attempt + 1 && sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt, mode: 'root', targetRoot: null, threadGeneration: next.threadGeneration, threadClaimId: next.threadClaimId }, next);
+  }
+  if (previous.state === 'preparing') {
+    return ['sending', 'skipped', 'manual'].includes(next.state) &&
+      (next.state !== 'sending' || next.sentAt !== null) && sameDeliveryStaticIdentity(previous, next);
+  }
+  if (!sameDeliveryIdentity(previous, next)) return false;
+  if (previous.state === 'sending') return ['uncertain', 'manual', 'done', 'not_sent', 'failed'].includes(next.state);
+  if (previous.state === 'uncertain') {
+    return ['done', 'manual', 'failed'].includes(next.state) ||
+      (next.state === 'uncertain' && next.historyAttempts > previous.historyAttempts);
+  }
+  return false;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalHash(value) {
+  return crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
+function candidateSetHash(candidateMessageIds) {
+  return canonicalHash([...new Set(candidateMessageIds || [])].sort());
+}
+
+function unsignedDeliveryRepairRecord(input) {
+  return {
+    version: input.version,
+    action: input.action,
+    repo: input.repo,
+    pr: input.pr,
+    eventKey: input.eventKey,
+    priorManualHash: input.priorManualHash,
+    priorReason: input.priorReason,
+    candidateHash: input.candidateHash,
+    messageId: input.messageId,
+    runId: input.runId,
+    operator: input.operator,
+    keyId: input.keyId,
+  };
+}
+
+function deliveryRepairPayload(input) {
+  return Buffer.from(`codex-review-feishu-delivery-repair:v1\n${JSON.stringify(unsignedDeliveryRepairRecord(input))}`, 'utf8');
+}
+
+function canonicalDeliveryRepairRecord(input, key, verifyOnly = false) {
+  const unsigned = unsignedDeliveryRepairRecord(input);
+  const signature = verifyOnly
+    ? input.signature
+    : crypto.sign(null, deliveryRepairPayload(unsigned), key).toString('base64url');
+  const record = { ...unsigned, signature };
+  if (!sortedKeysEqual(record, DELIVERY_REPAIR_KEYS) || record.version !== 1 ||
+      !validRepo(record.repo) || !Number.isInteger(record.pr) || record.pr <= 0 ||
+      !validEventKey(record.eventKey) || !/^[a-f0-9]{64}$/.test(record.priorManualHash || '') ||
+      !/^[a-f0-9]{64}$/.test(record.candidateHash || '') ||
+      !['select_mid', 'retry', 'discard'].includes(record.action) ||
+      !(record.messageId === null || validFeishuMessageId(record.messageId)) ||
+      !/^[a-z0-9_-]{1,64}$/.test(record.priorReason || '') ||
+      !/^[A-Za-z0-9_-]{1,100}$/.test(record.runId || '') ||
+      !/^[A-Za-z0-9_.-]{1,100}$/.test(record.operator || '') ||
+      !/^[A-Za-z0-9_.-]{1,40}$/.test(record.keyId || '') ||
+      !/^[A-Za-z0-9_-]{80,120}$/.test(record.signature || '')) return null;
+  if ((record.action === 'select_mid') !== validFeishuMessageId(record.messageId)) return null;
+  if (verifyOnly) {
+    const publicKey = repairPublicKey(key, record.keyId);
+    if (!publicKey) return null;
+    try {
+      if (!crypto.verify(null, deliveryRepairPayload(unsigned), publicKey, Buffer.from(record.signature, 'base64url'))) return null;
+    } catch (_error) { return null; }
+  }
+  return record;
+}
+
+function encodeDeliveryRepairRecord(input, privateKey) {
+  const record = canonicalDeliveryRepairRecord(input, privateKey, false);
+  if (!record) throw new Error('invalid signed delivery repair record');
+  return encodeMarker(DELIVERY_REPAIR_MARK, record);
+}
+
+function decodeDeliveryRepairRecord(body, keyring) {
+  const decoded = decodeSingleMarker(body, 'codex-review-feishu-delivery-repair');
+  return canonicalDeliveryRepairRecord(decoded || {}, keyring, true);
+}
+
+function validSignedManualRepair(previous, next, repair) {
+  if (!repair || previous.state !== 'manual' || !sameDeliveryIdentity(previous, next) ||
+      repair.repo !== previous.repo || repair.pr !== previous.pr || repair.eventKey !== previous.eventKey ||
+      repair.priorManualHash !== canonicalHash(previous) || repair.priorReason !== previous.reason ||
+      repair.candidateHash !== candidateSetHash(previous.candidateMessageIds) ||
+      JSON.stringify(previous.candidateMessageIds) !== JSON.stringify(next.candidateMessageIds)) return false;
+  if (repair.action === 'select_mid') {
+    return next.state === 'done' && repair.messageId === next.messageId &&
+      previous.candidateMessageIds.includes(next.messageId);
+  }
+  if (repair.action === 'retry') {
+    return previous.reason === 'definitely_not_sent_exhausted' && next.state === 'retrying' &&
+      next.messageId === null && repair.messageId === null;
+  }
+  return Boolean(repair.action === 'discard' && next.state === 'skipped' &&
+    next.messageId === null && repair.messageId === null);
+}
+
+async function readDeliveryLedger({
+  github, context, core = noopCore(), prNum,
+  repairPublicKeys = process.env.CODEX_FEISHU_REPAIR_PUBLIC_KEYS,
+  comments: suppliedComments = null,
+}) {
+  const comments = suppliedComments || await readThreadMarkerComments({ github, context, core, prNum });
+  if (!comments) return { ok: false, latest: new Map() };
+  const repo = repositoryName(context);
+  const grouped = new Map();
+  const tombstones = new Map();
+  for (const comment of comments) {
+    const body = String(comment.body || '');
+    if (body.includes(DELIVERY_TOMBSTONE_MARK)) {
+      if (!isGithubActionsBot(comment)) {
+        core.warning(`忽略非 github-actions bot 的 delivery tombstone comment_id=${comment.id}`);
+        continue;
+      }
+      const tombstone = decodeDeliveryTombstone(body);
+      if (!tombstone || tombstone.repo !== repo || tombstone.pr !== prNum) {
+        return conflictState(core, `可信 delivery tombstone 格式或绑定非法 comment_id=${comment.id}`, comments, {
+          extra: { latest: new Map() },
+        });
+      }
+      const previous = tombstones.get(tombstone.eventKey);
+      if (previous && canonicalHash(previous) !== canonicalHash(tombstone)) {
+        return conflictState(core, `eventKey=${tombstone.eventKey} delivery tombstone 冲突`, comments, {
+          extra: { latest: new Map() },
+        });
+      }
+      tombstones.set(tombstone.eventKey, tombstone);
+      continue;
+    }
+    if (!body.includes(DELIVERY_MARK)) continue;
+    if (!isGithubActionsBot(comment)) {
+      core.warning(`忽略非 github-actions bot 的 delivery record comment_id=${comment.id}`);
+      continue;
+    }
+    const record = decodeDeliveryRecord(body);
+    if (!record || record.repo !== repo || record.pr !== prNum) {
+      return conflictState(core, `可信 delivery record 格式或绑定非法 comment_id=${comment.id}`, comments, {
+        extra: { latest: new Map() },
+      });
+    }
+    let repair = null;
+    if (body.includes(DELIVERY_REPAIR_MARK)) {
+      repair = decodeDeliveryRepairRecord(body, repairPublicKeys);
+      if (!repair) {
+        return conflictState(core, `可信 delivery repair 签名非法 comment_id=${comment.id}`, comments, {
+          extra: { latest: new Map() },
+        });
+      }
+    }
+    if (!grouped.has(record.eventKey)) grouped.set(record.eventKey, []);
+    grouped.get(record.eventKey).push({ record, repair, commentId: comment.id });
+  }
+  const latest = new Map();
+  for (const [eventKey, entries] of grouped.entries()) {
+    entries.sort((a, b) => String(a.commentId).localeCompare(String(b.commentId), undefined, { numeric: true }));
+    let previous = null;
+    for (const entry of entries) {
+      const validTransition = previous && previous.state === 'manual' && ['done', 'retrying', 'skipped'].includes(entry.record.state)
+        ? validSignedManualRepair(previous, entry.record, entry.repair)
+        : validDeliveryTransition(previous, entry.record) && !entry.repair;
+      if (!validTransition) {
+        return conflictState(core, `eventKey=${eventKey} delivery 状态转换冲突`, comments, {
+          extra: { latest: new Map() },
+        });
+      }
+      previous = entry.record;
+    }
+    latest.set(eventKey, previous);
+  }
+  for (const [eventKey, tombstone] of tombstones.entries()) {
+    const current = latest.get(eventKey);
+    if (current && (!['done', 'skipped'].includes(current.state) || current.state !== tombstone.state)) {
+      return conflictState(core, `eventKey=${eventKey} delivery tombstone 与账本冲突`, comments, {
+        extra: { latest: new Map() },
+      });
+    }
+    if (!current) latest.set(eventKey, tombstone);
+  }
+  return { ok: true, latest, comments };
+}
+
+async function appendDeliveryAndConfirm({
+  github, context, core = noopCore(), prNum, record,
+  repair = null, repairPrivateKey = null, repairPublicKeys = null, session = null,
+}) {
+  const canonical = canonicalDeliveryRecord(record);
+  const markers = [encodeDeliveryRecord(canonical)];
+  let signedRepair = null;
+  if (repair) {
+    const encodedRepair = encodeDeliveryRepairRecord(repair, repairPrivateKey);
+    markers.push(encodedRepair);
+    signedRepair = decodeDeliveryRepairRecord(encodedRepair, repairPublicKeys);
+  }
+  if (session) {
+    const previous = session.latest.get(canonical.eventKey);
+    const validTransition = previous && previous.state === 'manual' && ['done', 'retrying', 'skipped'].includes(canonical.state)
+      ? validSignedManualRepair(previous, canonical, signedRepair)
+      : validDeliveryTransition(previous, canonical) && !signedRepair;
+    if (!validTransition) {
+      core.setFailed(`eventKey=${canonical.eventKey} 本地 delivery transition 非法`);
+      return { ok: false };
+    }
+  }
+  const created = await createComment({
+    github, context, core, prNum,
+    body: `${markers.join('\n')}\n<sub>Codex 飞书投递状态：${canonical.state}（自动维护，请勿删除）</sub>`,
+    label: `追加 ${canonical.state} 投递状态`,
+  });
+  if (session) {
+    if (!created.ok) {
+      core.setFailed(`${canonical.state} delivery 写入未获 GitHub create response 确认`);
+      return { ok: false };
+    }
+    session.latest.set(canonical.eventKey, canonical);
+    return { ok: true, record: canonical };
+  }
+  const ledger = await readDeliveryLedger({
+    github, context, core, prNum, repairPublicKeys: repairPublicKeys || undefined,
+  });
+  const confirmed = ledger.ok && JSON.stringify(ledger.latest.get(canonical.eventKey)) === JSON.stringify(canonical);
+  if (!confirmed) {
+    core.setFailed(`${canonical.state} 投递状态写入未能通过重读确认`);
+    return { ok: false, ledger };
+  }
+  return { ok: true, record: canonical, ledger };
+}
+
+function terminalNoSendRecord(ref, state, reason) {
+  return canonicalDeliveryRecord({
+    version: DELIVERY_VERSION, state, repo: ref.repo, pr: ref.pr, eventKey: ref.eventKey,
+    attempt: 0, mode: 'none', token: deliveryToken(ref.eventKey), reason,
+  });
 }
 
 function feishuFailureSummary(result) {
@@ -555,8 +1542,7 @@ function feishuFailureSummary(result) {
 }
 
 function shouldRecreateRootOnReplyFailure(result) {
-  const code = String(result && result.json && result.json.code || '');
-  return ROOT_MISSING_CODES.has(code);
+  return ROOT_MISSING_CODES.has(String(result && result.json && result.json.code || ''));
 }
 
 function isKnownRootSendFailure(result) {
@@ -569,284 +1555,452 @@ async function feishu(apiPath, method, body, token) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
+  const timer = setTimeout(() => ctrl.abort(), FEISHU_REQUEST_TIMEOUT_MS);
   try {
     const resp = await fetch(`${FEISHU}${apiPath}`, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: ctrl.signal,
+      method, headers, body: body ? JSON.stringify(body) : undefined, signal: ctrl.signal,
     });
     const text = await resp.text();
     let json;
     try { json = JSON.parse(text); } catch (_error) { json = {}; }
-    return { ok: resp.ok, status: resp.status, json, text };
+    return { ok: resp.ok, status: resp.status, json };
   } catch (error) {
     const message = error && error.name === 'AbortError' ? 'feishu API timeout (15s)' : errorMessage(error);
-    return { ok: false, status: 0, json: { code: 'NETWORK_ERROR', msg: message }, text: message };
+    return { ok: false, status: 0, json: { code: 'NETWORK_ERROR', msg: message } };
   } finally {
     clearTimeout(timer);
   }
 }
 
-function readFeishuEnv(core) {
+function readFeishuEnv(core, required = false) {
   const appId = process.env.CODEREVIEW_FEISHU_APP_ID;
   const appSecret = process.env.CODEREVIEW_FEISHU_APP_SECRET;
   const chatId = process.env.CODEREVIEW_FEISHU_CHAT_ID;
   for (const secret of [appId, appSecret, chatId]) if (secret) core.setSecret(secret);
   if (!appId || !appSecret || !chatId) {
-    core.warning('未配置 Feishu secret，跳过通知');
+    if (required) core.setFailed('Feishu secret 未完整配置，队列保持待处理');
+    else core.warning('未配置 Feishu secret，跳过通知');
     return null;
   }
   return { appId, appSecret, chatId };
 }
 
-function deterministicClaimId(repo, prNum, generation, reviewEventKey) {
-  return crypto.createHash('sha256').update(`claim:v2:${repo}#${prNum}:${generation}:${reviewEventKey}`).digest('hex').slice(0, 32);
-}
-
-function rootUuid(repo, prNum, generation, claimId) {
-  return crypto.createHash('sha256').update(`root:v2:${repo}#${prNum}:${generation}:${claimId}`).digest('hex').slice(0, 32);
-}
-
-function eventUuid(reviewEventKey, kind) {
-  return crypto.createHash('sha256').update(`${reviewEventKey}:${kind}`).digest('hex').slice(0, 32);
-}
-
-async function recoverSameJob({ github, context, core, prNum, reviewEventKey, recoveryFile }) {
-  const repo = repositoryName(context);
-  const loaded = await loadRecoveryState(recoveryFile, { repo, pr: prNum, reviewEventKey }, core);
-  if (!loaded.found) return { handled: false };
-  if (!loaded.valid) return { handled: true, ok: false };
-  const journal = loaded.state;
-  const current = await readThreadState({ github, context, core, prNum });
-  if (!current.ok) return { handled: true, ok: false };
-  const expectedClaimId = deterministicClaimId(repo, prNum, journal.generation, reviewEventKey);
-  if (journal.claimId !== expectedClaimId) {
-    core.setFailed('恢复日志 claim 与当前 event 不一致');
-    return { handled: true, ok: false };
-  }
-  const safeReservingPredecessor = journal.stage === 'reserving' && (
-    (current.kind === 'none' && current.generation === 0) ||
-    (['final', 'released'].includes(current.kind) && current.generation === journal.generation - 1)
-  );
-  if (safeReservingPredecessor) {
-    return { handled: false, retryReservation: journal, predecessor: current };
-  }
-  if (current.generation !== journal.generation || current.claimId !== journal.claimId) {
-    core.setFailed('恢复日志与最高 generation/claim 不一致');
-    return { handled: true, ok: false };
-  }
-  if (current.kind === 'final') {
-    await clearRecoveryState(recoveryFile, core);
-    return { handled: true, ok: true };
-  }
-  if (current.kind === 'released') {
-    await clearRecoveryState(recoveryFile, core);
-    core.setFailed('前次根消息明确未发送，generation 已 released');
-    return { handled: true, ok: false };
-  }
-  if (current.kind !== 'pending') {
-    core.setFailed('恢复日志存在但最高状态不是 pending');
-    return { handled: true, ok: false };
-  }
-  if (journal.stage === 'root-sent') {
-    const finalized = await finalizeThreadGeneration({
-      github, context, core, prNum,
-      generation: journal.generation,
-      claimId: journal.claimId,
-      messageId: journal.messageId,
-    });
-    if (finalized.ok) await clearRecoveryState(recoveryFile, core);
-    return { handled: true, ok: finalized.ok };
-  }
-  if (journal.stage === 'release-needed') {
-    const released = await releaseThreadGeneration({
-      github, context, core, prNum,
-      generation: journal.generation,
-      claimId: journal.claimId,
-    });
-    if (released.ok) await clearRecoveryState(recoveryFile, core);
-    core.setFailed('前次根消息明确发送失败');
-    return { handled: true, ok: false };
-  }
-  if (journal.stage === 'sending') {
-    core.setFailed('前次 Feishu 根消息结果不确定，保留 pending 并停止重发');
-    return { handled: true, ok: false };
-  }
-  if (journal.stage === 'reserving') {
-    await writeRecoveryStateAtomic(recoveryFile, { ...journal, stage: 'pending-confirmed' });
-  }
-  return { handled: false, resume: { ...journal, stage: 'pending-confirmed' } };
-}
-
-async function postToThread({ github, context, core }, { cls, prData, env, dedupeKey }) {
-  const { buildCard, interactiveCardContent } = require('./report');
-  const repo = repositoryName(context);
-  const prNum = prData.number;
-  const reviewEventKey = `${repo}#${prNum}:${dedupeKey}`;
-  const recoveryFile = recoveryFileFor(reviewEventKey);
-  const recovery = await recoverSameJob({ github, context, core, prNum, reviewEventKey, recoveryFile });
-  if (recovery.handled) return;
-
-  const cardContentOrFail = (card, label) => {
-    try { return interactiveCardContent(card); }
-    catch (error) { core.setFailed(`生成飞书卡片失败(${label}): ${errorMessage(error)}`); return null; }
-  };
-
-  let current;
-  let generation;
-  let claimId;
-  let content;
-  let allowFromFinal = false;
-  if (recovery.resume) {
-    current = await readThreadState({ github, context, core, prNum });
-    if (!current.ok || current.kind !== 'pending' ||
-        current.generation !== recovery.resume.generation || current.claimId !== recovery.resume.claimId) {
-      core.setFailed('same-job pending 恢复与 PR 状态不一致');
-      return;
-    }
-    generation = current.generation;
-    claimId = current.claimId;
-    content = cardContentOrFail(buildCard(context.repo.repo, prData, cls, { atAuthor: true, isReply: false }), 'root-recovery');
-    if (!content) return;
-  } else if (recovery.retryReservation) {
-    current = recovery.predecessor;
-    generation = recovery.retryReservation.generation;
-    claimId = recovery.retryReservation.claimId;
-    allowFromFinal = current.kind === 'final';
-    content = cardContentOrFail(buildCard(context.repo.repo, prData, cls, { atAuthor: true, isReply: false }), 'root-reservation-retry');
-    if (!content) return;
-  } else {
-    current = await readThreadState({ github, context, core, prNum });
-    if (!current.ok) return;
-    if (current.kind === 'pending') {
-      core.setFailed(`检测到跨 run pending generation=${current.generation}，必须 trusted repair 后再通知`);
-      return;
-    }
-  }
-
-  const tokResp = await feishu('/auth/v3/tenant_access_token/internal', 'POST', { app_id: env.appId, app_secret: env.appSecret });
-  const token = tokResp.json.tenant_access_token;
+async function tenantToken(env, core) {
+  const response = await feishu('/auth/v3/tenant_access_token/internal', 'POST', {
+    app_id: env.appId, app_secret: env.appSecret,
+  });
+  const token = response.json.tenant_access_token;
   if (!token) {
-    core.setFailed(`取 tenant_access_token 失败: ${feishuFailureSummary(tokResp)}`);
-    return;
+    core.setFailed(`取 tenant_access_token 失败: ${feishuFailureSummary(response)}`);
+    return null;
   }
   core.setSecret(token);
+  return token;
+}
 
-  if (!recovery.resume && !recovery.retryReservation && current.kind === 'final') {
-    const replyContent = cardContentOrFail(buildCard(context.repo.repo, prData, cls, { atAuthor: false, isReply: true }), 'reply');
-    if (!replyContent) return;
-    const reply = await feishu(`/im/v1/messages/${encodeURIComponent(current.messageId)}/reply`, 'POST', {
-      msg_type: 'interactive',
-      content: replyContent,
-      reply_in_thread: true,
-      uuid: eventUuid(reviewEventKey, `reply:${current.messageId}`),
-    }, token);
-    if (reply.ok && reply.json.code === 0) {
-      core.info('话题回复成功');
-      return;
-    }
-    if (!shouldRecreateRootOnReplyFailure(reply)) {
-      core.setFailed(`话题回复失败，未创建新 generation: ${feishuFailureSummary(reply)}`);
-      return;
-    }
-    core.warning(`根消息明确已撤回/删除，创建新 generation: ${feishuFailureSummary(reply)}`);
-    allowFromFinal = true;
-  }
+function contentWithDeliveryToken(content, token) {
+  const card = JSON.parse(content);
+  if (!card.header || !card.body || !Array.isArray(card.body.elements)) throw new Error('invalid interactive card content');
+  card.header.subtitle = { tag: 'plain_text', content: token };
+  return JSON.stringify(card);
+}
 
-  if (!recovery.resume) {
-    if (!recovery.retryReservation) {
-      generation = current.kind === 'none' ? 1 : current.generation + 1;
-      claimId = deterministicClaimId(repo, prNum, generation, reviewEventKey);
-      content = cardContentOrFail(buildCard(context.repo.repo, prData, cls, { atAuthor: true, isReply: false }), 'root');
-      if (!content) return;
-    }
-    const reserved = await reserveThreadGeneration({
-      github, context, core, prNum, generation, claimId, reviewEventKey, recoveryFile, allowFromFinal,
+function containsExactToken(value, token) {
+  if (value === token) return true;
+  if (Array.isArray(value)) return value.some((entry) => containsExactToken(entry, token));
+  if (value && typeof value === 'object') return Object.values(value).some((entry) => containsExactToken(entry, token));
+  return false;
+}
+
+function messageContainsToken(message, token) {
+  let content = message && message.body && message.body.content;
+  if (typeof content !== 'string') return false;
+  try { content = JSON.parse(content); } catch (_error) { return false; }
+  return containsExactToken(content, token);
+}
+
+async function findDeliveryInFeishuHistory({ env, token, record, nowMs = Date.now() }) {
+  const sentSeconds = Math.floor(Date.parse(record.sentAt) / 1000);
+  const startTime = sentSeconds - HISTORY_CLOCK_SKEW_SECONDS;
+  const endTime = sentSeconds + HISTORY_AFTER_SEND_SECONDS;
+  let pageToken = null;
+  const matches = new Map();
+  for (let page = 0; page < HISTORY_MAX_PAGES; page += 1) {
+    const params = new URLSearchParams({
+      container_id_type: 'chat',
+      container_id: env.chatId,
+      sort_type: 'ByCreateTimeDesc',
+      page_size: String(HISTORY_PAGE_SIZE),
+      start_time: String(startTime),
+      end_time: String(endTime),
+      card_msg_content_type: 'user_card_content',
     });
-    if (!reserved.ok) return;
-  }
-
-  try {
-    await writeRecoveryStateAtomic(recoveryFile, recoveryRecord({
-      repo, prNum, reviewEventKey, generation, claimId, stage: 'sending',
-    }));
-  } catch (error) {
-    core.setFailed(`发送前原子恢复日志写入失败: ${errorMessage(error)}`);
-    return;
-  }
-
-  const result = await feishu('/im/v1/messages?receive_id_type=chat_id', 'POST', {
-    receive_id: env.chatId,
-    msg_type: 'interactive',
-    content,
-    uuid: rootUuid(repo, prNum, generation, claimId),
-  }, token);
-  const newMid = result.json.data && result.json.data.message_id;
-  if (result.ok && result.json.code === 0 && validFeishuMessageId(newMid)) {
-    core.info(`根消息发送成功 message_id=${newMid}`);
-    try {
-      await writeRecoveryStateAtomic(recoveryFile, recoveryRecord({
-        repo, prNum, reviewEventKey, generation, claimId, stage: 'root-sent', messageId: newMid,
-      }));
-    } catch (error) {
-      core.setFailed(`根消息成功但 message_id 原子落盘失败，保留 pending: ${errorMessage(error)}`);
-      return;
+    if (pageToken) params.set('page_token', pageToken);
+    const response = await feishu(`/im/v1/messages?${params.toString()}`, 'GET', null, token);
+    if (!response.ok || response.json.code !== 0) {
+      return { ok: false, complete: false, matches: [], reason: feishuFailureSummary(response) };
     }
+    const data = response.json.data || {};
+    for (const message of data.items || []) {
+      const sender = message.sender || {};
+      const exactSender = sender.sender_type === 'app' && sender.id === env.appId;
+      if (exactSender && message.msg_type === 'interactive' && message.deleted !== true &&
+          messageContainsToken(message, record.token) && validFeishuMessageId(message.message_id)) {
+        matches.set(message.message_id, message);
+        if (matches.size >= 2) {
+          return { ok: true, complete: false, matches: [...matches.values()] };
+        }
+      }
+    }
+    if (!data.has_more) return { ok: true, complete: true, matches: [...matches.values()] };
+    pageToken = data.page_token;
+    if (!pageToken) return { ok: false, complete: false, matches: [...matches.values()], reason: 'has_more without page_token' };
+  }
+  return { ok: true, complete: false, matches: [...matches.values()], reason: 'history scan bound reached' };
+}
+
+function deterministicClaimId(repo, prNum, generation, eventKey) {
+  return crypto.createHash('sha256').update(`claim:v3:${repo}#${prNum}:${generation}:${eventKey}`).digest('hex').slice(0, 32);
+}
+
+function requestUuid(eventKey, mode, attempt) {
+  return crypto.createHash('sha256').update(`feishu:v3:${eventKey}:${mode}:${attempt}`).digest('hex').slice(0, 32);
+}
+
+function deliveryBase(ref, attempt, mode, sentAt, thread = {}) {
+  return {
+    version: DELIVERY_VERSION,
+    repo: ref.repo,
+    pr: ref.pr,
+    eventKey: ref.eventKey,
+    attempt,
+    mode,
+    targetRoot: mode === 'reply' ? thread.rootMid : null,
+    threadGeneration: mode === 'root' ? thread.generation : null,
+    threadClaimId: mode === 'root' ? thread.claimId : null,
+    token: deliveryToken(ref.eventKey),
+    sentAt,
+  };
+}
+
+async function markDeliveryFailure(args, base, reason) {
+  return appendDeliveryAndConfirm({
+    ...args,
+    record: canonicalDeliveryRecord({
+      ...base,
+      state: 'failed',
+      messageId: null,
+      nextCheckAt: null,
+      reason,
+    }),
+  });
+}
+
+function historyRecoveryExhausted(record, nextAttempts, nowMs = Date.now()) {
+  return nextAttempts >= HISTORY_MAX_ATTEMPTS || nowMs - Date.parse(record.sentAt) >= HISTORY_MAX_AGE_MS;
+}
+
+async function recoverAmbiguousDelivery({ github, context, core, ref, record, env, nowMs = Date.now(), session = null }) {
+  const dueAt = record.state === 'uncertain' ? Date.parse(record.nextCheckAt) : Date.parse(record.sentAt) + HISTORY_RETRY_DELAY_MS;
+  if (nowMs < dueAt) {
+    core.setFailed('Feishu 历史查询尚未到延迟重试时间；保持 uncertain 且不重发');
+    return { complete: false, retry: true };
+  }
+  const token = await tenantToken(env, core);
+  if (!token) return { complete: false, retry: true };
+  const history = await findDeliveryInFeishuHistory({ env, token, record, nowMs });
+  const candidates = [...new Set([
+    ...record.candidateMessageIds,
+    ...history.matches.map((message) => message.message_id),
+  ])].sort();
+  if (candidates.length > 1) {
+    const manual = canonicalDeliveryRecord({
+      ...record, state: 'manual', candidateMessageIds: candidates,
+      nextCheckAt: null, reason: 'history_multiple',
+    });
+    await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: manual, session });
+    core.setFailed('Feishu 历史 exact token 多匹配，进入人工 delivery repair；事件保持未完成');
+    return { complete: false, retry: false, manual: true };
+  }
+  if (!history.ok || !history.complete || history.matches.length === 0) {
+    const attempts = record.historyAttempts + 1;
+    const exhausted = historyRecoveryExhausted(record, attempts, nowMs);
+    if (exhausted) {
+      const manual = canonicalDeliveryRecord({
+        ...record, state: 'manual', candidateMessageIds: candidates,
+        historyAttempts: attempts, nextCheckAt: null, reason: 'history_exhausted',
+      });
+      await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: manual, session });
+      core.setFailed('Feishu 历史恢复达到 8 次或 24h 上限，转 manual 且不重发');
+      return { complete: false, retry: false, manual: true };
+    }
+    const uncertain = canonicalDeliveryRecord({
+      ...record,
+      state: 'uncertain',
+      candidateMessageIds: candidates,
+      historyAttempts: attempts,
+      nextCheckAt: new Date(nowMs + Math.min(
+        HISTORY_RETRY_DELAY_MS * (2 ** Math.min(record.historyAttempts, 5)),
+        HISTORY_MAX_BACKOFF_MS,
+      )).toISOString(),
+      reason: !history.ok ? 'history_error' : !history.complete ? 'history_incomplete' : 'history_zero',
+    });
+    await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: uncertain, session });
+    core.setFailed(`Feishu 历史暂不可确认(${uncertain.reason})；保持非终态退避且不会重发`);
+    return { complete: false, retry: true };
+  }
+  const messageId = history.matches[0].message_id;
+  if (record.mode === 'root') {
     const finalized = await finalizeThreadGeneration({
-      github, context, core, prNum, generation, claimId, messageId: newMid,
+      github, context, core, prNum: ref.pr,
+      generation: record.threadGeneration, claimId: record.threadClaimId, messageId, session,
     });
-    if (finalized.ok) await clearRecoveryState(recoveryFile, core);
-    return;
+    if (!finalized.ok) return { complete: false, retry: false };
+  }
+  const done = canonicalDeliveryRecord({
+    ...record, state: 'done', messageId, nextCheckAt: null, reason: null,
+  });
+  const appended = await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: done, session });
+  if (appended.ok) core.info('Feishu 历史 exact-token 唯一匹配，投递恢复完成');
+  return { complete: appended.ok, retry: !appended.ok };
+}
+
+async function sendAttempt({ github, context, core, ref, prData, cls, env, attempt, mode, thread, session = null }) {
+  const { buildCard, interactiveCardContent } = require('./report');
+  let content;
+  try {
+    const card = buildCard(context.repo.repo, prData, cls, { atAuthor: mode === 'root', isReply: mode === 'reply' });
+    content = contentWithDeliveryToken(interactiveCardContent(card), deliveryToken(ref.eventKey));
+  } catch (error) {
+    core.setFailed(`生成飞书卡片失败: ${errorMessage(error)}`);
+    return { complete: false, retry: false };
+  }
+  const token = await tenantToken(env, core);
+  if (!token) return { complete: false, retry: true };
+  const sentAt = new Date().toISOString();
+  const base = deliveryBase(ref, attempt, mode, sentAt, thread);
+  const sending = canonicalDeliveryRecord({ ...base, state: 'sending' });
+  const recorded = await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: sending, session });
+  if (!recorded.ok) return { complete: false, retry: true };
+
+  const apiPath = mode === 'reply'
+    ? `/im/v1/messages/${encodeURIComponent(thread.rootMid)}/reply`
+    : '/im/v1/messages?receive_id_type=chat_id';
+  const body = mode === 'reply'
+    ? { msg_type: 'interactive', content, reply_in_thread: true, uuid: requestUuid(ref.eventKey, mode, attempt) }
+    : { receive_id: env.chatId, msg_type: 'interactive', content, uuid: requestUuid(ref.eventKey, mode, attempt) };
+  const result = await feishu(apiPath, 'POST', body, token);
+  const messageId = result.json.data && result.json.data.message_id;
+  if (result.ok && result.json.code === 0 && validFeishuMessageId(messageId)) {
+    if (mode === 'root') {
+      const finalized = await finalizeThreadGeneration({
+        github, context, core, prNum: ref.pr,
+        generation: thread.generation, claimId: thread.claimId, messageId, session,
+      });
+      if (!finalized.ok) return { complete: false, retry: true };
+    }
+    const done = canonicalDeliveryRecord({ ...base, state: 'done', messageId });
+    const appended = await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: done, session });
+    if (appended.ok) core.info(`${mode === 'root' ? '根消息' : '话题回复'}发送成功`);
+    return { complete: appended.ok, retry: !appended.ok };
+  }
+
+  if (mode === 'reply' && shouldRecreateRootOnReplyFailure(result)) {
+    const notSent = canonicalDeliveryRecord({ ...base, state: 'not_sent', reason: 'root_missing' });
+    const appended = await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: notSent, session });
+    if (!appended.ok) return { complete: false, retry: false };
+    core.warning(`原根消息明确已撤回/删除: ${feishuFailureSummary(result)}`);
+    return { complete: false, retry: false, rootMissing: true, nextAttempt: attempt + 1 };
   }
 
   if (isKnownRootSendFailure(result)) {
-    try {
-      await writeRecoveryStateAtomic(recoveryFile, recoveryRecord({
-        repo, prNum, reviewEventKey, generation, claimId, stage: 'release-needed',
-      }));
-    } catch (error) {
-      core.warning(`known failure 恢复日志写入失败: ${errorMessage(error)}`);
+    if (mode === 'root') {
+      const released = await releaseThreadGeneration({
+        github, context, core, prNum: ref.pr,
+        generation: thread.generation, claimId: thread.claimId, session,
+      });
+      if (!released.ok) return { complete: false, retry: true };
+      const notSent = canonicalDeliveryRecord({
+        ...base, state: 'not_sent', reason: 'definitely_not_sent',
+      });
+      await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: notSent, session });
+      core.setFailed(`Feishu 根消息明确未发送，将由 watchdog 有界重试: ${feishuFailureSummary(result)}`);
+      return { complete: false, retry: true };
     }
-    const released = await releaseThreadGeneration({ github, context, core, prNum, generation, claimId });
-    if (released.ok) await clearRecoveryState(recoveryFile, core);
-    core.setFailed(`Feishu 根消息明确未发送: ${feishuFailureSummary(result)}`);
-    return;
+    await markDeliveryFailure({ github, context, core, prNum: ref.pr, session }, base, 'definitely_not_sent');
+    core.setFailed(`Feishu 消息明确未发送: ${feishuFailureSummary(result)}`);
+    return { complete: false, retry: false };
   }
 
-  core.setFailed(`Feishu 根消息结果不确定，保留 pending: ${feishuFailureSummary(result)}`);
+  const uncertain = canonicalDeliveryRecord({
+    ...base,
+    state: 'uncertain',
+    historyAttempts: 0,
+    nextCheckAt: new Date(Date.parse(sentAt) + HISTORY_RETRY_DELAY_MS).toISOString(),
+    reason: 'ambiguous',
+  });
+  await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: uncertain, session });
+  core.setFailed(`Feishu 发送结果不确定，已转历史 exact-token 恢复且不会重发: ${feishuFailureSummary(result)}`);
+  return { complete: false, retry: true };
+}
+
+async function prepareRootAttempt({ github, context, core, ref, attempt, current, allowFromFinal = false, session = null }) {
+  const generation = current.kind === 'none' ? 1 : current.generation + 1;
+  const claimId = deterministicClaimId(ref.repo, ref.pr, generation, ref.eventKey);
+  const preparing = canonicalDeliveryRecord({
+    ...deliveryBase(ref, attempt, 'root', null, { generation, claimId }),
+    state: 'preparing',
+  });
+  const recorded = await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: preparing, session });
+  if (!recorded.ok) return { ok: false };
+  const reserved = await reserveThreadGeneration({
+    github, context, core, prNum: ref.pr, generation, claimId, allowFromFinal, session,
+  });
+  return reserved.ok ? { ok: true, generation, claimId, preparing } : { ok: false };
+}
+
+async function deliverClassifiedEvent({ github, context, core, ref, prData, cls, env, latest, session = null }) {
+  if (latest && ['done', 'skipped'].includes(latest.state)) return { complete: true, retry: false };
+  if (latest && ['manual', 'failed'].includes(latest.state)) {
+    core.setFailed(`eventKey=${ref.eventKey} 等待人工 delivery repair`);
+    return { complete: false, retry: false, manual: true };
+  }
+  if (latest && ['sending', 'uncertain'].includes(latest.state)) {
+    return recoverAmbiguousDelivery({ github, context, core, ref, record: latest, env, session });
+  }
+
+  let current = session ? session.threadState : await readThreadState({ github, context, core, prNum: ref.pr });
+  if (!current.ok) return { complete: false, retry: false };
+  let attempt = latest && latest.state === 'not_sent' ? latest.attempt + 1 : 1;
+  if (latest && latest.state === 'retrying') {
+    if (latest.mode !== 'root' || current.kind !== 'released' || current.generation !== latest.threadGeneration ||
+        current.claimId !== latest.threadClaimId) {
+      core.setFailed('operator retry 与 released root thread state 不一致');
+      return { complete: false, retry: false, manual: true };
+    }
+    attempt = latest.attempt + 1;
+    const prepared = await prepareRootAttempt({ github, context, core, ref, attempt, current, session });
+    if (!prepared.ok) return { complete: false, retry: true };
+    return sendAttempt({
+      github, context, core, ref, prData, cls, env, attempt, mode: 'root',
+      thread: { generation: prepared.generation, claimId: prepared.claimId }, session,
+    });
+  }
+  if (latest && latest.state === 'preparing') {
+    const matchesPending = current.kind === 'pending' && current.generation === latest.threadGeneration &&
+      current.claimId === latest.threadClaimId;
+    if (!matchesPending) {
+      const predecessorGeneration = current.kind === 'none' ? 0 : current.generation;
+      if (predecessorGeneration !== latest.threadGeneration - 1 || current.kind === 'pending') {
+        core.setFailed('preparing delivery 无法接管不匹配的 thread state');
+        return { complete: false, retry: false, manual: true };
+      }
+      const reserved = await reserveThreadGeneration({
+        github, context, core, prNum: ref.pr,
+        generation: latest.threadGeneration, claimId: latest.threadClaimId,
+        allowFromFinal: current.kind === 'final', session,
+      });
+      if (!reserved.ok) return { complete: false, retry: true };
+    }
+    return sendAttempt({
+      github, context, core, ref, prData, cls, env, attempt: latest.attempt, mode: 'root',
+      thread: { generation: latest.threadGeneration, claimId: latest.threadClaimId }, session,
+    });
+  }
+  if (latest && latest.state === 'not_sent') {
+    if (latest.reason === 'definitely_not_sent') {
+      if (latest.mode !== 'root' || current.kind !== 'released' || current.generation !== latest.threadGeneration ||
+          current.claimId !== latest.threadClaimId) {
+        core.setFailed('definitely_not_sent delivery 与 released thread state 不一致');
+        return { complete: false, retry: false, manual: true };
+      }
+      if (latest.attempt >= DEFINITE_SEND_MAX_ATTEMPTS) {
+        const manual = canonicalDeliveryRecord({
+          ...latest, state: 'manual', nextCheckAt: null, reason: 'definitely_not_sent_exhausted',
+        });
+      await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: manual, session });
+        core.setFailed('Feishu 明确未发送已重试 3 次，转 manual dead-letter');
+        return { complete: false, retry: false, manual: true };
+      }
+    } else if (latest.mode !== 'reply' || current.kind !== 'final' || current.messageId !== latest.targetRoot) {
+      core.setFailed('root_missing delivery 与当前 thread state 不一致');
+      return { complete: false, retry: false, manual: true };
+    }
+    const prepared = await prepareRootAttempt({
+      github, context, core, ref, attempt, current, allowFromFinal: current.kind === 'final', session,
+    });
+    if (!prepared.ok) return { complete: false, retry: true };
+    return sendAttempt({
+      github, context, core, ref, prData, cls, env, attempt, mode: 'root',
+      thread: { generation: prepared.generation, claimId: prepared.claimId }, session,
+    });
+  }
+
+  if (current.kind === 'pending') {
+    core.setFailed(`检测到无 delivery owner 的 pending generation=${current.generation}，需 trusted repair`);
+    return { complete: false, retry: false };
+  }
+  if (current.kind === 'final') {
+    const reply = await sendAttempt({
+      github, context, core, ref, prData, cls, env, attempt, mode: 'reply',
+      thread: { rootMid: current.messageId }, session,
+    });
+    if (!reply.rootMissing) return reply;
+    current = session ? session.threadState : await readThreadState({ github, context, core, prNum: ref.pr });
+    if (!current.ok || current.kind !== 'final') return { complete: false, retry: false };
+    const prepared = await prepareRootAttempt({
+      github, context, core, ref, attempt: reply.nextAttempt, current, allowFromFinal: true, session,
+    });
+    if (!prepared.ok) return { complete: false, retry: true };
+    return sendAttempt({
+      github, context, core, ref, prData, cls, env, attempt: reply.nextAttempt, mode: 'root',
+      thread: { generation: prepared.generation, claimId: prepared.claimId }, session,
+    });
+  }
+  const prepared = await prepareRootAttempt({ github, context, core, ref, attempt, current, session });
+  if (!prepared.ok) return { complete: false, retry: true };
+  return sendAttempt({
+    github, context, core, ref, prData, cls, env, attempt, mode: 'root',
+    thread: { generation: prepared.generation, claimId: prepared.claimId }, session,
+  });
 }
 
 function normalizeResolveArgs(githubOrOptions, contextArg, coreArg) {
   if (githubOrOptions && githubOrOptions.github) {
-    return {
-      github: githubOrOptions.github,
-      context: githubOrOptions.context,
-      core: githubOrOptions.core || noopCore(),
-    };
+    return { github: githubOrOptions.github, context: githubOrOptions.context, core: githubOrOptions.core || noopCore() };
   }
   return { github: githubOrOptions, context: contextArg, core: coreArg || noopCore() };
 }
 
+function safePositiveInteger(value) {
+  const raw = String(value == null ? '' : value);
+  if (!/^[1-9][0-9]*$/.test(raw)) return null;
+  const number = Number(raw);
+  return Number.isSafeInteger(number) ? number : null;
+}
+
 async function resolvePrNumber(githubOrOptions, contextArg, coreArg) {
   const { github, context, core } = normalizeResolveArgs(githubOrOptions, contextArg, coreArg);
+  if (context.eventName === 'repository_dispatch') {
+    const number = safePositiveInteger(context.payload.client_payload && context.payload.client_payload.pr_number);
+    if (!number) core.setFailed('repository_dispatch pr_number 非 canonical safe integer');
+    return number;
+  }
   const direct = context.payload.pull_request && context.payload.pull_request.number;
   if (Number.isInteger(direct) && direct > 0) return direct;
   const checkRun = context.payload.check_run;
   if (!checkRun) {
-    core.setFailed('事件不包含 pull_request 或 check_run');
+    core.setFailed('事件不包含 pull_request、check_run 或受信 drain payload');
     return null;
   }
-  let candidates = [...new Set((checkRun.pull_requests || []).map((pr) => Number(pr.number)).filter((number) => Number.isInteger(number) && number > 0))];
+  let candidates = [...new Set((checkRun.pull_requests || [])
+    .map((pr) => Number(pr.number)).filter((number) => Number.isInteger(number) && number > 0))];
   if (candidates.length === 0 && checkRun.head_sha) {
     const associated = await withGithubRetry({
       core,
       label: '按 check SHA 解析 PR',
       operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
-        owner: context.repo.owner,
-        repo: context.repo.repo,
-        commit_sha: checkRun.head_sha,
+        owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
         request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
       }),
     });
@@ -876,9 +2030,7 @@ async function resolvePr(github, context, hint, core = noopCore()) {
     core,
     label: `读取 PR #${number}`,
     operation: () => github.rest.pulls.get({
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      pull_number: number,
+      owner: context.repo.owner, repo: context.repo.repo, pull_number: number,
       request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
@@ -891,6 +2043,7 @@ async function resolvePr(github, context, hint, core = noopCore()) {
     author: full.user.login,
     base: full.base.ref,
     head: full.head.ref,
+    headSha: full.head.sha,
     state: full.state,
   };
 }
@@ -901,19 +2054,13 @@ function hasCodexName(value) {
 
 function isCodexUser(user) {
   const login = String(user && user.login || '').toLowerCase();
-  const type = String(user && user.type || '').toLowerCase();
-  return hasCodexName(login) && (!type || type === 'bot' || /\[bot\]$/.test(login));
+  return String(user && user.id || '') === CODEX_REVIEW_USER_ID &&
+    login === CODEX_REVIEW_LOGIN && String(user && user.type || '').toLowerCase() === 'bot';
 }
 
 function isCodexCheckRun(checkRun) {
-  if (!checkRun) return false;
-  return [
-    checkRun.name,
-    checkRun.check_suite && checkRun.check_suite.app && checkRun.check_suite.app.name,
-    checkRun.app && checkRun.app.name,
-    checkRun.app && checkRun.app.slug,
-    checkRun.app && checkRun.app.owner && checkRun.app.owner.login,
-  ].some(hasCodexName);
+  return Boolean(checkRun && checkRun.app && checkRun.app.slug === CODEX_CHECK_APP_SLUG &&
+    (!checkRun.check_suite || !checkRun.check_suite.app || checkRun.check_suite.app.slug === CODEX_CHECK_APP_SLUG));
 }
 
 function isCodexPullRequestReview(review) {
@@ -925,11 +2072,8 @@ async function listCommentsForReview(github, context, core, prNum, reviewId) {
     core,
     label: '读取 Codex review comments',
     operation: () => github.paginate(github.rest.pulls.listReviewComments, {
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      pull_number: prNum,
-      per_page: 100,
-      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+      owner: context.repo.owner, repo: context.repo.repo, pull_number: prNum,
+      per_page: 100, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
   if (!result.ok) return null;
@@ -938,7 +2082,7 @@ async function listCommentsForReview(github, context, core, prNum, reviewId) {
 
 async function resolvedPrForNotification(github, context, core) {
   const envNumber = Number(process.env.RESOLVED_PR_NUMBER);
-  let number = Number.isInteger(envNumber) && envNumber > 0 ? envNumber : null;
+  let number = Number.isSafeInteger(envNumber) && envNumber > 0 ? envNumber : null;
   if (!number) number = await resolvePrNumber(github, context, core);
   if (!number) return null;
   const eventNumber = context.payload.pull_request && context.payload.pull_request.number;
@@ -949,6 +2093,938 @@ async function resolvedPrForNotification(github, context, core) {
   return resolvePr(github, context, { number }, core);
 }
 
+function eventRefFromContext(context, prData, core = noopCore()) {
+  const repo = repositoryName(context);
+  let input;
+  if (context.eventName === 'check_run') {
+    const checkRun = context.payload.check_run;
+    if (!isCodexCheckRun(checkRun)) {
+      core.setFailed('拒绝入队非 Codex check_run');
+      return null;
+    }
+    input = {
+      version: EVENT_VERSION, eventType: 'check_run', eventId: String(checkRun.id || ''),
+      repo, pr: prData.number, headSha: checkRun.head_sha,
+      createdAt: checkRun.completed_at || checkRun.updated_at,
+    };
+  } else if (context.eventName === 'pull_request_review') {
+    const review = context.payload.review;
+    if (!isCodexPullRequestReview(review)) {
+      core.setFailed('拒绝入队非 Codex pull_request_review');
+      return null;
+    }
+    input = {
+      version: EVENT_VERSION, eventType: 'pull_request_review', eventId: String(review.id || ''),
+      repo, pr: prData.number,
+      headSha: context.payload.pull_request && context.payload.pull_request.head && context.payload.pull_request.head.sha,
+      createdAt: review.submitted_at || review.updated_at,
+    };
+  } else {
+    core.setFailed(`event=${context.eventName} 不能入队`);
+    return null;
+  }
+  try { return canonicalEventRef(input); }
+  catch (error) { core.setFailed(`事件引用非法: ${errorMessage(error)}`); return null; }
+}
+
+async function enqueueOfficialCodexEventWithinBudget({ github, context, core }) {
+  const prData = await resolvedPrForNotification(github, context, core);
+  if (!prData) return null;
+  if (prData.base !== 'main' || prData.state !== 'open') {
+    core.info('PR 非 OPEN main，跳过入队');
+    return null;
+  }
+  const ref = eventRefFromContext(context, prData, core);
+  if (!ref || prData.headSha !== ref.headSha) {
+    if (ref) core.setFailed('事件 head SHA 与 canonical PR head 不一致');
+    return null;
+  }
+  const result = await enqueueEventRef({ github, context, core, ref });
+  return result.ok ? ref : null;
+}
+
+async function rehydrateEvent({ github, context, core, ref }) {
+  const { classifyCheckRun, classifyPullRequestReview, shouldNotify } = require('./report');
+  if (ref.repo !== repositoryName(context)) {
+    core.setFailed('event ref repo 与 workflow repo 不一致');
+    return { ok: false };
+  }
+  const prData = await resolvePr(github, context, { number: ref.pr }, core);
+  if (!prData) return { ok: false, retry: true };
+  if (prData.state !== 'open' || prData.base !== 'main' || prData.headSha !== ref.headSha) {
+    return { ok: true, notify: false, reason: 'stale_pr' };
+  }
+  if (ref.eventType === 'check_run') {
+    const id = safePositiveInteger(ref.eventId);
+    if (!id) { core.setFailed('check_run immutable ID 超出 safe integer'); return { ok: false, retry: false, manualReason: 'invalid_event_id' }; }
+    const fetched = await withGithubRetry({
+      core,
+      label: `按 immutable ID 重取 check_run ${ref.eventId}`,
+      operation: () => github.rest.checks.get({
+        owner: context.repo.owner, repo: context.repo.repo, check_run_id: id,
+        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+      }),
+    });
+    if (!fetched.ok) return { ok: false, retry: true };
+    const checkRun = fetched.value.data;
+    const createdAt = checkRun.completed_at || checkRun.updated_at;
+    const linked = (checkRun.pull_requests || []).map((pr) => Number(pr.number));
+    if (String(checkRun.id) !== ref.eventId || checkRun.head_sha !== ref.headSha || createdAt !== ref.createdAt ||
+        !isCodexCheckRun(checkRun) || checkRun.status !== 'completed' || (linked.length && !linked.includes(ref.pr))) {
+      core.setFailed('immutable check_run 与队列 ref 的 Codex/repo/PR/head/time 绑定不一致');
+      return { ok: false, retry: false, manualReason: 'immutable_mismatch' };
+    }
+    const cls = classifyCheckRun(checkRun, process.env);
+    return { ok: true, notify: shouldNotify(cls), reason: 'not_notifiable', cls, prData };
+  }
+  const id = safePositiveInteger(ref.eventId);
+  if (!id) { core.setFailed('review immutable ID 超出 safe integer'); return { ok: false, retry: false, manualReason: 'invalid_event_id' }; }
+  const fetched = await withGithubRetry({
+    core,
+    label: `按 immutable ID 重取 review ${ref.eventId}`,
+    operation: () => github.rest.pulls.getReview({
+      owner: context.repo.owner, repo: context.repo.repo, pull_number: ref.pr, review_id: id,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  if (!fetched.ok) return { ok: false, retry: true };
+  const review = fetched.value.data;
+  if (String(review.id) !== ref.eventId || review.submitted_at !== ref.createdAt || !isCodexPullRequestReview(review)) {
+    core.setFailed('immutable review 与队列 ref 的 Codex/repo/PR/head/time 绑定不一致');
+    return { ok: false, retry: false, manualReason: 'immutable_mismatch' };
+  }
+  const comments = await listCommentsForReview(github, context, core, ref.pr, review.id);
+  if (!comments) return { ok: false, retry: true };
+  const cls = classifyPullRequestReview(review, comments, process.env);
+  return { ok: true, notify: shouldNotify(cls), reason: 'not_notifiable', cls, prData };
+}
+
+async function scheduleDrain({ github, context, core, prNum }) {
+  const result = await withGithubRetry({
+    core,
+    label: '调度下一批 Codex 飞书队列消费',
+    operation: () => github.rest.repos.createDispatchEvent({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      event_type: 'codex-review-feishu-drain',
+      client_payload: { pr_number: String(prNum) },
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  return result.ok;
+}
+
+async function repairDelivery({
+  github, context, core = noopCore(), prNum, eventKey, messageId,
+  action = 'select_mid', runId, operator, privateKey, keyring, keyId,
+}) {
+  if (!validEventKey(eventKey) || !['select_mid', 'retry', 'discard'].includes(action) ||
+      (action === 'select_mid' ? !validFeishuMessageId(messageId) : Boolean(messageId))) {
+    core.setFailed('delivery repair action/eventKey/message_id 组合非法');
+    return { ok: false };
+  }
+  const queue = await readEventQueue({ github, context, core, prNum });
+  if (!queue.ok || !queue.events.some(({ ref }) => ref.eventKey === eventKey)) {
+    core.setFailed('delivery repair eventKey 不在受信 durable queue');
+    return { ok: false };
+  }
+  const ledger = await readDeliveryLedger({ github, context, core, prNum });
+  const latest = ledger.ok && ledger.latest.get(eventKey);
+  if (!latest || latest.state !== 'manual') {
+    core.setFailed('delivery repair 仅允许完成 history_multiple manual 状态');
+    return { ok: false };
+  }
+  if (action === 'select_mid' && !latest.candidateMessageIds.includes(messageId)) {
+    core.setFailed('delivery repair selected message_id 不在 manual candidate set');
+    return { ok: false };
+  }
+  if (action === 'retry' && latest.reason !== 'definitely_not_sent_exhausted') {
+    core.setFailed('retry 仅允许 definitely_not_sent_exhausted，history ambiguous 禁止重发');
+    return { ok: false };
+  }
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(String(runId || '')) ||
+      !/^[A-Za-z0-9_.-]{1,100}$/.test(String(operator || '')) ||
+      !privateKeyMatchesKeyring(privateKey, keyring, keyId)) {
+    core.setFailed('delivery repair signer/run/operator 或 keyring/keyId 非法');
+    return { ok: false };
+  }
+  core.setSecret(privateKey);
+  if (latest.mode === 'root' && action === 'select_mid') {
+    const finalized = await finalizeThreadGeneration({
+      github, context, core, prNum,
+      generation: latest.threadGeneration, claimId: latest.threadClaimId, messageId,
+    });
+    if (!finalized.ok) return { ok: false };
+  }
+  if (latest.mode === 'root' && action === 'discard') {
+    const thread = await readThreadState({ github, context, core, prNum });
+    if (thread.kind === 'pending' && thread.generation === latest.threadGeneration &&
+        thread.claimId === latest.threadClaimId) {
+      const released = await releaseThreadGeneration({
+        github, context, core, prNum,
+        generation: latest.threadGeneration, claimId: latest.threadClaimId,
+      });
+      if (!released.ok) return { ok: false };
+    }
+  }
+  const repair = {
+    version: 1,
+    repo: latest.repo,
+    pr: latest.pr,
+    eventKey: latest.eventKey,
+    priorManualHash: canonicalHash(latest),
+    priorReason: latest.reason,
+    candidateHash: candidateSetHash(latest.candidateMessageIds),
+    action,
+    messageId: action === 'select_mid' ? messageId : null,
+    runId: String(runId),
+    operator: String(operator),
+    keyId,
+  };
+  return appendDeliveryAndConfirm({
+    github, context, core, prNum,
+    record: canonicalDeliveryRecord({
+      ...latest,
+      state: action === 'select_mid' ? 'done' : action === 'retry' ? 'retrying' : 'skipped',
+      messageId: action === 'select_mid' ? messageId : null,
+      nextCheckAt: null,
+      reason: action === 'select_mid' ? null : action === 'retry' ? 'operator_retry' : 'operator_discard',
+    }),
+    repair,
+    repairPrivateKey: privateKey,
+    repairPublicKeys: keyring,
+  });
+}
+
+async function repairOrphanThread({
+  github, context, core = noopCore(), prNum, current, messageId, release,
+  runId, operator, privateKey, keyring, keyId,
+}) {
+  const comments = current && current.comments;
+  const thread = current || await readThreadState({ github, context, core, prNum, comments });
+  if (!thread.ok || thread.kind !== 'pending') {
+    core.setFailed('thread repair 仅允许最高 generation 为 pending');
+    return { ok: false };
+  }
+  const ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
+  if (!ledger.ok) return { ok: false };
+  const owner = [...ledger.latest.values()].find((record) =>
+    record.mode === 'root' &&
+    record.threadGeneration === thread.generation && record.threadClaimId === thread.claimId);
+  if (owner) {
+    core.setFailed(`pending generation/claim 由 delivery eventKey=${owner.eventKey} 持有；必须填写 event_key 走 signed delivery repair`);
+    return { ok: false, ownerEventKey: owner.eventKey };
+  }
+  const action = release ? 'release' : 'finalize';
+  if ((action === 'finalize' ? !validFeishuMessageId(messageId) : Boolean(messageId)) ||
+      !/^[A-Za-z0-9_-]{1,100}$/.test(String(runId || '')) ||
+      !/^[A-Za-z0-9_.-]{1,100}$/.test(String(operator || '')) ||
+      !privateKeyMatchesKeyring(privateKey, keyring, keyId)) {
+    core.setFailed('orphan thread repair action/message_id/signer/run/operator 非法');
+    return { ok: false };
+  }
+  core.setSecret(privateKey);
+  const prior = canonicalThreadState(thread.state);
+  const expected = canonicalThreadState({
+    ...prior,
+    state: action === 'finalize' ? 'final' : 'released',
+    messageId: action === 'finalize' ? messageId : null,
+  });
+  return appendStateAndConfirm({
+    github, context, core, prNum, expected,
+    threadRepair: {
+      version: 1, repo: expected.repo, pr: expected.pr,
+      priorThreadHash: canonicalHash(prior), action,
+      messageId: expected.messageId, runId: String(runId), operator: String(operator), keyId,
+    },
+    repairPrivateKey: privateKey,
+    repairPublicKey: keyring,
+  });
+}
+
+function setDrainOutputs(core, needsDispatch, mode) {
+  core.setOutput('needs_dispatch', needsDispatch ? 'true' : 'false');
+  core.setOutput('continuation_mode', mode || 'none');
+}
+
+async function drainQueuedCodexEventsWithinBudget({ github, context, core, batchSize = DRAIN_BATCH_SIZE }) {
+  setDrainOutputs(core, false, 'none');
+  const prNum = safePositiveInteger(process.env.RESOLVED_PR_NUMBER) || await resolvePrNumber(github, context, core);
+  if (!prNum) return;
+  const queue = await readEventQueue({ github, context, core, prNum });
+  if (!queue.ok) return;
+  const env = readFeishuEnv(core, queue.events.length > 0);
+  if (!env && queue.events.length) {
+    setDrainOutputs(core, true, 'retry');
+    return;
+  }
+  let processed = 0;
+  let blockedRetry = false;
+  let manualSeen = false;
+  for (const queued of queue.events) {
+    const ledger = await readDeliveryLedger({ github, context, core, prNum });
+    if (!ledger.ok) return;
+    const latest = ledger.latest.get(queued.ref.eventKey);
+    if (latest && ['done', 'skipped'].includes(latest.state)) continue;
+    if (latest && latest.state === 'manual') {
+      manualSeen = true;
+      core.warning(`eventKey=${queued.ref.eventKey} 位于 manual dead-letter，继续后续 FIFO`);
+      continue;
+    }
+    if (latest && latest.state === 'failed') {
+      const skipped = canonicalDeliveryRecord({
+        ...latest, state: 'skipped', messageId: null, nextCheckAt: null, reason: 'dead_letter',
+      });
+      await appendDeliveryAndConfirm({ github, context, core, prNum, record: skipped });
+      continue;
+    }
+    if (processed >= batchSize) break;
+    processed += 1;
+    if (latest && ['sending', 'uncertain'].includes(latest.state)) {
+      const recovered = await recoverAmbiguousDelivery({
+        github, context, core, ref: queued.ref, record: latest, env,
+      });
+      if (!recovered.complete) {
+        blockedRetry = recovered.retry;
+        manualSeen = recovered.manual === true;
+        if (manualSeen) continue;
+        break;
+      }
+      continue;
+    }
+    const hydrated = await rehydrateEvent({ github, context, core, ref: queued.ref });
+    if (!hydrated.ok) {
+      blockedRetry = hydrated.retry !== false;
+      if (hydrated.manualReason) {
+        if (latest && latest.state === 'preparing') {
+          const thread = await readThreadState({ github, context, core, prNum });
+          if (thread.kind === 'pending' && thread.generation === latest.threadGeneration && thread.claimId === latest.threadClaimId) {
+            const released = await releaseThreadGeneration({
+              github, context, core, prNum,
+              generation: latest.threadGeneration, claimId: latest.threadClaimId,
+            });
+            if (!released.ok) { blockedRetry = true; break; }
+          }
+        }
+        const record = latest
+          ? canonicalDeliveryRecord({ ...latest, state: 'skipped', messageId: null, nextCheckAt: null, reason: 'dead_letter' })
+          : terminalNoSendRecord(queued.ref, 'skipped', 'dead_letter');
+        await appendDeliveryAndConfirm({ github, context, core, prNum, record });
+        blockedRetry = false;
+        continue;
+      }
+      break;
+    }
+    if (!hydrated.notify) {
+      if (latest && latest.state === 'preparing') {
+        const thread = await readThreadState({ github, context, core, prNum });
+        if (thread.kind === 'pending' && thread.generation === latest.threadGeneration &&
+            thread.claimId === latest.threadClaimId) {
+          const released = await releaseThreadGeneration({
+            github, context, core, prNum,
+            generation: latest.threadGeneration, claimId: latest.threadClaimId,
+          });
+          if (!released.ok) break;
+        }
+      }
+      await appendDeliveryAndConfirm({
+        github, context, core, prNum,
+        record: latest
+          ? canonicalDeliveryRecord({ ...latest, state: 'skipped', messageId: null, nextCheckAt: null, reason: hydrated.reason })
+          : terminalNoSendRecord(queued.ref, 'skipped', hydrated.reason),
+      });
+      continue;
+    }
+    const delivered = await deliverClassifiedEvent({
+      github, context, core, ref: queued.ref, prData: hydrated.prData,
+      cls: hydrated.cls, env, latest,
+    });
+    if (!delivered.complete) {
+      blockedRetry = delivered.retry;
+      manualSeen = delivered.manual === true;
+      if (manualSeen) continue;
+      break;
+    }
+  }
+
+  const finalLedger = await readDeliveryLedger({ github, context, core, prNum });
+  if (!finalLedger.ok) return;
+  const remaining = queue.events.filter(({ ref }) => {
+    const state = finalLedger.latest.get(ref.eventKey);
+    return !state || !['done', 'skipped'].includes(state.state);
+  });
+  if (remaining.length > 0) {
+    const remainingActionable = remaining.some(({ ref }) => {
+      const state = finalLedger.latest.get(ref.eventKey);
+      return !state || state.state !== 'manual';
+    });
+    const mode = blockedRetry ? 'retry' : remainingActionable ? 'backlog' : 'watchdog';
+    setDrainOutputs(core, mode !== 'watchdog', mode);
+  }
+}
+
+function isManualRootPendingBarrier(record, threadState) {
+  return Boolean(record && record.state === 'manual' && record.mode === 'root' &&
+    threadState && threadState.kind === 'pending' &&
+    threadState.generation === record.threadGeneration && threadState.claimId === record.threadClaimId);
+}
+
+function persistedDrainCursorVersion(comments, cursor, context, prNum) {
+  const repo = repositoryName(context);
+  const records = comments
+    .filter((comment) => isTrustedMarkerComment(comment, { legacy: false }))
+    .map((comment) => ({ id: Number(comment.id), record: decodeDrainCursor(comment.body) }))
+    .filter(({ record }) => record && record.repo === repo && record.pr === prNum &&
+      record.nextEventKey === cursor.nextEventKey)
+    .sort((a, b) => b.id - a.id);
+  return records.length ? records[0].record.version : 2;
+}
+
+function compactCheckpointEntries(comments, queue, cursor, latest) {
+  const retainedKeys = new Set(queue.events
+    .filter(({ ref }) => {
+      const record = latest.get(ref.eventKey);
+      return !record || !['done', 'skipped'].includes(record.state);
+    })
+    .map(({ ref }) => ref.eventKey));
+  const threadEntries = [];
+  const cursorEntries = [];
+  const otherEntries = [];
+  const tombstoneEntries = new Map();
+  for (const comment of comments) {
+    const body = String(comment.body || '');
+    const entry = {
+      id: Number(comment.id), body,
+      createdAt: validIsoTime(comment.created_at) ? comment.created_at : '1970-01-01T00:00:00.000Z',
+      login: String(comment.user && comment.user.login || ''),
+      type: String(comment.user && comment.user.type || 'User'),
+      association: String(comment.author_association || 'NONE'),
+    };
+    if (!Number.isSafeInteger(entry.id) || entry.id <= 0 || body.includes(CHECKPOINT_MARK)) continue;
+    const tombstone = decodeDeliveryTombstone(body);
+    if (body.includes(DELIVERY_TOMBSTONE_MARK)) {
+      if (isGithubActionsBot(comment) && tombstone) {
+        const previous = tombstoneEntries.get(tombstone.eventKey);
+        if (!previous || entry.id < previous.entry.id) tombstoneEntries.set(tombstone.eventKey, { tombstone, entry });
+      }
+      continue;
+    }
+    if (body.includes(STATE_MARK)) {
+      if (isGithubActionsBot(comment) && decodeThreadState(body)) threadEntries.push(entry);
+      continue;
+    }
+    if (body.includes(MARK) && !body.includes(EVENT_MARK)) {
+      if (isTrustedMarkerComment(comment, { legacy: true }) && legacyMessageId(body)) threadEntries.push(entry);
+      continue;
+    }
+    if (body.includes(DRAIN_CURSOR_MARK)) {
+      if (isGithubActionsBot(comment) && decodeDrainCursor(body)) cursorEntries.push(entry);
+      continue;
+    }
+    const event = decodeEventRef(body);
+    if (isGithubActionsBot(comment) && event && retainedKeys.has(event.eventKey)) {
+      otherEntries.push(entry);
+      continue;
+    }
+    const delivery = decodeDeliveryRecord(body);
+    if (isGithubActionsBot(comment) && delivery && retainedKeys.has(delivery.eventKey)) otherEntries.push(entry);
+  }
+  for (const event of queue.events) {
+    const record = latest.get(event.ref.eventKey);
+    if (!record || !['done', 'skipped'].includes(record.state) || tombstoneEntries.has(event.ref.eventKey)) continue;
+    const source = comments.find((comment) => isGithubActionsBot(comment) &&
+      decodeEventRef(comment.body)?.eventKey === event.ref.eventKey);
+    const tombstone = canonicalDeliveryTombstone({
+      ...event.ref, eventCommentId: Number(event.commentId), state: record.state,
+    });
+    if (!tombstone) continue;
+    tombstoneEntries.set(event.ref.eventKey, {
+      tombstone,
+      entry: {
+        id: Number(event.commentId), body: encodeDeliveryTombstone(tombstone),
+        createdAt: source && validIsoTime(source.created_at) ? source.created_at : event.ref.createdAt,
+        login: GITHUB_ACTIONS_BOT, type: 'Bot', association: 'NONE',
+      },
+    });
+  }
+  const pendingStates = threadEntries.map((entry) => decodeThreadState(entry.body))
+    .filter((state) => state && state.state === 'pending')
+    .sort((a, b) => b.generation - a.generation);
+  const pending = pendingStates[0];
+  const pendingOwnerEventKeys = new Set();
+  if (pending) {
+    for (const comment of comments) {
+      const delivery = decodeDeliveryRecord(comment.body);
+      if (!isGithubActionsBot(comment) || !delivery || delivery.mode !== 'root' ||
+          delivery.threadGeneration !== pending.generation ||
+          delivery.threadClaimId !== pending.claimId) continue;
+      pendingOwnerEventKeys.add(delivery.eventKey);
+      const body = String(comment.body || '');
+      const entry = {
+        id: Number(comment.id), body,
+        createdAt: validIsoTime(comment.created_at) ? comment.created_at : '1970-01-01T00:00:00.000Z',
+        login: String(comment.user && comment.user.login || ''),
+        type: String(comment.user && comment.user.type || 'User'),
+        association: String(comment.author_association || 'NONE'),
+      };
+      if (!otherEntries.some((candidate) => candidate.id === entry.id)) otherEntries.push(entry);
+    }
+    for (const comment of comments) {
+      if (!isGithubActionsBot(comment)) continue;
+      const event = decodeEventRef(comment.body);
+      if (!event || !pendingOwnerEventKeys.has(event.eventKey)) continue;
+      const entry = {
+        id: Number(comment.id), body: String(comment.body || ''),
+        createdAt: validIsoTime(comment.created_at) ? comment.created_at : '1970-01-01T00:00:00.000Z',
+        login: String(comment.user && comment.user.login || ''),
+        type: String(comment.user && comment.user.type || 'User'),
+        association: String(comment.author_association || 'NONE'),
+      };
+      if (!otherEntries.some((candidate) => candidate.id === entry.id)) otherEntries.push(entry);
+    }
+  }
+  const terminalEntries = [...tombstoneEntries.entries()]
+    .filter(([eventKey]) => !pendingOwnerEventKeys.has(eventKey))
+    .map(([, value]) => value.entry);
+  const entries = [...threadEntries.slice(-20), ...terminalEntries, ...otherEntries, ...cursorEntries.slice(-1)]
+    .sort((a, b) => a.id - b.id);
+  if (entries.length > CHECKPOINT_MAX_ENTRIES) return null;
+  return entries;
+}
+
+async function persistCheckpoint({ github, context, core, prNum, comments, queue, cursor, latest = null }) {
+  let effectiveLatest = latest;
+  if (!(effectiveLatest instanceof Map)) {
+    const ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
+    if (!ledger.ok) return false;
+    effectiveLatest = ledger.latest;
+  }
+  const entries = compactCheckpointEntries(comments, queue, cursor, effectiveLatest);
+  if (!entries) {
+    core.warning('compact checkpoint 超过 state entry cap；保留旧 checkpoint 并立即续 backlog');
+    return null;
+  }
+  const metadata = comments._checkpoint || {};
+  const previous = metadata.checkpoint;
+  const highCommentId = comments.reduce((max, comment) =>
+    String(comment.body || '').includes(CHECKPOINT_MARK) ? max : Math.max(max, Number(comment.id) || 0),
+  previous ? previous.highCommentId : 0);
+  let highCreatedAt = previous ? previous.highCreatedAt : '1970-01-01T00:00:00.000Z';
+  for (const comment of comments) {
+    if (Number(comment.id) <= (previous ? previous.highCommentId : 0)) continue;
+    if (validIsoTime(comment.created_at) && Date.parse(comment.created_at) > Date.parse(highCreatedAt)) {
+      highCreatedAt = comment.created_at;
+    }
+  }
+  const checkpoint = canonicalCheckpoint({
+    version: 1, revision: previous ? previous.revision + 1 : 1,
+    repo: repositoryName(context), pr: prNum, highCommentId, highCreatedAt, entries,
+    parentHash: previous ? canonicalHash(previous) : null,
+  });
+  let body;
+  try { body = encodeCheckpoint(checkpoint); } catch (error) {
+    core.warning(`compact checkpoint 超过 comment size cap；保留旧 checkpoint 并立即续 backlog: ${errorMessage(error)}`);
+    return null;
+  }
+  // Checkpoints are append-only: created position is always at the comment tail and each
+  // revision cryptographically names its parent canonical snapshot.
+  if (true) {
+    try {
+      const created = await github.rest.issues.createComment({
+        owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum, body,
+        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+      });
+      metadata.commentId = Number(created.data.id);
+      metadata.checkpoint = checkpoint;
+      return true;
+    } catch (error) {
+      core.warning(`checkpoint POST 响应不确定，执行有界 prefix 核对: ${errorMessage(error)}`);
+      const targetHash = canonicalHash(checkpoint);
+      const tail = await readCheckpointTail({ github, context, core, prNum });
+      if (!tail) return false;
+      const found = tail.map((comment) => {
+        const candidate = decodeCheckpoint(comment.body);
+        return candidate && candidate.repo === repositoryName(context) && candidate.pr === prNum
+          ? { hash: canonicalHash(candidate), commentId: Number(comment.id), checkpoint: candidate }
+          : null;
+      }).filter(Boolean);
+      if (found.length > 0 && found.every(({ hash }) => hash === targetHash)) {
+        metadata.commentId = found[0].commentId;
+        metadata.checkpoint = found[0].checkpoint;
+        return true;
+      }
+      core.setFailed('checkpoint POST 未确认或发现不一致 lineage，保留旧 high-watermark');
+      return false;
+    }
+  }
+  const updated = await withGithubRetry({
+    core, label: '更新 compact checkpoint', setFailedOnExhausted: false,
+    operation: () => github.rest.issues.updateComment({
+      owner: context.repo.owner, repo: context.repo.repo, comment_id: metadata.commentId, body,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  if (updated.ok) {
+    metadata.checkpoint = checkpoint;
+    return true;
+  }
+  const reread = await withGithubRetry({
+    core, label: '核对不确定 checkpoint update', setFailedOnExhausted: false,
+    operation: () => github.rest.issues.getComment({
+      owner: context.repo.owner, repo: context.repo.repo, comment_id: metadata.commentId,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  const confirmed = reread.ok && decodeCheckpoint(reread.value.data.body);
+  if (confirmed && confirmed.revision === checkpoint.revision &&
+      canonicalHash(confirmed) === canonicalHash(checkpoint)) {
+    metadata.checkpoint = checkpoint;
+    return true;
+  }
+  core.setFailed('checkpoint update 未确认，保留旧 high-watermark 重放');
+  return false;
+}
+
+async function drainQueuedCodexEventsSnapshotWithinBudget({ github, context, core, batchSize = DRAIN_BATCH_SIZE }) {
+  setDrainOutputs(core, false, 'none');
+  const prNum = safePositiveInteger(process.env.RESOLVED_PR_NUMBER) || await resolvePrNumber(github, context, core);
+  if (!prNum) return;
+  let comments = await readThreadMarkerComments({ github, context, core, prNum });
+  if (!comments) {
+    setDrainOutputs(core, true, 'retry');
+    return;
+  }
+  let queue = await readEventQueue({ github, context, core, prNum, comments });
+  let ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
+  let threadState = await readThreadState({ github, context, core, prNum, comments });
+  let cursor = readDrainCursor({ comments, context, core, prNum });
+  if (!queue.ok || !ledger.ok || !threadState.ok || !cursor.ok) return;
+  const checkpointMetadata = comments._checkpoint || {};
+  const priorHighCommentId = checkpointMetadata.checkpoint ? checkpointMetadata.checkpoint.highCommentId : 0;
+  const snapshotHighCommentId = comments.reduce((max, comment) =>
+    String(comment.body || '').includes(CHECKPOINT_MARK) ? max : Math.max(max, Number(comment.id) || 0), 0);
+  let freshOverflow = false;
+  if (!checkpointMetadata.checkpoint || snapshotHighCommentId > priorHighCommentId) {
+    const ingested = await persistCheckpoint({
+      github, context, core, prNum, comments, queue, cursor, latest: ledger.latest,
+    });
+    if (ingested === null) {
+      if (!checkpointMetadata.checkpoint) {
+        setDrainOutputs(core, true, 'backlog');
+        return;
+      }
+      comments = checkpointMetadata.checkpoint.entries.map(virtualCheckpointComment);
+      Object.defineProperty(comments, '_checkpoint', {
+        value: { checkpoint: checkpointMetadata.checkpoint, commentId: checkpointMetadata.commentId, truncated: false },
+        enumerable: false,
+      });
+      queue = await readEventQueue({ github, context, core, prNum, comments });
+      ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
+      threadState = await readThreadState({ github, context, core, prNum, comments });
+      cursor = readDrainCursor({ comments, context, core, prNum });
+      if (!queue.ok || !ledger.ok || !threadState.ok || !cursor.ok) return;
+      freshOverflow = true;
+    } else if (!ingested) {
+      setDrainOutputs(core, true, 'retry');
+      return;
+    }
+    if (checkpointMetadata.truncated) {
+      setDrainOutputs(core, true, 'backlog');
+      return;
+    }
+  }
+  if (queue.events.length === 0) {
+    const checkpointed = await persistCheckpoint({
+      github, context, core, prNum, comments, queue, cursor, latest: ledger.latest,
+    });
+    if (checkpointed === null) setDrainOutputs(core, true, 'backlog');
+    else if (!checkpointed) setDrainOutputs(core, true, 'retry');
+    else if (comments._checkpoint && comments._checkpoint.truncated) setDrainOutputs(core, true, 'backlog');
+    return;
+  }
+  const env = readFeishuEnv(core, true);
+  if (!env) {
+    setDrainOutputs(core, true, 'retry');
+    return;
+  }
+
+  const session = { latest: new Map(ledger.latest), threadState };
+  const events = queue.events;
+  const cursorIndex = cursor.nextEventKey
+    ? events.findIndex(({ ref }) => ref.eventKey === cursor.nextEventKey)
+    : -1;
+  // v1 field name is retained for marker compatibility, but its value is now a monotonic
+  // high-watermark: the last event absorbed by the consumer, never the next circular slot.
+  const cursorVersion = cursor.version || persistedDrainCursorVersion(comments, cursor, context, prNum);
+  const startIndex = cursorVersion >= 3 && cursor.lastCommentId
+    ? events.findIndex((event) => Number(event.commentId) > cursor.lastCommentId)
+    : cursorIndex >= 0 ? cursorIndex + (cursorVersion >= 2 ? 1 : 0) : 0;
+  const normalizedStartIndex = startIndex < 0 ? events.length : startIndex;
+  const replayActionableStates = new Set([
+    'retrying', 'preparing', 'sending', 'uncertain', 'not_sent', 'failed',
+  ]);
+  const replayIndexes = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => Number(event.commentId) <= cursor.lastCommentId &&
+      replayActionableStates.has(session.latest.get(event.ref.eventKey)?.state))
+    .map(({ index }) => index);
+  if (replayIndexes.length === 0 && normalizedStartIndex >= events.length) {
+    const checkpointed = await persistCheckpoint({
+      github, context, core, prNum, comments, queue, cursor, latest: ledger.latest,
+    });
+    if (checkpointed === null) setDrainOutputs(core, true, 'backlog');
+    else if (!checkpointed) setDrainOutputs(core, true, 'retry');
+    else if (comments._checkpoint && comments._checkpoint.truncated) setDrainOutputs(core, true, 'backlog');
+    return;
+  }
+  const forwardIndexes = Array.from(
+    { length: Math.max(0, events.length - normalizedStartIndex) },
+    (_value, offset) => normalizedStartIndex + offset,
+  );
+  const scanIndexes = [...replayIndexes, ...forwardIndexes].slice(0, DRAIN_SCAN_LIMIT);
+  let scanned = 0;
+  let processed = 0;
+  let nextEventKey = cursor.nextEventKey;
+  let lastCommentId = cursor.lastCommentId;
+  let blockedMode = null;
+
+  const advanceAfter = (index) => {
+    const commentId = Number(events[index].commentId);
+    if (commentId > lastCommentId) {
+      nextEventKey = events[index].ref.eventKey;
+      lastCommentId = commentId;
+    }
+  };
+  const stopAt = (ref, mode) => {
+    blockedMode = mode;
+  };
+  const skipDeadLetter = async (ref, latest, reason = 'dead_letter') => {
+    if (latest && latest.state === 'preparing' && isManualRootPendingBarrier({ ...latest, state: 'manual' }, session.threadState)) {
+      const released = await releaseThreadGeneration({
+        github, context, core, prNum,
+        generation: latest.threadGeneration, claimId: latest.threadClaimId, session,
+      });
+      if (!released.ok) return false;
+    }
+    const skipped = latest
+      ? canonicalDeliveryRecord({ ...latest, state: 'skipped', messageId: null, nextCheckAt: null, reason })
+      : terminalNoSendRecord(ref, 'skipped', reason);
+    return (await appendDeliveryAndConfirm({
+      github, context, core, prNum, record: skipped, session,
+    })).ok;
+  };
+
+  for (const index of scanIndexes) {
+    const ref = events[index].ref;
+    scanned += 1;
+    let latest = session.latest.get(ref.eventKey);
+    if (latest && ['done', 'skipped'].includes(latest.state)) {
+      advanceAfter(index);
+      continue;
+    }
+    if (latest && latest.state === 'manual') {
+      if (isManualRootPendingBarrier(latest, session.threadState)) {
+        stopAt(ref, 'watchdog');
+        break;
+      }
+      core.warning(`eventKey=${ref.eventKey} manual dead-letter 可越过，继续 FIFO`);
+      advanceAfter(index);
+      continue;
+    }
+    if (latest && latest.state === 'failed') {
+      if (!await skipDeadLetter(ref, latest)) {
+        stopAt(ref, 'retry');
+        break;
+      }
+      advanceAfter(index);
+      continue;
+    }
+    if (processed >= batchSize) {
+      stopAt(ref, 'backlog');
+      break;
+    }
+    processed += 1;
+
+    if (latest && ['sending', 'uncertain'].includes(latest.state)) {
+      const recovered = await recoverAmbiguousDelivery({
+        github, context, core, ref, record: latest, env, session,
+      });
+      if (recovered.complete) {
+        advanceAfter(index);
+        continue;
+      }
+      latest = session.latest.get(ref.eventKey);
+      if (latest && latest.state === 'manual' && !isManualRootPendingBarrier(latest, session.threadState)) {
+        advanceAfter(index);
+        continue;
+      }
+      stopAt(ref, recovered.retry ? 'retry' : 'watchdog');
+      break;
+    }
+
+    const hydrated = await rehydrateEvent({ github, context, core, ref });
+    if (!hydrated.ok) {
+      if (hydrated.manualReason) {
+        if (!await skipDeadLetter(ref, latest)) {
+          stopAt(ref, 'retry');
+          break;
+        }
+        advanceAfter(index);
+        continue;
+      }
+      stopAt(ref, hydrated.retry === false ? 'watchdog' : 'retry');
+      break;
+    }
+    if (!hydrated.notify) {
+      if (!await skipDeadLetter(ref, latest, hydrated.reason)) {
+        stopAt(ref, 'retry');
+        break;
+      }
+      advanceAfter(index);
+      continue;
+    }
+
+    const delivered = await deliverClassifiedEvent({
+      github, context, core, ref, prData: hydrated.prData, cls: hydrated.cls,
+      env, latest, session,
+    });
+    if (delivered.complete) {
+      advanceAfter(index);
+      continue;
+    }
+    latest = session.latest.get(ref.eventKey);
+    if (latest && latest.state === 'failed') {
+      if (!await skipDeadLetter(ref, latest)) {
+        stopAt(ref, 'retry');
+        break;
+      }
+      advanceAfter(index);
+      continue;
+    }
+    if (latest && latest.state === 'manual' && !isManualRootPendingBarrier(latest, session.threadState)) {
+      advanceAfter(index);
+      continue;
+    }
+    stopAt(ref, delivered.retry ? 'retry' : 'watchdog');
+    break;
+  }
+
+  if (scanned > 0 && (nextEventKey !== cursor.nextEventKey || lastCommentId !== cursor.lastCommentId) &&
+      !await appendDrainCursor({ github, context, core, prNum, nextEventKey, lastCommentId })) {
+    blockedMode = blockedMode || 'retry';
+  }
+  const checkpointed = await persistCheckpoint({
+    github, context, core, prNum, comments, queue,
+    cursor: { ...cursor, version: 3, nextEventKey, lastCommentId },
+    latest: session.latest,
+  });
+  if (checkpointed === null) blockedMode = blockedMode || 'backlog';
+  else if (!checkpointed) blockedMode = blockedMode || 'retry';
+  if (comments._checkpoint && comments._checkpoint.truncated) blockedMode = blockedMode || 'backlog';
+  const remaining = events.filter(({ ref }) => {
+    const state = session.latest.get(ref.eventKey);
+    return !state || !['done', 'skipped'].includes(state.state);
+  });
+  if (remaining.length === 0) return;
+  const actionable = remaining.some(({ ref }) => {
+    const state = session.latest.get(ref.eventKey);
+    return !state || state.state !== 'manual';
+  });
+  const mode = blockedMode || (freshOverflow ? 'backlog' : actionable ? 'backlog' : 'watchdog');
+  setDrainOutputs(core, mode !== 'watchdog', mode);
+}
+
+async function scheduleQueuedCodexDrain(args) {
+  return withGithubAttemptBudget(async () => {
+    const { github, context, core } = args;
+    const prNum = safePositiveInteger(args.prNum || process.env.RESOLVED_PR_NUMBER) || await resolvePrNumber(github, context, core);
+    if (!prNum) return false;
+    return scheduleDrain({ github, context, core, prNum });
+  });
+}
+
+function watchdogWindow(pulls, repo, nowMs = Date.now()) {
+  const slot = Math.floor(nowMs / WATCHDOG_SLOT_MS);
+  const shard = slot % WATCHDOG_SHARDS;
+  const cycle = Math.floor(slot / WATCHDOG_SHARDS);
+  const inShard = pulls
+    .filter((pr) => {
+      const digest = crypto.createHash('sha256').update(`${repo}#${pr.number}`).digest();
+      return digest.readUInt32BE(0) % WATCHDOG_SHARDS === shard;
+    })
+    .sort((a, b) => Number(a.number) - Number(b.number));
+  if (inShard.length === 0) return { slot, shard, pulls: [] };
+  // For the same shard, cycle increments by exactly one. Advancing one position is coprime
+  // with every non-empty set length, unlike a cap-sized step (40 starves lengths 20/32/40).
+  const offset = cycle % inShard.length;
+  const rotated = inShard.slice(offset).concat(inShard.slice(0, offset));
+  return { slot, shard, pulls: rotated.slice(0, WATCHDOG_MAX_PRS_PER_RUN) };
+}
+
+async function sweepQueuedCodexReviews(args) {
+  return withGithubAttemptBudget(async () => {
+    const { github, context, core } = args;
+    const nowMs = Number.isFinite(args.nowMs) ? args.nowMs : Date.now();
+    const slot = Math.floor(nowMs / WATCHDOG_SLOT_MS);
+    const cycle = Math.floor(slot / WATCHDOG_SHARDS);
+    let startPage = 1 + (cycle % WATCHDOG_PAGE_WINDOWS) * WATCHDOG_MAX_PR_PAGES;
+    const pulls = [];
+    for (let pageOffset = 0; pageOffset < WATCHDOG_MAX_PR_PAGES; pageOffset += 1) {
+      const page = startPage + pageOffset;
+      const result = await withGithubRetry({
+        core,
+        label: `列出 watchdog PR page=${page}`,
+        operation: () => github.rest.pulls.list({
+          owner: context.repo.owner, repo: context.repo.repo, state: 'open', base: 'main',
+          sort: 'created', direction: 'asc', page, per_page: WATCHDOG_PR_PAGE_SIZE,
+          request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+        }),
+      });
+      if (!result.ok) return;
+      pulls.push(...result.value.data);
+      if (result.value.data.length < WATCHDOG_PR_PAGE_SIZE) break;
+    }
+    if (pulls.length === 0 && startPage !== 1) {
+      startPage = 1;
+      const fallback = await withGithubRetry({
+        core,
+        label: 'watchdog rotated page 为空，回退 page=1',
+        operation: () => github.rest.pulls.list({
+          owner: context.repo.owner, repo: context.repo.repo, state: 'open', base: 'main',
+          sort: 'created', direction: 'asc', page: 1, per_page: WATCHDOG_PR_PAGE_SIZE,
+          request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+        }),
+      });
+      if (!fallback.ok) return;
+      pulls.push(...fallback.value.data);
+    }
+    const window = watchdogWindow(pulls, repositoryName(context), nowMs);
+    let dispatches = 0;
+    for (const pr of window.pulls) {
+      if (dispatches >= WATCHDOG_MAX_DISPATCHES) break;
+      const prNum = Number(pr.number);
+      if (!Number.isSafeInteger(prNum) || prNum <= 0) continue;
+      const comments = await readThreadMarkerComments({ github, context, core, prNum });
+      if (!comments) continue;
+      const queue = await readEventQueue({ github, context, core, prNum, comments });
+      if (!queue.ok || queue.events.length === 0) continue;
+      const ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
+      if (!ledger.ok) continue;
+      const thread = await readThreadState({ github, context, core, prNum, comments });
+      if (!thread.ok) continue;
+      const barrier = queue.events.some(({ ref }) =>
+        isManualRootPendingBarrier(ledger.latest.get(ref.eventKey), thread));
+      if (barrier) continue;
+      const actionable = queue.events.some(({ ref }) => {
+        const state = ledger.latest.get(ref.eventKey);
+        return !state || !['done', 'skipped', 'manual'].includes(state.state);
+      });
+      if (actionable && await scheduleDrain({ github, context, core, prNum })) dispatches += 1;
+    }
+    core.info(`watchdog slot=${window.slot} shard=${window.shard} start_page=${startPage} prs=${window.pulls.length} dispatches=${dispatches}`);
+  });
+}
+
 async function notifyFromCheckRunWithinBudget({ github, context, core }) {
   const { classifyCheckRun, shouldNotify } = require('./report');
   const checkRun = context.payload.check_run;
@@ -956,11 +3032,13 @@ async function notifyFromCheckRunWithinBudget({ github, context, core }) {
   const cls = classifyCheckRun(checkRun, process.env);
   if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}，不通知`); return; }
   const prData = await resolvedPrForNotification(github, context, core);
-  if (!prData) return;
-  if (prData.base !== 'main' || prData.state !== 'open') { core.info('PR 非 OPEN main，跳过'); return; }
+  if (!prData || prData.base !== 'main' || prData.state !== 'open') return;
+  const ref = eventRefFromContext(context, prData, core);
+  if (!ref) return;
   const env = readFeishuEnv(core); if (!env) return;
-  const dedupeKey = `${checkRun.id || checkRun.head_sha}:${checkRun.head_sha}:${checkRun.completed_at || checkRun.updated_at || ''}`;
-  await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+  const ledger = await readDeliveryLedger({ github, context, core, prNum: ref.pr });
+  if (!ledger.ok) return;
+  await deliverClassifiedEvent({ github, context, core, ref, prData, cls, env, latest: ledger.latest.get(ref.eventKey) });
 }
 
 async function notifyFromPullRequestReviewWithinBudget({ github, context, core }) {
@@ -968,31 +3046,42 @@ async function notifyFromPullRequestReviewWithinBudget({ github, context, core }
   const review = context.payload.review;
   if (!isCodexPullRequestReview(review)) { core.info('非 Codex review，跳过'); return; }
   const prData = await resolvedPrForNotification(github, context, core);
-  if (!prData) return;
-  if (prData.base !== 'main' || prData.state !== 'open') { core.info('PR 非 OPEN main，跳过'); return; }
-  const comments = await listCommentsForReview(github, context, core, prData.number, review && review.id);
+  if (!prData || prData.base !== 'main' || prData.state !== 'open') return;
+  const comments = await listCommentsForReview(github, context, core, prData.number, review.id);
   if (!comments) return;
   const cls = classifyPullRequestReview(review, comments, process.env);
-  if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}，不通知`); return; }
+  if (!shouldNotify(cls)) return;
+  const ref = eventRefFromContext(context, prData, core);
+  if (!ref) return;
   const env = readFeishuEnv(core); if (!env) return;
-  const dedupeKey = `review:${review.id || ''}:${review.submitted_at || review.updated_at || ''}:${comments.length}`;
-  await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+  const ledger = await readDeliveryLedger({ github, context, core, prNum: ref.pr });
+  if (!ledger.ok) return;
+  await deliverClassifiedEvent({ github, context, core, ref, prData, cls, env, latest: ledger.latest.get(ref.eventKey) });
 }
 
-async function withGithubAttemptBudget(operation, options = {}) {
-  const previousDeadline = activeGithubAttemptDeadlineMs;
-  const nowFn = options.nowFn || Date.now;
-  const requestedDeadline = Number.isFinite(options.deadlineMs)
-    ? options.deadlineMs
-    : nowFn() + GITHUB_ATTEMPT_BUDGET_MS;
-  activeGithubAttemptDeadlineMs = Number.isFinite(previousDeadline)
-    ? previousDeadline
-    : requestedDeadline;
-  try {
-    return await operation();
-  } finally {
-    activeGithubAttemptDeadlineMs = previousDeadline;
-  }
+async function postSynthetic({ github, context, core, cls, prData, dedupeKey }) {
+  const env = readFeishuEnv(core); if (!env) return;
+  const createdAt = new Date().toISOString();
+  const ref = canonicalEventRef({
+    version: EVENT_VERSION,
+    eventType: 'check_run',
+    eventId: String(Math.max(1, parseInt(crypto.createHash('sha256').update(dedupeKey).digest('hex').slice(0, 12), 16))),
+    repo: repositoryName(context),
+    pr: prData.number,
+    headSha: validSha(context.sha) ? context.sha : crypto.createHash('sha256').update(String(context.sha || dedupeKey)).digest('hex'),
+    createdAt,
+  });
+  const ledger = await readDeliveryLedger({ github, context, core, prNum: ref.pr });
+  if (!ledger.ok) return;
+  await deliverClassifiedEvent({ github, context, core, ref, prData, cls, env, latest: ledger.latest.get(ref.eventKey) });
+}
+
+async function enqueueOfficialCodexEvent(args) {
+  return withGithubAttemptBudget(() => enqueueOfficialCodexEventWithinBudget(args));
+}
+
+async function drainQueuedCodexEvents(args) {
+  return withGithubAttemptBudget(() => drainQueuedCodexEventsSnapshotWithinBudget(args));
 }
 
 async function notifyFromCheckRun(args) {
@@ -1005,10 +3094,8 @@ async function notifyFromPullRequestReview(args) {
 
 async function notifyFromOfficialCodexEvent(args) {
   return withGithubAttemptBudget(async () => {
-    const { github, context, core } = args;
-    if (context.eventName === 'check_run') return notifyFromCheckRun({ github, context, core });
-    if (context.eventName === 'pull_request_review') return notifyFromPullRequestReview({ github, context, core });
-    core.info(`event=${context.eventName} 不支持，跳过`);
+    await enqueueOfficialCodexEventWithinBudget(args);
+    await drainQueuedCodexEventsSnapshotWithinBudget(args);
   });
 }
 
@@ -1020,9 +3107,7 @@ async function notifyFromActionResult(args) {
     if (!shouldNotify(cls)) return;
     const prData = await resolvedPrForNotification(github, context, core);
     if (!prData || prData.base !== 'main' || prData.state !== 'open') return;
-    const env = readFeishuEnv(core); if (!env) return;
-    const dedupeKey = `action:${context.sha}:${result && result.run_id || process.env.GITHUB_RUN_ID || ''}`;
-    await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+    await postSynthetic({ github, context, core, cls, prData, dedupeKey: `action:${context.sha}:${result && result.run_id || ''}` });
   });
 }
 
@@ -1034,10 +3119,8 @@ async function notifyFromActionFailure(args) {
     if (!shouldNotify(cls)) return;
     const prData = await resolvedPrForNotification(github, context, core);
     if (!prData || prData.base !== 'main' || prData.state !== 'open') return;
-    const env = readFeishuEnv(core); if (!env) return;
     const runId = failure && failure.runId || process.env.GITHUB_RUN_ID || '';
-    const dedupeKey = `action-failure:${context.sha}:${runId}:${cls.reason}`;
-    await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+    await postSynthetic({ github, context, core, cls, prData, dedupeKey: `action-failure:${context.sha}:${runId}:${cls.reason}` });
   });
 }
 
@@ -1047,6 +3130,22 @@ module.exports = {
   notifyFromPullRequestReview,
   notifyFromActionResult,
   notifyFromActionFailure,
+  enqueueOfficialCodexEvent,
+  drainQueuedCodexEvents,
+  enqueueEventRef,
+  readEventQueue,
+  readDeliveryLedger,
+  appendDeliveryAndConfirm,
+  findDeliveryInFeishuHistory,
+  deliveryToken,
+  contentWithDeliveryToken,
+  canonicalEventRef,
+  encodeEventRef,
+  decodeEventRef,
+  encodeDeliveryRecord,
+  decodeDeliveryRecord,
+  encodeDeliveryRepairRecord,
+  decodeDeliveryRepairRecord,
   validFeishuMessageId,
   shouldRecreateRootOnReplyFailure,
   isCodexCheckRun,
@@ -1054,6 +3153,20 @@ module.exports = {
   GITHUB_REQUEST_TIMEOUT_MS,
   GITHUB_ATTEMPT_BUDGET_MS,
   MAX_GITHUB_RETRY_DELAY_MS,
+  DRAIN_BATCH_SIZE,
+  HISTORY_MAX_PAGES,
+  HISTORY_PAGE_SIZE,
+  HISTORY_MAX_ATTEMPTS,
+  HISTORY_MAX_AGE_MS,
+  DEFINITE_SEND_MAX_ATTEMPTS,
+  WATCHDOG_PR_PAGE_SIZE,
+  WATCHDOG_MAX_PR_PAGES,
+  WATCHDOG_MAX_PRS_PER_RUN,
+  WATCHDOG_MAX_DISPATCHES,
+  WATCHDOG_SHARDS,
+  CODEX_REVIEW_USER_ID,
+  CODEX_REVIEW_LOGIN,
+  CODEX_CHECK_APP_SLUG,
   parseRetryAfterMs,
   withGithubAttemptBudget,
   withGithubRetry,
@@ -1061,8 +3174,14 @@ module.exports = {
   persistThreadMarker,
   MARK,
   STATE_MARK,
+  REPAIR_MARK,
+  EVENT_MARK,
+  DELIVERY_MARK,
+  DELIVERY_REPAIR_MARK,
   encodeThreadState,
   decodeThreadState,
+  encodeRepairRecord,
+  decodeRepairRecord,
   isTrustedMarkerComment,
   readThreadState,
   resolvePrNumber,
@@ -1070,4 +3189,16 @@ module.exports = {
   reserveThreadGeneration,
   finalizeThreadGeneration,
   releaseThreadGeneration,
+  repairLegacyConflict,
+  repairDelivery,
+  repairOrphanThread,
+  encodeThreadRepairRecord,
+  decodeThreadRepairRecord,
+  parseRepairPublicKeyring,
+  historyRecoveryExhausted,
+  scheduleQueuedCodexDrain,
+  sweepQueuedCodexReviews,
+  watchdogWindow,
+  THREAD_REPAIR_MARK,
+  CHECKPOINT_MARK,
 };
