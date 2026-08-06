@@ -21,6 +21,9 @@ on:
       - 'tests/tools/test_check_sibling_debrand.py'
       - 'website/scripts/generate-skill-docs.py'
       - 'website/scripts/extract-skills.py'
+      # Any Python source: a new top-level module or import can change what the
+      # wheel must ship, and the packaging declarations below do not name it.
+      - '**.py'
       # Packaging / install chain — these decide whether the wheel/sdist/ZPK
       # actually ship the policy + skill trees, so a change here can break
       # seeding without touching the policy itself.
