@@ -2400,8 +2400,8 @@ class ZetAgentAdapter(APIServerAdapter):
         # session overrides live in gateway_runner._session_model_overrides
         # which this adapter's _create_agent bypasses. Check it here.
         gw = getattr(self, "gateway_runner", None)
-        # gateway_session_key is profile-scoped for approval isolation; model
-        # overrides remain keyed by the external session id inside a profile.
+        # gateway_session_key is the stable external App session key. Model
+        # overrides remain keyed by the lineage session id inside a profile.
         override_key = session_id or gateway_session_key
         runtime_auxiliary_task_configs = None
         runtime_supports_vision = None
@@ -2533,7 +2533,9 @@ class ZetAgentAdapter(APIServerAdapter):
             return agent
 
         interaction_queue_key = (
-            gateway_session_key or self._interaction_queue_key(session_id or "")
+            self._interaction_queue_key(session_id)
+            if session_id
+            else (gateway_session_key or "")
         )
 
         # 1. Reasoning: late-bind on the agent (AIAgent reads
@@ -2678,16 +2680,17 @@ class ZetAgentAdapter(APIServerAdapter):
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
     ):
-        """Wrap base ``_run_agent`` to bind the session-scoped env
-        vars hermes' approval/clarify gate reads at runtime.
+        """Wrap base ``_run_agent`` to bind the App and interaction scopes.
 
-        ``HERMES_SESSION_KEY`` keys the per-session approval queue so
-        that the notify callback we registered in ``_create_agent``
-        is found when the agent calls ``check_all_command_guards``.
-        ``HERMES_EXEC_ASK`` flips the approval gate from "skip" to
-        "block-and-prompt" outside CLI/gateway sessions.
+        ``gateway_session_key`` is the stable external App session key used by
+        managed tools such as the desktop-browser router. Approval/clarify uses
+        a separate profile-scoped interaction key, bound through approval's
+        dedicated ContextVar, so identical lineage session IDs in two profiles
+        cannot share an interaction queue. ``HERMES_EXEC_ASK`` flips the
+        approval gate from "skip" to "block-and-prompt" outside CLI/gateway
+        sessions.
 
-        Both vars are saved and restored around the call so concurrent
+        These bindings are saved and restored around the call so concurrent
         chat.completions requests do not leak each other's session key.
         Process-global env is not strictly safe under concurrency, but
         webui uses the same pattern (api/streaming.py) and the
@@ -2778,6 +2781,12 @@ class ZetAgentAdapter(APIServerAdapter):
         interaction_queue_key = (
             self._interaction_queue_key(session_id) if session_id else gateway_session_key
         )
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        approval_session_token = set_current_session_key(interaction_queue_key or "")
 
         try:
             result = await super()._run_agent(
@@ -2790,7 +2799,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 agent_ref=agent_ref,
-                gateway_session_key=interaction_queue_key,
+                gateway_session_key=gateway_session_key,
                 route=route,
                 response_mode=response_mode,
                 plan_ack=plan_ack,
@@ -2961,7 +2970,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 os.environ.pop("HERMES_EXEC_ASK", None)
             else:
                 os.environ["HERMES_EXEC_ASK"] = old_exec_ask
-            clear_turn_vars(turn_context_tokens)
+            try:
+                reset_current_session_key(approval_session_token)
+            finally:
+                clear_turn_vars(turn_context_tokens)
 
     def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
         """Return the model this session will actually use this turn: the
