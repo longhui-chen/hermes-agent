@@ -23,7 +23,6 @@ MAX_ELEMENTS = 24
 MAX_LABEL_CHARS = 160
 MAX_SUMMARY_CHARS = 512
 MAX_TITLE_CHARS = 160
-MAX_PATH_CHARS = 512
 MAX_SESSION_ID_CHARS = 256
 MAX_SNAPSHOT_SCAN_CHARS = 64 * 1024
 MAX_URL_SCAN_CHARS = 4096
@@ -113,13 +112,11 @@ def _safe_url(value: Any) -> tuple[dict[str, str] | None, bool]:
         if re.fullmatch(r"[a-z0-9.-]+", hostname) is None:
             return None, truncated
 
-    path, path_truncated = _clean_text(parsed.path or "/", MAX_PATH_CHARS)
-    truncated = truncated or path_truncated
-    result = {"hostname": hostname}
-    if path:
-        result["path"] = path
-    # userinfo, port, query and fragment are intentionally never copied.
-    return result, truncated
+    # Every path segment is untrusted presentation data: magic links, password
+    # resets, invitations and signed resources routinely put credentials there.
+    # Keep only site identity; userinfo, port, path, query and fragment are
+    # intentionally never copied, regardless of encoding.
+    return {"hostname": hostname}, truncated
 
 
 def _decode_label(value: str) -> str:
@@ -213,11 +210,6 @@ def _fit_byte_budget(payload: dict[str, Any]) -> dict[str, Any]:
             break
         if field in payload:
             payload.pop(field, None)
-            payload["truncated"] = True
-    if _serialized_size(payload) > MAX_PREVIEW_BYTES:
-        url = payload.get("url")
-        if isinstance(url, dict):
-            url.pop("path", None)
             payload["truncated"] = True
     return payload
 

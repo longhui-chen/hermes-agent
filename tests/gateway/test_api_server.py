@@ -85,7 +85,7 @@ class TestToolCompletionPayload:
             "version": 1,
             "source": "navigate",
             "browserSessionId": "session-1",
-            "url": {"hostname": "example.com", "path": "/account"},
+            "url": {"hostname": "example.com"},
             "title": "Account",
             "elements": [
                 {"role": "heading", "label": "Account"},
@@ -4692,7 +4692,7 @@ class TestTakeoverUIHintOverSSE:
         completed = [e for e in events if e.get("status") == "completed"]
         assert len(completed) == 1
         state = completed[0]["browserState"]
-        assert state["url"] == {"hostname": "example.com", "path": "/login"}
+        assert state["url"] == {"hostname": "example.com"}
         assert state["elements"] == [
             {"role": "heading", "label": "Sign in"},
             {"role": "textbox", "label": "Email"},

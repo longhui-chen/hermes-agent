@@ -30,10 +30,7 @@ def test_navigate_projects_safe_structured_state() -> None:
     assert preview is not None
     assert preview["version"] == 1
     assert preview["source"] == "navigate"
-    assert preview["url"] == {
-        "hostname": "example.com",
-        "path": "/account/profile",
-    }
+    assert preview["url"] == {"hostname": "example.com"}
     assert preview["browserSessionId"] == "browser-session-1"
     assert preview["elementCount"] == 4
     assert preview["elements"] == [
@@ -101,7 +98,7 @@ def test_action_result_requires_and_sanitizes_landing_url() -> None:
     assert preview == {
         "version": 1,
         "source": "action_result",
-        "url": {"hostname": "example.com", "path": "/done"},
+        "url": {"hostname": "example.com"},
     }
     assert (
         project_browser_state_preview(
@@ -120,7 +117,7 @@ def test_url_projection_bounds_input_and_rejects_oversized_hostname() -> None:
     assert preview == {
         "version": 1,
         "source": "action_result",
-        "url": {"hostname": "example.com", "path": "/done"},
+        "url": {"hostname": "example.com"},
         "truncated": True,
     }
     assert (
@@ -130,6 +127,25 @@ def test_url_projection_bounds_input_and_rejects_oversized_hostname() -> None:
         )
         is None
     )
+
+
+def test_url_projection_never_copies_raw_or_encoded_path_credentials() -> None:
+    paths = (
+        "/reset/eyJhbGciOiJIUzI1NiJ9.private.signature",
+        "/magic-login/%34%66%38%63%2dsecret",
+        "/signed/resource/%252Fopaque%252Dsignature",
+    )
+    for path in paths:
+        preview = project_browser_state_preview(
+            "browser_navigate",
+            {"success": True, "url": f"https://Example.com{path}"},
+        )
+        assert preview is not None
+        assert preview["url"] == {"hostname": "example.com"}
+        encoded = json.dumps(preview, ensure_ascii=False)
+        assert path not in encoded
+        assert "secret" not in encoded
+        assert "signature" not in encoded
 
 
 def test_unknown_failed_and_sensitive_input_tools_fail_closed() -> None:
