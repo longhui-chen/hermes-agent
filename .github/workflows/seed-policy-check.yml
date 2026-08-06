@@ -1,9 +1,9 @@
 name: seed-policy-check
 
 # Seed-policy + de-brand guard. config/skill_seed_policy.json is the fail-closed
-# allowlist for new profiles. Hermes no longer supports public wheel/sdist
-# distribution, so packaged-content coverage follows the Zettlab ZPK source-tree
-# contract instead of building and installing a public wheel.
+# allowlist for new profiles. Public wheel/sdist distribution is unsupported;
+# packaged-content coverage follows the Zettlab ZPK source-tree contract, while
+# an authorized ZPK wheel build verifies the installed top-level modules.
 
 on:
   pull_request:
@@ -19,6 +19,9 @@ on:
       - 'tests/tools/test_check_sibling_debrand.py'
       - 'website/scripts/generate-skill-docs.py'
       - 'website/scripts/extract-skills.py'
+      # Any Python source: a new top-level module or import can change what the
+      # authorized Nix/ZPK wheel must ship.
+      - '**.py'
       - 'pyproject.toml'
       - 'setup.py'
       - 'Makefile'
@@ -52,7 +55,26 @@ jobs:
             tests/tools/test_skills_sync.py \
             tests/tools/test_check_sibling_debrand.py \
             tests/scripts/test_zpk_stage_payload.py \
-            tests/test_packaging_build_guard.py
+            tests/test_packaging_build_guard.py \
+            tests/test_packaging_metadata.py
+      - name: Authorized ZPK wheel ships declared top-level modules
+        run: |
+          python -m pip install --quiet build==1.5.0
+          HERMES_ZPK_BUILD=1 python -m build --wheel --outdir /tmp/wheelcheck >/dev/null
+          python - <<'PY'
+          import glob
+          import tomllib
+          import zipfile
+
+          whl = glob.glob("/tmp/wheelcheck/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          with open("pyproject.toml", "rb") as fh:
+              declared = tomllib.load(fh)["tool"]["setuptools"]["py-modules"]
+          top_level = {n for n in names if n.endswith(".py") and "/" not in n}
+          absent = sorted(f"{m}.py" for m in declared if f"{m}.py" not in top_level)
+          assert not absent, f"wheel is missing declared py-modules: {absent}"
+          print(f"wheel payload OK ({len(declared)} declared py-modules present)")
+          PY
       - name: Skills Hub stays curated
         run: |
           python - <<'PY'

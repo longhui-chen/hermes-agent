@@ -407,19 +407,36 @@ py-modules = [
   "hermes_logging",
   "utils",
   "mcp_serve",
+  "portable_import_security",
 ]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
 
 [tool.setuptools.package-data]
-hermes_cli = ["observability/schemas/*.json"]
+hermes_cli = [
+  "observability/schemas/*.json",
+  "web_dist/**/*",
+  "tui_dist/**/*",
+  "scripts/install.sh",
+  "scripts/install.ps1",
+]
 # gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
 # screenshot. Without this, sealed venvs (uv2nix) silently lose both —
 # status phrases fall back to the tiny hardcoded set and the Telegram
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
+plugins = [
+  "*/dashboard/manifest.json",
+  "*/dashboard/dist/*",
+  "*/dashboard/dist/**/*",
+  # Plugin discovery reads plugin.yaml/plugin.yml to register bundled plugins.
+  # Keep these manifests in the authorized Nix/ZPK wheel alongside the code.
+  "**/plugin.yaml",
+  "**/plugin.yml",
+  "**/README.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
