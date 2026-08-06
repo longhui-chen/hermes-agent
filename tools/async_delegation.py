@@ -721,7 +721,7 @@ def _prune_completed_locked() -> None:
 
 
 def _current_origin_session_id() -> str:
-    """Raw session id of the ORIGINATING api_server request, or ``""``.
+    """Raw session id of the originating HTTP agent request, or ``""``.
 
     The obvious source — ``HERMES_SESSION_ID`` via ``get_session_env`` — is
     NOT safe to read at dispatch time: constructing a child agent
@@ -734,14 +734,17 @@ def _current_origin_session_id() -> str:
     The request-scoped ``HERMES_SESSION_CHAT_ID`` binding survives child
     construction: ``_bind_api_server_session`` binds ``chat_id`` to the raw
     ``X-Hermes-Session-Id``, and its only writer is ``set_session_vars`` —
-    ``set_current_session_id`` never touches it. Gate on the platform: on
-    push platforms ``chat_id`` is a chat, not a session, so yield ``""``
-    there.
+    ``set_current_session_id`` never touches it. Restrict this to the HTTP
+    adapters where ``chat_id`` is a public session id; ordinary push-platform
+    chat ids are not interchangeable with session delivery keys.
     """
     try:
         from gateway.session_context import get_session_env
 
-        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+        if get_session_env("HERMES_SESSION_PLATFORM", "") not in {
+            "api_server",
+            "zet_agent",
+        }:
             return ""
         return get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
     except Exception:

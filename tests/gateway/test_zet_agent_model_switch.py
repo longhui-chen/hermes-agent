@@ -735,15 +735,93 @@ def test_seen_models_cache_is_profile_local(tmp_path, monkeypatch):
     ).read_text(encoding="utf-8")
 
 
-def test_last_resolved_model_cache_is_bounded(monkeypatch):
+def test_last_resolved_model_cache_is_bounded(tmp_path):
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
     adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
     adapter._last_resolved_model_cap = 2
+    profile_home = tmp_path / "profile"
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        adapter._remember_last_resolved_model("s1", "m1")
+        adapter._remember_last_resolved_model("s2", "m2")
+        adapter._remember_last_resolved_model("s3", "m3")
+    finally:
+        reset_hermes_home_override(token)
 
-    adapter._remember_last_resolved_model("s1", "m1")
-    adapter._remember_last_resolved_model("s2", "m2")
-    adapter._remember_last_resolved_model("s3", "m3")
+    prefix = str(profile_home.resolve())
+    assert set(adapter._last_resolved_model) == {
+        (prefix, "s2"),
+        (prefix, "s3"),
+        (prefix, None),
+    }
 
-    assert set(adapter._last_resolved_model) == {"s2", "s3", "*"}
+
+def test_last_resolved_model_fallback_is_profile_scoped_and_unloadable(tmp_path):
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    main_home = tmp_path / "main"
+    coder_home = tmp_path / "coder"
+
+    main_token = set_hermes_home_override(str(main_home))
+    try:
+        adapter._remember_last_resolved_model("", "main-model")
+        assert adapter._last_resolved_model_for("") == "main-model"
+    finally:
+        reset_hermes_home_override(main_token)
+
+    coder_token = set_hermes_home_override(str(coder_home))
+    try:
+        assert adapter._last_resolved_model_for("") is None
+        adapter._remember_last_resolved_model("", "coder-model")
+        assert adapter._last_resolved_model_for("") == "coder-model"
+    finally:
+        reset_hermes_home_override(coder_token)
+
+    adapter._drop_profile_local_model_caches(str(coder_home))
+    assert (str(coder_home.resolve()), None) not in adapter._last_resolved_model
+    assert (str(main_home.resolve()), None) in adapter._last_resolved_model
+
+
+def test_response_format_precheck_uses_profile_scoped_model_override(monkeypatch):
+    import gateway.run as gateway_run
+    from gateway.platforms.api_server import _api_request_profile
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    profile_token = _api_request_profile.set("coder")
+    try:
+        adapter.gateway_runner = types.SimpleNamespace(
+            _session_model_overrides={
+                adapter._session_model_state_key("public-session"): {
+                    "provider": "anthropic",
+                    "api_mode": "anthropic_messages",
+                }
+            }
+        )
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai",
+                "api_mode": "responses",
+                "base_url": "",
+            },
+        )
+        error = adapter._response_format_transport_error(
+            {"response_format": {"type": "json_object"}},
+            gateway_session_key="public-session",
+        )
+    finally:
+        _api_request_profile.reset(profile_token)
+
+    assert error is not None and "Anthropic" in error
 
 
 @pytest.mark.asyncio

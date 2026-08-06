@@ -140,6 +140,41 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     assert evt["origin_session_id"] == "raw-sid-7"
 
 
+def test_zet_background_routes_completion_by_public_session_not_approval_run(
+    monkeypatch,
+):
+    """A /v1/runs approval namespace must never become Zet's delivery key."""
+    from tools.approval import (
+        reset_current_session_key,
+        set_current_session_key,
+    )
+
+    dt = _patch_delegate(monkeypatch)
+    set_session_vars(
+        platform="zet_agent",
+        chat_id="public-app-session",
+        session_key="run_approval_namespace",
+        session_id="public-app-session",
+        async_delivery=True,
+    )
+    approval_token = set_current_session_key("run_approval_namespace")
+    try:
+        out = dt.delegate_task(
+            goal="bg on zet", context="ctx",
+            background=True, parent_agent=_fake_parent(),
+        )
+    finally:
+        reset_current_session_key(approval_token)
+
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched", parsed
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["session_key"] == "public-app-session"
+    assert evt["origin_session_id"] == "public-app-session"
+
+
 # ---------------------------------------------------------------------------
 # _current_origin_session_id — the clobber-proof origin capture helper
 # ---------------------------------------------------------------------------

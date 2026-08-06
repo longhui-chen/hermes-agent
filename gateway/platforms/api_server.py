@@ -1960,11 +1960,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._session_db_init_lock = threading.Lock()
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
-        # server requests; "*" is the process-wide fallback), mirroring
+        # server requests; the base adapter uses "*" as its fallback while
+        # multiplexing subclasses may scope that bucket), mirroring
         # GatewayRunner._last_resolved_model in run.py — recovers from a
         # transient empty model resolution (#35314) instead of building an
         # agent with model="" that 400s every call until manual retry.
-        self._last_resolved_model: "OrderedDict[str, str]" = OrderedDict()
+        self._last_resolved_model: "OrderedDict[Any, str]" = OrderedDict()
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -2577,28 +2578,56 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return routes
 
+    def _last_resolved_model_cache_key(self, session_key: str) -> Any:
+        """Return the adapter-owned cache key for one stable session."""
+        return str(session_key or "")
+
+    def _last_resolved_model_fallback_key(self) -> Any:
+        """Return the adapter-owned fallback bucket for empty resolutions."""
+        return "*"
+
+    def _is_last_resolved_model_fallback_key(self, cache_key: Any) -> bool:
+        return cache_key == "*"
+
+    def _last_resolved_model_for(self, session_key: str) -> Optional[str]:
+        cache = self._last_resolved_model
+        resolved_key = self._last_resolved_model_cache_key(session_key)
+        fallback_key = self._last_resolved_model_fallback_key()
+        return cache.get(resolved_key) or cache.get(fallback_key)
+
     def _remember_last_resolved_model(self, session_key: str, model: str) -> None:
         """Remember a successful model resolution in a bounded LRU.
 
-        ``*`` is the process fallback and does not count against the stable
-        session budget.  Accept plain dicts too because older tests and
-        embedders replace the attribute directly.
+        Adapter-owned fallback buckets do not count against the stable session
+        budget. Accept plain dicts too because older tests and embedders replace
+        the attribute directly.
         """
         if not model:
             return
         cache = self._last_resolved_model
-        if session_key:
-            cache[session_key] = model
+        resolved_key = self._last_resolved_model_cache_key(session_key)
+        fallback_key = self._last_resolved_model_fallback_key()
+        if resolved_key:
+            cache[resolved_key] = model
             move_to_end = getattr(cache, "move_to_end", None)
             if callable(move_to_end):
-                move_to_end(session_key)
-        cache["*"] = model
+                move_to_end(resolved_key)
+        cache[fallback_key] = model
         move_to_end = getattr(cache, "move_to_end", None)
         if callable(move_to_end):
-            move_to_end("*")
+            move_to_end(fallback_key)
         cap = max(1, int(getattr(self, "_last_resolved_model_cap", LAST_RESOLVED_MODEL_CAP)))
-        while len(cache) > cap + 1:
-            oldest = next((key for key in cache if key != "*"), None)
+        while sum(
+            1 for key in cache if not self._is_last_resolved_model_fallback_key(key)
+        ) > cap:
+            oldest = next(
+                (
+                    key
+                    for key in cache
+                    if not self._is_last_resolved_model_fallback_key(key)
+                ),
+                None,
+            )
             if oldest is None:
                 break
             cache.pop(oldest, None)
@@ -3955,8 +3984,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # stateless request, growing unbounded for the life of the process.
         _resolved_key = gateway_session_key or ""
         if not model:
-            _recovered = (self._last_resolved_model.get(_resolved_key)
-                          or self._last_resolved_model.get("*"))
+            _recovered = self._last_resolved_model_for(_resolved_key)
             if _recovered:
                 logger.warning(
                     "Empty model resolved for session=%s — recovering "
@@ -4057,11 +4085,7 @@ class APIServerAdapter(BasePlatformAdapter):
         override_key = gateway_session_key or session_id
         if override_key:
             try:
-                override = getattr(
-                    getattr(self, "gateway_runner", None),
-                    "_session_model_overrides",
-                    {},
-                ).get(override_key)
+                override = self._session_model_override_for(override_key)
             except Exception:
                 override = None
             if override:
@@ -8077,6 +8101,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     set_zettlab_turn_id("")
                     set_zettlab_connector_route_capability("")
 
+        profile_run_key = self._begin_profile_chat_run()
         self._activate_admitted_request()
         from contextvars import copy_context
 
@@ -8086,6 +8111,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await loop.run_in_executor(None, ctx.run, _run)
         finally:
             self._inflight_agent_runs -= 1
+            self._end_profile_chat_run(profile_run_key)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -8341,6 +8367,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        profile_run_key = self._begin_profile_chat_run()
+
+        def _release_profile_run() -> None:
+            nonlocal profile_run_key
+            if profile_run_key:
+                self._end_profile_chat_run(profile_run_key)
+                profile_run_key = ""
 
         async def _run_and_close():
             try:
@@ -8602,9 +8635,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                _release_profile_run()
 
         self._activate_admitted_request()
-        task = asyncio.create_task(_run_and_close())
+        try:
+            task = asyncio.create_task(_run_and_close())
+        except BaseException:
+            _release_profile_run()
+            raise
         self._active_run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
@@ -8612,6 +8650,7 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(lambda _task: _release_profile_run())
 
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}

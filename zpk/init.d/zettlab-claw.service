@@ -5,7 +5,6 @@ After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=-__APP_BASE__/current/runtime-defaults.env
 EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env
 Environment=HERMES_HOME=__APP_BASE__/data/hermes_home
 Environment=HERMES_LAZY_INSTALL_TARGET=__APP_BASE__/data/lazy-packages
@@ -16,6 +15,7 @@ Environment=HERMES_BUNDLED_PLUGINS=__APP_BASE__/current/lib/hermes-agent/plugins
 Environment=HERMES_BUNDLED_LOCALES=__APP_BASE__/current/lib/hermes-agent/locales
 Environment=HERMES_MANAGED_GATEWAY=1
 Environment=HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service
+Environment=HERMES_NEMO_RELAY_CORE_ENABLED=false
 Environment=PATH=/zettos/main/apps/com.zettlab.local-server/current/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=GATEWAY_MULTIPLEX_PROFILES=true
 Environment=ZET_AGENT_ENABLED=true

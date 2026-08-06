@@ -2469,6 +2469,23 @@ class ZetAgentAdapter(APIServerAdapter):
         overrides[state_key] = dict(candidate)
         return dict(candidate)
 
+    def _last_resolved_model_cache_key(self, session_key: str) -> Any:
+        """Keep transient model recovery inside the active profile home."""
+        raw_key = str(session_key or "")
+        if not raw_key:
+            return ""
+        return (self._seen_models_home_key(), raw_key)
+
+    def _last_resolved_model_fallback_key(self) -> Any:
+        return (self._seen_models_home_key(), None)
+
+    def _is_last_resolved_model_fallback_key(self, cache_key: Any) -> bool:
+        return (
+            isinstance(cache_key, tuple)
+            and len(cache_key) == 2
+            and cache_key[1] is None
+        )
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -2729,10 +2746,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
         resolved_key = gateway_session_key or ""
         if not model:
-            recovered = (
-                self._last_resolved_model.get(resolved_key)
-                or self._last_resolved_model.get("*")
-            )
+            recovered = self._last_resolved_model_for(resolved_key)
             if recovered:
                 logger.warning(
                     "Empty model resolved for session=%s — recovering last-known-good model %s",
@@ -3335,7 +3349,11 @@ class ZetAgentAdapter(APIServerAdapter):
         cache = getattr(self, "_last_resolved_model", None)
         if cache is not None:
             for key in list(cache.keys()):
-                if str(key).startswith(prefix):
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 2
+                    and key[0] == home_key
+                ) or str(key).startswith(prefix):
                     cache.pop(key, None)
 
     @staticmethod

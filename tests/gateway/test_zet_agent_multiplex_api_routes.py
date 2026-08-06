@@ -879,6 +879,124 @@ async def test_prefixed_profile_unload_blocks_active_sessions(profile_homes):
 
 
 @pytest.mark.asyncio
+async def test_prefixed_responses_holds_profile_lease_until_agent_finishes(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "responses-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/responses",
+        adapter._profile_handler(adapter._handle_responses),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        response_task = asyncio.create_task(
+            cli.post(
+                "/p/coder/v1/responses",
+                json={"input": "hello"},
+                headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+            )
+        )
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        blocked_data = await blocked.json()
+        assert blocked.status == 409
+        assert blocked_data["active_api_runs"] >= 1
+
+        release.set()
+        response = await response_task
+        assert response.status == 200
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_prefixed_runs_holds_profile_lease_until_background_task_finishes(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "runs-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/runs",
+        adapter._profile_handler(adapter._handle_runs),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        started_response = await cli.post(
+            "/p/coder/v1/runs",
+            json={"input": "hello", "session_id": "public-session"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert started_response.status == 202
+        run_id = (await started_response.json())["run_id"]
+
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        blocked_data = await blocked.json()
+        assert blocked.status == 409
+        assert blocked_data["active_api_runs"] >= 1
+
+        release.set()
+        for _ in range(100):
+            if run_id not in adapter._active_run_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert run_id not in adapter._active_run_tasks
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
 async def test_gateway_profile_unload_blocks_pending_sentinel():
     from gateway.run import _AGENT_PENDING_SENTINEL, GatewayRunner
 

@@ -3265,10 +3265,12 @@ def delegate_task(
 
         _session_key = get_current_session_key(default="")
         _origin_ui_session_id = ""
+        _session_platform = ""
         try:
             from gateway.session_context import get_session_env
 
             _source = get_session_env("HERMES_SESSION_SOURCE", "")
+            _session_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
             _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
             # In desktop/TUI, the routable session key is the durable
             # AIAgent.session_id. Context compression can rotate that id during
@@ -3283,6 +3285,13 @@ def delegate_task(
                     _session_key = _agent_session_id
         except Exception:
             _origin_ui_session_id = ""
+            _session_platform = ""
+        # Zet keeps approvals isolated by API run_id, but completion delivery
+        # is conversation-scoped. Route the detached result with the public
+        # App session id captured before child construction, never the
+        # approval namespace.
+        if _session_platform == "zet_agent" and _origin_wake_sid:
+            _session_key = _origin_wake_sid
         if not _session_key:
             # CLI (single-process) path: the approval contextvar is only bound
             # during gateway/TUI turns and HERMES_SESSION_KEY is not in the CLI
@@ -3372,7 +3381,7 @@ def delegate_task(
             model=creds["model"],
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
-            origin_session_id=_wake_sid,
+            origin_session_id=_origin_wake_sid,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,

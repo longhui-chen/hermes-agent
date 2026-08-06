@@ -6,7 +6,6 @@ HERMES_SRC="$APP_ROOT/lib/hermes-agent"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 HERMES_SCRIPT="$HERMES_SRC/venv/bin/hermes"
 HERMES_LAUNCHER="$APP_ROOT/libexec/hermes-secure-launcher.py"
-RUNTIME_DEFAULTS="$APP_ROOT/runtime-defaults.env"
 
 if [ ! -x "$HERMES_PYTHON" ]; then
     echo "hermes python is not ready: $HERMES_PYTHON" >&2
@@ -27,9 +26,5 @@ export HERMES_HOME="${HERMES_HOME:-$(dirname "$APP_ROOT")/data/hermes_home}"
 export HERMES_BUNDLED_SKILLS="${HERMES_BUNDLED_SKILLS:-$HERMES_SRC/skills}"
 export HERMES_BUNDLED_PLUGINS="${HERMES_BUNDLED_PLUGINS:-$HERMES_SRC/plugins}"
 export HERMES_BUNDLED_LOCALES="${HERMES_BUNDLED_LOCALES:-$HERMES_SRC/locales}"
-if [ -z "${HERMES_NEMO_RELAY_CORE_ENABLED+x}" ]; then
-    set -a
-    . "$RUNTIME_DEFAULTS"
-    set +a
-fi
+export HERMES_NEMO_RELAY_CORE_ENABLED="${HERMES_NEMO_RELAY_CORE_ENABLED:-false}"
 exec "$HERMES_PYTHON" -I "$HERMES_LAUNCHER" "$HERMES_SCRIPT" "$@"
