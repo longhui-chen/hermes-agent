@@ -25,22 +25,6 @@ from tools.browser_camofox import (
 from tools.browser_tool import browser_scroll
 
 
-def _get_serving_tabs(snapshot_payload, url="https://example.com/page"):
-    """Path-aware _get stub: /tabs answers the handback URL guard.
-
-    The guard runs whenever the handback filter is on, so any test that
-    exercises a filtered read needs the listing to resolve — otherwise it fails
-    closed and the test is measuring the wrong thing.
-    """
-    def _side_effect(path, params=None, timeout=None, session=None):
-        if path == "/tabs":
-            tab_id = (session or {}).get("tab_id") or "tab-1"
-            session_key = (session or {}).get("session_key") or "s"
-            return {"tabs": [{"tabId": tab_id, "listItemId": session_key, "url": url}]}
-        return snapshot_payload
-    return _side_effect
-
-
 @pytest.fixture
 def managed_session(monkeypatch):
     monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:8080/api/v1/internal/browser/camofox")
@@ -123,7 +107,7 @@ def test_managed_close_releases_lease_without_destroying_profile(managed_session
     mock_delete.assert_not_called()
 
 
-def test_click_result_url_is_untouched_without_privacy_filter(managed_session):
+def test_click_reports_the_landing_url_verbatim(managed_session):
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", return_value={"url": "https://site.example/page?q=fine"}),
@@ -212,8 +196,6 @@ def test_adopting_existing_tab_rejects_malformed_tab_id():
         "tab_id": None,
         "session_key": "task_opaque",
         "adopt_existing_tab": True,
-        "privacy_filter_after_handback": False,
-        "epoch": None,
     }
     with (
         patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:8080"),
@@ -759,8 +741,7 @@ def test_concurrent_turns_on_one_identity_create_one_tab():
     def _session_for(task_id):
         return {
             "user_id": "profileA", "session_key": "shared-session", "tab_id": None,
-            "adopt_existing_tab": True, "privacy_filter_after_handback": False,
-            "epoch": None, "task_id": task_id, "_lock": threading.Lock(),
+            "adopt_existing_tab": True, "task_id": task_id, "_lock": threading.Lock(),
         }
 
     sessions = {"parent": _session_for("parent"), "sub": _session_for("sub")}
@@ -823,8 +804,7 @@ def test_a_mutation_cannot_land_inside_another_turns_navigation():
     mod._owner_locks.clear()
     mod._owner_lock_refs.clear()
     session = {
-        "user_id": "profileA", "session_key": "shared", "tab_id": "tab-1",
-        "privacy_filter_after_handback": False, "epoch": 1, "_lock": None,
+        "user_id": "profileA", "session_key": "shared", "tab_id": "tab-1", "_lock": None,
     }
     order = []
     navigate_in_flight = threading.Event()
@@ -1159,12 +1139,12 @@ def test_backpressure_never_turns_away_an_existing_session():
     mod._sessions.clear()
 
 
-def test_the_capture_guard_does_not_depend_on_the_filter_state():
-    """The first post-handback capture is the one that turns the filter on.
+def test_the_capture_guard_holds_the_identity_unconditionally():
+    """The capture and the check that judges it must describe one moment.
 
-    Deciding whether to hold the lock by the state before the request therefore
-    leaves exactly that capture unprotected, and a concurrent navigate can move
-    the tab to an allowed page before the readability check looks.
+    A concurrent turn's navigate landing between them would let content taken
+    off a page the Agent may not read pass, because the tab had since moved to
+    one it may. Nothing about the session state may shorten the hold.
     """
     import threading
 
@@ -1172,8 +1152,7 @@ def test_the_capture_guard_does_not_depend_on_the_filter_state():
 
     mod._owner_locks.clear()
     mod._owner_lock_refs.clear()
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
-               "privacy_filter_after_handback": False, "epoch": 2}
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t"}
 
     held = threading.Event()
     other_turn_entered = threading.Event()
@@ -1188,7 +1167,7 @@ def test_the_capture_guard_does_not_depend_on_the_filter_state():
     with mod._capture_guard(session):
         held.set()
         # The other turn must not be able to take the identity while this
-        # capture is judged, even though the filter was off on entry.
+        # capture is being judged.
         assert not other_turn_entered.wait(0.2), "the capture ran without the tab identity held"
     worker.join(2)
     assert other_turn_entered.is_set()
