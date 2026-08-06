@@ -3649,6 +3649,17 @@ async function resolveCodexWorkflowRunRefs({ github, context, core = noopCore() 
     core.setFailed('source workflow id/name/path 不是固定 capture workflow');
     return null;
   }
+  const displayTitle = String(run.display_title || '');
+  if (!/^codex-feishu-capture:(review|check):(0|[1-9][0-9]*):([1-9][0-9]*)$/.test(displayTitle)) {
+    core.warning('legacy capture workflow_run display_title 非 canonical，安全 no-op');
+    return [];
+  }
+  const capture = parseCodexCaptureRunName(displayTitle, core);
+  if (!capture) return null;
+  if ((capture.type === 'review') !== (run.event === 'pull_request_review')) {
+    core.setFailed('canonical capture title type 与 fetched workflow_run event 不一致');
+    return null;
+  }
   const jobsResult = await withGithubRetry({
     core, label: `验证 source workflow run ${runId} capture job`,
     operation: () => github.rest.actions.listJobsForWorkflowRun({
@@ -3659,13 +3670,19 @@ async function resolveCodexWorkflowRunRefs({ github, context, core = noopCore() 
   });
   if (!jobsResult.ok) return null;
   const jobs = jobsResult.value.data && jobsResult.value.data.jobs || [];
-  if (jobs.length === 1 && jobs[0].name === 'capture' && jobs[0].conclusion === 'skipped') return [];
-  if (jobs.length !== 1 || jobs[0].name !== 'capture' || jobs[0].status !== 'completed' || jobs[0].conclusion !== 'success') {
-    core.setFailed('source workflow capture job 数量/name/status/conclusion 非法');
+  if (jobs.length !== 1 || !safePositiveInteger(jobs[0].id) || jobs[0].name !== 'capture' ||
+      jobs[0].status !== 'completed') {
+    core.setFailed('canonical source workflow capture job 数量/id/name/status 非法');
     return null;
   }
-  const capture = parseCodexCaptureRunName(run.display_title, core);
-  if (!capture || (capture.type === 'review') !== (run.event === 'pull_request_review')) return null;
+  if (jobs[0].conclusion === 'skipped') {
+    core.warning('canonical capture job 被官方 source filter 正常跳过，安全 no-op');
+    return [];
+  }
+  if (jobs[0].conclusion !== 'success') {
+    core.setFailed(`canonical source workflow capture job conclusion=${String(jobs[0].conclusion)} 非法`);
+    return null;
+  }
   if (capture.type === 'review') {
     const prData = await resolvePr(github, context, { number: capture.pr }, core);
     if (!prData || prData.state !== 'open' || prData.base !== 'main') return [];
