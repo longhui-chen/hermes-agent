@@ -1667,6 +1667,7 @@ def _admit_api_agent_request(handler):
             "active": True,
             "profile_run_key": profile_run_key,
             "profile_run_transferred": False,
+            "profile_run_released": False,
         }
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
@@ -1676,7 +1677,15 @@ def _admit_api_agent_request(handler):
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
-            if not reservation["profile_run_transferred"]:
+            if (
+                not reservation["profile_run_transferred"]
+                and not reservation["profile_run_released"]
+            ):
+                # Shielded idempotency work inherits this mutable reservation.
+                # Publish the release before ending the lease so a child that
+                # outlives its cancelled HTTP waiter cannot later transfer the
+                # stale key as though it were still active.
+                reservation["profile_run_released"] = True
                 self._end_profile_chat_run(profile_run_key)
             _api_agent_request_reservation.reset(token)
 
@@ -2101,10 +2110,16 @@ class APIServerAdapter(BasePlatformAdapter):
             reservation["active"] = False
             self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
 
-    def _claim_admitted_profile_run(self) -> str:
+    def _claim_admitted_profile_run(
+        self, profile_home: Optional[Any] = None
+    ) -> str:
         """Transfer the request's profile lease to its real agent lifecycle."""
         reservation = _api_agent_request_reservation.get()
-        if reservation and not reservation.get("profile_run_transferred"):
+        if (
+            reservation
+            and not reservation.get("profile_run_transferred")
+            and not reservation.get("profile_run_released")
+        ):
             profile_run_key = str(reservation.get("profile_run_key") or "")
             if profile_run_key:
                 reservation["profile_run_transferred"] = True
@@ -2113,7 +2128,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Direct/internal callers do not pass through the HTTP admission
         # decorator.  Preserve their old behavior while still respecting a
         # multiplex adapter's unload barrier.
-        profile_run_key = self._begin_profile_chat_run()
+        profile_run_key = self._begin_profile_chat_run(profile_home)
         if not profile_run_key:
             raise RuntimeError("profile is unloading")
         return profile_run_key
@@ -5543,7 +5558,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # the run (see _expanded_user_message for the placement contract).
             # The profile active-run count opens FIRST so /v1/profile/unload
             # cannot tear the profile down under an in-flight expansion.
-            profile_run_key = self._begin_profile_chat_run(
+            profile_run_key = self._claim_admitted_profile_run(
                 request.get("hermes_profile_home")
             )
             # 同非流式:展开自持一份计数,worker 真正结束才经 on_settled 释放。
@@ -5605,7 +5620,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # protected compute: an Idempotency-Key hit (or a concurrent
             # duplicate awaiting the first flight) must reuse the cached
             # result without re-running expansion side effects.
-            profile_run_key = self._begin_profile_chat_run(
+            profile_run_key = self._claim_admitted_profile_run(
                 request.get("hermes_profile_home")
             )
             # Expansion holds its OWN active-run count, released via
@@ -8490,8 +8505,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     finally:
                         clear_session_vars(create_tokens)
                 self._active_run_agents[run_id] = agent
+                run_cancelled = threading.Event()
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                    if run_cancelled.is_set():
+                        # Cancellation can win before the executor thread
+                        # registers this callback.  If the worker later enters
+                        # an approval gate with the now-stale callback, release
+                        # the freshly enqueued Event instead of stranding the
+                        # completion barrier forever.
+                        from tools.approval import unregister_gateway_notify
+
+                        unregister_gateway_notify(approval_session_key)
+                        return
                     event = dict(approval_data or {})
                     # Redact credentials from the command before it enters the
                     # SSE/API event stream — same egress bug as #48456, second
@@ -8552,6 +8578,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            if run_cancelled.is_set():
+                                # Close the cancel-before-register window.  A
+                                # later approval observes no live notifier and
+                                # the agent has already received its interrupt;
+                                # a callback captured concurrently is guarded
+                                # by _approval_notify above.
+                                request_hard_interrupt(
+                                    agent, "Run task cancelled before approval registration"
+                                )
+                                unregister_gateway_notify(approval_session_key)
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
                             # ownership so stop/cancel can reap only the
@@ -8596,6 +8632,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     # and profile unload can deadlock each other.
                     from tools.approval import unregister_gateway_notify
 
+                    run_cancelled.set()
+                    request_hard_interrupt(agent, "Run task cancelled")
                     unregister_gateway_notify(approval_session_key)
 
                 result, usage = await _run_in_executor_with_completion_barrier(

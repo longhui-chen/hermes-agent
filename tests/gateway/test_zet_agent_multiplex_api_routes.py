@@ -1071,10 +1071,16 @@ async def test_cancelled_runs_worker_keeps_profile_lease_until_thread_exits(
     adapter = _make_adapter()
     monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
     unregistered_approvals = []
+    original_unregister = approval.unregister_gateway_notify
+
+    def _spy_unregister(session_key):
+        unregistered_approvals.append(session_key)
+        original_unregister(session_key)
+
     monkeypatch.setattr(
         approval,
         "unregister_gateway_notify",
-        lambda session_key: unregistered_approvals.append(session_key),
+        _spy_unregister,
     )
     app = web.Application()
     _add_prefixed_zet_agent_routes(app, adapter)
@@ -1108,6 +1114,85 @@ async def test_cancelled_runs_worker_keeps_profile_lease_until_thread_exits(
         assert (await blocked.json())["active_api_runs"] == 1
 
         release.set()
+        for _ in range(100):
+            if run_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert run_task.done()
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runs_releases_approval_registered_after_cancel(
+    profile_homes,
+    monkeypatch,
+):
+    register_entered = threading.Event()
+    allow_register = threading.Event()
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    unregister_calls = []
+    original_register = approval.register_gateway_notify
+    original_unregister = approval.unregister_gateway_notify
+
+    def _delayed_register(session_key, callback):
+        register_entered.set()
+        assert allow_register.wait(timeout=5)
+        original_register(session_key, callback)
+
+    def _spy_unregister(session_key):
+        unregister_calls.append(session_key)
+        original_unregister(session_key)
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "late-register-agent"
+
+        def run_conversation(self, **_kwargs):
+            worker_entered.set()
+            assert release_worker.wait(timeout=5)
+            return {"final_response": "cancelled", "completed": True}
+
+    monkeypatch.setattr(approval, "register_gateway_notify", _delayed_register)
+    monkeypatch.setattr(approval, "unregister_gateway_notify", _spy_unregister)
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/runs",
+        adapter._profile_handler(adapter._handle_runs),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        started_response = await cli.post(
+            "/p/coder/v1/runs",
+            json={"input": "hello", "session_id": "late-register-session"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        run_id = (await started_response.json())["run_id"]
+        assert await asyncio.to_thread(register_entered.wait, 2)
+
+        run_task = adapter._active_run_tasks[run_id]
+        run_task.cancel()
+        await asyncio.sleep(0)
+        assert unregister_calls == [run_id]
+        assert not run_task.done()
+
+        allow_register.set()
+        assert await asyncio.to_thread(worker_entered.wait, 2)
+        for _ in range(100):
+            if len(unregister_calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert unregister_calls[:2] == [run_id, run_id]
+        assert approval.list_gateway_approvals(run_id) == []
+        assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+        release_worker.set()
         for _ in range(100):
             if run_task.done():
                 break
@@ -1168,6 +1253,81 @@ async def test_profile_unload_barrier_rejects_new_agent_request_during_teardown(
         release_unload.set()
         unloaded = await unload_task
         assert unloaded.status == 200
+
+
+@pytest.mark.asyncio
+async def test_cancelled_idempotent_waiter_cannot_transfer_released_profile_lease(
+    profile_homes,
+    monkeypatch,
+):
+    import gateway.platforms.api_server as api_server
+
+    child_waiting = asyncio.Event()
+    allow_claim = asyncio.Event()
+    child_tasks = []
+
+    async def _shielded_delayed_compute(_key, _fingerprint, compute_coro):
+        async def _delayed_compute():
+            child_waiting.set()
+            await allow_claim.wait()
+            return await compute_coro()
+
+        child_task = asyncio.create_task(_delayed_compute())
+        child_tasks.append(child_task)
+        return await asyncio.shield(child_task)
+
+    class _Request(dict):
+        def __init__(self):
+            super().__init__()
+            self.headers = {
+                "Authorization": f"Bearer {TEST_API_KEY}",
+                "Idempotency-Key": "cancel-before-claim",
+            }
+            self.match_info = {"profile": "coder"}
+            self.method = "POST"
+            self.path_qs = "/p/coder/v1/responses"
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+        async def json(self):
+            return {"input": "must not outlive released lease"}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_create_agent",
+        lambda **_kwargs: pytest.fail("stale idempotency task constructed an agent"),
+    )
+    monkeypatch.setattr(
+        api_server._idem_cache,
+        "get_or_set",
+        _shielded_delayed_compute,
+    )
+    handler = adapter._profile_handler(adapter._handle_responses)
+    request_task = asyncio.create_task(handler(_Request()))
+    await asyncio.wait_for(child_waiting.wait(), timeout=2)
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+    active_imports, active_api_runs, barrier_owner = (
+        adapter._block_runtime_import_profile(profile_homes["coder"])
+    )
+    assert (active_imports, active_api_runs) == (0, 0)
+    assert barrier_owner is not None
+
+    allow_claim.set()
+    try:
+        with pytest.raises(RuntimeError, match="profile is unloading"):
+            await child_tasks[0]
+    finally:
+        adapter._unblock_runtime_import_profile(
+            profile_homes["coder"], barrier_owner
+        )
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
 
 
 @pytest.mark.asyncio
