@@ -277,6 +277,79 @@ def test_zettlab_tts_auto_selects_local_gateway_and_product_model(monkeypatch, t
     assert captured["speech_kwargs"]["speed"] == 2.0
 
 
+def test_zettlab_tts_explicit_direct_openai_opt_out_wins(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured)
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    output_path = tmp_path / "speech.mp3"
+    tts_tool._generate_openai_tts(
+        "hello world",
+        str(output_path),
+        {
+            "provider": "openai",
+            "use_gateway": False,
+            "openai": {"model": "tts-1-hd", "voice": "nova", "speed": 1.25},
+        },
+    )
+
+    assert captured["api_key"] == "direct-openai-key"
+    assert captured["base_url"] == "https://api.openai.com/v1"
+    assert captured["speech_kwargs"]["model"] == "tts-1-hd"
+    assert captured["speech_kwargs"]["voice"] == "nova"
+    assert captured["speech_kwargs"]["speed"] == 1.25
+
+
+def test_zettlab_tts_direct_keys_are_isolated_by_profile(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured)
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-process-key")
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    from agent import secret_scope
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        profile_a = secret_scope.set_secret_scope(
+            {"VOICE_TOOLS_OPENAI_KEY": "profile-a-key"}
+        )
+        try:
+            tts_tool._generate_openai_tts(
+                "profile a",
+                str(tmp_path / "profile-a.mp3"),
+                {"provider": "openai", "use_gateway": False},
+            )
+            profile_a_key = captured["api_key"]
+        finally:
+            secret_scope.reset_secret_scope(profile_a)
+
+        profile_b = secret_scope.set_secret_scope(
+            {"OPENAI_API_KEY": "profile-b-key"}
+        )
+        try:
+            tts_tool._generate_openai_tts(
+                "profile b",
+                str(tmp_path / "profile-b.mp3"),
+                {"provider": "openai", "use_gateway": False},
+            )
+            profile_b_key = captured["api_key"]
+        finally:
+            secret_scope.reset_secret_scope(profile_b)
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert profile_a_key == "profile-a-key"
+    assert profile_b_key == "profile-b-key"
+
+
 def test_zettlab_tts_requirements_accept_gateway_without_direct_key(monkeypatch):
     _install_fake_tools_package()
     _install_fake_openai_module({})
@@ -297,6 +370,27 @@ def test_zettlab_tts_requirements_accept_gateway_without_direct_key(monkeypatch)
     )
 
     assert tts_tool.check_tts_requirements() is True
+
+
+def test_zettlab_tts_direct_opt_out_requires_direct_key(monkeypatch):
+    _install_fake_tools_package()
+    _install_fake_openai_module({})
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    monkeypatch.setattr(
+        tts_tool,
+        "_load_tts_config",
+        lambda: {"provider": "openai", "use_gateway": False},
+    )
+
+    assert tts_tool.check_tts_requirements() is False
 
 
 def test_zettlab_tts_visibility_is_rechecked_across_multiplex_profiles(monkeypatch):

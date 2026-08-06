@@ -75,9 +75,19 @@ from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
-    resolve_openai_audio_api_key,
 )
 from tools.xai_http import hermes_xai_user_agent
+
+
+def _resolve_profile_openai_audio_api_key() -> str:
+    """Resolve OpenAI audio credentials from the active profile scope."""
+    from agent.secret_scope import get_secret
+
+    return (
+        get_secret("VOICE_TOOLS_OPENAI_KEY", "")
+        or get_secret("OPENAI_API_KEY", "")
+        or ""
+    ).strip()
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- providers are imported only when actually used to avoid
@@ -330,6 +340,13 @@ def _resolve_max_text_length(
 # ===========================================================================
 # Config loader -- reads tts: section from ~/.hermes/config.yaml
 # ===========================================================================
+def _gateway_is_explicitly_disabled(tts_config: Dict[str, Any]) -> bool:
+    value = tts_config.get("use_gateway")
+    return value is False or (
+        isinstance(value, str) and value.strip().lower() == "false"
+    )
+
+
 def _load_tts_config() -> Dict[str, Any]:
     """
     Load TTS configuration from ~/.hermes/config.yaml.
@@ -360,14 +377,7 @@ def _load_tts_config() -> Dict[str, Any]:
         # use_gateway is a normal mergeable setting, so consult the effective
         # value after managed scope has overridden the user layer. Unlike the
         # provider default, it has no DEFAULT_CONFIG value to disambiguate.
-        effective_use_gateway = tts_config.get("use_gateway")
-        gateway_opted_out = (
-            effective_use_gateway is False
-            or (
-                isinstance(effective_use_gateway, str)
-                and effective_use_gateway.strip().lower() == "false"
-            )
-        )
+        gateway_opted_out = _gateway_is_explicitly_disabled(tts_config)
         provider_is_explicit = any(
             isinstance(value, str) and value.strip()
             for value in (raw_provider, managed_provider)
@@ -1120,14 +1130,16 @@ def _generate_openai_tts(
     explicit_base_url = base_url is not None
     if api_key is None:
         if config_base_url:
-            api_key = resolve_openai_audio_api_key()
+            api_key = _resolve_profile_openai_audio_api_key()
             if not api_key:
                 raise ValueError(
                     "tts.openai.base_url requires VOICE_TOOLS_OPENAI_KEY or "
                     "OPENAI_API_KEY"
                 )
         else:
-            api_key, fallback_base, managed_model = _resolve_openai_audio_client_config()
+            api_key, fallback_base, managed_model = _resolve_openai_audio_client_config(
+                tts_config
+            )
 
     if model is None:
         model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
@@ -2751,15 +2763,24 @@ def check_tts_requirements() -> bool:
 check_tts_requirements._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 
-def _resolve_openai_audio_client_config() -> tuple[str, str, Optional[str]]:
+def _resolve_openai_audio_client_config(
+    tts_config: Dict[str, Any],
+) -> tuple[str, str, Optional[str]]:
     """Return ``(api_key, base_url, managed_model)`` for OpenAI audio.
 
-    The Zettlab board-local gateway takes precedence over direct credentials:
+    The Zettlab board-local gateway takes precedence over direct credentials
+    unless the effective config explicitly sets ``tts.use_gateway: false``:
     local-server consumes its action token, replaces it with IoT auth, and the
     cloud gateway owns regional provider selection plus billing. Outside a
     Zettlab session, direct OpenAI keeps its historical precedence unless
     ``tts.use_gateway`` selects the Nous managed path.
     """
+    direct_api_key = _resolve_profile_openai_audio_api_key()
+    if _gateway_is_explicitly_disabled(tts_config):
+        if direct_api_key:
+            return direct_api_key, DEFAULT_OPENAI_BASE_URL, None
+        raise ValueError("Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set")
+
     zettlab_gateway = resolve_zettlab_tool_gateway("openai-tts")
     if zettlab_gateway is not None:
         return (
@@ -2768,7 +2789,6 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, Optional[str]]:
             ZETTLAB_OPENAI_TTS_MODEL,
         )
 
-    direct_api_key = resolve_openai_audio_api_key()
     if direct_api_key and not prefers_gateway("tts"):
         return direct_api_key, DEFAULT_OPENAI_BASE_URL, None
 
@@ -2799,10 +2819,13 @@ def _has_openai_audio_backend(tts_config: Optional[Dict[str, Any]] = None) -> bo
         else None
     ) or {}
     if oai_config.get("base_url"):
-        return bool(resolve_openai_audio_api_key())
+        return bool(_resolve_profile_openai_audio_api_key())
+    direct_api_key = _resolve_profile_openai_audio_api_key()
+    if isinstance(tts_config, dict) and _gateway_is_explicitly_disabled(tts_config):
+        return bool(direct_api_key)
     return bool(
         resolve_zettlab_tool_gateway("openai-tts")
-        or resolve_openai_audio_api_key()
+        or direct_api_key
         or resolve_managed_tool_gateway("openai-audio")
     )
 
@@ -3071,7 +3094,7 @@ if __name__ == "__main__":
     print(f"  OpenAI:     {'installed' if _check(_import_openai_client, 'oai') else 'not installed'}")
     print(
         "    API Key:  "
-        f"{'set' if resolve_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
+        f"{'set' if _resolve_profile_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
     )
     print(f"  MiniMax:    {'API key set' if get_env_value('MINIMAX_API_KEY') else 'not set (MINIMAX_API_KEY)'}")
     print(f"  Piper:      {'installed' if _check_piper_available() else 'not installed (pip install piper-tts)'}")
