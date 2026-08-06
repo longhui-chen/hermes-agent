@@ -7,7 +7,6 @@ guards, and the bounded degradation an older local-server's 409 falls into
 during a firmware upgrade window.
 """
 
-import contextlib
 import json
 import time
 from unittest.mock import MagicMock, patch
@@ -18,14 +17,12 @@ import requests
 from tools.browser_camofox import (
     _adopt_existing_tab,
     _run_pending_teardowns,
-    camofox_back,
     camofox_click,
     camofox_close,
     camofox_navigate,
     camofox_snapshot,
-    camofox_vision,
 )
-from tools.browser_tool import _camofox_eval, browser_scroll
+from tools.browser_tool import browser_scroll
 
 
 def _get_serving_tabs(snapshot_payload, url="https://example.com/page"):
@@ -1643,3 +1640,154 @@ def test_a_queued_delete_is_dropped_when_the_tab_is_adopted_again():
         mod._pending_lease_releases.clear()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Shared browser model
+#
+# The control protocol is gone: a human may drive the same tab at any time and
+# hermes neither declares nor adopts an epoch. These pin the two things that
+# would silently reintroduce it — a header on the wire, or a read path that
+# withholds or rewrites what the tab actually shows — plus the one bounded
+# degradation left, an older local-server's 409 during a firmware upgrade.
+# ---------------------------------------------------------------------------
+
+
+def test_no_epoch_header_is_ever_sent():
+    """The epoch is not a value this side has, declares or forwards.
+
+    A new local-server ignores the header, but an *older* one fences on it:
+    resending a remembered value would refuse the Agent's own calls, and
+    forwarding an upstream-supplied one would let a caller pick the fence.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t"}
+    seen = []
+
+    def _record(url, **kwargs):
+        seen.append(kwargs.get("headers") or {})
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"ok": True}
+        response.headers = {"X-Zettlab-Browser-Epoch": "9"}
+        return response
+
+    with (
+        patch("tools.browser_camofox.requests.post", side_effect=_record),
+        patch("tools.browser_camofox.requests.get", side_effect=_record),
+    ):
+        mod._post("/tabs/tab-1/navigate", {"userId": "u"}, session=session)
+        # A response carrying an epoch must not teach this side to send one.
+        mod._get("/tabs/tab-1/snapshot", params={"userId": "u"}, session=session)
+
+    assert seen, "no request was made"
+    for headers in seen:
+        assert not any(k.lower() == "x-zettlab-browser-epoch" for k in headers), headers
+
+
+def test_an_older_local_servers_control_409_degrades_to_a_plain_retry():
+    """Mixed firmware: old local-server, new hermes.
+
+    The old proxy still fences on the epoch and answers 409 with a control
+    code. Nothing is recovered — the browser is shared, so "the page changed"
+    is ordinary — but the Agent must get a known, retryable, readable shape
+    rather than an unrecognised error.
+    """
+    import tools.browser_camofox as mod
+
+    response = MagicMock(status_code=409)
+    response.json.return_value = {
+        "error": "browser_epoch_stale",
+        "message": "page state changed after human control; snapshot the tab before continuing",
+        "epoch": 7,
+    }
+    stale = requests.HTTPError(response=response)
+
+    with patch("tools.browser_camofox._get") as read:
+        result = json.loads(mod._retryable_control_result(stale))
+
+    assert result["success"] is False
+    assert result["retryable"] is True
+    assert result["error"] == "browser_epoch_stale"
+    assert "snapshot" in result["message"].lower()
+    # No recovery snapshot, and the proxy's epoch is not adopted anywhere.
+    assert not read.called, "the deleted recovery handshake came back"
+    assert "epoch" not in result
+
+
+def test_an_ordinary_conflict_is_not_dressed_up_as_a_control_error():
+    """Only the known control codes map; everything else keeps its own shape."""
+    import tools.browser_camofox as mod
+
+    response = MagicMock(status_code=409)
+    response.json.return_value = {"error": "browser_tab_not_registered"}
+    assert mod._retryable_control_result(requests.HTTPError(response=response)) is None
+
+    response = MagicMock(status_code=500)
+    response.json.return_value = {"error": "browser_epoch_stale"}
+    assert mod._retryable_control_result(requests.HTTPError(response=response)) is None
+
+
+def test_a_snapshot_of_a_page_a_human_used_is_not_rewritten(managed_session):
+    """Shared means shared: what the tab shows is what the Agent reads.
+
+    The deleted filter blanked form controls and reduced URLs to their origin
+    whenever it believed a human had just been there. With no control protocol
+    there is no such moment to detect, and a filter that cannot be turned off
+    correctly is worse than none — it silently starves the Agent.
+    """
+    snapshot = (
+        'textbox "Search": quarterly results\n'
+        '- link "Report" [e1]\n'
+        '  /url: https://example.com/report?share=abc123'
+    )
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._get", return_value={"snapshot": snapshot, "refsCount": 1}),
+    ):
+        result = json.loads(camofox_snapshot(task_id="agent-task"))
+
+    assert result["success"] is True
+    assert result["snapshot"] == snapshot
+    assert "REDACTED" not in result["snapshot"]
+
+
+def test_navigate_reports_the_landing_url_and_title_verbatim(managed_session):
+    """The landing URL is addressing, not content, and is never blanked."""
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=managed_session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={
+            "url": "https://idp.example/callback?state=xyz", "title": "Signed in",
+        }),
+        patch("tools.browser_camofox._get", return_value={"snapshot": "- text \"ok\"", "refsCount": 0}),
+    ):
+        result = json.loads(camofox_navigate("https://idp.example/start", task_id="agent-task"))
+
+    assert result["success"] is True
+    assert result["url"] == "https://idp.example/callback?state=xyz"
+    assert result["title"] == "Signed in"
+    assert "snapshot_withheld" not in result
+
+
+def test_navigate_still_refuses_a_landing_the_floor_blocks(managed_session):
+    """Removing the control protocol must not remove the page-content floor.
+
+    Cloud metadata and blocklisted sites are refused on the URL the tab landed
+    on, whoever put it there — that guard is independent of the deleted filter.
+    """
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=managed_session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={
+            "url": "http://169.254.169.254/latest/meta-data/", "title": "metadata",
+        }),
+        patch("tools.browser_camofox._get", return_value={
+            "snapshot": "- text \"iam credentials\"", "refsCount": 1,
+        }),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
+    assert result["success"] is False
+    assert "iam credentials" not in json.dumps(result)
