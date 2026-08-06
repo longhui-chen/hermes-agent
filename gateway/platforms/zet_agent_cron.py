@@ -450,6 +450,26 @@ def _same_db_key(db_path: Path) -> str:
         return str(db_path)
 
 
+def _job_store_agent_id() -> str:
+    """执行中 job 所属 profile：当前 cron store 是 ``<root>/profiles/<X>/cron/jobs.json`` 时返回 X。
+
+    这是服务端事实（store 路径来自 ContextVar override / 模块常量 / active home，
+    不来自 job 内容），不依赖 profile secret scope 是否绑上；root/legacy store 返回空串。
+    """
+    try:
+        from cron.jobs import _current_cron_store
+        jobs_file = Path(_current_cron_store().jobs_file).resolve()
+    except Exception as _e:
+        _dbg(f"_job_store_agent_id: store resolution FAILED: {_e!r}")
+        return ""
+    parts = jobs_file.parts
+    if len(parts) >= 4 and parts[-4] == "profiles" and parts[-2] == "cron" and parts[-1] == "jobs.json":
+        candidate = parts[-3]
+        if _PROFILE_ID_RE.match(candidate):
+            return candidate
+    return ""
+
+
 def _resolve_persist_db_path(session_id: str) -> Tuple[Path, Optional[str]]:
     """``(持有 session_id 的 state.db, 未决原因)``；见 zettlab-local-server/docs/cron-run-history.md §3.3。
 
@@ -460,7 +480,8 @@ def _resolve_persist_db_path(session_id: str) -> Tuple[Path, Optional[str]]:
     from hermes_constants import get_hermes_home
     current = Path(get_hermes_home()) / "state.db"
     origin_agent_id = _agent_id_from(session_id)
-    exec_agent_id = _scoped_env("ZET_AGENT_ID").strip()
+    # job 所属 profile 优先于 .env 身份：前者是服务端事实，后者在 scope 未绑时读的是根 .env
+    exec_agent_id = _job_store_agent_id() or _scoped_env("ZET_AGENT_ID").strip()
     if origin_agent_id and exec_agent_id and origin_agent_id != exec_agent_id:
         # session_id 来自调用方可控的 job.origin —— 跨 agent 的库一律不落
         return current, (

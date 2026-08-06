@@ -728,7 +728,11 @@ def test_persist_creates_missing_session_in_profile_db(tmp_path, monkeypatch):
 
 def test_persist_follows_session_agent_id_not_process_home(tmp_path, monkeypatch):
     """multiplex 下 override 绑到了「别的 profile」时，摘要仍按会话自带的 agentID
-    落库 —— 绝不允许跨 profile 写。"""
+    落库 —— 绝不允许跟着错的 home 跨 profile 写。
+
+    job 必须来自它自己 profile 的 cron store：那是执行身份的服务端来源。
+    job 住在 B 的 store 却把 origin 指向 A 是攻击形状，由
+    test_cross_agent_origin_refused_by_job_store_profile_when_env_unbound 钉住拒绝。"""
     import cron.jobs as cron_jobs
     import gateway.platforms.zet_agent_cron as zc
     from hermes_state import SessionDB
@@ -740,8 +744,8 @@ def test_persist_follows_session_agent_id_not_process_home(tmp_path, monkeypatch
     other_prof = root / "profiles" / OTHER
     prof.mkdir(parents=True)
     other_prof.mkdir(parents=True)
-    # 进程 home 绑在 OTHER 的 profile 上（错的那个 profile）
-    _mux_env(monkeypatch, other_prof, other_prof, root / "state.db")
+    # 进程 home 绑在 OTHER 的 profile 上（错的那个）；job 仍在自己 profile 的 store 里
+    _mux_env(monkeypatch, other_prof, prof, root / "state.db")
 
     SID = f"zettlab:userA:{AID}:orig001"
     JID = "jobCross"
@@ -2407,3 +2411,100 @@ def test_missing_exec_agent_identity_keeps_session_routing(tmp_path, monkeypatch
     db.close()
 
     assert zc._resolve_persist_db_path(SID) == ((prof / "state.db").resolve(), None)
+
+
+def test_cross_agent_origin_refused_by_job_store_profile_when_env_unbound(tmp_path, monkeypatch):
+    """核心用例：ZET_AGENT_ID 拿不到（scope 未绑，读的是根 .env）时，执行身份必须
+    从「job 所属 profile 的 cron store 路径」盖章 —— 该 store 是服务端事实，调用方
+    改不了。跨 agent origin 仍要拦住：不落对方 profile 库，也不落 root 共享库。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    EXEC = "agent0a"
+    VICTIM = "agent0b"
+    exec_prof = root / "profiles" / EXEC
+    victim_prof = root / "profiles" / VICTIM
+    exec_prof.mkdir(parents=True)
+    victim_prof.mkdir(parents=True)
+    # 进程 home 退化到根 home，且 ZET_AGENT_ID 未设 —— 上一轮 fail-open 的触发态；
+    # 但 job 是从 EXEC 的 profile cron store 读出来的（jobs_home=exec_prof）。
+    _mux_env(monkeypatch, root, exec_prof, root / "state.db")
+
+    SID = f"zettlab:userA:{VICTIM}:orig001"
+    victim_db = SessionDB(db_path=victim_prof / "state.db")
+    victim_db.create_session(SID, source="zet_agent", user_id="userA")
+    victim_db.close()
+
+    assert zc._job_store_agent_id() == EXEC
+
+    db_path, unresolved = zc._resolve_persist_db_path(SID)
+    assert unresolved, "scope 未绑时也必须按 job store profile 拦住跨 agent origin"
+    assert VICTIM in unresolved and EXEC in unresolved
+    assert db_path != (victim_prof / "state.db").resolve()
+
+    JID = "jobStoreCrossTenant"
+    job = _mux_cron_job(JID, SID)
+    cron_jobs.save_jobs([job])
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n越权写入\n"
+    try:
+        err = zc._try_persist_to_session(JID, True, None, None, job)
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+    assert err, "跨 agent persist 必须以投递失败上抛，不许静默落库"
+    assert _cron_summary_rows(victim_prof / "state.db", SID) == 0
+    assert _cron_summary_rows(root / "state.db", SID) == 0
+    assert cron_jobs.get_job(JID)["origin"]["chat_id"] == SID
+
+
+def test_job_store_profile_matching_origin_resolves_normally(tmp_path, monkeypatch):
+    """合法流量：origin 的 agentID == job 所属 profile（App 提交的形状），即使
+    ZET_AGENT_ID 为空也照常解析到该 profile 的库。"""
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, prof, root / "state.db")  # 已 delenv ZET_AGENT_ID
+
+    SID = f"zettlab:userA:{AID}:orig001"
+    db = SessionDB(db_path=prof / "state.db")
+    db.create_session(SID, source="zet_agent", user_id="userA")
+    db.close()
+
+    assert zc._job_store_agent_id() == AID
+    assert zc._resolve_persist_db_path(SID) == ((prof / "state.db").resolve(), None)
+
+
+def test_job_store_profile_wins_over_stale_env_identity(tmp_path, monkeypatch):
+    """store 身份和 .env 身份冲突时 store 赢：根 .env 里残留的 legacy ZET_AGENT_ID
+    不能把该 profile 自己的合法 job 挡死。"""
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, prof, root / "state.db")
+    monkeypatch.setenv("ZET_AGENT_ID", "legacy-main")
+
+    SID = f"zettlab:userA:{AID}:orig001"
+    db = SessionDB(db_path=prof / "state.db")
+    db.create_session(SID, source="zet_agent", user_id="userA")
+    db.close()
+
+    assert zc._resolve_persist_db_path(SID) == ((prof / "state.db").resolve(), None)
+
+
+def test_job_store_agent_id_only_matches_profile_store_shape(tmp_path, monkeypatch):
+    """root/legacy store（无 profiles/<X>/ 段）不产生身份；此时回退 .env 身份。"""
+    import gateway.platforms.zet_agent_cron as zc
+
+    root = tmp_path / "hermes_home"
+    (root / "profiles").mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+    assert zc._job_store_agent_id() == ""
