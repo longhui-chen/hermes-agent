@@ -870,8 +870,11 @@ def _run_forced_evaluation(
             "content": (
                 _DETECTOR_INSTRUCTIONS
                 + "\n\nReturn only one compact JSON object with exactly these keys: "
-                "decision, suggested_name, reason, evidence_turn_ids, confidence, "
-                "dedup_key, proposal_text. Do not use Markdown fences."
+                "decision, suggested_name, reason, target, evidence_turn_ids, "
+                "confidence, dedup_key, proposal_text. For channel/connector "
+                "decisions target is MANDATORY: copy the exact kind/provider id "
+                "verbatim from the recommendable list in [connection-inventory]; "
+                "use an empty string for other decisions. Do not use Markdown fences."
             ),
         },
         {"role": "user", "content": evidence},
