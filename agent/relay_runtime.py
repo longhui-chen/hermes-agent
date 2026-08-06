@@ -8,6 +8,7 @@ import contextvars
 import importlib
 import inspect
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -424,6 +425,13 @@ class RelayHostRegistry:
         with self._lock:
             host = self._hosts.get(key)
             if host is not None or not create:
+                return host
+            if not _core_relay_enabled():
+                host = NoopRelayRuntime(
+                    profile_key=key,
+                    reason="NeMo Relay core runtime is disabled by environment",
+                )
+                self._hosts[key] = host
                 return host
             try:
                 host = RelayRuntime(profile_key=key)
@@ -989,6 +997,14 @@ def current_profile_key() -> str:
 def _load_nemo_relay() -> Any:
     """Load the binding only when a producer or consumer needs Relay."""
     return importlib.import_module("nemo_relay")
+
+
+def _core_relay_enabled() -> bool:
+    """Keep upstream Relay behavior unless an embedding explicitly opts out."""
+    raw = os.environ.get("HERMES_NEMO_RELAY_CORE_ENABLED")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _session_id(event: dict[str, Any]) -> str:
