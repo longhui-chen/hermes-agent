@@ -2372,6 +2372,30 @@ def collect_memory_citations(agent, raw) -> None:
         pass
 
 
+def collect_prefetch_citations(agent, parts) -> None:
+    """memory.citations 预取路径采集（需求 3 边界补全，真机反馈：预取注入的
+    记忆回答不显示引用角标是反直觉的）。prefetch 注入的每个 provider 分块登
+    记为一条引用（provider 粒度，id 取内容摘要哈希保证同轮幂等），与
+    search_memory 工具命中共用同一容器与 turn 收尾发射通道。静默失败。"""
+    try:
+        import hashlib
+        items = []
+        for name, text in parts or []:
+            trimmed = str(text or "").strip()
+            if not trimmed:
+                continue
+            digest = hashlib.sha1(trimmed.encode("utf-8", "ignore")).hexdigest()[:12]
+            items.append({
+                "id": f"prefetch-{name}-{digest}",
+                "source": str(name or "memory"),
+                "excerpt": trimmed[:240],
+            })
+        if items:
+            collect_memory_citations(agent, json.dumps({"items": items}, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,

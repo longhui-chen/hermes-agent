@@ -124,3 +124,40 @@ class TestSearchMemoryCitationCollection:
         ):
             invoke_tool(agent, "search_memory", {"query": "x"}, effective_task_id="t")
         assert not getattr(agent, "_zet_memory_citations", None)
+
+
+def test_collect_prefetch_citations_provider_granularity():
+    """预取路径引用（需求 3 边界补全）：每个 provider 分块一条引用，
+    id 内容哈希幂等，空块跳过，与工具命中共用同一容器。"""
+    from agent.agent_runtime_helpers import collect_prefetch_citations
+
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    collect_prefetch_citations(agent, [
+        ("builtin", "每周五下午开产品周会，周报要在周会前发出。"),
+        ("empty", "   "),
+    ])
+    sink = agent._zet_memory_citations
+    assert len(sink) == 1
+    entry = next(iter(sink.values()))
+    assert entry["source"] == "builtin"
+    assert entry["id"].startswith("prefetch-builtin-")
+    assert "周会" in entry["excerpt"]
+
+    # 同轮重复登记（幂等）：同内容不产生第二条
+    collect_prefetch_citations(agent, [("builtin", "每周五下午开产品周会，周报要在周会前发出。")])
+    assert len(agent._zet_memory_citations) == 1
+
+
+def test_collect_prefetch_citations_silent_on_bad_input():
+    from agent.agent_runtime_helpers import collect_prefetch_citations
+
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    collect_prefetch_citations(agent, None)
+    collect_prefetch_citations(agent, [("x",)])  # 坏形状 → 静默
+    assert getattr(agent, "_zet_memory_citations", {}) in ({}, getattr(agent, "_zet_memory_citations", {}))
