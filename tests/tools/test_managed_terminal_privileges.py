@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import stat
@@ -18,16 +19,11 @@ from tools.environments.local import LocalEnvironment
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
-def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
+def test_managed_terminal_inherits_service_identity_inside_profile_cgroup(
+    monkeypatch,
+):
     captured = {}
-    info = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    monkeypatch.setattr(local_module.os, "lstat", lambda _path: info)
-    monkeypatch.setattr(
-        local_module,
-        "_managed_terminal_identity",
-        lambda _env=None: (65534, 65534),
-    )
     monkeypatch.setattr(local_module, "_find_bash", lambda: "/bin/bash")
     monkeypatch.setattr(local_module, "_make_run_env", lambda _env: {})
     monkeypatch.setattr(
@@ -45,18 +41,6 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
     monkeypatch.setattr(
         local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
     )
-    monkeypatch.setattr(
-        local_module, "_trusted_managed_unshare", lambda: "/usr/bin/unshare"
-    )
-    monkeypatch.setattr(
-        local_module,
-        "_managed_terminal_home_paths",
-        lambda _env=None: (
-            Path("/run/zettlab-claw/terminal-homes/65534"),
-            Path("/run/zettlab-claw/terminal-homes/65534/tmp"),
-            Path("/run/zettlab-claw/terminal-homes/65534/var-tmp"),
-        ),
-    )
 
     class Process:
         pid = 42
@@ -72,54 +56,25 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
     environment.cwd = "/tmp"
     environment._run_bash("id")
 
-    assert captured["argv"][:5] == [
+    assert captured["argv"] == [
         "/usr/bin/python3",
         "-I",
         "-c",
         local_module._MANAGED_TERMINAL_CGROUP_ENTER,
         "/sys/fs/cgroup/unit/terminal-profile-65534",
-    ]
-    assert captured["argv"][5:14] == [
-        "/usr/bin/setpriv",
-        "--reuid=65534",
-        "--regid=65534",
-        "--clear-groups",
-        "--bounding-set=-all",
-        "--inh-caps=-all",
-        "--ambient-caps=-all",
-        "--no-new-privs",
-        "--",
-    ]
-    assert captured["argv"][14:27] == [
-        "/usr/bin/unshare",
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--fork",
-        "--kill-child=KILL",
-        "--",
-        "/usr/bin/python3",
-        "-I",
-        "-c",
-        local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
-        "/run/zettlab-claw/terminal-homes/65534/tmp",
-        "/run/zettlab-claw/terminal-homes/65534/var-tmp",
-    ]
-    assert captured["argv"][27:] == [
         "/bin/bash",
         "-c",
         "id",
     ]
-    assert "mount(None,b'/',16384|262144)" in (
-        local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
-    )
-    assert "b'/tmp',4096|16384" in local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
-    assert "b'/var/tmp',4096|16384" in local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
+    assert "/usr/bin/setpriv" not in captured["argv"]
+    assert "/usr/bin/unshare" not in captured["argv"]
 
 
-def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
+def test_managed_terminal_keeps_existing_root_cwd(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     run_env = {"HERMES_HOME": "/profiles/main"}
+    workspace = tmp_path / "private-workspace"
+    workspace.mkdir(mode=0o700)
 
     def prepare_home(env):
         env["HOME"] = "/run/zettlab-claw/terminal-homes/100001"
@@ -135,23 +90,18 @@ def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
     )
     monkeypatch.setattr(
         local_module,
-        "_managed_terminal_identity",
-        lambda _env=None: (100001, 100001),
-    )
-    monkeypatch.setattr(
-        local_module,
-        "_managed_identity_can_traverse",
-        lambda directory, **_kwargs: directory != "/root",
+        "_prepare_managed_profile_runtime",
+        lambda _env: None,
     )
 
     assert local_module._managed_terminal_cwd(
-        "/root",
+        str(workspace),
+        env=run_env,
+    ) == str(workspace)
+    assert local_module._managed_terminal_cwd(
+        str(tmp_path / "missing"),
         env=run_env,
     ) == "/run/zettlab-claw/terminal-homes/100001"
-    assert local_module._managed_terminal_cwd(
-        "/workspace",
-        env=run_env,
-    ) == "/workspace"
     assert run_env["HOME"] == "/run/zettlab-claw/terminal-homes/100001"
     assert run_env["TMPDIR"] == "/tmp"
     assert run_env["TMP"] == "/tmp"
@@ -240,13 +190,6 @@ def test_managed_profile_runtime_exposes_only_active_skills_and_output(
     assert stat.S_IMODE(outside_file.stat().st_mode) == 0o600
     assert outside_file.read_text() == "protected"
     assert stat.S_IMODE(sibling_home.stat().st_mode) == 0o700
-    assert local_module._managed_identity_can_traverse(
-        str(skills_root), uid=uid, gid=gid
-    )
-    assert not local_module._managed_identity_can_traverse(
-        str(sibling_home), uid=uid, gid=gid
-    )
-
     os.chmod(private_skill, 0o622)
     local_module._prepare_managed_command_skill_sources(command, env)
     assert stat.S_IMODE(private_skill.stat().st_mode) == 0o640
@@ -445,11 +388,10 @@ def test_managed_skill_tree_bad_package_does_not_block_others(
     os.name == "nt"
     or not hasattr(os, "geteuid")
     or os.geteuid() != 0
-    or not Path("/usr/bin/setpriv").is_file()
-    or not Path("/usr/bin/unshare").is_file(),
-    reason="requires the production root/Linux namespace boundary",
+    or not Path("/usr/bin/python3").is_file(),
+    reason="requires the production root/Linux service identity",
 )
-def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
+def test_managed_terminal_root_can_modify_skill_and_write_output(
     monkeypatch,
 ):
     root = Path(tempfile.mkdtemp(prefix="hermes-managed-test-", dir="/run"))
@@ -467,12 +409,7 @@ def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
         original = (
             "from pathlib import Path\n"
             "source = Path(__file__)\n"
-            "try:\n"
-            "    source.write_text('tampered')\n"
-            "except OSError:\n"
-            "    pass\n"
-            "else:\n"
-            "    raise SystemExit('skill source was writable')\n"
+            "source.write_text('tampered')\n"
             "Path(__import__('os').environ['ZET_AGENT_OUTPUT_DIR'], "
             "'state.txt').write_text('ok')\n"
         )
@@ -504,40 +441,20 @@ def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
             f'python3 "{script}"', env
         )
         uid, gid = local_module._managed_terminal_identity(env)
-        private_tmp = root / "private-tmp"
-        private_var_tmp = root / "private-var-tmp"
-        private_tmp.mkdir()
-        private_var_tmp.mkdir()
-        for path in (private_tmp, private_var_tmp):
-            os.chown(path, uid, gid)
-            os.chmod(path, 0o700)
-
-        argv = [
-            "/usr/bin/setpriv",
-            f"--reuid={uid}",
-            f"--regid={gid}",
-            "--clear-groups",
-            "--bounding-set=-all",
-            "--inh-caps=-all",
-            "--ambient-caps=-all",
-            "--no-new-privs",
-            "--",
-            "/usr/bin/unshare",
-            "--user",
-            "--map-root-user",
-            "--mount",
-            "--fork",
-            "--kill-child=KILL",
-            "--",
-            "/usr/bin/python3",
-            "-I",
-            "-c",
-            local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
-            str(private_tmp),
-            str(private_var_tmp),
-            "/usr/bin/python3",
-            str(script),
-        ]
+        cgroup = root / "cgroup"
+        cgroup.mkdir()
+        (cgroup / "cgroup.procs").write_text("")
+        monkeypatch.setattr(
+            local_module,
+            "_ensure_managed_terminal_cgroup",
+            lambda _env=None: cgroup,
+        )
+        monkeypatch.setattr(
+            local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
+        )
+        argv = local_module._managed_terminal_argv(
+            ["/usr/bin/python3", str(script)], env=env
+        )
         result = subprocess.run(
             argv,
             env=env,
@@ -548,7 +465,7 @@ def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
         )
 
         assert result.returncode == 0, result.stderr
-        assert script.read_text() == original
+        assert script.read_text() == "tampered"
         assert (output / "state.txt").read_text() == "ok"
         assert legacy_output.read_text() == "historical"
         assert legacy_output.stat().st_uid == uid
@@ -557,54 +474,33 @@ def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
         shutil.rmtree(root)
 
 
-def test_managed_terminal_mounts_skill_source_read_only():
-    helper = local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
-
-    compile(helper, "<managed-private-tmp-enter>", "exec")
-    assert "skill_root=os.path.join(hermes_home,'skills')" in helper
-    assert "mount(encoded,encoded,4096|16384)" in helper
-    # MS_REMOUNT 不递归：子挂载必须经 mountinfo 收集后从深到浅逐点补只读
-    assert "open('/proc/self/mountinfo','rb')" in helper
-    assert "point==skill_root or point.startswith(skill_root+'/')" in helper
-    assert "sorted(points,key=len,reverse=True)" in helper
-    assert "mount(None,os.fsencode(point),32|4096|1|2|4)" in helper
-
-
-def test_managed_terminal_skill_mount_requires_absolute_hermes_home():
-    helper = local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
-
-    # HERMES_HOME 为空/相对路径时不得把子进程 cwd 下的同名目录挂成只读
-    assert "hermes_home=os.environ.get('HERMES_HOME','')" in helper
-    assert (
-        "if os.path.isabs(hermes_home) and os.path.isdir(skill_root):" in helper
-    )
-    assert "if skill_root and os.path.isdir(skill_root):" not in helper
-
-
-def test_managed_terminal_fails_closed_without_trusted_setpriv(monkeypatch):
+def test_managed_terminal_does_not_require_setpriv(monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.setattr(
-        local_module.os,
-        "lstat",
-        lambda _path: (_ for _ in ()).throw(FileNotFoundError()),
+        local_module,
+        "_ensure_managed_terminal_cgroup",
+        lambda _env=None: Path("/sys/fs/cgroup/unit/terminal-profile-100001"),
     )
-    with pytest.raises(OSError, match="privilege drop is unavailable"):
-        local_module._managed_terminal_privilege_drop_prefix()
+    monkeypatch.setattr(
+        local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
+    )
+
+    argv = local_module._managed_terminal_argv(
+        ["/bin/sh", "-c", "id -u"],
+        env={"HERMES_HOME": "/profiles/main"},
+    )
+
+    assert argv[-3:] == ["/bin/sh", "-c", "id -u"]
+    assert not any("setpriv" in item for item in argv)
+    assert "--clear-groups" not in argv
 
 
-def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
+def test_managed_execute_code_uses_runtime_wrapper(monkeypatch):
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.setattr(
         local_module,
         "_managed_execute_code_sandbox_argv",
-        lambda argv, *, env, execution_scope, workspace: [
-            "/usr/bin/setpriv",
-            "--reuid=65534",
-            "--regid=65534",
-            "--clear-groups",
-            "--bounding-set=-all",
-            "--",
-            *argv,
-        ],
+        lambda argv, *, env, execution_scope, workspace: ["cgroup", *argv],
     )
 
     argv = code_execution_module._managed_execute_code_argv(
@@ -616,18 +512,101 @@ def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
     )
 
     assert argv == [
-        "/usr/bin/setpriv",
-        "--reuid=65534",
-        "--regid=65534",
-        "--clear-groups",
-        "--bounding-set=-all",
-        "--",
+        "cgroup",
         "/app/venv/bin/python",
         "/tmp/hermes-execute/script.py",
     ]
 
 
-def test_managed_execute_code_gets_unique_identity_from_terminal(monkeypatch):
+@pytest.mark.skipif(os.name == "nt", reason="managed gateway uses Unix RPC")
+def test_managed_execute_code_uses_workspace_paths_and_service_identity(
+    monkeypatch,
+):
+    import tools.approval as approval_module
+    import tools.terminal_tool as terminal_module
+
+    captured = {}
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(
+        terminal_module,
+        "_get_env_config",
+        lambda: {"env_type": "local"},
+    )
+    monkeypatch.setattr(
+        terminal_module,
+        "_docker_has_host_access",
+        lambda _config: False,
+    )
+    monkeypatch.setattr(
+        approval_module,
+        "check_execute_code_guard",
+        lambda *_args, **_kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(
+        code_execution_module,
+        "_load_config",
+        lambda: {"timeout": 10, "max_tool_calls": 5},
+    )
+    if sys.platform != "linux":
+        monkeypatch.setattr(
+            code_execution_module,
+            "_MANAGED_EXECUTE_CODE_PREAMBLE",
+            "",
+        )
+    monkeypatch.setattr(
+        local_module,
+        "_prepare_managed_execute_code_workspace",
+        lambda *_args, **_kwargs: 61001,
+    )
+    monkeypatch.setattr(
+        local_module,
+        "retire_managed_execute_code_identity",
+        lambda *_args, **_kwargs: 0,
+    )
+
+    def use_service_process(python, script_path, *, env, **_kwargs):
+        captured["script_path"] = script_path
+        captured["env"] = dict(env)
+        return [python, script_path]
+
+    monkeypatch.setattr(
+        code_execution_module,
+        "_managed_execute_code_argv",
+        use_service_process,
+    )
+
+    result = json.loads(
+        code_execution_module.execute_code(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "print(json.dumps({\n"
+            "    'cwd': os.getcwd(),\n"
+            "    'euid': getattr(os, 'geteuid', lambda: -1)(),\n"
+            "    'home': os.environ['HOME'],\n"
+            "    'rpc_exists': Path(os.environ['HERMES_RPC_SOCKET']).exists(),\n"
+            "    'script': str(Path(__file__).resolve()),\n"
+            "    'tmpdir': os.environ['TMPDIR'],\n"
+            "}))\n",
+            task_id="managed-root-paths",
+            enabled_tools=[],
+        )
+    )
+
+    assert result["status"] == "success", result
+    child = json.loads(result["output"])
+    workspace = str(Path(captured["script_path"]).parent)
+    assert os.path.realpath(child["cwd"]) == os.path.realpath(workspace)
+    assert child["euid"] == getattr(os, "geteuid", lambda: -1)()
+    assert os.path.realpath(child["home"]) == os.path.realpath(workspace)
+    assert child["rpc_exists"] is True
+    assert os.path.realpath(child["script"]) == os.path.realpath(
+        captured["script_path"]
+    )
+    assert os.path.realpath(child["tmpdir"]) == os.path.realpath(workspace)
+    assert captured["env"]["HERMES_RPC_SOCKET"] != "/tmp/rpc.sock"
+
+
+def test_managed_execute_code_keeps_unique_resource_ids_for_cgroups(monkeypatch):
     monkeypatch.setattr(local_module.os, "geteuid", lambda: 0)
     monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
     local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
@@ -658,17 +637,6 @@ def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
         local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
     )
     monkeypatch.setattr(
-        local_module, "_trusted_managed_unshare", lambda: "/usr/bin/unshare"
-    )
-    monkeypatch.setattr(
-        local_module,
-        "_managed_execute_code_private_tmp_paths",
-        lambda _workspace, _uid: (
-            Path("/run/zettlab-claw/execute-code/61001"),
-            Path("/run/zettlab-claw/execute-code/61001/var-tmp"),
-        ),
-    )
-    monkeypatch.setattr(
         trusted_runner, "_create_managed_invocation_cgroup", lambda: cgroup
     )
     monkeypatch.setattr(
@@ -685,34 +653,17 @@ def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
         workspace="/run/zettlab-claw/execute-code/61001",
     )
 
-    assert argv[:6] == [
+    assert argv == [
         "/usr/bin/python3",
         "-I",
         "-c",
         local_module._MANAGED_TERMINAL_CGROUP_ENTER,
         str(cgroup.path),
-        "/usr/bin/setpriv",
-    ]
-    assert argv[6:9] == [
-        "--reuid=61001",
-        "--regid=61001",
-        "--clear-groups",
-    ]
-    assert argv[14:25] == [
-        "/usr/bin/unshare",
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--",
         "/usr/bin/python3",
-        "-I",
-        "-c",
-        local_module._MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER,
-        "/run/zettlab-claw/execute-code/61001",
-        "/run/zettlab-claw/execute-code/61001/var-tmp",
+        "/tmp/script.py",
     ]
-    assert argv[25:] == ["/usr/bin/python3", "/tmp/script.py"]
-    assert "--fork" not in argv
+    assert not any("setpriv" in item for item in argv)
+    assert "--clear-groups" not in argv
     monkeypatch.setattr(
         local_module,
         "_terminate_managed_uid",
@@ -765,17 +716,15 @@ def test_managed_execute_code_preamble_disables_dumpability():
     )
 
 
-def test_managed_service_mounts_system_read_only_with_scoped_writes():
+def test_managed_service_keeps_filesystem_open_for_root_commands():
     service = Path("zpk/init.d/zettlab-claw.service").read_text(
         encoding="utf-8"
     )
-    assert "ProtectSystem=strict" in service
+    assert "ProtectSystem=" not in service
+    assert "ReadOnlyPaths=" not in service
+    assert "ReadWritePaths=" not in service
     assert "RuntimeDirectory=zettlab-claw" in service
     assert "RuntimeDirectoryMode=0755" in service
-    assert "ReadWritePaths=__APP_BASE__/data" in service
-    assert "ReadWritePaths=-/volume1/subvol/agents/data" in service
-    assert "ReadWritePaths=-/volume1/agents/data" in service
-    assert "ReadOnlyPaths=-/volume1/subvol/agents/zettlab-presets" in service
     assert (
         "Environment=HERMES_LAZY_INSTALL_TARGET="
         "__APP_BASE__/data/lazy-packages"
@@ -839,36 +788,12 @@ def _background_registry(monkeypatch):
         "_managed_terminal_cwd",
         lambda cwd, *, env: cwd,
     )
-    monkeypatch.setattr(
-        local_module,
-        "_managed_terminal_home_paths",
-        lambda _env=None: (
-            Path("/run/zettlab-claw/terminal-homes/65534"),
-            Path("/run/zettlab-claw/terminal-homes/65534/tmp"),
-            Path("/run/zettlab-claw/terminal-homes/65534/var-tmp"),
-        ),
-    )
-    monkeypatch.setattr(
-        local_module, "_trusted_managed_unshare", lambda: "/usr/bin/unshare"
-    )
     return registry
 
 
-def test_managed_background_pipe_drops_identity_capabilities(monkeypatch):
+def test_managed_background_pipe_inherits_service_identity(monkeypatch):
     captured = {}
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    monkeypatch.setattr(
-        local_module,
-        "_managed_terminal_privilege_drop_prefix",
-        lambda _env=None: [
-            "/usr/bin/setpriv",
-            "--reuid=65534",
-            "--regid=65534",
-            "--clear-groups",
-            "--bounding-set=-all",
-            "--",
-        ],
-    )
     monkeypatch.setattr(
         local_module,
         "_ensure_managed_terminal_cgroup",
@@ -896,31 +821,17 @@ def test_managed_background_pipe_drops_identity_capabilities(monkeypatch):
         fake_popen,
     )
     registry.spawn_local("sleep 1", cwd="/tmp")
-    assert captured["argv"][5:11] == [
-        "/usr/bin/setpriv",
-        "--reuid=65534",
-        "--regid=65534",
-        "--clear-groups",
-        "--bounding-set=-all",
-        "--",
+    assert captured["argv"][5:] == [
+        "/bin/bash",
+        "-lic",
+        "set +m; sleep 1",
     ]
+    assert not any("setpriv" in item for item in captured["argv"])
 
 
-def test_managed_background_pty_drops_identity_capabilities(monkeypatch):
+def test_managed_background_pty_inherits_service_identity(monkeypatch):
     captured = {}
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    monkeypatch.setattr(
-        local_module,
-        "_managed_terminal_privilege_drop_prefix",
-        lambda _env=None: [
-            "/usr/bin/setpriv",
-            "--reuid=65534",
-            "--regid=65534",
-            "--clear-groups",
-            "--bounding-set=-all",
-            "--",
-        ],
-    )
     monkeypatch.setattr(
         local_module,
         "_ensure_managed_terminal_cgroup",
@@ -945,14 +856,12 @@ def test_managed_background_pty_drops_identity_capabilities(monkeypatch):
         SimpleNamespace(PtyProcess=PtyProcess),
     )
     registry.spawn_local("sleep 1", cwd="/tmp", use_pty=True)
-    assert captured["argv"][5:11] == [
-        "/usr/bin/setpriv",
-        "--reuid=65534",
-        "--regid=65534",
-        "--clear-groups",
-        "--bounding-set=-all",
-        "--",
+    assert captured["argv"][5:] == [
+        "/bin/bash",
+        "-lic",
+        "set +m; sleep 1",
     ]
+    assert not any("setpriv" in item for item in captured["argv"])
 
 
 def test_managed_terminal_identity_is_profile_scoped(monkeypatch):
@@ -1083,7 +992,7 @@ def test_managed_uid_inventory_ignores_zombies(tmp_path):
     sys.platform != "linux" or os.geteuid() != 0,
     reason="requires Linux root identity broker",
 )
-def test_profile_retirement_kills_background_and_rotates_identity(
+def test_profile_retirement_removes_cgroup_and_rotates_resource_identity(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
@@ -1091,16 +1000,14 @@ def test_profile_retirement_kills_background_and_rotates_identity(
     monkeypatch.setattr(
         local_module, "_MANAGED_TERMINAL_HOME_ROOT", tmp_path / "homes"
     )
+    removed_cgroups = []
     monkeypatch.setattr(
         local_module,
-        "_managed_terminal_argv",
-        lambda argv, *, env=None: (
-            local_module._managed_terminal_privilege_drop_prefix(env) + list(argv)
-        ),
+        "_remove_managed_terminal_cgroup",
+        lambda removed_uid: removed_cgroups.append(removed_uid) or True,
     )
-    monkeypatch.setattr(
-        local_module, "_remove_managed_terminal_cgroup", lambda _uid: True
-    )
+    monkeypatch.setattr(local_module, "_terminate_managed_uid", lambda _uid: 0)
+    monkeypatch.setattr(local_module, "_managed_uid_processes", lambda _uid: set())
     local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
     local_module._MANAGED_TERMINAL_RETIRED_UIDS.clear()
     local_module._MANAGED_TERMINAL_RETIRED_SCOPES.clear()
@@ -1112,26 +1019,14 @@ def test_profile_retirement_kills_background_and_rotates_identity(
     home = homes / str(uid)
     home.mkdir(mode=0o700)
     os.chown(home, uid, gid)
-    process = subprocess.Popen(
-        local_module._managed_terminal_argv(
-            ["/bin/sh", "-c", "sleep 60"], env=env
-        ),
-        start_new_session=True,
-    )
-    deadline = time.monotonic() + 2
-    while process.poll() is None and process.pid not in local_module._managed_uid_processes(uid):
-        if time.monotonic() >= deadline:
-            process.kill()
-            pytest.fail("managed process did not enter its UID domain")
-        time.sleep(0.02)
 
     result = local_module.retire_managed_terminal_profile(profile_home)
-    process.wait(timeout=2)
     new_uid, _ = local_module._managed_terminal_identity(env)
     assert result["identity_retired"] is True
     assert result["terminal_home_removed"] is True
     assert result["terminal_cgroup_removed"] is True
-    assert result["killed_uid_processes"] >= 1
+    assert result["killed_uid_processes"] == 0
+    assert removed_cgroups == [uid]
     assert not home.exists()
     assert new_uid != uid
 

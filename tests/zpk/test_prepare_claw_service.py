@@ -945,7 +945,7 @@ def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
     "layout",
     ["real", "ota_symlink", "volume_symlink"],
 )
-def test_service_data_write_carveout_supports_all_device_layouts(
+def test_service_data_layouts_do_not_require_systemd_write_carveouts(
     tmp_path: Path,
     layout: str,
 ):
@@ -995,8 +995,9 @@ def test_service_data_write_carveout_supports_all_device_layouts(
         / "init.d"
         / "zettlab-claw.service"
     ).read_text(encoding="utf-8")
-    assert "ReadOnlyPaths=/zettos/main/apps" in service
-    assert "ReadWritePaths=__APP_BASE__/data" in service
+    assert "ProtectSystem=" not in service
+    assert "ReadOnlyPaths=" not in service
+    assert "ReadWritePaths=" not in service
     probe = data_path / "service-write-boundary-probe"
     probe.write_text("writable\n", encoding="utf-8")
     assert probe.read_text(encoding="utf-8") == "writable\n"
@@ -1663,12 +1664,9 @@ def test_zpk_agent_service_names_are_device_facing():
     assert "CapabilityBoundingSet=~CAP_SYS_PTRACE" not in service
     assert "Delegate=pids memory" in service
     assert "KillMode=control-group" in service
-    assert "ReadOnlyPaths=/zettos/main/apps" in service
-    assert "ReadWritePaths=__APP_BASE__/data" in service
-    assert (
-        "ReadOnlyPaths=-/volume1/subvol/agents/zettlab-presets" in service
-    )
-    assert "ReadOnlyPaths=-/volume1/agents/zettlab-presets" in service
+    assert "ProtectSystem=" not in service
+    assert "ReadOnlyPaths=" not in service
+    assert "ReadWritePaths=" not in service
     assert 'HERMES_LAUNCHER="$APP_ROOT/libexec/hermes-secure-launcher.py"' in (
         hermes_wrapper
     )
@@ -2025,7 +2023,7 @@ def test_zpk_secure_launcher_builds_supervisor_and_enables_controllers(
     ) == "memory pids\n"
     assert os.environ[launcher._MANAGED_CGROUP_ROOT_ENV] == service_relative
 
-    # Child Hermes processes inherit the managed identity and re-enter through
+    # Child Hermes processes inherit the service identity and re-enter through
     # the same packaged launcher. They may verify, but must not rebuild, the
     # already-active supervisor topology.
     launcher._prepare_managed_service_cgroup()

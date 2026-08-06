@@ -82,15 +82,12 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
     assert registry.kill_started_since(
         "session-a", baseline, source="gateway_turn_timeout"
     ) == 1
-    assert calls == [
-        (
-            "proc_new",
-            {
-                "source": "gateway_turn_timeout",
-                "consume_output": True,
-            },
-        )
-    ]
+    assert len(calls) == 1
+    session_id, kwargs = calls[0]
+    assert session_id == "proc_new"
+    assert kwargs["source"] == "gateway_turn_timeout"
+    assert kwargs["consume_output"] is True
+    assert kwargs["_trusted_session"] is new
 
 
 def test_kill_all_backward_compat_and_exclude_ids(registry):
@@ -111,9 +108,12 @@ def test_kill_all_backward_compat_and_exclude_ids(registry):
     registry.kill_process = fake_kill
 
     assert registry.kill_all("session-a", exclude_ids=frozenset({"proc_a"})) == 1
-    assert calls == [
-        ("proc_b", {"source": "kill_all", "consume_output": False})
-    ]
+    assert len(calls) == 1
+    session_id, kwargs = calls[0]
+    assert session_id == "proc_b"
+    assert kwargs["source"] == "kill_all"
+    assert kwargs["consume_output"] is False
+    assert kwargs["_trusted_session"] is b
 
     calls.clear()
     assert registry.kill_all("session-a") == 2
@@ -1786,4 +1786,3 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-

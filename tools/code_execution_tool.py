@@ -1595,15 +1595,13 @@ def execute_code(
                 env=child_env,
                 execution_scope=managed_execute_scope,
             )
-            child_env["HOME"] = "/tmp"
-            child_env["TMPDIR"] = "/tmp"
-            child_env["TMP"] = "/tmp"
-            child_env["TEMP"] = "/tmp"
-            child_env["HERMES_RPC_SOCKET"] = f"/tmp/{os.path.basename(sock_path)}"
-            _pp_parts[0] = "/tmp"
-            child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+            child_env["HOME"] = tmpdir
+            child_env["TMPDIR"] = tmpdir
+            child_env["TMP"] = tmpdir
+            child_env["TEMP"] = tmpdir
+            child_env["HERMES_RPC_SOCKET"] = sock_path
             _child_cwd = tmpdir
-            _child_script_path = "/tmp/script.py"
+            _child_script_path = _script_path
 
         proc = subprocess.Popen(
             _managed_execute_code_argv(
@@ -1623,12 +1621,13 @@ def execute_code(
         )
 
         # Start accepting only after Popen returns, so the managed path can bind
-        # the one allowed UDS client to the exact child PID and per-call UID.
+        # the one allowed UDS client to the exact root service child PID.
         expected_peer = None
         if managed_gateway:
             if managed_execute_uid is None:
                 raise OSError("managed execute_code identity is unavailable")
-            expected_peer = (proc.pid, managed_execute_uid)
+            service_uid = getattr(os, "geteuid", lambda: -1)()
+            expected_peer = (proc.pid, service_uid)
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
@@ -1749,9 +1748,9 @@ def execute_code(
             poll_interval = min(0.2, poll_interval * 1.5)
 
         # A script can start a detached/background descendant which survives
-        # the top-level process group.  Retire the invocation UID on every
+        # the top-level process group. Retire the invocation cgroup on every
         # normal exit before readers, RPC state, or the workspace are released.
-        # Failure raises into the error result and keeps the UID reservation.
+        # Failure raises into the error result and keeps the resource ID.
         if managed_execute_uid is not None and managed_execute_scope is not None:
             from tools.environments.local import (
                 retire_managed_execute_code_identity,

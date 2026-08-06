@@ -4221,32 +4221,18 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         _end_session_call,
         _ensure_tab,
         _browser_identity_key,
-        _handback_privacy_filter_enabled,
         _held_owner_lock,
-        _last_response_started_handback,
         _mutating_tab_call,
         _tool_error_from_exception,
     )
-
-    def _blocked_after_handback() -> str:
-        return json.dumps({
-            "success": False,
-            "error": (
-                "Browser evaluation is blocked after human control until the "
-                "Agent navigates to a new page or closes the session."
-            ),
-        }, ensure_ascii=False)
 
     try:
         tab_info = _ensure_tab(task_id or "default")
         user_id = tab_info["user_id"]
         guard_active = _eval_ssrf_guard_active(task_id or "default")
-        # The private-page probes, arbitrary JS, handback checks, and landing
-        # probe must all describe one identity-serialized page transition.
+        # The private-page probes, arbitrary JS, and landing probe must all
+        # describe one identity-serialized page transition.
         with _held_owner_lock(_browser_identity_key(tab_info)):
-            filtered_at_request = _handback_privacy_filter_enabled(tab_info)
-            if filtered_at_request:
-                return _blocked_after_handback()
             if guard_active:
                 blocked_url = _camofox_current_page_private_url(tab_info)
                 if blocked_url:
@@ -4257,22 +4243,15 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                             f"({blocked_url}). Refusing to evaluate JavaScript on this page."
                         ),
                     }, ensure_ascii=False)
-                if _last_response_started_handback() or _handback_privacy_filter_enabled(tab_info):
-                    return _blocked_after_handback()
 
             # Arbitrary JS can change the document as readily as a click, so it
-            # inherits the stale-epoch check from the shared mutation helper.
+            # goes through the shared mutation helper that serializes on the
+            # tab identity.
             resp = _mutating_tab_call(
                 tab_info,
                 "/evaluate",
                 {"expression": expression, "userId": user_id},
             )
-            if (
-                filtered_at_request
-                or _last_response_started_handback()
-                or _handback_privacy_filter_enabled(tab_info)
-            ):
-                return _blocked_after_handback()
 
             if guard_active:
                 blocked_url = _camofox_current_page_private_url(tab_info)
@@ -4285,8 +4264,6 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                             "JavaScript navigation via browser_console."
                         ),
                     }, ensure_ascii=False)
-                if _last_response_started_handback() or _handback_privacy_filter_enabled(tab_info):
-                    return _blocked_after_handback()
 
         # Camofox returns the result in a JSON envelope
         raw_result = resp.get("result") if isinstance(resp, dict) else resp
@@ -4314,7 +4291,7 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         return _tool_error_from_exception(e, session=locals().get("tab_info"))
     finally:
         # _ensure_tab hands back a referenced cache entry and ownership with
-        # it. Every path here — success, the two handback refusals, the
+        # it. Every path here — success, the private-page refusals, the
         # unsupported-eval degradation and any error — has to give it back, or
         # the entry is skipped by the idle sweep and by eviction forever.
         _end_session_call(locals().get("tab_info"))

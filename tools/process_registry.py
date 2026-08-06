@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 _MANAGED_CHECKPOINT_PATH = Path("/run/zettlab-claw/processes.json")
+_PROC_ROOT = Path("/proc")
 _MANAGED_PROFILE_ROOTS = (
     Path("/volume1/subvol/agents/data"),
     Path("/volume1/agents/data"),
@@ -619,7 +620,7 @@ class ProcessRegistry:
 
     @staticmethod
     def _managed_pid_matches_profile(pid: int, profile_owner: str) -> bool:
-        """Bind a recovered PID to the profile's UID and delegated cgroup."""
+        """Bind a recovered service process to its profile cgroup."""
 
         try:
             from tools.environments.local import (
@@ -630,7 +631,7 @@ class ProcessRegistry:
             uid, _gid = _managed_terminal_identity(
                 {"HERMES_HOME": profile_owner}
             )
-            status = (Path("/proc") / str(pid) / "status").read_text(
+            status = (_PROC_ROOT / str(pid) / "status").read_text(
                 encoding="utf-8", errors="replace"
             )
             effective_uid = None
@@ -640,7 +641,8 @@ class ProcessRegistry:
                     if len(fields) >= 3:
                         effective_uid = int(fields[2])
                     break
-            if effective_uid != uid:
+            service_uid = getattr(os, "geteuid", lambda: -1)()
+            if effective_uid != service_uid:
                 return False
 
             cgroup_root = os.environ.get("HERMES_MANAGED_CGROUP_ROOT", "")
@@ -656,7 +658,7 @@ class ProcessRegistry:
                 f"{cgroup_root.rstrip('/')}/"
                 f"{_MANAGED_TERMINAL_CGROUP_PREFIX}-{uid}"
             )
-            memberships = (Path("/proc") / str(pid) / "cgroup").read_text(
+            memberships = (_PROC_ROOT / str(pid) / "cgroup").read_text(
                 encoding="ascii", errors="strict"
             ).splitlines()
             unified = [line[3:] for line in memberships if line.startswith("0::")]
@@ -2594,7 +2596,7 @@ class ProcessRegistry:
                 and not self._managed_pid_matches_profile(pid, profile_owner)
             ):
                 logger.warning(
-                    "Skipping recovered process outside its managed identity: %s",
+                    "Skipping recovered process outside its managed profile cgroup: %s",
                     entry.get("session_id", "?"),
                 )
                 continue

@@ -154,8 +154,8 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
         self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
 
-    def test_timezone_shell_quoted_in_remote_execution(self):
-        """HERMES_TIMEZONE must be shell-quoted in remote env_prefix to prevent injection."""
+    def test_invalid_timezone_is_not_injected_in_remote_execution(self):
+        """Invalid HERMES_TIMEZONE values must not reach the remote shell."""
         class FakeEnv:
             def __init__(self):
                 self.commands = []
@@ -188,12 +188,8 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
-        # The TZ value must be shell-quoted — it should NOT contain unescaped semicolons
-        self.assertNotIn("TZ=US/Eastern; echo PWNED", run_cmd,
-                         "TZ value with shell metacharacters must not appear unquoted")
-        # shlex.quote wraps values containing special characters in single quotes
-        self.assertIn("TZ='US/Eastern; echo PWNED'", run_cmd,
-                      "TZ value must be wrapped in single quotes by shlex.quote()")
+        self.assertNotIn(malicious_tz, run_cmd)
+        self.assertNotIn(" TZ=", run_cmd)
 
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")

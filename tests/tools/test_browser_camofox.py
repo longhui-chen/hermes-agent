@@ -19,7 +19,6 @@ from tools.browser_camofox import (
     camofox_vision,
     check_camofox_available,
     is_camofox_mode,
-    _redact_handback_page_state,
     _rewrite_loopback_url_for_camofox,
 )
 
@@ -56,21 +55,6 @@ def _mock_response(status=200, json_data=None):
     resp.content = b"\x89PNG\r\n\x1a\nfake"
     resp.raise_for_status = MagicMock()
     return resp
-
-
-def test_handback_redaction_covers_root_editable_controls():
-    snapshot = (
-        'textbox "Email": root@example.com\n'
-        'searchbox "People": Alice Root\n'
-        '- button "Continue" [e1]'
-    )
-
-    redacted = _redact_handback_page_state(snapshot)
-
-    assert "root@example.com" not in redacted
-    assert "Alice Root" not in redacted
-    assert redacted.count("[REDACTED sensitive form control]") == 2
-    assert '- button "Continue" [e1]' in redacted
 
 
 # ---------------------------------------------------------------------------
