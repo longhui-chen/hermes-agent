@@ -74,7 +74,17 @@ jobs:
           print(checks)
           missing = [k for k, v in checks.items() if not v]
           assert not missing, f"wheel is missing required payload: {missing}"
-          print("wheel payload OK")
+          # Declared top-level modules must land in the built wheel. The
+          # sibling test asserts the other direction (shipped code may only
+          # import root modules that py-modules declares); together they close
+          # the gap that dropped portable_import_security from every build.
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              declared = tomllib.load(fh)["tool"]["setuptools"]["py-modules"]
+          top_level = {n for n in names if n.endswith(".py") and "/" not in n}
+          absent = sorted(f"{m}.py" for m in declared if f"{m}.py" not in top_level)
+          assert not absent, f"wheel is missing declared py-modules: {absent}"
+          print(f"wheel payload OK ({len(declared)} declared py-modules present)")
           PY
       - name: Installed wheel seeds the curated set (real sysconfig resolution)
         run: |

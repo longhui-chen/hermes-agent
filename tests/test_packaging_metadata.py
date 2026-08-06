@@ -37,6 +37,92 @@ def _packages_find_include():
     return data["tool"]["setuptools"]["packages"]["find"]["include"]
 
 
+def _declared_py_modules():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return data["tool"]["setuptools"]["py-modules"]
+
+
+def _shipped_python_sources():
+    """Every .py file the wheel actually carries.
+
+    Two channels: the top-level modules named in ``py-modules`` and the
+    packages selected by ``packages.find``. Deliberately excludes setup.py
+    (build script, never installed), tests/ and scripts/ — an import that
+    only exists there cannot break a user's install.
+    """
+    files = []
+    for module in _declared_py_modules():
+        path = REPO_ROOT / f"{module}.py"
+        if path.exists():
+            files.append(path)
+    for package in find_packages(where=str(REPO_ROOT), include=_packages_find_include()):
+        files.extend((REPO_ROOT / Path(*package.split("."))).glob("*.py"))
+    return files
+
+
+def _absolute_import_sites(path):
+    """Yield (top_level_name, lineno) for every absolute import in a file.
+
+    Relative imports (``from . import x``) are skipped: they resolve inside a
+    package that packages.find already covers, so they cannot reference an
+    undeclared root module.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                yield alias.name.split(".")[0], node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                yield node.module.split(".")[0], node.lineno
+
+
+def test_every_imported_root_module_is_declared_in_py_modules():
+    """Regression guard for the portable_import_security packaging miss.
+
+    ``[tool.setuptools] py-modules`` is hand-maintained, and setuptools ships
+    exactly the top-level modules it names — a root-level ``foo.py`` that no
+    one lists is silently dropped from the wheel even though it sits right
+    next to the modules that do ship.
+
+    portable_import_security.py hit this. It holds the credential scan that
+    rejects portable imports carrying someone else's API keys, it is imported
+    bare (no try/except) from hermes_state.py and tools/memory_tool.py, and it
+    was never declared. Every packaged build — wheel, editable, ZPK — shipped
+    the callers without the module, so the cross-device session import and the
+    curated memory import endpoints failed on every single call in production
+    while the source tree, its unit tests and CI all stayed green: the tests
+    import it from the repo root, where the file has always been present.
+
+    Testing the module's behaviour cannot catch this. Only the declaration can:
+    anything the shipped code imports by name must be named in py-modules.
+    """
+    declared = set(_declared_py_modules())
+    root_modules = {path.stem for path in REPO_ROOT.glob("*.py")} - {"setup"}
+    undeclared = root_modules - declared
+
+    offenders: dict[str, list[str]] = {}
+    for source in _shipped_python_sources():
+        for name, lineno in _absolute_import_sites(source):
+            if name in undeclared:
+                rel = source.relative_to(REPO_ROOT)
+                offenders.setdefault(name, []).append(f"{rel}:{lineno}")
+
+    assert not offenders, (
+        "shipped code imports a root-level module that [tool.setuptools] "
+        "py-modules does not declare, so the wheel will not carry it and the "
+        "import raises ModuleNotFoundError on every packaged install. Add the "
+        "module to py-modules in pyproject.toml:\n  "
+        + "\n  ".join(
+            f"{name} -> imported at {', '.join(sites)}"
+            for name, sites in sorted(offenders.items())
+        )
+    )
+
+
 def test_every_on_disk_subpackage_is_covered_by_packages_find():
     """Regression test for #34701 (and the bug class behind #34034 / #28149).
 
