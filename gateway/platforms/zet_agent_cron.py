@@ -366,7 +366,7 @@ def _dbg(msg: str) -> None:
     local-server console. Production deployments can ignore this file."""
     try:
         import datetime as _dt
-        with open("/tmp/zet_agent_cron.log", "a") as _f:
+        with open("/tmp/zet_agent_cron.log", "a", encoding="utf-8") as _f:
             _f.write(f"{_dt.datetime.now().isoformat()} pid={os.getpid()} {msg}\n")
     except Exception:
         pass
@@ -684,12 +684,15 @@ def install() -> None:
     # gives us a second safety net + diagnostic log so we can prove the
     # values are set right before super() builds the agent.
     try:
+        import functools as _functools
+
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.session_context import set_session_vars
 
         if not getattr(APIServerAdapter._create_agent, _PATCH_SENTINEL, False):
             _orig_create = APIServerAdapter._create_agent
 
+            @_functools.wraps(_orig_create)
             def _wrapped_create(self, *args, **kwargs):
                 session_id = kwargs.get("session_id")
                 if session_id:

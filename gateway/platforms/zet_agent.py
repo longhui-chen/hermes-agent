@@ -105,9 +105,16 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     DEFAULT_HOST,
     MAX_REQUEST_BYTES,
+    _REQUEST_OPTION_MISSING,
+    _ProviderAuthResolutionError,
+    _apply_runtime_agent_overrides,
     _chat_finish_reason_from_result,
+    _clean_request_string,
     _coerce_port,
     _openai_error,
+    _request_reasoning_config,
+    _request_service_tier,
+    _resolve_request_runtime_agent_kwargs,
     _strip_skill_display_token,
 )
 from gateway.platforms.base import SendResult
@@ -2340,7 +2347,12 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        requested_model: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
+        session_model: Optional[str] = None,
+        confirmed_runtime_lock: bool = False,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Build the agent for the zet_agent platform, then attach extra callbacks.
@@ -2387,6 +2399,8 @@ class ZetAgentAdapter(APIServerAdapter):
 
         from run_agent import AIAgent
         from gateway.run import (
+            _checkpoint_agent_kwargs,
+            _current_max_iterations,
             _resolve_runtime_agent_kwargs,
             _resolve_gateway_model,
             _load_gateway_config,
@@ -2395,7 +2409,10 @@ class ZetAgentAdapter(APIServerAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         platform_key = Platform.ZET_AGENT.value
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except RuntimeError as exc:
+            raise _ProviderAuthResolutionError(str(exc)) from exc
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
@@ -2405,6 +2422,65 @@ class ZetAgentAdapter(APIServerAdapter):
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             model = runtime_model
+
+        request_reasoning_config = _request_reasoning_config(model_options)
+        if request_reasoning_config is not None:
+            reasoning_config = request_reasoning_config
+        request_service_tier = _request_service_tier(model_options)
+
+        request_model = _clean_request_string(requested_model)
+        request_provider = _clean_request_string(requested_provider)
+        route_model = (
+            _clean_request_string(route.get("model"))
+            if isinstance(route, dict)
+            else None
+        )
+        route_provider = (
+            _clean_request_string(route.get("provider"))
+            if isinstance(route, dict)
+            else None
+        )
+        route_api_key = (
+            _clean_request_string(route.get("api_key"))
+            if isinstance(route, dict)
+            else None
+        )
+        route_base_url = (
+            _clean_request_string(route.get("base_url"))
+            if isinstance(route, dict)
+            else None
+        )
+
+        def _resolve_provider_runtime(
+            provider: Optional[str],
+            *,
+            target_model: Optional[str],
+            required: bool,
+        ) -> Optional[Dict[str, Any]]:
+            provider_name = _clean_request_string(provider)
+            if not provider_name:
+                return None
+            try:
+                return _resolve_request_runtime_agent_kwargs(
+                    provider_name,
+                    target_model=target_model or None,
+                )
+            except Exception as exc:
+                try:
+                    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+
+                    return _resolve_runtime_agent_kwargs_for_provider(provider_name)
+                except Exception:
+                    pass
+                if required:
+                    raise _ProviderAuthResolutionError(str(exc)) from exc
+                logger.debug(
+                    "zet_agent provider-runtime refresh failed for provider=%s model=%s",
+                    provider_name,
+                    target_model or "",
+                    exc_info=True,
+                )
+                return None
 
         # ZET-576: apply session-level model override if present.
         # _resolve_gateway_model reads config.yaml (agent default), but
@@ -2416,104 +2492,193 @@ class ZetAgentAdapter(APIServerAdapter):
         override_key = session_id or gateway_session_key
         runtime_auxiliary_task_configs = None
         runtime_supports_vision = None
-        override = None
-        if gw is not None and override_key:
+        session_override = None
+        if not confirmed_runtime_lock and gw is not None and override_key:
             candidate = getattr(gw, "_session_model_overrides", {}).get(override_key)
             if isinstance(candidate, dict):
-                override = dict(candidate)
-        if override is None:
-            override = self._session_model_override_for(override_key)
+                session_override = dict(candidate)
+        if not confirmed_runtime_lock and session_override is None:
+            session_override = self._session_model_override_for(override_key)
 
-        # Per-client route sits between the global runtime and an explicit
-        # session /model override, matching the base API adapter precedence.
-        if route and not override:
-            if route.get("provider"):
-                try:
-                    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+        from hermes_cli.model_switch import resolve_effective_model
 
-                    provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        route["provider"]
-                    )
-                    provider_kwargs.pop("model", None)
-                    runtime_kwargs.update(provider_kwargs)
-                except Exception:
-                    for key in (
-                        "api_key",
-                        "base_url",
-                        "api_mode",
-                        "command",
-                        "args",
-                        "credential_pool",
-                    ):
-                        runtime_kwargs.pop(key, None)
-                    runtime_kwargs["provider"] = route["provider"]
-            if route.get("model"):
-                model = route["model"]
-            if route.get("api_key"):
-                runtime_kwargs["api_key"] = route["api_key"]
-            if route.get("base_url"):
-                runtime_kwargs["base_url"] = route["base_url"]
-            logger.debug(
-                "zet_agent model route applied: model=%s provider=%s",
-                model,
-                runtime_kwargs.get("provider"),
+        session_row_model = _clean_request_string(session_model)
+        if session_override:
+            override_model = resolve_effective_model(session_override, None, model)
+            session_provider = _clean_request_string(
+                session_override.get("provider")
             )
-        elif route and override:
-            logger.debug(
-                "zet_agent model route skipped: session /model override wins for %s",
-                override_key,
+            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            provider_runtime = _resolve_provider_runtime(
+                session_provider or current_provider,
+                target_model=override_model,
+                required=False,
             )
-
-        if override:
-            model = override.get("model", model)
-            for k in ("provider", "api_key", "base_url", "api_mode"):
-                v = override.get(k)
-                if v is not None:
-                    runtime_kwargs[k] = v
-            context_length = override.get("context_length")
+            if provider_runtime:
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            _apply_runtime_agent_overrides(runtime_kwargs, session_override)
+            model = override_model
+            context_length = session_override.get("context_length")
             if context_length is not None:
                 runtime_kwargs["config_context_length"] = context_length
-            auxiliary = override.get("auxiliary")
+            auxiliary = session_override.get("auxiliary")
             if isinstance(auxiliary, dict):
                 runtime_auxiliary_task_configs = auxiliary
-            supports_vision = override.get("supports_vision")
+            supports_vision = session_override.get("supports_vision")
             if isinstance(supports_vision, bool):
                 runtime_supports_vision = supports_vision
             logger.info(
                 "session-model-override applied: session=%s model=%s",
                 override_key, model,
             )
+            if route or request_model or request_provider:
+                logger.debug(
+                    "zet_agent request selection skipped: session /model override wins for %s",
+                    override_key or "",
+                )
+        elif session_row_model and not confirmed_runtime_lock:
+            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            provider_runtime = _resolve_provider_runtime(
+                current_provider,
+                target_model=session_row_model,
+                required=False,
+            )
+            if provider_runtime:
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            model = resolve_effective_model(None, session_row_model, model)
+            if request_model or request_provider:
+                logger.debug(
+                    "zet_agent request selection skipped: session-persisted model wins for %s",
+                    override_key or "",
+                )
+        else:
+            effective_model = (
+                (route_model or model)
+                if route is not None
+                else (request_model or model)
+            )
+            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            effective_provider = request_provider or route_provider or current_provider
+            provider_runtime = None
+            if effective_provider and (
+                bool(request_provider or route_provider) or effective_model != model
+            ):
+                provider_runtime = _resolve_provider_runtime(
+                    effective_provider,
+                    target_model=effective_model,
+                    required=bool(request_provider) or confirmed_runtime_lock,
+                )
+            if provider_runtime:
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            elif effective_provider and effective_provider != current_provider:
+                for key in (
+                    "api_key",
+                    "base_url",
+                    "api_mode",
+                    "command",
+                    "args",
+                    "credential_pool",
+                ):
+                    runtime_kwargs.pop(key, None)
+                runtime_kwargs["provider"] = effective_provider
+            model = effective_model
+            if route_api_key:
+                runtime_kwargs["api_key"] = route_api_key
+            if route_base_url:
+                runtime_kwargs["base_url"] = route_base_url
+            if route:
+                logger.debug(
+                    "zet_agent request selection applied: model=%s provider=%s route_provider=%s request_provider=%s",
+                    model,
+                    runtime_kwargs.get("provider"),
+                    route_provider or "",
+                    request_provider or "",
+                )
+
+        if not model and runtime_kwargs.get("provider"):
+            try:
+                from hermes_cli.models import get_default_model_for_provider
+
+                model = get_default_model_for_provider(runtime_kwargs["provider"])
+                if model:
+                    logger.info(
+                        "No model configured — defaulting to %s for provider %s",
+                        model,
+                        runtime_kwargs["provider"],
+                    )
+            except Exception:
+                pass
+
+        resolved_key = gateway_session_key or ""
+        if not model:
+            recovered = (
+                self._last_resolved_model.get(resolved_key)
+                or self._last_resolved_model.get("*")
+            )
+            if recovered:
+                logger.warning(
+                    "Empty model resolved for session=%s — recovering last-known-good model %s",
+                    resolved_key,
+                    recovered,
+                )
+                model = recovered
+        else:
+            if resolved_key:
+                self._last_resolved_model[resolved_key] = model
+            self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
-        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-        fallback_model = GatewayRunner._load_fallback_model()
-
-        agent = AIAgent(
-            model=model,
-            **runtime_kwargs,
-            max_iterations=max_iterations,
-            quiet_mode=True,
-            verbose_logging=False,
-            ephemeral_system_prompt=ephemeral_system_prompt or None,
-            enabled_toolsets=enabled_toolsets,
-            session_id=session_id,
-            platform=platform_key,
-            stream_delta_callback=stream_delta_callback,
-            tool_progress_callback=tool_progress_callback,
-            tool_start_callback=tool_start_callback,
-            tool_complete_callback=tool_complete_callback,
-            session_db=self._ensure_session_db(),
-            fallback_model=fallback_model,
-            reasoning_config=reasoning_config,
-            gateway_session_key=gateway_session_key,
-            request_overrides=agent_request_overrides or None,
+        max_iterations = _current_max_iterations()
+        fallback_model = (
+            None if confirmed_runtime_lock else GatewayRunner._load_fallback_model()
         )
+
+        agent_kwargs = {
+            "model": model,
+            **runtime_kwargs,
+            **_checkpoint_agent_kwargs(user_config),
+            "max_iterations": max_iterations,
+            "quiet_mode": True,
+            "verbose_logging": False,
+            "ephemeral_system_prompt": ephemeral_system_prompt or None,
+            "enabled_toolsets": enabled_toolsets,
+            "session_id": session_id,
+            "platform": platform_key,
+            "stream_delta_callback": stream_delta_callback,
+            "tool_progress_callback": tool_progress_callback,
+            "tool_start_callback": tool_start_callback,
+            "tool_complete_callback": tool_complete_callback,
+            "session_db": self._ensure_session_db(),
+            "fallback_model": fallback_model,
+            "reasoning_config": reasoning_config,
+            "gateway_session_key": gateway_session_key,
+            "request_overrides": agent_request_overrides or None,
+        }
+        if request_service_tier is not _REQUEST_OPTION_MISSING:
+            agent_kwargs["service_tier"] = request_service_tier
+
+        agent = AIAgent(**agent_kwargs)
         if disable_tools:
             agent.tools = []
             agent.valid_tool_names = set()
             agent._skip_mcp_refresh = True
+        agent._hermes_api_runtime = {
+            "provider": runtime_kwargs.get("provider")
+            or getattr(agent, "provider", "")
+            or "",
+            "model": getattr(agent, "model", None) or model,
+            "route_source": (
+                "session_model_lock"
+                if confirmed_runtime_lock
+                else "session_model_override"
+                if session_override
+                else "raw_request"
+                if route or request_model or request_provider
+                else "global"
+            ),
+        }
         agent.runtime_auxiliary_task_configs = runtime_auxiliary_task_configs
         agent.runtime_supports_vision = runtime_supports_vision
         from gateway.session_context import get_session_env
