@@ -5760,8 +5760,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     event_data = json.dumps(
                         item[1], ensure_ascii=False, separators=(",", ":")
                     )
+                    # Other progress fields are not projected/sanitized.  Keep
+                    # malformed lone surrogates as valid JSON escapes instead
+                    # of allowing one label to terminate the whole SSE stream.
                     await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode(
+                            "utf-8", errors="backslashreplace"
+                        )
                     )
                 elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
                     event_data = json.dumps(item[1])

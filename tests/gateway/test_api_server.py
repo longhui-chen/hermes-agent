@@ -4649,6 +4649,54 @@ class TestTakeoverUIHintOverSSE:
         }
 
     @pytest.mark.asyncio
+    async def test_tool_progress_surrogate_does_not_break_the_sse_stream(self, adapter):
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+
+            async def _mock_run_agent(**kwargs):
+                start = kwargs.get("tool_start_callback")
+                if start:
+                    start("call_surrogate", "terminal", {"command": "ignored"})
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(
+                    adapter, "_response_format_transport_error", return_value=None
+                ),
+                patch(
+                    "agent.display.build_tool_preview",
+                    return_value="Broken \ud800 label",
+                ),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "run command"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert "[DONE]" in body
+        running_wire = next(
+            line[len("data: ") :]
+            for block in body.split("\n\n")
+            if "event: hermes.tool.progress" in block
+            for line in block.splitlines()
+            if line.startswith("data: ")
+            and json.loads(line[len("data: ") :]).get("status") == "running"
+        )
+        assert "\\ud800" in running_wire
+        assert json.loads(running_wire)["label"] == "Broken \ud800 label"
+
+    @pytest.mark.asyncio
     async def test_browser_state_preview_reaches_the_sse_stream(self, adapter):
         app = _create_app(adapter)
         result = json.dumps(
