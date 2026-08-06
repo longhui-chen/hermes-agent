@@ -218,6 +218,45 @@ def test_stalled_body_read_is_cancelled_at_the_deadline(client, monkeypatch):
     assert released.is_set(), "expiry must close the response to unblock the reader"
 
 
+def test_stalled_headers_phase_is_bounded(client, monkeypatch):
+    """The budget must cover `session.get()`, not just the body read.
+
+    `get()` only returns once the status line and headers have arrived, so a
+    peer trickling headers stalls there — before any response object exists to
+    close. Bounding only the body read leaves this hole open, and it hangs agent
+    construction just the same.
+    """
+    entered = threading.Event()
+
+    def stalled_get(*_args, **_kwargs):
+        entered.set()
+        time.sleep(30)  # never returns a response within the budget
+
+    monkeypatch.setattr(client, "_capability_timeout", lambda: 0.2)
+    monkeypatch.setattr(client._CAPABILITY_SESSION, "get", stalled_get)
+
+    started = time.monotonic()
+    with pytest.raises(client.ZettlabMediaDeadlineError):
+        client.get_capabilities("image")
+    elapsed = time.monotonic() - started
+
+    assert entered.is_set()
+    assert elapsed < 5.0, f"headers stall must not hang the caller, took {elapsed:.1f}s"
+
+
+def test_probe_slots_are_bounded(client, monkeypatch):
+    """Abandoned probes keep running, so their number has to be capped."""
+    monkeypatch.setattr(client, "_capability_timeout", lambda: 0.05)
+    monkeypatch.setattr(client._CAPABILITY_SESSION, "get", lambda *a, **k: time.sleep(30))
+
+    for _ in range(6):
+        with pytest.raises(client.ZettlabMediaDeadlineError):
+            client.get_capabilities("image")
+
+    live = [t for t in threading.enumerate() if t.name == "zettlab-capability-probe"]
+    assert len(live) <= 2, f"orphaned probe threads must stay bounded, saw {len(live)}"
+
+
 def test_stalled_probe_degrades_to_tool_unavailable(client, monkeypatch, caplog):
     """A stalled probe must hide the tool, never hang agent construction."""
     released = threading.Event()

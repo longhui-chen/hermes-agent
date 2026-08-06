@@ -53,11 +53,14 @@ CAPABILITY_CACHE_TTL = 60.0
 # otherwise accumulate one 256KB document per profile/config permutation and
 # never release them — an unbounded resident cache under a 2GB device budget.
 MAX_CAPABILITY_CACHE_ENTRIES = 8
-# How long to wait for the capability reader thread to notice the closed
-# response before giving up on it. Short: the thread is a daemon and the raise
-# happens either way, this only avoids leaving an obviously-finishable thread
-# behind.
+# How long to wait for a cancelled probe thread to notice the closed response
+# before giving up on it. Short: the thread is a daemon and the caller raises
+# either way; this only avoids leaving an obviously-finishable thread behind.
 _CAPABILITY_CANCEL_GRACE = 0.5
+# Bound on concurrently in-flight probe threads. A probe abandoned at its
+# deadline keeps running until its socket timeout fires, so without a cap a
+# persistently stalled peer would let one orphan accumulate per probe.
+_CAPABILITY_PROBE_SLOTS = threading.BoundedSemaphore(2)
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 _IMAGE_READ_CHUNK_BYTES = 48 * 1024
 _MAX_LOCAL_IMAGE_PATH_CHARS = 4096
@@ -929,19 +932,7 @@ def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
         if cached is not None and now - cached[0] < CAPABILITY_CACHE_TTL:
             return copy.deepcopy(cached[1])
 
-    timeout = _capability_timeout()
-    deadline = time.monotonic() + timeout
-    resp = _CAPABILITY_SESSION.get(
-        url,
-        timeout=timeout,
-        allow_redirects=False,
-        stream=True,
-    )
-    try:
-        _raise_for_status(resp)
-        data = _bounded_capability_json(resp, MAX_CAPABILITY_RESPONSE_BYTES, deadline)
-    finally:
-        _close_response(resp)
+    data = _fetch_capability_document(url, MAX_CAPABILITY_RESPONSE_BYTES)
     if not isinstance(data, dict):
         raise ZettlabMediaError("media capability response is not a JSON object")
 
@@ -1006,53 +997,8 @@ def _bounded_response_json(resp: requests.Response, limit: int) -> Any:
         raise ZettlabMediaError("media generation response is not valid JSON") from exc
 
 
-def _read_capability_body(resp: requests.Response, limit: int, deadline: float) -> bytes:
-    """Read a bounded body under a *cancellable* wall-clock budget.
-
-    Two separate things have to be true here, and only the first is obvious.
-
-    ``requests``/``urllib3`` bound socket idle time, not total elapsed time. On
-    top of that, ``raw.read(n)`` has ``BufferedReader`` semantics: it returns
-    only once *n* bytes have arrived or the stream ends. So a peer dribbling one
-    byte every few seconds keeps every individual recv comfortably under the
-    socket timeout while stalling the read as a whole — checking a clock between
-    reads cannot help, because control never comes back to check it.
-
-    The bound therefore has to be enforced from outside the read. Run it on a
-    daemon thread and cap it with ``join(deadline)``; on expiry, closing the
-    response is what actually unblocks the reader, after which the thread ends
-    on its own. It is a daemon so that even in the pathological case where the
-    close does not land it can never hold up interpreter exit.
-    """
-    outcome: Dict[str, Any] = {}
-
-    def _read() -> None:
-        try:
-            try:
-                outcome["body"] = resp.raw.read(limit + 1, decode_content=True)
-            except TypeError:
-                outcome["body"] = resp.raw.read(limit + 1)
-        except BaseException as exc:  # noqa: BLE001 — relayed to the caller below
-            outcome["error"] = exc
-
-    reader = threading.Thread(
-        target=_read, name="zettlab-capability-read", daemon=True,
-    )
-    reader.start()
-    reader.join(max(0.0, deadline - time.monotonic()))
-    if reader.is_alive():
-        _close_response(resp)
-        reader.join(_CAPABILITY_CANCEL_GRACE)
-        raise ZettlabMediaDeadlineError("media capability read deadline exceeded")
-
-    error = outcome.get("error")
-    if error is not None:
-        raise error
-    return outcome.get("body") or b""
-
-
-def _bounded_capability_json(resp: Any, limit: int, deadline: float) -> Any:
-    """Parse the capability body, size-capped and deadline-bounded."""
+def _bounded_capability_json(resp: Any, limit: int) -> Any:
+    """Parse the capability body with the response size cap applied."""
     if not isinstance(resp, requests.Response):
         try:
             return resp.json()
@@ -1061,14 +1007,84 @@ def _bounded_capability_json(resp: Any, limit: int, deadline: float) -> Any:
     raw = getattr(resp, "raw", None)
     if raw is None or not hasattr(raw, "read"):
         raise ZettlabMediaError("media capability response body is unavailable")
-
-    body = _read_capability_body(resp, limit, deadline)
+    try:
+        body = raw.read(limit + 1, decode_content=True)
+    except TypeError:
+        body = raw.read(limit + 1)
     if len(body) > limit:
         raise ZettlabMediaError("media capability response exceeds maximum size")
     try:
         return json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ZettlabMediaError("media capability response is not valid JSON") from exc
+
+
+def _fetch_capability_document(url: str, limit: int) -> Any:
+    """Run one capability probe under a cancellable wall-clock budget.
+
+    The budget has to cover the *whole* exchange, not just the body. Neither
+    ``requests`` nor ``urllib3`` bounds total elapsed time — the timeout is
+    socket-idle only — and both halves can stall without ever tripping it:
+
+    - ``session.get()`` returns once the status line and headers have arrived,
+      so a peer trickling headers stalls there;
+    - ``raw.read(n)`` has ``BufferedReader`` semantics and returns only after
+      *n* bytes or end of stream, so a peer trickling the body stalls there.
+
+    In both cases every individual recv stays under the socket timeout while
+    the call as a whole hangs, and checking a clock around it is useless
+    because control never comes back. Since this runs during agent
+    construction, a hang here costs the user the whole turn — strictly worse
+    than the missing-tool symptom this cache exists to fix.
+
+    So run the entire request on a daemon thread and cap it with
+    ``join(deadline)``. Once a response object exists, closing it is what
+    unblocks a stalled body read; before that (still inside ``get()``) there is
+    nothing to close, and we simply stop waiting — the caller degrades on time
+    either way, and the orphan is a daemon that ends on its own when the socket
+    timeout fires. ``_CAPABILITY_PROBE_SLOTS`` bounds how many such orphans can
+    exist at once so a persistently sick peer cannot accumulate threads.
+    """
+    if not _CAPABILITY_PROBE_SLOTS.acquire(blocking=False):
+        raise ZettlabMediaDeadlineError("media capability probe slots exhausted")
+
+    timeout = _capability_timeout()
+    deadline = time.monotonic() + timeout
+    outcome: Dict[str, Any] = {}
+
+    def _run() -> None:
+        resp = None
+        try:
+            resp = _CAPABILITY_SESSION.get(
+                url,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+            )
+            outcome["response"] = resp
+            _raise_for_status(resp)
+            outcome["data"] = _bounded_capability_json(resp, limit)
+        except BaseException as exc:  # noqa: BLE001 — relayed to the caller below
+            outcome["error"] = exc
+        finally:
+            if resp is not None:
+                _close_response(resp)
+            _CAPABILITY_PROBE_SLOTS.release()
+
+    probe = threading.Thread(target=_run, name="zettlab-capability-probe", daemon=True)
+    probe.start()
+    probe.join(max(0.0, deadline - time.monotonic()))
+    if probe.is_alive():
+        resp = outcome.get("response")
+        if resp is not None:
+            _close_response(resp)
+            probe.join(_CAPABILITY_CANCEL_GRACE)
+        raise ZettlabMediaDeadlineError("media capability probe deadline exceeded")
+
+    error = outcome.get("error")
+    if error is not None:
+        raise error
+    return outcome.get("data")
 
 
 def _close_response(resp: Any) -> None:
