@@ -819,9 +819,10 @@ class _MediaHTTPSession:
 class _CapabilityResponse:
     """Minimal response view over an ``http.client`` exchange."""
 
-    def __init__(self, conn: Any, raw: Any) -> None:
+    def __init__(self, conn: Any, raw: Any, sock: Any = None) -> None:
         self._conn = conn
         self._raw = raw
+        self._sock = sock
         self.status_code = int(getattr(raw, "status", 0) or 0)
         self.reason = getattr(raw, "reason", "")
 
@@ -844,6 +845,15 @@ class _CapabilityResponse:
             raise ZettlabMediaError("media capability response is not valid JSON") from exc
 
     def close(self) -> None:
+        # A ``Connection: close`` response detaches the socket from
+        # HTTPConnection after headers, while HTTPResponse's buffered reader
+        # keeps it alive. Retain and shut that socket down directly so a body
+        # read in the probe thread is interrupted before closing both wrappers.
+        _shutdown_socket(self._sock)
+        try:
+            self._raw.close()
+        except Exception:
+            pass
         _shutdown_connection(self._conn)
 
 
@@ -891,12 +901,29 @@ class _CapabilityTransport:
         target = parsed.path or "/"
         if parsed.query:
             target = f"{target}?{parsed.query}"
+        sock = None
         try:
             conn.request("GET", target, headers={"Accept": "application/json", "Connection": "close"})
-            return _CapabilityResponse(conn, conn.getresponse())
+            # Keep the socket before getresponse(): for non-reusable responses
+            # http.client clears conn.sock after parsing headers, but the
+            # returned HTTPResponse still owns a file view of the same socket.
+            sock = getattr(conn, "sock", None)
+            if holder is not None:
+                holder["socket"] = sock
+            return _CapabilityResponse(conn, conn.getresponse(), sock)
         except BaseException:
+            _shutdown_socket(sock)
             _shutdown_connection(conn)
             raise
+
+
+def _shutdown_socket(sock: Any) -> None:
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, ValueError):
+        pass
 
 
 def _shutdown_connection(conn: Any) -> None:
@@ -908,12 +935,7 @@ def _shutdown_connection(conn: Any) -> None:
     """
     if conn is None:
         return
-    sock = getattr(conn, "sock", None)
-    if sock is not None:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+    _shutdown_socket(getattr(conn, "sock", None))
     try:
         conn.close()
     except Exception:
@@ -1174,6 +1196,7 @@ class _CapabilityProbe:
         finally:
             if resp is not None:
                 _close_response(resp)
+            _shutdown_socket(self._outcome.get("socket"))
             _shutdown_connection(self._outcome.get("connection"))
             _probe_state.holder = None
             self._retire()
@@ -1190,6 +1213,7 @@ class _CapabilityProbe:
         # probe instead of joining one that is already being torn down.
         self._retire()
         _close_response(self._outcome.get("response"))
+        _shutdown_socket(self._outcome.get("socket"))
         _shutdown_connection(self._outcome.get("connection"))
 
     def result(self) -> Any:

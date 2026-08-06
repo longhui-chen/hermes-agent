@@ -384,6 +384,115 @@ def test_deadline_shuts_the_socket_down_so_the_probe_ends(client, monkeypatch):
         acceptor.join(1)
 
 
+def test_deadline_shuts_detached_response_socket_so_slow_body_probe_ends(
+    client, monkeypatch
+):
+    """Cancellation must reach a socket detached by ``Connection: close``.
+
+    ``HTTPConnection.getresponse()`` clears ``conn.sock`` after headers when
+    the response cannot be reused, while ``HTTPResponse`` keeps the socket
+    alive through its buffered reader. A peer that then dribbles the body can
+    strand the probe unless the transport retained that socket separately.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    accepted = []
+    body_started = threading.Event()
+    stop = threading.Event()
+
+    def accept_and_dribble_body():
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return
+        accepted.append(conn)
+        try:
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 1000000\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            body_started.set()
+            while not stop.wait(0.1):
+                conn.sendall(b"{")
+        except OSError:
+            pass
+
+    acceptor = threading.Thread(target=accept_and_dribble_body, daemon=True)
+    acceptor.start()
+
+    monkeypatch.setattr(
+        client,
+        "base_url",
+        lambda mt: f"http://127.0.0.1:{port}/api/v1/ai-proxy/v1",
+    )
+    monkeypatch.setattr(client, "_capability_timeout", lambda: 0.3)
+
+    before = {
+        t.ident
+        for t in threading.enumerate()
+        if t.name == "zettlab-capability-probe"
+    }
+    started = time.monotonic()
+    try:
+        with pytest.raises(client.ZettlabMediaDeadlineError):
+            client.get_capabilities("image")
+        elapsed = time.monotonic() - started
+        assert body_started.is_set(), "the peer must reach the slow-body phase"
+        assert elapsed < 3.0, f"caller must return on its deadline, took {elapsed:.1f}s"
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            live = {
+                t.ident
+                for t in threading.enumerate()
+                if t.name == "zettlab-capability-probe"
+            } - before
+            if not live:
+                break
+            time.sleep(0.05)
+        assert not live, "cancelled slow-body probe must not retain its detached socket"
+    finally:
+        stop.set()
+        for conn in accepted:
+            conn.close()
+        listener.close()
+        acceptor.join(1)
+
+
+def test_capability_response_closes_its_retained_socket_and_raw_stream(client):
+    """Response cleanup releases both views of a detached connection."""
+
+    class _Socket:
+        def __init__(self):
+            self.shutdown_calls = []
+
+        def shutdown(self, how):
+            self.shutdown_calls.append(how)
+
+    class _Raw:
+        status = 200
+        reason = "OK"
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    sock = _Socket()
+    raw = _Raw()
+    resp = client._CapabilityResponse(conn=None, raw=raw, sock=sock)
+
+    resp.close()
+
+    assert sock.shutdown_calls == [socket.SHUT_RDWR]
+    assert raw.closed is True
+
+
 def test_capability_response_enforces_the_size_cap(client):
     """The real transport's reader keeps the 256KB cap."""
 
