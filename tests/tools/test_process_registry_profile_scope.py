@@ -128,6 +128,46 @@ def test_managed_recovery_rejects_wrong_uid_or_cgroup(monkeypatch, tmp_path):
     assert registry._running == {}
 
 
+def test_managed_pid_matches_service_uid_and_profile_cgroup(monkeypatch, tmp_path):
+    from tools.environments import local as local_module
+
+    pid = 123
+    proc_root = tmp_path / "proc"
+    process_root = proc_root / str(pid)
+    process_root.mkdir(parents=True)
+    (process_root / "status").write_text(
+        "State:\tS (sleeping)\nUid:\t0\t0\t0\t0\n",
+        encoding="utf-8",
+    )
+    (process_root / "cgroup").write_text(
+        "0::/system.slice/zettlab-claw.service/terminal-profile-100001\n",
+        encoding="ascii",
+    )
+    monkeypatch.setattr(process_module, "_PROC_ROOT", proc_root)
+    monkeypatch.setattr(process_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_identity",
+        lambda _env=None: (100001, 100001),
+    )
+    monkeypatch.setenv(
+        "HERMES_MANAGED_CGROUP_ROOT",
+        "/system.slice/zettlab-claw.service",
+    )
+
+    assert ProcessRegistry._managed_pid_matches_profile(
+        pid, "/profiles/coder"
+    )
+
+    (process_root / "status").write_text(
+        "State:\tS (sleeping)\nUid:\t100001\t100001\t100001\t100001\n",
+        encoding="utf-8",
+    )
+    assert not ProcessRegistry._managed_pid_matches_profile(
+        pid, "/profiles/coder"
+    )
+
+
 def test_global_cleanup_uses_only_preselected_registry_objects(monkeypatch, tmp_path):
     registry = _registry()
     main = (tmp_path / "main").resolve()

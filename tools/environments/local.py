@@ -32,8 +32,6 @@ _MANAGED_BOOTSTRAP_ENV_KEYS = frozenset({
     "HERMES_MANAGED_CGROUP_UNIT",
     "HERMES_MANAGED_CGROUP_ROOT",
 })
-_MANAGED_SETPRIV_PATH = "/usr/bin/setpriv"
-_MANAGED_UNSHARE_PATH = "/usr/bin/unshare"
 _MANAGED_TERMINAL_UID_MIN = 100_000
 _MANAGED_TERMINAL_UID_MAX = 2_000_000_000
 _MANAGED_TERMINAL_IDENTITY_ATTEMPTS = 64
@@ -69,76 +67,6 @@ _MANAGED_TERMINAL_CGROUP_ENTER = (
     "finally:\n os.close(fd)\n"
     "os.execv(sys.argv[2],sys.argv[2:])\n"
 )
-_MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
-    "import ctypes,os,re,stat,sys\n"
-    "if len(sys.argv)<4:\n raise OSError('managed private tmp argv is invalid')\n"
-    "sources=sys.argv[1:3]\n"
-    "for source in sources:\n"
-    " info=os.lstat(source)\n"
-    " if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_mode&0o077:\n"
-    "  raise OSError('managed private tmp source is not trusted')\n"
-    "for target in ('/tmp','/var/tmp'):\n"
-    " info=os.lstat(target)\n"
-    " if not stat.S_ISDIR(info.st_mode):\n  raise OSError('managed private tmp target is unavailable')\n"
-    "libc=ctypes.CDLL(None,use_errno=True)\n"
-    "libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]\n"
-    "libc.mount.restype=ctypes.c_int\n"
-    "def mount(source,target,flags):\n"
-    " result=libc.mount(source,target,None,flags,None)\n"
-    " if result!=0:\n  error=ctypes.get_errno();raise OSError(error,os.strerror(error),os.fsdecode(target))\n"
-    "mount(None,b'/',16384|262144)\n"
-    "mount(os.fsencode(sources[0]),b'/tmp',4096|16384)\n"
-    "mount(os.fsencode(sources[1]),b'/var/tmp',4096|16384)\n"
-    # 相对 HERMES_HOME 会把子进程 cwd 下的同名目录挂成只读，必须要求绝对路径
-    "hermes_home=os.environ.get('HERMES_HOME','')\n"
-    "skill_root=os.path.join(hermes_home,'skills')\n"
-    "if os.path.isabs(hermes_home) and os.path.isdir(skill_root):\n"
-    " info=os.lstat(skill_root)\n"
-    " if not stat.S_ISDIR(info.st_mode) or info.st_mode&0o022:\n"
-    "  raise OSError('managed skill source is not trusted')\n"
-    " encoded=os.fsencode(skill_root)\n"
-    " mount(encoded,encoded,4096|16384)\n"
-    # MS_REMOUNT 不递归：skills 下的子挂载若不逐个补只读，就是快照守卫豁免区里的可写洞
-    " points={skill_root}\n"
-    " with open('/proc/self/mountinfo','rb') as handle:\n"
-    "  for line in handle:\n"
-    "   fields=line.split(b' ')\n"
-    "   if len(fields)<5:\n"
-    "    continue\n"
-    "   point=os.fsdecode(re.sub(rb'\\\\([0-7]{3})',lambda m:bytes([int(m.group(1),8)]),fields[4]))\n"
-    "   if point==skill_root or point.startswith(skill_root+'/'):\n"
-    "    points.add(point)\n"
-    " for point in sorted(points,key=len,reverse=True):\n"
-    "  mount(None,os.fsencode(point),32|4096|1|2|4)\n"
-    "os.umask(0o077)\n"
-    "os.execv(sys.argv[3],sys.argv[3:])\n"
-)
-_MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER = (
-    "import ctypes,os,stat,sys\n"
-    "if len(sys.argv)<4:\n raise OSError('managed execute_code private tmp argv is invalid')\n"
-    "workspace,var_tmp=sys.argv[1:3]\n"
-    "for source in (workspace,var_tmp):\n"
-    " info=os.lstat(source)\n"
-    " if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_mode&0o077:\n"
-    "  raise OSError('managed execute_code private tmp source is not trusted')\n"
-    "for target in ('/tmp','/var/tmp'):\n"
-    " info=os.lstat(target)\n"
-    " if not stat.S_ISDIR(info.st_mode):\n  raise OSError('managed execute_code private tmp target is unavailable')\n"
-    "libc=ctypes.CDLL(None,use_errno=True)\n"
-    "libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]\n"
-    "libc.mount.restype=ctypes.c_int\n"
-    "def mount(source,target,flags):\n"
-    " result=libc.mount(source,target,None,flags,None)\n"
-    " if result!=0:\n  error=ctypes.get_errno();raise OSError(error,os.strerror(error),os.fsdecode(target))\n"
-    "mount(None,b'/',16384|262144)\n"
-    "mount(os.fsencode(var_tmp),b'/var/tmp',4096|16384)\n"
-    "mount(os.fsencode(workspace),b'/tmp',4096|16384)\n"
-    "os.chdir('/tmp')\n"
-    "os.umask(0o077)\n"
-    "os.execv(sys.argv[3],sys.argv[3:])\n"
-)
-
-
 def _managed_terminal_profile_scope(
     env: Mapping[str, str] | None = None,
 ) -> str:
@@ -170,7 +98,7 @@ def _validate_managed_root_directory_chain(directory: Path) -> Path:
 def _managed_terminal_identity(
     env: Mapping[str, str] | None = None,
 ) -> tuple[int, int]:
-    """Derive one device-independent non-root identity per multiplex profile."""
+    """Derive a profile resource ID without changing the command's service UID."""
 
     if _IS_WINDOWS or os.geteuid() != 0:
         raise OSError("managed terminal requires a root identity broker")
@@ -228,40 +156,11 @@ def _managed_terminal_identity(
     raise OSError("managed terminal profile identity collision")
 
 
-def _managed_terminal_privilege_drop_prefix(
-    env: Mapping[str, str] | None = None,
-) -> list[str]:
-    """Return the fixed fail-closed capability drop for model shell commands."""
-
-    try:
-        info = os.lstat(_MANAGED_SETPRIV_PATH)
-    except OSError as exc:
-        raise OSError("managed terminal privilege drop is unavailable") from exc
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
-        or info.st_mode & 0o022
-    ):
-        raise OSError("managed terminal privilege drop is not trusted")
-    uid, gid = _managed_terminal_identity(env)
-    return [
-        _MANAGED_SETPRIV_PATH,
-        f"--reuid={uid}",
-        f"--regid={gid}",
-        "--clear-groups",
-        "--bounding-set=-all",
-        "--inh-caps=-all",
-        "--ambient-caps=-all",
-        "--no-new-privs",
-        "--",
-    ]
-
-
 def _managed_execute_code_identity(
     env: Mapping[str, str],
     execution_scope: str,
 ) -> tuple[int, int]:
-    """Reserve a per-execution UID distinct from every persistent terminal."""
+    """Reserve an invocation resource ID without changing the command UID."""
 
     if _IS_WINDOWS or os.geteuid() != 0:
         raise OSError("managed execute_code requires a root identity broker")
@@ -315,7 +214,7 @@ def _release_managed_execute_code_identity(
     env: Mapping[str, str],
     execution_scope: str,
 ) -> None:
-    """Release an invocation UID after its process tree and RPC socket are gone."""
+    """Release an invocation resource ID after its cgroup and RPC socket are gone."""
 
     owner_scope = (
         f"execute-code\0{_managed_terminal_profile_scope(env)}\0"
@@ -333,7 +232,7 @@ def _managed_execute_code_sandbox_argv(
     execution_scope: str | None,
     workspace: str | None = None,
 ) -> list[str]:
-    """Drop one execute_code invocation into its non-shared identity domain."""
+    """Keep one root execute_code invocation inside its resource cgroup."""
 
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return list(argv)
@@ -341,22 +240,8 @@ def _managed_execute_code_sandbox_argv(
         raise OSError("managed execute_code scope is unavailable")
     if workspace is None:
         raise OSError("managed execute_code workspace is unavailable")
-    try:
-        info = os.lstat(_MANAGED_SETPRIV_PATH)
-    except OSError as exc:
-        raise OSError("managed execute_code privilege drop is unavailable") from exc
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
-        or info.st_mode & 0o022
-    ):
-        raise OSError("managed execute_code privilege drop is not trusted")
-    uid, gid = _managed_execute_code_identity(env, execution_scope)
+    uid, _gid = _managed_execute_code_identity(env, execution_scope)
     launcher = _trusted_managed_python()
-    namespace_launcher = _trusted_managed_unshare()
-    private_tmp, private_var_tmp = _managed_execute_code_private_tmp_paths(
-        workspace, uid
-    )
     from tools.trusted_direct_runner import (
         _create_managed_invocation_cgroup,
         _kill_and_remove_managed_cgroup,
@@ -377,26 +262,6 @@ def _managed_execute_code_sandbox_argv(
         "-c",
         _MANAGED_TERMINAL_CGROUP_ENTER,
         str(cgroup.path),
-        _MANAGED_SETPRIV_PATH,
-        f"--reuid={uid}",
-        f"--regid={gid}",
-        "--clear-groups",
-        "--bounding-set=-all",
-        "--inh-caps=-all",
-        "--ambient-caps=-all",
-        "--no-new-privs",
-        "--",
-        namespace_launcher,
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--",
-        launcher,
-        "-I",
-        "-c",
-        _MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER,
-        str(private_tmp),
-        str(private_var_tmp),
         *argv,
     ]
 
@@ -406,12 +271,11 @@ def _managed_terminal_argv(
     *,
     env: Mapping[str, str] | None = None,
 ) -> list[str]:
-    """Apply the managed capability boundary to every local terminal path."""
+    """Keep a root terminal command inside its profile resource cgroup."""
 
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return list(argv)
     cgroup = _ensure_managed_terminal_cgroup(env)
-    _home, private_tmp, private_var_tmp = _managed_terminal_home_paths(env)
     launcher = _trusted_managed_python()
     return [
         launcher,
@@ -419,20 +283,6 @@ def _managed_terminal_argv(
         "-c",
         _MANAGED_TERMINAL_CGROUP_ENTER,
         str(cgroup),
-        *_managed_terminal_privilege_drop_prefix(env),
-        _trusted_managed_unshare(),
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--fork",
-        "--kill-child=KILL",
-        "--",
-        launcher,
-        "-I",
-        "-c",
-        _MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
-        str(private_tmp),
-        str(private_var_tmp),
         *list(argv),
     ]
 
@@ -453,23 +303,6 @@ def _trusted_managed_python() -> str:
     ):
         raise OSError("managed terminal cgroup launcher is not trusted")
     return str(interpreter)
-
-
-def _trusted_managed_unshare() -> str:
-    """Return the fixed root-owned user/mount namespace launcher."""
-
-    try:
-        info = os.lstat(_MANAGED_UNSHARE_PATH)
-    except OSError as exc:
-        raise OSError("managed terminal namespace launcher is unavailable") from exc
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
-        or info.st_mode & 0o022
-        or not info.st_mode & 0o111
-    ):
-        raise OSError("managed terminal namespace launcher is not trusted")
-    return _MANAGED_UNSHARE_PATH
 
 
 def _managed_terminal_cgroup_for_uid(
@@ -646,58 +479,15 @@ def _prepare_managed_execute_code_workspace(
             raise OSError("managed execute_code workspace entry is not trusted")
         os.chown(path, uid, gid)
         os.chmod(path, 0o600)
-    for child_name in ("var-tmp",):
-        child = Path(directory) / child_name
-        os.mkdir(child, 0o700)
-        child_info = os.lstat(child)
-        if (
-            not stat.S_ISDIR(child_info.st_mode)
-            or child_info.st_uid != 0
-            or child_info.st_gid != 0
-            or child_info.st_mode & 0o077
-        ):
-            raise OSError("managed execute_code private tmp is not trusted")
-        os.chown(child, uid, gid)
-        os.chmod(child, 0o700)
     os.chown(directory, uid, gid)
     os.chmod(directory, 0o700)
     return uid
 
 
-def _managed_execute_code_private_tmp_paths(
-    workspace: str, uid: int
-) -> tuple[Path, Path]:
-    """Validate invocation-owned mount sources created in its scratch workspace."""
-
-    raw_home = str(workspace or "")
-    if not raw_home or not os.path.isabs(raw_home) or "\x00" in raw_home:
-        raise OSError("managed execute_code private tmp is unavailable")
-    home = Path(raw_home)
-    home_info = os.lstat(home)
-    if (
-        not stat.S_ISDIR(home_info.st_mode)
-        or home_info.st_uid != uid
-        or home_info.st_gid != uid
-        or home_info.st_mode & 0o077
-    ):
-        raise OSError("managed execute_code HOME is not trusted")
-
-    private_var_tmp = home / "var-tmp"
-    child_info = os.lstat(private_var_tmp)
-    if (
-        not stat.S_ISDIR(child_info.st_mode)
-        or child_info.st_uid != uid
-        or child_info.st_gid != uid
-        or child_info.st_mode & 0o077
-    ):
-        raise OSError("managed execute_code private tmp is not trusted")
-    return home, private_var_tmp
-
-
-def _managed_terminal_home_paths(
+def _managed_terminal_home_path(
     env: Mapping[str, str] | None,
-) -> tuple[Path, Path, Path]:
-    """Create the profile HOME and private tmp mount sources."""
+) -> Path:
+    """Create the profile-scoped HOME used by root service commands."""
 
     uid, gid = _managed_terminal_identity(env)
     parent = _MANAGED_TERMINAL_HOME_ROOT.parent
@@ -742,37 +532,13 @@ def _managed_terminal_home_paths(
     ):
         raise OSError("managed terminal profile home is not trusted")
 
-    private_paths = []
-    for child_name in ("tmp", "var-tmp"):
-        child = home / child_name
-        created = False
-        try:
-            os.mkdir(child, 0o700)
-            created = True
-        except FileExistsError:
-            pass
-        if created:
-            os.chown(child, uid, gid)
-        child_info = os.lstat(child)
-        if (
-            not stat.S_ISDIR(child_info.st_mode)
-            or child_info.st_uid != uid
-            or child_info.st_gid != gid
-        ):
-            raise OSError("managed terminal private tmp is not trusted")
-        os.chmod(child, 0o700, follow_symlinks=False)
-        child_info = os.lstat(child)
-        if child_info.st_mode & 0o077:
-            raise OSError("managed terminal private tmp is not owner-only")
-        private_paths.append(child)
-
-    return home, private_paths[0], private_paths[1]
+    return home
 
 
 def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
-    """Set a profile-scoped HOME and namespace-local tmp environment."""
+    """Set a profile-scoped HOME and the service-local tmp environment."""
 
-    home, _private_tmp, _private_var_tmp = _managed_terminal_home_paths(env)
+    home = _managed_terminal_home_path(env)
     home_text = str(home)
     env["HOME"] = home_text
     env["TMPDIR"] = "/tmp"
@@ -785,7 +551,7 @@ def _managed_uid_processes(
     uid: int,
     proc_root: Path = Path("/proc"),
 ) -> set[int]:
-    """Return Linux processes whose effective UID is the managed identity."""
+    """Return legacy Linux processes still running under a resource ID."""
     if _IS_WINDOWS or not proc_root.is_dir():
         return set()
     processes: set[int] = set()
@@ -818,9 +584,9 @@ def _managed_uid_processes(
 
 
 def _terminate_managed_uid(uid: int, timeout: float = 2.0) -> int:
-    """Terminate every process in a managed identity and verify it is empty."""
+    """Terminate legacy processes that still use a retired resource ID."""
     killed: set[int] = set()
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
         live = _managed_uid_processes(uid)
         if not live:
             return len(killed)
@@ -849,13 +615,12 @@ def retire_managed_execute_code_identity(
     env: Mapping[str, str],
     execution_scope: str,
 ) -> int:
-    """Empty one invocation UID before making it available for reuse.
+    """Empty one invocation cgroup before making its resource ID reusable.
 
     A model script can detach descendants from the process group that owns the
-    top-level ``execute_code`` child.  The per-invocation UID is the durable
-    containment boundary, so it must be verified empty before its reservation
-    is released.  If termination fails, the reservation deliberately remains
-    live and the caller fails closed.
+    top-level ``execute_code`` child. The per-invocation cgroup is the durable
+    containment boundary. UID cleanup remains for processes launched by an
+    older service version during a rolling upgrade.
     """
 
     with _MANAGED_EXECUTE_CODE_CGROUP_LOCK:
@@ -874,7 +639,7 @@ def retire_managed_execute_code_identity(
 
 
 def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
-    """Destroy a profile UID domain before that profile can be recreated."""
+    """Destroy a profile resource domain before it can be recreated."""
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return {
             "killed_uid_processes": 0,
@@ -935,37 +700,6 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
             "terminal_cgroup_removed": cgroup_removed,
             "identity_retired": True,
         }
-
-
-def _managed_identity_can_traverse(
-    directory: str,
-    *,
-    uid: int,
-    gid: int,
-) -> bool:
-    """Check directory traversal using the runner's cleared-group identity."""
-
-    try:
-        resolved = Path(directory).resolve(strict=True)
-    except (OSError, RuntimeError):
-        return False
-    components = [resolved, *resolved.parents]
-    for component in reversed(components):
-        try:
-            info = component.stat()
-        except OSError:
-            return False
-        if not stat.S_ISDIR(info.st_mode):
-            return False
-        if info.st_uid == uid:
-            permission = (info.st_mode >> 6) & 0o7
-        elif info.st_gid == gid:
-            permission = (info.st_mode >> 3) & 0o7
-        else:
-            permission = info.st_mode & 0o7
-        if permission & 0o1 == 0:
-            return False
-    return True
 
 
 def _managed_skill_entry_mode(info: os.stat_result) -> int | None:
@@ -1350,12 +1084,11 @@ def _migrate_managed_output_tree(
 
 
 def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
-    """Expose only this profile's skills and output to its terminal identity.
+    """Normalize profile skills and output for managed runtime compatibility.
 
-    Platform profiles are root-owned. The model shell receives a stable,
-    profile-stable UID/GID, so it needs execute permission on the common parents,
-    profile-group access to its own source, and ownership of its output. The
-    skill tree is additionally bind-mounted read-only in the child namespace.
+    Managed commands keep the service UID. The derived ID remains an ownership
+    and cgroup key so existing profile data, cleanup, and upgrades stay
+    compatible while the command execution path runs as the service user.
     """
 
     uid, gid = _managed_terminal_identity(env)
@@ -1525,9 +1258,9 @@ def _managed_output_is_trusted(output_dir: str) -> bool:
     The trust check lives here rather than at the (single) preparation call site
     so that both sides of the contract reach the same verdict: the guard never
     runs preparation, and an output directory rejected there must not silently
-    remain the guard's protection target. A symlink, a group/other-writable
-    directory, or anything not owned by root or the derived identity means the
-    platform did not provision it — fall back to the profile home instead.
+    remain the guard's protection target. A symlink or group/other-writable
+    directory still falls back to the profile home. Ownership no longer limits
+    the root service identity that runs managed commands.
     """
 
     try:
@@ -1538,39 +1271,7 @@ def _managed_output_is_trusted(output_dir: str) -> bool:
         return False
     if info.st_mode & 0o022:
         return False
-    return info.st_uid == 0 or info.st_uid >= _MANAGED_TERMINAL_UID_MIN
-
-
-def _managed_cwd_is_unusable(cwd: str) -> bool:
-    """Report whether *cwd* is unreachable by any derived identity.
-
-    Identity-free stand-in for :func:`_managed_identity_can_traverse`, used when
-    the derived UID is not available (the guard resolves an effective cwd from
-    the gateway process, which may not carry the terminal's env). Walks the whole
-    parent chain, not just the leaf: the execution side rejects a cwd whose
-    *parent* is unreachable (``/volume1`` at 0770 root:group), and a leaf-only
-    check would leave the guard protecting a directory the command never enters.
-
-    A derived identity owns nothing outside its own profile tree, so "other"
-    execute is the honest permission to demand of a candidate cwd. ``/root`` —
-    the hardcoded terminal default that made every non-readonly command fail
-    closed on device — is 0700 root and falls out of the same rule.
-    """
-
-    if not cwd:
-        return True
-    try:
-        resolved = Path(cwd).resolve(strict=True)
-    except (OSError, RuntimeError):
-        return True
-    for component in (resolved, *resolved.parents):
-        try:
-            info = component.stat()
-        except OSError:
-            return True
-        if not stat.S_ISDIR(info.st_mode) or not info.st_mode & 0o001:
-            return True
-    return False
+    return True
 
 
 def managed_effective_cwd(
@@ -1590,10 +1291,9 @@ def managed_effective_cwd(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return cwd
     try:
-        uid, gid = _managed_terminal_identity(env)
-        usable = bool(cwd) and _managed_identity_can_traverse(cwd, uid=uid, gid=gid)
+        usable = bool(cwd) and Path(cwd).resolve(strict=True).is_dir()
     except Exception:
-        usable = not _managed_cwd_is_unusable(cwd)
+        usable = False
     if usable:
         return cwd
     return managed_fallback_cwd(env, home=home) or home or cwd
@@ -2086,7 +1786,7 @@ MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
 PROFILE_PUBLIC_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # Platform-owned, profile-scoped filesystem capability. Unlike connector
     # and action tokens this value is safe for model-authored shell commands,
-    # and skills use it to keep mutable state outside their read-only source.
+    # and skills use it as the conventional location for mutable state.
     "ZET_AGENT_OUTPUT_DIR",
 })
 _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
