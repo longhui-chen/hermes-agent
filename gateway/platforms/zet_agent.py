@@ -107,6 +107,7 @@ from gateway.platforms.api_server import (
     MAX_REQUEST_BYTES,
     _REQUEST_OPTION_MISSING,
     _ProviderAuthResolutionError,
+    _api_request_profile,
     _apply_runtime_agent_overrides,
     _chat_finish_reason_from_result,
     _clean_request_string,
@@ -531,6 +532,11 @@ class ZetAgentAdapter(APIServerAdapter):
         self._session_lock = threading.Lock()
         self._approval_session_ids: set[str] = set()
 
+        # The file itself is profile-local. Keep the in-memory mirror keyed by
+        # canonical HERMES_HOME as well so serving coder after main cannot
+        # write main's session metadata into coder's file.
+        self._seen_models_by_home: Dict[str, "OrderedDict[str, str]"] = {}
+
         # Portable imports mutate profile-owned state outside the chat-run
         # path. Track them explicitly so a successful profile unload cannot
         # race a worker that later recreates the deleted profile directory.
@@ -763,9 +769,61 @@ class ZetAgentAdapter(APIServerAdapter):
                 user_name="",
                 session_key=session_key or session_id,
                 async_delivery=self.supports_async_delivery,
+                exec_ask="1",
             )
         except Exception as _e:
             logger.warning("[zet_agent] set_session_vars failed (cron origin won't auto-populate): %s", _e)
+
+    def _bind_api_server_session(
+        self,
+        *,
+        chat_id: str,
+        session_key: str,
+        session_id: str,
+    ) -> list:
+        """Bind inherited API routes as Zet, without touching the parent.
+
+        In particular ``/v1/runs`` owns a worker lifecycle that never calls
+        Zet's ``_run_agent`` wrapper. A subclass chokepoint keeps approvals,
+        cron origin and async-delivery correct there while ordinary
+        APIServerAdapter requests remain ``api_server`` and non-delivering.
+        """
+        from gateway.session_context import set_session_vars
+
+        return set_session_vars(
+            platform="zet_agent",
+            chat_id=chat_id,
+            session_key=session_key,
+            session_id=session_id,
+            async_delivery=self.supports_async_delivery,
+            cron_session="",
+            exec_ask="1",
+        )
+
+    @staticmethod
+    def _public_session_id_for_current_profile(session_key: str) -> Optional[str]:
+        """Return the public App id represented by an opaque Zet session key.
+
+        Bare ids are already public. Multiplex keys have the exact
+        ``<current HERMES_HOME>|<public id>`` shape; a foreign-home prefix is
+        rejected rather than stripped so one profile cannot claim another's
+        completion.
+        """
+        key = str(session_key or "").strip()
+        if not key:
+            return None
+        if "|" not in key:
+            return key
+        try:
+            from hermes_constants import get_hermes_home
+
+            prefix = f"{get_hermes_home()}|"
+        except Exception:
+            return None
+        if not key.startswith(prefix):
+            return None
+        public_id = key[len(prefix):].strip()
+        return public_id or None
 
     def resolve_process_event_source(self, session_key: str):
         """Claim synthetic process events whose session_key is a zet_agent
@@ -779,7 +837,7 @@ class ZetAgentAdapter(APIServerAdapter):
         gateway actually persisted are claimed, so foreign platforms' keys
         stay unresolvable.
         """
-        key = (session_key or "").strip()
+        key = self._public_session_id_for_current_profile(session_key)
         if not key:
             return None
         try:
@@ -858,7 +916,12 @@ class ZetAgentAdapter(APIServerAdapter):
         payload = {
             "schema": 1,
             "kind": "delegation",
-            "session_key": str(evt.get("session_key") or ""),
+            "session_key": (
+                self._public_session_id_for_current_profile(
+                    str(evt.get("session_key") or "")
+                )
+                or str(evt.get("parent_session_id") or "")
+            ),
             "session_id": str(evt.get("parent_session_id") or ""),
             "delegation_id": str(evt.get("delegation_id") or ""),
             "status": evt.get("status"),
@@ -2349,6 +2412,63 @@ class ZetAgentAdapter(APIServerAdapter):
     # Agent factory override
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _session_model_state_key(session_id: str) -> str:
+        profile = str(_api_request_profile.get() or "main").strip() or "main"
+        if profile == "default":
+            profile = "main"
+        return f"agent:{profile}:zet_agent:dm:{session_id}"
+
+    def _session_model_override_for(
+        self, session_key: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve local-server's public id into profile-owned runner state.
+
+        The JSON control plane is already profile-local. Its in-memory mirror
+        must encode the same owner; a bare public id would collide across
+        profiles and cannot be cleared by ``unload_profile_runtime``.
+        """
+        raw_key = str(session_key or "").strip()
+        if not raw_key:
+            return None
+        public_id = self._public_session_id_for_current_profile(raw_key)
+        profile = str(_api_request_profile.get() or "main").strip() or "main"
+        if profile == "default":
+            profile = "main"
+        state_prefix = f"agent:{profile}:zet_agent:dm:"
+        if raw_key.startswith(state_prefix):
+            state_key = raw_key
+            public_id = raw_key[len(state_prefix):]
+        elif public_id:
+            state_key = self._session_model_state_key(public_id)
+        else:
+            return None
+
+        gw = getattr(self, "gateway_runner", None)
+        overrides = getattr(gw, "_session_model_overrides", None) if gw is not None else None
+        if overrides is None:
+            return None
+        try:
+            candidate = overrides.get(state_key)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, dict):
+            return dict(candidate)
+
+        # Rehydrate from the active profile's local-server-owned file. Do not
+        # consult a process-global bare-id cache: that was the cross-profile
+        # leak this scoped key replaces.
+        try:
+            from gateway.session_model_overrides import load_session_model_overrides
+
+            candidate = load_session_model_overrides().get(public_id or "")
+        except Exception:
+            candidate = None
+        if not isinstance(candidate, dict):
+            return None
+        overrides[state_key] = dict(candidate)
+        return dict(candidate)
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -2399,15 +2519,6 @@ class ZetAgentAdapter(APIServerAdapter):
         ephemeral_system_prompt = (
             _zettlab_workflow_addendum(bool(plan_auto_execute))
             + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
-        )
-
-        # cron origin + async-delivery capability（见 helper docstring）。
-        # ZetAgent's _run_agent keeps the public App session in session_id and
-        # passes a profile-scoped multiplex key as gateway_session_key.  Cron
-        # must persist the former while approval/clarify routing uses the latter.
-        self._bind_turn_session_context(
-            session_id or gateway_session_key or "",
-            session_key=gateway_session_key,
         )
 
         from run_agent import AIAgent
@@ -2500,17 +2611,11 @@ class ZetAgentAdapter(APIServerAdapter):
         # session overrides live in gateway_runner._session_model_overrides
         # which this adapter's _create_agent bypasses. Check it here.
         gw = getattr(self, "gateway_runner", None)
-        # gateway_session_key is profile-scoped for approval isolation; model
-        # overrides remain keyed by the external session id inside a profile.
         override_key = session_id or gateway_session_key
         runtime_auxiliary_task_configs = None
         runtime_supports_vision = None
         session_override = None
         if not confirmed_runtime_lock and gw is not None and override_key:
-            candidate = getattr(gw, "_session_model_overrides", {}).get(override_key)
-            if isinstance(candidate, dict):
-                session_override = dict(candidate)
-        if not confirmed_runtime_lock and session_override is None:
             session_override = self._session_model_override_for(override_key)
 
         from hermes_cli.model_switch import resolve_effective_model
@@ -2636,9 +2741,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
                 model = recovered
         else:
-            if resolved_key:
-                self._last_resolved_model[resolved_key] = model
-            self._last_resolved_model["*"] = model
+            self._remember_last_resolved_model(resolved_key, model)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -2883,11 +2986,9 @@ class ZetAgentAdapter(APIServerAdapter):
         ``HERMES_EXEC_ASK`` flips the approval gate from "skip" to
         "block-and-prompt" outside CLI/gateway sessions.
 
-        Both vars are saved and restored around the call so concurrent
-        chat.completions requests do not leak each other's session key.
-        Process-global env is not strictly safe under concurrency, but
-        webui uses the same pattern (api/streaming.py) and the
-        contention window is short enough in practice.
+        These flags are bound through gateway.session_context by the
+        subclass ``_bind_api_server_session`` chokepoint. They are never mirrored
+        into process-global ``os.environ`` because HTTP turns overlap.
         """
         # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
         # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
@@ -2955,12 +3056,6 @@ class ZetAgentAdapter(APIServerAdapter):
                         user_message = f"{_note}\n\n{user_message}"
         except Exception:
             logger.debug("[zet_agent] model-identity note hook failed", exc_info=True)
-
-        old_session_key = os.environ.get("HERMES_SESSION_KEY")
-        old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
-        if session_id:
-            os.environ["HERMES_SESSION_KEY"] = session_id
-        os.environ.setdefault("HERMES_EXEC_ASK", "1")
 
         from gateway.session_context import clear_turn_vars, set_turn_vars
 
@@ -3156,14 +3251,6 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
             except Exception:
                 logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
-            if old_session_key is None:
-                os.environ.pop("HERMES_SESSION_KEY", None)
-            else:
-                os.environ["HERMES_SESSION_KEY"] = old_session_key
-            if old_exec_ask is None:
-                os.environ.pop("HERMES_EXEC_ASK", None)
-            else:
-                os.environ["HERMES_EXEC_ASK"] = old_exec_ask
             clear_turn_vars(turn_context_tokens)
 
     def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
@@ -3172,13 +3259,9 @@ class ZetAgentAdapter(APIServerAdapter):
         default. Mirrors the model resolution in ``_create_agent`` so the
         open-time identity check compares against what the agent really runs.
         """
-        gw = getattr(self, "gateway_runner", None)
         key = gateway_session_key or session_id
-        if gw is not None and key:
-            try:
-                override = getattr(gw, "_session_model_overrides", {}).get(key)
-            except Exception:
-                override = None
+        if key:
+            override = self._session_model_override_for(key)
             if override and override.get("model"):
                 return override["model"]
         try:
@@ -3199,24 +3282,61 @@ class ZetAgentAdapter(APIServerAdapter):
                     self._seen_models_lock = lk
         return lk
 
+    @staticmethod
+    def _seen_models_home_key() -> str:
+        from hermes_constants import get_hermes_home
+
+        return os.path.abspath(os.fspath(get_hermes_home()))
+
     def _ensure_seen_models(self) -> "OrderedDict[str, str]":
-        """Lazily load (once) the per-session last-seen model map. Call under _seen_lock()."""
-        if not getattr(self, "_seen_loaded", False):
-            try:
-                from gateway.session_seen_models import load_seen_models
-                self._seen_models = OrderedDict(load_seen_models())
-            except Exception:
-                self._seen_models = OrderedDict()
-                logger.debug("[zet_agent] load_seen_models failed", exc_info=True)
-            self._seen_loaded = True
-        return self._seen_models
+        """Load the active profile's last-seen model map. Call under lock."""
+        home_key = self._seen_models_home_key()
+        caches = getattr(self, "_seen_models_by_home", None)
+        if caches is None:
+            caches = {}
+            self._seen_models_by_home = caches
+        seen = caches.get(home_key)
+        if seen is None:
+            # Compatibility for embedders/tests that seeded the former
+            # single-profile attributes before the first lookup.
+            if getattr(self, "_seen_loaded", False) and hasattr(self, "_seen_models"):
+                seen = OrderedDict(getattr(self, "_seen_models", {}))
+                self._seen_loaded = False
+            else:
+                try:
+                    from gateway.session_seen_models import load_seen_models, seen_path
+
+                    seen = OrderedDict(load_seen_models(seen_path(Path(home_key))))
+                except Exception:
+                    seen = OrderedDict()
+                    logger.debug("[zet_agent] load_seen_models failed", exc_info=True)
+            caches[home_key] = seen
+        self._seen_models = seen
+        return seen
 
     def _save_seen_models(self) -> None:
         try:
-            from gateway.session_seen_models import save_seen_models
-            save_seen_models(getattr(self, "_seen_models", {}))
+            from gateway.session_seen_models import save_seen_models, seen_path
+
+            home_key = self._seen_models_home_key()
+            seen = self._ensure_seen_models()
+            save_seen_models(seen, seen_path(Path(home_key)))
         except Exception:
             logger.debug("[zet_agent] save_seen_models failed", exc_info=True)
+
+    def _drop_profile_local_model_caches(self, profile_home: str) -> None:
+        """Release adapter-owned model metadata for one unloaded profile."""
+        if not profile_home:
+            return
+        home_key = os.path.abspath(os.path.expanduser(profile_home))
+        with self._seen_lock():
+            getattr(self, "_seen_models_by_home", {}).pop(home_key, None)
+        prefix = f"{home_key}|"
+        cache = getattr(self, "_last_resolved_model", None)
+        if cache is not None:
+            for key in list(cache.keys()):
+                if str(key).startswith(prefix):
+                    cache.pop(key, None)
 
     @staticmethod
     def _extract_first_user_message(agent: Any) -> str:
@@ -5954,11 +6074,11 @@ class ZetAgentAdapter(APIServerAdapter):
         if gw is not None:
             overrides = getattr(gw, "_session_model_overrides", None)
             if overrides is not None:
-                overrides[session_id] = override
+                overrides[self._session_model_state_key(session_id)] = override
             evict = getattr(gw, "_evict_cached_agent", None)
             if callable(evict):
                 try:
-                    evict(session_id)
+                    evict(self._interaction_queue_key(session_id))
                 except Exception as exc:
                     logger.warning(
                         "session-model-switch: evict_cached_agent failed for %s: %s",
@@ -6013,8 +6133,9 @@ class ZetAgentAdapter(APIServerAdapter):
         gw = getattr(self, "gateway_runner", None)
         if gw is not None:
             overrides = getattr(gw, "_session_model_overrides", None)
-            if overrides is not None and session_id in overrides:
-                overrides.pop(session_id, None)
+            state_key = self._session_model_state_key(session_id)
+            if overrides is not None and state_key in overrides:
+                overrides.pop(state_key, None)
                 cleared = True
             # Only evict when we actually removed an override: an un-overridden
             # session's cached agent is already built on the default model, so
@@ -6023,7 +6144,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 evict = getattr(gw, "_evict_cached_agent", None)
                 if callable(evict):
                     try:
-                        evict(session_id)
+                        evict(self._interaction_queue_key(session_id))
                     except Exception as exc:
                         logger.warning(
                             "session-model-clear: evict_cached_agent failed for %s: %s",
@@ -6689,6 +6810,8 @@ class ZetAgentAdapter(APIServerAdapter):
                         exc_info=True,
                     )
 
+            self._drop_profile_local_model_caches(profile_home)
+
         self._complete_runtime_import_profile_unload(
             profile_home, unload_barrier_owner
         )
@@ -6704,6 +6827,21 @@ class ZetAgentAdapter(APIServerAdapter):
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
     # ------------------------------------------------------------------
+
+    def _register_base_http_routes(self, router: "web.UrlDispatcher") -> None:
+        """Register the canonical API-server table and its profile mirrors.
+
+        Zet used to copy a point-in-time subset of ``connect()``. The inherited
+        capability document then advertised newer session/model endpoints that
+        the listener did not have. Keeping the route table as the owner makes
+        upstream additions reach Zet automatically; only chat completions swaps
+        in the fork's diagnostic wrapper.
+        """
+        for method, path, handler in self._http_route_table():
+            if path == "/v1/chat/completions":
+                handler = self._diagnostic_chat_completions
+            router.add_route(method, path, handler)
+            router.add_route(method, f"/p/{{profile}}{path}", handler)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp server, registering our extra routes
@@ -6763,7 +6901,16 @@ class ZetAgentAdapter(APIServerAdapter):
         import socket as _socket
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [
+                mw
+                for mw in (
+                    self._make_profile_prefix_middleware(),
+                    cors_middleware,
+                    body_limit_middleware,
+                    security_headers_middleware,
+                )
+                if mw is not None
+            ]
             # client_max_size=MAX_REQUEST_BYTES mirrors APIServerAdapter.connect
             # in api_server.py — without it aiohttp falls back to its 1 MiB
             # default and rejects multimodal payloads (image_url with inlined
@@ -6771,43 +6918,13 @@ class ZetAgentAdapter(APIServerAdapter):
             # as a misleading 400 "Invalid JSON in request body".
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
-            # Base routes — kept identical to APIServerAdapter.connect
-            # so health/models/responses/runs/jobs all work under the
-            # zet_agent platform too.
-            self._app.router.add_get("/health", self._handle_health)
-            self._app.router.add_get("/health/detailed", self._handle_health_detailed)
-            self._app.router.add_get("/v1/health", self._handle_health)
-            self._app.router.add_get("/v1/models", self._handle_models)
-            if hasattr(self, "_handle_capabilities"):
-                self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
-            self._app.router.add_post("/v1/chat/completions", self._diagnostic_chat_completions)
-            self._app.router.add_post("/v1/responses", self._handle_responses)
-            self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
-            self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
-            # Cron jobs management
-            self._app.router.add_get("/api/jobs", self._handle_list_jobs)
-            self._app.router.add_get("/api/jobs/occurrences", self._handle_list_job_occurrences)
-            self._app.router.add_post("/api/jobs", self._handle_create_job)
-            self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
-            self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
-            self._app.router.add_delete("/api/jobs/{job_id}", self._handle_delete_job)
-            self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
-            self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
-            self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._register_base_http_routes(self._app.router)
             self._app.router.add_post(
                 "/api/sessions/import", self._handle_session_import,
             )
             self._app.router.add_post(
                 "/api/memory/import", self._handle_memory_import,
             )
-            self._register_unprefixed_cron_control_routes(self._app.router)
-            # Structured event streaming
-            self._app.router.add_post("/v1/runs", self._handle_runs)
-            if hasattr(self, "_handle_get_run"):
-                self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
-            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
-            self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
-
             # ZET-372 — interaction respond endpoints.
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/approval/respond",
@@ -6914,10 +7031,6 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/p/{profile}/v1/subagents/{subagent_id}/interrupt",
                 self._profile_handler(self._handle_subagent_interrupt),
-            )
-            self._register_profile_api_routes(
-                self._app.router,
-                chat_handler=self._diagnostic_chat_completions,
             )
             self._app.router.add_post(
                 "/p/{profile}/v1/skills/reload",

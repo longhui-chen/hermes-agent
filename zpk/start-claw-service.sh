@@ -4,6 +4,7 @@ set -euo pipefail
 APP_ROOT=$(dirname "$(readlink -f "$0")")
 APP_BASE=$(dirname "$APP_ROOT")
 ENV_FILE="$APP_BASE/data/secrets/zettlab-claw.env"
+RUNTIME_DEFAULTS="$APP_ROOT/runtime-defaults.env"
 
 load_reconciled_env() {
     local key value complete=0
@@ -34,6 +35,12 @@ load_reconciled_env() {
 # fill values not already supplied by systemd or a manual operator environment.
 load_reconciled_env
 
+if [ -z "${HERMES_NEMO_RELAY_CORE_ENABLED+x}" ]; then
+    set -a
+    . "$RUNTIME_DEFAULTS"
+    set +a
+fi
+
 # The shared EnvironmentFile is also consumed by local-server and may contain
 # legacy values for these Claw-owned paths. Reassert the current package slot
 # after loading it so stale persisted values cannot redirect runtime state or
@@ -45,7 +52,6 @@ export HERMES_BUNDLED_LOCALES="$APP_ROOT/lib/hermes-agent/locales"
 export HERMES_LAZY_INSTALL_TARGET="$APP_BASE/data/lazy-packages"
 export HERMES_MANAGED_GATEWAY=1
 export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service
-export HERMES_NEMO_RELAY_CORE_ENABLED="${HERMES_NEMO_RELAY_CORE_ENABLED:-false}"
 unset HERMES_MANAGED_CGROUP_ROOT
 
 # systemd EnvironmentFile values override Environment= values regardless of

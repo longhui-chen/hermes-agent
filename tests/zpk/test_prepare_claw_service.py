@@ -71,6 +71,10 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
     hermes_wrapper_path.parent.mkdir(parents=True)
     shutil.copy2(repo_root / "zpk" / "bin" / "hermes", hermes_wrapper_path)
     hermes_wrapper_path.chmod(0o755)
+    shutil.copy2(
+        repo_root / "zpk" / "runtime-defaults.env",
+        app_root / "runtime-defaults.env",
+    )
     prepare_source = (repo_root / "zpk" / "prepare-claw-service.sh").read_text(
         encoding="utf-8"
     )
@@ -1634,6 +1638,9 @@ def test_zpk_agent_service_names_are_device_facing():
     hermes_wrapper = (repo_root / "zpk" / "bin" / "hermes").read_text(
         encoding="utf-8"
     )
+    runtime_defaults = (repo_root / "zpk" / "runtime-defaults.env").read_text(
+        encoding="utf-8"
+    )
     package_meta = (repo_root / "zpk" / "package.meta").read_text(encoding="utf-8")
     install = (repo_root / "zpk" / "install.sh").read_text(encoding="utf-8")
     start = (repo_root / "zpk" / "init.d" / "start.sh").read_text(encoding="utf-8")
@@ -1645,9 +1652,10 @@ def test_zpk_agent_service_names_are_device_facing():
     assert (
         "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
     )
+    assert "EnvironmentFile=-__APP_BASE__/current/runtime-defaults.env" in service
     assert "Environment=GATEWAY_MULTIPLEX_PROFILES=true" in service
     assert "Environment=HERMES_MANAGED_GATEWAY=1" in service
-    assert "Environment=HERMES_NEMO_RELAY_CORE_ENABLED=false" in service
+    assert "Environment=HERMES_NEMO_RELAY_CORE_ENABLED=" not in service
     assert (
         "Environment=HERMES_BUNDLED_LOCALES="
         "__APP_BASE__/current/lib/hermes-agent/locales" in service
@@ -1678,18 +1686,13 @@ def test_zpk_agent_service_names_are_device_facing():
         'export HERMES_BUNDLED_LOCALES="${HERMES_BUNDLED_LOCALES:-$HERMES_SRC/locales}"'
         in hermes_wrapper
     )
-    assert (
-        'export HERMES_NEMO_RELAY_CORE_ENABLED="${HERMES_NEMO_RELAY_CORE_ENABLED:-false}"'
-        in hermes_wrapper
-    )
+    assert '. "$RUNTIME_DEFAULTS"' in hermes_wrapper
     assert '"$APP_ROOT/prepare-claw-service.sh" --emit-env' in start_wrapper
     assert "load_reconciled_env" in start_wrapper
     assert "export GATEWAY_MULTIPLEX_PROFILES=true" in start_wrapper
     assert "export HERMES_MANAGED_GATEWAY=1" in start_wrapper
-    assert (
-        'export HERMES_NEMO_RELAY_CORE_ENABLED="${HERMES_NEMO_RELAY_CORE_ENABLED:-false}"'
-        in start_wrapper
-    )
+    assert '. "$RUNTIME_DEFAULTS"' in start_wrapper
+    assert runtime_defaults.count("HERMES_NEMO_RELAY_CORE_ENABLED=false") == 1
     assert (
         'export HERMES_BUNDLED_LOCALES="$APP_ROOT/lib/hermes-agent/locales"'
         in start_wrapper

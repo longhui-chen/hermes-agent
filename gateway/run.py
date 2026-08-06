@@ -6192,22 +6192,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 
-        # Restore explicit session-level model overrides written by the
-        # Zettlab local-server. Local-server owns the control-plane state;
-        # Hermes consumes this profile-local JSON at startup and only keeps
-        # runtime overrides in memory afterwards.
-        try:
-            from gateway.session_model_overrides import load_session_model_overrides
-
-            stored = load_session_model_overrides()
-            if stored:
-                self._session_model_overrides.update(stored)
-                logger.info(
-                    "session-model-overrides: restored %d from profile json",
-                    len(stored),
-                )
-        except Exception as exc:
-            logger.debug("session-model-overrides restore skipped: %s", exc)
+        # Zettlab local-server's session_model_overrides.json is profile-local
+        # and keyed by public App session id. ZetAgent rehydrates it lazily
+        # inside the active profile scope, then stores it under a structured
+        # runner key. Eagerly loading it here would create unowned bare-id
+        # entries in the process-wide state map and let equal ids collide.
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
@@ -23722,17 +23711,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for key in keys:
                     evicted_entries.append(_cache.pop(key, None))
 
-        overrides = getattr(self, "_session_model_overrides", None)
-        if isinstance(overrides, dict):
-            for key in list(overrides.keys()):
-                if str(key).startswith(prefix):
-                    overrides.pop(key, None)
-
         running_ids = {
             id(agent)
             for agent in getattr(self, "_running_agents", {}).values()
             if agent is not None and agent is not _AGENT_PENDING_SENTINEL
         }
+
+        overrides = getattr(self, "_session_model_overrides", None)
+        if overrides is not None:
+            for key in list(overrides.keys()):
+                if str(key).startswith(prefix):
+                    overrides.pop(key, None)
+
+        # SessionState consolidation replaced the old dicts with live mapping
+        # views. Once a profile is inactive and being unloaded, drop the whole
+        # container row so conversation/persistent fields cannot survive the
+        # profile directory being deleted and recreated.
+        sessions = self.__dict__.get("_sessions")
+        if sessions is not None:
+            for key in list(sessions.keys()):
+                if str(key).startswith(prefix):
+                    sessions.pop(key, None)
+
         cleaned = 0
         for entry in evicted_entries:
             agent = entry[0] if isinstance(entry, tuple) and entry else entry

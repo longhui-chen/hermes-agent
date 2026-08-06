@@ -217,6 +217,13 @@ def get_current_session_key(default: str = "default") -> str:
     return get_session_env("HERMES_SESSION_KEY", default)
 
 
+def _session_env_enabled(name: str) -> bool:
+    """Read request-local flags before the legacy process environment."""
+    from gateway.session_context import get_session_env
+
+    return is_truthy_value(get_session_env(name, ""))
+
+
 def _get_session_platform() -> str:
     """Return the current gateway platform from contextvars/env fallback."""
     try:
@@ -3898,7 +3905,7 @@ def _run_approval_gate(
         )
         return {"approved": True, "message": None}
 
-    if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
+    if is_gateway or _session_env_enabled("HERMES_EXEC_ASK"):
         # Interactive gateway round-trip when a notify callback is
         # registered for this session (Discord/Telegram/Slack embed +
         # buttons, same mechanism as check_dangerous_command). Blocks the
@@ -4498,7 +4505,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    is_ask = _session_env_enabled("HERMES_EXEC_ASK")
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
@@ -5002,7 +5009,7 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
 
     is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    is_ask = _session_env_enabled("HERMES_EXEC_ASK")
 
     # Cron: no user is present to approve arbitrary code.
     if _is_cron_approval_context():

@@ -53,6 +53,26 @@ def test_install_normalizes_legacy_zettlab_origin():
     assert job["origin"]["platform"] == "zettlab"
 
 
+def test_install_does_not_relabel_generic_api_server_context():
+    """Zet's cron extension must not monkey-patch the parent API adapter.
+
+    Zet overrides _create_agent, so the old parent patch never protected Zet
+    and instead rewrote ordinary API-server turns as delivering zet_agent
+    sessions.
+    """
+    from gateway.platforms.api_server import APIServerAdapter
+    import gateway.platforms.zet_agent_cron as zet_agent_cron
+
+    before = APIServerAdapter._create_agent
+    zet_agent_cron.install()
+    assert APIServerAdapter._create_agent is before
+    assert not getattr(
+        APIServerAdapter._create_agent,
+        zet_agent_cron._PATCH_SENTINEL,
+        False,
+    )
+
+
 def test_install_bypasses_scheduler_delivery_for_zet_agent(monkeypatch):
     import cron.scheduler as scheduler
     import gateway.platforms.zet_agent_cron as zet_agent_cron

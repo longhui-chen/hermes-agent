@@ -17,9 +17,8 @@ hermes-agent is a fork that periodically syncs from upstream. Editing
 cron/scheduler.py directly creates merge conflicts every release.
 
 We patch ``cron.scheduler.{save_job_output, mark_job_run, run_job,
-_deliver_result, _resolve_origin}`` (and ``APIServerAdapter._create_agent``)
-at module import time (triggered by zet_agent_cron.pth in the venv
-site-packages).
+_deliver_result, _resolve_origin}`` at module import time (triggered by
+zet_agent_cron.pth in the venv site-packages).
 
 Auto-install: ``install()`` runs on module import. The .pth line forces
 import at Python startup, so patches are in place before any cron job
@@ -404,8 +403,7 @@ def _dbg(msg: str) -> None:
 
 
 def install() -> None:
-    """Patch cron.scheduler.{save_job_output, mark_job_run} +
-    APIServerAdapter._create_agent. Idempotent."""
+    """Patch Zettlab cron persistence/delivery seams. Idempotent."""
     _dbg("install() entered")
     try:
         import cron.scheduler as _sched
@@ -705,50 +703,6 @@ def install() -> None:
         _warn_if_failure_template_drifted(_inspect.getsource(_sched))
     except Exception as _e:
         _dbg(f"install() failure-template self-check skipped: {_e!r}")
-
-    # ── _create_agent patch — set HERMES_SESSION_* contextvars ────────
-    #
-    # ZetAgentAdapter._create_agent already calls set_session_vars locally,
-    # but contextvars are task-local: if the agent's tool calls run in a
-    # task spawned BEFORE _create_agent ran, they won't see the values.
-    # Patching at the parent class level (APIServerAdapter._create_agent)
-    # gives us a second safety net + diagnostic log so we can prove the
-    # values are set right before super() builds the agent.
-    try:
-        import functools as _functools
-
-        from gateway.platforms.api_server import APIServerAdapter
-        from gateway.session_context import set_session_vars
-
-        if not getattr(APIServerAdapter._create_agent, _PATCH_SENTINEL, False):
-            _orig_create = APIServerAdapter._create_agent
-
-            @_functools.wraps(_orig_create)
-            def _wrapped_create(self, *args, **kwargs):
-                session_id = kwargs.get("session_id")
-                if session_id:
-                    try:
-                        set_session_vars(
-                            platform="zet_agent",
-                            chat_id=session_id,
-                            chat_name="",
-                            thread_id="",
-                            user_id="",
-                            user_name="",
-                            session_key=session_id,
-                        )
-                        _dbg(f"_create_agent: set_session_vars chat_id={session_id}")
-                    except Exception as _e:
-                        _dbg(f"_create_agent: set_session_vars FAILED: {_e!r}")
-                else:
-                    _dbg("_create_agent: no session_id, skip set_session_vars")
-                return _orig_create(self, *args, **kwargs)
-
-            setattr(_wrapped_create, _PATCH_SENTINEL, True)
-            APIServerAdapter._create_agent = _wrapped_create
-            _dbg("install() patched APIServerAdapter._create_agent OK")
-    except ImportError as _ie:
-        _dbg(f"install() _create_agent patch SKIP (ImportError): {_ie}")
 
     # ── _flush_messages_to_session_db patch — fix user-message-drop bug ──
     #

@@ -59,6 +59,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -212,6 +213,10 @@ _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "credential_pool",
     "max_tokens",
 )
+
+# One entry is retained per stable API session plus the process fallback.
+# Devices are long-lived, so even stable session keys need a hard ceiling.
+LAST_RESOLVED_MODEL_CAP = 2048
 
 
 def _clean_request_string(value: Any) -> Optional[str]:
@@ -1959,7 +1964,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # GatewayRunner._last_resolved_model in run.py — recovers from a
         # transient empty model resolution (#35314) instead of building an
         # agent with model="" that 400s every call until manual retry.
-        self._last_resolved_model: Dict[str, str] = {}
+        self._last_resolved_model: "OrderedDict[str, str]" = OrderedDict()
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -2571,6 +2576,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 ]
             )
         return routes
+
+    def _remember_last_resolved_model(self, session_key: str, model: str) -> None:
+        """Remember a successful model resolution in a bounded LRU.
+
+        ``*`` is the process fallback and does not count against the stable
+        session budget.  Accept plain dicts too because older tests and
+        embedders replace the attribute directly.
+        """
+        if not model:
+            return
+        cache = self._last_resolved_model
+        if session_key:
+            cache[session_key] = model
+            move_to_end = getattr(cache, "move_to_end", None)
+            if callable(move_to_end):
+                move_to_end(session_key)
+        cache["*"] = model
+        move_to_end = getattr(cache, "move_to_end", None)
+        if callable(move_to_end):
+            move_to_end("*")
+        cap = max(1, int(getattr(self, "_last_resolved_model_cap", LAST_RESOLVED_MODEL_CAP)))
+        while len(cache) > cap + 1:
+            oldest = next((key for key in cache if key != "*"), None)
+            if oldest is None:
+                break
+            cache.pop(oldest, None)
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -3250,6 +3281,7 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_get("/p/{profile}/health", self._profile_handler(self._handle_health))
         router.add_get("/p/{profile}/v1/health", self._profile_handler(self._handle_health))
         router.add_get("/p/{profile}/v1/models", self._profile_handler(self._handle_models))
+        router.add_get("/p/{profile}/api/model/options", self._profile_handler(self._handle_model_options))
         router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
         router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
         router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
@@ -3263,6 +3295,7 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_post("/p/{profile}/api/sessions/{session_id}/fork", self._profile_handler(self._handle_fork_session))
         router.add_post("/p/{profile}/api/sessions/{session_id}/chat", self._profile_handler(self._handle_session_chat))
         router.add_post("/p/{profile}/api/sessions/{session_id}/chat/stream", self._profile_handler(self._handle_session_chat_stream))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/model", self._profile_handler(self._handle_session_model_lock))
 
         router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
         router.add_get("/p/{profile}/api/jobs/occurrences", self._profile_handler(self._handle_list_job_occurrences))
@@ -3933,9 +3966,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 model = _recovered
         elif model:
-            if _resolved_key:
-                self._last_resolved_model[_resolved_key] = model
-            self._last_resolved_model["*"] = model
+            self._remember_last_resolved_model(_resolved_key, model)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -8327,17 +8358,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return
                 with self._profile_scope(request_profile):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=agent_overrides.get("requested_model"),
-                        requested_provider=agent_overrides.get("requested_provider"),
-                        model_options=agent_overrides.get("model_options"),
-                        route=route,
+                    from gateway.session_context import clear_session_vars
+
+                    create_tokens = self._bind_api_server_session(
+                        chat_id=session_id or "",
+                        session_key=gateway_session_key or session_id or "",
+                        session_id=session_id or "",
                     )
+                    try:
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=_text_cb,
+                            tool_progress_callback=event_cb,
+                            gateway_session_key=gateway_session_key,
+                            requested_model=agent_overrides.get("requested_model"),
+                            requested_provider=agent_overrides.get("requested_provider"),
+                            model_options=agent_overrides.get("model_options"),
+                            route=route,
+                        )
+                    finally:
+                        clear_session_vars(create_tokens)
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:

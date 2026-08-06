@@ -130,6 +130,27 @@ class TestSessionDbCloseOnShutdown:
         healthy_db.close.assert_called_once()
 
 
+def test_profile_runtime_unload_drops_session_field_views():
+    """SessionFieldView is MutableMapping, not dict; profile unload must
+    clear the migrated state container rather than silently skipping it."""
+    from collections import OrderedDict
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    coder = "agent:coder:zet_agent:dm:same-session"
+    main = "agent:main:zet_agent:dm:same-session"
+    runner._session_model_overrides = {
+        coder: {"model": "coder-model"},
+        main: {"model": "main-model"},
+    }
+
+    assert runner._evict_cached_agents_for_profile("coder") == 0
+    assert coder not in runner._session_model_overrides
+    assert main in runner._session_model_overrides
+
+
 class TestSessionResetZombieRace:
     """Regression for #28686 — a session_reset racing the in-flight run's
     guarded release must not leave a dead agent locking the slot forever.
@@ -159,4 +180,3 @@ class TestSessionResetZombieRace:
         assert key not in runner._running_agents
         assert key not in runner._running_agents_ts
         assert key not in runner._busy_ack_ts
-

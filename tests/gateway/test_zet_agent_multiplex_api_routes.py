@@ -981,6 +981,27 @@ async def test_prefixed_control_routes_registered(profile_homes):
     assert expected <= registered
 
 
+def test_zet_base_routes_match_advertised_api_surface():
+    """Zet must not hand-copy an older subset of APIServer routes while
+    inheriting a capability document that advertises the newer endpoints."""
+    adapter = _make_adapter()
+    app = web.Application()
+
+    adapter._register_base_http_routes(app.router)
+
+    registered = {resource.canonical for resource in app.router.resources()}
+    expected = {
+        "/api/model/options",
+        "/api/sessions/{session_id}/model",
+        "/api/sessions/{session_id}/chat",
+        "/v1/skills",
+        "/v1/toolsets",
+        "/v1/runs/{run_id}/approval",
+    }
+    assert expected <= registered
+    assert {f"/p/{{profile}}{path}" for path in expected} <= registered
+
+
 @pytest.mark.asyncio
 async def test_prefixed_reset_and_unload_return_ok(profile_homes):
     adapter = _make_adapter()

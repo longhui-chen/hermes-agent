@@ -137,11 +137,6 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
 
-    from gateway.session_context import get_session_env
-
-    assert get_session_env("HERMES_SESSION_CHAT_ID") == public_session_id
-    assert get_session_env("HERMES_SESSION_KEY") == scoped_session_key
-
 
 @pytest.mark.asyncio
 async def test_zet_agent_forwards_current_turn_reference_image(monkeypatch):

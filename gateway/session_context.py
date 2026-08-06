@@ -96,6 +96,12 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Whether this request has a live human approval channel.  ZetAgent used to
+# mirror this through os.environ for the whole awaited turn; two concurrent
+# HTTP turns could therefore clear or resurrect each other's value.  Keep it
+# task-local with the rest of the session identity instead.
+_EXEC_ASK: ContextVar = ContextVar("HERMES_EXEC_ASK", default=_UNSET)
+
 # Per-session cron marker. Unlike the process-global legacy env var, this is
 # scoped to one cron job / inbound session. _UNSET preserves the legacy env
 # fallback for CLI/tests; "1" marks cron; "" explicitly marks non-cron and
@@ -236,6 +242,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_EXEC_ASK": _EXEC_ASK,
     "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_TURN_ID": _TURN_ID,
     "HERMES_PLAN_ACK_STATUS": _PLAN_ACK_STATUS,
@@ -387,6 +394,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    exec_ask: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -406,6 +414,9 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
+    ``exec_ask`` uses the same tri-state contract. Delivering HTTP/chat
+    adapters bind ``"1"``; stateless or legacy callers leave it ``_UNSET``.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -427,6 +438,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
+        _EXEC_ASK.set(exec_ask),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -464,6 +476,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _CRON_SESSION,
+        _EXEC_ASK,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

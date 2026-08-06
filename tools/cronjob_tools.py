@@ -1285,12 +1285,13 @@ def check_cronjob_requirements() -> bool:
     leave the tool disabled. Uses the shared ``env_var_enabled`` helper so
     every consumer of these flags agrees on the truthy set.
     """
-    from utils import env_var_enabled
+    from gateway.session_context import get_session_env
+    from utils import env_var_enabled, is_truthy_value
 
     return (
         env_var_enabled("HERMES_INTERACTIVE")
         or env_var_enabled("HERMES_GATEWAY_SESSION")
-        or env_var_enabled("HERMES_EXEC_ASK")
+        or is_truthy_value(get_session_env("HERMES_EXEC_ASK", ""))
     )
 
 
