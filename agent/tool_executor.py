@@ -1002,6 +1002,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        if name == "search_memory":
+            # memory.citations 采集：所有工具执行路径的结果汇聚点（并行路径）。
+            from agent.agent_runtime_helpers import collect_memory_citations
+            collect_memory_citations(agent, function_result)
+
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1632,6 +1637,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
+                if function_name == "search_memory":
+                    # 生产主路径（registry 分派）的 memory.citations 采集挂点。
+                    from agent.agent_runtime_helpers import collect_memory_citations
+                    collect_memory_citations(agent, function_result)
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
                     agent,
@@ -1738,6 +1747,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent.tool_complete_callback(tool_call.id, function_name, display_args, function_result)
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
+
+        if function_name == "search_memory":
+            # memory.citations 采集：所有工具执行路径的结果汇聚点（串行路径）。
+            from agent.agent_runtime_helpers import collect_memory_citations
+            collect_memory_citations(agent, function_result)
 
         function_result = maybe_persist_tool_result(
             content=function_result,

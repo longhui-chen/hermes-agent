@@ -274,3 +274,128 @@ def test_artifact_dismiss_latches(monkeypatch):
     )
     _drive_turn(plugin, "s-art-dismiss", "这个分析结果再帮我看一眼")
     assert len(ctx.emitted) == 1
+
+
+# ---------------------------------------------------------------------------
+# 区域感知库存（available_kinds）+ 出卡文案衔接（同轮/后续轮上下文注入）
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_channels_tool(monkeypatch, payload):
+    import sys
+    import types
+
+    fake = types.ModuleType("tools.list_my_channels_tool")
+    fake._check_list_my_channels = lambda: True
+    fake.list_my_channels_tool = lambda args, **kw: json.dumps(payload, ensure_ascii=False)
+    monkeypatch.setitem(sys.modules, "tools.list_my_channels_tool", fake)
+    # connector 工具一并桩为不可用，隔离本组用例
+    fake_conn = types.ModuleType("tools.list_my_connectors_tool")
+    fake_conn._check_list_my_connectors = lambda: False
+    fake_conn.list_my_connectors_tool = lambda args, **kw: json.dumps({"connectors": []})
+    monkeypatch.setitem(sys.modules, "tools.list_my_connectors_tool", fake_conn)
+
+
+def test_fetch_inventory_intersects_region_available_kinds(monkeypatch):
+    """新版 local-server 回传 available_kinds（区域感知）：推荐范围 = 可连 ∩ 白名单。
+    CN 设备场景：telegram 在白名单但不在区域可连清单 → 不得进入 recommendable。"""
+    plugin = _load_plugin()
+    _install_fake_channels_tool(
+        monkeypatch,
+        {
+            "installed_channels": [
+                {"kind": "feishu", "name": "飞书", "status": "online", "target_ref": "channel:feishu"}
+            ],
+            "available_kinds": ["wecom", "wechat", "dingtalk"],
+        },
+    )
+    inventory = plugin._fetch_connection_inventory()
+    assert inventory["fetched"] is True
+    assert inventory["channels_connected"] == ["feishu"]
+    # dingtalk 不在平台白名单、telegram/discord/slack 不在区域可连清单 —— 都被排除
+    assert inventory["channels_recommendable"] == ["wechat", "wecom"]
+
+
+def test_fetch_inventory_legacy_server_without_available_kinds(monkeypatch):
+    """老版 local-server 无 available_kinds 字段：降级回「白名单 − 已连」旧公式。"""
+    plugin = _load_plugin()
+    _install_fake_channels_tool(
+        monkeypatch,
+        {
+            "installed_channels": [
+                {"kind": "feishu", "name": "飞书", "status": "online", "target_ref": "channel:feishu"}
+            ]
+        },
+    )
+    inventory = plugin._fetch_connection_inventory()
+    assert inventory["fetched"] is True
+    assert inventory["channels_recommendable"] == sorted(
+        plugin.RECOMMENDABLE_CHANNEL_KINDS - {"feishu"}
+    )
+
+
+def test_channel_proposal_injects_same_turn_card_context(monkeypatch):
+    """出卡当轮：主模型必须被告知「回复下方会附加连接卡」，禁止编造设置路径。"""
+    plugin = _load_plugin()
+    ctx = _Context(_FakeLlm([_connection_candidate()]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    injected = plugin._on_pre_llm_call(
+        session_id="s-ctx",
+        turn_id="turn-1",
+        user_message="数据日报出来后我经常在电脑前错过",
+        conversation_history=[],
+    )
+    assert injected is not None
+    context = injected["context"]
+    assert "connect card" in context
+    assert "telegram" in context
+    assert "invent settings paths" in context
+
+
+def test_channel_proposal_followup_context_points_to_card(monkeypatch):
+    """后续轮 carry context：连接类不得引导走 Hermes 原生创建流程，必须指向已出的卡。"""
+    plugin = _load_plugin()
+    ctx = _Context(_FakeLlm([_connection_candidate()]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    _drive_turn(plugin, "s-carry", "数据日报出来后我经常在电脑前错过")
+    followup = plugin._on_pre_llm_call(
+        session_id="s-carry",
+        turn_id="turn-2",
+        user_message="好的",
+        conversation_history=[],
+    )
+    assert followup is not None
+    context = followup["context"]
+    assert "Connect button" in context
+    assert "native creation flow" not in context
+
+
+def test_creation_type_followup_context_keeps_native_flow(monkeypatch):
+    """回归护栏：agent/skill/task 的后续轮话术保持原样（仍走原生创建流程）。"""
+    plugin = _load_plugin()
+    creation_candidate = {
+        "decision": "task",
+        "suggested_name": "每周销售汇总",
+        "reason": "重复出现的整理需求。",
+        "evidence_turn_ids": ["evidence-1"],
+        "confidence": 0.8,
+        "dedup_key": "task-weekly-sales",
+        "proposal_text": "要沉淀成 Task 吗？",
+    }
+    ctx = _Context(_FakeLlm([creation_candidate]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    _drive_turn(plugin, "s-task-carry", "帮我整理这周的销售数据")
+    followup = plugin._on_pre_llm_call(
+        session_id="s-task-carry",
+        turn_id="turn-2",
+        user_message="好的",
+        conversation_history=[],
+    )
+    assert followup is not None
+    assert "native creation flow" in followup["context"]

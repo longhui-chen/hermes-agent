@@ -2342,6 +2342,36 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
 
+def collect_memory_citations(agent, raw) -> None:
+    """memory.citations 采集（需求 3.1）：search_memory 命中条目记到 agent 的
+    有界去重容器，zet_agent 在 turn 收尾汇总为一张 memory.citations 附件
+    （同 turn 恒定 id upsert）。两条工具派发路径共用：tool_executor 的通用
+    registry 分派（生产主路径）与 invoke_tool 的内置分支。采集失败静默——
+    引用展示是旁路产物，绝不影响工具结果本身。"""
+    try:
+        parsed = json.loads(raw)
+        items = parsed.get("items") if isinstance(parsed, dict) else None
+        if not isinstance(items, list) or not items:
+            return
+        sink = getattr(agent, "_zet_memory_citations", None)
+        if sink is None:
+            sink = {}
+            agent._zet_memory_citations = sink
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            if not item_id or len(sink) >= 32:
+                continue
+            sink.setdefault(item_id, {
+                "id": item_id[:64],
+                "source": str(item.get("source") or "")[:120],
+                "excerpt": str(item.get("excerpt") or "")[:240],
+            })
+    except Exception:
+        pass
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
@@ -2502,31 +2532,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             # built-in curated MEMORY.md/USER.md search inside the tool.
             from tools.search_memory_tool import search_memory_tool as _search_memory_tool
             raw = _search_memory_tool(next_args, memory_manager=agent._memory_manager)
-            # memory.citations 采集（需求 3.1）：命中条目记到 agent 上的有界
-            # 容器，zet_agent 在 turn 收尾把它汇总成一张 memory.citations
-            # 附件（同 id upsert）。采集失败静默——引用展示是旁路产物，
-            # 绝不影响工具结果本身。
-            try:
-                parsed = json.loads(raw)
-                items = parsed.get("items") if isinstance(parsed, dict) else None
-                if isinstance(items, list) and items:
-                    sink = getattr(agent, "_zet_memory_citations", None)
-                    if sink is None:
-                        sink = {}
-                        agent._zet_memory_citations = sink
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        item_id = str(item.get("id") or "")
-                        if not item_id or len(sink) >= 32:
-                            continue
-                        sink.setdefault(item_id, {
-                            "id": item_id[:64],
-                            "source": str(item.get("source") or "")[:120],
-                            "excerpt": str(item.get("excerpt") or "")[:240],
-                        })
-            except Exception:
-                pass
+            collect_memory_citations(agent, raw)
             return _finish_agent_tool(raw, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:

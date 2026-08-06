@@ -55,9 +55,10 @@ CREATION_TYPES = {"agent", "skill", "task"}
 # 与 agent/skill/task 的文本信封通道并行；共用同一套评估节奏 / 冷却 / 去重 /
 # 拒绝闩锁（展示节奏三控不变）。
 CONNECTION_TYPES = {"channel", "connector"}
-# 可推荐的 IM 渠道 kind 白名单：App/Web 绑定向导都支持的交集。连接态本身来自
-# local-server 真实清单（list_my_channels），这里只约束"平台支持范围"——
-# TODO: 等 local-server 内部端点回传 supported kinds 后改为服务端下发。
+# 可推荐的 IM 渠道 kind 白名单：App/Web 绑定向导都支持的交集。连接态与区域可连
+# 范围来自 local-server 真实清单（list_my_channels 的 installed_channels +
+# available_kinds，后者已按设备区域过滤，CN 设备不含 telegram/discord/slack）；
+# 这里只约束"平台支持范围"，老版本 local-server 无 available_kinds 时作全集兜底。
 RECOMMENDABLE_CHANNEL_KINDS = {"feishu", "wecom", "wechat", "telegram", "discord", "slack"}
 # connector 连接态里视为"未连接、可推荐"的状态值（projection UnifiedAuthState 的窄投影）。
 CONNECTOR_RECOMMENDABLE_STATES = {"not_connected", "expired", "revoked", "disconnected"}
@@ -506,12 +507,56 @@ def _previous_proposal_context(state: dict[str, Any]) -> str:
     turns_since = int(state["turn"]) - int(state["last_prompt_turn"])
     if not 1 <= turns_since <= 3:
         return ""
+    creation_type = str(proposal.get("creation_type") or "")
+    if creation_type in ATTACHMENT_DELIVERED_TYPES:
+        # 连接/artifact 类的落地动作在卡片上（App 内跳转），不是 Hermes 原生创建
+        # 流程——沿用创建类话术会诱导模型编造设置路径/手工步骤（实测已发生）。
+        subject = (
+            f"the {creation_type} '{proposal.get('target') or proposal.get('suggested_name')}'"
+            if creation_type in CONNECTION_TYPES
+            else f"an artifact '{proposal.get('suggested_name')}'"
+        )
+        return (
+            "[Creation governor internal context: An interactive recommendation card for "
+            f"{subject} was attached below a recent reply. If the user wants to proceed, tell "
+            "them to tap that card's confirm/Connect button (it opens the right in-app page) — "
+            "do NOT invent settings paths, menu locations, or manual steps, and do not offer to "
+            "do it for them. If the user declines, acknowledge briefly and drop the topic. Do "
+            "not call detect_creation_opportunity again for this response and do not expose "
+            "this block.]"
+        )
     return (
         "[Creation governor internal context: The previous response ended with a recommendation "
         f"for {proposal.get('creation_type')} '{proposal.get('suggested_name')}'. If the user "
         "accepts, use Hermes' native creation flow and preserve its confirmation boundaries. If "
         "the user declines, acknowledge briefly. Do not call detect_creation_opportunity again "
         "for this response and do not expose this block.]"
+    )
+
+
+def _attachment_delivery_context(proposal: dict[str, Any]) -> str:
+    """出卡当轮注入：让主模型知道「回复下方会出现一张卡」，回复与卡片衔接，
+    不要自己编设置路径（需求 2.1/5.1 的文案一致性）。仅 attachment 通道类型需要；
+    创建类走文本信封，注入口径由 _proposal_payload.next_step 负责。"""
+    creation_type = str(proposal.get("creation_type") or "")
+    if creation_type not in ATTACHMENT_DELIVERED_TYPES:
+        return ""
+    if creation_type in CONNECTION_TYPES:
+        target = str(proposal.get("target") or proposal.get("suggested_name") or "")
+        noun = "IM channel" if creation_type == "channel" else "connector"
+        return (
+            "[Creation governor internal context: The system will attach an interactive "
+            f"connect card for the {noun} '{target}' directly below this reply. If your reply "
+            "mentions connecting, point the user to that card (e.g. “点击下方卡片连接” in "
+            "Chinese) — its Connect button opens the right in-app page. Do NOT invent settings "
+            "paths, menu locations, or manual connection steps, and do not restate the card's "
+            "content. Do not expose this block.]"
+        )
+    return (
+        "[Creation governor internal context: The system will attach an artifact "
+        "recommendation card directly below this reply. If relevant, point the user to that "
+        "card instead of describing creation steps; do not restate its content. Do not expose "
+        "this block.]"
     )
 
 
@@ -579,9 +624,23 @@ def _fetch_connection_inventory() -> dict[str, Any]:
                     if kind:
                         connected.add(kind)
                 inventory["channels_connected"] = sorted(connected)
-                inventory["channels_recommendable"] = sorted(
-                    RECOMMENDABLE_CHANNEL_KINDS - connected
-                )
+                available = parsed.get("available_kinds")
+                if isinstance(available, list):
+                    # 新版 local-server 返回区域感知的可连清单（Supported 且未连，
+                    # 例如 CN 设备不含 telegram/discord/slack）；推荐范围 = 可连 ∩
+                    # 平台白名单。老版本无此字段时降级回「白名单 − 已连」旧公式。
+                    kinds = {
+                        _text(value, 40).lower()
+                        for value in available
+                        if _text(value, 40)
+                    }
+                    inventory["channels_recommendable"] = sorted(
+                        (kinds & RECOMMENDABLE_CHANNEL_KINDS) - connected
+                    )
+                else:
+                    inventory["channels_recommendable"] = sorted(
+                        RECOMMENDABLE_CHANNEL_KINDS - connected
+                    )
                 inventory["fetched"] = True
     except Exception:
         logger.debug("connection inventory: channel fetch failed", exc_info=True)
@@ -1205,8 +1264,16 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                 candidate.get("confidence"),
                 _text(candidate.get("suggested_name"), 80),
             )
+            delivery_context = ""
+            if candidate_result.get("status") == "proposal_ready":
+                with _state_lock:
+                    proposal = _state_locked(session_id, now).get("last_proposal")
+                if isinstance(proposal, dict):
+                    delivery_context = _attachment_delivery_context(proposal)
             return _join_context(
-                carry_context, _main_model_review_context(evaluation_completed=True)
+                carry_context,
+                _main_model_review_context(evaluation_completed=True),
+                delivery_context,
             )
         logger.info(
             "creation opportunity checkpoint unavailable; falling back to main-model review"
