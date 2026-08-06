@@ -2170,6 +2170,67 @@ def test_unreadable_owning_store_fails_closed_and_keeps_origin(tmp_path, monkeyp
     assert _cron_summary_rows(prof / "state.db", SID) == 0
 
 
+def _fake_probe(monkeypatch, zc, verdicts):
+    """按 resolve 后的路径钉死 _db_has_session 三态返回。"""
+    resolved = {str(p.resolve()): v for p, v in verdicts.items()}
+
+    def probe(db_path, session_id):
+        return resolved.get(str(db_path.resolve()), False)
+
+    monkeypatch.setattr(zc, "_db_has_session", probe)
+
+
+def test_undecided_profile_probe_blocks_root_fallback(tmp_path, monkeypatch):
+    """profile 候选探测未决（None）时，root 命中也必须返回未决——
+    否则 profile 其实持有该会话时结果被写进 root，split session 扩大。"""
+    import gateway.platforms.zet_agent_cron as zc
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:undecided1"
+    _fake_probe(monkeypatch, zc, {prof / "state.db": None, root / "state.db": True})
+
+    db_path, unresolved = zc._resolve_persist_db_path(SID)
+    assert unresolved, "profile 候选未决时不许降级返回 root"
+    assert str((prof / "state.db").resolve()) in unresolved
+
+
+def test_excluded_profile_falls_back_to_owning_root(tmp_path, monkeypatch):
+    """profile 候选明确不拥有（False）+ root 拥有 → 正常降级到 root。"""
+    import gateway.platforms.zet_agent_cron as zc
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:undecided2"
+    _fake_probe(monkeypatch, zc, {prof / "state.db": False, root / "state.db": True})
+
+    assert zc._resolve_persist_db_path(SID) == (root / "state.db", None)
+
+
+def test_all_candidates_excluded_creates_new_in_profile(tmp_path, monkeypatch):
+    """全部候选明确不拥有 → 走 new-in-profile 分支。"""
+    import gateway.platforms.zet_agent_cron as zc
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:undecided3"
+    _fake_probe(monkeypatch, zc, {prof / "state.db": False, root / "state.db": False})
+
+    assert zc._resolve_persist_db_path(SID) == ((prof / "state.db").resolve(), None)
+
+
 def test_split_session_logs_warning_instead_of_silently_preferring_profile(
     tmp_path, monkeypatch, caplog
 ):

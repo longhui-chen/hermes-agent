@@ -483,7 +483,7 @@ def _resolve_persist_db_path(session_id: str) -> Tuple[Path, Optional[str]]:
         owned = _owns(db_path)
         if owned is None:
             _record_unknown(db_path)
-        elif owned:
+        elif owned and not unknown:
             _warn_if_split_session(session_id, db_path, root_candidates, _owns)
             return db_path, None
 
@@ -491,13 +491,13 @@ def _resolve_persist_db_path(session_id: str) -> Tuple[Path, Optional[str]]:
         owned = _owns(db_path)
         if owned is None:
             _record_unknown(db_path)
-        elif owned:
+        elif owned and not unknown:
             return db_path, None
 
     owned = _owns(current)
     if owned is None:
         _record_unknown(current)
-    elif owned:
+    elif owned and not unknown:
         return current, None
 
     if unknown:
