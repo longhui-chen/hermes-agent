@@ -72,6 +72,30 @@ def test_snapshot_is_bounded_and_marks_truncation() -> None:
     )
 
 
+def test_byte_budget_keeps_high_priority_elements() -> None:
+    snapshot = "\n".join([
+        *(f'- widget "Other {index} {"🦞" * 160}"' for index in range(24)),
+        '- alert "Critical" [ref=alert]',
+    ])
+
+    preview = project_browser_state_preview(
+        "browser_snapshot",
+        {"success": True, "snapshot": snapshot, "element_count": 25},
+    )
+
+    assert preview is not None
+    assert preview["truncated"] is True
+    assert {"role": "alert", "label": "Critical"} in preview["elements"]
+    assert (
+        len(
+            json.dumps(preview, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        <= MAX_PREVIEW_BYTES
+    )
+
+
 def test_snapshot_parses_only_attribute_state_and_prioritizes_known_roles() -> None:
     snapshot = "\n".join([
         '- button "Show [hidden] files" [selected]',

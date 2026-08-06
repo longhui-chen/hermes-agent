@@ -227,7 +227,14 @@ def _fit_byte_budget(payload: dict[str, Any]) -> dict[str, Any]:
         and elements
         and _serialized_size(payload) > MAX_PREVIEW_BYTES
     ):
-        elements.pop()
+        drop_index = max(
+            range(len(elements)),
+            key=lambda index: (
+                _ROLE_PRIORITY.get(elements[index].get("role", "other"), 5),
+                index,
+            ),
+        )
+        elements.pop(drop_index)
         payload["truncated"] = True
     if isinstance(elements, list) and not elements:
         payload.pop("elements", None)
