@@ -21,6 +21,7 @@ const DELIVERY_REPAIR_MARK = '<!-- codex-review-feishu-delivery-repair:';
 const DELIVERY_TOMBSTONE_MARK = '<!-- codex-review-feishu-delivery-tombstone:';
 const DRAIN_CURSOR_MARK = '<!-- codex-review-feishu-drain-cursor:';
 const CHECKPOINT_MARK = '<!-- codex-review-feishu-checkpoint:';
+const BOOTSTRAP_MARK = '<!-- codex-review-feishu-bootstrap-progress:';
 const EVENT_MARK = '<!-- codex-review-feishu-event:';
 const DELIVERY_MARK = '<!-- codex-review-feishu-delivery:';
 const THREAD_STATE_VERSION = 2;
@@ -50,13 +51,11 @@ const HISTORY_MAX_BACKOFF_MS = 15 * 60 * 1000;
 const HISTORY_MAX_ATTEMPTS = 8;
 const HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DEFINITE_SEND_MAX_ATTEMPTS = 3;
-const WATCHDOG_PR_PAGE_SIZE = 50;
-const WATCHDOG_MAX_PR_PAGES = 4;
-const WATCHDOG_PAGE_WINDOWS = 8;
+const WATCHDOG_PR_PAGE_SIZE = 100;
 const WATCHDOG_MAX_PRS_PER_RUN = 40;
 const WATCHDOG_MAX_DISPATCHES = 10;
 const WATCHDOG_SHARDS = 4;
-const WATCHDOG_SLOT_MS = 30 * 60 * 1000;
+const WATCHDOG_SLOT_MS = 5 * 60 * 1000;
 const GITHUB_ACTIONS_BOT = 'github-actions[bot]';
 const CODEX_REVIEW_USER_ID = '199175422';
 const CODEX_REVIEW_LOGIN = 'chatgpt-codex-connector[bot]';
@@ -204,6 +203,30 @@ async function withGithubAttemptBudget(operation, options = {}) {
     return await operation();
   } finally {
     activeGithubAttemptDeadlineMs = previousDeadline;
+  }
+}
+
+function hasGithubRequestBudget(nowMs = Date.now()) {
+  return !Number.isFinite(activeGithubAttemptDeadlineMs) ||
+    activeGithubAttemptDeadlineMs - nowMs >= GITHUB_REQUEST_TIMEOUT_MS;
+}
+
+async function githubGraphqlWithTimeout(github, query, variables = {}, timeoutMs = GITHUB_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await github.graphql(query, {
+      ...variables,
+      request: { ...(variables.request || {}), timeout: timeoutMs, signal: controller.signal },
+    });
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    const timeoutError = new Error(`GitHub GraphQL timeout (${timeoutMs}ms)`);
+    timeoutError.name = 'AbortError';
+    timeoutError.cause = error;
+    throw timeoutError;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -373,6 +396,17 @@ function decodeCheckpoint(body) {
   } catch (_error) { return null; }
 }
 
+// Bootstrap progress uses the same bounded compressed payload as a checkpoint, but is not
+// authoritative. A drain must finish the oldest-to-newest scan before it may hydrate/send.
+function encodeBootstrapProgress(input) {
+  return encodeCheckpoint(input).replace(CHECKPOINT_MARK, BOOTSTRAP_MARK);
+}
+
+function decodeBootstrapProgress(body) {
+  if (typeof body !== 'string' || !body.includes(BOOTSTRAP_MARK) || body.includes(CHECKPOINT_MARK)) return null;
+  return decodeCheckpoint(body.replace(BOOTSTRAP_MARK, CHECKPOINT_MARK));
+}
+
 function virtualCheckpointComment(entry) {
   return {
     id: entry.id,
@@ -403,7 +437,7 @@ async function readCheckpointTail({ github, context, core, prNum }) {
   for (let page = 0; page < COMMENT_MIGRATION_MAX_PAGES; page += 1) {
     const result = await withGithubRetry({
       core, label: `从 comment tail 定位 checkpoint page=${page + 1}`,
-      operation: () => github.graphql(`query($owner:String!,$repo:String!,$pr:Int!,$before:String){
+      operation: () => githubGraphqlWithTimeout(github, `query($owner:String!,$repo:String!,$pr:Int!,$before:String){
         repository(owner:$owner,name:$repo){pullRequest(number:$pr){comments(last:100,before:$before){
           pageInfo{hasPreviousPage startCursor}
           nodes{databaseId body createdAt authorAssociation author{login __typename}}
@@ -413,7 +447,8 @@ async function readCheckpointTail({ github, context, core, prNum }) {
     if (!result.ok) return null;
     const connection = result.value.repository.pullRequest.comments;
     for (const node of connection.nodes || []) {
-      if (!String(node.body || '').includes(CHECKPOINT_MARK) ||
+      if (!(String(node.body || '').includes(CHECKPOINT_MARK) ||
+            String(node.body || '').includes(BOOTSTRAP_MARK)) ||
           String(node.author && node.author.login || '').toLowerCase() !== GITHUB_ACTIONS_BOT) continue;
       found.push({
         id: Number(node.databaseId), body: node.body, created_at: node.createdAt,
@@ -424,24 +459,89 @@ async function readCheckpointTail({ github, context, core, prNum }) {
     if (found.length || !connection.pageInfo.hasPreviousPage) return found;
     before = connection.pageInfo.startCursor;
   }
-  core.setFailed('bounded checkpoint tail locator 超界，停止消费以避免错误迁移');
-  return null;
+  // A bounded tail miss is not proof that a large legacy PR has no checkpoint. The forward
+  // bootstrap below can safely establish that fact without materializing ordinary comments.
+  return found;
 }
 
-async function readThreadMarkerComments({ github, context, core = noopCore(), prNum }) {
-  const repo = repositoryName(context);
-  const tailCheckpoints = await readCheckpointTail({ github, context, core, prNum });
-  if (tailCheckpoints === null) return null;
-  const prefix = [];
-  let prefixFull = false;
-  for (let page = 1; page <= COMMENT_MIGRATION_MAX_PAGES; page += 1) {
-    const result = await listCommentPage({ github, context, core, prNum, page });
-    if (!result.ok) return null;
-    prefix.push(...result.value.data);
-    prefixFull = result.value.data.length === COMMENT_PAGE_SIZE;
-    if (!prefixFull) break;
+function bootstrapMarkerEntry(comment) {
+  const body = String(comment && comment.body || '');
+  if (!body.includes('<!-- codex-review-feishu-') || body.includes(CHECKPOINT_MARK) ||
+      body.includes(BOOTSTRAP_MARK)) return null;
+  const trusted = isGithubActionsBot(comment) ||
+    (legacyMessageId(body) && isTrustedMarkerComment(comment, { legacy: true }));
+  const id = Number(comment && comment.id);
+  if (!trusted || !Number.isSafeInteger(id) || id <= 0) return null;
+  return {
+    id, body,
+    createdAt: validIsoTime(comment.created_at) ? comment.created_at : '1970-01-01T00:00:00.000Z',
+    login: String(comment.user && comment.user.login || ''),
+    type: String(comment.user && comment.user.type || 'User') === 'Bot' ? 'Bot' : 'User',
+    association: String(comment.author_association || 'NONE'),
+  };
+}
+
+function selectBootstrapProgress(comments, repo, prNum, core) {
+  const decoded = comments
+    .filter((comment) => isGithubActionsBot(comment) && String(comment.body || '').includes(BOOTSTRAP_MARK))
+    .map((comment) => ({ comment, progress: decodeBootstrapProgress(comment.body) }));
+  if (decoded.some(({ progress }) => !progress || progress.repo !== repo || progress.pr !== prNum)) {
+    core.setFailed('可信 bootstrap progress 损坏或绑定到其他 repo/PR');
+    return { ok: false, progress: null };
   }
-  const checkpointComments = (tailCheckpoints.length ? tailCheckpoints : prefix).filter((comment) =>
+  const byRevision = new Map();
+  for (const entry of decoded) {
+    if (!byRevision.has(entry.progress.revision)) byRevision.set(entry.progress.revision, []);
+    byRevision.get(entry.progress.revision).push(entry);
+  }
+  const representatives = [];
+  for (const [revision, entries] of [...byRevision.entries()].sort((a, b) => a[0] - b[0])) {
+    const hashes = new Set(entries.map(({ progress }) => canonicalHash(progress)));
+    if (hashes.size !== 1) {
+      core.setFailed(`bootstrap progress revision=${revision} 存在不同 canonical hash`);
+      return { ok: false, progress: null };
+    }
+    representatives.push(entries[0]);
+  }
+  for (let index = 1; index < representatives.length; index += 1) {
+    const previous = representatives[index - 1].progress;
+    const current = representatives[index].progress;
+    if (current.revision === previous.revision + 1 && current.parentHash !== canonicalHash(previous)) {
+      core.setFailed(`bootstrap progress revision=${current.revision} parentHash lineage 不一致`);
+      return { ok: false, progress: null };
+    }
+  }
+  return { ok: true, progress: representatives.length ? representatives[representatives.length - 1].progress : null };
+}
+
+async function appendBootstrapProgress({ github, context, core, prNum, previous, entries, highCommentId, highCreatedAt }) {
+  const progress = canonicalCheckpoint({
+    version: 1, revision: previous ? previous.revision + 1 : 1,
+    repo: repositoryName(context), pr: prNum, highCommentId, highCreatedAt,
+    parentHash: previous ? canonicalHash(previous) : null, entries,
+  });
+  let body;
+  try { body = encodeBootstrapProgress(progress); } catch (error) {
+    core.setFailed(`bootstrap progress 超过安全上限: ${errorMessage(error)}`);
+    return false;
+  }
+  const result = await withGithubRetry({
+    core, label: '持久化 bootstrap progress', attempts: 1,
+    operation: () => github.rest.issues.createComment({
+      owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum, body,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  return result.ok;
+}
+
+async function readThreadMarkerComments({
+  github, context, core = noopCore(), prNum, bootstrapPageLimit = Infinity,
+}) {
+  const repo = repositoryName(context);
+  const tailMarkers = await readCheckpointTail({ github, context, core, prNum });
+  if (tailMarkers === null) return null;
+  const checkpointComments = tailMarkers.filter((comment) =>
     isGithubActionsBot(comment) && String(comment.body || '').includes(CHECKPOINT_MARK));
   const decodedCheckpoints = checkpointComments.map((comment) => ({ comment, checkpoint: decodeCheckpoint(comment.body) }));
   if (decodedCheckpoints.some(({ checkpoint }) => !checkpoint || checkpoint.repo !== repo || checkpoint.pr !== prNum)) {
@@ -475,7 +575,15 @@ async function readThreadMarkerComments({ github, context, core = noopCore(), pr
   const checkpoint = selected ? selected.checkpoint : null;
   let comments = [];
   let truncated = false;
+  let bootstrapHigh = null;
   if (checkpoint) {
+    // Keep the established checkpoint path behavior stable; only the legacy no-checkpoint
+    // path below changes to a streaming bootstrap.
+    for (let page = 1; page <= COMMENT_MIGRATION_MAX_PAGES; page += 1) {
+      const result = await listCommentPage({ github, context, core, prNum, page });
+      if (!result.ok) return null;
+      if (result.value.data.length < COMMENT_PAGE_SIZE) break;
+    }
     comments = checkpoint.entries.map(virtualCheckpointComment);
     for (let page = 1; page <= COMMENT_INCREMENTAL_MAX_PAGES; page += 1) {
       const result = await listCommentPage({
@@ -490,18 +598,64 @@ async function readThreadMarkerComments({ github, context, core = noopCore(), pr
       if (page === COMMENT_INCREMENTAL_MAX_PAGES) truncated = true;
     }
   } else {
-    comments.push(...prefix);
-    truncated = prefix.length === COMMENT_MIGRATION_MAX_PAGES * COMMENT_PAGE_SIZE && prefixFull;
-  }
-  if (truncated && !checkpoint) {
-    core.setFailed('legacy comment migration 超过有界页上限，拒绝创建不完整 checkpoint');
-    return null;
+    const selectedProgress = selectBootstrapProgress(tailMarkers, repo, prNum, core);
+    if (!selectedProgress.ok) return null;
+    const previousProgress = selectedProgress.progress;
+    const retainedById = new Map((previousProgress ? previousProgress.entries : [])
+      .map((entry) => [entry.id, entry]));
+    const baseHighCommentId = previousProgress ? previousProgress.highCommentId : 0;
+    let highCommentId = baseHighCommentId;
+    let highCreatedAt = previousProgress ? previousProgress.highCreatedAt : '1970-01-01T00:00:00.000Z';
+    const since = highCommentId ? new Date(Date.parse(highCreatedAt) - 1000).toISOString() : undefined;
+    let complete = false;
+    for (let page = 1; ; page += 1) {
+      if (page > bootstrapPageLimit || !hasGithubRequestBudget()) {
+        truncated = true;
+        break;
+      }
+      const result = await listCommentPage({ github, context, core, prNum, page, since });
+      if (!result.ok) return null;
+      for (const comment of result.value.data) {
+        const id = Number(comment.id);
+        if (!Number.isSafeInteger(id) || id <= baseHighCommentId) continue;
+        highCommentId = Math.max(highCommentId, id);
+        if (validIsoTime(comment.created_at) && Date.parse(comment.created_at) > Date.parse(highCreatedAt)) {
+          highCreatedAt = comment.created_at;
+        }
+        const entry = bootstrapMarkerEntry(comment);
+        if (entry) retainedById.set(entry.id, entry);
+      }
+      if (result.value.data.length < COMMENT_PAGE_SIZE) {
+        complete = true;
+        break;
+      }
+    }
+    const entries = [...retainedById.values()].sort((a, b) => a.id - b.id);
+    if (!complete) {
+      if (!await appendBootstrapProgress({
+        github, context, core, prNum, previous: previousProgress, entries, highCommentId, highCreatedAt,
+      })) return null;
+      comments = entries.map(virtualCheckpointComment);
+      Object.defineProperty(comments, '_checkpoint', {
+        value: {
+          commentId: null, checkpoint: null, truncated: true, bootstrapIncomplete: true,
+          bootstrapHighCommentId: highCommentId, bootstrapHighCreatedAt: highCreatedAt,
+        }, enumerable: false,
+      });
+      return comments;
+    }
+    comments = entries.map(virtualCheckpointComment);
+    bootstrapHigh = { highCommentId, highCreatedAt };
   }
   if (truncated) core.warning('incremental comment snapshot 达到有界页上限，仅推进已吸收 high-watermark 并续下一批');
   comments = [...new Map(comments.map((comment) => [Number(comment.id), comment])).values()]
     .sort((a, b) => Number(a.id) - Number(b.id));
   Object.defineProperty(comments, '_checkpoint', {
-    value: { commentId: checkpointComment && Number(checkpointComment.id), checkpoint, truncated }, enumerable: false,
+    value: {
+      commentId: checkpointComment && Number(checkpointComment.id), checkpoint, truncated,
+      bootstrapHighCommentId: bootstrapHigh && bootstrapHigh.highCommentId,
+      bootstrapHighCreatedAt: bootstrapHigh && bootstrapHigh.highCreatedAt,
+    }, enumerable: false,
   });
   return comments;
 }
@@ -1126,6 +1280,16 @@ async function readEventQueue({ github, context, core = noopCore(), prNum, comme
 
 async function enqueueEventRef({ github, context, core = noopCore(), ref }) {
   const canonical = canonicalEventRef(ref);
+  const existing = await readEventQueue({ github, context, core, prNum: canonical.pr });
+  if (!existing.ok) return { ok: false, queue: existing };
+  const alreadyQueued = existing.events.find((entry) => entry.ref.eventKey === canonical.eventKey);
+  if (alreadyQueued) {
+    if (JSON.stringify(alreadyQueued.ref) !== JSON.stringify(canonical)) {
+      core.setFailed(`eventKey=${canonical.eventKey} 已绑定不同 immutable ref`);
+      return { ok: false, queue: existing };
+    }
+    return { ok: true, ref: canonical, queue: existing, existing: true };
+  }
   await createComment({
     github, context, core, prNum: canonical.pr,
     body: `${encodeEventRef(canonical)}\n<sub>Codex 代码评审事件队列（自动维护，请勿删除）</sub>`,
@@ -1509,8 +1673,20 @@ async function appendDeliveryAndConfirm({
   });
   if (session) {
     if (!created.ok) {
-      core.setFailed(`${canonical.state} delivery 写入未获 GitHub create response 确认`);
-      return { ok: false };
+      // A create response can be lost after GitHub persisted the comment. Re-read only on
+      // this exceptional path; accepting the exact canonical record is safe because the
+      // Feishu POST always happens after the sending transition returns successfully.
+      const ledger = await readDeliveryLedger({
+        github, context, core, prNum, repairPublicKeys: repairPublicKeys || undefined,
+      });
+      const confirmed = ledger.ok &&
+        JSON.stringify(ledger.latest.get(canonical.eventKey)) === JSON.stringify(canonical);
+      if (!confirmed) {
+        core.setFailed(`${canonical.state} delivery 写入未获 GitHub create response 或重读确认`);
+        return { ok: false, ledger };
+      }
+      session.latest = ledger.latest;
+      return { ok: true, record: canonical, ledger, recovered: true };
     }
     session.latest.set(canonical.eventKey, canonical);
     return { ok: true, record: canonical };
@@ -1815,15 +1991,18 @@ async function sendAttempt({ github, context, core, ref, prData, cls, env, attem
 
   if (isKnownRootSendFailure(result)) {
     if (mode === 'root') {
+      const notSent = canonicalDeliveryRecord({
+        ...base, state: 'not_sent', reason: 'definitely_not_sent',
+      });
+      const persisted = await appendDeliveryAndConfirm({
+        github, context, core, prNum: ref.pr, record: notSent, session,
+      });
+      if (!persisted.ok) return { complete: false, retry: true };
       const released = await releaseThreadGeneration({
         github, context, core, prNum: ref.pr,
         generation: thread.generation, claimId: thread.claimId, session,
       });
       if (!released.ok) return { complete: false, retry: true };
-      const notSent = canonicalDeliveryRecord({
-        ...base, state: 'not_sent', reason: 'definitely_not_sent',
-      });
-      await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: notSent, session });
       core.setFailed(`Feishu 根消息明确未发送，将由 watchdog 有界重试: ${feishuFailureSummary(result)}`);
       return { complete: false, retry: true };
     }
@@ -1832,6 +2011,29 @@ async function sendAttempt({ github, context, core, ref, prData, cls, env, attem
     return { complete: false, retry: false };
   }
 
+  // The POST result is ambiguous. The batch snapshot is intentionally stale here: a
+  // concurrent/recovered comment may already have settled this exact sending attempt.
+  // Re-read before appending uncertain, and never issue another POST for persisted sending.
+  const freshLedger = await readDeliveryLedger({ github, context, core, prNum: ref.pr });
+  if (!freshLedger.ok) return { complete: false, retry: true };
+  const fresh = freshLedger.latest.get(ref.eventKey);
+  if (session) session.latest = freshLedger.latest;
+  if (!fresh || !sameDeliveryIdentity(fresh, sending)) {
+    core.setFailed('Feishu POST 歧义后 delivery fresh reread 与本次 sending identity 不一致');
+    return { complete: false, retry: true };
+  }
+  if (fresh.state === 'done' || fresh.state === 'skipped') {
+    return { complete: true, retry: false };
+  }
+  if (fresh.state === 'manual' || fresh.state === 'failed') {
+    return { complete: false, retry: false, manual: true };
+  }
+  if (fresh.state === 'not_sent') return { complete: false, retry: true };
+  if (fresh.state === 'uncertain') return { complete: false, retry: true };
+  if (fresh.state !== 'sending') {
+    core.setFailed(`Feishu POST 歧义后出现非法 fresh state=${fresh.state}`);
+    return { complete: false, retry: true };
+  }
   const uncertain = canonicalDeliveryRecord({
     ...base,
     state: 'uncertain',
@@ -1909,9 +2111,23 @@ async function deliverClassifiedEvent({ github, context, core, ref, prData, cls,
   }
   if (latest && latest.state === 'not_sent') {
     if (latest.reason === 'definitely_not_sent') {
-      if (latest.mode !== 'root' || current.kind !== 'released' || current.generation !== latest.threadGeneration ||
-          current.claimId !== latest.threadClaimId) {
+      if (latest.mode !== 'root') {
         core.setFailed('definitely_not_sent delivery 与 released thread state 不一致');
+        return { complete: false, retry: false, manual: true };
+      }
+      const matchingPending = current.kind === 'pending' && current.generation === latest.threadGeneration &&
+        current.claimId === latest.threadClaimId;
+      if (matchingPending) {
+        const released = await releaseThreadGeneration({
+          github, context, core, prNum: ref.pr,
+          generation: latest.threadGeneration, claimId: latest.threadClaimId, session,
+        });
+        if (!released.ok) return { complete: false, retry: true };
+        current = session ? session.threadState : await readThreadState({ github, context, core, prNum: ref.pr });
+      }
+      if (current.kind !== 'released' || current.generation !== latest.threadGeneration ||
+          current.claimId !== latest.threadClaimId) {
+        core.setFailed('definitely_not_sent delivery 无法收敛到 matching released thread state');
         return { complete: false, retry: false, manual: true };
       }
       if (latest.attempt >= DEFINITE_SEND_MAX_ATTEMPTS) {
@@ -1979,11 +2195,54 @@ function safePositiveInteger(value) {
   return Number.isSafeInteger(number) ? number : null;
 }
 
+const MAX_RESOLVED_EVENT_REFS = 20;
+const CODEX_CAPTURE_WORKFLOW_NAME = 'Codex Review -> Feishu Capture';
+const CODEX_CAPTURE_WORKFLOW_PATH = '.github/workflows/codex-review-feishu.yml';
+const SOURCE_RECONCILE_MAX_EVENTS = 20;
+const SOURCE_RECONCILE_PAGE_SIZE = 100;
+const SOURCE_RECONCILE_MAX_PAGES = 10;
+
+function parseCompactEventRefs(value, core = noopCore()) {
+  let input = value;
+  if (typeof value === 'string') {
+    try { input = JSON.parse(value); } catch (_error) { core.setFailed('event_refs_json 不是合法 JSON'); return null; }
+  }
+  if (!Array.isArray(input) || input.length === 0 || input.length > MAX_RESOLVED_EVENT_REFS) {
+    core.setFailed(`event refs 数量必须为 1..${MAX_RESOLVED_EVENT_REFS}`);
+    return null;
+  }
+  try {
+    const refs = input.map((entry) => canonicalEventRef(entry));
+    if (new Set(refs.map((ref) => `${ref.pr}:${ref.eventKey}`)).size !== refs.length) throw new Error('duplicate ref');
+    return refs;
+  } catch (error) {
+    core.setFailed(`compact immutable event refs 非 canonical: ${errorMessage(error)}`);
+    return null;
+  }
+}
+
+function dispatchEventRef(context, core = noopCore()) {
+  const payload = context.payload.client_payload || {};
+  if (!payload.event_ref) return null;
+  const refs = parseCompactEventRefs([payload.event_ref], core);
+  if (!refs) return null;
+  const ref = refs[0];
+  if (ref.repo !== repositoryName(context) || String(payload.pr_number) !== String(ref.pr)) {
+    core.setFailed('repository_dispatch compact ref 的 repo/pr 绑定非法');
+    return null;
+  }
+  return ref;
+}
+
 async function resolvePrNumber(githubOrOptions, contextArg, coreArg) {
   const { github, context, core } = normalizeResolveArgs(githubOrOptions, contextArg, coreArg);
   if (context.eventName === 'repository_dispatch') {
     const number = safePositiveInteger(context.payload.client_payload && context.payload.client_payload.pr_number);
     if (!number) core.setFailed('repository_dispatch pr_number 非 canonical safe integer');
+    if (number && context.payload.client_payload && context.payload.client_payload.event_ref) {
+      const ref = dispatchEventRef(context, core);
+      if (!ref || ref.pr !== number) return null;
+    }
     return number;
   }
   const direct = context.payload.pull_request && context.payload.pull_request.number;
@@ -2016,6 +2275,53 @@ async function resolvePrNumber(githubOrOptions, contextArg, coreArg) {
     return null;
   }
   return candidates[0];
+}
+
+async function resolveOfficialCodexEventRefs(githubOrOptions, contextArg, coreArg) {
+  const { github, context, core } = normalizeResolveArgs(githubOrOptions, contextArg, coreArg);
+  if (!['check_run', 'pull_request_review'].includes(context.eventName)) {
+    core.setFailed(`event=${context.eventName} 不能解析 source immutable refs`);
+    return null;
+  }
+  if (context.eventName === 'pull_request_review') {
+    const number = safePositiveInteger(context.payload.pull_request && context.payload.pull_request.number);
+    if (!number) { core.setFailed('review event PR number 非 canonical'); return null; }
+    const prData = await resolvePr(github, context, { number }, core);
+    if (!prData || prData.state !== 'open' || prData.base !== 'main') return [];
+    const ref = eventRefFromContext(context, prData, core);
+    return ref && ref.headSha === prData.headSha ? [ref] : null;
+  }
+  const checkRun = context.payload.check_run;
+  if (!isCodexCheckRun(checkRun) || !checkRun.head_sha) {
+    core.setFailed('check_run Codex identity/head SHA 非法');
+    return null;
+  }
+  const associated = await withGithubRetry({
+    core, label: '按 check SHA 解析全部关联 PR',
+    operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
+      owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
+      per_page: MAX_RESOLVED_EVENT_REFS + 1, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  if (!associated.ok) return null;
+  const numbers = [...new Set([
+    ...(checkRun.pull_requests || []).map((pr) => Number(pr.number)),
+    ...(associated.value.data || []).map((pr) => Number(pr.number)),
+  ].filter((number) => Number.isSafeInteger(number) && number > 0))].sort((a, b) => a - b);
+  if (numbers.length > MAX_RESOLVED_EVENT_REFS || (associated.value.data || []).length > MAX_RESOLVED_EVENT_REFS) {
+    core.setFailed(`check_run 关联 PR 超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
+    return null;
+  }
+  const refs = [];
+  for (const number of numbers) {
+    const prData = await resolvePr(github, context, { number }, core);
+    if (!prData) return null;
+    if (prData.state !== 'open' || prData.base !== 'main' || prData.headSha !== checkRun.head_sha) continue;
+    const ref = eventRefFromContext(context, prData, core);
+    if (!ref) return null;
+    refs.push(ref);
+  }
+  return refs;
 }
 
 async function resolvePr(github, context, hint, core = noopCore()) {
@@ -2113,10 +2419,15 @@ function eventRefFromContext(context, prData, core = noopCore()) {
       core.setFailed('拒绝入队非 Codex pull_request_review');
       return null;
     }
+    const eventHead = context.payload.pull_request && context.payload.pull_request.head && context.payload.pull_request.head.sha;
+    if (!eventHead || review.commit_id !== eventHead) {
+      core.setFailed('review commit_id 与 event PR head 不一致');
+      return null;
+    }
     input = {
       version: EVENT_VERSION, eventType: 'pull_request_review', eventId: String(review.id || ''),
       repo, pr: prData.number,
-      headSha: context.payload.pull_request && context.payload.pull_request.head && context.payload.pull_request.head.sha,
+      headSha: eventHead,
       createdAt: review.submitted_at || review.updated_at,
     };
   } else {
@@ -2128,6 +2439,19 @@ function eventRefFromContext(context, prData, core = noopCore()) {
 }
 
 async function enqueueOfficialCodexEventWithinBudget({ github, context, core }) {
+  const serialized = process.env.RESOLVED_EVENT_REFS;
+  if (serialized) {
+    const refs = parseCompactEventRefs(serialized, core);
+    if (!refs) return null;
+    const confirmed = [];
+    for (const ref of refs) {
+      const hydrated = await rehydrateEvent({ github, context, core, ref });
+      if (!hydrated.ok) continue;
+      const result = await enqueueEventRef({ github, context, core, ref });
+      if (result.ok) confirmed.push(ref);
+    }
+    return confirmed;
+  }
   const prData = await resolvedPrForNotification(github, context, core);
   if (!prData) return null;
   if (prData.base !== 'main' || prData.state !== 'open') {
@@ -2168,9 +2492,24 @@ async function rehydrateEvent({ github, context, core, ref }) {
     if (!fetched.ok) return { ok: false, retry: true };
     const checkRun = fetched.value.data;
     const createdAt = checkRun.completed_at || checkRun.updated_at;
-    const linked = (checkRun.pull_requests || []).map((pr) => Number(pr.number));
+    let linked = (checkRun.pull_requests || []).map((pr) => Number(pr.number));
+    if (!linked.includes(ref.pr)) {
+      const associated = await withGithubRetry({
+        core, label: `重验 check_run ${ref.eventId} 关联 PR`,
+        operation: () => github.rest.repos.listPullRequestsAssociatedWithCommit({
+          owner: context.repo.owner, repo: context.repo.repo, commit_sha: checkRun.head_sha,
+          per_page: MAX_RESOLVED_EVENT_REFS + 1, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+        }),
+      });
+      if (!associated.ok) return { ok: false, retry: true };
+      if ((associated.value.data || []).length > MAX_RESOLVED_EVENT_REFS) {
+        core.setFailed(`check_run rehydrate 关联 PR 超过 cap=${MAX_RESOLVED_EVENT_REFS}`);
+        return { ok: false, retry: false, manualReason: 'association_overflow' };
+      }
+      linked = [...new Set([...linked, ...(associated.value.data || []).map((pr) => Number(pr.number))])];
+    }
     if (String(checkRun.id) !== ref.eventId || checkRun.head_sha !== ref.headSha || createdAt !== ref.createdAt ||
-        !isCodexCheckRun(checkRun) || checkRun.status !== 'completed' || (linked.length && !linked.includes(ref.pr))) {
+        !isCodexCheckRun(checkRun) || checkRun.status !== 'completed' || !linked.includes(ref.pr)) {
       core.setFailed('immutable check_run 与队列 ref 的 Codex/repo/PR/head/time 绑定不一致');
       return { ok: false, retry: false, manualReason: 'immutable_mismatch' };
     }
@@ -2189,7 +2528,8 @@ async function rehydrateEvent({ github, context, core, ref }) {
   });
   if (!fetched.ok) return { ok: false, retry: true };
   const review = fetched.value.data;
-  if (String(review.id) !== ref.eventId || review.submitted_at !== ref.createdAt || !isCodexPullRequestReview(review)) {
+  if (String(review.id) !== ref.eventId || review.submitted_at !== ref.createdAt ||
+      review.commit_id !== ref.headSha || prData.headSha !== ref.headSha || !isCodexPullRequestReview(review)) {
     core.setFailed('immutable review 与队列 ref 的 Codex/repo/PR/head/time 绑定不一致');
     return { ok: false, retry: false, manualReason: 'immutable_mismatch' };
   }
@@ -2199,7 +2539,9 @@ async function rehydrateEvent({ github, context, core, ref }) {
   return { ok: true, notify: shouldNotify(cls), reason: 'not_notifiable', cls, prData };
 }
 
-async function scheduleDrain({ github, context, core, prNum }) {
+async function scheduleDrain({ github, context, core, prNum, ref = null }) {
+  const clientPayload = { pr_number: String(prNum) };
+  if (ref) clientPayload.event_ref = canonicalEventRef(ref);
   const result = await withGithubRetry({
     core,
     label: '调度下一批 Codex 飞书队列消费',
@@ -2207,7 +2549,7 @@ async function scheduleDrain({ github, context, core, prNum }) {
       owner: context.repo.owner,
       repo: context.repo.repo,
       event_type: 'codex-review-feishu-drain',
-      client_payload: { pr_number: String(prNum) },
+      client_payload: clientPayload,
       request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
@@ -2608,8 +2950,9 @@ async function persistCheckpoint({ github, context, core, prNum, comments, queue
   const previous = metadata.checkpoint;
   const highCommentId = comments.reduce((max, comment) =>
     String(comment.body || '').includes(CHECKPOINT_MARK) ? max : Math.max(max, Number(comment.id) || 0),
-  previous ? previous.highCommentId : 0);
-  let highCreatedAt = previous ? previous.highCreatedAt : '1970-01-01T00:00:00.000Z';
+  previous ? previous.highCommentId : Number(metadata.bootstrapHighCommentId) || 0);
+  let highCreatedAt = previous ? previous.highCreatedAt :
+    (validIsoTime(metadata.bootstrapHighCreatedAt) ? metadata.bootstrapHighCreatedAt : '1970-01-01T00:00:00.000Z');
   for (const comment of comments) {
     if (Number(comment.id) <= (previous ? previous.highCommentId : 0)) continue;
     if (validIsoTime(comment.created_at) && Date.parse(comment.created_at) > Date.parse(highCreatedAt)) {
@@ -2647,10 +2990,13 @@ async function persistCheckpoint({ github, context, core, prNum, comments, queue
         return candidate && candidate.repo === repositoryName(context) && candidate.pr === prNum
           ? { hash: canonicalHash(candidate), commentId: Number(comment.id), checkpoint: candidate }
           : null;
-      }).filter(Boolean);
-      if (found.length > 0 && found.every(({ hash }) => hash === targetHash)) {
-        metadata.commentId = found[0].commentId;
-        metadata.checkpoint = found[0].checkpoint;
+      }).filter((candidate) => candidate && candidate.checkpoint.revision === checkpoint.revision);
+      const expected = found.filter(({ hash }) => hash === targetHash);
+      const revisionHashes = new Set(found.map(({ hash }) => hash));
+      if (expected.length > 0 && revisionHashes.size === 1 &&
+          expected.every(({ checkpoint: candidate }) => candidate.parentHash === checkpoint.parentHash)) {
+        metadata.commentId = expected[0].commentId;
+        metadata.checkpoint = expected[0].checkpoint;
         return true;
       }
       core.setFailed('checkpoint POST 未确认或发现不一致 lineage，保留旧 high-watermark');
@@ -2685,13 +3031,19 @@ async function persistCheckpoint({ github, context, core, prNum, comments, queue
   return false;
 }
 
-async function drainQueuedCodexEventsSnapshotWithinBudget({ github, context, core, batchSize = DRAIN_BATCH_SIZE }) {
+async function drainQueuedCodexEventsSnapshotWithinBudget({
+  github, context, core, batchSize = DRAIN_BATCH_SIZE, bootstrapPageLimit = Infinity,
+}) {
   setDrainOutputs(core, false, 'none');
   const prNum = safePositiveInteger(process.env.RESOLVED_PR_NUMBER) || await resolvePrNumber(github, context, core);
   if (!prNum) return;
-  let comments = await readThreadMarkerComments({ github, context, core, prNum });
+  let comments = await readThreadMarkerComments({ github, context, core, prNum, bootstrapPageLimit });
   if (!comments) {
     setDrainOutputs(core, true, 'retry');
+    return;
+  }
+  if (comments._checkpoint && comments._checkpoint.bootstrapIncomplete) {
+    setDrainOutputs(core, true, 'backlog');
     return;
   }
   let queue = await readEventQueue({ github, context, core, prNum, comments });
@@ -2937,10 +3289,205 @@ async function drainQueuedCodexEventsSnapshotWithinBudget({ github, context, cor
 async function scheduleQueuedCodexDrain(args) {
   return withGithubAttemptBudget(async () => {
     const { github, context, core } = args;
-    const prNum = safePositiveInteger(args.prNum || process.env.RESOLVED_PR_NUMBER) || await resolvePrNumber(github, context, core);
+    let ref = args.ref || null;
+    if (ref) {
+      const refs = parseCompactEventRefs([ref], core);
+      if (!refs) return false;
+      [ref] = refs;
+    }
+    const prNum = safePositiveInteger(args.prNum || ref && ref.pr || process.env.RESOLVED_PR_NUMBER) || await resolvePrNumber(github, context, core);
     if (!prNum) return false;
-    return scheduleDrain({ github, context, core, prNum });
+    return scheduleDrain({ github, context, core, prNum, ref });
   });
+}
+
+function parseCodexCaptureRunName(value, core = noopCore()) {
+  const raw = String(value || '');
+  if (raw.length > 100) { core.setFailed('capture run name 超长'); return null; }
+  const match = /^codex-feishu-capture:(review|check):(0|[1-9][0-9]*):([1-9][0-9]*)$/.exec(raw);
+  if (!match) { core.setFailed('capture run name 格式非法'); return null; }
+  const pr = safePositiveInteger(match[2]);
+  const eventId = safePositiveInteger(match[3]);
+  if ((!pr && match[2] !== '0') || !eventId || (match[1] === 'review' && !pr)) {
+    core.setFailed('capture run name 数字超出 safe integer');
+    return null;
+  }
+  return { type: match[1], pr: pr || 0, eventId };
+}
+
+async function resolveCodexWorkflowRunRefs({ github, context, core = noopCore() }) {
+  if (context.eventName !== 'workflow_run') { core.setFailed('仅 workflow_run 可消费 capture wake-up'); return null; }
+  const hint = context.payload.workflow_run || {};
+  const runId = safePositiveInteger(hint.id);
+  if (!runId) { core.setFailed('workflow_run id 非 canonical safe integer'); return null; }
+  const runResult = await withGithubRetry({
+    core, label: `重取 source workflow run ${runId}`,
+    operation: () => github.rest.actions.getWorkflowRun({
+      owner: context.repo.owner, repo: context.repo.repo, run_id: runId,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  if (!runResult.ok) return null;
+  const run = runResult.value.data || {};
+  const workflowId = safePositiveInteger(run.workflow_id);
+  if (!workflowId || String(run.id) !== String(runId) || run.status !== 'completed' || run.conclusion !== 'success' ||
+      !['check_run', 'pull_request_review'].includes(run.event) ||
+      String(run.repository && run.repository.full_name || '') !== repositoryName(context) ||
+      (hint.workflow_id && String(hint.workflow_id) !== String(workflowId))) {
+    core.setFailed('source workflow run repo/id/event/status/conclusion 绑定非法');
+    return null;
+  }
+  const workflowResult = await withGithubRetry({
+    core, label: `验证 source workflow id=${workflowId}`,
+    operation: () => github.rest.actions.getWorkflow({
+      owner: context.repo.owner, repo: context.repo.repo, workflow_id: workflowId,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  if (!workflowResult.ok) return null;
+  const workflow = workflowResult.value.data || {};
+  if (String(workflow.id) !== String(workflowId) || workflow.name !== CODEX_CAPTURE_WORKFLOW_NAME ||
+      workflow.path !== CODEX_CAPTURE_WORKFLOW_PATH) {
+    core.setFailed('source workflow id/name/path 不是固定 capture workflow');
+    return null;
+  }
+  const jobsResult = await withGithubRetry({
+    core, label: `验证 source workflow run ${runId} capture job`,
+    operation: () => github.rest.actions.listJobsForWorkflowRun({
+      owner: context.repo.owner, repo: context.repo.repo, run_id: runId,
+      filter: 'latest', page: 1, per_page: 2,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  if (!jobsResult.ok) return null;
+  const jobs = jobsResult.value.data && jobsResult.value.data.jobs || [];
+  if (jobs.length === 1 && jobs[0].name === 'capture' && jobs[0].conclusion === 'skipped') return [];
+  if (jobs.length !== 1 || jobs[0].name !== 'capture' || jobs[0].status !== 'completed' || jobs[0].conclusion !== 'success') {
+    core.setFailed('source workflow capture job 数量/name/status/conclusion 非法');
+    return null;
+  }
+  const capture = parseCodexCaptureRunName(run.display_title, core);
+  if (!capture || (capture.type === 'review') !== (run.event === 'pull_request_review')) return null;
+  if (capture.type === 'review') {
+    const prData = await resolvePr(github, context, { number: capture.pr }, core);
+    if (!prData || prData.state !== 'open' || prData.base !== 'main') return [];
+    const fetched = await withGithubRetry({
+      core, label: `按 wake-up immutable ID 重取 review ${capture.eventId}`,
+      operation: () => github.rest.pulls.getReview({
+        owner: context.repo.owner, repo: context.repo.repo, pull_number: capture.pr, review_id: capture.eventId,
+        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+      }),
+    });
+    if (!fetched.ok) return null;
+    const review = fetched.value.data;
+    if (!review || String(review.id) !== String(capture.eventId) || !isCodexPullRequestReview(review) ||
+        review.commit_id !== prData.headSha || !review.submitted_at) {
+      core.setFailed('wake-up review 官方身份/commit/current head 绑定非法');
+      return null;
+    }
+    return [canonicalEventRef({
+      version: EVENT_VERSION, eventType: 'pull_request_review', eventId: String(review.id),
+      repo: repositoryName(context), pr: prData.number, headSha: prData.headSha, createdAt: review.submitted_at,
+    })];
+  }
+  const fetched = await withGithubRetry({
+    core, label: `按 wake-up immutable ID 重取 check_run ${capture.eventId}`,
+    operation: () => github.rest.checks.get({
+      owner: context.repo.owner, repo: context.repo.repo, check_run_id: capture.eventId,
+      request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+    }),
+  });
+  if (!fetched.ok) return null;
+  const checkRun = fetched.value.data;
+  if (!checkRun || String(checkRun.id) !== String(capture.eventId) || !isCodexCheckRun(checkRun) ||
+      checkRun.status !== 'completed' || !validSha(checkRun.head_sha) || !(checkRun.completed_at || checkRun.updated_at)) {
+    core.setFailed('wake-up check_run 官方身份/status/head/time 绑定非法');
+    return null;
+  }
+  const sourceContext = { ...context, eventName: 'check_run', payload: { check_run: checkRun } };
+  return resolveOfficialCodexEventRefs(github, sourceContext, core);
+}
+
+async function consumeCodexWorkflowRunWakeup(args) {
+  return withGithubAttemptBudget(async () => {
+    const { github, context, core } = args;
+    const refs = await resolveCodexWorkflowRunRefs({ github, context, core });
+    if (!refs) return null;
+    const confirmed = [];
+    for (const ref of refs) {
+      const hydrated = await rehydrateEvent({ github, context, core, ref });
+      if (!hydrated.ok || hydrated.reason === 'stale_pr') return null;
+      const queued = await enqueueEventRef({ github, context, core, ref });
+      if (!queued.ok) return null;
+      confirmed.push(ref);
+    }
+    for (const ref of confirmed) {
+      if (!await scheduleDrain({ github, context, core, prNum: ref.pr })) return null;
+    }
+    return confirmed;
+  });
+}
+
+async function reconcileOfficialSourcesForPr({ github, context, core, prData, knownEventKeys = new Set() }) {
+  const reviewItems = [];
+  const checkItems = [];
+  for (let page = 1; page <= SOURCE_RECONCILE_MAX_PAGES; page += 1) {
+    if (!hasGithubRequestBudget()) return null;
+    const result = await withGithubRetry({
+      core, label: `枚举 PR #${prData.number} 当前 head reviews page=${page}`,
+      operation: () => github.rest.pulls.listReviews({
+        owner: context.repo.owner, repo: context.repo.repo, pull_number: prData.number,
+        page, per_page: SOURCE_RECONCILE_PAGE_SIZE,
+        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+      }),
+    });
+    if (!result.ok) return null;
+    const pageItems = result.value.data || [];
+    reviewItems.push(...pageItems);
+    if (pageItems.length < SOURCE_RECONCILE_PAGE_SIZE) break;
+    if (page === SOURCE_RECONCILE_MAX_PAGES) {
+      core.warning(`PR #${prData.number} reviews 达分页 cap=${SOURCE_RECONCILE_MAX_PAGES}`);
+    }
+  }
+  for (let page = 1; page <= SOURCE_RECONCILE_MAX_PAGES; page += 1) {
+    if (!hasGithubRequestBudget()) return null;
+    const result = await withGithubRetry({
+      core, label: `枚举 PR #${prData.number} 当前 head checks page=${page}`,
+      operation: () => github.rest.checks.listForRef({
+        owner: context.repo.owner, repo: context.repo.repo, ref: prData.headSha, filter: 'all',
+        page, per_page: SOURCE_RECONCILE_PAGE_SIZE,
+        request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
+      }),
+    });
+    if (!result.ok) return null;
+    const pageItems = result.value.data && result.value.data.check_runs || [];
+    checkItems.push(...pageItems);
+    if (pageItems.length < SOURCE_RECONCILE_PAGE_SIZE) break;
+    if (page === SOURCE_RECONCILE_MAX_PAGES) {
+      core.warning(`PR #${prData.number} checks 达分页 cap=${SOURCE_RECONCILE_MAX_PAGES}`);
+    }
+  }
+  const reviews = reviewItems.filter((review) =>
+    isCodexPullRequestReview(review) && review.commit_id === prData.headSha && review.submitted_at);
+  const checks = checkItems.filter((checkRun) =>
+    isCodexCheckRun(checkRun) && checkRun.status === 'completed' && checkRun.head_sha === prData.headSha &&
+    (checkRun.completed_at || checkRun.updated_at));
+  const all = [
+    ...reviews.map((review) => canonicalEventRef({
+      version: EVENT_VERSION, eventType: 'pull_request_review', eventId: String(review.id),
+      repo: repositoryName(context), pr: prData.number, headSha: prData.headSha, createdAt: review.submitted_at,
+    })),
+    ...checks.map((checkRun) => canonicalEventRef({
+      version: EVENT_VERSION, eventType: 'check_run', eventId: String(checkRun.id),
+      repo: repositoryName(context), pr: prData.number, headSha: prData.headSha,
+      createdAt: checkRun.completed_at || checkRun.updated_at,
+    })),
+  ].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.eventKey.localeCompare(b.eventKey));
+  const unknown = all.filter((ref) => !knownEventKeys.has(ref.eventKey));
+  if (unknown.length > SOURCE_RECONCILE_MAX_EVENTS) {
+    core.info(`PR #${prData.number} source reconciliation unknown=${unknown.length}，本轮稳定推进 ${SOURCE_RECONCILE_MAX_EVENTS}`);
+  }
+  return unknown.slice(0, SOURCE_RECONCILE_MAX_EVENTS);
 }
 
 function watchdogWindow(pulls, repo, nowMs = Date.now()) {
@@ -2965,12 +3512,13 @@ async function sweepQueuedCodexReviews(args) {
   return withGithubAttemptBudget(async () => {
     const { github, context, core } = args;
     const nowMs = Number.isFinite(args.nowMs) ? args.nowMs : Date.now();
-    const slot = Math.floor(nowMs / WATCHDOG_SLOT_MS);
-    const cycle = Math.floor(slot / WATCHDOG_SHARDS);
-    let startPage = 1 + (cycle % WATCHDOG_PAGE_WINDOWS) * WATCHDOG_MAX_PR_PAGES;
     const pulls = [];
-    for (let pageOffset = 0; pageOffset < WATCHDOG_MAX_PR_PAGES; pageOffset += 1) {
-      const page = startPage + pageOffset;
+    let page = 1;
+    for (;;) {
+      if (!hasGithubRequestBudget()) {
+        core.warning('watchdog 在读取完全部 OPEN PR 前到达 attempt deadline，留待下一轮');
+        return;
+      }
       const result = await withGithubRetry({
         core,
         label: `列出 watchdog PR page=${page}`,
@@ -2983,20 +3531,7 @@ async function sweepQueuedCodexReviews(args) {
       if (!result.ok) return;
       pulls.push(...result.value.data);
       if (result.value.data.length < WATCHDOG_PR_PAGE_SIZE) break;
-    }
-    if (pulls.length === 0 && startPage !== 1) {
-      startPage = 1;
-      const fallback = await withGithubRetry({
-        core,
-        label: 'watchdog rotated page 为空，回退 page=1',
-        operation: () => github.rest.pulls.list({
-          owner: context.repo.owner, repo: context.repo.repo, state: 'open', base: 'main',
-          sort: 'created', direction: 'asc', page: 1, per_page: WATCHDOG_PR_PAGE_SIZE,
-          request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
-        }),
-      });
-      if (!fallback.ok) return;
-      pulls.push(...fallback.value.data);
+      page += 1;
     }
     const window = watchdogWindow(pulls, repositoryName(context), nowMs);
     let dispatches = 0;
@@ -3004,24 +3539,53 @@ async function sweepQueuedCodexReviews(args) {
       if (dispatches >= WATCHDOG_MAX_DISPATCHES) break;
       const prNum = Number(pr.number);
       if (!Number.isSafeInteger(prNum) || prNum <= 0) continue;
+      const prData = await resolvePr(github, context, { number: prNum }, core);
+      if (!prData || prData.state !== 'open' || prData.base !== 'main') continue;
       const comments = await readThreadMarkerComments({ github, context, core, prNum });
       if (!comments) continue;
+      if (comments._checkpoint && comments._checkpoint.bootstrapIncomplete) continue;
       const queue = await readEventQueue({ github, context, core, prNum, comments });
-      if (!queue.ok || queue.events.length === 0) continue;
-      const ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
-      if (!ledger.ok) continue;
-      const thread = await readThreadState({ github, context, core, prNum, comments });
-      if (!thread.ok) continue;
-      const barrier = queue.events.some(({ ref }) =>
-        isManualRootPendingBarrier(ledger.latest.get(ref.eventKey), thread));
-      if (barrier) continue;
-      const actionable = queue.events.some(({ ref }) => {
-        const state = ledger.latest.get(ref.eventKey);
-        return !state || !['done', 'skipped', 'manual'].includes(state.state);
+      if (!queue.ok) continue;
+      let barrier = false;
+      let actionable = false;
+      if (queue.events.length > 0) {
+        const ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
+        if (!ledger.ok) continue;
+        const thread = await readThreadState({ github, context, core, prNum, comments });
+        if (!thread.ok) continue;
+        barrier = queue.events.some(({ ref }) =>
+          isManualRootPendingBarrier(ledger.latest.get(ref.eventKey), thread));
+        actionable = queue.events.some(({ ref }) => {
+          const state = ledger.latest.get(ref.eventKey);
+          if (!state || ['retrying', 'failed'].includes(state.state)) return true;
+          if (['done', 'skipped', 'manual'].includes(state.state)) return false;
+          return !state.nextCheckAt || Date.parse(state.nextCheckAt) <= nowMs;
+        });
+      }
+      let existingDispatched = false;
+      if (!barrier && actionable) {
+        existingDispatched = await scheduleDrain({ github, context, core, prNum });
+        if (!existingDispatched) {
+          core.warning(`watchdog PR #${prNum} 已有 durable queue dispatch 失败，跳过 source reconciliation`);
+          continue;
+        }
+        dispatches += 1;
+      }
+      const sources = await reconcileOfficialSourcesForPr({
+        github, context, core, prData,
+        knownEventKeys: new Set(queue.events.map(({ ref }) => ref.eventKey)),
       });
-      if (actionable && await scheduleDrain({ github, context, core, prNum })) dispatches += 1;
+      let sourcesDurable = true;
+      for (const ref of sources || []) {
+        const queued = await enqueueEventRef({ github, context, core, ref });
+        if (!queued.ok) { sourcesDurable = false; break; }
+      }
+      if (barrier) continue;
+      const newDurableSources = sourcesDurable && sources && sources.length > 0;
+      if (!existingDispatched && newDurableSources && dispatches < WATCHDOG_MAX_DISPATCHES &&
+          await scheduleDrain({ github, context, core, prNum })) dispatches += 1;
     }
-    core.info(`watchdog slot=${window.slot} shard=${window.shard} start_page=${startPage} prs=${window.pulls.length} dispatches=${dispatches}`);
+    core.info(`watchdog slot=${window.slot} shard=${window.shard} open_prs=${pulls.length} prs=${window.pulls.length} dispatches=${dispatches}`);
   });
 }
 
@@ -3080,8 +3644,26 @@ async function enqueueOfficialCodexEvent(args) {
   return withGithubAttemptBudget(() => enqueueOfficialCodexEventWithinBudget(args));
 }
 
+async function ensureDispatchedEventEnqueued({ github, context, core }) {
+  if (context.eventName !== 'repository_dispatch' ||
+      !context.payload.client_payload || !context.payload.client_payload.event_ref) return true;
+  const ref = dispatchEventRef(context, core);
+  if (!ref) return false;
+  const hydrated = await rehydrateEvent({ github, context, core, ref });
+  if (!hydrated.ok) {
+    core.setFailed('dispatch immutable ref strict rehydrate 失败，拒绝补入队');
+    return false;
+  }
+  const ensured = await enqueueEventRef({ github, context, core, ref });
+  if (!ensured.ok) core.setFailed('dispatch immutable ref 未能 idempotent ensure enqueue');
+  return ensured.ok;
+}
+
 async function drainQueuedCodexEvents(args) {
-  return withGithubAttemptBudget(() => drainQueuedCodexEventsSnapshotWithinBudget(args));
+  return withGithubAttemptBudget(async () => {
+    if (!await ensureDispatchedEventEnqueued(args)) return;
+    return drainQueuedCodexEventsSnapshotWithinBudget(args);
+  });
 }
 
 async function notifyFromCheckRun(args) {
@@ -3160,16 +3742,17 @@ module.exports = {
   HISTORY_MAX_AGE_MS,
   DEFINITE_SEND_MAX_ATTEMPTS,
   WATCHDOG_PR_PAGE_SIZE,
-  WATCHDOG_MAX_PR_PAGES,
   WATCHDOG_MAX_PRS_PER_RUN,
   WATCHDOG_MAX_DISPATCHES,
   WATCHDOG_SHARDS,
+  WATCHDOG_SLOT_MS,
   CODEX_REVIEW_USER_ID,
   CODEX_REVIEW_LOGIN,
   CODEX_CHECK_APP_SLUG,
   parseRetryAfterMs,
   withGithubAttemptBudget,
   withGithubRetry,
+  githubGraphqlWithTimeout,
   readThreadMarkerComments,
   persistThreadMarker,
   MARK,
@@ -3185,6 +3768,15 @@ module.exports = {
   isTrustedMarkerComment,
   readThreadState,
   resolvePrNumber,
+  resolveOfficialCodexEventRefs,
+  resolveCodexWorkflowRunRefs,
+  consumeCodexWorkflowRunWakeup,
+  parseCodexCaptureRunName,
+  parseCompactEventRefs,
+  MAX_RESOLVED_EVENT_REFS,
+  CODEX_CAPTURE_WORKFLOW_NAME,
+  CODEX_CAPTURE_WORKFLOW_PATH,
+  SOURCE_RECONCILE_MAX_EVENTS,
   resolvePr,
   reserveThreadGeneration,
   finalizeThreadGeneration,
@@ -3201,4 +3793,9 @@ module.exports = {
   watchdogWindow,
   THREAD_REPAIR_MARK,
   CHECKPOINT_MARK,
+  BOOTSTRAP_MARK,
+  encodeCheckpoint,
+  decodeCheckpoint,
+  encodeBootstrapProgress,
+  decodeBootstrapProgress,
 };
