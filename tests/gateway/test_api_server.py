@@ -96,6 +96,24 @@ class TestToolCompletionPayload:
         }
         assert "snapshot" not in payload
 
+    @patch(
+        "gateway.platforms.api_server.project_browser_state_preview",
+        side_effect=UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogate"),
+    )
+    def test_preview_failure_keeps_the_tool_completion(self, _project_preview):
+        payload = _tool_completion_payload(
+            "call_browser_state",
+            "browser_navigate",
+            {"success": True, "title": "malformed"},
+        )
+
+        assert payload == {
+            "tool": "browser_navigate",
+            "toolCallId": "call_browser_state",
+            "status": "completed",
+            "outcome": "success",
+        }
+
     def test_emits_only_bounded_takeover_hint_for_live_clients(self):
         payload = _tool_completion_payload(
             "call_browser_1",
@@ -4636,7 +4654,7 @@ class TestTakeoverUIHintOverSSE:
             {
                 "success": True,
                 "url": "https://example.com/login?return_to=private",
-                "title": "Sign in",
+                "title": "Sign \ud800in",
                 "snapshot": '- heading "Sign in" [e1]\n- textbox "Email" [e2]: private@example.com',
                 "element_count": 2,
             }
@@ -4693,6 +4711,8 @@ class TestTakeoverUIHintOverSSE:
         assert len(completed) == 1
         state = completed[0]["browserState"]
         assert state["url"] == {"hostname": "example.com"}
+        assert state["title"] == "Sign ?in"
+        assert state["truncated"] is True
         assert state["elements"] == [
             {"role": "heading", "label": "Sign in"},
             {"role": "textbox", "label": "Email"},

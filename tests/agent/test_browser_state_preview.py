@@ -72,6 +72,51 @@ def test_snapshot_is_bounded_and_marks_truncation() -> None:
     )
 
 
+def test_snapshot_parses_only_attribute_state_and_prioritizes_known_roles() -> None:
+    snapshot = "\n".join([
+        '- button "Show [hidden] files" [selected]',
+        '- button "Plan [selected]" [ref=e2]',
+        '- button "Actually hidden" [hidden]',
+        *(f'- widget "Other {index}" [ref=o{index}]' for index in range(24)),
+        '- alert "Critical" [ref=alert]',
+    ])
+
+    preview = project_browser_state_preview(
+        "browser_snapshot",
+        {"success": True, "snapshot": snapshot, "element_count": 27},
+    )
+
+    assert preview is not None
+    assert preview["truncated"] is True
+    assert len(preview["elements"]) == MAX_ELEMENTS
+    assert preview["elements"][0] == {
+        "role": "button",
+        "label": "Show [hidden] files",
+        "state": "selected",
+    }
+    assert preview["elements"][1] == {"role": "button", "label": "Plan [selected]"}
+    assert {"role": "alert", "label": "Critical"} in preview["elements"]
+    assert all(item.get("label") != "Actually hidden" for item in preview["elements"])
+    assert any(item["role"] == "other" for item in preview["elements"])
+
+
+def test_projection_replaces_lone_surrogates_before_utf8_serialization() -> None:
+    preview = project_browser_state_preview(
+        "browser_navigate",
+        {
+            "success": True,
+            "title": "Broken \ud800 title",
+            "snapshot": '- heading "Broken \ud800 heading" [ref=e1]',
+        },
+    )
+
+    assert preview is not None
+    assert preview["truncated"] is True
+    assert "\ud800" not in preview["title"]
+    assert "\ud800" not in preview["elements"][0]["label"]
+    json.dumps(preview, ensure_ascii=False).encode("utf-8")
+
+
 def test_vision_projects_analysis_but_not_local_screenshot_path() -> None:
     preview = project_browser_state_preview(
         "browser_vision",

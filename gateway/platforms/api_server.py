@@ -1003,13 +1003,23 @@ def _tool_completion_payload(
     decoded = _promote_connector_error_from_tool_output(decoded)
 
     ui_hint = _takeover_ui_hint(decoded, function_name)
-    browser_state = project_browser_state_preview(
-        function_name,
-        decoded,
-        browser_session_id=(
-            ui_hint.get("browser_session_id") if ui_hint is not None else None
-        ),
-    )
+    try:
+        browser_state = project_browser_state_preview(
+            function_name,
+            decoded,
+            browser_session_id=(
+                ui_hint.get("browser_session_id") if ui_hint is not None else None
+            ),
+        )
+    except Exception:
+        # Preview is an optional presentation projection.  A malformed browser
+        # result or projector defect must never suppress the real completion.
+        logger.warning(
+            "[api_server] browser state preview projection failed for tool=%s",
+            function_name,
+            exc_info=True,
+        )
+        browser_state = None
     if browser_state is not None:
         payload["browserState"] = browser_state
 

@@ -49,10 +49,18 @@ _ROLE_MAP = {
     "switch": "other",
     "tab": "other",
 }
+_ROLE_PRIORITY = {
+    "alert": 0,
+    "heading": 1,
+    "textbox": 2,
+    "button": 3,
+    "link": 4,
+    "other": 5,
+}
 _ELEMENT_RE = re.compile(
     r"^\s*(?:-\s*)?"
-    r"(heading|button|link|textbox|alert|checkbox|radio|combobox|menuitem|option|switch|tab)"
-    r'\b(?:\s+"((?:[^"\\]|\\.)*)")?',
+    r"(?P<role>[a-z][a-z0-9_-]*)"
+    r'\b(?:\s+"(?P<label>(?:[^"\\]|\\.)*)")?',
     re.IGNORECASE,
 )
 _HIDDEN_STATE_RE = re.compile(
@@ -80,6 +88,14 @@ def _clean_text(value: Any, max_chars: int) -> tuple[str, bool]:
     scan_limit = max(max_chars * 8, max_chars)
     truncated = len(value) > scan_limit
     value = value[:scan_limit]
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        # Browser-controlled text can contain lone UTF-16 surrogates.  Replace
+        # them before redaction/serialization so preview failure cannot escape
+        # into the tool-completion path.
+        value = value.encode("utf-8", errors="replace").decode("utf-8")
+        truncated = True
     value = redact_sensitive_text(value, force=True, redact_url_credentials=True)
     value = " ".join(value.split())
     if len(value) > max_chars:
@@ -147,22 +163,20 @@ def _snapshot_elements(snapshot: Any) -> tuple[list[dict[str, str]], int, bool]:
 
     truncated = len(snapshot) > MAX_SNAPSHOT_SCAN_CHARS
     snapshot = snapshot[:MAX_SNAPSHOT_SCAN_CHARS]
-    elements: list[dict[str, str]] = []
+    candidates: list[dict[str, str]] = []
     matched_count = 0
     for line in snapshot.splitlines():
-        if _HIDDEN_STATE_RE.search(line):
-            continue
         match = _ELEMENT_RE.match(line)
         if not match:
             continue
-        matched_count += 1
-        if len(elements) >= MAX_ELEMENTS:
-            truncated = True
+        attributes = line[match.end() :]
+        if _HIDDEN_STATE_RE.search(attributes):
             continue
+        matched_count += 1
 
-        source_role = match.group(1).lower()
-        element: dict[str, str] = {"role": _ROLE_MAP[source_role]}
-        raw_label = match.group(2)
+        source_role = match.group("role").lower()
+        element: dict[str, str] = {"role": _ROLE_MAP.get(source_role, "other")}
+        raw_label = match.group("label")
         if raw_label:
             label, label_truncated = _clean_text(
                 _decode_label(raw_label), MAX_LABEL_CHARS
@@ -170,10 +184,25 @@ def _snapshot_elements(snapshot: Any) -> tuple[list[dict[str, str]], int, bool]:
             truncated = truncated or label_truncated
             if label:
                 element["label"] = label
-        state = _safe_state(line)
+        state = _safe_state(attributes)
         if state:
             element["state"] = state[:MAX_LABEL_CHARS]
-        elements.append(element)
+        candidates.append(element)
+
+    if len(candidates) > MAX_ELEMENTS:
+        truncated = True
+        selected_indices = sorted(
+            sorted(
+                range(len(candidates)),
+                key=lambda index: (
+                    _ROLE_PRIORITY[candidates[index]["role"]],
+                    index,
+                ),
+            )[:MAX_ELEMENTS]
+        )
+        elements = [candidates[index] for index in selected_indices]
+    else:
+        elements = candidates
     return elements, matched_count, truncated
 
 
