@@ -8648,6 +8648,61 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert "interrupt_called" not in calls  # must NOT interrupt
 
 
+def test_session_steer_requeues_at_turn_tail_when_session_still_running(monkeypatch):
+    agent = types.SimpleNamespace(steer=lambda _text: False)
+    transport = object()
+    session = _session(agent=agent, running=True, transport=transport)
+    queued = []
+    monkeypatch.setattr(
+        server,
+        "_enqueue_prompt",
+        lambda sess, text, target: queued.append((sess, text, target)),
+    )
+    server._sessions["sid"] = session
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "check the final log"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"] == {
+        "status": "queued",
+        "text": "check the final log",
+        "requeued": True,
+    }
+    assert queued == [(session, "check the final log", transport)]
+
+
+def test_session_steer_rejects_closed_slot_when_session_is_idle(monkeypatch):
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda _text: False),
+        running=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_enqueue_prompt",
+        lambda *_args: pytest.fail("idle session must not requeue steer text"),
+    )
+    server._sessions["sid"] = session
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "too late"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"] == {"status": "rejected", "text": "too late"}
+
+
 def test_session_steer_rejects_empty_text():
     server._sessions["sid"] = _session(
         agent=types.SimpleNamespace(steer=lambda t: True)

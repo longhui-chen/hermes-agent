@@ -374,6 +374,13 @@ override-dependencies = [
   # so, we force-override this to pynacl 1.6. here.
   # remove this when we update discord.py
   "pynacl>=1.6,<1.7",
+  # Zettlab's fork freezes Microsoft/Azure dependencies because their auth and
+  # payload behavior is device-sensitive. Keep transitive Teams packages exact
+  # as well so a lock refresh cannot silently move the family together.
+  "msal==1.36.0",
+  "microsoft-teams-api==2.0.13.4",
+  "microsoft-teams-cards==2.0.13.4",
+  "microsoft-teams-common==2.0.13.4",
 ]
 exclude-newer = "14 days"
 exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false }

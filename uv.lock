@@ -8,7 +8,13 @@ resolution-markers = [
 ]
 
 [manifest]
-overrides = [{ name = "pynacl", specifier = ">=1.6,<1.7" }]
+overrides = [
+    { name = "microsoft-teams-api", specifier = "==2.0.13.4" },
+    { name = "microsoft-teams-cards", specifier = "==2.0.13.4" },
+    { name = "microsoft-teams-common", specifier = "==2.0.13.4" },
+    { name = "msal", specifier = "==1.36.0" },
+    { name = "pynacl", specifier = ">=1.6,<1.7" },
+]
 
 [[package]]
 name = "agent-client-protocol"
@@ -2466,7 +2472,7 @@ wheels = [
 
 [[package]]
 name = "microsoft-teams-api"
-version = "2.0.14"
+version = "2.0.13.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "microsoft-teams-cards" },
@@ -2474,9 +2480,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b9/7f/cb8d3edd4310a91029ef793e267d0addafa2ca598b4a6548a331bac67eca/microsoft_teams_api-2.0.14.tar.gz", hash = "sha256:719b4438671385490f2d6994a25c7341af282ba87dbba79ddc908573ff7320b9", size = 51690, upload-time = "2026-07-08T00:18:22.738Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e1/7f/dc1995f72a8d23e723b168db20bac67b819ef2fa734bc23f63bc8086c41b/microsoft_teams_api-2.0.13.4.tar.gz", hash = "sha256:d16f88ae90f65bcce83ede9ecc57773f7b1a19cbecde63be624b586b59e34fc9", size = 51779, upload-time = "2026-06-08T19:24:02.661Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ff/34/a7b0d1fba3adb3e3c97136a8f9e539331b0be9d099ef7a0ef35b3d9d0084/microsoft_teams_api-2.0.14-py3-none-any.whl", hash = "sha256:bcb109e9656f0abed9317d64815c0745cb5f30d2063c5b5571058789c340b21c", size = 149737, upload-time = "2026-07-08T00:18:29.572Z" },
+    { url = "https://files.pythonhosted.org/packages/27/15/e1a1369a22c265b52da3ac4b3ee67b5c02911300db045894868bd7be932f/microsoft_teams_api-2.0.13.4-py3-none-any.whl", hash = "sha256:be52ef7765ea5851e0982de1ff6b1192869c85fc74e890ae20029bd99064b532", size = 149825, upload-time = "2026-06-08T19:24:13.202Z" },
 ]
 
 [[package]]
@@ -2502,23 +2508,23 @@ wheels = [
 
 [[package]]
 name = "microsoft-teams-cards"
-version = "2.0.14"
+version = "2.0.13.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/45/73/5e337bf6bde2803d75e5990fc11085d83e99f6184bbd5d6efa5614a26239/microsoft_teams_cards-2.0.14.tar.gz", hash = "sha256:9a6170e72e9207c508b6cb91b950b7785177fbd57adb781c99bc8756e15e8977", size = 28109, upload-time = "2026-07-08T00:18:26.086Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ef/7f/cce9633f635d9e1b2318ce2146a804a14a46c9e34e855c3784beb8ab39b3/microsoft_teams_cards-2.0.13.4.tar.gz", hash = "sha256:de54956a2afbbcf187f2531459967515b4f4743fa784bd0f454eaff1ac675c90", size = 28108, upload-time = "2026-06-08T19:24:07.841Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/e9/c22bec14a6f4e8d5e054c23f150012afbf1ef3acf4ee871fc885728eae92/microsoft_teams_cards-2.0.14-py3-none-any.whl", hash = "sha256:5e2eaaed534eab688c25c16111e0159d2946228c7c35315f92f22fff826a30c6", size = 29602, upload-time = "2026-07-08T00:18:32.732Z" },
+    { url = "https://files.pythonhosted.org/packages/20/09/95cad44d4417e33df11a15c82ca1bde442c1f1f77396f936f18896f116c1/microsoft_teams_cards-2.0.13.4-py3-none-any.whl", hash = "sha256:b8b887466c8144675ff5704064daf05ec3ebdf4d322658ab9a25bfc1373d7909", size = 29617, upload-time = "2026-06-08T19:24:17.373Z" },
 ]
 
 [[package]]
 name = "microsoft-teams-common"
-version = "2.0.14"
+version = "2.0.13.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/28/3e/07ccc19e13e07a1b76e8ad75edbdaea167cc4dd5a4c65ed680225df9da84/microsoft_teams_common-2.0.14.tar.gz", hash = "sha256:fa852a495ca398e5cad5b79fa692490e4d2ddc52c92fc11bda6643b5847a168a", size = 11132, upload-time = "2026-07-08T00:18:27.358Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6c/f1/a32821cfdde6c0d33a1e4022492a2211af670a81ec1fab727c49cddd4f7a/microsoft_teams_common-2.0.13.4.tar.gz", hash = "sha256:ed3175316f77f083a500da0a84ddf53ac31c6de008a252f0cfd86bdb70120bf3", size = 11122, upload-time = "2026-06-08T19:24:09.694Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/68/0e/8abf463737a7352f20e86ec1d37ff23a596e3b23dd5dc874f56306a4c789/microsoft_teams_common-2.0.14-py3-none-any.whl", hash = "sha256:5517f4ea7487077c9b5bc44a67ab7bed6551dd2c46fc5d95cbce4a04647ae15e", size = 16571, upload-time = "2026-07-08T00:18:33.856Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/04/859b3d7fadd1d61ab581f79afb6125c16c60cecf2a2e6bbb2ebbcfd34f80/microsoft_teams_common-2.0.13.4-py3-none-any.whl", hash = "sha256:19524ec75587d797d07c5a78e9b72921b6d58f33d39512ca2d33468160fd0d82", size = 16588, upload-time = "2026-06-08T19:24:18.325Z" },
 ]
 
 [[package]]
@@ -2567,16 +2573,16 @@ wheels = [
 
 [[package]]
 name = "msal"
-version = "1.37.0"
+version = "1.36.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9a/99/d840198ecf6e8057bbc937f129ae940404485d736cda73253bbff9537f01/msal-1.37.0.tar.gz", hash = "sha256:1b1672a33ee467c1d70b341bb16cafd51bb3c817147a95b93263794b03971bec", size = 182444, upload-time = "2026-05-29T19:49:05.561Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/cb/b02b0f748ac668922364ccb3c3bff5b71628a05f5adfec2ba2a5c3031483/msal-1.36.0.tar.gz", hash = "sha256:3f6a4af2b036b476a4215111c4297b4e6e236ed186cd804faefba23e4990978b", size = 174217, upload-time = "2026-04-09T10:20:33.525Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/94/b0/d807279f4b55d16d1f120d5ac4344c6e39b56732e2a224d40bded7fd67ad/msal-1.37.0-py3-none-any.whl", hash = "sha256:dd17e95a7c71bce75e8108113438ba7c4a086b3bcad4f57a8c09b7af3d753c2d", size = 123725, upload-time = "2026-05-29T19:49:04.335Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/d3/414d1f0a5f6f4fe5313c2b002c54e78a3332970feb3f5fed14237aa17064/msal-1.36.0-py3-none-any.whl", hash = "sha256:36ecac30e2ff4322d956029aabce3c82301c29f0acb1ad89b94edcabb0e58ec4", size = 121547, upload-time = "2026-04-09T10:20:32.336Z" },
 ]
 
 [[package]]

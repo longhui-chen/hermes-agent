@@ -3000,6 +3000,18 @@ def _(rid, params: dict) -> dict:
         accepted = agent.steer(text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
+    if not accepted and text.strip():
+        # A steer arriving after the current tool batch closes can miss the
+        # agent's active-turn slot while the gateway still owns a running turn.
+        # Preserve the user message by queueing it as the next prompt instead of
+        # silently rejecting it at this narrow turn-tail boundary.
+        if not session.get("running"):
+            return _ok(rid, {"status": "rejected", "text": text})
+        _enqueue_prompt(session, text, session.get("transport"))
+        return _ok(
+            rid,
+            {"status": "queued", "text": text, "requeued": True},
+        )
     if accepted:
         # Record the correction on the live turn exactly like session.redirect
         # does. Without this, a resume/reconnect while the turn is running

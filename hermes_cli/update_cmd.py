@@ -976,7 +976,8 @@ def _update_via_zip(args):
                 f"{', '.join(result['relocated'])}"
             )
         if not result["copied"] and not result.get("updated"):
-            print("  ✓ Skills are up to date")
+            if not _m()._warn_if_seed_policy_error(result):
+                print("  ✓ Skills are up to date")
     except Exception:
         pass
 
@@ -4370,7 +4371,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"{', '.join(result['relocated'])}"
                 )
             if not result["copied"] and not result.get("updated"):
-                print("  ✓ Skills are up to date")
+                if not _m()._warn_if_seed_policy_error(result):
+                    print("  ✓ Skills are up to date")
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
 

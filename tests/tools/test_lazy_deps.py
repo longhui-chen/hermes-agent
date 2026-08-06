@@ -229,7 +229,7 @@ class TestIsSatisfiedVersionAware:
         ("feature", "installed_versions", "expected_repairs"),
         [
             (
-                "skill.google_workspace",
+                "platform.google_chat",
                 {
                     "google-api-python-client": "2.194.0",
                     "google-auth": "2.55.0",
