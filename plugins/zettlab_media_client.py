@@ -10,12 +10,16 @@ from __future__ import annotations
 import atexit
 import base64
 import binascii
+import copy
+import http.client
 import io
 import ipaddress
 import json
+import logging
 import multiprocessing
 import os
 import queue
+import socket
 import stat
 import threading
 import time
@@ -26,6 +30,8 @@ from urllib.request import url2pathname
 import requests
 from agent.secret_scope import get_secret
 from tools.interrupt import is_interrupted
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
 CAPABILITY_TIMEOUT = 5.0
@@ -41,6 +47,19 @@ ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 MAX_MEDIA_HTTP_WORKERS = 2
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=MAX_MEDIA_HTTP_WORKERS)
+# How long a successful capability response is reused. The probe runs on every
+# tool-definition pass (twice: image + video), so without a cache each turn pays
+# a fresh round-trip for a value that only changes when the cloud catalog does.
+CAPABILITY_CACHE_TTL = 60.0
+# Hard cap on cached capability documents. Keys are (base URL, media type) and
+# the base URL is profile-scoped, so a long-lived multiplexed gateway could
+# otherwise accumulate one 256KB document per profile/config permutation and
+# never release them — an unbounded resident cache under a 2GB device budget.
+MAX_CAPABILITY_CACHE_ENTRIES = 8
+# How long to wait for a cancelled probe to unwind after its socket is shut
+# down. Short: the shutdown is what breaks the block, so the thread is expected
+# to end almost immediately; the caller raises either way.
+_CAPABILITY_CANCEL_GRACE = 0.5
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 _IMAGE_READ_CHUNK_BYTES = 48 * 1024
 _MAX_LOCAL_IMAGE_PATH_CHARS = 4096
@@ -797,8 +816,142 @@ class _MediaHTTPSession:
             worker.close()
 
 
+class _CapabilityResponse:
+    """Minimal response view over an ``http.client`` exchange."""
+
+    def __init__(self, conn: Any, raw: Any, sock: Any = None) -> None:
+        self._conn = conn
+        self._raw = raw
+        self._sock = sock
+        self.status_code = int(getattr(raw, "status", 0) or 0)
+        self.reason = getattr(raw, "reason", "")
+
+    def raise_for_status(self) -> None:
+        # requests.HTTPError so the shared _raise_for_status() helper, which
+        # renders the error body, keeps working across both transports.
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code} {self.reason}".strip())
+
+    def json(self) -> Any:
+        # Read one byte past the cap so an oversized body is detected without
+        # ever materialising it.
+        limit = MAX_CAPABILITY_RESPONSE_BYTES
+        body = self._raw.read(limit + 1)
+        if len(body) > limit:
+            raise ZettlabMediaError("media capability response exceeds maximum size")
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ZettlabMediaError("media capability response is not valid JSON") from exc
+
+    def close(self) -> None:
+        # A ``Connection: close`` response detaches the socket from
+        # HTTPConnection after headers, while HTTPResponse's buffered reader
+        # keeps it alive. Retain and shut that socket down directly so a body
+        # read in the probe thread is interrupted before closing both wrappers.
+        _shutdown_socket(self._sock)
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+        _shutdown_connection(self._conn)
+
+
+class _CapabilityTransport:
+    """Loopback GET for the capability probe, cancellable at any phase.
+
+    Deliberately ``http.client`` rather than ``requests``. The probe runs
+    during agent construction under a wall-clock deadline, and enforcing that
+    deadline means another thread has to be able to break the call — but
+    neither library bounds total elapsed time, and a peer that trickles bytes
+    below the socket idle timeout stalls indefinitely without tripping it.
+    ``requests`` keeps its socket inside a connection pool that is not
+    reachable while the request is in flight, so there is nothing to break:
+    ``Session.get()`` stalls in the status-line/headers phase before any
+    response object exists.
+
+    ``HTTPConnection`` is constructed before it connects, so the handle is
+    published to the canceller up front and stays valid through connect,
+    headers and body. Cancellation is ``shutdown()`` on the socket, not merely
+    ``close()`` — closing a descriptor another thread is blocked in does not
+    reliably wake it, while a shutdown does.
+
+    The policy the requests version had to configure is inherent here:
+    ``http.client`` never follows redirects and never reads proxy environment
+    variables, so a probe the caller believes is loopback-only stays that way.
+    """
+
+    def get(
+        self,
+        url: str,
+        timeout: float,
+        allow_redirects: bool = False,
+        stream: bool = True,
+    ) -> _CapabilityResponse:
+        # allow_redirects / stream are accepted to keep one call shape across
+        # both media transports; http.client already behaves that way.
+        parsed = urlparse(url)
+        conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        # timeout bounds each socket operation, including the connect syscall;
+        # the caller's deadline bounds the exchange as a whole.
+        conn = conn_cls(parsed.hostname or "127.0.0.1", parsed.port, timeout=timeout)
+        holder = getattr(_probe_state, "holder", None)
+        if holder is not None:
+            holder["connection"] = conn
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        sock = None
+        try:
+            conn.request("GET", target, headers={"Accept": "application/json", "Connection": "close"})
+            # Keep the socket before getresponse(): for non-reusable responses
+            # http.client clears conn.sock after parsing headers, but the
+            # returned HTTPResponse still owns a file view of the same socket.
+            sock = getattr(conn, "sock", None)
+            if holder is not None:
+                holder["socket"] = sock
+            return _CapabilityResponse(conn, conn.getresponse(), sock)
+        except BaseException:
+            _shutdown_socket(sock)
+            _shutdown_connection(conn)
+            raise
+
+
+def _shutdown_socket(sock: Any) -> None:
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, ValueError):
+        pass
+
+
+def _shutdown_connection(conn: Any) -> None:
+    """Break any phase of an in-flight probe.
+
+    ``shutdown`` first: a blocking recv in another thread is woken by a socket
+    shutdown but not reliably by a close of its descriptor, and waking that
+    thread is the entire point of the call.
+    """
+    if conn is None:
+        return
+    _shutdown_socket(getattr(conn, "sock", None))
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 _FILE_WORKER = _MediaFileWorker()
 _SESSION = _MediaHTTPSession()
+_CAPABILITY_TRANSPORT = _CapabilityTransport()
+# Lets the transport hand its connection to whoever is enforcing the deadline:
+# the probe thread points this at its own shared outcome dict before calling.
+_probe_state = threading.local()
+_capability_cache: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
+_capability_cache_lock = threading.Lock()
+_capability_inflight: Dict[str, "_CapabilityProbe"] = {}
+_capability_inflight_lock = threading.Lock()
 atexit.register(_SESSION.close)
 atexit.register(_FILE_WORKER.close)
 
@@ -864,23 +1017,81 @@ def base_url(media_type: str) -> str:
     return raw
 
 
+def _capability_timeout() -> float:
+    """Wall-clock budget for one capability probe.
+
+    Env-overridable because everything else on this path is a hard-coded
+    constant, which left operators with no lever at all when the probe started
+    failing in the field.
+    """
+    raw = os.environ.get("ZETTLAB_MEDIA_CAPABILITY_TIMEOUT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return CAPABILITY_TIMEOUT
+
+
 def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch the ai-proxy media capability document, cached per base URL.
+
+    Deliberately NOT routed through ``_SESSION``: that worker pool exists to
+    give remote media transfers a killable subprocess with a real wall-clock
+    bound, and each request there costs a fresh interpreter plus a re-import of
+    the Hermes entry point. This probe is a loopback GET with no request body
+    and a size-capped response — it does not need that isolation, and paying
+    for it made every probe race ``CAPABILITY_TIMEOUT``. Losing that race
+    silently stripped ``image_generate`` / ``video_generate`` from the tool
+    list, so the model reported the capability as missing.
+    """
     mt = media_type or "image"
-    deadline = time.monotonic() + CAPABILITY_TIMEOUT
-    resp = _SESSION.get(
-        f"{base_url(mt)}/media/generation-capabilities",
-        timeout=max(0.2, deadline - time.monotonic()),
-        allow_redirects=False,
-        stream=True,
-    )
-    try:
-        _raise_for_status(resp)
-        data = _bounded_response_json(resp, MAX_CAPABILITY_RESPONSE_BYTES)
-    finally:
-        _close_response(resp)
+    url = f"{base_url(mt)}/media/generation-capabilities"
+    cache_key = (url, mt)
+
+    now = time.monotonic()
+    with _capability_cache_lock:
+        cached = _capability_cache.get(cache_key)
+        if cached is not None and now - cached[0] < CAPABILITY_CACHE_TTL:
+            return copy.deepcopy(cached[1])
+
+    data = _fetch_capability_document(url, MAX_CAPABILITY_RESPONSE_BYTES)
     if not isinstance(data, dict):
         raise ZettlabMediaError("media capability response is not a JSON object")
-    return data
+
+    with _capability_cache_lock:
+        # Only successful probes are cached. A negative cache would keep the
+        # tool hidden for the full TTL after a single blip — the exact failure
+        # mode this change exists to remove.
+        _capability_cache[cache_key] = (time.monotonic(), data)
+        _evict_capability_cache_locked()
+    return copy.deepcopy(data)
+
+
+def _evict_capability_cache_locked() -> None:
+    """Drop expired entries, then the oldest ones over the cap."""
+    now = time.monotonic()
+    for key in [k for k, (ts, _) in _capability_cache.items()
+                if now - ts >= CAPABILITY_CACHE_TTL]:
+        _capability_cache.pop(key, None)
+    excess = len(_capability_cache) - MAX_CAPABILITY_CACHE_ENTRIES
+    if excess <= 0:
+        return
+    oldest = sorted(_capability_cache.items(), key=lambda item: item[1][0])
+    for key, _ in oldest[:excess]:
+        _capability_cache.pop(key, None)
+
+
+def invalidate_capability_cache() -> None:
+    """Drop cached capability documents.
+
+    Call after anything that can change the device's media catalog (config
+    reload, credential change) so the next probe re-reads it immediately.
+    """
+    with _capability_cache_lock:
+        _capability_cache.clear()
 
 
 def action_headers() -> Dict[str, str]:
@@ -909,6 +1120,142 @@ def _bounded_response_json(resp: requests.Response, limit: int) -> Any:
         return json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ZettlabMediaError("media generation response is not valid JSON") from exc
+
+
+def _bounded_capability_json(resp: Any, limit: int) -> Any:
+    """Parse the capability body with the response size cap applied."""
+    if not isinstance(resp, requests.Response):
+        try:
+            return resp.json()
+        except (ValueError, UnicodeError) as exc:
+            raise ZettlabMediaError("media capability response is not valid JSON") from exc
+    raw = getattr(resp, "raw", None)
+    if raw is None or not hasattr(raw, "read"):
+        raise ZettlabMediaError("media capability response body is unavailable")
+    try:
+        body = raw.read(limit + 1, decode_content=True)
+    except TypeError:
+        body = raw.read(limit + 1)
+    if len(body) > limit:
+        raise ZettlabMediaError("media capability response exceeds maximum size")
+    try:
+        return json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ZettlabMediaError("media capability response is not valid JSON") from exc
+
+
+class _CapabilityProbe:
+    """One in-flight capability request, shared by every waiter on its key.
+
+    Runs on a daemon thread so the caller keeps a wall-clock deadline the
+    request itself cannot provide: neither ``requests`` nor ``http.client``
+    bounds total elapsed time — their timeout is socket-idle only — and both
+    the headers phase and the body read stall indefinitely against a peer that
+    trickles bytes below that idle timeout, without control ever returning to
+    check a clock. Since this runs during agent construction, a stall here
+    costs the user the whole turn, which is strictly worse than the
+    missing-tool symptom the cache exists to fix.
+
+    ``cancel()`` is what makes the deadline real rather than merely advisory:
+    it shuts the socket down, which breaks whichever phase the thread is
+    parked in, so an abandoned probe ends instead of lingering. That property
+    is why nothing here needs a cap on concurrent probes — an earlier revision
+    capped them, and the cap became its own outage, because a probe that could
+    not be cancelled never gave its slot back and the tools stayed hidden even
+    after the peer recovered.
+    """
+
+    def __init__(self, url: str, limit: int, timeout: float) -> None:
+        self._url = url
+        self._limit = limit
+        self._timeout = timeout
+        self._outcome: Dict[str, Any] = {}
+        self.done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="zettlab-capability-probe", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        resp = None
+        try:
+            _probe_state.holder = self._outcome
+            resp = _CAPABILITY_TRANSPORT.get(
+                self._url,
+                timeout=self._timeout,
+                allow_redirects=False,
+                stream=True,
+            )
+            self._outcome["response"] = resp
+            _raise_for_status(resp)
+            self._outcome["data"] = _bounded_capability_json(resp, self._limit)
+        except BaseException as exc:  # noqa: BLE001 — relayed to waiters below
+            self._outcome["error"] = exc
+        finally:
+            if resp is not None:
+                _close_response(resp)
+            _shutdown_socket(self._outcome.get("socket"))
+            _shutdown_connection(self._outcome.get("connection"))
+            _probe_state.holder = None
+            self._retire()
+            self.done.set()
+
+    def _retire(self) -> None:
+        with _capability_inflight_lock:
+            for key, probe in list(_capability_inflight.items()):
+                if probe is self:
+                    _capability_inflight.pop(key, None)
+
+    def cancel(self) -> None:
+        # Drop out of the in-flight map first so a later caller starts a fresh
+        # probe instead of joining one that is already being torn down.
+        self._retire()
+        _close_response(self._outcome.get("response"))
+        _shutdown_socket(self._outcome.get("socket"))
+        _shutdown_connection(self._outcome.get("connection"))
+
+    def result(self) -> Any:
+        error = self._outcome.get("error")
+        if error is not None:
+            raise error
+        return self._outcome.get("data")
+
+
+def _fetch_capability_document(url: str, limit: int) -> Any:
+    """Run one capability probe under an enforced wall-clock budget.
+
+    Probes are shared per key. A multiplexed gateway builds agents
+    concurrently, and each build probes image and video, so a cold cache would
+    otherwise fire one identical loopback request per agent per media type
+    against the same base URL. Waiters attach to the in-flight probe instead,
+    and each still leaves on its own deadline.
+    """
+    timeout = _capability_timeout()
+    deadline = time.monotonic() + timeout
+
+    with _capability_inflight_lock:
+        probe = _capability_inflight.get(url)
+        started = probe is None
+        if probe is None:
+            probe = _CapabilityProbe(url, limit, timeout)
+            _capability_inflight[url] = probe
+    if started:
+        try:
+            probe.start()
+        except BaseException:
+            # A probe that never ran must not stay in the map: later callers
+            # would attach to a thread that will never set `done` and wait out
+            # their whole deadline for nothing.
+            probe.cancel()
+            raise
+
+    if not probe.done.wait(max(0.0, deadline - time.monotonic())):
+        probe.cancel()
+        probe.done.wait(_CAPABILITY_CANCEL_GRACE)
+        raise ZettlabMediaDeadlineError("media capability probe deadline exceeded")
+    return probe.result()
 
 
 def _close_response(resp: Any) -> None:
@@ -1064,7 +1411,18 @@ def _resolve_model_from_section(
 def is_available(media_type: str) -> bool:
     try:
         section = type_capability(media_type)
-    except Exception:
+    except Exception as exc:
+        # Never swallow this silently: the caller turns False into "the tool
+        # does not exist", and the model then tells the user the capability is
+        # missing. Without this line that path leaves no trace anywhere.
+        logger.warning(
+            "Zettlab %s capability probe failed (%s: %s); %s generation tools "
+            "are unavailable this turn",
+            media_type,
+            type(exc).__name__,
+            exc,
+            media_type,
+        )
         return False
     models = section.get("models")
     return (

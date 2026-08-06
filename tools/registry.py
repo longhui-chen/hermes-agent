@@ -162,6 +162,46 @@ def _must_recheck_profile_scope(fn: Callable) -> bool:
         return False
 
 
+def _profile_scoped_check(fn: Callable) -> bool:
+    """Evaluate a profile-scoped check_fn with no caching at all.
+
+    Deliberately uncached: a function-global TTL/last-good verdict would let
+    one profile's grant expose a tool for another, or outlive a revoke — see
+    ``test_mutation_dispatch_flow_rechecks_revoked_profile_after_cached_gate``.
+    Callers still de-duplicate within a single get_definitions() pass.
+
+    That makes the cost of the probe itself the thing to keep small; caching
+    belongs behind the check (e.g. a cached capability document), not in front
+    of the authorization decision.
+    """
+    try:
+        value = bool(fn())
+    except Exception:
+        # A raise is a malfunction, not an answer: log it here because the
+        # check itself may have had no chance to.
+        logger.warning(
+            "profile-scoped check_fn %s raised; dependent tools are "
+            "unavailable this turn",
+            getattr(fn, "__qualname__", fn),
+            exc_info=True,
+        )
+        return False
+
+    if not value:
+        # A plain False is the designed answer for every optional tool whose
+        # prerequisite is absent — no grant, no provider configured — and this
+        # runs uncached on every agent construction. Warning here buried the
+        # real alarms in agent.log within minutes. Checks that fail for a
+        # reason the operator needs (the media capability probe timing out,
+        # say) log that reason themselves, where it can be stated.
+        logger.debug(
+            "profile-scoped check_fn %s returned False; dependent tools are "
+            "unavailable this turn",
+            getattr(fn, "__qualname__", fn),
+        )
+    return value
+
+
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
@@ -172,18 +212,7 @@ def _check_fn_cached(fn: Callable) -> bool:
     contention, probe timeout) from silently stripping tools mid-session.
     """
     if _must_recheck_profile_scope(fn):
-        # A function-global TTL/last-good cache is unsafe here: profile A's
-        # grant can otherwise expose a tool for profile B, or outlive revoke.
-        # Keep the normal per-definitions-pass de-duplication in callers, but
-        # re-evaluate across multiplexed profile scopes.
-        try:
-            return bool(fn())
-        except Exception:
-            logger.warning(
-                "profile-scoped check_fn %s raised; dependent tools are unavailable this turn",
-                getattr(fn, "__qualname__", fn),
-            )
-            return False
+        return _profile_scoped_check(fn)
 
     now = time.monotonic()
     with _check_fn_cache_lock:
