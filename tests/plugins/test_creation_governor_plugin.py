@@ -172,7 +172,7 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     assert all(call[1]["fail_fast"] is True for call in llm.calls)
     instructions = llm.calls[0][0][0]["content"]
     assert "high-recall zero-shot" in instructions
-    assert "ongoing external work domain" in instructions
+    assert "Bounded one-shot veto" in instructions
     assert "today" in instructions
     assert "not by itself a future trigger" in instructions
 
@@ -198,6 +198,25 @@ def test_freshness_maintenance_prefers_task_without_topic_keywords():
     assert "keep one persistent result fresh" in description
     assert "Flomo" not in instructions
     assert "user.md" not in instructions
+
+
+def test_bounded_one_shot_policy_and_pending_upload_gate():
+    plugin = _load_plugin()
+    context = _Context()
+    plugin.register(context)
+
+    instructions = plugin._DETECTOR_INSTRUCTIONS
+    description = context.tools[0]["schema"]["description"]
+    assert "one finite file, table" in instructions
+    assert "friction, not evidence for a durable Agent" in instructions
+    assert "the analysis verb alone is not evidence for an Agent" in description
+    assert "one finite file, table, questionnaire" in description
+
+    response = (
+        "目前最直接的替代办法是把 Google 表格下载成 CSV，然后把 CSV 文件上传给我。"
+        "我拿到文件后就能直接完成问卷总结。"
+    )
+    assert plugin._response_delivery_block_reason(response) == "blocked_or_unexecuted"
 
 
 def test_missing_fast_route_retries_once_on_active_main_model():
