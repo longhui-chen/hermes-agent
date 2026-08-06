@@ -295,6 +295,44 @@ def profile_homes(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_prefixed_main_auth_uses_shared_zet_agent_key_without_profile_api_key(
+    tmp_path, monkeypatch
+):
+    """ZetAgent profile mirrors share the device-internal listener key."""
+    root = tmp_path / ".hermes"
+    coder_home = root / "profiles" / "coder"
+    root.mkdir(parents=True)
+    coder_home.mkdir(parents=True)
+    (root / ".env").write_text("", encoding="utf-8")
+    (coder_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("ZET_AGENT_KEY", TEST_API_KEY)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("default", root), ("coder", coder_home)],
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True))
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        accepted = await cli.get(
+            "/p/main/v1/models",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        rejected = await cli.get(
+            "/p/main/v1/models",
+            headers={"Authorization": "Bearer wrong-device-key"},
+        )
+
+    assert accepted.status == 200
+    assert rejected.status == 401
+
+
+@pytest.mark.asyncio
 async def test_prefixed_main_health_is_registered(profile_homes):
     adapter = _make_adapter()
     app = web.Application()

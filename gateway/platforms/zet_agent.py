@@ -534,6 +534,17 @@ class ZetAgentAdapter(APIServerAdapter):
         ] = {}
         self._runtime_import_barrier_generation = 0
 
+    def _expected_api_key(self) -> str:
+        """Use the device listener key for every ZetAgent profile mirror.
+
+        local-server is the intended caller of this device-internal surface and
+        authenticates all ``/p/<profile>`` requests with one ``ZET_AGENT_KEY``.
+        Generic API-server gateways keep their profile-scoped key isolation in
+        :class:`APIServerAdapter`; only this managed-device adapter preserves
+        the shared listener-key contract.
+        """
+        return self._api_key
+
     @staticmethod
     def _profile_directory_identity(key: str) -> Optional[tuple[int, int]]:
         try:
