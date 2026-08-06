@@ -438,3 +438,23 @@ def test_availability_context_absent_when_inventory_unfetched(monkeypatch):
         session_id="s-noground", turn_id="turn-1", user_message="随便聊聊", conversation_history=[]
     )
     assert "[channel-availability]" not in (result or {}).get("context", "")
+
+
+def test_empty_target_falls_back_to_suggested_name_in_pool(monkeypatch):
+    """真机实测：flash 档检测器把渠道 kind 填进 suggested_name 而漏掉 target。
+    仅当 suggested_name 逐字命中库存池时回退采用；不命中仍拒绝。"""
+    plugin = _load_plugin()
+    hit = _connection_candidate() | {"target": "", "suggested_name": "telegram"}
+    miss = _connection_candidate() | {"target": "", "suggested_name": "微信通知直达"}
+    ctx = _Context(_FakeLlm([hit, miss]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+    monkeypatch.setattr(plugin, "PROMPT_COOLDOWN_TURNS", -1)
+
+    _drive_turn(plugin, "s-fallback-hit", "日报结果发到我手机才有用")
+    assert len(ctx.emitted) == 1
+    assert ctx.emitted[0]["payload"] == {"channel_kind": "telegram"}
+    assert ctx.emitted[0]["dedup_key"] == "channel:telegram"
+
+    _drive_turn(plugin, "s-fallback-miss", "日报结果发到我手机才有用")
+    assert len(ctx.emitted) == 1  # 第二个候选仍被硬闸拒绝

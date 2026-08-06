@@ -669,7 +669,7 @@ def _fetch_connection_inventory() -> dict[str, Any]:
                     )
                 inventory["fetched"] = True
     except Exception:
-        logger.debug("connection inventory: channel fetch failed", exc_info=True)
+        logger.warning("connection inventory: channel fetch failed", exc_info=True)
     try:
         from tools.list_my_connectors_tool import (
             _check_list_my_connectors,
@@ -697,7 +697,7 @@ def _fetch_connection_inventory() -> dict[str, Any]:
                 inventory["connectors_recommendable"] = sorted(set(recommendable))
                 inventory["fetched"] = True
     except Exception:
-        logger.debug("connection inventory: connector fetch failed", exc_info=True)
+        logger.warning("connection inventory: connector fetch failed", exc_info=True)
     return inventory
 
 
@@ -741,7 +741,15 @@ _DETECTOR_SCHEMA = {
         },
         "suggested_name": {"type": "string"},
         "reason": {"type": "string"},
-        "target": {"type": "string"},
+        "target": {
+            "type": "string",
+            "description": (
+                "REQUIRED when decision is channel/connector: the exact kind/"
+                "provider id copied verbatim from the recommendable list in "
+                "[connection-inventory] (e.g. 'wechat', 'gmail'). Never invent "
+                "values; leave empty only for non-connection decisions."
+            ),
+        },
         "evidence_turn_ids": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "dedup_key": {"type": "string"},
@@ -909,9 +917,10 @@ def _run_forced_evaluation(
     try:
         parsed = _parse_detector_json(result.text)
         logger.info(
-            "creation opportunity JSON decision=%s confidence=%s title=%s "
+            "creation opportunity JSON decision=%s target=%s confidence=%s title=%s "
             "provider=%s model=%s",
             parsed.get("decision") if parsed else None,
+            _text(parsed.get("target"), 80) if parsed else "",
             parsed.get("confidence") if parsed else None,
             _text(parsed.get("suggested_name"), 80) if parsed else "",
             getattr(result, "provider", ""),
@@ -980,7 +989,23 @@ def _normalize_candidate(
             "channels_recommendable" if decision == "channel" else "connectors_recommendable"
         )
         pool = inventory.get(pool_key) if inventory.get("fetched") else None
+        if not target and isinstance(pool, list):
+            # 容错（真机实测）：flash 档检测器常把渠道 kind 填进 suggested_name
+            # 而漏掉 target。仅当 suggested_name 逐字命中库存池时回退采用——
+            # 仍然在"目标必须命中真实可连清单"的硬闸之内，不放宽任何约束。
+            fallback = _text(args.get("suggested_name"), 80).lower()
+            if fallback in pool:
+                target = fallback
         if not target or not isinstance(pool, list) or target not in pool:
+            # 拒绝原因必须可诊断：真机排障时需要区分「检测器没给 target」「库存
+            # 未取到」「target 不在可推荐集合」三种完全不同的故障面。
+            logger.info(
+                "connection candidate rejected: target=%r pool=%s fetched=%s decision=%s",
+                target,
+                pool,
+                bool(inventory.get("fetched")),
+                decision,
+            )
             return None, "connection_target_unavailable"
 
     evidence_turn_ids = args.get("evidence_turn_ids")
