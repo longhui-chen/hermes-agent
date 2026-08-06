@@ -2295,3 +2295,115 @@ def test_profile_candidates_are_symlink_resolved_not_reopened_by_name(tmp_path, 
     _mux_env(monkeypatch, home, home, home / "state.db")
 
     assert zc._profile_state_db_candidates(AID) == [real_profiles / AID / "state.db"]
+
+
+def test_cross_agent_origin_refused_for_profile_store(tmp_path, monkeypatch):
+    """job.origin 是调用方可控输入：嵌的 agentID ≠ 当前执行 agent 时必须 fail-closed，
+    绝不返回对方 profile 的库路径，也不往里写。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    EXEC = "agent0a"
+    VICTIM = "agent0b"
+    victim_prof = root / "profiles" / VICTIM
+    victim_prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+    monkeypatch.setenv("ZET_AGENT_ID", EXEC)
+
+    SID = f"zettlab:userA:{VICTIM}:orig001"
+    victim_db = SessionDB(db_path=victim_prof / "state.db")
+    victim_db.create_session(SID, source="zet_agent", user_id="userA")
+    victim_db.close()
+
+    db_path, unresolved = zc._resolve_persist_db_path(SID)
+    assert unresolved, "跨 agent origin 必须报未决，不能解析成功"
+    assert VICTIM in unresolved and EXEC in unresolved
+    assert db_path != (victim_prof / "state.db").resolve()
+
+    JID = "jobCrossTenantProf"
+    job = _mux_cron_job(JID, SID)
+    cron_jobs.save_jobs([job])
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n越权写入\n"
+    try:
+        err = zc._try_persist_to_session(JID, True, None, None, job)
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+    assert err, "跨 agent persist 必须以投递失败上抛，不许静默丢弃"
+    assert _cron_summary_rows(victim_prof / "state.db", SID) == 0
+    assert cron_jobs.get_job(JID)["origin"]["chat_id"] == SID
+
+
+def test_cross_agent_origin_refused_for_root_store(tmp_path, monkeypatch):
+    """root 库是所有 agent 共享的：跨 agent origin 命中 root-only 会话时同样
+    fail-closed，不许降级写 root。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    EXEC = "agent0a"
+    VICTIM = "agent0b"
+    (root / "profiles").mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+    monkeypatch.setenv("ZET_AGENT_ID", EXEC)
+
+    SID = f"zettlab:userA:{VICTIM}:legacy01"
+    root_db = SessionDB(db_path=root / "state.db")
+    root_db.create_session(SID, source="zet_agent", user_id="userA")
+    root_db.close()
+
+    _, unresolved = zc._resolve_persist_db_path(SID)
+    assert unresolved, "root 命中也不能绕过跨 agent 校验"
+
+    JID = "jobCrossTenantRoot"
+    job = _mux_cron_job(JID, SID)
+    cron_jobs.save_jobs([job])
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n越权写 root\n"
+    try:
+        err = zc._try_persist_to_session(JID, True, None, None, job)
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+    assert err
+    assert _cron_summary_rows(root / "state.db", SID) == 0
+
+
+def test_matching_origin_agent_resolves_normally(tmp_path, monkeypatch):
+    """origin 的 agentID == 当前执行 agent（App/Web 的合法流量形状）→ 解析不变。"""
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+    monkeypatch.setenv("ZET_AGENT_ID", AID)
+
+    SID = f"zettlab:userA:{AID}:orig001"
+    db = SessionDB(db_path=prof / "state.db")
+    db.create_session(SID, source="zet_agent", user_id="userA")
+    db.close()
+
+    assert zc._resolve_persist_db_path(SID) == ((prof / "state.db").resolve(), None)
+
+
+def test_missing_exec_agent_identity_keeps_session_routing(tmp_path, monkeypatch):
+    """拿不到执行 agent 身份（ZET_AGENT_ID 空，profile override 未绑）时不做校验：
+    这正是 61% 记录依赖的降级恢复路径，fail-closed 会把合法流量一起挡死。"""
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")  # 已 delenv ZET_AGENT_ID
+
+    SID = f"zettlab:userA:{AID}:orig001"
+    db = SessionDB(db_path=prof / "state.db")
+    db.create_session(SID, source="zet_agent", user_id="userA")
+    db.close()
+
+    assert zc._resolve_persist_db_path(SID) == ((prof / "state.db").resolve(), None)

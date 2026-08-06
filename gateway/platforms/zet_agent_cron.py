@@ -459,7 +459,15 @@ def _resolve_persist_db_path(session_id: str) -> Tuple[Path, Optional[str]]:
     """
     from hermes_constants import get_hermes_home
     current = Path(get_hermes_home()) / "state.db"
-    agent_id = _agent_id_from(session_id) or _scoped_env("ZET_AGENT_ID").strip()
+    origin_agent_id = _agent_id_from(session_id)
+    exec_agent_id = _scoped_env("ZET_AGENT_ID").strip()
+    if origin_agent_id and exec_agent_id and origin_agent_id != exec_agent_id:
+        # session_id 来自调用方可控的 job.origin —— 跨 agent 的库一律不落
+        return current, (
+            f"origin agent {origin_agent_id!r} does not match executing agent "
+            f"{exec_agent_id!r} for session {session_id} — cross-agent persist refused"
+        )
+    agent_id = origin_agent_id or exec_agent_id
     candidates = _profile_state_db_candidates(agent_id)
 
     probed: Dict[str, Optional[bool]] = {}
