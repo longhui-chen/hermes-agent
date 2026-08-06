@@ -624,6 +624,19 @@ class TestAdapterInit:
             "response_format": {"type": "json_object"},
         }
 
+    def test_create_agent_fails_closed_for_silent_execution_policy(self):
+        """A misrouted silent proof must not build the ordinary API agent."""
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+        with pytest.raises(
+            PermissionError,
+            match="silent_automation requires the zet_agent adapter",
+        ):
+            adapter._create_agent(
+                session_id="misrouted-silent-turn",
+                request_overrides={"_zet_execution_policy": "silent_automation"},
+            )
+
     def test_create_agent_handles_fallback_model_kwarg_collision(self, monkeypatch):
         """When the primary provider auth-fails, _resolve_runtime_agent_kwargs()
         returns a runtime dict that carries its own ``model`` key. _create_agent

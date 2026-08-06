@@ -218,6 +218,7 @@ def test_proactive_video_runner_receives_turn_scoped_capability(monkeypatch, tmp
             "HERMES_TURN_ID": turn_id,
             "HERMES_SESSION_KEY": "api-lineage-tip",
             "HERMES_GATEWAY_SESSION_KEY": stable_key,
+            "HERMES_EXECUTION_POLICY": "silent_automation",
         },
     )
     tokens = set_turn_vars(
@@ -706,6 +707,52 @@ def test_proactive_receipt_allows_only_preference_success_finalizer():
             "HERMES_TURN_ID": turn_id,
             "HERMES_SESSION_KEY": "api-lineage-tip",
             "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+            "HERMES_EXECUTION_POLICY": "silent_automation",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("script_name", "arguments"),
+    (
+        ("normalize.py", ["--inspect-input", "/private/source.mov"]),
+        (
+            "preference_resolver.py",
+            [
+                "finalize-success",
+                "--workflow-state",
+                "/volume1/subvol/agents/data/agent-1/output/proactive-pvm-"
+                + "a" * 24
+                + "/.video-edit-workflow-mini/workflow_state.json",
+                "--memory-commit-state",
+                "skipped",
+                "--sidecar-state",
+                "skipped",
+            ],
+        ),
+        (
+            "cloud_render_business.py",
+            ["--agent-id", "agent-1", "upload", "--file", "/private/source.mov"],
+        ),
+    ),
+)
+def test_silent_policy_rejects_non_proactive_helper_scope(script_name, arguments):
+    """A silent receipt with a stale/ordinary key cannot use legacy helpers."""
+    turn_id = "pvm-" + "a" * 24
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[sys.executable, f"/trusted/{script_name}", *arguments],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert not terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": "zettlab:owner:agent:stable",
+            "HERMES_EXECUTION_POLICY": "silent_automation",
         },
     )
 
@@ -772,6 +819,7 @@ def test_proactive_receipt_rejects_unbound_preference_finalizer(arguments):
             "HERMES_TURN_ID": turn_id,
             "HERMES_SESSION_KEY": "api-lineage-tip",
             "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+            "HERMES_EXECUTION_POLICY": "silent_automation",
         },
     )
 

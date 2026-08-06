@@ -129,6 +129,13 @@ _BUSINESS_EXECUTION_TOKEN: ContextVar = ContextVar(
     "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
     default=_UNSET,
 )
+# The verified per-turn execution policy is kept separate from the legacy
+# session environment map.  It is non-secret routing metadata for the trusted
+# video receipt, but generic model-authored subprocesses must not inherit it.
+_EXECUTION_POLICY: ContextVar = ContextVar(
+    "HERMES_EXECUTION_POLICY",
+    default=_UNSET,
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -290,6 +297,7 @@ def set_turn_vars(
     plan_ack_turn_id: str = "",
     plan_ack_revision_requested: str = "",
     business_execution_token: str = "",
+    execution_policy: str = "",
 ) -> list:
     """Bind one request's turn identity and plan receipt task-locally."""
     global _session_context_engaged
@@ -301,6 +309,7 @@ def set_turn_vars(
         _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
         _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
         _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
+        _EXECUTION_POLICY.set(execution_policy),
     ]
 
 
@@ -314,6 +323,7 @@ def clear_turn_vars(tokens: list) -> None:
             _PLAN_ACK_TURN_ID,
             _PLAN_ACK_REVISION_REQUESTED,
             _BUSINESS_EXECUTION_TOKEN,
+            _EXECUTION_POLICY,
         ),
         tokens,
     ):
@@ -348,6 +358,19 @@ def business_execution_token() -> str:
     if value is _UNSET or value is None:
         return ""
     return str(value).strip()
+
+
+def execution_policy() -> str:
+    """Return the verified policy for the current turn, if one is bound.
+
+    This stays outside ``_VAR_MAP`` so ordinary model-authored subprocesses do
+    not receive policy metadata through the generic session environment bridge.
+    The dedicated trusted video receipt snapshots it explicitly instead.
+    """
+    value = _EXECUTION_POLICY.get()
+    if value is _UNSET or value is None:
+        return ""
+    return str(value).strip().lower()
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -558,6 +581,7 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
     _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
+    _EXECUTION_POLICY.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.

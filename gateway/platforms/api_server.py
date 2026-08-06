@@ -4001,6 +4001,14 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
         """
+        if str(
+            (request_overrides or {}).get("_zet_execution_policy", "") or ""
+        ).strip().lower() == "silent_automation":
+            # Reject before resolving provider credentials or touching SessionDB;
+            # this path is not authorized to construct a silent agent.
+            raise PermissionError(
+                "silent_automation requires the zet_agent adapter"
+            )
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs,

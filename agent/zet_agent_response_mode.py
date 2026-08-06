@@ -212,6 +212,7 @@ class _TrustedExecutionReceipt:
     turn_id: str
     session_id: str
     gateway_session_key: str = ""
+    execution_policy: str = ""
 
 
 @dataclass(frozen=True)
@@ -391,14 +392,17 @@ def _capture_trusted_execution_receipt(
     try:
         from gateway.session_context import (
             business_execution_token,
+            execution_policy,
             get_session_env,
         )
 
         business_token = business_execution_token()
+        bound_execution_policy = execution_policy()
         gateway_session_key = get_session_env("HERMES_SESSION_KEY")
         session_id = get_session_env("HERMES_SESSION_ID") or gateway_session_key
     except Exception:
         business_token = ""
+        bound_execution_policy = ""
         session_id = ""
         gateway_session_key = ""
 
@@ -409,6 +413,7 @@ def _capture_trusted_execution_receipt(
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
         gateway_session_key=str(gateway_session_key or "").strip(),
+        execution_policy=str(bound_execution_policy or "").strip().lower(),
     )
     present = {
         "agent_id": bool(receipt.agent_id),
@@ -443,6 +448,10 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
         # session id used by deployed helper authorization. Terminal policy
         # consumes this private field before launching the helper.
         result["HERMES_GATEWAY_SESSION_KEY"] = receipt.gateway_session_key
+    if receipt.execution_policy:
+        # Keep the policy in the frozen receipt so terminal authorization cannot
+        # be weakened by a later session-context mutation.
+        result["HERMES_EXECUTION_POLICY"] = receipt.execution_policy
     return result
 
 

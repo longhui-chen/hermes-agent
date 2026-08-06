@@ -206,6 +206,118 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
+    """Cancellation revokes execution without restoring memory or tools."""
+    constructed = []
+    observed = {}
+
+    def tool(name):
+        return {"type": "function", "function": {"name": name}}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+            self.tools = [
+                tool("skill_view"),
+                tool("terminal"),
+                tool("memory"),
+                tool("clarify"),
+            ]
+            self.valid_tool_names = {
+                item["function"]["name"] for item in self.tools
+            }
+            self._skip_mcp_refresh = False
+            self._persist_disabled = False
+            self._session_db = kwargs.get("session_db")
+            self._session_json_enabled = True
+            self._current_turn_id = "cancelled-silent-turn"
+            self.session_id = kwargs.get("session_id")
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_total_tokens = 0
+
+        def run_conversation(self, **_kwargs):
+            from gateway.session_context import (
+                business_execution_token,
+                execution_policy,
+            )
+
+            observed.update(
+                {
+                    "business_token": business_execution_token(),
+                    "execution_policy": execution_policy(),
+                    "persist_disabled": self._persist_disabled,
+                    "session_db": self._session_db,
+                    "session_json_enabled": self._session_json_enabled,
+                    "tool_names": {
+                        item["function"]["name"] for item in self.tools
+                    },
+                    "valid_tool_names": set(self.valid_tool_names),
+                }
+            )
+            return {"final_response": "cancelled", "completed": True}
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai",
+            "base_url": "https://example.test/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-test")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        staticmethod(lambda: {}),
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr("tools.zettlab_snapshot_guard.finish_turn", lambda *_a, **_k: None)
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: object())
+    monkeypatch.setattr(adapter, "_session_model_override_for", lambda _key: None)
+    monkeypatch.setattr(adapter, "_effective_model", lambda *_args: "")
+    monkeypatch.setattr(adapter, "_bind_turn_session_context", lambda *_args: None)
+
+    result, _usage = await adapter._run_agent(
+        user_message="cancel silent task",
+        conversation_history=[],
+        session_id="api-lineage-tip",
+        gateway_session_key="zettlab:owner:agent:stable",
+        turn_id="pvm-" + "a" * 24,
+        business_execution_token="a" * 64,
+        execution_policy="silent_automation",
+        plan_ack={
+            "turn_id": "plan-turn-1",
+            "status": "cancelled",
+            "revision_requested": False,
+        },
+    )
+
+    assert result["final_response"] == "cancelled"
+    assert constructed[0]["skip_memory"] is True
+    assert observed == {
+        "business_token": "",
+        "execution_policy": "silent_automation",
+        "persist_disabled": True,
+        "session_db": None,
+        "session_json_enabled": False,
+        "tool_names": {"skill_view"},
+        "valid_tool_names": {"skill_view"},
+    }
+
+
 def test_zet_agent_run_agent_covers_base_signature():
     base_params, _ = _keyword_params(APIServerAdapter._run_agent)
     override_params, has_var_kw = _keyword_params(ZetAgentAdapter._run_agent)

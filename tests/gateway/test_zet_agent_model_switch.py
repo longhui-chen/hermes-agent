@@ -399,7 +399,7 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
     monkeypatch,
 ):
     from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_token
+    from gateway.session_context import business_execution_token, execution_policy
 
     adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
     captured = {}
@@ -410,6 +410,7 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
 
     async def fake_super(self, **kwargs):
         captured["scoped_token"] = business_execution_token()
+        captured["scoped_policy"] = execution_policy()
         captured["forwarded_token"] = kwargs["business_execution_token"]
         captured["execution_policy"] = kwargs["execution_policy"]
         return ({}, {})
@@ -431,8 +432,9 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
 
     assert captured == {
         "scoped_token": "",
+        "scoped_policy": "silent_automation",
         "forwarded_token": "",
-        "execution_policy": "",
+        "execution_policy": "silent_automation",
     }
 
 

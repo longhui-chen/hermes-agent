@@ -2650,9 +2650,9 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_auto_execute = agent_request_overrides.pop(
             "_zet_plan_auto_execute", None
         )
-        execution_policy = agent_request_overrides.pop(
-            "_zet_execution_policy", ""
-        )
+        execution_policy = str(
+            agent_request_overrides.pop("_zet_execution_policy", "") or ""
+        ).strip().lower()
         disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
 
         # 在 ephemeral_system_prompt 头部接 zettlab 工作风格 addendum。
@@ -3181,9 +3181,10 @@ class ZetAgentAdapter(APIServerAdapter):
             # carry the newer turn-bound side-effect capability. Cancellation
             # similarly preserves the receipt while revoking execution.
             scoped_business_execution_token = ""
-        scoped_execution_policy = (
-            execution_policy if scoped_business_execution_token else ""
-        )
+        # ``plan_ack`` is a UI receipt, not part of the HMAC proof.  It may
+        # revoke the side-effect capability on cancellation, but it must not
+        # turn a verified silent turn back into an ordinary memory/tool turn.
+        scoped_execution_policy = str(execution_policy or "").strip().lower()
 
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
@@ -3234,6 +3235,7 @@ class ZetAgentAdapter(APIServerAdapter):
             plan_ack_turn_id=ack_turn_id,
             plan_ack_revision_requested=ack_revision_requested,
             business_execution_token=scoped_business_execution_token,
+            execution_policy=scoped_execution_policy,
         )
         # This turn's ledger card title (X-Task-Title). Bound here, before the
         # base adapter's copy_context() hands the request to its executor, so

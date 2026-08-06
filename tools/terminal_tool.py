@@ -4949,6 +4949,9 @@ def _video_edit_runtime_claims_match_receipt(
 ) -> bool:
     """Bind model-supplied business routing claims to the frozen receipt."""
     script_name = Path(parsed.argv[1]).name
+    execution_policy = str(
+        trusted_env.get("HERMES_EXECUTION_POLICY", "") or ""
+    ).strip().lower()
     turn_id = str(trusted_env.get("HERMES_TURN_ID", "") or "").strip()
     gateway_session_key = str(
         trusted_env.get("HERMES_GATEWAY_SESSION_KEY", "") or ""
@@ -4964,6 +4967,18 @@ def _video_edit_runtime_claims_match_receipt(
             expected_agent_id=expected_agent_id,
             turn_id=turn_id,
         )
+    if execution_policy == "silent_automation":
+        # Silent turns have no interactive fallback.  Every terminal operation
+        # must stay inside the proactive manifest wrapper; otherwise a valid
+        # proof with an ordinary/stale session key could reach the legacy
+        # normalize, preference, or cloud upload helpers.
+        if script_name == "preference_resolver.py" and proactive_receipt:
+            return _proactive_preference_finalizer_arguments_match_receipt(
+                parsed.argv[2:],
+                expected_agent_id=expected_agent_id,
+                turn_id=turn_id,
+            )
+        return False
     if proactive_receipt:
         if script_name == "normalize.py":
             return False
