@@ -147,7 +147,7 @@ function makeReview(id = 701) {
 function makeGithub({
   comments = [], checks = new Map(), reviews = new Map(), reviewComments = [], associated = null, openPulls = [],
   associationFailure = null,
-  workflowRun = null, workflowPath = CODEX_CAPTURE_WORKFLOW_PATH,
+  workflowRun = null, workflowPath = CODEX_CAPTURE_WORKFLOW_PATH, workflowJobs = null,
   dispatchFails = false, callOrder = null,
   checkpointCreateLosesResponse = false,
   checkpointCreateLosesResponseAt = null,
@@ -186,6 +186,7 @@ function makeGithub({
     checkReads: new Map(),
     reviewReads: [],
     associationReads: [],
+    jobReads: 0,
     failThreadRelease: threadReleaseFails,
     graphql: async (_query, variables) => {
       assert(variables.request && variables.request.signal instanceof AbortSignal,
@@ -215,9 +216,12 @@ function makeGithub({
         getWorkflow: async (options) => ({ data: {
           id: options.workflow_id, name: CODEX_CAPTURE_WORKFLOW_NAME, path: workflowPath,
         } }),
-        listJobsForWorkflowRun: async () => ({ data: { jobs: [{
-          name: 'capture', status: 'completed', conclusion: 'success',
-        }] } }),
+        listJobsForWorkflowRun: async () => {
+          github.jobReads += 1;
+          return { data: { jobs: workflowJobs === null ? [{
+            id: 8801, name: 'capture', status: 'completed', conclusion: 'success',
+          }] : workflowJobs } };
+        },
       },
       repos: {
         listPullRequestsAssociatedWithCommit: async (options) => {
@@ -620,8 +624,9 @@ async function main() {
     });
     assert(wakeRefs && wakeRefs.length === 1 && wakeGithub.dispatches.length === 1 &&
       wakeRef.eventKey === expectedWakeRef.eventKey && wakeRef.headSha === wakeReview.commit_id &&
+      wakeGithub.jobReads === 1 &&
       wakeGithub.reviewReads.length === 2 && wakeGithub.reviewReads.every((read) => read.pullNumber === 42),
-    'workflow_run hint 无 head；scoped API 重验 hint PR 的 official review 后按 fetched commit/id 构造 immutable ref，current head 前进仍入队');
+    'canonical title + valid capture job 正常重验 official review，并按 fetched commit/id 构造 immutable ref 入队');
     const forbiddenComments = [];
     const forbiddenGithub = makeGithub({
       comments: forbiddenComments, reviews: new Map([['801', wakeReview]]), workflowRun: wakeRun,
@@ -645,6 +650,90 @@ async function main() {
     });
     assert(wrongPathRefs === null && wrongPathCore.failures.some((message) => message.includes('id/name/path')),
       'workflow_run name 不构成信任；workflow_id 必须经 API 映射到固定 capture path');
+
+    const legacyRun = {
+      ...wakeRun, id: 9010, display_title: '旧分支 PR 标题，不是 canonical capture run name',
+    };
+    const legacyWakeComments = [];
+    const legacyWakeGithub = makeGithub({
+      comments: legacyWakeComments, workflowRun: legacyRun,
+      workflowJobs: [{ id: null, name: 'legacy-notify', status: 'queued', conclusion: null }],
+    });
+    const legacyWakeCore = makeCore();
+    const legacyWakeRefs = await consumeCodexWorkflowRunWakeup({
+      github: legacyWakeGithub,
+      context: context('workflow_run', { workflow_run: { id: 9010, workflow_id: 77 } }),
+      core: legacyWakeCore,
+    });
+    assert(Array.isArray(legacyWakeRefs) && legacyWakeRefs.length === 0 &&
+      legacyWakeCore.failures.length === 0 &&
+      legacyWakeCore.warnings.some((message) => message.includes('legacy') && message.includes('no-op')) &&
+      legacyWakeGithub.jobReads === 0 && legacyWakeGithub.reviewReads.length === 0 &&
+      legacyWakeComments.length === 0 && legacyWakeGithub.dispatches.length === 0,
+    'legacy PR title 即使对应旧 job shape 也在 job/API/queue 前安全 no-op，不产生运营红灯或写入');
+
+    const invalidCanonicalRun = {
+      ...wakeRun, id: 9011, display_title: 'codex-feishu-capture:review:42:801',
+    };
+    const invalidCanonicalComments = [];
+    const invalidCanonicalGithub = makeGithub({
+      comments: invalidCanonicalComments, workflowRun: invalidCanonicalRun,
+      workflowJobs: [{ id: null, name: 'legacy-notify', status: 'queued', conclusion: null }],
+    });
+    const invalidCanonicalCore = makeCore();
+    const invalidCanonicalRefs = await consumeCodexWorkflowRunWakeup({
+      github: invalidCanonicalGithub,
+      context: context('workflow_run', { workflow_run: { id: 9011, workflow_id: 77 } }),
+      core: invalidCanonicalCore,
+    });
+    assert(invalidCanonicalRefs === null && invalidCanonicalGithub.jobReads === 1 &&
+      invalidCanonicalGithub.reviewReads.length === 0 && invalidCanonicalComments.length === 0 &&
+      invalidCanonicalGithub.dispatches.length === 0 &&
+      invalidCanonicalCore.failures.some((message) => message.includes('capture job') && message.includes('id')),
+    'canonical title 声明新协议后，invalid capture job id/name/status/conclusion 必须 fail closed 且零写入');
+
+    const skippedCanonicalRun = {
+      ...wakeRun, id: 9012, display_title: 'codex-feishu-capture:review:42:801',
+    };
+    const skippedCanonicalComments = [];
+    const skippedCanonicalGithub = makeGithub({
+      comments: skippedCanonicalComments, workflowRun: skippedCanonicalRun,
+      workflowJobs: [{ id: 8812, name: 'capture', status: 'completed', conclusion: 'skipped' }],
+    });
+    const skippedCanonicalCore = makeCore();
+    const skippedCanonicalRefs = await consumeCodexWorkflowRunWakeup({
+      github: skippedCanonicalGithub,
+      context: context('workflow_run', { workflow_run: { id: 9012, workflow_id: 77 } }),
+      core: skippedCanonicalCore,
+    });
+    assert(Array.isArray(skippedCanonicalRefs) && skippedCanonicalRefs.length === 0 &&
+      skippedCanonicalCore.failures.length === 0 &&
+      skippedCanonicalCore.warnings.some((message) => message.includes('正常跳过') && message.includes('no-op')) &&
+      skippedCanonicalGithub.jobReads === 1 && skippedCanonicalGithub.reviewReads.length === 0 &&
+      skippedCanonicalGithub.checkReads.size === 0 && skippedCanonicalGithub.prReads.length === 0 &&
+      skippedCanonicalComments.length === 0 && skippedCanonicalGithub.dispatches.length === 0,
+    'canonical title + valid skipped capture job 是官方过滤 no-op，零 source API/queue/dispatch 且不标红');
+
+    const failedCanonicalRun = {
+      ...wakeRun, id: 9013, display_title: 'codex-feishu-capture:review:42:801',
+    };
+    const failedCanonicalComments = [];
+    const failedCanonicalGithub = makeGithub({
+      comments: failedCanonicalComments, workflowRun: failedCanonicalRun,
+      workflowJobs: [{ id: 8813, name: 'capture', status: 'completed', conclusion: 'failure' }],
+    });
+    const failedCanonicalCore = makeCore();
+    const failedCanonicalRefs = await consumeCodexWorkflowRunWakeup({
+      github: failedCanonicalGithub,
+      context: context('workflow_run', { workflow_run: { id: 9013, workflow_id: 77 } }),
+      core: failedCanonicalCore,
+    });
+    assert(failedCanonicalRefs === null && failedCanonicalGithub.jobReads === 1 &&
+      failedCanonicalGithub.reviewReads.length === 0 && failedCanonicalGithub.checkReads.size === 0 &&
+      failedCanonicalGithub.prReads.length === 0 && failedCanonicalComments.length === 0 &&
+      failedCanonicalGithub.dispatches.length === 0 &&
+      failedCanonicalCore.failures.some((message) => message.includes('conclusion=failure')),
+    'canonical title + valid capture job failure conclusion 仍 fail closed，零 source API/queue/dispatch');
 
     const oldCheckSha = 'c'.repeat(40);
     const oldCheck = makeCheck(803, { headSha: oldCheckSha });
