@@ -12,11 +12,14 @@ JPEG = b"\xff\xd8\xffinline-image"
 WEBP = b"RIFF\x0c\x00\x00\x00WEBPinline-image"
 
 
-def _capability(limit: int = 1024):
-    return {
+def _capability(limit: int = 1024, *, supports_url: bool = False):
+    capability = {
         "modalities": ["text", "image"],
         "_type_limits": {"max_inline_image_bytes": limit},
     }
+    if supports_url:
+        capability["supports_input_image_url"] = True
+    return capability
 
 
 @pytest.mark.parametrize(
@@ -73,6 +76,15 @@ def test_normalized_modalities_ignore_unknown_values(modalities):
     assert client.normalized_modalities({"modalities": modalities}) == []
 
 
+def test_supported_modalities_accept_url_only_image_capability():
+    from plugins import zettlab_media_client as client
+
+    assert client.supported_modalities(
+        {"limits": {}},
+        {"modalities": ["image"], "supports_input_image_url": True},
+    ) == ["image"]
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [
@@ -87,9 +99,10 @@ def test_inline_image_input_rejects_unsafe_or_invalid_values(value, message):
         client.inline_image_input(value, None, _capability())
 
 
-def test_inline_image_input_rejects_remote_url_before_network(monkeypatch):
+def test_inline_image_input_passes_https_url_without_network(monkeypatch):
     from plugins import zettlab_media_client as client
 
+    source = "https://images.example.com/source.png?token=signed-value"
     monkeypatch.setattr(
         client._SESSION,
         "request",
@@ -97,12 +110,73 @@ def test_inline_image_input_rejects_remote_url_before_network(monkeypatch):
             AssertionError("remote URL must not be fetched")
         ),
     )
+    monkeypatch.setattr(
+        client._FILE_WORKER,
+        "read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("remote URL must not reach the file worker")
+        ),
+    )
+
+    assert client.inline_image_input(
+        source,
+        None,
+        _capability(supports_url=True),
+    ) == source
+
+
+def test_inline_image_input_fails_closed_when_url_capability_is_missing():
+    from plugins import zettlab_media_client as client
 
     with pytest.raises(client.ZettlabMediaError, match="not enabled"):
         client.inline_image_input(
-            "https://example.com/source.png",
+            "https://images.example.com/source.png",
             None,
             _capability(),
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://images.example.com/source.png",
+        "https://user:pass@images.example.com/source.png",
+        "https://images.example.com/source.png#fragment",
+        "https://images.example.com/source image.png",
+        "https://localhost/source.png",
+        "https://images.localhost/source.png",
+        "https://10.0.0.5/source.png",
+        "https://[::1]/source.png",
+        "https://images.example.com:8443/source.png",
+        "https://127.1/source.png",
+        "https://2130706433/source.png",
+        "https://0177.0.0.1/source.png",
+        "https://0x7f000001/source.png",
+        "https://intranet/source.png",
+        "https://localhost。/source.png",
+        "https://127。0。0。1/source.png",
+    ],
+)
+def test_inline_image_input_rejects_invalid_remote_url(value):
+    from plugins import zettlab_media_client as client
+
+    with pytest.raises(client.ZettlabMediaError, match="valid HTTPS URL"):
+        client.inline_image_input(
+            value,
+            None,
+            _capability(supports_url=True),
+        )
+
+
+def test_inline_image_input_rejects_oversize_remote_url():
+    from plugins import zettlab_media_client as client
+
+    value = "https://images.example.com/" + "a" * client.MAX_INPUT_IMAGE_URL_BYTES
+    with pytest.raises(client.ZettlabMediaError, match="exceeds maximum size"):
+        client.inline_image_input(
+            value,
+            None,
+            _capability(supports_url=True),
         )
 
 

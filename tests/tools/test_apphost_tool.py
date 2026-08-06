@@ -165,6 +165,16 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
      {"staging_dir": "/tmp/stage", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/stage"}, "POST", "/app1/reload",
      {"staging_dir": "/tmp/stage"}),
+    # The note travels with the version and is what the user is shown when
+    # deciding whether to undo it, so it has to reach the host.
+    ("reload", {"slug": "app1", "staging_dir": "/tmp/stage", "note": "Footer 加了一个链接"},
+     "POST", "/app1/reload", {"staging_dir": "/tmp/stage", "note": "Footer 加了一个链接"}),
+    # Undo always names the version it means. This is what makes a retry
+    # safe — an undo that already succeeded is recognised instead of swapping
+    # the app forward again. The untargeted form the server would accept is
+    # deliberately not offered on this face (see the required-params test).
+    ("rollback", {"slug": "app1", "to_version": "v17858"}, "POST", "/app1/rollback",
+     {"to_version": "v17858"}),
     ("delete", {"slug": "app1"}, "DELETE", "/app1", None),
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}, "POST",
      "/app1/lifecycle", {"action": "restart"}),
@@ -209,6 +219,7 @@ _ALL_HTTP_ACTION_ARGS = [
     ("release_slot", {"slot_token": "s1"}),
     ("install", {"staging_dir": "/tmp/s", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
+    ("rollback", {"slug": "app1", "to_version": "v1"}),
     ("delete", {"slug": "app1"}),
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}),
     ("logs", {"slug": "app1"}),
@@ -357,6 +368,60 @@ def test_http_error_without_json_body_degrades_to_transport_error(monkeypatch):
     _assert_no_secret_leak(out, scope)
 
 
+# --- rollback against a server that predates the route -----------------------
+# Hermes (zettlab-claw) and local-server are separate OTA packages, so a new
+# tool action can meet an older server. Its router answers the unregistered
+# path with a bodiless 404; every business 404 on this face carries a JSON
+# {code} body. transport_error means "transient, retry" to the caller — the
+# one meaning a permanently missing route must not have.
+
+def _http_error(code, body):
+    def _boom(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, code, "err", None, io.BytesIO(body))
+    return _boom
+
+
+def test_rollback_404_without_body_is_unsupported_not_retryable(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(404, b"404 page not found")):
+            out = json.loads(app_host_tool(
+                {"action": "rollback", "slug": "app1", "to_version": "v1"}))
+    assert out["ok"] is False and out["status"] == 404
+    assert out["error"]["code"] == "unsupported"
+    # The message must hand the model its fallback, not a dead end.
+    assert "reload" in out["error"]["message"]
+
+
+def test_rollback_404_with_json_body_stays_verbatim(monkeypatch):
+    """A parsable 404 is the server speaking (unknown app / not the owner) —
+    the unsupported mapping must never swallow it."""
+    upstream = {"code": "not_found", "message": 'unknown app "app1"'}
+    body = json.dumps(upstream).encode("utf-8")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(404, body)):
+            out = json.loads(app_host_tool(
+                {"action": "rollback", "slug": "app1", "to_version": "v1"}))
+    assert out["ok"] is False and out["status"] == 404
+    assert out["error"] == upstream
+
+
+def test_rollback_unsupported_mapping_is_narrow(monkeypatch):
+    """Only (rollback, 404, no parsable body) maps to unsupported. A wider
+    match would relabel real outages as a permanent capability gap."""
+    cases = [
+        # Another action hitting a bodiless 404 stays transport_error.
+        ({"action": "probe"}, 404),
+        # rollback hitting a non-404 bodiless error stays transport_error.
+        ({"action": "rollback", "slug": "app1", "to_version": "v1"}, 502),
+    ]
+    for args, code in cases:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _http_error(code, b"<html></html>")):
+                out = json.loads(app_host_tool(args))
+        assert out["ok"] is False and out["status"] == code, (args, code)
+        assert out["error"]["code"] == "transport_error", (args, code)
+
+
 def test_connection_error_does_not_leak_url_or_token(monkeypatch):
     scope = _scope()
 
@@ -477,6 +542,8 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     # slot's integrity walk before the response.
     ("install", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
     ("reload", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
+    # No rebuild, but still stop + swap + health-check — long tier.
+    ("rollback", {"slug": "a1", "to_version": "v1"}, 120.0),
     ("acquire_slot", {}, 120.0),
     ("probe", {}, 30.0),
     ("delete", {"slug": "a1"}, 30.0),
@@ -530,6 +597,11 @@ def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
     ("install", {"slug": "app1"}),           # staging_dir missing
     ("install", {"staging_dir": "/tmp/s"}),  # slug missing
     ("reload", {"slug": "app1"}),            # staging_dir missing
+    # to_version missing: an untargeted rollback is a symmetric swap, so a
+    # retry after a lost response would undo the undo — the tool refuses to
+    # send one even though the server would accept it.
+    ("rollback", {"slug": "app1"}),
+    ("rollback", {"slug": "app1", "to_version": "   "}),  # whitespace is not a target
     ("lifecycle", {"slug": "app1"}),         # lifecycle_action missing
     ("lifecycle", {"slug": "app1", "lifecycle_action": "explode"}),
 ])
@@ -557,6 +629,7 @@ _SERVER_INTERNAL_ROUTES = {
     ("POST", "/install"),
     ("GET", ""),
     ("POST", "/{name}/reload"),
+    ("POST", "/{name}/rollback"),
     ("DELETE", "/{name}"),
     ("POST", "/{name}/lifecycle"),
     ("GET", "/{name}/logs"),
@@ -848,3 +921,31 @@ def test_schema_actions_match_handler():
         out = json.loads(app_host_tool({"action": action}))
         error = out.get("error") or {}
         assert "未知动作" not in str(error.get("message", "")), action
+
+
+# --- reachability ------------------------------------------------------------
+# The model can only call what the schema declares. Handling an action in
+# _build_request is not enough: an action missing from the enum is invisible,
+# and the model works around it — which is exactly how undo ended up being
+# "recompile the app with the old content" instead of one step back.
+
+def test_schema_declares_every_action_it_handles():
+    declared = set(APP_HOST_SCHEMA["parameters"]["properties"]["action"]["enum"])
+    for action in ("rollback", "reload", "install", "list", "delete", "lifecycle", "logs"):
+        assert action in declared, f"{action} is handled but not offered to the model"
+
+
+def test_schema_declares_the_arguments_undo_depends_on():
+    props = APP_HOST_SCHEMA["parameters"]["properties"]
+    # Without to_version an undo cannot be retried safely: the swap is
+    # symmetric, so repeating an untargeted one swaps the app forward again.
+    assert "to_version" in props
+    # Without note the archived version has no description, and the user is
+    # asked to undo something the host can only identify by a timestamp.
+    assert "note" in props
+
+
+def test_undo_is_described_where_the_model_reads_it():
+    text = APP_HOST_SCHEMA["description"]
+    assert "rollback" in text
+    assert "prev_version_id" in text, "the model has to be told where to get to_version"

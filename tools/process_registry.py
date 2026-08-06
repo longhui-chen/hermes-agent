@@ -46,8 +46,10 @@ from pathlib import Path, PurePosixPath
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import (
+    _apply_profile_secret_scope_env,
     _find_shell,
     _managed_terminal_argv,
+    _prepare_managed_command_skill_sources,
     _managed_terminal_cwd,
     _resolve_safe_cwd,
     _sanitize_subprocess_env,
@@ -896,11 +898,13 @@ class ProcessRegistry:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                _apply_profile_secret_scope_env(pty_env, inject=True)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 session.cwd = _managed_terminal_cwd(
                     session.cwd,
                     env=pty_env,
                 )
+                _prepare_managed_command_skill_sources(command, pty_env)
                 pty_proc = _PtyProcessCls.spawn(
                     _managed_terminal_argv(
                         [user_shell, "-lic", f"set +m; {command}"],
@@ -945,11 +949,13 @@ class ProcessRegistry:
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        _apply_profile_secret_scope_env(bg_env, inject=True)
         bg_env["PYTHONUNBUFFERED"] = "1"
         session.cwd = _managed_terminal_cwd(
             session.cwd,
             env=bg_env,
         )
+        _prepare_managed_command_skill_sources(command, bg_env)
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(

@@ -32,6 +32,7 @@ def _capabilities():
                 "id": "seedance-v1",
                 "display_name": "Seedance V1",
                 "modalities": ["text", "image"],
+                "supports_input_image_url": True,
                 "aspect_ratios": ["16:9", "9:16"],
                 "resolutions": ["720p"],
                 "durations": [5, 10],
@@ -62,6 +63,8 @@ def test_zettlab_video_provider_reads_capabilities(monkeypatch):
     assert caps["aspect_ratios"] == ["16:9", "9:16"]
     assert caps["resolutions"] == ["720p"]
     assert caps["max_duration"] == 10
+    assert caps["supports_inline_image"] is True
+    assert caps["supports_input_image_url"] is True
 
 
 def test_zettlab_video_capabilities_use_only_selected_model(monkeypatch):
@@ -164,6 +167,49 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     assert "parameters" not in captured["json"]
     assert captured["json"]["input_image"] == PNG_DATA_URI
     assert "remote_media_inputs" not in captured["json"]
+
+
+def test_zettlab_video_generate_passes_https_url_unchanged(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    source = "https://images.example.com/source.png?token=signed-value"
+    captured = {}
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "seedance-v1",
+            {
+                "id": "seedance-v1",
+                "modalities": ["text", "image"],
+                "supports_input_image_url": True,
+                "aspect_ratios": ["16:9"],
+                "resolutions": ["720p"],
+                "durations": [5],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
+    )
+
+    def fake_create_and_wait(**kwargs):
+        captured.update(kwargs["payload"])
+        return {
+            "job_id": "video-url",
+            "status": "done",
+            "assets": [{"url": "https://cdn.example/url.mp4"}],
+        }
+
+    monkeypatch.setattr(client, "create_and_wait", fake_create_and_wait)
+    got = ZettlabVideoGenProvider().generate(
+        "animate this",
+        image_url=source,
+        duration=5,
+        aspect_ratio="16:9",
+        resolution="720p",
+    )
+
+    assert got["success"] is True
+    assert captured["input_image"] == source
 
 
 def test_zettlab_video_rejects_disabled_custom_parameters(monkeypatch):

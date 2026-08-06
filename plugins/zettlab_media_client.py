@@ -35,6 +35,7 @@ MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 MAX_MEDIA_REQUEST_BYTES = 7 * 1024 * 1024
 MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
 MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_INPUT_IMAGE_URL_BYTES = 8 * 1024
 LOCAL_IMAGE_READ_TIMEOUT = 30.0
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
@@ -1077,35 +1078,73 @@ def is_available(media_type: str) -> bool:
     )
 
 
+def _looks_like_legacy_ipv4_literal(host: str) -> bool:
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4:
+        return False
+    for part in parts:
+        if part and part.isascii() and part.isdecimal():
+            continue
+        if (
+            len(part) > 2
+            and part[:2].casefold() == "0x"
+            and all(character in "0123456789abcdefABCDEF" for character in part[2:])
+        ):
+            continue
+        return False
+    return True
+
+
+def _is_ascii_dns_hostname(host: str) -> bool:
+    if not host.isascii() or len(host) > 253 or "." not in host:
+        return False
+    for part in host.split("."):
+        if (
+            not 1 <= len(part) <= 63
+            or part.startswith("-")
+            or part.endswith("-")
+            or not all(character.isalnum() or character == "-" for character in part)
+        ):
+            return False
+    return True
+
+
 def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
     if value is None:
         return None
     raw = str(value).strip()
     if not raw:
         return None
-    parsed = urlparse(raw)
-    host = (parsed.hostname or "").lower().rstrip(".")
     try:
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").casefold().rstrip(".")
         port = parsed.port
-    except ValueError:
-        port = -1
+    except ValueError as exc:
+        raise ZettlabMediaError(
+            f"{label} must be a valid HTTPS URL for Zettlab media generation"
+        ) from exc
     try:
         is_ip_literal = bool(host) and ipaddress.ip_address(host) is not None
     except ValueError:
         is_ip_literal = False
     if (
-        parsed.scheme != "https"
+        parsed.scheme.casefold() != "https"
         or not parsed.netloc
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-        or port not in {None, 443}
         or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or any(character.isspace() for character in raw)
+        or port not in {None, 443}
         or host == "localhost"
         or host.endswith(".localhost")
         or is_ip_literal
+        or _looks_like_legacy_ipv4_literal(host)
+        or not _is_ascii_dns_hostname(host)
     ):
-        raise ZettlabMediaError(f"{label} must be an https URL for Zettlab media generation")
+        raise ZettlabMediaError(
+            f"{label} must be a valid HTTPS URL for Zettlab media generation"
+        )
     return raw
 
 
@@ -1144,13 +1183,58 @@ def normalized_modalities(model_capability: Optional[Dict[str, Any]]) -> List[st
     return modalities
 
 
+def supports_inline_image_input(
+    type_section: Optional[Dict[str, Any]],
+    model_capability: Optional[Dict[str, Any]],
+) -> bool:
+    limits = type_section.get("limits") if isinstance(type_section, dict) else None
+    return (
+        "image" in normalized_modalities(model_capability)
+        and _effective_inline_image_limit(limits) is not None
+    )
+
+
+def supports_input_image_url(model_capability: Optional[Dict[str, Any]]) -> bool:
+    return (
+        "image" in normalized_modalities(model_capability)
+        and isinstance(model_capability, dict)
+        and model_capability.get("supports_input_image_url") is True
+    )
+
+
+def image_input_description(
+    type_section: Optional[Dict[str, Any]],
+    model_capability: Optional[Dict[str, Any]],
+) -> str:
+    supports_inline = supports_inline_image_input(type_section, model_capability)
+    supports_url = supports_input_image_url(model_capability)
+    if supports_inline and supports_url:
+        return (
+            "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
+            "local file path, file URL, or HTTPS URL. HTTPS URLs are passed "
+            "through without being downloaded by Hermes."
+        )
+    if supports_url:
+        return (
+            "Pass one HTTPS image URL. It is passed through without being "
+            "downloaded by Hermes."
+        )
+    return (
+        "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
+        "local file path, or file URL."
+    )
+
+
 def supported_modalities(
     type_section: Optional[Dict[str, Any]],
     model_capability: Optional[Dict[str, Any]],
 ) -> List[str]:
     modalities = normalized_modalities(model_capability)
-    limits = type_section.get("limits") if isinstance(type_section, dict) else None
-    if "image" in modalities and _effective_inline_image_limit(limits) is None:
+    if (
+        "image" in modalities
+        and not supports_inline_image_input(type_section, model_capability)
+        and not supports_input_image_url(model_capability)
+    ):
         modalities.remove("image")
     return modalities
 
@@ -1163,6 +1247,21 @@ def _inline_image_limit(model_capability: Optional[Dict[str, Any]]) -> int:
             "Inline image input is not enabled for this Zettlab media generation model"
         )
     return limit
+
+
+def validate_input_image_url(
+    value: str,
+    model_capability: Optional[Dict[str, Any]],
+) -> str:
+    """Validate the wire shape only; ai-api owns fetching the image."""
+    if not supports_input_image_url(model_capability):
+        raise ZettlabMediaError(
+            "HTTPS image URLs are not enabled for this Zettlab media generation model"
+        )
+    raw = str(value or "").strip()
+    if len(raw.encode("utf-8")) > MAX_INPUT_IMAGE_URL_BYTES:
+        raise ZettlabMediaError("image input URL exceeds maximum size")
+    return validate_remote_url(raw, label="image input") or ""
 
 
 def _sniff_image_mime(raw: bytes) -> Optional[str]:
@@ -1274,17 +1373,18 @@ def inline_image_input(
         return None
     if len(candidates) != 1:
         raise ZettlabMediaError("exactly one image input is supported")
-    limit = _inline_image_limit(model_capability)
     source = candidates[0]
     if source.startswith("data:"):
+        limit = _inline_image_limit(model_capability)
         return _validate_image_data_uri(source, limit)
     _reject_windows_network_or_device_path(source)
-    parsed = urlparse(source)
+    try:
+        parsed = urlparse(source)
+    except ValueError as exc:
+        raise ZettlabMediaError("image input must be a valid HTTPS URL") from exc
     if parsed.scheme.casefold() in {"http", "https"}:
-        raise ZettlabMediaError(
-            "HTTP(S) image URLs are not enabled for Zettlab yet; use a base64 "
-            "data URI or an absolute local image path"
-        )
+        return validate_input_image_url(source, model_capability)
+    limit = _inline_image_limit(model_capability)
     (
         prepared_source,
         normalized_task_id,
