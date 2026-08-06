@@ -75,6 +75,37 @@ def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     assert executions.EXECUTIONS_FILE.read_bytes() == b"not a sqlite database"
 
 
+def test_ledger_follows_the_active_profile_home(monkeypatch, tmp_path):
+    """Multiplex single-process gateway: each profile's attempts must land in
+    that profile's ledger. Module-level path evaluation pinned every profile to
+    whichever home was active at import time (the root home), which is why the
+    root ledger held every job and per-profile ledgers stayed empty."""
+    import cron.executions as executions
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    root = tmp_path / "hermes_home"
+    profile_a = root / "profiles" / "agent-a"
+    profile_b = root / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    assert executions.EXECUTIONS_FILE is None, "ledger path must not be import-time bound"
+
+    for home, job_id in ((profile_a, "job-a"), (profile_b, "job-b")):
+        token = set_hermes_home_override(str(home))
+        try:
+            row = executions.create_execution(job_id, source="builtin")
+            executions.finish_execution(row["id"], success=True)
+            assert [r["job_id"] for r in executions.list_executions()] == [job_id]
+        finally:
+            reset_hermes_home_override(token)
+
+    assert (profile_a / "cron" / "executions.db").exists()
+    assert (profile_b / "cron" / "executions.db").exists()
+    assert not (root / "cron" / "executions.db").exists()
+
+
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
     executions = _point_ledger(monkeypatch, tmp_path)
     row = executions.create_execution("cli-job", source="builtin")

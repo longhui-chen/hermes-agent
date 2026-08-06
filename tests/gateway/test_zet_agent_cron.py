@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 import inspect
+from contextlib import contextmanager
 
 import pytest
 
@@ -541,6 +542,260 @@ def test_persist_targets_call_time_profile_home_not_frozen_default(tmp_path, mon
     # Summary in the per-profile db (App reads it), NOT the frozen top-level db.
     assert _cron_summary_count(prof / "state.db") == 1
     assert _cron_summary_count(top / "state.db") == 0
+
+
+def _cron_summary_rows(db_file, session_id):
+    """Count cron-summary messages for one session in one state.db (read-only)."""
+    import sqlite3
+
+    if not db_file.exists():
+        return 0
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    try:
+        return conn.execute(
+            "select count(*) from messages where session_id=? "
+            "and content like '%cron-summary%'",
+            (session_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _mux_cron_job(job_id, session_id, name="论文推荐"):
+    return {
+        "id": job_id, "name": name, "prompt": "推荐论文", "skills": [], "skill": None,
+        "schedule": {"kind": "cron", "expr": "30 21 * * *", "display": "每天21:30"},
+        "schedule_display": "每天21:30", "repeat": {"times": None, "completed": 1},
+        "enabled": True, "state": "scheduled", "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": session_id},
+        "timezone": "Asia/Shanghai", "last_status": None, "last_error": None,
+        "last_delivery_error": None,
+    }
+
+
+def _mux_env(monkeypatch, hermes_home, jobs_home, default_db):
+    """Point the process at ``hermes_home`` with DEFAULT_DB_PATH frozen elsewhere."""
+    import cron.jobs as cron_jobs
+    import hermes_state
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", default_db)
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", jobs_home / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", jobs_home / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", jobs_home / "cron" / "output")
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+
+
+def test_persist_lands_in_profile_db_when_home_override_unbound(tmp_path, monkeypatch):
+    """S0 止血：cron 线程里 profile override 没绑上（get_hermes_home() = 根 home）时，
+    摘要仍必须落 profiles/<agentID>/state.db —— 这正是线上 61% 记录跳不过去的成因。"""
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+    zc.install()
+
+    SID = f"zettlab:userA:{AID}:orig001"
+    JID = "jobUnbound"
+    cron_jobs.save_jobs([_mux_cron_job(JID, SID)])
+
+    prof_db = SessionDB(db_path=prof / "state.db")
+    prof_db.create_session(SID, source="zet_agent", user_id="userA")
+    prof_db.close()
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n今日推荐：论文\n"
+    try:
+        scheduler.mark_job_run(JID, True, scheduled_at="2026-07-30T13:30:00Z",
+                               output_filename="run.md")
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    assert _cron_summary_rows(prof / "state.db", SID) == 1
+    assert _cron_summary_rows(root / "state.db", SID) == 0
+    # 源会话没被当成「已删除」→ 不许派生承接会话
+    assert cron_jobs.get_job(JID)["origin"]["chat_id"] == SID
+
+
+def test_persist_keeps_legacy_root_store_session_in_place(tmp_path, monkeypatch):
+    """存量 root-only 会话（板子上 101 个）不能被当成已删除：继续写根库、
+    不派生承接会话。否则每次 cron 都给用户新建一个空对话。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "abf18a05"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:legacy01"
+    JID = "jobLegacy"
+    job = _mux_cron_job(JID, SID)
+    cron_jobs.save_jobs([job])
+
+    root_db = SessionDB(db_path=root / "state.db")
+    root_db.create_session(SID, source="zet_agent", user_id="userA")
+    root_db.close()
+    # profile 库存在但没有这个会话
+    other = SessionDB(db_path=prof / "state.db")
+    other.create_session(f"zettlab:userA:{AID}:other01", source="zet_agent", user_id="userA")
+    other.close()
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n旧会话续写\n"
+    try:
+        assert zc._try_persist_to_session(JID, True, None, None, job) is None
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    assert _cron_summary_rows(root / "state.db", SID) == 1
+    assert _cron_summary_rows(prof / "state.db", SID) == 0
+    assert cron_jobs.get_job(JID)["origin"]["chat_id"] == SID
+
+
+def test_persist_prefers_profile_db_for_split_session(tmp_path, monkeypatch):
+    """劈裂会话（两库都有，板子上 2 个）：新写入只进 profile 库，根库不再增长——
+    S2a 小手术的前置条件就是这个「不再边合边裂」。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:9sKO_OC-HQSg"
+    JID = "jobSplit"
+    job = _mux_cron_job(JID, SID)
+    cron_jobs.save_jobs([job])
+
+    for db_file in (root / "state.db", prof / "state.db"):
+        db = SessionDB(db_path=db_file)
+        db.create_session(SID, source="zet_agent", user_id="userA")
+        db.close()
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n劈裂会话\n"
+    try:
+        assert zc._try_persist_to_session(JID, True, None, None, job) is None
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    assert _cron_summary_rows(prof / "state.db", SID) == 1
+    assert _cron_summary_rows(root / "state.db", SID) == 0
+
+
+def test_persist_creates_missing_session_in_profile_db(tmp_path, monkeypatch):
+    """会话两库都没有（calendar-reminders 合成会话）→ 建在 profile 库，不建在根库。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "main"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:calendar-reminders"
+    JID = "jobCal"
+    job = _mux_cron_job(JID, SID, name="喝水提醒")
+    job["source"] = "calendar"
+    cron_jobs.save_jobs([job])
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n该喝水啦\n"
+    try:
+        assert zc._try_persist_to_session(JID, True, None, None, job) is None
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    prof_db = SessionDB(db_path=prof / "state.db", read_only=True)
+    try:
+        assert prof_db.get_session(SID) is not None
+    finally:
+        prof_db.close()
+    assert _cron_summary_rows(prof / "state.db", SID) == 1
+    assert not (root / "state.db").exists() or _cron_summary_rows(root / "state.db", SID) == 0
+
+
+def test_persist_follows_session_agent_id_not_process_home(tmp_path, monkeypatch):
+    """multiplex 下 override 绑到了「别的 profile」时，摘要仍按会话自带的 agentID
+    落库 —— 绝不允许跨 profile 写。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    OTHER = "d490707e"
+    prof = root / "profiles" / AID
+    other_prof = root / "profiles" / OTHER
+    prof.mkdir(parents=True)
+    other_prof.mkdir(parents=True)
+    # 进程 home 绑在 OTHER 的 profile 上（错的那个 profile）
+    _mux_env(monkeypatch, other_prof, other_prof, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:orig001"
+    JID = "jobCross"
+    job = _mux_cron_job(JID, SID)
+    cron_jobs.save_jobs([job])
+
+    prof_db = SessionDB(db_path=prof / "state.db")
+    prof_db.create_session(SID, source="zet_agent", user_id="userA")
+    prof_db.close()
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n跨 profile 保护\n"
+    try:
+        assert zc._try_persist_to_session(JID, True, None, None, job) is None
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    assert _cron_summary_rows(prof / "state.db", SID) == 1
+    assert _cron_summary_rows(other_prof / "state.db", SID) == 0
+    assert _cron_summary_rows(root / "state.db", SID) == 0
+
+
+def test_profile_db_resolution_rejects_traversal_agent_id(tmp_path, monkeypatch):
+    """origin.chat_id 是外部输入：agentID 段不是纯 profile 名就不许拼进路径。"""
+    import gateway.platforms.zet_agent_cron as zc
+
+    root = tmp_path / "hermes_home"
+    (root / "profiles").mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    for bad in ("../../etc", "..", ".", "", "a/b", "x\x00y", "eae0707d\n"):
+        assert zc._profile_state_db_candidates(bad) == [], bad
+    assert zc._profile_state_db_candidates("eae0707d") == [
+        (root / "profiles" / "eae0707d" / "state.db").resolve()
+    ]
+    # 整条解析也退回当前 home，不落到 profiles 之外
+    assert zc._resolve_persist_db_path("zettlab:userA:../../etc:s1") == (root / "state.db", None)
+
+
+def test_cron_session_readers_stay_on_default_db_path(tmp_path, monkeypatch):
+    """fake-success / silent / 附件三条读路径必须跟 cron/scheduler.py 写 cron session
+    的那个 bare SessionDB() 同库（DEFAULT_DB_PATH）；profile 化只这一侧会读空。"""
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    root = tmp_path / "hermes_home"
+    prof = root / "profiles" / "eae0707d"
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, prof, prof, root / "state.db")
+
+    db = zc._cron_session_db()
+    try:
+        assert db.db_path == hermes_state.DEFAULT_DB_PATH
+    finally:
+        db.close()
 
 
 def test_persist_failure_surfaces_delivery_error_never_silent(tmp_path, monkeypatch):
@@ -1722,3 +1977,260 @@ def test_normal_failed_cron_run_still_finishes_turn(monkeypatch):
     scheduler.run_job({"id": "failed-job"}, defer_agent_teardown=deferred)
 
     assert finishes == [("failed", "turn_cron_2")]
+
+
+def test_persist_finds_root_store_when_override_points_at_profile_home(tmp_path, monkeypatch):
+    """board229 实测缺陷：cron 线程的 home override 指向 <root>/profiles/<agent> 时，
+    候选集里没有 root 自己的 state.db —— root-only 存量会话被判成已删，每次 run 派生 handoff。
+
+    原有用例的 override 是根 home，探不到这条路径。"""
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    # 关键差异：home override = profile home，不是根 home
+    _mux_env(monkeypatch, prof, root, root / "state.db")
+    zc.install()
+
+    SID = f"zettlab:userA:{AID}:rootonly1"
+    JID = "jobRootOnly"
+    cron_jobs.save_jobs([_mux_cron_job(JID, SID)])
+
+    # 会话只存在于 root 库；profile 库是空的（存量漂移的真实形态）
+    root_db = SessionDB(db_path=root / "state.db")
+    root_db.create_session(SID, source="zet_agent", user_id="userA")
+    root_db.close()
+    SessionDB(db_path=prof / "state.db").close()
+
+    assert zc._resolve_persist_db_path(SID) == (root / "state.db", None)
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n验证成功\n"
+    try:
+        scheduler.mark_job_run(JID, True, scheduled_at="2026-08-05T10:00:00Z",
+                               output_filename="run.md")
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    # 落在原会话（root 库），且没有派生新会话
+    assert _cron_summary_rows(root / "state.db", SID) == 1
+    import sqlite3
+    con = sqlite3.connect(root / "state.db")
+    try:
+        extra = [r[0] for r in con.execute(
+            "SELECT id FROM sessions WHERE id LIKE ? AND id != ?", (f"zettlab:%{AID}:%", SID))]
+    finally:
+        con.close()
+    assert extra == [], f"派生了 handoff 会话: {extra}"
+
+
+@contextmanager
+def _context_home_override(home):
+    """cron 线程的真实形态：context 级 override，进程 HERMES_HOME 留在别处。"""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_persist_finds_root_store_with_context_level_profile_override(tmp_path, monkeypatch):
+    """生产形态：context override = profile home，进程 HERMES_HOME = root。
+    monkeypatch.setenv 是进程级，get_hermes_home() 与 get_process_hermes_home()
+    会永远相等，那半段候选逻辑一行都覆盖不到 —— 必须走 set_hermes_home_override。"""
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_constants import get_hermes_home, get_process_hermes_home
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+    zc.install()
+
+    SID = f"zettlab:userA:{AID}:rootonly2"
+    JID = "jobCtxRootOnly"
+    cron_jobs.save_jobs([_mux_cron_job(JID, SID)])
+
+    root_db = SessionDB(db_path=root / "state.db")
+    root_db.create_session(SID, source="zet_agent", user_id="userA")
+    root_db.close()
+    SessionDB(db_path=prof / "state.db").close()
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\ncontext override\n"
+    with _context_home_override(prof):
+        assert get_hermes_home() != get_process_hermes_home(), "两个 home 必须真的分叉"
+        assert zc._resolve_persist_db_path(SID) == (root / "state.db", None)
+        try:
+            scheduler.mark_job_run(JID, True, scheduled_at="2026-08-05T10:00:00Z",
+                                   output_filename="run.md")
+        finally:
+            zc._LATEST_OUTPUT.pop(JID, None)
+
+    assert _cron_summary_rows(root / "state.db", SID) == 1
+    assert _cron_summary_rows(prof / "state.db", SID) == 0
+    assert cron_jobs.get_job(JID)["origin"]["chat_id"] == SID
+
+
+def test_new_session_never_lands_in_legacy_nested_profiles_dir(tmp_path, monkeypatch):
+    """遗留的 <root>/profiles/<A>/profiles/<A>/ 目录不许成为候选：它排在第一位，
+    全新会话（handoff / calendar-reminders）会被建进一个 local-server 永远读不到的库。"""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "main"
+    prof = root / "profiles" / AID
+    nested = prof / "profiles" / AID
+    nested.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:calendar-reminders"
+    JID = "jobNested"
+    job = _mux_cron_job(JID, SID, name="喝水提醒")
+    cron_jobs.save_jobs([job])
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n该喝水啦\n"
+    with _context_home_override(prof):
+        assert nested / "state.db" not in zc._profile_state_db_candidates(AID)
+        try:
+            assert zc._try_persist_to_session(JID, True, None, None, job) is None
+        finally:
+            zc._LATEST_OUTPUT.pop(JID, None)
+
+    assert not (nested / "state.db").exists(), "新会话落进了嵌套假库"
+    assert _cron_summary_rows(prof / "state.db", SID) == 1
+    prof_db = SessionDB(db_path=prof / "state.db", read_only=True)
+    try:
+        assert prof_db.get_session(SID) is not None
+    finally:
+        prof_db.close()
+
+
+def test_unreadable_owning_store_fails_closed_and_keeps_origin(tmp_path, monkeypatch):
+    """探测失败 != 会话已删。owning store 读不出来时必须 fail-closed：
+    落 last_delivery_error，绝不派生 handoff 会话去永久改写 job.origin.chat_id。"""
+    import os
+
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses file mode bits, cannot simulate an unreadable store")
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+    zc.install()
+
+    SID = f"zettlab:userA:{AID}:rootonly3"
+    JID = "jobUnreadable"
+    cron_jobs.save_jobs([_mux_cron_job(JID, SID)])
+
+    root_db = SessionDB(db_path=root / "state.db")
+    root_db.create_session(SID, source="zet_agent", user_id="userA")
+    root_db.close()
+
+    for suffix in ("", "-wal", "-shm"):
+        sidecar = root / f"state.db{suffix}"
+        if sidecar.exists():
+            os.chmod(sidecar, 0o000)
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n读不出来\n"
+    try:
+        with _context_home_override(prof):
+            _, unresolved = zc._resolve_persist_db_path(SID)
+            assert unresolved, "探测失败必须报未决，不能静默当成会话不存在"
+            scheduler.mark_job_run(JID, True, scheduled_at="2026-08-05T11:00:00Z",
+                                   output_filename="run.md")
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = root / f"state.db{suffix}"
+            if sidecar.exists():
+                os.chmod(sidecar, 0o600)
+
+    stored = cron_jobs.get_job(JID)
+    assert stored["origin"]["chat_id"] == SID, "fail-open 了：origin 被改写成 handoff 会话"
+    assert stored.get("last_delivery_error"), "失败没有落到 last_delivery_error"
+    assert _cron_summary_rows(prof / "state.db", SID) == 0
+
+
+def test_split_session_logs_warning_instead_of_silently_preferring_profile(
+    tmp_path, monkeypatch, caplog
+):
+    """§6.3：两库同时命中时静默取 profile 会掩盖劈裂，必须告警 + 打点。"""
+    import logging
+
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    root = tmp_path / "hermes_home"
+    AID = "eae0707d"
+    prof = root / "profiles" / AID
+    prof.mkdir(parents=True)
+    _mux_env(monkeypatch, root, root, root / "state.db")
+
+    SID = f"zettlab:userA:{AID}:split01"
+    for db_file in (root / "state.db", prof / "state.db"):
+        db = SessionDB(db_path=db_file)
+        db.create_session(SID, source="zet_agent", user_id="userA")
+        db.close()
+
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.zet_agent_cron"):
+        db_path, unresolved = zc._resolve_persist_db_path(SID)
+
+    assert (db_path, unresolved) == ((prof / "state.db").resolve(), None)
+    assert any("split session detected" in r.getMessage() for r in caplog.records)
+
+
+def test_root_candidates_cover_both_context_and_process_homes(tmp_path, monkeypatch):
+    """候选集必须同时含 context override 和进程 HERMES_HOME 两条 root。
+    所有 _mux_env 用例都用进程级 setenv，两者永远相等 → get_process_hermes_home()
+    那半段一行没被覆盖。"""
+    import gateway.platforms.zet_agent_cron as zc
+
+    root_a = tmp_path / "rootA"
+    root_b = tmp_path / "rootB"
+    AID = "eae0707d"
+    (root_b / "profiles" / AID).mkdir(parents=True)
+    _mux_env(monkeypatch, root_a, root_a, root_a / "state.db")
+
+    with _context_home_override(root_b / "profiles" / AID):
+        roots = zc._root_state_db_candidates()
+        profiles = zc._profile_state_db_candidates(AID)
+
+    assert root_b / "state.db" in roots, "context override 的 root 丢了"
+    assert root_a / "state.db" in roots, "进程 HERMES_HOME 的 root 丢了"
+    assert (root_b / "profiles" / AID / "state.db").resolve() in profiles
+    assert (root_a / "profiles" / AID / "state.db").resolve() in profiles
+
+
+def test_profile_candidates_are_symlink_resolved_not_reopened_by_name(tmp_path, monkeypatch):
+    """校验用的是 db_path.resolve()，返回的就必须是同一个 resolved 路径 —— 返回未解析的
+    名字等于把校验和使用分成两次 lookup（TOCTOU），中间那层 symlink 可以被换掉。"""
+    import gateway.platforms.zet_agent_cron as zc
+
+    AID = "eae0707d"
+    real_profiles = tmp_path / "real_profiles"
+    (real_profiles / AID).mkdir(parents=True)
+    home = tmp_path / "linked_home"
+    home.mkdir()
+    (home / "profiles").symlink_to(real_profiles)
+    _mux_env(monkeypatch, home, home, home / "state.db")
+
+    assert zc._profile_state_db_candidates(AID) == [real_profiles / AID / "state.db"]
