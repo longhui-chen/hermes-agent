@@ -2,8 +2,8 @@
 set -euo pipefail
 
 APP_ROOT=$(dirname "$(readlink -f "$0")")
-APP_BASE=$(dirname "$APP_ROOT")
-ENV_FILE="$APP_BASE/data/secrets/zettlab-claw.env"
+DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/zettos-main-data/com.zettlab.claw}"
+ENV_FILE="$DATA_DIR/secrets/zettlab-claw.env"
 
 load_reconciled_env() {
     local key value complete=0
@@ -38,10 +38,10 @@ load_reconciled_env
 # legacy values for these Claw-owned paths. Reassert the current package slot
 # after loading it so stale persisted values cannot redirect runtime state or
 # bundled code.
-export HERMES_HOME="$APP_BASE/data/hermes_home"
+export HERMES_HOME="$DATA_DIR/hermes_home"
 export HERMES_BUNDLED_SKILLS="$APP_ROOT/lib/hermes-agent/skills"
 export HERMES_BUNDLED_PLUGINS="$APP_ROOT/lib/hermes-agent/plugins"
-export HERMES_LAZY_INSTALL_TARGET="$APP_BASE/data/lazy-packages"
+export HERMES_LAZY_INSTALL_TARGET="$DATA_DIR/lazy-packages"
 export HERMES_MANAGED_GATEWAY=1
 export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service
 unset HERMES_MANAGED_CGROUP_ROOT

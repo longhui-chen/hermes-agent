@@ -7,6 +7,7 @@ HERMES_SRC="$APP_ROOT/lib/hermes-agent"
 HERMES_BIN="$HERMES_SRC/venv/bin/hermes"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 HERMES_LINK="/usr/local/bin/hermes"
+DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/zettos-main-data/com.zettlab.claw}"
 
 source "$APP_ROOT/zpk-systemd.sh"
 
@@ -44,7 +45,7 @@ cleanup_legacy_systemd_services() {
     systemctl disable "$legacy_service" 2>/dev/null || true
     rm -f "$systemd_dir/$legacy_service" "/etc/systemd/system/$legacy_service"
     rm -rf "/etc/systemd/system/$legacy_service.d"
-    rm -f "$APP_BASE/data/secrets/hermes-agent-mux.env"
+    rm -f "$DATA_DIR/secrets/hermes-agent-mux.env" "$APP_BASE/data/secrets/hermes-agent-mux.env"
     systemctl daemon-reload 2>/dev/null || true
     LEGACY_GATEWAY_SERVICE_REMOVED=true
 }
@@ -71,8 +72,6 @@ if [ ! -f "$HERMES_SRC/pyproject.toml" ]; then
     exit 1
 fi
 
-mkdir -p "$APP_BASE/data/hermes_home" "$APP_BASE/data/profiles" "$APP_BASE/data/sessions"
-
 if [ ! -x "$HERMES_BIN" ]; then
     echo "prebuilt hermes binary is missing or not executable: $HERMES_BIN" >&2
     exit 1
@@ -83,6 +82,7 @@ if [ ! -x "$HERMES_PYTHON" ]; then
     exit 1
 fi
 
+"$APP_ROOT/prepare-claw-service.sh"
 "$APP_ROOT/bin/hermes" --version
 
 mkdir -p "$(dirname "$HERMES_LINK")"
@@ -91,11 +91,10 @@ ln -sfn "$APP_BASE/current/bin/hermes" "$HERMES_LINK"
 # 探测并写 PyPI 镜像源（境内 lazy-install 提速）；失败不阻断安装
 setup_pypi_mirror || true
 
-"$APP_ROOT/prepare-claw-service.sh"
 install_systemd_services "$APP_ROOT"
 cleanup_legacy_systemd_services
 start_replacement_service_after_legacy_cleanup
 
 echo "Install complete."
 echo "  hermes: $APP_BASE/current/bin/hermes"
-echo "  HERMES_HOME: $APP_BASE/data/hermes_home"
+echo "  HERMES_HOME: $DATA_DIR/hermes_home"

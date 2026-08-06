@@ -167,7 +167,7 @@ jobs:
           echo "BACKUP_SRC=$BACKUP"
 
           # 3. 清空源码目录（venv 已移出），解新源码。
-          #    注：hermes_home/data 软链在 <app_root 父目录>/data（com.zettlab.claw/data），
+          #    注：hermes_home 位于 /volume1/system/zettos-main-data/com.zettlab.claw，
           #    不在 HERMES_SRC，故清空这里不碰 hermes_home。
           find "$HERMES_SRC" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           tar xzf /tmp/hermes-src.new.tgz -C "$HERMES_SRC"

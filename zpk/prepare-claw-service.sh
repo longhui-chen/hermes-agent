@@ -2,14 +2,11 @@
 set -euo pipefail
 
 APP_ROOT=$(dirname "$(readlink -f "$0")")
-APP_BASE=$(dirname "$APP_ROOT")
 HERMES_SRC="$APP_ROOT/lib/hermes-agent"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
-DATA_DIR="$APP_BASE/data"
+DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/zettos-main-data/com.zettlab.claw}"
 HERMES_HOME="$DATA_DIR/hermes_home"
-SECRET_DIR="$APP_BASE/data/secrets"
-OTA_DATA_TARGET="$(dirname "$(dirname "$APP_BASE")")/data/$(basename "$APP_BASE")"
-VOLUME_DATA_TARGET="/volume1/subvol/apps/$(basename "$APP_BASE")/data"
+SECRET_DIR="$DATA_DIR/secrets"
 LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
@@ -93,25 +90,6 @@ detect_zettlab_presets_dir() {
     return 1
 }
 
-trusted_data_symlink_target() {
-    local resolved candidate expected=""
-    resolved="$(readlink -f "$DATA_DIR" 2>/dev/null || true)"
-    [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
-    for candidate in "$OTA_DATA_TARGET" "$VOLUME_DATA_TARGET"; do
-        candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
-        if [ -n "$candidate" ] && [ "$resolved" = "$candidate" ]; then
-            expected="$candidate"
-            break
-        fi
-    done
-    [ -n "$expected" ] || return 1
-
-    printf '%s\n' "$resolved"
-}
-
-# Presets are executable content selected from a configurable path, so keep the
-# ownership and mode checks for that input. Device data symlinks use the fixed
-# OTA/volume target allowlist above and deliberately do not inherit this gate.
 trusted_presets_path_chain() {
     local current="$1" trust_root="$2" process_uid uid mode group other
     process_uid="$(id -u)"
@@ -136,29 +114,8 @@ trusted_presets_path_chain() {
     done
 }
 
-pin_trusted_data_symlink() {
-    local resolved_path
-    [ -L "$DATA_DIR" ] || return 0
-    resolved_path="$(trusted_data_symlink_target || true)"
-    if [ -z "$resolved_path" ]; then
-        echo "refusing untrusted data symlink: $DATA_DIR" >&2
-        exit 1
-    fi
-
-    # Stop following the mutable app-level symlink after validation. All
-    # prepare-time state writes below use this fixed canonical target.
-    DATA_DIR="$resolved_path"
-    HERMES_HOME="$DATA_DIR/hermes_home"
-    SECRET_DIR="$DATA_DIR/secrets"
-    LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
-    KEY_FILE="$SECRET_DIR/zet_agent.key"
-    ENV_FILE="$SECRET_DIR/zettlab-claw.env"
-    PROFILE_PERMISSIONS_MARKER="$SECRET_DIR/profile-permissions-v2.done"
-}
-
 secure_state_directories() {
     local path resolved_path mode expected_mode uid
-    pin_trusted_data_symlink
     for path in "$DATA_DIR" "$HERMES_HOME" "$SECRET_DIR"; do
         if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
             echo "refusing non-directory state path: $path" >&2
@@ -169,7 +126,11 @@ secure_state_directories() {
                 echo "state path changed while preparing it: $path" >&2
                 exit 1
             fi
-            resolved_path="$path"
+            resolved_path="$(readlink -f "$path" 2>/dev/null || true)"
+            if [ "$resolved_path" != "$path" ]; then
+                echo "refusing state path with symlinked or non-canonical components: $path" >&2
+                exit 1
+            fi
         fi
         if [ "$(id -u)" -eq 0 ]; then
             uid="$(stat -c '%u' "$resolved_path" 2>/dev/null || stat -f '%u' "$resolved_path" 2>/dev/null || true)"

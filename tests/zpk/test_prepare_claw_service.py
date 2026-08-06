@@ -29,7 +29,6 @@ def _prepare_script_fixture(
     *,
     default_presets_dir: Path | None = None,
     protected_presets_root: Path | None = None,
-    volume_data_target: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     repo_root = Path(__file__).resolve().parents[2]
     app_base = tmp_path / "zettos" / "main" / "apps" / "com.zettlab.claw"
@@ -39,8 +38,15 @@ def _prepare_script_fixture(
     hermes_path = python_path.with_name("hermes")
     hermes_wrapper_path = app_root / "bin" / "hermes"
     invocation_log = app_root / "hermes-invocations.jsonl"
-    hermes_home = app_base / "data" / "hermes_home"
-    env_path = app_base / "data" / "secrets" / "zettlab-claw.env"
+    data_dir = (
+        tmp_path
+        / "volume1"
+        / "system"
+        / "zettos-main-data"
+        / "com.zettlab.claw"
+    )
+    hermes_home = data_dir / "hermes_home"
+    env_path = data_dir / "secrets" / "zettlab-claw.env"
 
     python_path.parent.mkdir(parents=True)
     os.symlink(sys.executable, python_path)
@@ -74,6 +80,15 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
     prepare_source = (repo_root / "zpk" / "prepare-claw-service.sh").read_text(
         encoding="utf-8"
     )
+    data_assignment = (
+        'DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-'
+        '/volume1/system/zettos-main-data/com.zettlab.claw}"'
+    )
+    assert data_assignment in prepare_source
+    prepare_source = prepare_source.replace(
+        data_assignment,
+        f"DATA_DIR={shlex.quote(str(data_dir))}",
+    )
     protected_root = protected_presets_root or tmp_path
     for assignment in (
         'SUBVOLUME_ZETTLAB_PRESETS_ROOT="/volume1/subvol/agents/zettlab-presets"',
@@ -95,16 +110,6 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
             default_assignment,
             f"SUBVOLUME_ZETTLAB_PRESETS_DIR="
             f"{shlex.quote(str(default_presets_dir))}",
-        )
-    if volume_data_target is not None:
-        volume_assignment = (
-            'VOLUME_DATA_TARGET="/volume1/subvol/apps/'
-            '$(basename "$APP_BASE")/data"'
-        )
-        assert volume_assignment in prepare_source
-        prepare_source = prepare_source.replace(
-            volume_assignment,
-            f"VOLUME_DATA_TARGET={shlex.quote(str(volume_data_target))}",
         )
     script.write_text(prepare_source, encoding="utf-8")
     script.chmod(0o755)
@@ -928,7 +933,7 @@ def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
 
     app_root, _hermes_home, _env_path = _prepare_script_fixture(tmp_path)
     data_dir = _hermes_home.parent
-    data_dir.mkdir()
+    data_dir.mkdir(parents=True)
     data_dir.chmod(0o700)
 
     subprocess.run(
@@ -941,46 +946,14 @@ def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
     assert data_dir.stat().st_mode & 0o777 == 0o700
 
 
-@pytest.mark.parametrize(
-    "layout",
-    ["real", "ota_symlink", "volume_symlink"],
-)
-def test_service_data_layouts_do_not_require_systemd_write_carveouts(
+def test_service_direct_data_layout_does_not_require_systemd_write_carveouts(
     tmp_path: Path,
-    layout: str,
 ):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
-    volume_target = (
-        tmp_path
-        / "volume1"
-        / "subvol"
-        / "apps"
-        / "com.zettlab.claw"
-        / "data"
-    )
-    app_root, hermes_home, env_path = _prepare_script_fixture(
-        tmp_path,
-        volume_data_target=volume_target,
-    )
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
     data_path = hermes_home.parent
-    if layout == "real":
-        data_path.mkdir(parents=True)
-    else:
-        target = (
-            tmp_path
-            / "zettos"
-            / "main"
-            / "data"
-            / "com.zettlab.claw"
-            if layout == "ota_symlink"
-            else volume_target
-        )
-        target.mkdir(parents=True)
-        target.chmod(0o750)
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-        data_path.symlink_to(target, target_is_directory=True)
 
     subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
@@ -1002,221 +975,23 @@ def test_service_data_layouts_do_not_require_systemd_write_carveouts(
     probe.write_text("writable\n", encoding="utf-8")
     assert probe.read_text(encoding="utf-8") == "writable\n"
     assert env_path.is_file()
+    assert not (app_root.parent / "data").exists()
 
 
-def test_prepare_claw_service_allows_trusted_ota_data_symlink(tmp_path: Path):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
-    data_link = hermes_home.parent
-    expected_target = tmp_path / "zettos" / "main" / "data" / "com.zettlab.claw"
-    expected_target.mkdir(parents=True)
-    expected_target.chmod(0o750)
-    data_link.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(expected_target, data_link)
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-
-    assert data_link.is_symlink()
-    assert data_link.resolve() == expected_target.resolve()
-    assert hermes_home.is_dir()
-    assert env_path.is_file()
-    assert expected_target.stat().st_mode & 0o777 == 0o750
-
-
-def test_prepare_claw_service_allows_trusted_volume_data_symlink(tmp_path: Path):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    volume_target = tmp_path / "volume1" / "subvol" / "apps" / "com.zettlab.claw" / "data"
-    app_root, hermes_home, env_path = _prepare_script_fixture(
-        tmp_path,
-        volume_data_target=volume_target,
-    )
-    data_link = hermes_home.parent
-    volume_target.mkdir(parents=True)
-    volume_target.chmod(0o750)
-    data_link.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(volume_target, data_link)
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-
-    assert data_link.is_symlink()
-    assert data_link.resolve() == volume_target.resolve()
-    assert hermes_home.is_dir()
-    assert env_path.is_file()
-    assert volume_target.stat().st_mode & 0o777 == 0o750
-
-
-def test_prepare_claw_service_accepts_writable_ota_data_symlink_target(
-    tmp_path: Path,
-):
-    """A legacy-deploy 777 data directory is accepted, not crash-looped.
-
-    Firmware 0.0.52 boards with a hand-deployed
-    /zettos/main/data/com.zettlab.claw at mode 777 used to hit
-    "refusing untrusted data symlink" and restart forever. The canonical
-    OTA target is now allowed regardless of its incoming mode; normal state
-    preparation still narrows the app-owned leaf without gating startup.
-    """
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
-    data_link = hermes_home.parent
-    expected_target = tmp_path / "zettos" / "main" / "data" / "com.zettlab.claw"
-    expected_target.mkdir(parents=True)
-    expected_target.chmod(0o777)
-    marker = expected_target / "marker"
-    marker.write_text("do-not-touch\n", encoding="utf-8")
-    data_link.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(expected_target, data_link)
-
-    result = subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-        capture_output=True,
-        text=True,
-    )
-
-    assert "refusing untrusted data symlink" not in result.stderr
-    assert "tightened group/other-writable data path" not in result.stderr
-    assert marker.read_text(encoding="utf-8") == "do-not-touch\n"
-    assert expected_target.stat().st_mode & 0o777 == 0o755
-    assert hermes_home.is_dir()
-    assert env_path.is_file()
-
-
-def test_prepare_claw_service_accepts_writable_shared_data_parent(
-    tmp_path: Path,
-):
-    """A writable firmware data root does not block an allowlisted target."""
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
-    data_link = hermes_home.parent
-    data_parent = tmp_path / "zettos" / "main" / "data"
-    expected_target = data_parent / "com.zettlab.claw"
-    expected_target.mkdir(parents=True)
-    expected_target.chmod(0o750)
-    data_parent.chmod(0o770)
-    data_link.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(expected_target, data_link)
-
-    result = subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-        capture_output=True,
-        text=True,
-    )
-
-    assert "refusing untrusted data symlink" not in result.stderr
-    assert data_parent.stat().st_mode & 0o777 == 0o770
-    assert env_path.is_file()
-
-
-def test_prepare_claw_service_accepts_writable_directory_above_data_root(
-    tmp_path: Path,
-):
-    """Writable ancestors above the data root do not gate service startup."""
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
-    data_link = hermes_home.parent
-    trust_root = tmp_path / "zettos" / "main"
-    expected_target = trust_root / "data" / "com.zettlab.claw"
-    expected_target.mkdir(parents=True)
-    expected_target.chmod(0o750)
-    trust_root.chmod(0o770)
-    data_link.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(expected_target, data_link)
-
-    try:
-        result = subprocess.run(
-            [str(app_root / "prepare-claw-service.sh")],
-            check=True,
-            cwd=str(app_root),
-            env=_script_env(),
-            capture_output=True,
-            text=True,
-        )
-
-        assert "refusing untrusted data symlink" not in result.stderr
-        assert trust_root.stat().st_mode & 0o777 == 0o770
-        assert env_path.is_file()
-    finally:
-        trust_root.chmod(0o755)
-
-
-def test_prepare_claw_service_pins_validated_data_symlink_target(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    data_link = hermes_home.parent
-    expected_target = tmp_path / "zettos" / "main" / "data" / "com.zettlab.claw"
-    replacement_target = tmp_path / "replacement-data"
-    expected_target.mkdir(parents=True)
-    replacement_target.mkdir()
-    expected_target.chmod(0o750)
-    replacement_target.chmod(0o750)
-    data_link.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(expected_target, data_link)
-
-    secret_dir = expected_target / "secrets"
-    secret_dir.mkdir()
-    lock_path = secret_dir / "prepare-claw-service.lock"
-    lock_file = lock_path.open("w", encoding="utf-8")
-    lock_file.write("held")
-    lock_file.flush()
-    os.fsync(lock_file.fileno())
-    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
-    process = subprocess.Popen(
-        [str(app_root / "prepare-claw-service.sh")],
-        cwd=str(app_root),
-        env=_script_env(HERMES_PREPARE_LOCK_TIMEOUT_SECONDS="5"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        deadline = time.monotonic() + 5
-        while lock_path.stat().st_size != 0 and time.monotonic() < deadline:
-            assert process.poll() is None
-            time.sleep(0.01)
-        assert lock_path.stat().st_size == 0
-        assert process.poll() is None
-        data_link.unlink()
-        os.symlink(replacement_target, data_link)
-    finally:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
-    stdout, stderr = process.communicate(timeout=30)
-
-    assert process.returncode == 0, (stdout, stderr)
-    assert (expected_target / "hermes_home").is_dir()
-    assert (expected_target / "secrets" / "zettlab-claw.env").is_file()
-    assert list(replacement_target.iterdir()) == []
+def test_r2_runtime_scripts_use_only_direct_system_data_path():
+    repo_root = Path(__file__).resolve().parents[2]
+    runtime_files = [
+        repo_root / "zpk" / "prepare-claw-service.sh",
+        repo_root / "zpk" / "start-claw-service.sh",
+        repo_root / "zpk" / "bin" / "hermes",
+        repo_root / "zpk" / "init.d" / "zettlab-claw.service",
+    ]
+    text = "\n".join(path.read_text(encoding="utf-8") for path in runtime_files)
+    assert "/volume1/system/zettos-main-data/com.zettlab.claw" in text
+    assert "RequiresMountsFor=/volume1" in text
+    assert "/volume1/subvol/apps" not in text
+    assert "__APP_BASE__/data" not in text
+    assert 'DATA_DIR="$APP_BASE/data"' not in text
 
 
 @pytest.mark.parametrize("managed_name", ["zet_agent.key", "zettlab-claw.env"])
@@ -1272,9 +1047,10 @@ def test_prepare_claw_service_refuses_symlinked_state_directories(
     (target / "marker").write_text("do-not-touch\n", encoding="utf-8")
 
     if state_path == "data":
+        data_dir.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, data_dir)
     else:
-        data_dir.mkdir()
+        data_dir.mkdir(parents=True)
         os.symlink(target, data_dir / "secrets")
 
     result = subprocess.run(
@@ -1287,10 +1063,7 @@ def test_prepare_claw_service_refuses_symlinked_state_directories(
     )
 
     assert result.returncode != 0
-    if state_path == "data":
-        assert "refusing untrusted data symlink" in result.stderr
-    else:
-        assert "refusing non-directory state path" in result.stderr
+    assert "refusing non-directory state path" in result.stderr
     assert (target / "marker").read_text(encoding="utf-8") == "do-not-touch\n"
     assert target.stat().st_mode & 0o777 == 0o777
 
@@ -1483,6 +1256,7 @@ Path({str(gateway_log)!r}).write_text(
     }
     if with_explicit_override:
         overrides["HERMES_MANAGED_DIR"] = str(explicit_managed)
+    overrides["ZETTLAB_CLAW_DATA_DIR"] = str(hermes_home.parent)
     subprocess.run(
         [str(start_script)],
         check=True,
@@ -1507,9 +1281,7 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["plugins"] == str(
         app_root / "lib" / "hermes-agent" / "plugins"
     )
-    assert gateway_env["lazy_target"] == str(
-        app_root.parent / "data" / "lazy-packages"
-    )
+    assert gateway_env["lazy_target"] == str(hermes_home.parent / "lazy-packages")
     assert gateway_env["presets"] == str(explicit_presets)
     assert gateway_env["presets_override"] is None
     env_text = env_path.read_text(encoding="utf-8")
@@ -1626,8 +1398,10 @@ def test_zpk_agent_service_names_are_device_facing():
     meta = json.loads(package_meta)
 
     assert (
-        "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
+        "EnvironmentFile=-/volume1/system/zettos-main-data/"
+        "com.zettlab.claw/secrets/zettlab-claw.env" in service
     )
+    assert "RequiresMountsFor=/volume1" in service
     assert "Environment=GATEWAY_MULTIPLEX_PROFILES=true" in service
     assert "Environment=HERMES_MANAGED_GATEWAY=1" in service
     assert (
@@ -1656,7 +1430,7 @@ def test_zpk_agent_service_names_are_device_facing():
     assert "load_reconciled_env" in start_wrapper
     assert "export GATEWAY_MULTIPLEX_PROFILES=true" in start_wrapper
     assert "export HERMES_MANAGED_GATEWAY=1" in start_wrapper
-    assert 'export HERMES_LAZY_INSTALL_TARGET="$APP_BASE/data/lazy-packages"' in start_wrapper
+    assert 'export HERMES_LAZY_INSTALL_TARGET="$DATA_DIR/lazy-packages"' in start_wrapper
     assert (
         "export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service"
         in start_wrapper
@@ -1667,10 +1441,18 @@ def test_zpk_agent_service_names_are_device_facing():
     assert meta["service_name"] == "zettlab-claw"
     assert "restart" not in meta
     assert "systemctl restart zettlab-claw.service" not in install
+    assert (
+        'DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/'
+        'zettos-main-data/com.zettlab.claw}"' in install
+    )
+    assert install.index('"$APP_ROOT/prepare-claw-service.sh"') < install.index(
+        '"$APP_ROOT/bin/hermes" --version'
+    )
     assert "systemctl start zettlab-claw.service" in install
     assert "systemctl start zettlab-claw.service" in start
     assert "systemctl stop zettlab-claw.service" in stop
     assert "zettlab-claw.service" in uninstall
+    assert 'DATA_DIR="/volume1/system/zettos-main-data/$APP_ID"' in uninstall
 
 
 def _load_secure_launcher():
