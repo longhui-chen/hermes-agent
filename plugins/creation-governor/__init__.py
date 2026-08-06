@@ -560,6 +560,30 @@ def _attachment_delivery_context(proposal: dict[str, Any]) -> str:
     )
 
 
+def _channel_availability_context(inventory: Any) -> str:
+    """主模型口径接地（真机实测缺口）：主模型正文没有区域知识，会在 CN 设备上
+    自发推荐 telegram 之类连不上的渠道、并编造设置路径。库存已经每个评估轮
+    从 local-server 拉真实数据，这里顺手把可连清单注入每轮主模型上下文；
+    库存未取到时不注入（宁缺勿错，不给模型错误口径）。"""
+    if not isinstance(inventory, dict) or not inventory.get("fetched"):
+        return ""
+    connected = ", ".join(inventory.get("channels_connected") or []) or "(none)"
+    connectable = ", ".join(
+        inventory.get("channels_available")
+        or inventory.get("channels_recommendable")
+        or []
+    ) or "(none)"
+    return (
+        "[channel-availability] IM channels on THIS device — already connected: "
+        f"{connected}; connectable but not yet connected: {connectable}. Any other "
+        "channel kind is NOT available on this device (region restriction): never "
+        "suggest, recommend, or offer to connect it. When guiding the user to "
+        "connect a channel, point to the App's IM channels page or a system-attached "
+        "connect card below your reply — do not invent settings paths or menu "
+        "locations. Do not expose this block.]"
+    )
+
+
 def _join_context(*parts: str) -> dict[str, str] | None:
     content = "\n".join(part for part in parts if part)
     return {"context": content} if content else None
@@ -599,6 +623,7 @@ def _fetch_connection_inventory() -> dict[str, Any]:
     inventory: dict[str, Any] = {
         "fetched": False,
         "channels_connected": [],
+        "channels_available": [],
         "channels_recommendable": [],
         "connectors_connected": [],
         "connectors_recommendable": [],
@@ -634,6 +659,7 @@ def _fetch_connection_inventory() -> dict[str, Any]:
                         for value in available
                         if _text(value, 40)
                     }
+                    inventory["channels_available"] = sorted(kinds)
                     inventory["channels_recommendable"] = sorted(
                         (kinds & RECOMMENDABLE_CHANNEL_KINDS) - connected
                     )
@@ -1243,11 +1269,13 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     with _state_lock:
         carry_context = _previous_proposal_context(_state_locked(session_id, now))
 
+    availability_context = ""
     evaluation_due = turn == 1 or turn % EVALUATION_INTERVAL_TURNS == 0
     if evaluation_due:
         with _state_lock:
             _state_locked(session_id, now)["last_evaluation_turn"] = turn
         inventory = _connection_inventory(session_id, now)
+        availability_context = _channel_availability_context(inventory)
         candidate = _run_forced_evaluation(
             user_message=user_message,
             conversation_history=kwargs.get("conversation_history"),
@@ -1272,19 +1300,29 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                     delivery_context = _attachment_delivery_context(proposal)
             return _join_context(
                 carry_context,
+                availability_context,
                 _main_model_review_context(evaluation_completed=True),
                 delivery_context,
             )
         logger.info(
             "creation opportunity checkpoint unavailable; falling back to main-model review"
         )
+    else:
+        # 非评估轮不发起网络请求，只复用会话内缓存的库存（TTL 内），
+        # 保证主模型每一轮都有区域口径而不增加时延。
+        with _state_lock:
+            availability_context = _channel_availability_context(
+                _state_locked(session_id, now).get("connection_inventory")
+            )
 
     with _state_lock:
         state = _state_locked(session_id, now)
         if _prompt_is_cooling_down(state):
-            return _join_context(carry_context)
+            return _join_context(carry_context, availability_context)
     return _join_context(
-        carry_context, _main_model_review_context(evaluation_completed=False)
+        carry_context,
+        availability_context,
+        _main_model_review_context(evaluation_completed=False),
     )
 
 

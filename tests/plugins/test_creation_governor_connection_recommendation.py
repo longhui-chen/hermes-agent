@@ -399,3 +399,42 @@ def test_creation_type_followup_context_keeps_native_flow(monkeypatch):
     )
     assert followup is not None
     assert "native creation flow" in followup["context"]
+
+
+def test_availability_context_grounds_main_model_every_turn(monkeypatch):
+    """主模型口径接地：评估轮注入 [channel-availability]（含可连清单），
+    非评估轮复用会话缓存继续注入；库存未取到则完全不注入。"""
+    plugin = _load_plugin()
+    ctx = _Context(_FakeLlm([{"decision": "none"}]))
+    plugin.register(ctx)
+    inventory = dict(_INVENTORY) | {"channels_available": ["feishu", "wechat", "wecom"]}
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(inventory))
+
+    first = plugin._on_pre_llm_call(
+        session_id="s-ground", turn_id="turn-1", user_message="随便聊聊", conversation_history=[]
+    )
+    assert "[channel-availability]" in first["context"]
+    assert "feishu, wechat, wecom" in first["context"]
+    assert "never suggest" in first["context"]
+
+    second = plugin._on_pre_llm_call(
+        session_id="s-ground", turn_id="turn-2", user_message="继续", conversation_history=[]
+    )
+    assert "[channel-availability]" in second["context"]
+
+
+def test_availability_context_absent_when_inventory_unfetched(monkeypatch):
+    plugin = _load_plugin()
+    ctx = _Context(_FakeLlm([{"decision": "none"}]))
+    plugin.register(ctx)
+    monkeypatch.setattr(
+        plugin,
+        "_fetch_connection_inventory",
+        lambda: {"fetched": False, "channels_connected": [], "channels_available": [],
+                 "channels_recommendable": [], "connectors_connected": [],
+                 "connectors_recommendable": []},
+    )
+    result = plugin._on_pre_llm_call(
+        session_id="s-noground", turn_id="turn-1", user_message="随便聊聊", conversation_history=[]
+    )
+    assert "[channel-availability]" not in (result or {}).get("context", "")
