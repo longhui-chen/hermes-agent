@@ -480,3 +480,22 @@ def test_channel_card_emitted_at_pre_llm_stage(monkeypatch):
     transformed = plugin._transform_llm_output(session_id="s-early", response_text="好的，已安排。")
     assert transformed is None
     assert len(ctx.emitted) == 1
+
+
+def test_connection_candidate_missing_name_falls_back_to_target(monkeypatch):
+    """flash 检测器强调 target 后偶发漏填 suggested_name：连接类用 target 兜底，
+    不拒掉合法推荐（标题由客户端 i18n 渲染，此字段仅展示面冗余）。"""
+    plugin = _load_plugin()
+    candidate = _connection_candidate() | {"suggested_name": ""}
+    ctx = _Context(_FakeLlm([candidate]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    plugin._on_pre_llm_call(
+        session_id="s-noname",
+        turn_id="turn-1",
+        user_message="日报结果发到我手机才有用",
+        conversation_history=[],
+    )
+    assert len(ctx.emitted) == 1
+    assert ctx.emitted[0]["payload"] == {"channel_kind": "telegram"}

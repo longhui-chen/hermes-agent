@@ -871,7 +871,8 @@ def _run_forced_evaluation(
                 _DETECTOR_INSTRUCTIONS
                 + "\n\nReturn only one compact JSON object with exactly these keys: "
                 "decision, suggested_name, reason, target, evidence_turn_ids, "
-                "confidence, dedup_key, proposal_text. For channel/connector "
+                "confidence, dedup_key, proposal_text. suggested_name, reason and "
+                "proposal_text are ALWAYS required and must be non-empty. For channel/connector "
                 "decisions target is MANDATORY: copy the exact kind/provider id "
                 "verbatim from the recommendable list in [connection-inventory]; "
                 "use an empty string for other decisions. Do not use Markdown fences."
@@ -971,6 +972,11 @@ def _normalize_candidate(
         return None, "unsupported_creation_type"
 
     suggested_name = _text(args.get("suggested_name"), 80)
+    if decision in CONNECTION_TYPES and not suggested_name:
+        # flash 档检测器在 target MANDATORY 强调后偶发漏填 suggested_name（真机
+        # 实测）。连接卡标题由客户端 i18n 渲染、语义 dedup 键也走 target——这里
+        # 用 target 兜底，不因展示面冗余字段拒掉合法推荐。
+        suggested_name = _text(args.get("target"), 80).lower()
     reason = _text(args.get("reason"), 400)
     proposal_text = _text(args.get("proposal_text"), 500)
     try:
