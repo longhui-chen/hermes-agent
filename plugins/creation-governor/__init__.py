@@ -1326,6 +1326,22 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                     proposal = _state_locked(session_id, now).get("last_proposal")
                 if isinstance(proposal, dict):
                     delivery_context = _attachment_delivery_context(proposal)
+                    if proposal.get("creation_type") in ATTACHMENT_DELIVERED_TYPES:
+                        # 采集即发射（真机体验修复）：判定在 pre_llm 就完成了，
+                        # 原先卡片却等到 turn 收尾的 transform 钩子才发射——用户
+                        # 要多等整个回复生成（Pro 模型 20s+）才能看到卡。此处
+                        # 判定通过立即发射，卡片先于正文出现；发射成功记
+                        # last_delivery_turn 让 transform 钩子跳过重复发射，
+                        # 失败（无活跃流等）则保持原状、由 transform 收尾兜底。
+                        if _emit_recommendation_attachment(session_id, proposal):
+                            logger.info(
+                                "attachment recommendation emitted early type=%s target=%s turn=%s",
+                                proposal.get("creation_type"),
+                                _text(proposal.get("target"), 80),
+                                turn,
+                            )
+                            with _state_lock:
+                                _state_locked(session_id, now)["last_delivery_turn"] = turn
             return _join_context(
                 carry_context,
                 availability_context,

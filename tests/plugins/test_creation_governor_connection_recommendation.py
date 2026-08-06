@@ -458,3 +458,25 @@ def test_empty_target_falls_back_to_suggested_name_in_pool(monkeypatch):
 
     _drive_turn(plugin, "s-fallback-miss", "日报结果发到我手机才有用")
     assert len(ctx.emitted) == 1  # 第二个候选仍被硬闸拒绝
+
+
+def test_channel_card_emitted_at_pre_llm_stage(monkeypatch):
+    """采集即发射（真机体验修复）：判定完成即出卡，不等 turn 收尾——用户不用
+    等完整回复生成（Pro 模型 20s+）才看到卡；transform 钩子不重复发射。"""
+    plugin = _load_plugin()
+    ctx = _Context(_FakeLlm([_connection_candidate()]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    plugin._on_pre_llm_call(
+        session_id="s-early",
+        turn_id="turn-1",
+        user_message="日报结果发到我手机才有用",
+        conversation_history=[],
+    )
+    assert len(ctx.emitted) == 1
+    assert ctx.emitted[0]["kind"] == "channel.connect"
+
+    transformed = plugin._transform_llm_output(session_id="s-early", response_text="好的，已安排。")
+    assert transformed is None
+    assert len(ctx.emitted) == 1
