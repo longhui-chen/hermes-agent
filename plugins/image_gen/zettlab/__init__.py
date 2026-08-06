@@ -84,16 +84,17 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 "modalities": ["text"],
                 "max_reference_images": 0,
                 "supports_inline_image": False,
+                "supports_input_image_url": False,
             }
         modalities = media_client.supported_modalities(cap, model)
+        supports_inline = media_client.supports_inline_image_input(cap, model)
+        supports_url = media_client.supports_input_image_url(model)
         return {
             "modalities": modalities,
             "max_reference_images": 0,
-            "supports_inline_image": "image" in modalities,
-            "image_input_description": (
-                "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
-                "local file path, or file URL. HTTP(S) URLs are not enabled yet."
-            ),
+            "supports_inline_image": supports_inline,
+            "supports_input_image_url": supports_url,
+            "image_input_description": media_client.image_input_description(cap, model),
         }
 
     def generate(

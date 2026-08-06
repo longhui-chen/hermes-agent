@@ -267,6 +267,82 @@ def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypa
     assert all("remote_media_inputs" not in request for request in requests)
 
 
+def test_https_image_url_dispatches_unchanged_through_both_generation_tools(monkeypatch, patch_media_get):
+    from agent import image_gen_registry, video_gen_registry
+    from plugins import zettlab_media_client as client
+    from plugins.image_gen.zettlab import ZettlabImageGenProvider
+    from plugins.video_gen.zettlab import ZettlabVideoGenProvider
+    from tools import image_generation_tool as image_tool
+    from tools import video_generation_tool as video_tool
+
+    source = "https://images.example.com/source.png?token=signed-value"
+    image_gen_registry._reset_for_tests()
+    video_gen_registry._reset_for_tests()
+    image_gen_registry.register_provider(ZettlabImageGenProvider())
+    video_gen_registry.register_provider(ZettlabVideoGenProvider())
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
+    monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
+    monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
+    monkeypatch.setattr(video_tool, "_read_configured_video_provider", lambda: "zettlab")
+    monkeypatch.setattr(video_tool, "_read_configured_video_model", lambda: None)
+    monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
+
+    capabilities = {
+        "image": {
+            "enabled": True,
+            "default_model": "seedream-v4",
+            "models": [{
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "supports_input_image_url": True,
+            }],
+            "limits": {},
+        },
+        "video": {
+            "enabled": True,
+            "default_model": "seedance-v1",
+            "models": [{
+                "id": "seedance-v1",
+                "modalities": ["text", "image"],
+                "supports_input_image_url": True,
+                "durations": [5],
+            }],
+            "limits": {},
+        },
+    }
+    requests = []
+    patch_media_get(
+        client,
+        lambda url, timeout, allow_redirects, stream, headers=None: _Resp(capabilities),
+    )
+
+    def fake_post(url, json, headers, timeout, allow_redirects, stream):
+        requests.append(json)
+        extension = "png" if json["media_type"] == "image" else "mp4"
+        return _Resp({
+            "job_id": f"job-{json['media_type']}",
+            "status": "done",
+            "assets": [{"url": f"https://cdn.example/generated.{extension}"}],
+        })
+
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
+    image_result = json.loads(image_tool._handle_image_generate({
+        "prompt": "edit this image",
+        "image_url": source,
+    }))
+    video_result = json.loads(video_tool._handle_video_generate({
+        "prompt": "animate this image",
+        "image_url": source,
+        "duration": 5,
+    }))
+
+    assert image_result["success"] is True
+    assert video_result["success"] is True
+    assert [request["media_type"] for request in requests] == ["image", "video"]
+    assert all(request["input_image"] == source for request in requests)
+    assert all("remote_media_inputs" not in request for request in requests)
+
+
 def test_generated_media_local_artifact_flow(monkeypatch, patch_media_get):
     from agent import image_gen_registry, video_gen_registry
     from plugins import zettlab_media_client as client

@@ -70,6 +70,8 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             for value in model.get("durations") or []:
                 if isinstance(value, int) and value not in durations:
                     durations.append(value)
+        supports_inline = media_client.supports_inline_image_input(cap, model)
+        supports_url = media_client.supports_input_image_url(model)
         return {
             "modalities": modalities,
             "aspect_ratios": aspect_ratios or [DEFAULT_ASPECT_RATIO],
@@ -79,10 +81,9 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             "supports_audio": False,
             "supports_negative_prompt": False,
             "max_reference_images": 0,
-            "image_input_description": (
-                "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
-                "local file path, or file URL. HTTP(S) URLs are not enabled yet."
-            ),
+            "supports_inline_image": supports_inline,
+            "supports_input_image_url": supports_url,
+            "image_input_description": media_client.image_input_description(cap, model),
         }
 
     def generate(

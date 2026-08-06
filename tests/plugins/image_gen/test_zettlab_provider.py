@@ -71,6 +71,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch, patch_media_get)
                     "id": "seedream-v4",
                     "display_name": "Seedream V4",
                     "modalities": ["text", "image"],
+                    "supports_input_image_url": True,
                 }],
                 "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
             },
@@ -83,7 +84,11 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch, patch_media_get)
     assert provider.is_available() is True
     assert provider.default_model() == "seedream-v4"
     assert provider.list_models()[0]["display"] == "Seedream V4"
-    assert provider.capabilities()["max_reference_images"] == 0
+    capabilities = provider.capabilities()
+    assert capabilities["max_reference_images"] == 0
+    assert capabilities["supports_inline_image"] is True
+    assert capabilities["supports_input_image_url"] is True
+    assert "without being downloaded" in capabilities["image_input_description"]
 
 
 def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch, patch_media_get):
@@ -294,6 +299,46 @@ def test_zettlab_image_generate_routes_data_uri_to_inline_input(monkeypatch):
     assert "remote_media_inputs" not in captured
 
 
+def test_zettlab_image_generate_passes_https_url_unchanged(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    source = "https://images.example.com/source.png?token=signed-value"
+    captured = {}
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "supports_input_image_url": True,
+                "aspect_ratios": ["1:1"],
+                "resolutions": ["2K"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
+    )
+
+    def fake_create_and_wait(**kwargs):
+        captured.update(kwargs["payload"])
+        return {
+            "job_id": "job-url",
+            "status": "done",
+            "assets": [{"url": "https://cdn.example/url.png"}],
+        }
+
+    monkeypatch.setattr(client, "create_and_wait", fake_create_and_wait)
+    got = ZettlabImageGenProvider().generate(
+        "turn this into a painting",
+        aspect_ratio="square",
+        image_url=source,
+    )
+
+    assert got["success"] is True
+    assert captured["input_image"] == source
+
+
 def test_zettlab_image_generate_rejects_mixed_inline_and_remote_without_http(monkeypatch):
     from plugins import zettlab_media_client as client
 
@@ -436,16 +481,50 @@ def test_zettlab_image_model_without_text_input_never_sends(
 
 
 @pytest.mark.parametrize("value", [
-    "https://localhost/a.png",
-    "https://127.0.0.1/a.png",
-    "https://example.com:8443/a.png",
+    "http://example.com/a.png",
+    "https://user:pass@example.com/a.png",
     "https://example.com/a.png#fragment",
 ])
-def test_zettlab_remote_input_matches_gateway_url_policy(value):
+def test_zettlab_remote_input_requires_structural_https_url(value):
     from plugins import zettlab_media_client as client
 
     with pytest.raises(client.ZettlabMediaError):
         client.validate_remote_url(value, label="image_url")
+
+
+@pytest.mark.parametrize("value", [
+    "https://localhost/a.png",
+    "https://images.localhost/a.png",
+    "https://127.0.0.1/a.png",
+    "https://[::1]/a.png",
+    "https://example.com:8443/a.png?token=signed-value",
+    "https://127.1/a.png",
+    "https://2130706433/a.png",
+    "https://0177.0.0.1/a.png",
+    "https://0x7f000001/a.png",
+    "https://intranet/a.png",
+    "https://localhost。/a.png",
+    "https://127。0。0。1/a.png",
+])
+def test_zettlab_remote_input_rejects_local_ip_and_non_default_port(value):
+    from plugins import zettlab_media_client as client
+
+    with pytest.raises(client.ZettlabMediaError):
+        client.validate_remote_url(value, label="image_url")
+
+
+def test_zettlab_remote_input_preserves_signed_default_port_url():
+    from plugins import zettlab_media_client as client
+
+    value = "https://images.example.com:443/a.png?token=signed-value"
+    assert client.validate_remote_url(value, label="image_url") == value
+
+
+def test_zettlab_remote_input_preserves_zero_padded_default_port_url():
+    from plugins import zettlab_media_client as client
+
+    value = "https://images.example.com:0443/a.png?token=signed-value"
+    assert client.validate_remote_url(value, label="image_url") == value
 
 
 def test_zettlab_ai_proxy_rejects_non_loopback_base_url(monkeypatch):
