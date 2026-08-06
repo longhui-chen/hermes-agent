@@ -107,6 +107,9 @@ jobs:
       needs.resolve_dispatch_pr.outputs.pr_number != '' &&
       github.event_name == 'repository_dispatch' &&
       github.ref_name == github.event.repository.default_branch
+    # This is the only checkpoint-writing job. GitHub may replace an older pending job,
+    # but its event ref was committed before dispatch; source reconciliation and the
+    # five-minute watchdog re-kick every unfinished PR, so replacement cannot lose work.
     concurrency:
       group: codex-review-feishu-${{ github.repository }}-pr-${{ needs.resolve_dispatch_pr.outputs.pr_number }}
       cancel-in-progress: false
@@ -228,6 +231,8 @@ jobs:
       github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      CODEX_FEISHU_REPAIR_PUBLIC_KEYS: ${{ vars.CODEX_FEISHU_REPAIR_PUBLIC_KEYS }}
     permissions:
       contents: write
       pull-requests: read

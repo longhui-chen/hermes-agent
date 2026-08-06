@@ -33,6 +33,10 @@ const GITHUB_REQUEST_TIMEOUT_MS = 15000;
 const GITHUB_RETRY_BASE_MS = 1000;
 const MAX_GITHUB_RETRY_DELAY_MS = 30000;
 const GITHUB_ATTEMPT_BUDGET_MS = 180000;
+// A bootstrap scan must never spend the final two request slots: they are reserved for
+// persisting the last completely absorbed page and confirming a lost create response.
+// The extra 5s covers JS/runner overhead after full 15s request timeouts.
+const BOOTSTRAP_PROGRESS_RESERVE_MS = (2 * GITHUB_REQUEST_TIMEOUT_MS) + 5000;
 const FEISHU_REQUEST_TIMEOUT_MS = 15000;
 const DRAIN_BATCH_SIZE = 5;
 const DRAIN_SCAN_LIMIT = 50;
@@ -54,7 +58,7 @@ const DEFINITE_SEND_MAX_ATTEMPTS = 3;
 const WATCHDOG_PR_PAGE_SIZE = 100;
 const WATCHDOG_MAX_PRS_PER_RUN = 40;
 const WATCHDOG_MAX_DISPATCHES = 10;
-const WATCHDOG_SHARDS = 4;
+const WATCHDOG_SHARDS = 1;
 const WATCHDOG_SLOT_MS = 5 * 60 * 1000;
 const GITHUB_ACTIONS_BOT = 'github-actions[bot]';
 const CODEX_REVIEW_USER_ID = '199175422';
@@ -206,9 +210,9 @@ async function withGithubAttemptBudget(operation, options = {}) {
   }
 }
 
-function hasGithubRequestBudget(nowMs = Date.now()) {
+function hasGithubRequestBudget(nowMs = Date.now(), reserveMs = 0) {
   return !Number.isFinite(activeGithubAttemptDeadlineMs) ||
-    activeGithubAttemptDeadlineMs - nowMs >= GITHUB_REQUEST_TIMEOUT_MS;
+    activeGithubAttemptDeadlineMs - nowMs >= GITHUB_REQUEST_TIMEOUT_MS + reserveMs;
 }
 
 async function githubGraphqlWithTimeout(github, query, variables = {}, timeoutMs = GITHUB_REQUEST_TIMEOUT_MS) {
@@ -417,10 +421,15 @@ function virtualCheckpointComment(entry) {
   };
 }
 
-async function listCommentPage({ github, context, core, prNum, page, since }) {
+async function listCommentPage({
+  github, context, core, prNum, page, since,
+  deadlineMs = activeGithubAttemptDeadlineMs, nowFn = Date.now,
+}) {
   return withGithubRetry({
     core,
     label: `读取 PR 通知账本 page=${page}`,
+    deadlineMs,
+    nowFn,
     operation: () => github.rest.issues.listComments({
       owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum,
       page, per_page: COMMENT_PAGE_SIZE,
@@ -430,13 +439,17 @@ async function listCommentPage({ github, context, core, prNum, page, since }) {
   });
 }
 
-async function readCheckpointTail({ github, context, core, prNum }) {
+async function readCheckpointTail({
+  github, context, core, prNum, nowFn = Date.now,
+  attempts = MARKER_IO_ATTEMPTS, maxPages = COMMENT_MIGRATION_MAX_PAGES,
+}) {
   if (typeof github.graphql !== 'function') return [];
   let before = null;
   const found = [];
-  for (let page = 0; page < COMMENT_MIGRATION_MAX_PAGES; page += 1) {
+  for (let page = 0; page < maxPages; page += 1) {
     const result = await withGithubRetry({
       core, label: `从 comment tail 定位 checkpoint page=${page + 1}`,
+      nowFn, attempts,
       operation: () => githubGraphqlWithTimeout(github, `query($owner:String!,$repo:String!,$pr:Int!,$before:String){
         repository(owner:$owner,name:$repo){pullRequest(number:$pr){comments(last:100,before:$before){
           pageInfo{hasPreviousPage startCursor}
@@ -481,6 +494,54 @@ function bootstrapMarkerEntry(comment) {
   };
 }
 
+// GitHub comments are the source of truth. Concurrent append-only checkpoint writers can
+// legitimately create sibling snapshots from the same base. Select the sibling with the
+// lowest high-watermark so every omitted comment is replayed, then follow only descendants
+// of that deterministic branch. Orphan siblings remain harmless source comments and a later
+// checkpoint joins them after replay; no process-local lock is required.
+function selectSnapshotLineage(decoded, core, label, valueKey) {
+  const byRevision = new Map();
+  for (const entry of decoded) {
+    const value = entry[valueKey];
+    if (!byRevision.has(value.revision)) byRevision.set(value.revision, []);
+    byRevision.get(value.revision).push(entry);
+  }
+  let selected = null;
+  for (const [revision, entries] of [...byRevision.entries()].sort((a, b) => a[0] - b[0])) {
+    if (selected && revision !== selected[valueKey].revision + 1) {
+      core.warning(`${label} revision=${revision} 与 canonical lineage 不连续；从较早 high-watermark 重放`);
+      break;
+    }
+    const unique = new Map();
+    for (const entry of entries) {
+      const hash = canonicalHash(entry[valueKey]);
+      if (!unique.has(hash) || Number(entry.comment.id) < Number(unique.get(hash).entry.comment.id)) {
+        unique.set(hash, { entry, hash });
+      }
+    }
+    const parentHash = selected ? canonicalHash(selected[valueKey]) : null;
+    const compatible = [...unique.values()].filter(({ entry }) =>
+      !selected || entry[valueKey].parentHash === parentHash);
+    if (!compatible.length) {
+      core.warning(`${label} revision=${revision} 没有连接 canonical parent；从较早 high-watermark 重放`);
+      break;
+    }
+    compatible.sort((left, right) => {
+      const a = left.entry[valueKey];
+      const b = right.entry[valueKey];
+      return a.highCommentId - b.highCommentId ||
+        Date.parse(a.highCreatedAt) - Date.parse(b.highCreatedAt) ||
+        left.hash.localeCompare(right.hash) ||
+        Number(left.entry.comment.id) - Number(right.entry.comment.id);
+    });
+    if (unique.size > 1) {
+      core.warning(`${label} revision=${revision} 检测到并发 sibling；选择最低 high-watermark 并从 GitHub source replay`);
+    }
+    selected = compatible[0].entry;
+  }
+  return selected;
+}
+
 function selectBootstrapProgress(comments, repo, prNum, core) {
   const decoded = comments
     .filter((comment) => isGithubActionsBot(comment) && String(comment.body || '').includes(BOOTSTRAP_MARK))
@@ -489,32 +550,14 @@ function selectBootstrapProgress(comments, repo, prNum, core) {
     core.setFailed('可信 bootstrap progress 损坏或绑定到其他 repo/PR');
     return { ok: false, progress: null };
   }
-  const byRevision = new Map();
-  for (const entry of decoded) {
-    if (!byRevision.has(entry.progress.revision)) byRevision.set(entry.progress.revision, []);
-    byRevision.get(entry.progress.revision).push(entry);
-  }
-  const representatives = [];
-  for (const [revision, entries] of [...byRevision.entries()].sort((a, b) => a[0] - b[0])) {
-    const hashes = new Set(entries.map(({ progress }) => canonicalHash(progress)));
-    if (hashes.size !== 1) {
-      core.setFailed(`bootstrap progress revision=${revision} 存在不同 canonical hash`);
-      return { ok: false, progress: null };
-    }
-    representatives.push(entries[0]);
-  }
-  for (let index = 1; index < representatives.length; index += 1) {
-    const previous = representatives[index - 1].progress;
-    const current = representatives[index].progress;
-    if (current.revision === previous.revision + 1 && current.parentHash !== canonicalHash(previous)) {
-      core.setFailed(`bootstrap progress revision=${current.revision} parentHash lineage 不一致`);
-      return { ok: false, progress: null };
-    }
-  }
-  return { ok: true, progress: representatives.length ? representatives[representatives.length - 1].progress : null };
+  const selected = selectSnapshotLineage(decoded, core, 'bootstrap progress', 'progress');
+  return { ok: true, progress: selected ? selected.progress : null };
 }
 
-async function appendBootstrapProgress({ github, context, core, prNum, previous, entries, highCommentId, highCreatedAt }) {
+async function appendBootstrapProgress({
+  github, context, core, prNum, previous, entries, highCommentId, highCreatedAt,
+  nowFn = Date.now,
+}) {
   const progress = canonicalCheckpoint({
     version: 1, revision: previous ? previous.revision + 1 : 1,
     repo: repositoryName(context), pr: prNum, highCommentId, highCreatedAt,
@@ -526,20 +569,37 @@ async function appendBootstrapProgress({ github, context, core, prNum, previous,
     return false;
   }
   const result = await withGithubRetry({
-    core, label: '持久化 bootstrap progress', attempts: 1,
+    core, label: '持久化 bootstrap progress', attempts: 1, setFailedOnExhausted: false,
+    nowFn,
     operation: () => github.rest.issues.createComment({
       owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum, body,
       request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
-  return result.ok;
+  if (result.ok) return true;
+  // createComment may have committed even though its response was lost. Spend exactly the
+  // second reserved request on a one-page/one-attempt tail confirmation; further recovery is
+  // delegated to the next run's source scan rather than exceeding the shared outer budget.
+  const targetHash = canonicalHash(progress);
+  const tail = await readCheckpointTail({
+    github, context, core, prNum, nowFn, attempts: 1, maxPages: 1,
+  });
+  const confirmed = tail && tail.some((comment) => {
+    const candidate = decodeBootstrapProgress(comment.body);
+    return candidate && candidate.repo === repositoryName(context) && candidate.pr === prNum &&
+      canonicalHash(candidate) === targetHash;
+  });
+  if (confirmed) return true;
+  core.setFailed('bootstrap progress POST 未确认；下轮从 GitHub source 重新扫描');
+  return false;
 }
 
 async function readThreadMarkerComments({
   github, context, core = noopCore(), prNum, bootstrapPageLimit = Infinity,
+  nowFn = Date.now,
 }) {
   const repo = repositoryName(context);
-  const tailMarkers = await readCheckpointTail({ github, context, core, prNum });
+  const tailMarkers = await readCheckpointTail({ github, context, core, prNum, nowFn });
   if (tailMarkers === null) return null;
   const checkpointComments = tailMarkers.filter((comment) =>
     isGithubActionsBot(comment) && String(comment.body || '').includes(CHECKPOINT_MARK));
@@ -548,29 +608,7 @@ async function readThreadMarkerComments({
     core.setFailed('可信 checkpoint 损坏或绑定到其他 repo/PR');
     return null;
   }
-  const byRevision = new Map();
-  for (const entry of decodedCheckpoints) {
-    if (!byRevision.has(entry.checkpoint.revision)) byRevision.set(entry.checkpoint.revision, []);
-    byRevision.get(entry.checkpoint.revision).push(entry);
-  }
-  const representatives = [];
-  for (const [revision, entries] of [...byRevision.entries()].sort((a, b) => a[0] - b[0])) {
-    const hashes = new Set(entries.map(({ checkpoint }) => canonicalHash(checkpoint)));
-    if (hashes.size !== 1) {
-      core.setFailed(`checkpoint revision=${revision} 存在不同 canonical hash`);
-      return null;
-    }
-    representatives.push(entries[0]);
-  }
-  for (let index = 1; index < representatives.length; index += 1) {
-    const previous = representatives[index - 1].checkpoint;
-    const current = representatives[index].checkpoint;
-    if (current.revision === previous.revision + 1 && current.parentHash !== canonicalHash(previous)) {
-      core.setFailed(`checkpoint revision=${current.revision} parentHash lineage 不一致`);
-      return null;
-    }
-  }
-  const selected = representatives.length ? representatives[representatives.length - 1] : null;
+  const selected = selectSnapshotLineage(decodedCheckpoints, core, 'checkpoint', 'checkpoint');
   const checkpointComment = selected ? selected.comment : null;
   const checkpoint = selected ? selected.checkpoint : null;
   let comments = [];
@@ -608,13 +646,24 @@ async function readThreadMarkerComments({
     let highCreatedAt = previousProgress ? previousProgress.highCreatedAt : '1970-01-01T00:00:00.000Z';
     const since = highCommentId ? new Date(Date.parse(highCreatedAt) - 1000).toISOString() : undefined;
     let complete = false;
+    const scanDeadlineMs = Number.isFinite(activeGithubAttemptDeadlineMs)
+      ? activeGithubAttemptDeadlineMs - BOOTSTRAP_PROGRESS_RESERVE_MS
+      : activeGithubAttemptDeadlineMs;
     for (let page = 1; ; page += 1) {
-      if (page > bootstrapPageLimit || !hasGithubRequestBudget()) {
+      if (page > bootstrapPageLimit ||
+          !hasGithubRequestBudget(nowFn(), BOOTSTRAP_PROGRESS_RESERVE_MS)) {
         truncated = true;
         break;
       }
-      const result = await listCommentPage({ github, context, core, prNum, page, since });
-      if (!result.ok) return null;
+      const result = await listCommentPage({
+        github, context, core, prNum, page, since, deadlineMs: scanDeadlineMs, nowFn,
+      });
+      if (!result.ok) {
+        // The scan budget is intentionally shorter than the outer budget. Persist all
+        // fully absorbed pages with the reserved request slot even when a later page fails.
+        truncated = true;
+        break;
+      }
       for (const comment of result.value.data) {
         const id = Number(comment.id);
         if (!Number.isSafeInteger(id) || id <= baseHighCommentId) continue;
@@ -634,6 +683,7 @@ async function readThreadMarkerComments({
     if (!complete) {
       if (!await appendBootstrapProgress({
         github, context, core, prNum, previous: previousProgress, entries, highCommentId, highCreatedAt,
+        nowFn,
       })) return null;
       comments = entries.map(virtualCheckpointComment);
       Object.defineProperty(comments, '_checkpoint', {
@@ -1442,6 +1492,10 @@ function validDeliveryTransition(previous, next) {
   if (previous.state === 'manual') return false;
   if (previous.state === 'retrying') {
     if (next.state === 'skipped') return sameDeliveryIdentity(previous, next);
+    if (previous.mode === 'reply') {
+      return next.state === 'sending' && next.attempt === previous.attempt + 1 &&
+        sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt }, next);
+    }
     return next.state === 'preparing' && next.attempt === previous.attempt + 1 &&
       sameDeliveryStaticIdentity({
         ...previous, attempt: next.attempt, mode: 'root', targetRoot: null,
@@ -1451,6 +1505,10 @@ function validDeliveryTransition(previous, next) {
   if (previous.state === 'not_sent') {
     if (next.state === 'skipped') return sameDeliveryIdentity(previous, next);
     if (next.state === 'manual') return sameDeliveryIdentity(previous, next);
+    if (previous.mode === 'reply') {
+      return next.state === 'sending' && next.attempt === previous.attempt + 1 &&
+        sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt }, next);
+    }
     return next.state === 'preparing' && next.attempt === previous.attempt + 1 && sameDeliveryStaticIdentity({ ...previous, attempt: next.attempt, mode: 'root', targetRoot: null, threadGeneration: next.threadGeneration, threadClaimId: next.threadClaimId }, next);
   }
   if (previous.state === 'preparing') {
@@ -1553,7 +1611,8 @@ function validSignedManualRepair(previous, next, repair) {
       previous.candidateMessageIds.includes(next.messageId);
   }
   if (repair.action === 'retry') {
-    return previous.reason === 'definitely_not_sent_exhausted' && next.state === 'retrying' &&
+    return ['definitely_not_sent_exhausted', 'history_exhausted'].includes(previous.reason) &&
+      previous.candidateMessageIds.length === 0 && next.state === 'retrying' &&
       next.messageId === null && repair.messageId === null;
   }
   return Boolean(repair.action === 'discard' && next.state === 'skipped' &&
@@ -1619,7 +1678,11 @@ async function readDeliveryLedger({
   for (const [eventKey, entries] of grouped.entries()) {
     entries.sort((a, b) => String(a.commentId).localeCompare(String(b.commentId), undefined, { numeric: true }));
     let previous = null;
+    let previousRepair = null;
     for (const entry of entries) {
+      const exactDuplicate = previous && canonicalHash(previous) === canonicalHash(entry.record) &&
+        canonicalHash(previousRepair) === canonicalHash(entry.repair);
+      if (exactDuplicate) continue;
       const validTransition = previous && previous.state === 'manual' && ['done', 'retrying', 'skipped'].includes(entry.record.state)
         ? validSignedManualRepair(previous, entry.record, entry.repair)
         : validDeliveryTransition(previous, entry.record) && !entry.repair;
@@ -1629,6 +1692,7 @@ async function readDeliveryLedger({
         });
       }
       previous = entry.record;
+      previousRepair = entry.repair;
     }
     latest.set(eventKey, previous);
   }
@@ -1990,25 +2054,22 @@ async function sendAttempt({ github, context, core, ref, prData, cls, env, attem
   }
 
   if (isKnownRootSendFailure(result)) {
+    const notSent = canonicalDeliveryRecord({
+      ...base, state: 'not_sent', reason: 'definitely_not_sent',
+    });
+    const persisted = await appendDeliveryAndConfirm({
+      github, context, core, prNum: ref.pr, record: notSent, session,
+    });
+    if (!persisted.ok) return { complete: false, retry: true };
     if (mode === 'root') {
-      const notSent = canonicalDeliveryRecord({
-        ...base, state: 'not_sent', reason: 'definitely_not_sent',
-      });
-      const persisted = await appendDeliveryAndConfirm({
-        github, context, core, prNum: ref.pr, record: notSent, session,
-      });
-      if (!persisted.ok) return { complete: false, retry: true };
       const released = await releaseThreadGeneration({
         github, context, core, prNum: ref.pr,
         generation: thread.generation, claimId: thread.claimId, session,
       });
       if (!released.ok) return { complete: false, retry: true };
-      core.setFailed(`Feishu 根消息明确未发送，将由 watchdog 有界重试: ${feishuFailureSummary(result)}`);
-      return { complete: false, retry: true };
     }
-    await markDeliveryFailure({ github, context, core, prNum: ref.pr, session }, base, 'definitely_not_sent');
-    core.setFailed(`Feishu 消息明确未发送: ${feishuFailureSummary(result)}`);
-    return { complete: false, retry: false };
+    core.setFailed(`Feishu ${mode === 'root' ? '根消息' : '话题回复'}明确未发送，将由 watchdog 有界重试: ${feishuFailureSummary(result)}`);
+    return { complete: false, retry: true };
   }
 
   // The POST result is ambiguous. The batch snapshot is intentionally stale here: a
@@ -2075,6 +2136,16 @@ async function deliverClassifiedEvent({ github, context, core, ref, prData, cls,
   if (!current.ok) return { complete: false, retry: false };
   let attempt = latest && latest.state === 'not_sent' ? latest.attempt + 1 : 1;
   if (latest && latest.state === 'retrying') {
+    if (latest.mode === 'reply') {
+      if (current.kind !== 'final' || current.messageId !== latest.targetRoot) {
+        core.setFailed('operator retry 与当前 reply root 不一致');
+        return { complete: false, retry: false, manual: true };
+      }
+      return sendAttempt({
+        github, context, core, ref, prData, cls, env, attempt: latest.attempt + 1,
+        mode: 'reply', thread: { rootMid: latest.targetRoot }, session,
+      });
+    }
     if (latest.mode !== 'root' || current.kind !== 'released' || current.generation !== latest.threadGeneration ||
         current.claimId !== latest.threadClaimId) {
       core.setFailed('operator retry 与 released root thread state 不一致');
@@ -2111,8 +2182,28 @@ async function deliverClassifiedEvent({ github, context, core, ref, prData, cls,
   }
   if (latest && latest.state === 'not_sent') {
     if (latest.reason === 'definitely_not_sent') {
+      if (latest.attempt >= DEFINITE_SEND_MAX_ATTEMPTS) {
+        const manual = canonicalDeliveryRecord({
+          ...latest, state: 'manual', nextCheckAt: null, reason: 'definitely_not_sent_exhausted',
+        });
+        const appended = await appendDeliveryAndConfirm({
+          github, context, core, prNum: ref.pr, record: manual, session,
+        });
+        core.setFailed('Feishu 明确未发送已重试 3 次，转 manual dead-letter');
+        return { complete: false, retry: !appended.ok, manual: appended.ok };
+      }
+      if (latest.mode === 'reply') {
+        if (current.kind !== 'final' || current.messageId !== latest.targetRoot) {
+          core.setFailed('definitely_not_sent reply 与当前 thread state 不一致');
+          return { complete: false, retry: false, manual: true };
+        }
+        return sendAttempt({
+          github, context, core, ref, prData, cls, env, attempt,
+          mode: 'reply', thread: { rootMid: latest.targetRoot }, session,
+        });
+      }
       if (latest.mode !== 'root') {
-        core.setFailed('definitely_not_sent delivery 与 released thread state 不一致');
+        core.setFailed('definitely_not_sent delivery mode 非法');
         return { complete: false, retry: false, manual: true };
       }
       const matchingPending = current.kind === 'pending' && current.generation === latest.threadGeneration &&
@@ -2128,14 +2219,6 @@ async function deliverClassifiedEvent({ github, context, core, ref, prData, cls,
       if (current.kind !== 'released' || current.generation !== latest.threadGeneration ||
           current.claimId !== latest.threadClaimId) {
         core.setFailed('definitely_not_sent delivery 无法收敛到 matching released thread state');
-        return { complete: false, retry: false, manual: true };
-      }
-      if (latest.attempt >= DEFINITE_SEND_MAX_ATTEMPTS) {
-        const manual = canonicalDeliveryRecord({
-          ...latest, state: 'manual', nextCheckAt: null, reason: 'definitely_not_sent_exhausted',
-        });
-      await appendDeliveryAndConfirm({ github, context, core, prNum: ref.pr, record: manual, session });
-        core.setFailed('Feishu 明确未发送已重试 3 次，转 manual dead-letter');
         return { complete: false, retry: false, manual: true };
       }
     } else if (latest.mode !== 'reply' || current.kind !== 'final' || current.messageId !== latest.targetRoot) {
@@ -2580,8 +2663,10 @@ async function repairDelivery({
     core.setFailed('delivery repair selected message_id 不在 manual candidate set');
     return { ok: false };
   }
-  if (action === 'retry' && latest.reason !== 'definitely_not_sent_exhausted') {
-    core.setFailed('retry 仅允许 definitely_not_sent_exhausted，history ambiguous 禁止重发');
+  if (action === 'retry' &&
+      (!['definitely_not_sent_exhausted', 'history_exhausted'].includes(latest.reason) ||
+       latest.candidateMessageIds.length !== 0)) {
+    core.setFailed('retry 仅允许无候选的明确未发送/history_exhausted；存在 exact-token 候选时禁止重发');
     return { ok: false };
   }
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(String(runId || '')) ||
@@ -2598,7 +2683,7 @@ async function repairDelivery({
     });
     if (!finalized.ok) return { ok: false };
   }
-  if (latest.mode === 'root' && action === 'discard') {
+  if (latest.mode === 'root' && ['discard', 'retry'].includes(action)) {
     const thread = await readThreadState({ github, context, core, prNum });
     if (thread.kind === 'pending' && thread.generation === latest.threadGeneration &&
         thread.claimId === latest.threadClaimId) {
@@ -3503,7 +3588,10 @@ function watchdogWindow(pulls, repo, nowMs = Date.now()) {
   if (inShard.length === 0) return { slot, shard, pulls: [] };
   // For the same shard, cycle increments by exactly one. Advancing one position is coprime
   // with every non-empty set length, unlike a cap-sized step (40 starves lengths 20/32/40).
-  const offset = cycle % inShard.length;
+  let step = Math.min(WATCHDOG_MAX_PRS_PER_RUN, Math.max(1, inShard.length - 1));
+  const gcd = (left, right) => right === 0 ? left : gcd(right, left % right);
+  while (step > 1 && gcd(step, inShard.length) !== 1) step -= 1;
+  const offset = (cycle * step) % inShard.length;
   const rotated = inShard.slice(offset).concat(inShard.slice(0, offset));
   return { slot, shard, pulls: rotated.slice(0, WATCHDOG_MAX_PRS_PER_RUN) };
 }
@@ -3541,16 +3629,25 @@ async function sweepQueuedCodexReviews(args) {
       if (!Number.isSafeInteger(prNum) || prNum <= 0) continue;
       const prData = await resolvePr(github, context, { number: prNum }, core);
       if (!prData || prData.state !== 'open' || prData.base !== 'main') continue;
-      const comments = await readThreadMarkerComments({ github, context, core, prNum });
+      const comments = await readThreadMarkerComments({
+        github, context, core, prNum, bootstrapPageLimit: args.bootstrapPageLimit,
+      });
       if (!comments) continue;
-      if (comments._checkpoint && comments._checkpoint.bootstrapIncomplete) continue;
+      if (comments._checkpoint && comments._checkpoint.bootstrapIncomplete) {
+        if (await scheduleDrain({ github, context, core, prNum })) {
+          dispatches += 1;
+        } else {
+          core.warning(`watchdog PR #${prNum} bootstrap progress 已持久化但 continuation dispatch 失败，留待下一轮`);
+        }
+        continue;
+      }
       const queue = await readEventQueue({ github, context, core, prNum, comments });
       if (!queue.ok) continue;
+      const ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
+      if (!ledger.ok) continue;
       let barrier = false;
       let actionable = false;
       if (queue.events.length > 0) {
-        const ledger = await readDeliveryLedger({ github, context, core, prNum, comments });
-        if (!ledger.ok) continue;
         const thread = await readThreadState({ github, context, core, prNum, comments });
         if (!thread.ok) continue;
         barrier = queue.events.some(({ ref }) =>
@@ -3573,7 +3670,12 @@ async function sweepQueuedCodexReviews(args) {
       }
       const sources = await reconcileOfficialSourcesForPr({
         github, context, core, prData,
-        knownEventKeys: new Set(queue.events.map(({ ref }) => ref.eventKey)),
+        knownEventKeys: new Set([
+          ...queue.events.map(({ ref }) => ref.eventKey),
+          ...[...ledger.latest.entries()]
+            .filter(([, record]) => ['done', 'skipped'].includes(record.state))
+            .map(([eventKey]) => eventKey),
+        ]),
       });
       let sourcesDurable = true;
       for (const ref of sources || []) {
@@ -3734,6 +3836,7 @@ module.exports = {
   isCodexPullRequestReview,
   GITHUB_REQUEST_TIMEOUT_MS,
   GITHUB_ATTEMPT_BUDGET_MS,
+  BOOTSTRAP_PROGRESS_RESERVE_MS,
   MAX_GITHUB_RETRY_DELAY_MS,
   DRAIN_BATCH_SIZE,
   HISTORY_MAX_PAGES,
