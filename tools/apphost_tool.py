@@ -315,6 +315,23 @@ def _require_source_subdir(args):
     return source_subdir
 
 
+def _session_key():
+    """Stable chat-session identity for creation provenance, or "".
+
+    Only HERMES_SESSION_KEY qualifies: the lineage id in HERMES_SESSION_ID is
+    rotated by context compaction, so recording it as provenance would name a
+    session that stops being findable mid-conversation. No session key means
+    no provenance — the server treats the field as optional.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        value = get_session_env("HERMES_SESSION_KEY", "")
+    except Exception:
+        value = os.environ.get("HERMES_SESSION_KEY", "")
+    return str(value or "").strip()
+
+
 def _build_request(action, args):
     """Return (method, path, body_dict_or_None, timeout) for an HTTP action."""
     timeout = _DEFAULT_TIMEOUT
@@ -346,12 +363,22 @@ def _build_request(action, args):
         note = str(args.get("note", "") or "").strip()
         if note:
             body["note"] = note
+        # Creation provenance rides only on install: a reload updates code,
+        # it never rewrites who created the app.
+        if mode == "install":
+            session_key = _session_key()
+            if session_key:
+                body["session_id"] = session_key
         return "POST", "/publish", body, _LONG_TIMEOUT
     if action == "install":
-        return "POST", "/install", {
+        body = {
             "staging_dir": _require_staging_dir(args),
             "slug": _require_slug(args),
-        }, _LONG_TIMEOUT
+        }
+        session_key = _session_key()
+        if session_key:
+            body["session_id"] = session_key
+        return "POST", "/install", body, _LONG_TIMEOUT
     if action == "reload":
         slug = _require_slug(args)
         body = {"staging_dir": _require_staging_dir(args)}

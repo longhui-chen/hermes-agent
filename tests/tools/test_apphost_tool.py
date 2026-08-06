@@ -1010,3 +1010,55 @@ def test_undo_is_described_where_the_model_reads_it():
     text = APP_HOST_SCHEMA["description"]
     assert "rollback" in text
     assert "prev_version_id" in text, "the model has to be told where to get to_version"
+
+
+# --- creation provenance (session key) ---------------------------------------
+
+_SESSION_KEY = "zettlab:usr-1f2e3d:main:0"
+
+
+def _routed_body(monkeypatch, action_args):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope(), poison_environ=True):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool(action_args))
+    assert out["ok"] is True
+    req = seen["req"]
+    return json.loads(req.data.decode("utf-8")) if req.data else None
+
+
+def test_publish_install_carries_stable_session_key(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
+    monkeypatch.setenv("HERMES_SESSION_ID", "api-rotated-tip")
+    body = _routed_body(monkeypatch, {
+        "action": "publish", "mode": "install", "source_subdir": "runs/run-1/app1",
+    })
+    assert body["session_id"] == _SESSION_KEY
+
+
+def test_publish_reload_never_rewrites_creation_provenance(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
+    body = _routed_body(monkeypatch, {
+        "action": "publish", "mode": "reload", "source_subdir": "runs/run-2/app1",
+    })
+    assert "session_id" not in body
+
+
+def test_legacy_install_carries_stable_session_key(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
+    body = _routed_body(monkeypatch, {
+        "action": "install", "staging_dir": "/tmp/stage", "slug": "app1",
+    })
+    assert body["session_id"] == _SESSION_KEY
+
+
+def test_rotating_session_id_is_not_provenance(monkeypatch):
+    # HERMES_SESSION_ID rotates on context compaction: recording it would
+    # name a session that stops being findable mid-conversation. Without the
+    # stable key there must be no session_id at all.
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "api-rotated-tip")
+    body = _routed_body(monkeypatch, {
+        "action": "publish", "mode": "install", "source_subdir": "runs/run-1/app1",
+    })
+    assert "session_id" not in body
