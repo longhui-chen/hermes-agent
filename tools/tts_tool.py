@@ -183,7 +183,9 @@ DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
-ZETTLAB_OPENAI_TTS_MODEL = "zettlab-tts"
+# Public model already configured on Zettlab's ai-api TTS channel. The cloud
+# gateway is deliberately a thin relay and does not translate product aliases.
+ZETTLAB_AI_API_TTS_MODEL = "seed-tts-1.1"
 DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
@@ -1171,20 +1173,11 @@ def _generate_openai_tts(
             managed_model, model,
         )
         model = managed_model
-    if managed_contract_active and managed_model == ZETTLAB_OPENAI_TTS_MODEL:
-        if voice != DEFAULT_OPENAI_VOICE:
-            logger.warning(
-                "TTS: Zettlab managed audio uses voice alias %r; replacing %r",
-                DEFAULT_OPENAI_VOICE, voice,
-            )
-        voice = DEFAULT_OPENAI_VOICE
-        speed = max(0.5, min(2.0, speed))
-
     response_format = _tts_response_format_from_path(output_path)
 
     OpenAIClient = _import_openai_client()
     client_kwargs: Dict[str, Any] = {}
-    if managed_contract_active and managed_model == ZETTLAB_OPENAI_TTS_MODEL:
+    if managed_contract_active and managed_model == ZETTLAB_AI_API_TTS_MODEL:
         # Board-local traffic must never inherit HTTP(S)_PROXY: otherwise
         # httpx sends 127.0.0.1 to the desktop/system proxy and the managed
         # route fails before it reaches local-server. Keep the OpenAI SDK's
@@ -2770,10 +2763,10 @@ def _resolve_openai_audio_client_config(
 
     The Zettlab board-local gateway takes precedence over direct credentials
     unless the effective config explicitly sets ``tts.use_gateway: false``:
-    local-server consumes its action token, replaces it with IoT auth, and the
-    cloud gateway owns regional provider selection plus billing. Outside a
-    Zettlab session, direct OpenAI keeps its historical precedence unless
-    ``tts.use_gateway`` selects the Nous managed path.
+    local-server consumes its action token and replaces it with IoT auth, the
+    cloud gateway moderates and relays the request, and ai-api owns provider
+    selection plus billing. Outside a Zettlab session, direct OpenAI keeps its
+    historical precedence unless ``tts.use_gateway`` selects the Nous path.
     """
     direct_api_key = _resolve_profile_openai_audio_api_key()
     if _gateway_is_explicitly_disabled(tts_config):
@@ -2786,7 +2779,7 @@ def _resolve_openai_audio_client_config(
         return (
             zettlab_gateway.token,
             urljoin(f"{zettlab_gateway.gateway_origin.rstrip('/')}/", "v1"),
-            ZETTLAB_OPENAI_TTS_MODEL,
+            ZETTLAB_AI_API_TTS_MODEL,
         )
 
     if direct_api_key and not prefers_gateway("tts"):

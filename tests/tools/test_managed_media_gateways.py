@@ -244,7 +244,7 @@ def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatc
     assert captured["close_calls"] == 1
 
 
-def test_zettlab_tts_auto_selects_local_gateway_and_product_model(monkeypatch, tmp_path):
+def test_zettlab_tts_auto_selects_local_gateway_and_ai_api_model(monkeypatch, tmp_path):
     captured = {}
     _install_fake_tools_package()
     _install_fake_openai_module(captured)
@@ -272,9 +272,9 @@ def test_zettlab_tts_auto_selects_local_gateway_and_product_model(monkeypatch, t
     assert captured["api_key"] == "local-action-token"
     assert captured["base_url"] == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
     assert captured["client_kwargs"]["http_client"]._trust_env is False
-    assert captured["speech_kwargs"]["model"] == "zettlab-tts"
-    assert captured["speech_kwargs"]["voice"] == "alloy"
-    assert captured["speech_kwargs"]["speed"] == 2.0
+    assert captured["speech_kwargs"]["model"] == "seed-tts-1.1"
+    assert captured["speech_kwargs"]["voice"] == "nova"
+    assert captured["speech_kwargs"]["speed"] == 3.0
 
 
 def test_zettlab_tts_explicit_direct_openai_opt_out_wins(monkeypatch, tmp_path):
