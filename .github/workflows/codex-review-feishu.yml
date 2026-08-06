@@ -1,51 +1,111 @@
-name: Codex Review → Feishu
+name: Codex Review -> Feishu
 
-# 监听官方 Codex GitHub Code Review 产物，把不通过 / 基础设施失败发到飞书评审群。
-# 这条 workflow 不运行 Codex、不需要 OPENAI_API_KEY，也不会产生 OpenAI API 计费；
-# Codex review 本身由 chatgpt.com/codex/settings/code-review 控制并消耗 Codex 会员额度。
-#
-# 监听两类 GitHub 产物：
-# - pull_request_review：官方 Codex 像 reviewer 一样提交行内评论时触发；
-# - check_run：若官方 Codex 同时产出 check，报错/超时/额度失败也能进群。
-#
-# 飞书出站通知仍由 GitHub Actions 直接调用飞书 OpenAPI。165 上的对话机器人只负责群里
-# @ 机器人后的代码问答和每小时同步 workspace，不参与这条出站通知链路。
-
+# Resolve the PR without secrets first. The reporting and trusted repair jobs then use the
+# resolved PR number as their only concurrency key, so review and check_run events for the
+# same PR cannot race the two-phase marker protocol.
 on:
   pull_request_review:
     types: [submitted]
   check_run:
     types: [completed]
-
-concurrency:
-  # 同一 PR 的 pull_request_review 与 check_run 串行执行，避免首次锚点写回前并发发出多个飞书根话题。
-  group: codex-review-feishu-${{ github.repository }}-${{ github.event.pull_request.number || github.event.check_run.pull_requests[0].number || github.event.check_run.head_sha || github.run_id }}
-  cancel-in-progress: false
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open PR number whose highest pending generation should be repaired
+        required: true
+        type: string
+      message_id:
+        description: Feishu root message_id used to finalize (leave empty for explicit release)
+        required: false
+        type: string
+      release:
+        description: Explicitly release the highest pending generation instead of finalizing it
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  pull-requests: read
-  issues: write
-  checks: read
 
 jobs:
+  resolve_pr:
+    if: >-
+      github.event_name != 'workflow_dispatch' &&
+      github.repository_owner == 'zettlab' &&
+      (
+        (github.event_name == 'pull_request_review' && contains(github.event.review.user.login, 'codex')) ||
+        (github.event_name == 'check_run' &&
+          (
+            contains(github.event.check_run.name, 'codex') ||
+            contains(github.event.check_run.app.name, 'codex') ||
+            contains(github.event.check_run.app.slug, 'codex') ||
+            contains(github.event.check_run.app.owner.login, 'codex') ||
+            contains(github.event.check_run.check_suite.app.name, 'codex') ||
+            contains(github.event.check_run.check_suite.app.slug, 'codex')
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+    steps:
+      - name: Checkout trusted PR resolver
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/codereview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Resolve one PR without notification secrets
+        id: resolve
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { resolvePrNumber } = require(`${process.env.GITHUB_WORKSPACE}/scripts/codereview/notify.js`);
+            const prNumber = await resolvePrNumber(github, context, core);
+            if (!prNumber) return;
+            core.setOutput('pr_number', String(prNumber));
+
   report:
-    if: github.repository_owner == 'zettlab'
+    needs: resolve_pr
+    if: needs.resolve_pr.result == 'success' && needs.resolve_pr.outputs.pr_number != ''
+    concurrency:
+      group: codex-review-feishu-${{ github.repository }}-pr-${{ needs.resolve_pr.outputs.pr_number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: read
     steps:
-      - name: Checkout notification scripts
-        uses: actions/checkout@v5
+      - name: Checkout trusted notification scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: |
             scripts/codereview
+            .github/workflows/codex-review-feishu.yml
             scripts/test-harness/feishu/feishu_openid_registry.json
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
+      - name: Verify notification thread flow
+        run: node scripts/codereview/test_notify_flow.js
+
       - name: Parse official Codex review and post to Feishu thread
-        uses: actions/github-script@v8
+        id: notify_first
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
+          RESOLVED_PR_NUMBER: ${{ needs.resolve_pr.outputs.pr_number }}
           CODEREVIEW_FEISHU_APP_ID: ${{ secrets.CODEREVIEW_FEISHU_APP_ID }}
           CODEREVIEW_FEISHU_APP_SECRET: ${{ secrets.CODEREVIEW_FEISHU_APP_SECRET }}
           CODEREVIEW_FEISHU_CHAT_ID: ${{ secrets.CODEREVIEW_FEISHU_CHAT_ID }}
@@ -54,3 +114,101 @@ jobs:
           script: |
             const { notifyFromOfficialCodexEvent } = require(`${process.env.GITHUB_WORKSPACE}/scripts/codereview/notify.js`);
             await notifyFromOfficialCodexEvent({ github, context, core });
+
+      - name: Delay before automatic notification retry
+        if: steps.notify_first.outcome == 'failure'
+        run: sleep 30
+
+      - name: Recover or retry official Codex review notification
+        if: steps.notify_first.outcome == 'failure'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          RESOLVED_PR_NUMBER: ${{ needs.resolve_pr.outputs.pr_number }}
+          CODEREVIEW_FEISHU_APP_ID: ${{ secrets.CODEREVIEW_FEISHU_APP_ID }}
+          CODEREVIEW_FEISHU_APP_SECRET: ${{ secrets.CODEREVIEW_FEISHU_APP_SECRET }}
+          CODEREVIEW_FEISHU_CHAT_ID: ${{ secrets.CODEREVIEW_FEISHU_CHAT_ID }}
+          CODEREVIEW_NOTIFY_ON: important
+        with:
+          script: |
+            const { notifyFromOfficialCodexEvent } = require(`${process.env.GITHUB_WORKSPACE}/scripts/codereview/notify.js`);
+            await notifyFromOfficialCodexEvent({ github, context, core });
+
+  normalize_repair:
+    if: github.event_name == 'workflow_dispatch' && github.repository_owner == 'zettlab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions:
+      contents: read
+    outputs:
+      pr_number: ${{ steps.normalize.outputs.pr_number }}
+    steps:
+      - name: Normalize repair PR number without notification secrets
+        id: normalize
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          RAW_PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          script: |
+            const raw = String(process.env.RAW_PR_NUMBER || '');
+            if (!/^[1-9][0-9]*$/.test(raw)) return core.setFailed('pr_number 必须是 canonical 正整数');
+            const prNumber = Number(raw);
+            if (!Number.isSafeInteger(prNumber)) return core.setFailed('pr_number 超出 JavaScript safe integer 范围');
+            core.setOutput('pr_number', String(prNumber));
+
+  repair_pending:
+    needs: normalize_repair
+    if: needs.normalize_repair.result == 'success' && needs.normalize_repair.outputs.pr_number != ''
+    concurrency:
+      group: codex-review-feishu-${{ github.repository }}-pr-${{ needs.normalize_repair.outputs.pr_number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout trusted repair implementation
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/codereview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Finalize or explicitly release highest pending generation
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          REPAIR_PR_NUMBER: ${{ needs.normalize_repair.outputs.pr_number }}
+          REPAIR_MESSAGE_ID: ${{ inputs.message_id }}
+          REPAIR_RELEASE: ${{ inputs.release }}
+        with:
+          script: |
+            const {
+              finalizeThreadGeneration,
+              readThreadState,
+              releaseThreadGeneration,
+              resolvePr,
+              validFeishuMessageId,
+              withGithubAttemptBudget,
+            } = require(`${process.env.GITHUB_WORKSPACE}/scripts/codereview/notify.js`);
+            await withGithubAttemptBudget(async () => {
+              const prNumber = Number(process.env.REPAIR_PR_NUMBER);
+              const messageId = String(process.env.REPAIR_MESSAGE_ID || '').trim();
+              const release = String(process.env.REPAIR_RELEASE) === 'true';
+              if (!Number.isInteger(prNumber) || prNumber <= 0) return core.setFailed('pr_number 必须是正整数');
+              if (release === Boolean(messageId)) return core.setFailed('message_id 与 explicit release 必须且只能选择一个');
+              if (messageId && !validFeishuMessageId(messageId)) return core.setFailed('message_id 格式非法');
+              const prData = await resolvePr(github, context, { number: prNumber }, core);
+              if (!prData || prData.state !== 'open') return core.setFailed('仅允许修复 OPEN PR');
+              const current = await readThreadState({ github, context, core, prNum: prNumber });
+              if (!current.ok || current.kind !== 'pending') return core.setFailed('最高 generation 不是 pending，拒绝修复');
+              const args = {
+                github, context, core, prNum: prNumber,
+                generation: current.generation, claimId: current.claimId,
+              };
+              const result = release
+                ? await releaseThreadGeneration({ ...args, reason: 'trusted-workflow-dispatch' })
+                : await finalizeThreadGeneration({ ...args, messageId });
+              if (!result.ok) core.setFailed('pending generation 修复未确认');
+            });
