@@ -79,7 +79,7 @@ _PERCENT_TOKEN_RE = re.compile(r"[^\s<>\"']*%[0-9a-f]{2}[^\s<>\"']*", re.IGNOREC
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
 _MALFORMED_PERCENT_RE = re.compile(r"%(?![0-9a-f]{2})", re.IGNORECASE)
 _HTTP_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
-_HTTP_URL_LIKE_RE = re.compile(r"https?:", re.IGNORECASE)
+_UNSAFE_URL_LIKE_RE = re.compile(r"(?:https?|file):", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
 _SAFE_STATES = (
     "disabled",
@@ -187,8 +187,16 @@ def _replace_encoded_presentation_tokens(value: str) -> tuple[str, bool, bool]:
                 break
             decoded = next_value
 
+        if _MALFORMED_PERCENT_RE.search(decoded) and _UNSAFE_URL_LIKE_RE.search(decoded):
+            changed = True
+            if value[match.end() :].strip():
+                unsafe_path = True
+            return "[REDACTED]"
         if _HTTP_SCHEME_RE.search(decoded):
             changed = True
+            if value[match.end() :].strip():
+                unsafe_path = True
+                return "[REDACTED]"
             if _MALFORMED_PERCENT_RE.search(raw):
                 return "[REDACTED]"
             return _hostname_from_decoded_url_token(decoded)
@@ -213,7 +221,7 @@ def _presentation_safe_paths_and_urls(value: str) -> tuple[str, bool]:
         return "[REDACTED]", True
     candidate, urls_redacted = _hostname_only_embedded_urls(candidate)
     if (
-        _HTTP_URL_LIKE_RE.search(candidate)
+        _UNSAFE_URL_LIKE_RE.search(candidate)
         or _EMBEDDED_FILE_URL_RE.search(candidate)
         or _LOCAL_PATH_RE.search(candidate)
     ):

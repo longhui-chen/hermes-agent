@@ -212,17 +212,32 @@ def test_malformed_encoded_free_text_url_fails_closed() -> None:
     [
         "https://Example.COM/magic link/opaque-credential",
         "https:%2G%2Gexample.com/magic/opaque-credential",
+        "https:%2F%2FExample.COM%2Fmagic link/opaque-credential",
+        "HTTPS%253A%252F%252FExample.COM%252Fmagic link/opaque-credential",
+        "https%3A%2G%2Gexample.com/magic/opaque-credential",
+        "HTTPS%253A%252G%252Gexample.com%252Fmagic%252Fopaque-credential",
     ],
 )
 def test_ambiguous_free_text_url_boundary_fails_closed(target: str) -> None:
     preview = project_browser_state_preview(
         "browser_navigate",
-        {"success": True, "title": f"Continue at {target}"},
+        {
+            "success": True,
+            "title": f"Continue at {target}",
+            "snapshot": f'- link "Open {target}" [ref=e1]',
+        },
+    )
+    vision = project_browser_state_preview(
+        "browser_vision",
+        {"success": True, "analysis": f"Continue at {target}"},
     )
 
     assert preview is not None
-    assert preview["title"] == "[REDACTED]"
-    assert "opaque-credential" not in json.dumps(preview)
+    assert preview["title"].endswith("[REDACTED]")
+    assert preview["elements"][0]["label"].endswith("[REDACTED]")
+    assert vision is not None
+    assert vision["summary"].endswith("[REDACTED]")
+    assert "opaque-credential" not in json.dumps([preview, vision])
 
 
 @pytest.mark.parametrize(
