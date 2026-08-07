@@ -2396,6 +2396,39 @@ def collect_prefetch_citations(agent, parts) -> None:
         pass
 
 
+def collect_answer_attribution_citations(agent, answer_text) -> None:
+    """系统提示常驻记忆的事后归因（需求 3 第三通道，真机缺口）：MEMORY.md/
+    USER.md 全文常驻系统提示，模型不调 search_memory 也能答出记忆内容，此时
+    本轮没有任何引用可显示。turn 收尾若本轮无引用且回答非平凡，用 curated
+    打分器拿回答文本反查记忆条目；中文按单字分词，虚词与任何条目都有重叠，
+    须用相对阈值（命中数 ≥ max(6, 35% 答案去重 token 数)）压误报，宁缺勿滥。
+    静默失败——归因是旁路装饰，绝不影响回答与既有引用。"""
+    try:
+        text = str(answer_text or "").strip()
+        if len(text) < 20:
+            return
+        if getattr(agent, "_zet_memory_citations", None):
+            return  # 工具/预取路径已有引用，事后归因让位
+        from tools.search_memory_tool import _TOKEN_RE, search_memory_tool as _smt
+        query = text[:400]
+        token_count = len(set(_TOKEN_RE.findall(query.lower())))
+        if token_count < 8:
+            return
+        raw = _smt({"query": query, "top_k": 4},
+                   memory_manager=getattr(agent, "_memory_manager", None))
+        parsed = json.loads(raw)
+        items = parsed.get("items") if isinstance(parsed, dict) else None
+        if not isinstance(items, list):
+            return
+        floor = max(6.0, 0.35 * token_count)
+        kept = [it for it in items
+                if isinstance(it, dict) and float(it.get("score", 0) or 0) >= floor]
+        if kept:
+            collect_memory_citations(agent, json.dumps({"items": kept}, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,

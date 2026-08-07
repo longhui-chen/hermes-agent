@@ -161,3 +161,66 @@ def test_collect_prefetch_citations_silent_on_bad_input():
     collect_prefetch_citations(agent, None)
     collect_prefetch_citations(agent, [("x",)])  # 坏形状 → 静默
     assert getattr(agent, "_zet_memory_citations", {}) in ({}, getattr(agent, "_zet_memory_citations", {}))
+
+
+def _fake_smt(items):
+    def _tool(args, memory_manager=None):
+        import json as _json
+        return _json.dumps({"items": items}, ensure_ascii=False)
+    return _tool
+
+
+def test_answer_attribution_keeps_only_high_relative_score(monkeypatch):
+    """事后归因（常驻记忆通道）：相对阈值（≥35% 答案 token 数）过滤——
+    真命中条目留下，只共享虚词的低分条目丢弃。"""
+    import tools.search_memory_tool as smt_mod
+    from agent.agent_runtime_helpers import collect_answer_attribution_citations
+
+    answer = "你们团队的产品周会安排在每周五下午，周报需要在周会开始之前发出来。"
+    monkeypatch.setattr(smt_mod, "search_memory_tool", _fake_smt([
+        {"id": "hit1", "source": "memory", "excerpt": "每周五下午开产品周会", "score": 18.0},
+        {"id": "noise", "source": "memory", "excerpt": "AC 内存 2GB 限制", "score": 4.0},
+    ]))
+
+    class _Agent:
+        _memory_manager = None
+
+    agent = _Agent()
+    collect_answer_attribution_citations(agent, answer)
+    sink = agent._zet_memory_citations
+    assert list(sink) == ["hit1"]
+
+
+def test_answer_attribution_defers_to_existing_citations(monkeypatch):
+    """本轮已有工具/预取引用时归因让位，不覆盖不追加。"""
+    import tools.search_memory_tool as smt_mod
+    from agent.agent_runtime_helpers import (
+        collect_answer_attribution_citations,
+        collect_memory_citations,
+    )
+    monkeypatch.setattr(smt_mod, "search_memory_tool", _fake_smt([
+        {"id": "hit1", "source": "memory", "excerpt": "x", "score": 99.0},
+    ]))
+
+    class _Agent:
+        _memory_manager = None
+
+    agent = _Agent()
+    collect_memory_citations(agent, '{"items": [{"id": "tool-1", "source": "memory", "excerpt": "y"}]}')
+    collect_answer_attribution_citations(agent, "一段足够长的回答文本，其中包含很多不同的字符组合内容。")
+    assert list(agent._zet_memory_citations) == ["tool-1"]
+
+
+def test_answer_attribution_skips_trivial_answers(monkeypatch):
+    import tools.search_memory_tool as smt_mod
+    from agent.agent_runtime_helpers import collect_answer_attribution_citations
+    called = []
+    monkeypatch.setattr(smt_mod, "search_memory_tool", lambda *a, **k: called.append(1) or '{"items": []}')
+
+    class _Agent:
+        _memory_manager = None
+
+    agent = _Agent()
+    collect_answer_attribution_citations(agent, "好的")
+    assert not called
+    assert not getattr(agent, "_zet_memory_citations", None)

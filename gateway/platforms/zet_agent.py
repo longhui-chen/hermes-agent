@@ -2152,6 +2152,14 @@ class ZetAgentAdapter(APIServerAdapter):
             # 发射失败一律静默——引用展示是旁路，绝不影响回答。
             try:
                 _cit_agent = agent_ref[0] if agent_ref else None
+                if _cit_agent is not None and not getattr(_cit_agent, "_zet_memory_citations", None):
+                    # 常驻系统提示的记忆没有采集点（模型不调工具就无引用）——
+                    # 用回答文本对记忆条目做事后归因（相对阈值压误报）。
+                    _final_text = ""
+                    if isinstance(result, tuple) and result and isinstance(result[0], dict):
+                        _final_text = str(result[0].get("final_response") or "")
+                    from agent.agent_runtime_helpers import collect_answer_attribution_citations
+                    collect_answer_attribution_citations(_cit_agent, _final_text)
                 citations = getattr(_cit_agent, "_zet_memory_citations", None)
                 if stream_q is not None and isinstance(citations, dict) and citations:
                     self._push_memory_citations(
