@@ -823,9 +823,29 @@ class TestChatCompletionsZettlabTaskHeaders:
         assert "X-Task-Id" not in headers
         assert "X-Zettlab-Conversation-ID" not in headers
 
-    def test_cron_session_collapses_to_stable_job_task_id(self, transport):
-        # cron_<job>_<YYYYMMDD>_<HHMMSS> -> cron_<job> so all runs of a cron job
-        # aggregate into one credit-ledger task card.
+    def test_turn_scoped_task_id_keeps_the_conversation_routing_key(self, transport):
+        # 🔴 F5 red line: the ledger key carries the turn segment, the routing /
+        # prompt-cache key must not — one bucket per conversation, not per turn.
+        from gateway.session_context import set_zettlab_turn_id
+
+        set_zettlab_turn_id("turn-7")
+        try:
+            kw = transport.build_kwargs(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=30.0,
+                session_id="zettlab:u1:agent-a:abc123",
+            )
+        finally:
+            set_zettlab_turn_id("")
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc123:tturn-7"
+        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc123"
+        assert headers["X-Task-Id"] != headers["X-Zettlab-Conversation-ID"]
+
+    def test_cron_session_bills_per_run_and_routes_per_job(self, transport):
+        # cron_<job>_<YYYYMMDD>_<HHMMSS> bills as-is (one ledger card per run)
+        # while the routing key collapses to cron_<job> (stable per job).
         msgs = [{"role": "user", "content": "hi"}]
         kw = transport.build_kwargs(
             model="gpt-4o",
@@ -834,7 +854,7 @@ class TestChatCompletionsZettlabTaskHeaders:
             session_id="cron_4b2628798006_20260624_104233",
         )
         headers = kw.get("extra_headers") or {}
-        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Task-Id") == "cron_4b2628798006_20260624_104233"
         assert headers.get("X-Zettlab-Conversation-ID") == "cron_4b2628798006"
         assert headers.get("X-Scene-Type") == "agent"
 
@@ -854,13 +874,14 @@ class TestChatCompletionsZettlabTaskHeaders:
                 session_id="cron_job1_20260624_104233",
             )
             headers = kw.get("extra_headers") or {}
-            assert headers.get("X-Task-Id") == "cron_job1"
+            assert headers.get("X-Task-Id") == "cron_job1_20260624_104233"
             assert unquote(headers.get("X-Task-Title", "")) == "站立提醒"
         finally:
             _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
 
     def test_interactive_session_omits_task_title(self, transport):
-        # No cron title var -> X-Task-Title must not be stamped on conversations.
+        # No cron title var and no bound turn title -> X-Task-Title must not be
+        # stamped (the client falls back to its own scene mapping).
         from gateway.session_context import _VAR_MAP
 
         _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
@@ -872,3 +893,32 @@ class TestChatCompletionsZettlabTaskHeaders:
         )
         headers = kw.get("extra_headers") or {}
         assert "X-Task-Title" not in headers
+
+    def test_turn_title_is_stamped_for_interactive_turns(self, transport):
+        # The API server binds this turn's user-message summary; every model
+        # call of the turn stamps the same percent-encoded title.
+        from urllib.parse import unquote
+
+        from gateway.session_context import (
+            _VAR_MAP,
+            pop_zettlab_turn_title,
+            push_zettlab_turn_title,
+        )
+
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+        token = push_zettlab_turn_title("帮我整理这周的照片")
+        try:
+            kwargs = [
+                transport.build_kwargs(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": "hi"}],
+                    timeout=30.0,
+                    session_id="zettlab:u1:agent-a:abc123",
+                )
+                for _ in range(2)
+            ]
+        finally:
+            pop_zettlab_turn_title(token)
+        titles = {(kw.get("extra_headers") or {}).get("X-Task-Title") for kw in kwargs}
+        assert len(titles) == 1
+        assert unquote(titles.pop()) == "帮我整理这周的照片"

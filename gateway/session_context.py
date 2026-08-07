@@ -36,8 +36,9 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
-from contextlib import contextmanager
+import hashlib
 import re
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
 
@@ -172,12 +173,39 @@ _CURRENT_TURN_REFERENCE_IMAGE: ContextVar[str] = ContextVar(
 )
 
 
+# Short summary of the current turn's user message, stamped as X-Task-Title so
+# the credit ledger's per-turn card shows what the turn was about (the cron
+# equivalent is _CRON_TASK_TITLE). Bound per request by the API-server adapter;
+# empty everywhere else, where the client still falls back to local parsing.
+_ZETTLAB_TURN_TITLE: ContextVar = ContextVar("zettlab_turn_title", default="")
+
+# Ledger attribution key captured before spawning a background worker. See
+# billing_usage_id() — ContextVars do not follow a bare thread, so a worker
+# whose spend belongs to the turn that started it re-binds the key here.
+_BILLING_USAGE_ID: ContextVar = ContextVar("zettlab_billing_usage_id", default="")
+
+
 def set_zettlab_turn_id(turn_id: str) -> None:
     _ZETTLAB_TURN_ID.set(turn_id or "")
 
 
 def zettlab_turn_id() -> str:
     return _ZETTLAB_TURN_ID.get().strip()
+
+
+def push_zettlab_turn_title(title: str):
+    """Bind this turn's ledger card title and return its reset token."""
+    return _ZETTLAB_TURN_TITLE.set(str(title or "").strip())
+
+
+def pop_zettlab_turn_title(token) -> None:
+    """Restore the turn title that preceded this turn."""
+    _ZETTLAB_TURN_TITLE.reset(token)
+
+
+def zettlab_turn_title() -> str:
+    """Return the current turn's ledger card title ('' when unbound)."""
+    return _ZETTLAB_TURN_TITLE.get().strip()
 
 
 def push_zettlab_browser_session_token(value: str):
@@ -702,28 +730,49 @@ def async_delivery_supported() -> bool:
 # ---------------------------------------------------------------------------
 
 # Cron sessions are ``cron_<job_id>_<YYYYMMDD>_<HHMMSS>`` (a fresh id per run).
-# Strip the trailing date+time so every run of a job collapses to a stable
-# ``cron_<job_id>`` — the credit ledger then aggregates all runs into one task
-# card per cron job instead of one card per minute.
+# Stripping the trailing date+time recovers the stable per-job ``cron_<job_id>``,
+# which is what the routing/cache key uses — the ledger key keeps the timestamp
+# so each execution gets its own usage card (see billing_conversation_id_for).
 _CRON_RUN_TS_RE = re.compile(r"_\d{8}_\d{6}$")
+
+# Turn segment appended to an interactive session's ledger key, so the ledger
+# shows one card per chat turn instead of one per conversation.
+_TURN_SEGMENT_PREFIX = ":t"
+# ai-api truncates task_id at 128 chars. Cap the composed key below that so a
+# long client-minted turn id cannot clip the session part of the key; past the
+# cap the turn segment degrades to a short digest instead. The cap can only
+# protect keys whose session part itself fits: a session id longer than
+# 128 - len(":t") - digest chars still overflows even in digest form, and
+# ai-api's truncation then collapses that session's turns back onto one card —
+# session-level attribution, same as before per-turn keys existed.
+_MAX_BILLING_USAGE_ID_LEN = 120
+_TURN_SEGMENT_DIGEST_LEN = 12
+
+# A turn id is emitted into the key verbatim only when it is entirely made of
+# these characters: unambiguous (no ``:`` — the key's own separator) and safe
+# for an HTTP header value (ASCII; httpx raises UnicodeEncodeError on anything
+# else at request-encode time, which would fail every model call of the turn).
+_TURN_SEGMENT_SAFE_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+# X-Task-Title carries one short line; longer user messages are cut here.
+_MAX_TURN_TITLE_LEN = 60
 
 
 def billing_task_id_for(session_id: str) -> str:
-    """Map a session_id to the credit-ledger task_id to attribute spend to.
+    """Map a session_id to the credit-ledger key its spend belongs to.
 
-    - Interactive sessions (``zettlab:<uid>:<agent>:<rand>``) → used as-is, so a
-      conversation's turns aggregate into one task card.
-    - Cron sessions (``cron_<job>_<YYYYMMDD>_<HHMMSS>``) → collapsed to a stable
-      ``cron_<job>`` so all runs of a cron job aggregate into one card.
+    - Interactive sessions (``zettlab:<uid>:<agent>:<rand>``) → used as-is; the
+      per-turn segment is added by :func:`billing_usage_id_for`.
+    - Cron sessions (``cron_<job>_<YYYYMMDD>_<HHMMSS>``) → used as-is, so every
+      run of a job is its own ledger card instead of all runs collapsing into
+      one per-job card.
     - Anything else → '' (don't attribute; also avoids leaking X-Task-Id to
       third-party providers on non-NAS sessions).
     """
     if not isinstance(session_id, str) or not session_id:
         return ""
-    if session_id.startswith("zettlab:"):
+    if session_id.startswith("zettlab:") or session_id.startswith("cron_"):
         return session_id
-    if session_id.startswith("cron_"):
-        return _CRON_RUN_TS_RE.sub("", session_id)
     return ""
 
 
@@ -732,16 +781,120 @@ def billing_task_id() -> str:
     return billing_task_id_for(get_session_env("HERMES_SESSION_ID", ""))
 
 
-def billing_task_title_encoded() -> str:
-    """Percent-encoded cron job name for the current run, for the X-Task-Title header.
+def billing_conversation_id_for(session_id: str) -> str:
+    """Map a session_id to the ai-gateway routing key (X-Zettlab-Conversation-ID).
 
-    Only cron runs set ``HERMES_CRON_TASK_TITLE`` (see run_job), so this returns
-    '' for interactive sessions. HTTP headers are ASCII-only, so the (possibly
-    CJK) title is percent-encoded here; ai-api ``url.QueryUnescape``-decodes it
-    once at the boundary before persisting to ``scene_params.task_title``.
-    Returns '' when there is no title to stamp.
+    🔴 This is deliberately NOT the ledger key: ai-gateway keys sticky model
+    routing and prompt-cache affinity off this value, so it must stay stable for
+    a whole conversation. Appending the turn segment here would give every turn
+    a fresh routing/cache bucket and collapse the cache hit rate.
+
+    Cron runs collapse to ``cron_<job>`` — unchanged from before the ledger keys
+    went per-run — so consecutive runs of one job keep their routing stickiness.
+    """
+    base = billing_task_id_for(session_id)
+    if base.startswith("cron_"):
+        return _CRON_RUN_TS_RE.sub("", base)
+    return base
+
+
+def billing_conversation_id() -> str:
+    """``billing_conversation_id_for`` for the current session context."""
+    return billing_conversation_id_for(get_session_env("HERMES_SESSION_ID", ""))
+
+
+def _turn_key_segment(turn_id: Any) -> str:
+    """Normalize a turn id into one key segment: header-safe, no separators.
+
+    The upstream contract (api_server._extract_turn_id) deliberately accepts any
+    trimmed token free of whitespace/control chars — including colons, symbols
+    and non-ASCII. Those cannot pass into the composed X-Task-Id verbatim, and
+    *dropping* the offending characters would let two distinct turn ids (e.g.
+    ``turn:1`` / ``turn1``) collide on one ledger card. So: a token made purely
+    of ``[A-Za-z0-9._-]`` passes through unchanged; anything else becomes the
+    first :data:`_TURN_SEGMENT_DIGEST_LEN` hex chars of its sha1 — still
+    deterministic and unique per turn, always a legal header value.
+    """
+    text = str(turn_id or "").strip()
+    if not text:
+        return ""
+    if _TURN_SEGMENT_SAFE_RE.fullmatch(text):
+        return text
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:_TURN_SEGMENT_DIGEST_LEN]
+
+
+def billing_usage_id_for(session_id: str, turn_id: Any = None) -> str:
+    """Ledger key for one unit of usage — a chat turn, or a single cron run.
+
+    Interactive sessions get a ``:t<turn>`` segment so each turn bills to its own
+    ledger card; cron sessions already carry their per-run timestamp and are
+    returned unchanged.
+
+    *turn_id* defaults to the current request's turn (``zettlab_turn_id``). Pass
+    it explicitly from a background worker: ContextVars do not follow a bare
+    thread, so a worker that must bill to the turn which spawned it has to carry
+    the value across itself.
+
+    Falls back to the plain session key when no turn is bound (CLI, gateway
+    platforms, cron), so non-API-server callers keep session-level attribution.
+    """
+    base = billing_task_id_for(session_id)
+    if not base.startswith("zettlab:"):
+        return base
+    segment = _turn_key_segment(zettlab_turn_id() if turn_id is None else turn_id)
+    if not segment:
+        return base
+    usage_id = f"{base}{_TURN_SEGMENT_PREFIX}{segment}"
+    if len(usage_id) > _MAX_BILLING_USAGE_ID_LEN:
+        digest = hashlib.sha1(segment.encode("utf-8")).hexdigest()[:_TURN_SEGMENT_DIGEST_LEN]
+        usage_id = f"{base}{_TURN_SEGMENT_PREFIX}{digest}"
+    return usage_id
+
+
+def billing_usage_id() -> str:
+    """``billing_usage_id_for`` for the current session/turn context.
+
+    A key bound via :func:`push_billing_usage_id` wins: background workers
+    (title generation) run outside the turn's context and re-bind the key they
+    captured before spawning, so their spend still lands on that turn's card.
+    """
+    override = _BILLING_USAGE_ID.get().strip()
+    if override:
+        return override
+    return billing_usage_id_for(get_session_env("HERMES_SESSION_ID", ""))
+
+
+def push_billing_usage_id(usage_id: str):
+    """Bind a captured ledger key for this context; returns its reset token."""
+    return _BILLING_USAGE_ID.set(str(usage_id or "").strip())
+
+
+def pop_billing_usage_id(token) -> None:
+    """Restore the ledger key that preceded :func:`push_billing_usage_id`."""
+    _BILLING_USAGE_ID.reset(token)
+
+
+def summarize_turn_title(user_message: Any) -> str:
+    """Collapse a turn's user message into a short one-line ledger card title."""
+    text = " ".join(str(user_message or "").split())
+    return text[:_MAX_TURN_TITLE_LEN]
+
+
+def billing_task_title_encoded() -> str:
+    """Percent-encoded X-Task-Title for the current run.
+
+    Cron runs carry the job name (``HERMES_CRON_TASK_TITLE``, set by run_job) so
+    the ledger's cron card shows the real name even after the job is deleted;
+    interactive turns carry this turn's user-message summary (bound by the API
+    server, see :func:`push_zettlab_turn_title`) so the per-turn card has a title
+    without the client having to resolve one locally.
+
+    HTTP headers are ASCII-only, so the (possibly CJK) title is percent-encoded
+    here; ai-api ``url.QueryUnescape``-decodes it once at the boundary before
+    persisting to ``scene_params.task_title``. Returns '' when there is no title
+    to stamp — the client then falls back to its local scene mapping.
     """
     from urllib.parse import quote
 
-    title = get_session_env("HERMES_CRON_TASK_TITLE", "").strip()
+    title = get_session_env("HERMES_CRON_TASK_TITLE", "").strip() or zettlab_turn_title()
     return quote(title, safe="") if title else ""

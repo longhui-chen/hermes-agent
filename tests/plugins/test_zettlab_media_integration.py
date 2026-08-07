@@ -734,3 +734,26 @@ def test_zet_agent_hides_video_tool_when_zettlab_is_disabled_even_if_another_pro
     )
 
     assert "video_generate" not in {item["function"]["name"] for item in definitions}
+
+
+def test_media_job_bills_to_the_current_turn():
+    """A media job requested inside a turn bills to that turn's ledger card."""
+    from gateway.session_context import set_zettlab_turn_id
+    from plugins import zettlab_media_client as client
+
+    set_zettlab_turn_id("turn-5")
+    try:
+        assert (
+            client._billing_task_id("zettlab:user:main:session-local")
+            == "zettlab:user:main:session-local:tturn-5"
+        )
+        # Non-Zettlab sessions and unbound turns keep the raw session id, so
+        # attribution never gets weaker than before per-turn keys.
+        assert client._billing_task_id("local-session") == "local-session"
+    finally:
+        set_zettlab_turn_id("")
+
+    assert (
+        client._billing_task_id("zettlab:user:main:session-local")
+        == "zettlab:user:main:session-local"
+    )
