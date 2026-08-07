@@ -1024,6 +1024,8 @@ _CONNECTOR_RUNTIME_SHELL_OPTIONS_WITH_ARG = {
 _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH = 8
 _CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _CONNECTOR_RUNTIME_TIMEOUT_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?")
+_LARK_CLI_COMMAND = "lark-cli"
+_LARK_CLI_MAX_TIMEOUT_SECONDS = 600
 @dataclass(frozen=True)
 class _ConnectorRuntimeRootAnchor:
     configured_root: Path
@@ -1038,6 +1040,11 @@ class _ConnectorRuntimeCommand:
     argv: list[str]
     root_identity: tuple[int, int]
     script_identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _LarkCLICommand:
+    args: list[str]
 
 
 @dataclass(frozen=True)
@@ -2031,6 +2038,191 @@ def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
         _log_connector_runtime_rejection(reason or "trust_check_failed", str(relative))
         return None
     return path
+
+
+def _managed_lark_cli_broker_enabled() -> bool:
+    return os.environ.get("HERMES_MANAGED_GATEWAY") == "1" and os.name != "nt"
+
+
+def _lex_lark_cli_command(command: str) -> Optional[list[str]]:
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _parse_lark_cli_command(command: str) -> Optional[_LarkCLICommand]:
+    """Parse one exact foreground lark-cli invocation without a shell."""
+
+    if not _managed_lark_cli_broker_enabled():
+        return None
+    tokens = _lex_lark_cli_command(command)
+    if not tokens or tokens[0] != _LARK_CLI_COMMAND:
+        return None
+    if any(
+        token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+        for token in tokens
+    ):
+        return None
+    return _LarkCLICommand(args=tokens[1:])
+
+
+def _lark_cli_command_is_present(command: str) -> bool:
+    tokens = _lex_lark_cli_command(command)
+    if tokens is None:
+        first = command.strip().split(None, 1)[0] if command.strip() else ""
+        return first == _LARK_CLI_COMMAND
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    for segment in segments:
+        for index, token in enumerate(segment):
+            if Path(token).name != _LARK_CLI_COMMAND:
+                continue
+            if index == 0 or _connector_runtime_command_prefix_is_supported(
+                segment[:index]
+            ):
+                return True
+    return False
+
+
+def _lark_cli_shell_guard_result(
+    command: str,
+    *,
+    compound: bool = False,
+) -> Optional[str]:
+    """Keep broker-required lark-cli calls out of generic/background shells."""
+
+    if (
+        not _managed_lark_cli_broker_enabled()
+        or not _lark_cli_command_is_present(command)
+    ):
+        return None
+    code = "lark_cli_compound_command" if compound else "lark_cli_direct_only"
+    message = (
+        "Managed lark-cli commands must run as one direct foreground non-PTY "
+        "terminal call, without shell operators or command wrappers. Retry "
+        "each lark-cli command in a separate terminal tool call."
+    )
+    return json.dumps(
+        {
+            "output": "",
+            "exit_code": 2,
+            "error": message,
+            "errorCode": code,
+            "status": "error",
+            "lark_cli_brokered": False,
+            "lark_cli_blocked": True,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _lark_cli_broker_agent_id() -> str:
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+    scope = current_secret_scope()
+    if scope is None and is_multiplex_active():
+        raise RuntimeError("lark-cli profile scope unavailable")
+    agent_id = str(
+        (scope or {}).get("ZET_AGENT_ID")
+        or ("" if is_multiplex_active() else os.environ.get("ZET_AGENT_ID", ""))
+    ).strip()
+    if not agent_id:
+        raise RuntimeError("lark-cli profile identity unavailable")
+    return agent_id
+
+
+def _lark_cli_result_json(
+    *,
+    output: str,
+    exit_code: int,
+    timed_out: bool,
+) -> str:
+    from agent.redact import redact_sensitive_text
+    from tools.ansi_strip import strip_ansi
+
+    normalized = strip_ansi(str(output or ""))
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        max_output_chars = get_max_bytes()
+    except Exception:
+        max_output_chars = 50000
+    if len(normalized) > max_output_chars:
+        head_chars = int(max_output_chars * 0.4)
+        tail_chars = max_output_chars - head_chars
+        omitted = len(normalized) - head_chars - tail_chars
+        normalized = (
+            normalized[:head_chars]
+            + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted] ...\n\n"
+            + normalized[-tail_chars:]
+        )
+    normalized = (
+        redact_sensitive_text(normalized.strip(), force=True, code_file=False)
+        if normalized
+        else ""
+    )
+    return json.dumps(
+        {
+            "output": normalized,
+            "exit_code": 124 if timed_out else int(exit_code),
+            "error": "Command timed out while running lark-cli" if timed_out else None,
+            "status": "error" if timed_out else "completed",
+            "lark_cli_brokered": True,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _run_lark_cli_command_if_allowed(
+    command: str,
+    *,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_lark_cli_command(command)
+    if parsed is None:
+        return _lark_cli_shell_guard_result(command, compound=True)
+    try:
+        normalized_timeout = max(
+            1,
+            min(int(timeout), _LARK_CLI_MAX_TIMEOUT_SECONDS),
+        )
+        from agent.credential_broker import request_lark_cli
+
+        completed = request_lark_cli(
+            _lark_cli_broker_agent_id(),
+            parsed.args,
+            timeout_seconds=normalized_timeout,
+        )
+        return _lark_cli_result_json(
+            output=completed.output,
+            exit_code=completed.exit_code,
+            timed_out=completed.timed_out,
+        )
+    except Exception as exc:
+        logger.warning("Managed lark-cli broker request failed: %s", type(exc).__name__)
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": str(exc),
+                "errorCode": "lark_cli_broker_unavailable",
+                "status": "error",
+                "lark_cli_brokered": True,
+            },
+            ensure_ascii=False,
+        )
 
 
 def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntimeCommand]:
@@ -7216,6 +7408,9 @@ def terminal_tool(
             if connector_runtime_result is not None:
                 return connector_runtime_result
         else:
+            lark_cli_result = _lark_cli_shell_guard_result(command)
+            if lark_cli_result is not None:
+                return lark_cli_result
             camera_runtime_result = _camera_runtime_shell_guard_result(command)
             if camera_runtime_result is not None:
                 return camera_runtime_result
@@ -7453,6 +7648,17 @@ def terminal_tool(
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+
+        # Managed lark-cli is intentionally brokered only after the ordinary
+        # terminal approval pass. That preserves the CLI's read/write/high-risk
+        # approval semantics while keeping OAuth files out of the model shell.
+        if not background and not pty and env_type == "local":
+            lark_cli_result = _run_lark_cli_command_if_allowed(
+                command,
+                timeout=effective_timeout,
+            )
+            if lark_cli_result is not None:
+                return lark_cli_result
 
         # Prepare command for execution
         pty_disabled_reason = None
