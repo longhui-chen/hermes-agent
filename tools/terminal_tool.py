@@ -3062,7 +3062,7 @@ def _video_edit_worker_process_identity_is_current(
         return not readable
 
     try:
-        os.kill(identity.pid, 0)
+        os.kill(identity.pid, 0)  # windows-footgun: ok -- POSIX worker only
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -3512,7 +3512,7 @@ def _run_trusted_video_edit_worker_supervisor_child(
         os.environ.clear()
         os.environ.update(worker_env)
         _close_inherited_video_edit_worker_fds(keep={child_fd, source_fd})
-        os.setsid()
+        os.setsid()  # windows-footgun: ok -- forked POSIX supervisor child
         sys.argv = [
             "hermes-resident-worker-supervisor",
             str(source_fd),
@@ -3567,7 +3567,7 @@ def _trusted_video_edit_worker_factory_bootstrap(
     child_pid: Optional[int] = None
     process: Optional[_ForkedVideoEditWorkerSeed] = None
     try:
-        child_pid = os.fork()
+        child_pid = os.fork()  # windows-footgun: ok -- POSIX-gated worker path
         if child_pid == 0:
             _run_trusted_video_edit_worker_supervisor_child(
                 image=image,
@@ -3799,12 +3799,12 @@ def _force_kill_video_edit_worker_group(
         return False
     group_signaled = True
     try:
-        os.killpg(identity.pid, signal.SIGKILL)
+        os.killpg(identity.pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX worker
     except (PermissionError, ProcessLookupError):
         group_signaled = False
     leader_signaled = _signal_video_edit_worker_process_identity(
         identity,
-        signal.SIGKILL,
+        signal.SIGKILL,  # windows-footgun: ok -- POSIX worker
     )
     return group_signaled or leader_signaled
 
