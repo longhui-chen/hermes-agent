@@ -499,3 +499,60 @@ def test_connection_candidate_missing_name_falls_back_to_target(monkeypatch):
     )
     assert len(ctx.emitted) == 1
     assert ctx.emitted[0]["payload"] == {"channel_kind": "telegram"}
+
+
+# ---------------------------------------------------------------------------
+# agent 品类开关（AGENT_RECOMMENDATION_ENABLED）——落地工具缺失期的止血闸
+# ---------------------------------------------------------------------------
+
+
+def test_agent_decision_is_rejected_while_disabled(monkeypatch):
+    """开关关闭时，即便模型仍返回 agent（prompt 只是引导），事后硬闸也必须拒绝，
+    绝不出一张点了必然失败的卡。"""
+    plugin = _load_plugin()
+    assert plugin.AGENT_RECOMMENDATION_ENABLED is False
+    agent_candidate = {
+        "decision": "agent",
+        "suggested_name": "邮件待办助手",
+        "reason": "邮件待办会随新邮件持续变化，需要长期跟进。",
+        "evidence_turn_ids": ["evidence-1"],
+        "confidence": 0.9,
+        "dedup_key": "mail-todo-agent",
+        "proposal_text": "要创建一个邮件待办助手吗？",
+    }
+    ctx = _Context(_FakeLlm([agent_candidate]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    assert _drive_turn(plugin, "s-agent-off", "帮我看看邮件里的待办") is None
+    assert ctx.emitted == []
+
+
+def test_agent_option_hidden_from_detector_while_disabled():
+    """开关关闭时模型连选项都看不到：schema enum 无 agent，指令给出明确禁令。"""
+    plugin = _load_plugin()
+    assert "agent" not in plugin._DETECTOR_SCHEMA["properties"]["decision"]["enum"]
+    instructions = plugin._detector_instructions()
+    assert "DISABLED on this deployment" in instructions
+    assert "__AGENT_RULE__" not in instructions
+
+
+def test_skill_and_task_unaffected_by_agent_switch(monkeypatch):
+    """回归护栏：关掉 agent 不影响 skill/task 的正常推荐。"""
+    plugin = _load_plugin()
+    skill_candidate = {
+        "decision": "skill",
+        "suggested_name": "周报整理法",
+        "reason": "同一套整理方法会被反复使用。",
+        "evidence_turn_ids": ["evidence-1"],
+        "confidence": 0.85,
+        "dedup_key": "weekly-report-method",
+        "proposal_text": "要沉淀成一个 Skill 吗？",
+    }
+    ctx = _Context(_FakeLlm([skill_candidate]))
+    plugin.register(ctx)
+    monkeypatch.setattr(plugin, "_fetch_connection_inventory", lambda: dict(_INVENTORY))
+
+    transformed = _drive_turn(plugin, "s-skill-on", "帮我把这周的数据整理一下")
+    assert transformed is not None
+    assert "creation-recommendation:start" in transformed

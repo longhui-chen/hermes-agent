@@ -50,6 +50,12 @@ PROMPT_COOLDOWN_TURNS = 10
 SESSION_STATE_TTL_SECONDS = 24 * 60 * 60
 MAX_SESSION_STATES = 512
 CREATION_TYPES = {"agent", "skill", "task"}
+# agent 品类落地缺口（2026-08-07 真机实测）：hermes 侧没有 create_agent 工具
+# （task 走原生定时、skill 有 skill_manager_tool，唯独 agent 档案的增删归
+# zls 管理 API / App 界面，从未暴露给会话），用户点「确认」必然收到
+# "Agent 创建服务当前不可用"。推荐一个建不成的东西比不推更伤，先关掉。
+# **恢复方式：补齐 create_agent 工具后把这里改回 True，无需改动其他代码。**
+AGENT_RECOMMENDATION_ENABLED = False
 # Connection recommendations (Zettlab 需求 2/5)：channel/connector 走结构化
 # attachment 通道（ctx.emit_attachment → channel.connect / connector.connect 卡），
 # 与 agent/skill/task 的文本信封通道并行；共用同一套评估节奏 / 冷却 / 去重 /
@@ -737,7 +743,9 @@ _DETECTOR_SCHEMA = {
     "properties": {
         "decision": {
             "type": "string",
-            "enum": ["agent", "skill", "task", "channel", "connector", "artifact", "none"],
+            "enum": (
+                ["agent"] if AGENT_RECOMMENDATION_ENABLED else []
+            ) + ["skill", "task", "channel", "connector", "artifact", "none"],
         },
         "suggested_name": {"type": "string"},
         "reason": {"type": "string"},
@@ -768,6 +776,13 @@ _DETECTOR_SCHEMA = {
 }
 
 
+_AGENT_RULE_ENABLED = """2. agent: future work needs a long-lived responsible role, retained domain context, judgment,
+   autonomous choice among tools, decisions about the next step, or repeated interpretation of a
+   changing real-world business domain, account, operation, project, or body of evidence."""
+
+_AGENT_RULE_DISABLED = """2. agent: DISABLED on this deployment — never return "agent". If a case looks like a long-lived
+   responsible role, evaluate whether a skill or task covers it; otherwise return none."""
+
 _DETECTOR_INSTRUCTIONS = """Perform one high-recall zero-shot product judgment.
 
 Return exactly one of agent, skill, task, channel, connector, artifact, or none. Do not classify by topic words and do not use
@@ -780,9 +795,7 @@ Definitions and conflict order:
 1. task: the desired future value depends on a recurring time trigger, event trigger, background
    monitoring, or repeated refresh of new information. A word such as 'today' that merely scopes
    the current data is not by itself a future trigger.
-2. agent: future work needs a long-lived responsible role, retained domain context, judgment,
-   autonomous choice among tools, decisions about the next step, or repeated interpretation of a
-   changing real-world business domain, account, operation, project, or body of evidence.
+__AGENT_RULE__
 3. skill: future inputs vary but a stable input-to-output method can be reused without an
    independent identity or durable state.
 4. none: small talk, a trivial transformation, a low-value closed-world fact lookup, an explicit
@@ -848,6 +861,12 @@ connector 用于"这类任务实质上需要用户自己的外部数据"。artif
 有长期价值选 artifact。"""
 
 
+def _detector_instructions() -> str:
+    """按开关渲染检测器指令：agent 品类关闭时给出明确禁令而不是判定规则。"""
+    rule = _AGENT_RULE_ENABLED if AGENT_RECOMMENDATION_ENABLED else _AGENT_RULE_DISABLED
+    return _DETECTOR_INSTRUCTIONS.replace("__AGENT_RULE__", rule)
+
+
 def _run_forced_evaluation(
     *,
     user_message: str,
@@ -871,7 +890,7 @@ def _run_forced_evaluation(
         {
             "role": "system",
             "content": (
-                _DETECTOR_INSTRUCTIONS
+                _detector_instructions()
                 + "\n\nReturn only one compact JSON object with exactly these keys: "
                 "decision, suggested_name, reason, target, evidence_turn_ids, "
                 "confidence, dedup_key, proposal_text. suggested_name, reason and "
@@ -967,6 +986,9 @@ def _normalize_candidate(
     )
     if decision == "none":
         return None, "none"
+    if decision == "agent" and not AGENT_RECOMMENDATION_ENABLED:
+        # 事后过滤是硬闸：prompt 只是引导，模型仍可能选 agent。
+        return None, "agent_recommendation_disabled"
     if (
         decision not in CREATION_TYPES
         and decision not in CONNECTION_TYPES

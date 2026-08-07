@@ -23,7 +23,7 @@ class _Llm:
         self.calls.append((_messages, _kwargs))
         return SimpleNamespace(
             text=json.dumps({
-                "decision": "agent",
+                "decision": "skill",
                 "suggested_name": "Business Research Partner",
                 "reason": "Future questions benefit from retained context and judgment.",
                 "evidence_turn_ids": ["evidence-1"],
@@ -137,9 +137,9 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
             .strip()
             + "=="
         ).decode("utf-8"),
-        "creation_type": "agent",
+        "creation_type": "skill",
         "title": "Business Research Partner",
-        "dedup_key": "agent:business-research-partner",
+        "dedup_key": "skill:business-research-partner",
         "evidence_turn_ids": ["evidence-1"],
     }
     response["proposal_id"] = json.loads(response["proposal_id"])["proposal_id"]
@@ -200,9 +200,9 @@ def test_invalid_card_action_flow_is_denied_without_entering_creation():
                 "type": "creation_recommendation_response",
                 "action": "create",
                 "proposal_id": "stale-proposal",
-                "creation_type": "agent",
+                "creation_type": "skill",
                 "title": "Business Research Partner",
-                "dedup_key": "agent:business-research-partner",
+                "dedup_key": "skill:business-research-partner",
             })
             + "\n[/creation_recommendation_response]"
         ),
@@ -230,9 +230,9 @@ def test_invalid_card_action_flow_is_denied_without_entering_creation():
                 "type": "creation_recommendation_response",
                 "action": "create",
                 "proposal_id": "stale-proposal",
-                "creation_type": "agent",
+                "creation_type": "skill",
                 "title": "Business Research Partner",
-                "dedup_key": "agent:business-research-partner",
+                "dedup_key": "skill:business-research-partner",
             })
             + "\n[/creation_recommendation_response]"
         ),

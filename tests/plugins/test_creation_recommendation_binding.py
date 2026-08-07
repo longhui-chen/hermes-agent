@@ -9,7 +9,7 @@ from tests.plugins.test_creation_governor_plugin import _Context, _FakeLlm, _loa
 
 def _candidate() -> dict[str, object]:
     return {
-        "decision": "agent",
+        "decision": "skill",
         "suggested_name": "广告分析助手",
         "reason": "后续判断需要保留投放背景",
         "evidence_turn_ids": ["turn-1"],
