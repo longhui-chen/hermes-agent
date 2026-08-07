@@ -138,6 +138,104 @@ def request_lark_cli(
     )
 
 
+def request_lark_auth_start(
+    agent_id: str,
+    *,
+    scope: str = "",
+    timeout_seconds: int,
+    socket_path: str | os.PathLike[str] | None = None,
+) -> LarkCLIResult:
+    """Start the device-code OAuth flow with server-built argv.
+
+    The agent supplies only a scope list; zls composes the exact
+    `auth login --no-wait --json [--scope ...]` invocation, so authorization
+    can never be blocked by (or smuggled through) argv matching.
+    """
+
+    return _request_lark_auth(
+        agent_id,
+        {"purpose": "lark-auth-start", "scope": str(scope or "")},
+        timeout_seconds=timeout_seconds,
+        socket_path=socket_path,
+    )
+
+
+def request_lark_auth_complete(
+    agent_id: str,
+    *,
+    device_code: str,
+    timeout_seconds: int,
+    socket_path: str | os.PathLike[str] | None = None,
+) -> LarkCLIResult:
+    """Finish the device-code OAuth flow; tokens land in the service home."""
+
+    return _request_lark_auth(
+        agent_id,
+        {"purpose": "lark-auth-complete", "device_code": str(device_code or "")},
+        timeout_seconds=timeout_seconds,
+        socket_path=socket_path,
+    )
+
+
+def _request_lark_auth(
+    agent_id: str,
+    body: dict,
+    *,
+    timeout_seconds: int,
+    socket_path: str | os.PathLike[str] | None,
+) -> LarkCLIResult:
+    normalized_agent_id = _normalize_agent_id(agent_id)
+    try:
+        normalized_timeout = int(timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("lark-cli broker timeout is invalid") from exc
+    if not 1 <= normalized_timeout <= _MAX_LARK_TIMEOUT_SECONDS:
+        raise RuntimeError("lark-cli broker timeout is invalid")
+    payload = json.dumps(
+        {
+            "agent_id": normalized_agent_id,
+            "timeout_seconds": normalized_timeout,
+            **body,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    response = _exchange(
+        payload,
+        socket_path=socket_path,
+        response_limit=_MAX_LARK_RESPONSE_BYTES,
+        timeout_seconds=normalized_timeout + _TIMEOUT_SECONDS,
+    )
+    return _parse_lark_result(response)
+
+
+def _parse_lark_result(response: object) -> LarkCLIResult:
+    if not isinstance(response, dict) or set(response) - {
+        "output",
+        "exit_code",
+        "timed_out",
+        "error",
+    }:
+        raise RuntimeError("lark-cli broker response is invalid")
+    error = response.get("error", "")
+    if error:
+        if not isinstance(error, str):
+            raise RuntimeError("lark-cli broker response is invalid")
+        raise RuntimeError(error)
+    output = response.get("output", "")
+    exit_code = response.get("exit_code", 0)
+    timed_out = response.get("timed_out", False)
+    if (
+        not isinstance(output, str)
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or not -1 <= exit_code <= 255
+        or not isinstance(timed_out, bool)
+    ):
+        raise RuntimeError("lark-cli broker response is invalid")
+    return LarkCLIResult(output=output, exit_code=exit_code, timed_out=timed_out)
+
+
 def _normalize_agent_id(agent_id: str) -> str:
     normalized_agent_id = str(agent_id or "").strip()
     encoded_agent_id = normalized_agent_id.encode("utf-8")
