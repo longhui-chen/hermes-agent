@@ -2899,7 +2899,9 @@ class ZetAgentAdapter(APIServerAdapter):
             return agent
 
         interaction_queue_key = (
-            gateway_session_key or self._interaction_queue_key(session_id or "")
+            self._interaction_queue_key(session_id)
+            if session_id
+            else (gateway_session_key or "")
         )
 
         # 1. Reasoning: late-bind on the agent (AIAgent reads
@@ -3051,18 +3053,20 @@ class ZetAgentAdapter(APIServerAdapter):
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
     ):
-        """Wrap base ``_run_agent`` to bind the session-scoped env
-        vars hermes' approval/clarify gate reads at runtime.
+        """Wrap base ``_run_agent`` to bind the App and interaction scopes.
 
-        ``HERMES_SESSION_KEY`` keys the per-session approval queue so
-        that the notify callback we registered in ``_create_agent``
-        is found when the agent calls ``check_all_command_guards``.
-        ``HERMES_EXEC_ASK`` flips the approval gate from "skip" to
-        "block-and-prompt" outside CLI/gateway sessions.
+        ``gateway_session_key`` is the stable external App session key used by
+        managed tools such as the desktop-browser router. Approval/clarify uses
+        a separate profile-scoped interaction key, bound through approval's
+        dedicated ContextVar, so identical lineage session IDs in two profiles
+        cannot share an interaction queue. ``HERMES_EXEC_ASK`` flips the
+        approval gate from "skip" to "block-and-prompt" outside CLI/gateway
+        sessions.
 
-        These flags are bound through gateway.session_context by the
-        subclass ``_bind_api_server_session`` chokepoint. They are never mirrored
-        into process-global ``os.environ`` because HTTP turns overlap.
+        The App/turn flags are bound through gateway.session_context by the
+        subclass ``_bind_api_server_session`` chokepoint. The interaction key
+        below is bound through approval's dedicated ContextVar. Neither scope
+        is mirrored into process-global ``os.environ`` because HTTP turns overlap.
         """
         # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
         # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
@@ -3174,6 +3178,12 @@ class ZetAgentAdapter(APIServerAdapter):
         interaction_queue_key = (
             self._interaction_queue_key(session_id) if session_id else gateway_session_key
         )
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        approval_session_token = set_current_session_key(interaction_queue_key or "")
 
         try:
             result = await super()._run_agent(
@@ -3186,7 +3196,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 agent_ref=agent_ref,
-                gateway_session_key=interaction_queue_key,
+                gateway_session_key=gateway_session_key,
                 requested_model=requested_model,
                 requested_provider=requested_provider,
                 model_options=model_options,
@@ -3357,8 +3367,11 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
             except Exception:
                 logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
-            clear_turn_vars(turn_context_tokens)
-            pop_zettlab_turn_title(turn_title_token)
+            try:
+                reset_current_session_key(approval_session_token)
+            finally:
+                clear_turn_vars(turn_context_tokens)
+                pop_zettlab_turn_title(turn_title_token)
 
     def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
         """Return the model this session will actually use this turn: the
