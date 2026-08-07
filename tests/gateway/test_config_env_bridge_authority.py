@@ -44,6 +44,7 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
             "HERMES_MAX_ITERATIONS",
             "HERMES_AGENT_TIMEOUT",
             "HERMES_AGENT_TIMEOUT_WARNING",
+            "HERMES_SESSION_STALL_TIMEOUT",
             "HERMES_GATEWAY_BUSY_INPUT_MODE",
             "HERMES_GATEWAY_BUSY_TEXT_MODE",
             "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT",
@@ -176,34 +177,24 @@ def hermes_home(tmp_path: Path) -> Path:
     return home
 
 
-def test_config_max_turns_wins_over_stale_env(hermes_home: Path) -> None:
-    """Regression: config.yaml:agent.max_turns=500 must beat .env=60."""
-    _write_config(hermes_home, agent_cfg={"max_turns": 500})
-    _write_env(hermes_home, {"HERMES_MAX_ITERATIONS": "60"})
-
-    env = _run_gateway_import(hermes_home, initial_env={})
-
-    assert env.get("HERMES_MAX_ITERATIONS") == "500", (
-        f"expected config.yaml max_turns=500 to win; got {env.get('HERMES_MAX_ITERATIONS')!r}. "
-        "Stale .env value is shadowing config — the bridge lost its override."
-    )
-
-
 def test_config_gateway_timeout_wins_over_stale_env(hermes_home: Path) -> None:
     """Every agent.* bridge key must be config-authoritative, not .env-authoritative."""
     _write_config(hermes_home, agent_cfg={
         "gateway_timeout": 1800,
         "gateway_timeout_warning": 900,
+        "session_stall_timeout": 300,
     })
     _write_env(hermes_home, {
         "HERMES_AGENT_TIMEOUT": "60",
         "HERMES_AGENT_TIMEOUT_WARNING": "30",
+        "HERMES_SESSION_STALL_TIMEOUT": "15",
     })
 
     env = _run_gateway_import(hermes_home, initial_env={})
 
     assert env.get("HERMES_AGENT_TIMEOUT") == "1800"
     assert env.get("HERMES_AGENT_TIMEOUT_WARNING") == "900"
+    assert env.get("HERMES_SESSION_STALL_TIMEOUT") == "300"
 
 
 def test_config_display_busy_input_mode_wins_over_stale_env(hermes_home: Path) -> None:

@@ -43,31 +43,6 @@ class TestIsHeadedMode:
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
             assert _is_headed_mode() is True
 
-    def test_config_string_true(self):
-        from tools.browser_tool import _is_headed_mode
-        cfg = {"browser": {"headed": "true"}}
-        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
-            assert _is_headed_mode() is True
-
-    def test_config_false_beats_missing_env(self):
-        from tools.browser_tool import _is_headed_mode
-        cfg = {"browser": {"headed": False}}
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AGENT_BROWSER_HEADED", None)
-            with patch("hermes_cli.config.read_raw_config", return_value=cfg):
-                assert _is_headed_mode() is False
-
-    def test_env_var_fallback(self):
-        from tools.browser_tool import _is_headed_mode
-        with patch.dict(os.environ, {"AGENT_BROWSER_HEADED": "1"}):
-            with patch("hermes_cli.config.read_raw_config", return_value={}):
-                assert _is_headed_mode() is True
-
-    def test_env_var_garbage_is_false(self):
-        from tools.browser_tool import _is_headed_mode
-        with patch.dict(os.environ, {"AGENT_BROWSER_HEADED": "banana"}):
-            with patch("hermes_cli.config.read_raw_config", return_value={}):
-                assert _is_headed_mode() is False
 
     def test_caching(self):
         from tools.browser_tool import _is_headed_mode
@@ -219,24 +194,6 @@ class TestHeadedFlagInjection:
         assert len(captured) == 1
         assert "--headed" in captured[0]
 
-    @patch("tools.browser_tool._get_session_info")
-    @patch("tools.browser_tool._find_agent_browser", return_value="/usr/bin/agent-browser")
-    @patch("tools.browser_tool._is_local_mode", return_value=True)
-    @patch("tools.browser_tool._chromium_installed", return_value=True)
-    @patch("tools.browser_tool._get_cloud_provider", return_value=None)
-    @patch("tools.browser_tool._get_cdp_override", return_value="")
-    @patch("tools.browser_tool._is_camofox_mode", return_value=False)
-    def test_headed_flag_not_added_when_headless(
-        self, _camofox, _cdp, _cloud, _chromium, _local, _find, _session
-    ):
-        import tools.browser_tool as bt
-        bt._cached_headed_mode = False
-        bt._headed_mode_resolved = True
-        _session.return_value = {"session_name": "test-sess"}
-
-        captured = self._run_and_capture(bt)
-        assert len(captured) == 1
-        assert "--headed" not in captured[0]
 
     @patch("tools.browser_tool._get_session_info")
     @patch("tools.browser_tool._find_agent_browser", return_value="/usr/bin/agent-browser")

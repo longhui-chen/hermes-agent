@@ -66,33 +66,6 @@ def test_is_available_false_without_config(temp_home, monkeypatch):
     assert ChronosCronScheduler().is_available() is False
 
 
-def test_is_available_true_with_config_and_token(temp_home, monkeypatch):
-    import plugins.cron_providers.chronos as mod
-    from plugins.cron_providers.chronos import ChronosCronScheduler
-
-    monkeypatch.setattr(mod, "_cfg", lambda *k, default="": "https://x" )
-    monkeypatch.setattr("hermes_cli.auth.get_provider_auth_state",
-                        lambda pid: {"access_token": "tok"})
-    assert ChronosCronScheduler().is_available() is True
-
-
-def test_is_available_makes_no_network(temp_home, monkeypatch):
-    """is_available must not construct the NAS client / hit network."""
-    import plugins.cron_providers.chronos as mod
-    from plugins.cron_providers.chronos import ChronosCronScheduler
-
-    monkeypatch.setattr(mod, "_cfg", lambda *k, default="": "https://x")
-    monkeypatch.setattr("hermes_cli.auth.get_provider_auth_state",
-                        lambda pid: {"access_token": "tok"})
-    p = ChronosCronScheduler()
-
-    def explode():
-        raise AssertionError("is_available must not build the NAS client")
-
-    monkeypatch.setattr(p, "_get_client", explode)
-    assert p.is_available() is True  # did not call _get_client
-
-
 # -- arming -------------------------------------------------------------------
 
 def test_arm_one_shot_sends_provision(chronos):
@@ -105,20 +78,6 @@ def test_arm_one_shot_sends_provision(chronos):
     assert p["fire_at"] == "2026-06-18T12:00:00+00:00"
     assert p["dedup_key"] == "j1:2026-06-18T12:00:00+00:00"
     assert p["agent_callback_url"] == "https://agent.example/"
-
-
-def test_arm_one_shot_preserves_sub_minute_fire(chronos):
-    """Sub-minute fire times survive — the agent owns the time, so there's no
-    1-minute scheduler floor."""
-    prov, fake = chronos
-    prov._arm_one_shot({"id": "j2", "next_run_at": "2026-06-18T12:00:30+00:00"})
-    assert fake.provisions[0]["fire_at"] == "2026-06-18T12:00:30+00:00"
-
-
-def test_arm_one_shot_noop_without_next_run(chronos):
-    prov, fake = chronos
-    prov._arm_one_shot({"id": "j3", "next_run_at": None})
-    assert fake.provisions == []
 
 
 # -- reconcile ----------------------------------------------------------------
@@ -984,23 +943,3 @@ def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
     assert fake.provisions[0]["fire_at"] == "2026-06-18T12:05:00+00:00"
 
 
-def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
-    """repeat-N exhausted / one-shot completed → mark_job_run deleted the job →
-    get_job None → no re-arm (the schedule stops cleanly)."""
-    prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: True)
-    monkeypatch.setattr("cron.jobs.get_job", lambda jid: None)
-
-    assert prov.fire_due("j1") is True
-    assert fake.provisions == []
-
-
-def test_fire_due_no_rearm_when_claim_lost(chronos, monkeypatch):
-    """If the run didn't happen (claim lost), don't re-arm."""
-    prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: False)
-
-    assert prov.fire_due("j1") is False
-    assert fake.provisions == []

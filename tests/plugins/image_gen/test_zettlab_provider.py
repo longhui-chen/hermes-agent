@@ -56,7 +56,7 @@ class _ErrorResp(_Resp):
         raise requests.HTTPError(response=self)
 
 
-def test_zettlab_image_provider_reads_capabilities(monkeypatch):
+def test_zettlab_image_provider_reads_capabilities(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     def fake_get(url, timeout, allow_redirects, stream):
@@ -71,29 +71,34 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
                     "id": "seedream-v4",
                     "display_name": "Seedream V4",
                     "modalities": ["text", "image"],
+                    "supports_input_image_url": True,
                 }],
                 "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
             },
             "video": {"enabled": False, "models": []},
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
 
     provider = ZettlabImageGenProvider()
     assert provider.is_available() is True
     assert provider.default_model() == "seedream-v4"
     assert provider.list_models()[0]["display"] == "Seedream V4"
-    assert provider.capabilities()["max_reference_images"] == 0
+    capabilities = provider.capabilities()
+    assert capabilities["max_reference_images"] == 0
+    assert capabilities["supports_inline_image"] is True
+    assert capabilities["supports_input_image_url"] is True
+    assert "without being downloaded" in capabilities["image_input_description"]
 
 
-def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch):
+def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     response = requests.Response()
     response.status_code = 200
     raw = io.BytesIO(b"x" * (client.MAX_CAPABILITY_RESPONSE_BYTES + 1))
     response.raw = raw
-    monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: response)
+    patch_media_get(client, lambda *args, **kwargs: response)
 
     with pytest.raises(client.ZettlabMediaError, match="exceeds maximum size"):
         client.get_capabilities("image")
@@ -192,7 +197,7 @@ def test_zettlab_provider_validates_local_model_override(monkeypatch):
     assert client.default_model("image") is None
 
 
-def test_zettlab_image_generate_creates_media_job(monkeypatch):
+def test_zettlab_image_generate_creates_media_job(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -233,7 +238,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
             }],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
     monkeypatch.setattr(client._SESSION, "post", fake_post)
 
     got = ZettlabImageGenProvider().generate(
@@ -292,6 +297,46 @@ def test_zettlab_image_generate_routes_data_uri_to_inline_input(monkeypatch):
     assert got["success"] is True
     assert captured["input_image"] == TINY_PNG_DATA_URL
     assert "remote_media_inputs" not in captured
+
+
+def test_zettlab_image_generate_passes_https_url_unchanged(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    source = "https://images.example.com/source.png?token=signed-value"
+    captured = {}
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "supports_input_image_url": True,
+                "aspect_ratios": ["1:1"],
+                "resolutions": ["2K"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
+    )
+
+    def fake_create_and_wait(**kwargs):
+        captured.update(kwargs["payload"])
+        return {
+            "job_id": "job-url",
+            "status": "done",
+            "assets": [{"url": "https://cdn.example/url.png"}],
+        }
+
+    monkeypatch.setattr(client, "create_and_wait", fake_create_and_wait)
+    got = ZettlabImageGenProvider().generate(
+        "turn this into a painting",
+        aspect_ratio="square",
+        image_url=source,
+    )
+
+    assert got["success"] is True
+    assert captured["input_image"] == source
 
 
 def test_zettlab_image_generate_rejects_mixed_inline_and_remote_without_http(monkeypatch):
@@ -436,16 +481,50 @@ def test_zettlab_image_model_without_text_input_never_sends(
 
 
 @pytest.mark.parametrize("value", [
-    "https://localhost/a.png",
-    "https://127.0.0.1/a.png",
-    "https://example.com:8443/a.png",
+    "http://example.com/a.png",
+    "https://user:pass@example.com/a.png",
     "https://example.com/a.png#fragment",
 ])
-def test_zettlab_remote_input_matches_gateway_url_policy(value):
+def test_zettlab_remote_input_requires_structural_https_url(value):
     from plugins import zettlab_media_client as client
 
     with pytest.raises(client.ZettlabMediaError):
         client.validate_remote_url(value, label="image_url")
+
+
+@pytest.mark.parametrize("value", [
+    "https://localhost/a.png",
+    "https://images.localhost/a.png",
+    "https://127.0.0.1/a.png",
+    "https://[::1]/a.png",
+    "https://example.com:8443/a.png?token=signed-value",
+    "https://127.1/a.png",
+    "https://2130706433/a.png",
+    "https://0177.0.0.1/a.png",
+    "https://0x7f000001/a.png",
+    "https://intranet/a.png",
+    "https://localhost。/a.png",
+    "https://127。0。0。1/a.png",
+])
+def test_zettlab_remote_input_rejects_local_ip_and_non_default_port(value):
+    from plugins import zettlab_media_client as client
+
+    with pytest.raises(client.ZettlabMediaError):
+        client.validate_remote_url(value, label="image_url")
+
+
+def test_zettlab_remote_input_preserves_signed_default_port_url():
+    from plugins import zettlab_media_client as client
+
+    value = "https://images.example.com:443/a.png?token=signed-value"
+    assert client.validate_remote_url(value, label="image_url") == value
+
+
+def test_zettlab_remote_input_preserves_zero_padded_default_port_url():
+    from plugins import zettlab_media_client as client
+
+    value = "https://images.example.com:0443/a.png?token=signed-value"
+    assert client.validate_remote_url(value, label="image_url") == value
 
 
 def test_zettlab_ai_proxy_rejects_non_loopback_base_url(monkeypatch):
@@ -514,7 +593,7 @@ def test_zettlab_ai_proxy_ignores_environment_proxies(monkeypatch):
     assert settings["proxies"] == {}
 
 
-def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch):
+def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -529,7 +608,7 @@ def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch):
             raise result
         return result
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
     monkeypatch.setattr(client._SESSION, "delete", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cleanup should not run")))
 
     job = client.create_and_wait(media_type="image", model="seedream-v4", prompt="retry", payload={}, timeout_seconds=10)
@@ -1108,7 +1187,7 @@ def test_zettlab_poll_interrupt_preserves_active_job(monkeypatch):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="stop", payload={}, timeout_seconds=10)
 
 
-def test_zettlab_poll_attempt_timeout_retries_until_total_deadline(monkeypatch):
+def test_zettlab_poll_attempt_timeout_retries_until_total_deadline(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -1123,14 +1202,14 @@ def test_zettlab_poll_attempt_timeout_retries_until_total_deadline(monkeypatch):
             raise client.ZettlabMediaDeadlineError("single poll timed out")
         return _Resp({"job_id": "job-slow-poll", "status": "done", "assets": [{"url": "https://cdn.example/done.png"}]})
 
-    monkeypatch.setattr(client._SESSION, "get", timeout_first_poll)
+    patch_media_get(client, timeout_first_poll)
     job = client.create_and_wait(media_type="image", model="seedream-v4", prompt="retry", payload={}, timeout_seconds=10)
 
     assert job["status"] == "done"
     assert attempts == 2
 
 
-def test_zettlab_malformed_poll_response_preserves_job_id(monkeypatch):
+def test_zettlab_malformed_poll_response_preserves_job_id(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -1139,7 +1218,7 @@ def test_zettlab_malformed_poll_response_preserves_job_id(monkeypatch):
     response = requests.Response()
     response.status_code = 200
     response.raw = io.BytesIO(b"{not-json")
-    monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: response)
+    patch_media_get(client, lambda *args, **kwargs: response)
 
     with pytest.raises(client.ZettlabMediaError, match=r"not valid JSON.*job_id=job-malformed"):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="bad", payload={}, timeout_seconds=10)
@@ -1161,7 +1240,7 @@ def test_zettlab_poll_transport_failure_preserves_job_id(monkeypatch):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="pipe", payload={}, timeout_seconds=0.02)
 
 
-def test_zettlab_poll_continues_past_transient_failures(monkeypatch):
+def test_zettlab_poll_continues_past_transient_failures(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -1182,7 +1261,7 @@ def test_zettlab_poll_continues_past_transient_failures(monkeypatch):
             raise result
         return result
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
     job = client.create_and_wait(media_type="image", model="seedream-v4", prompt="recover", payload={}, timeout_seconds=10)
     assert job["status"] == "done"
 

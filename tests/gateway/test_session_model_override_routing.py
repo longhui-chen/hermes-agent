@@ -182,7 +182,7 @@ def test_session_override_context_length_affects_route_signature():
 
     route = runner._resolve_turn_agent_config("ping", model, runtime_kwargs)
     assert route["runtime"]["config_context_length"] == 1_000_000
-    assert route["signature"][4] == 1_000_000
+    assert route["signature"][5] == 1_000_000
 
 def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
     """Regression: fallback provider must not inherit the primary model.

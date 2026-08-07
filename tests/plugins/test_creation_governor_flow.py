@@ -98,6 +98,36 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
     assert "Business Research Partner" in output
 
 
+def test_pending_single_file_handoff_does_not_deliver_recommendation_card():
+    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    plugin = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(plugin)
+    plugin._reset_state_for_tests()
+    context = _Context()
+    plugin.register(context)
+
+    context.hooks[0][0][1](
+        session_id="single-questionnaire",
+        user_message="读取这份问卷表格并总结",
+        conversation_history=[],
+    )
+    output = context.hooks[1][0][1](
+        session_id="single-questionnaire",
+        response_text=(
+            "请先把 Google 表格下载成 CSV，再把 CSV 文件上传给我。"
+            "我拿到文件后就能直接完成问卷总结。"
+        ),
+        completed=True,
+        failed=False,
+    )
+
+    assert output is None
+    state_key = plugin._session_key({"session_id": "single-questionnaire"})
+    assert plugin._session_states[state_key]["last_proposal"] is None
+    assert plugin._session_states[state_key]["last_prompt_turn"] == -10_000
+
+
 def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
     plugin = importlib.util.module_from_spec(spec)

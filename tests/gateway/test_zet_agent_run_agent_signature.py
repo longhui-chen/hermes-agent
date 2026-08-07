@@ -76,6 +76,68 @@ def test_zet_agent_connect_covers_base_signature():
     )
 
 
+def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.model = kwargs.get("model")
+            self.provider = kwargs.get("provider")
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "global-provider",
+            "model": "global/model",
+            "api_key": "global-key",
+        },
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "global/model")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._checkpoint_agent_kwargs", lambda _cfg: {})
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        lambda: {"enabled": False},
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model", lambda: None
+    )
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent._resolve_request_runtime_agent_kwargs",
+        lambda provider, target_model=None: {
+            "provider": provider,
+            "model": target_model,
+            "api_key": "request-key",
+        },
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+    public_session_id = "zettlab:userA:main:session-1"
+    scoped_session_key = f"/profiles/main|{public_session_id}"
+    agent = adapter._create_agent(
+        session_id=public_session_id,
+        gateway_session_key=scoped_session_key,
+        requested_model="request/model",
+        requested_provider="request-provider",
+        model_options={"reasoning_effort": "high", "service_tier": "priority"},
+    )
+
+    assert isinstance(agent, FakeAgent)
+    assert captured["model"] == "request/model"
+    assert captured["provider"] == "request-provider"
+    assert captured["api_key"] == "request-key"
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert captured["service_tier"] == "priority"
+    assert captured["platform"] == "zet_agent"
+
+
 @pytest.mark.asyncio
 async def test_zet_agent_forwards_current_turn_reference_image(monkeypatch):
     captured = {}

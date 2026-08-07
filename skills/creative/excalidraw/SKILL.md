@@ -1,7 +1,7 @@
 ---
 name: excalidraw
 description: "Hand-drawn Excalidraw JSON diagrams (arch, flow, seq)."
-version: 1.0.0
+version: 1.0.1
 author: Hermes Agent
 license: MIT
 dependencies: []
@@ -51,7 +51,7 @@ Save to any path, e.g. `~/diagrams/my_diagram.excalidraw`.
 Run the upload script (located in this skill's `scripts/` directory) via terminal:
 
 ```bash
-python skills/diagramming/excalidraw/scripts/upload.py ~/diagrams/my_diagram.excalidraw
+python3 "${HERMES_SKILL_DIR}/scripts/upload.py" ~/diagrams/my_diagram.excalidraw
 ```
 
 This uploads to excalidraw.com (no account needed) and prints a shareable URL. Requires the `cryptography` pip package (`pip install cryptography`).
@@ -195,5 +195,4 @@ See `references/colors.md` for full color tables. Quick reference:
 - Do NOT use emoji in text -- they don't render in Excalidraw's font
 - For dark mode diagrams, see `references/dark-mode.md`
 - For larger examples, see `references/examples.md`
-
 
