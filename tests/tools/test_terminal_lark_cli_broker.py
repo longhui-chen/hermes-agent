@@ -81,6 +81,15 @@ def test_terminal_flow_dispatches_authorized_lark_cli_without_local_shell(
         "agent.credential_broker.request_lark_cli",
         fake_request,
     )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_check_all_guards",
+        lambda *args, **kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": default,
+    )
     token = secret_scope.set_secret_scope({"ZET_AGENT_ID": "agent-1"})
     previous_multiplex = secret_scope.is_multiplex_active()
     secret_scope.set_multiplex_active(True)
