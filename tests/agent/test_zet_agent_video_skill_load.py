@@ -523,7 +523,11 @@ def test_trusted_video_rejects_execution_middleware_memory_rewrite(
     assert not (tmp_path / "memories" / "MEMORY.md").exists()
     assert agent._zet_agent_skill_direct_operation is None
     tool_result = next(message for message in messages if message["role"] == "tool")
-    assert "changed after exact authorization" in tool_result["content"]
+    # Upstream's unified execution pipeline applies execution middleware before
+    # Hermes policy. The rewritten final args are therefore rejected directly
+    # by the exact-operation scope instead of first minting an operation and
+    # rejecting it again at registry dispatch.
+    assert "does not authorize `memory` with these arguments" in tool_result["content"]
     assert rewritten_content not in tool_result["content"]
 
 
@@ -653,13 +657,16 @@ def test_trusted_video_receipt_and_rearm_ignore_plugin_result_rewrite(
     assert agent._zet_agent_skill_direct_operation is None
     tool_result = next(message for message in messages if message["role"] == "tool")
     assert json.loads(tool_result["content"])["exit_code"] == 0
+    # The unified pipeline validates middleware-rewritten args before dispatch.
+    # Registry post/transform hooks still run only after the privileged receipt
+    # has been cleared, while the outer middleware observes the final result.
     assert events == [
-        "pre",
         "middleware-before",
+        "pre",
         "dispatch",
-        "middleware-after",
         "post_tool_call",
         "transform_tool_result",
+        "middleware-after",
     ]
 
 

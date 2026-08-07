@@ -46,12 +46,11 @@ def _capabilities():
     }
 
 
-def test_zettlab_video_provider_reads_capabilities(monkeypatch):
+def test_zettlab_video_provider_reads_capabilities(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(
-        client._SESSION,
-        "get",
+    patch_media_get(
+        client,
         lambda url, timeout, allow_redirects, stream: _Resp(_capabilities()),
     )
 
@@ -119,12 +118,12 @@ def test_zettlab_video_capabilities_hide_image_with_invalid_inline_limit(
     assert ZettlabVideoGenProvider().capabilities()["modalities"] == []
 
 
-def test_zettlab_video_generate_creates_media_job(monkeypatch):
+def test_zettlab_video_generate_creates_media_job(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     captured = {}
-    monkeypatch.setattr(client._SESSION, "get", lambda url, **kwargs: _Resp(_capabilities()))
+    patch_media_get(client, lambda url, **kwargs: _Resp(_capabilities()))
 
     def fake_post(url, json, headers, timeout, allow_redirects, stream):
         assert allow_redirects is False
@@ -212,10 +211,10 @@ def test_zettlab_video_generate_passes_https_url_unchanged(monkeypatch):
     assert captured["input_image"] == source
 
 
-def test_zettlab_video_rejects_disabled_custom_parameters(monkeypatch):
+def test_zettlab_video_rejects_disabled_custom_parameters(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, **kwargs: _Resp(_capabilities()))
+    patch_media_get(client, lambda url, **kwargs: _Resp(_capabilities()))
     monkeypatch.setattr(
         client,
         "create_and_wait",

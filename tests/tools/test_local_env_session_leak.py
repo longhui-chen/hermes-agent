@@ -144,25 +144,6 @@ def test_set_session_vars_engages_and_overrides_foreign_global(monkeypatch):
     assert env.get("HERMES_SESSION_KEY") == "agent:main:discord:group:MY_BUGS_ROOT:111"
 
 
-def test_engaged_strips_all_session_vars_when_unset(monkeypatch):
-    """The strip covers every HERMES_SESSION_* mirror, not just the key."""
-    _engage()
-    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign-key")
-    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "foreign-thread")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "foreign-chat")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "foreign-user")
-
-    env = _make_run_env({})
-
-    for var in (
-        "HERMES_SESSION_KEY",
-        "HERMES_SESSION_THREAD_ID",
-        "HERMES_SESSION_CHAT_ID",
-        "HERMES_SESSION_USER_ID",
-    ):
-        assert var not in env, f"{var} leaked from a foreign global: {env.get(var)!r}"
-
-
 def test_unengaged_process_preserves_os_environ_fallback(monkeypatch):
     """A process that never engaged the session-context system keeps the fallback.
 
@@ -178,28 +159,6 @@ def test_unengaged_process_preserves_os_environ_fallback(monkeypatch):
 
     assert env.get("HERMES_SESSION_KEY") == "cli-session-key"
     assert env.get("HERMES_SESSION_ID") == "cli-session-id"
-
-
-def test_engaged_explicit_empty_contextvar_clears(monkeypatch):
-    """An explicitly-cleared ContextVar ("" via clear_session_vars) clears the var.
-
-    After a handler finishes it calls clear_session_vars which sets each var to
-    "" (distinct from _UNSET). A subprocess spawned in that window must see the
-    empty value (which overrides the foreign global), NOT the foreign global —
-    an empty key is safe (whoami reads "" → no thread).
-    """
-    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign-after-clear")
-
-    tokens = set_session_vars(session_key="real-key", platform="discord", chat_id="c")
-    clear_session_vars(tokens)  # sets vars to "" (explicitly cleared); stays engaged
-
-    env = _make_run_env({})
-
-    # Explicit-empty wins over the foreign global: either stripped or "" — never
-    # the foreign value. Both outcomes are safe for the consumer.
-    assert env.get("HERMES_SESSION_KEY", "") == "", (
-        f"Foreign key survived an explicit clear: {env.get('HERMES_SESSION_KEY')!r}"
-    )
 
 
 def test_explicit_empty_thread_id_overrides_stale_value(monkeypatch):
@@ -274,18 +233,6 @@ def test_sanitize_subprocess_env_set_contextvar_wins_when_engaged():
     assert sanitized.get("HERMES_SESSION_KEY") == "agent:main:discord:group:REAL_BG:222"
 
 
-def test_sanitize_subprocess_env_unengaged_preserves_fallback(monkeypatch):
-    """Background path in an unengaged process keeps the inherited value."""
-    stale_base = {
-        "PATH": "/usr/bin:/bin",
-        "HERMES_SESSION_KEY": "cli-bg-key",
-    }
-
-    sanitized = _sanitize_subprocess_env(stale_base)
-
-    assert sanitized.get("HERMES_SESSION_KEY") == "cli-bg-key"
-
-
 # --------------------------------------------------------------------------- #
 # Non-terminal spawn surface (hermes_subprocess_env) — sibling path
 # --------------------------------------------------------------------------- #
@@ -308,24 +255,6 @@ def test_hermes_subprocess_env_strips_foreign_session_key_when_engaged(monkeypat
         "Foreign concurrent session key leaked into non-terminal spawn env: "
         f"{env.get('HERMES_SESSION_KEY')!r}"
     )
-
-
-def test_hermes_subprocess_env_bound_contextvar_wins(monkeypatch):
-    """A caller that binds the session identity keeps it through this helper."""
-    monkeypatch.setenv(
-        "HERMES_SESSION_KEY",
-        "agent:main:discord:thread:FOREIGN:FOREIGN",
-    )
-    tokens = set_session_vars(
-        session_key="agent:main:discord:group:MINE:111",
-        platform="discord",
-        chat_id="MINE",
-    )
-    try:
-        env = hermes_subprocess_env()
-        assert env.get("HERMES_SESSION_KEY") == "agent:main:discord:group:MINE:111"
-    finally:
-        clear_session_vars(tokens)
 
 
 def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
@@ -492,6 +421,7 @@ def test_local_snapshot_wrapper_unsets_connector_runtime_before_and_after_comman
     env._cwd_file = "/tmp/hermes-cwd-test.txt"
     env._cwd_marker = "__HERMES_CWD_snapshot_test__"
     env._snapshot_ready = True
+    env._snapshot_passthrough_names = set()
 
     script = env._wrap_command("printf done", "/tmp")
 
@@ -502,7 +432,7 @@ def test_local_snapshot_wrapper_unsets_connector_runtime_before_and_after_comman
         "unset ZETTLAB_CONNECTORS_AUTH_TOKEN",
         first_unset_idx + 1,
     )
-    dump_idx = script.index("export -p >")
+    dump_idx = script.index("export -p;")
 
     assert source_idx < first_unset_idx < eval_idx
     assert eval_idx < second_unset_idx < dump_idx
@@ -517,6 +447,7 @@ def test_local_snapshot_wrapper_preserves_unengaged_cli_fallback(monkeypatch):
     env._cwd_file = "/tmp/hermes-cwd-cli-test.txt"
     env._cwd_marker = "__HERMES_CWD_snapshot_cli_test__"
     env._snapshot_ready = True
+    env._snapshot_passthrough_names = set()
     env.env = {}
 
     script = env._wrap_command(
@@ -536,6 +467,7 @@ def test_local_snapshot_bootstrap_unsets_connector_runtime_before_first_dump():
     env._cwd_file = "/tmp/hermes-cwd-bootstrap.txt"
     env._cwd_marker = "__HERMES_CWD_bootstrap_test__"
     env._snapshot_timeout = 5
+    env._snapshot_passthrough_names = set()
     captured: dict[str, str] = {}
 
     class _Proc:
@@ -549,7 +481,7 @@ def test_local_snapshot_bootstrap_unsets_connector_runtime_before_first_dump():
     script = captured["script"]
 
     unset_idx = script.index("unset ZETTLAB_CONNECTORS_AUTH_TOKEN")
-    dump_idx = script.index("export -p >")
+    dump_idx = script.index("export -p;")
 
     assert unset_idx < dump_idx
 

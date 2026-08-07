@@ -8,7 +8,15 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PROTECTED_TREES = ("plugins", "venv")
+PROTECTED_TREES = (
+    "config",
+    "locales",
+    "optional-mcps",
+    "optional-skills",
+    "plugins",
+    "skills",
+    "venv",
+)
 IGNORED_DIRECTORY_NAMES = {
     ".git",
     ".gk",
@@ -87,7 +95,8 @@ def main() -> int:
             print(f"  - ... and {len(missing) - MAX_REPORTED_PATHS} more")
         return 1
 
-    print("ZPK stage check ok: plugins/ and venv/ runtime files preserved")
+    protected = ", ".join(f"{tree}/" for tree in PROTECTED_TREES)
+    print(f"ZPK stage check ok: runtime trees preserved ({protected})")
     return 0
 
 

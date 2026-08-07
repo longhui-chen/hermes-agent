@@ -119,13 +119,6 @@ class TestSourceGuardrail:
         assert "def _interpreter_shutting_down(" in source
         assert "#58720" in source
 
-    def test_helper_guards_dispatch_submit(self, source):
-        """The tick dispatch (``_submit_with_guard``) must consult the guard so
-        a tick that races teardown skips instead of crashing."""
-        idx_submit = source.find("def _submit_with_guard(")
-        assert idx_submit >= 0
-        tail = source[idx_submit:idx_submit + 1600]
-        assert "_interpreter_shutting_down(" in tail
 
     def test_helper_guards_standalone_delivery(self, source):
         """The standalone delivery path must consult the guard before

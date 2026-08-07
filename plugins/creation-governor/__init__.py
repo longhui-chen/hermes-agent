@@ -35,7 +35,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "detect_creation_opportunity"
-PLUGIN_VERSION = "0.9.2"
+PLUGIN_VERSION = "0.9.3"
 MIN_CONFIDENCE = 0.55
 AUXILIARY_TASK_NAME = "creation_governor_checkpoint"
 AUXILIARY_MODEL_ALIAS = "zettlab-creation-fast"
@@ -111,7 +111,12 @@ _UNFINISHED_TASK_RE = re.compile(
     r"(?:access|read|retrieve|query|analy[sz]e|execute|complete|continue)|"
     r"(?:not connected|isn't connected|missing (?:access|authorization|permission|data))|"
     r"(?:please|need you to).{0,24}(?:connect|authorize|provide|upload).{0,80}"
-    r"(?:before|then|so I can)",
+    r"(?:before|then|so I can)|"
+    r"(?:拿到|收到|获得).{0,48}(?:文件|数据|表格|问卷|CSV)?.{0,32}"
+    r"(?:后|以后|之后).{0,24}(?:就能|才能|才可以|可以继续).{0,64}"
+    r"(?:完成|继续|总结|分析|处理)|"
+    r"(?:once|after).{0,80}(?:upload|send|provide|receive|have).{0,80}"
+    r"(?:can|will be able to).{0,64}(?:complete|continue|analy[sz]e|summari[sz]e)",
     re.IGNORECASE,
 )
 _CLARIFICATION_REQUIRED_RE = re.compile(
@@ -618,10 +623,11 @@ _DETECTOR_SCHEMA = {
 _DETECTOR_INSTRUCTIONS = """Perform one high-recall zero-shot product judgment.
 
 Return exactly one of agent, skill, task, or none. Do not classify by topic words and do not use
-memorized examples. A single substantive request is enough when a reasonable user would benefit
-from reusing the capability. Do not require the user to mention repetition, frequency, saving, or
-creation. Ask whether a durable capability would materially reduce friction or improve judgment
-the next time a related need appears.
+memorized examples. A single substantive request can be enough only when the conversation itself
+supports durable future value; the mere possibility that a capability could be reused is not enough.
+Do not require magic words such as repetition, saving, or creation, but require affirmative semantic
+evidence that the account, project, source, responsibility, or class of future inputs continues beyond
+this bounded request.
 
 Definitions and conflict order:
 1. task: the desired future value depends on a recurring time trigger, event trigger, background
@@ -637,10 +643,19 @@ Definitions and conflict order:
    request to create/configure/schedule something through Hermes' native flow, or no reasonable
    reuse value.
 
+Bounded one-shot veto: return none when the user only wants a result from one finite file, table,
+questionnaire, document, import, dataset, or other bounded item and the conversation does not support
+future recurrence, ongoing ownership, background refresh, or retained-context judgment. Needing an
+upload, authorization, connector, or other setup step to finish the current request is execution
+friction, not evidence for a durable Agent. If the same method is expected across future inputs,
+skill may qualify; if freshness or a future trigger is the value, task may qualify; if continuing
+responsibility and autonomous judgment are both present, agent may qualify.
+
 High-recall boundary: a substantive request to inspect, compare, diagnose, research, optimize, or
-make a judgment about an ongoing external work domain should normally be agent rather than none,
-even on the first request and even when the requested snapshot is scoped to today/current/latest.
-Choose none only when reuse value is genuinely absent, not merely unstated.
+make a judgment may qualify on the first request when it concerns an ongoing external account,
+project, operation, or responsibility whose future state and decisions remain after this turn. The
+verb alone never makes it an Agent. Choose none when durable reuse value is absent from the meaning
+of the conversation, including bounded one-shot work.
 
 Existing-capability gate takes priority over high recall. If the conversation shows that an
 existing Agent, Skill, scheduled Task, Dashboard, or application already performs the same future
@@ -656,15 +671,16 @@ invent a daily, weekly, or other schedule in the recommendation. After the user 
 Hermes' native task/cronjob flow must ask for any missing schedule or event trigger. Stable refresh
 steps do not make the opportunity a skill when freshness is the core value.
 
-Apply this semantic gate before returning none. Ask, in order: (a) will the underlying information,
-account, project, or operating environment change after this turn; (b) would a responsible role with
-retained context make a future judgment better; (c) would a stable method save meaningful effort on
-a different future input? If any answer is yes and no existing capability already covers the need,
-choose task for a future trigger,
+Apply this semantic gate before returning a positive decision. Ask, in order: (a) is this merely one
+bounded item whose requested result ends the work; (b) will the underlying information, account,
+project, or operating environment continue after this turn; (c) would a responsible role with
+retained context make a future judgment better; (d) is there evidence that a stable method will be
+used on materially different future inputs? If (a) is yes and (b)-(d) are no, return none. Otherwise,
+when no existing capability already covers the need, choose task for a future trigger,
 background refresh, or freshness maintenance; otherwise agent for continuing ownership/judgment,
-otherwise skill for the reusable method. Ambiguity about whether the user will repeat the request is
-not evidence for none. Do not reduce an analytical request to a fact lookup merely because the
-current data or connector is unavailable.
+otherwise skill for the reusable method. Do not infer recurrence merely because a method is
+theoretically reusable. Do not reduce an ongoing analytical responsibility to a fact lookup merely
+because the current data or connector is unavailable.
 
 Judge reuse value separately from current execution availability. Missing authorization,
 connectors, data, or tools may still reveal a long-term need, but the plugin separately suppresses
@@ -681,17 +697,21 @@ For a task recommendation, name the ongoing outcome that should stay current ins
 generic method. Explain what changing source would make the current result stale, but do not claim
 or imply a cadence the user did not provide.
 
-中文请求必须按同一套语义规则判断，不要因为用户没有说“重复”“以后”“保存”或“创建”就返回
-none。先判断需求所涉及的账户、项目、业务环境或信息是否会继续变化；如果会变化且后续判断需要
+中文请求必须按同一套语义规则判断，不依赖“重复”“以后”“保存”或“创建”等触发词，但必须从语义
+上找到任务在本轮之后仍会继续的证据。只处理一份确定的文件、表格、问卷、文档、导入数据或其他
+有限对象，并且完成本次结果后工作即结束时，优先返回 none；不能因为还需要用户上传文件、授权或
+连接 Connector 才能完成本轮任务，就推断需要一个长期 Agent。先判断需求所涉及的账户、项目、
+业务环境或信息是否会继续变化；如果会变化且后续判断需要
 保留背景、综合数据或自主选择工具，选择 agent。如果价值来自未来的时间、事件、后台监控、提醒，
 或让一个随来源变化而过期的画像、摘要、索引、报告或状态持续保持最新，选择 task。只要“来源会
 变化”“结果会过期”“自动刷新能减少反复手工操作”中至少两项在语义上成立，就可以优先 task，
 不要求用户先说每天、每周或具体频率；推荐时不得虚构周期，用户确认后再由 Hermes 原生 cronjob
 流程补问缺失的时间或事件条件。如果对话显示已有 Agent、Skill、定时任务、Dashboard 或应用已经
 覆盖同一长期需求，优先返回 none；不能因为用户正在配置、预置、预览或使用刚创建的对象，就再推荐
-一个平行的 Agent 或 Skill。如果价值只是对不同输入重复使用一套稳定方法，且不存在保持结果
-新鲜的需求，才选择 skill。只有寒暄、低价值封闭事实、微小的一次性转换、用户已经明确要求创建，
-或 Agent/Skill/Task 三种长期价值都确实不存在时，才选择 none。
+一个平行的 Agent 或 Skill。如果有证据表明未来还会处理不同输入，且价值只是重复使用一套稳定
+方法、又不存在保持结果新鲜的需求，才选择 skill。只有寒暄、低价值封闭事实、微小的一次性转换、
+有限对象的一次性处理、用户已经明确要求创建，或 Agent/Skill/Task 三种长期价值都确实不存在时，
+才选择 none。
 “今天”“最近”“当前”只是本次数据范围，不等于没有长期价值。缺少授权、连接器或数据只影响本次
 执行，但插件会在当前任务没有实际交付时阻止卡片展示。名称、原因和 proposal_text 必须使用面向
 用户的语言，不能写“用户已……”这类内部判定；proposal_text 要明确说明将进入哪种原生创建流程。"""
@@ -1363,8 +1383,9 @@ def register(ctx: Any) -> None:
             "name": TOOL_NAME,
             "description": (
                 "Perform one high-recall zero-shot semantic choice among Agent, Skill, Task, and "
-                "none. A single substantive request is enough; never require the user to mention "
-                "repetition, saving, or creation. Use "
+                "none. Do not require magic words such as repetition, saving, or creation, but "
+                "require semantic evidence that durable future value continues beyond the current "
+                "bounded request. Use "
                 "meaning and conversation context, never topic keyword matching or memorized "
                 "examples. Task means desired future time/event/background execution or keeping "
                 "a derived result current as its source changes; a current data range such as "
@@ -1374,9 +1395,13 @@ def register(ctx: Any) -> None:
                 "the recommendation, must not be invented, and is collected by Hermes' native "
                 "task flow after confirmation. Agent means a long-lived "
                 "responsible role with retained context, judgment, autonomous tool choice, or "
-                "interpretation of a changing real-world work domain. A substantive first request "
-                "to inspect, compare, diagnose, research, optimize, or make a judgment about an "
-                "ongoing external work domain should normally be Agent rather than none. "
+                "interpretation of a changing real-world work domain. A first request may qualify "
+                "only when it concerns an ongoing account, project, operation, or responsibility; "
+                "the analysis verb alone is not evidence for an Agent. A request that only processes "
+                "one finite file, table, questionnaire, document, import, or dataset returns none "
+                "unless future recurrence, freshness, or ongoing ownership is supported. Requiring "
+                "an upload, authorization, or connector to finish the current request is execution "
+                "friction, not reuse evidence. "
                 "If an existing Agent, Skill, scheduled Task, Dashboard, or application already "
                 "does the same future job, return none unless the new object adds a materially "
                 "different responsibility. Configuring, seeding, previewing, or using a newly "

@@ -1,14 +1,14 @@
 ---
-title: "Plan — Plan mode: write an actionable markdown plan to"
+title: "Plan — Write a markdown plan to .hermes/plans/; no execution"
 sidebar_label: "Plan"
-description: "Plan mode: write an actionable markdown plan to"
+description: "Write a markdown plan to .hermes/plans/; no execution"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Plan
 
-Plan mode: write an actionable markdown plan to .hermes/plans/, no execution. Bite-sized tasks, exact paths, complete code.
+Write a markdown plan to .hermes/plans/; no execution.
 
 ## Skill metadata
 
@@ -21,7 +21,7 @@ Plan mode: write an actionable markdown plan to .hermes/plans/, no execution. Bi
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `planning`, `plan-mode`, `implementation`, `workflow`, `design`, `documentation` |
-| Related skills | [`subagent-driven-development`](/docs/user-guide/skills/optional/software-development/software-development-subagent-driven-development), [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) |
+| Related skills | [`subagent-driven-development`](/docs/user-guide/skills/optional/software-development/software-development-subagent-driven-development), `test-driven-development`, [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) |
 
 ## Reference: full SKILL.md
 
