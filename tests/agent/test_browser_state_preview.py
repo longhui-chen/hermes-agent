@@ -165,6 +165,9 @@ def test_projection_replaces_lone_surrogates_before_utf8_serialization() -> None
         ("https://Example.COM/magic-login/raw-credential", "example.com"),
         ("https:%2F%2FExample.COM%2Fmagic-login%2Fcredential", "example.com"),
         ("https%253A%252F%252FExample.COM%252Fsigned%252Fcredential", "example.com"),
+        ("https:%2F%2FExample.COM%2Fmagic%20link%2Fcredential", "example.com"),
+        ("https%253A%252F%252FExample.COM%252Fsigned%2520link%252Fcredential", "example.com"),
+        ("https:%2F%2FExample.COM%2Fmagic%0Alink%2Fcredential", "example.com"),
     ],
 )
 def test_free_text_urls_keep_only_hostname(target: str, hostname: str) -> None:
@@ -188,6 +191,20 @@ def test_free_text_urls_keep_only_hostname(target: str, hostname: str) -> None:
     assert "credential" not in encoded
     assert "token=private" not in encoded
     assert "#secret" not in encoded
+
+
+def test_malformed_encoded_free_text_url_fails_closed() -> None:
+    preview = project_browser_state_preview(
+        "browser_navigate",
+        {
+            "success": True,
+            "title": "Continue at https:%2F%2FExample.COM%2Fmagic%",
+        },
+    )
+
+    assert preview is not None
+    assert preview["title"] == "Continue at [REDACTED]"
+    assert "magic" not in json.dumps(preview)
 
 
 @pytest.mark.parametrize(
@@ -311,6 +328,21 @@ def test_url_projection_bounds_input_and_rejects_oversized_hostname() -> None:
         )
         is None
     )
+    for hostname in (
+        ".foo",
+        "foo.",
+        "foo..bar",
+        "-foo.example",
+        "foo-.example",
+        f"{'a' * 64}.example",
+    ):
+        assert (
+            project_browser_state_preview(
+                "browser_click",
+                {"success": True, "url": f"https://{hostname}/path"},
+            )
+            is None
+        )
 
 
 def test_url_projection_never_copies_raw_or_encoded_path_credentials() -> None:

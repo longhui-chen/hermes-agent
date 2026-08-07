@@ -75,6 +75,10 @@ _LOCAL_PATH_RE = re.compile(
     r"(^|[^a-z0-9/])(?:/[^\s\"'<>]+|[a-z]:\\[^\s\"'<>]+)",
     re.IGNORECASE,
 )
+_PERCENT_TOKEN_RE = re.compile(r"[^\s<>\"']*%[0-9a-f]{2}[^\s<>\"']*", re.IGNORECASE)
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
+_MALFORMED_PERCENT_RE = re.compile(r"%(?![0-9a-f]{2})", re.IGNORECASE)
+_HTTP_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
 _SAFE_STATES = (
     "disabled",
@@ -115,32 +119,96 @@ def _hostname_only_embedded_urls(value: str) -> tuple[str, bool]:
     return _EMBEDDED_HTTP_URL_RE.sub(_replace, value), changed
 
 
+def _safe_hostname(hostname: str) -> str | None:
+    hostname = hostname.lower()
+    if len(hostname) > 253:
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or re.fullmatch(r"[a-z0-9-]+", label) is None
+            for label in labels
+        ):
+            return None
+    return hostname
+
+
+def _hostname_from_decoded_url_token(value: str) -> str:
+    """Reduce one percent-decoded token to a hostname or fail closed.
+
+    Decoding a URL path can introduce whitespace or control characters. Parse
+    the decoded token as one unit so a regex cannot consume only its prefix and
+    leave a credential-bearing path suffix behind.
+    """
+    scheme = _HTTP_SCHEME_RE.search(value)
+    if scheme is None:
+        return "[REDACTED]"
+    token = value[scheme.start() :]
+    trailing = ""
+    while token and token[-1] in _URL_TRAILING_PUNCTUATION:
+        trailing = token[-1] + trailing
+        token = token[:-1]
+    try:
+        parsed = urlsplit(token)
+        hostname = parsed.hostname
+    except (TypeError, ValueError):
+        return f"[REDACTED]{trailing}"
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        return f"[REDACTED]{trailing}"
+    safe_hostname = _safe_hostname(hostname)
+    return f"{safe_hostname or '[REDACTED]'}{trailing}"
+
+
+def _replace_encoded_presentation_tokens(value: str) -> tuple[str, bool, bool]:
+    """Return (text, changed, unsafe_path) for percent-bearing tokens."""
+    changed = False
+    unsafe_path = False
+
+    def _replace(match: re.Match[str]) -> str:
+        nonlocal changed, unsafe_path
+        raw = match.group(0)
+        decoded = raw
+        for _ in range(2):
+            if _PERCENT_ESCAPE_RE.search(decoded) is None:
+                break
+            try:
+                next_value = unquote(decoded, errors="strict")
+            except UnicodeError:
+                changed = True
+                return "[REDACTED]"
+            if next_value == decoded:
+                break
+            decoded = next_value
+
+        if _HTTP_SCHEME_RE.search(decoded):
+            changed = True
+            if _MALFORMED_PERCENT_RE.search(raw):
+                return "[REDACTED]"
+            return _hostname_from_decoded_url_token(decoded)
+        if _EMBEDDED_FILE_URL_RE.search(decoded) or _LOCAL_PATH_RE.search(decoded):
+            changed = True
+            unsafe_path = True
+            return "[REDACTED]"
+        return raw
+
+    return _PERCENT_TOKEN_RE.sub(_replace, value), changed, unsafe_path
+
+
 def _presentation_safe_paths_and_urls(value: str) -> tuple[str, bool]:
     """Apply bounded raw/encoded URL and local-path presentation policy."""
-    candidate = value
-    decoded = value
-    decoded_rounds = 0
-    for _ in range(2):
-        try:
-            next_value = unquote(decoded, errors="strict")
-        except UnicodeError:
-            return "[REDACTED]", True
-        if next_value == decoded:
-            break
-        decoded = next_value
-        decoded_rounds += 1
-
-    if decoded_rounds and (
-        _EMBEDDED_HTTP_URL_RE.search(decoded)
-        or _EMBEDDED_FILE_URL_RE.search(decoded)
-        or _LOCAL_PATH_RE.search(decoded)
-    ):
-        candidate = decoded
-
+    candidate, encoded_changed, unsafe_path = _replace_encoded_presentation_tokens(value)
+    if unsafe_path:
+        return "[REDACTED]", True
     candidate, urls_redacted = _hostname_only_embedded_urls(candidate)
     if _EMBEDDED_FILE_URL_RE.search(candidate) or _LOCAL_PATH_RE.search(candidate):
         return "[REDACTED]", True
-    return candidate, urls_redacted or candidate != value
+    return candidate, encoded_changed or urls_redacted or candidate != value
 
 
 def _clean_text(value: Any, max_chars: int) -> tuple[str, bool]:
@@ -184,14 +252,9 @@ def _safe_url(value: Any) -> tuple[dict[str, str] | None, bool]:
     if parsed.scheme.lower() not in {"http", "https"} or not hostname:
         return None, truncated
 
-    hostname = hostname.lower()
-    if len(hostname) > 253:
+    hostname = _safe_hostname(hostname)
+    if hostname is None:
         return None, True
-    try:
-        ipaddress.ip_address(hostname)
-    except ValueError:
-        if re.fullmatch(r"[a-z0-9.-]+", hostname) is None:
-            return None, truncated
 
     # Every path segment is untrusted presentation data: magic links, password
     # resets, invitations and signed resources routinely put credentials there.
