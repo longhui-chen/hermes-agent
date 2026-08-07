@@ -1174,6 +1174,11 @@ def test_managed_gateway_keeps_existing_root_workdir(monkeypatch, tmp_path):
     monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
     output = tmp_path / "agents-data" / "output"
     output.mkdir(parents=True)
+    monkeypatch.setattr(
+        local_mod,
+        "_managed_output_is_trusted",
+        lambda candidate: candidate == str(output),
+    )
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
     rec = _install(monkeypatch, {"ready": True, "operations": []})
@@ -3033,4 +3038,3 @@ def test_ssh_backend_is_remote_even_for_loopback_host(monkeypatch, tmp_path):
         # #18：远端后端不再阻断，断言改为「放行 + 归因 remote_backend + 零请求」。
         assert_allowed_unprotected(out, rec, "remote_backend")
         assert rec.requests == [], f"ssh({host}) 不该向本机 ensure"
-

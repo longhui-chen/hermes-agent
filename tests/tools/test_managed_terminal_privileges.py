@@ -1164,6 +1164,11 @@ def test_managed_fallback_cwd_reads_profile_scope_when_env_lacks_output(
     output.mkdir()
     os.chmod(output, 0o700)
     monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setattr(
+        local_module,
+        "_managed_output_is_trusted",
+        lambda candidate: candidate == str(output),
+    )
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
 

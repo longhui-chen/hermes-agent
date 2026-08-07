@@ -13,6 +13,15 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAKEFILE = REPO_ROOT / "Makefile"
 CHECK_SCRIPT = REPO_ROOT / "scripts" / "check_zpk_stage.py"
+PROTECTED_TREES = (
+    "config",
+    "locales",
+    "optional-mcps",
+    "optional-skills",
+    "plugins",
+    "skills",
+    "venv",
+)
 
 
 def _zpk_excludes() -> list[str]:
@@ -39,6 +48,11 @@ def _write_file(root: Path, relative_path: str) -> None:
     path = root / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(relative_path, encoding="utf-8")
+
+
+def _create_protected_trees(root: Path) -> None:
+    for tree in PROTECTED_TREES:
+        (root / tree).mkdir(parents=True, exist_ok=True)
 
 
 def _load_check_module():
@@ -78,12 +92,17 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
         "dist/root-only.txt",
         "docs/root-only.txt",
         "tests/root-only.txt",
+        "config/skill_seed_policy.json",
+        "locales/en.yaml",
+        "optional-mcps/linear/manifest.yaml",
+        "optional-skills/research/demo/SKILL.md",
         "plugins/web/exa/provider.py",
         "plugins/kanban/dashboard/dist/index.js",
         "plugins/hermes-achievements/README.md",
         "plugins/hermes-achievements/dashboard/dist/index.js",
         "plugins/hermes-achievements/docs/runtime-note.md",
         "plugins/hermes-achievements/tests/test_runtime_contract.py",
+        "skills/software-development/plan/SKILL.md",
         "venv/lib/python3.11/site-packages/botocore/data/endpoints.json",
         "venv/lib/python3.11/site-packages/slack_sdk/web/client.py",
     ):
@@ -106,12 +125,17 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
         assert not (staged / root_only_path).exists()
 
     for runtime_path in (
+        "config/skill_seed_policy.json",
+        "locales/en.yaml",
+        "optional-mcps/linear/manifest.yaml",
+        "optional-skills/research/demo/SKILL.md",
         "plugins/web/exa/provider.py",
         "plugins/kanban/dashboard/dist/index.js",
         "plugins/hermes-achievements/README.md",
         "plugins/hermes-achievements/dashboard/dist/index.js",
         "plugins/hermes-achievements/docs/runtime-note.md",
         "plugins/hermes-achievements/tests/test_runtime_contract.py",
+        "skills/software-development/plan/SKILL.md",
         "venv/lib/python3.11/site-packages/botocore/data/endpoints.json",
         "venv/lib/python3.11/site-packages/slack_sdk/web/client.py",
     ):
@@ -131,6 +155,8 @@ def test_find_missing_runtime_paths_reports_files_removed_from_protected_trees(
     for relative_path in (kept_path, missing_path, ignored_path, missing_plugin_path):
         _write_file(source, relative_path)
     _write_file(staged, kept_path)
+    _create_protected_trees(source)
+    _create_protected_trees(staged)
 
     module = _load_check_module()
 
@@ -146,10 +172,9 @@ def test_zpk_stage_payload_check_flow_fails_when_runtime_content_is_missing(
     source = tmp_path / "source"
     staged = tmp_path / "staged"
     missing_path = "plugins/kanban/dashboard/dist/index.js"
+    _create_protected_trees(source)
+    _create_protected_trees(staged)
     _write_file(source, missing_path)
-    (source / "venv").mkdir()
-    (staged / "plugins").mkdir(parents=True)
-    (staged / "venv").mkdir()
 
     result = subprocess.run(
         [
@@ -182,8 +207,8 @@ def test_zpk_stage_payload_check_flow_accepts_complete_runtime_trees(
     )
     for relative_path in runtime_paths:
         _write_file(source, relative_path)
-    shutil.copytree(source / "plugins", staged / "plugins")
-    shutil.copytree(source / "venv", staged / "venv")
+    _create_protected_trees(source)
+    shutil.copytree(source, staged)
 
     result = subprocess.run(
         [

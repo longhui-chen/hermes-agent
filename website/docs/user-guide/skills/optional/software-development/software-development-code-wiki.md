@@ -21,7 +21,7 @@ Generate wiki docs + Mermaid diagrams for any codebase.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `Documentation`, `Mermaid`, `Architecture`, `Diagrams`, `Wiki`, `Code-Analysis` |
-| Related skills | None |
+| Related skills | `codebase-inspection`, `github-repo-management` |
 
 ## Reference: full SKILL.md
 
@@ -52,7 +52,7 @@ Do NOT use this for:
 
 - No env vars required.
 - `git` on PATH for repo SHA tracking and remote clones.
-- Optional: `pygount` for language-breakdown stats.
+- Optional: `pygount` for language-breakdown stats (see the `codebase-inspection` skill).
 
 ## How to Run
 

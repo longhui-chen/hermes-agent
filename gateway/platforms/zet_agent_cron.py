@@ -17,9 +17,8 @@ hermes-agent is a fork that periodically syncs from upstream. Editing
 cron/scheduler.py directly creates merge conflicts every release.
 
 We patch ``cron.scheduler.{save_job_output, mark_job_run, run_job,
-_deliver_result, _resolve_origin}`` (and ``APIServerAdapter._create_agent``)
-at module import time (triggered by zet_agent_cron.pth in the venv
-site-packages).
+_deliver_result, _resolve_origin}`` at module import time (triggered by
+zet_agent_cron.pth in the venv site-packages).
 
 Auto-install: ``install()`` runs on module import. The .pth line forces
 import at Python startup, so patches are in place before any cron job
@@ -269,18 +268,49 @@ def _handle_channel_delivery(job: dict, content: str):
     return combined, remaining, True
 
 
+def _is_public_zet_agent_session_id(value: str) -> bool:
+    """Return whether value has the public zettlab user/agent/session shape."""
+    parts = value.split(":", 3)
+    return len(parts) == 4 and parts[0] == "zettlab" and all(parts[1:])
+
+
+def _normalize_zet_agent_chat_id(value: str) -> str:
+    """Strip this profile's internal multiplex prefix from a public chat id.
+
+    Older ZetAgent builds accidentally persisted
+    ``<profile_home>|zettlab:<user>:<agent>:<session>`` as ``origin.chat_id``.
+    Only accept the exact active profile home and a valid public id tail; a
+    foreign/arbitrary prefix remains unchanged so routing stays fail-closed.
+    """
+    raw = str(value or "").strip()
+    if _is_public_zet_agent_session_id(raw):
+        return raw
+    profile_home, separator, candidate = raw.rpartition("|")
+    if not separator or not _is_public_zet_agent_session_id(candidate):
+        return raw
+    try:
+        from hermes_constants import get_hermes_home
+
+        if Path(profile_home) != get_hermes_home():
+            return raw
+    except Exception as exc:
+        _dbg(f"_normalize_zet_agent_chat_id: profile resolution FAILED: {exc!r}")
+        return raw
+    return candidate
+
+
 def _resolve_zet_agent_chat_id(job: dict) -> str:
     origin = job.get("origin") or {}
     if isinstance(origin, dict):
         chat_id = str(origin.get("chat_id", "") or "").strip()
         platform = origin.get("platform")
         if chat_id and (not platform or _is_zet_agent_platform(platform)):
-            return chat_id
+            return _normalize_zet_agent_chat_id(chat_id)
     try:
         import cron.scheduler as _sched
         for target in _sched._resolve_delivery_targets(job):
             if _is_zet_agent_platform(target.get("platform")):
-                return str(target.get("chat_id", "") or "").strip()
+                return _normalize_zet_agent_chat_id(target.get("chat_id", ""))
     except Exception as _e:
         _dbg(f"_resolve_zet_agent_chat_id: target resolution FAILED: {_e!r}")
     return ""
@@ -366,15 +396,14 @@ def _dbg(msg: str) -> None:
     local-server console. Production deployments can ignore this file."""
     try:
         import datetime as _dt
-        with open("/tmp/zet_agent_cron.log", "a") as _f:
+        with open("/tmp/zet_agent_cron.log", "a", encoding="utf-8") as _f:
             _f.write(f"{_dt.datetime.now().isoformat()} pid={os.getpid()} {msg}\n")
     except Exception:
         pass
 
 
 def install() -> None:
-    """Patch cron.scheduler.{save_job_output, mark_job_run} +
-    APIServerAdapter._create_agent. Idempotent."""
+    """Patch Zettlab cron persistence/delivery seams. Idempotent."""
     _dbg("install() entered")
     try:
         import cron.scheduler as _sched
@@ -674,47 +703,6 @@ def install() -> None:
         _warn_if_failure_template_drifted(_inspect.getsource(_sched))
     except Exception as _e:
         _dbg(f"install() failure-template self-check skipped: {_e!r}")
-
-    # ── _create_agent patch — set HERMES_SESSION_* contextvars ────────
-    #
-    # ZetAgentAdapter._create_agent already calls set_session_vars locally,
-    # but contextvars are task-local: if the agent's tool calls run in a
-    # task spawned BEFORE _create_agent ran, they won't see the values.
-    # Patching at the parent class level (APIServerAdapter._create_agent)
-    # gives us a second safety net + diagnostic log so we can prove the
-    # values are set right before super() builds the agent.
-    try:
-        from gateway.platforms.api_server import APIServerAdapter
-        from gateway.session_context import set_session_vars
-
-        if not getattr(APIServerAdapter._create_agent, _PATCH_SENTINEL, False):
-            _orig_create = APIServerAdapter._create_agent
-
-            def _wrapped_create(self, *args, **kwargs):
-                session_id = kwargs.get("session_id")
-                if session_id:
-                    try:
-                        set_session_vars(
-                            platform="zet_agent",
-                            chat_id=session_id,
-                            chat_name="",
-                            thread_id="",
-                            user_id="",
-                            user_name="",
-                            session_key=session_id,
-                        )
-                        _dbg(f"_create_agent: set_session_vars chat_id={session_id}")
-                    except Exception as _e:
-                        _dbg(f"_create_agent: set_session_vars FAILED: {_e!r}")
-                else:
-                    _dbg("_create_agent: no session_id, skip set_session_vars")
-                return _orig_create(self, *args, **kwargs)
-
-            setattr(_wrapped_create, _PATCH_SENTINEL, True)
-            APIServerAdapter._create_agent = _wrapped_create
-            _dbg("install() patched APIServerAdapter._create_agent OK")
-    except ImportError as _ie:
-        _dbg(f"install() _create_agent patch SKIP (ImportError): {_ie}")
 
     # ── _flush_messages_to_session_db patch — fix user-message-drop bug ──
     #
@@ -1351,6 +1339,28 @@ def _try_persist_to_session(
     if not origin_chat_id:
         _dbg(f"_try_persist: job {job_id} no origin.chat_id, skip (deliver={job.get('deliver')!r})")
         return None
+
+    # Self-heal jobs written by the old multiplex binding.  Persistence can
+    # proceed even if the best-effort rewrite fails, because resolution above
+    # already produced the public SessionDB id for this run.
+    origin = job.get("origin") or {}
+    if isinstance(origin, dict):
+        stored_chat_id = str(origin.get("chat_id", "") or "").strip()
+        if stored_chat_id and stored_chat_id != origin_chat_id:
+            normalized = _normalize_zet_agent_chat_id(stored_chat_id)
+            if normalized == origin_chat_id:
+                try:
+                    from cron.jobs import update_job
+
+                    healed_origin = dict(origin)
+                    healed_origin["chat_id"] = origin_chat_id
+                    update_job(job_id, {"origin": healed_origin})
+                    _dbg(
+                        f"_try_persist: healed scoped origin for job {job_id} "
+                        f"to {origin_chat_id}"
+                    )
+                except Exception as exc:
+                    _dbg(f"_try_persist: heal job.origin FAILED: {exc!r}")
 
     try:
         from hermes_state import SessionDB

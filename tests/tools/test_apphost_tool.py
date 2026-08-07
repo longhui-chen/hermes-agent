@@ -161,6 +161,14 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     ("list", {}, "GET", "?mine=1", None),
     ("acquire_slot", {}, "POST", "/buildslot", None),
     ("release_slot", {"slot_token": "s1"}, "DELETE", "/buildslot/s1", None),
+    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1"},
+     "POST", "/publish",
+     {"mode": "install", "source_subdir": "runs/run-1/app1"}),
+    ("publish", {"mode": "reload", "source_subdir": "runs/run-2/app1",
+                 "note": "Footer 加了一个链接"},
+     "POST", "/publish",
+     {"mode": "reload", "source_subdir": "runs/run-2/app1",
+      "note": "Footer 加了一个链接"}),
     ("install", {"staging_dir": "/tmp/stage", "slug": "app1"}, "POST", "/install",
      {"staging_dir": "/tmp/stage", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/stage"}, "POST", "/app1/reload",
@@ -217,6 +225,7 @@ _ALL_HTTP_ACTION_ARGS = [
     ("list", {}),
     ("acquire_slot", {}),
     ("release_slot", {"slot_token": "s1"}),
+    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1"}),
     ("install", {"staging_dir": "/tmp/s", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
     ("rollback", {"slug": "app1", "to_version": "v1"}),
@@ -392,6 +401,20 @@ def test_rollback_404_without_body_is_unsupported_not_retryable(monkeypatch):
     assert "reload" in out["error"]["message"]
 
 
+def test_publish_404_without_body_requires_device_upgrade(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(404, b"404 page not found")):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": "runs/run-1/app1",
+            }))
+    assert out["ok"] is False and out["status"] == 404
+    assert out["error"]["code"] == "unsupported"
+    assert "升级" in out["error"]["message"]
+    assert ".staging" in out["error"]["message"]
+
+
 def test_rollback_404_with_json_body_stays_verbatim(monkeypatch):
     """A parsable 404 is the server speaking (unknown app / not the owner) —
     the unsupported mapping must never swallow it."""
@@ -439,7 +462,11 @@ def test_connection_error_does_not_leak_url_or_token(monkeypatch):
     _assert_no_secret_leak(out, scope)
 
 
-def test_install_failure_is_never_auto_retried(monkeypatch):
+@pytest.mark.parametrize("args", [
+    {"action": "install", "slug": "a1", "staging_dir": "/tmp/s"},
+    {"action": "publish", "mode": "reload", "source_subdir": "runs/run-2/a1"},
+])
+def test_mutation_failure_is_never_auto_retried(monkeypatch, args):
     """Retry semantics belong to the calling skill; a blind tool-level retry
     would race the server's rollback-on-cancel logic."""
     scope = _scope()
@@ -451,9 +478,9 @@ def test_install_failure_is_never_auto_retried(monkeypatch):
 
     with mux_profile_scope(monkeypatch, scope):
         with patch("tools.apphost_tool._urlopen", _boom):
-            out = json.loads(app_host_tool({"action": "install", "slug": "a1", "staging_dir": "/tmp/s"}))
+            out = json.loads(app_host_tool(args))
     assert out["ok"] is False
-    assert len(attempts) == 1, f"install must be attempted exactly once, got {attempts}"
+    assert len(attempts) == 1, f"mutation must be attempted exactly once, got {attempts}"
 
 
 def test_missing_config_returns_error(monkeypatch):
@@ -542,6 +569,7 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     # slot's integrity walk before the response.
     ("install", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
     ("reload", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
+    ("publish", {"mode": "reload", "source_subdir": "runs/run-2/a1"}, 120.0),
     # No rebuild, but still stop + swap + health-check — long tier.
     ("rollback", {"slug": "a1", "to_version": "v1"}, 120.0),
     ("acquire_slot", {}, 120.0),
@@ -597,6 +625,8 @@ def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
     ("install", {"slug": "app1"}),           # staging_dir missing
     ("install", {"staging_dir": "/tmp/s"}),  # slug missing
     ("reload", {"slug": "app1"}),            # staging_dir missing
+    ("publish", {"source_subdir": "runs/run-1/app1"}),  # mode missing
+    ("publish", {"mode": "install"}),         # source_subdir missing
     # to_version missing: an untargeted rollback is a symmetric swap, so a
     # retry after a lost response would undo the undo — the tool refuses to
     # send one even though the server would accept it.
@@ -626,6 +656,7 @@ _SERVER_INTERNAL_ROUTES = {
     ("GET", "/storage"),
     ("POST", "/buildslot"),
     ("DELETE", "/buildslot/{token}"),
+    ("POST", "/publish"),
     ("POST", "/install"),
     ("GET", ""),
     ("POST", "/{name}/reload"),
@@ -642,7 +673,9 @@ def _route_template(method, path):
     parts = path.split("/")
     if len(parts) >= 2 and parts[1] == "buildslot" and len(parts) == 3:
         parts[2] = "{token}"
-    elif len(parts) >= 2 and parts[1] not in ("storage", "buildslot", "install", ""):
+    elif len(parts) >= 2 and parts[1] not in (
+        "storage", "buildslot", "publish", "install", ""
+    ):
         parts[1] = "{name}"
     return method, "/".join(parts)
 
@@ -811,6 +844,31 @@ def test_malformed_staging_dir_rejected_without_http(monkeypatch, bad_staging):
     assert "req" not in seen
 
 
+@pytest.mark.parametrize("bad_source", [
+    "",
+    ".",
+    "../another-agent/app",
+    "runs/../another-agent/app",
+    "/volume1/subvol/agents/data/agent-a/output/app",
+    "runs\\run-1\\app",
+    "runs/run-1/app\nX-Injected: 1",
+    "runs/run-1/app\x00",
+    "a" * 2000,
+])
+def test_malformed_publish_source_rejected_without_http(monkeypatch, bad_source):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": bad_source,
+            }))
+    assert out["ok"] is False and out["status"] == 0
+    assert out["error"]["code"] == "invalid_request"
+    assert "req" not in seen
+
+
 # --- response-size caps ------------------------------------------------------
 
 def test_error_body_read_is_capped(monkeypatch):
@@ -887,7 +945,9 @@ def test_delegated_children_never_get_app_host(monkeypatch):
         parent_names = {
             d["function"]["name"]
             for d in model_tools.get_tool_definitions(
-                enabled_toolsets=enabled, quiet_mode=True
+                enabled_toolsets=enabled,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
             )
         }
         child_names = {
@@ -896,6 +956,7 @@ def test_delegated_children_never_get_app_host(monkeypatch):
                 enabled_toolsets=enabled,
                 disabled_toolsets=_blocked_toolsets_for_role("worker"),
                 quiet_mode=True,
+                skip_tool_search_assembly=True,
             )
         }
     assert "app_host" in parent_names  # control: reachable before the block
@@ -931,7 +992,10 @@ def test_schema_actions_match_handler():
 
 def test_schema_declares_every_action_it_handles():
     declared = set(APP_HOST_SCHEMA["parameters"]["properties"]["action"]["enum"])
-    for action in ("rollback", "reload", "install", "list", "delete", "lifecycle", "logs"):
+    for action in (
+        "publish", "rollback", "reload", "install", "list", "delete",
+        "lifecycle", "logs",
+    ):
         assert action in declared, f"{action} is handled but not offered to the model"
 
 

@@ -53,6 +53,26 @@ def test_install_normalizes_legacy_zettlab_origin():
     assert job["origin"]["platform"] == "zettlab"
 
 
+def test_install_does_not_relabel_generic_api_server_context():
+    """Zet's cron extension must not monkey-patch the parent API adapter.
+
+    Zet overrides _create_agent, so the old parent patch never protected Zet
+    and instead rewrote ordinary API-server turns as delivering zet_agent
+    sessions.
+    """
+    from gateway.platforms.api_server import APIServerAdapter
+    import gateway.platforms.zet_agent_cron as zet_agent_cron
+
+    before = APIServerAdapter._create_agent
+    zet_agent_cron.install()
+    assert APIServerAdapter._create_agent is before
+    assert not getattr(
+        APIServerAdapter._create_agent,
+        zet_agent_cron._PATCH_SENTINEL,
+        False,
+    )
+
+
 def test_install_bypasses_scheduler_delivery_for_zet_agent(monkeypatch):
     import cron.scheduler as scheduler
     import gateway.platforms.zet_agent_cron as zet_agent_cron
@@ -334,6 +354,70 @@ def test_handoff_session_when_origin_deleted(tmp_path, monkeypatch):
     blob = " ".join((m.get("content") or "") for m in msgs if isinstance(m.get("content"), str))
     assert '"origin_recreated": true' in blob
     assert "该喝水啦" in blob
+
+
+def test_persist_heals_profile_scoped_internal_origin_key(tmp_path, monkeypatch):
+    """Internal multiplex queue keys must never become persisted chat ids."""
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+
+    session_id = "zettlab:userA:main:origin001"
+    internal_key = f"{tmp_path}|{session_id}"
+    job_id = "job-scoped-origin"
+    job = {
+        "id": job_id,
+        "name": "喝水提醒",
+        "prompt": "提醒喝水",
+        "skills": [],
+        "skill": None,
+        "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": internal_key},
+        "timezone": "UTC",
+    }
+    cron_jobs.save_jobs([job])
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id, source="zet_agent", user_id="userA")
+    db.close()
+
+    zc._LATEST_OUTPUT[job_id] = (
+        "# Cron Job: 喝水提醒\n\n## Response\n\n该喝水了，记得补充水分。\n"
+    )
+    try:
+        assert zc._try_persist_to_session(job_id, True, None, None, job) is None
+    finally:
+        zc._LATEST_OUTPUT.pop(job_id, None)
+
+    stored = cron_jobs.get_job(job_id)
+    assert stored["origin"]["chat_id"] == session_id
+    db = SessionDB(db_path=tmp_path / "state.db")
+    messages = db.get_messages(session_id)
+    db.close()
+    assert any("该喝水了" in str(message.get("content")) for message in messages)
+
+
+def test_scoped_origin_normalization_rejects_foreign_profile(tmp_path, monkeypatch):
+    """Only this profile's internal key may be reduced to a public chat id."""
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session_id = "zettlab:userA:main:origin001"
+
+    assert zc._normalize_zet_agent_chat_id(f"{tmp_path}|{session_id}") == session_id
+    foreign = f"{tmp_path.parent / 'foreign'}|{session_id}"
+    assert zc._normalize_zet_agent_chat_id(foreign) == foreign
+    malformed = f"{tmp_path}|not-a-public-session"
+    assert zc._normalize_zet_agent_chat_id(malformed) == malformed
 
 
 def test_calendar_reminder_session_is_created_without_handoff(tmp_path, monkeypatch):

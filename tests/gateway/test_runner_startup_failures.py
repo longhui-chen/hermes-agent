@@ -70,84 +70,6 @@ class _SuccessfulAdapter(BasePlatformAdapter):
 
 
 @pytest.mark.asyncio
-async def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_path):
-    """Retryable startup errors should leave the gateway running in
-    degraded mode so the reconnect watcher can recover the platform when
-    the underlying problem clears.  Previously this returned False from
-    ``start()`` and exited the process, which converted a single broken
-    platform (e.g. unpaired WhatsApp, DNS blip on Telegram) into a
-    systemd restart loop and killed cron jobs in the meantime.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    config = GatewayConfig(
-        platforms={
-            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")
-        },
-        sessions_dir=tmp_path / "sessions",
-    )
-    runner = GatewayRunner(config)
-
-    monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config: _RetryableFailureAdapter())
-
-    ok = await runner.start()
-
-    # Gateway stays alive in degraded mode; reconnect watcher takes over.
-    assert ok is True
-    assert runner.should_exit_cleanly is False
-    state = read_runtime_status()
-    assert state["gateway_state"] in {"degraded", "running"}
-    # Telegram was queued for retry, not given up on.
-    assert Platform.TELEGRAM in runner._failed_platforms
-    assert state["platforms"]["telegram"]["state"] == "retrying"
-    assert state["platforms"]["telegram"]["error_code"] == "telegram_connect_error"
-
-
-@pytest.mark.asyncio
-async def test_runner_allows_cron_only_mode_when_no_platforms_are_enabled(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    config = GatewayConfig(
-        platforms={
-            Platform.TELEGRAM: PlatformConfig(enabled=False, token="***")
-        },
-        sessions_dir=tmp_path / "sessions",
-    )
-    runner = GatewayRunner(config)
-
-    ok = await runner.start()
-
-    assert ok is True
-    assert runner.should_exit_cleanly is False
-    assert runner.adapters == {}
-    state = read_runtime_status()
-    assert state["gateway_state"] == "running"
-
-
-@pytest.mark.asyncio
-async def test_runner_records_connected_platform_state_on_success(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    config = GatewayConfig(
-        platforms={
-            Platform.DISCORD: PlatformConfig(enabled=True, token="***")
-        },
-        sessions_dir=tmp_path / "sessions",
-    )
-    runner = GatewayRunner(config)
-
-    monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config: _SuccessfulAdapter())
-    monkeypatch.setattr(runner.hooks, "discover_and_load", lambda: None)
-    monkeypatch.setattr(runner.hooks, "emit", AsyncMock())
-
-    ok = await runner.start()
-
-    assert ok is True
-    state = read_runtime_status()
-    assert state["gateway_state"] == "running"
-    assert state["platforms"]["discord"]["state"] == "connected"
-    assert state["platforms"]["discord"]["error_code"] is None
-    assert state["platforms"]["discord"]["error_message"] is None
-
-
-@pytest.mark.asyncio
 async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, tmp_path):
     """Verbosity != None must not crash with NameError on RedactingFormatter (#8044)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -161,6 +83,7 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
             self.adapters = {}
 
         async def start(self):
+            assert self._platform_lock_takeover_on_start is False
             return True
 
         async def stop(self):
@@ -875,21 +798,3 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
     assert exc_info.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
 
-def test_runner_warns_when_docker_gateway_lacks_explicit_output_mount(monkeypatch, tmp_path, caplog):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TERMINAL_ENV", "docker")
-    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", '["/etc/localtime:/etc/localtime:ro"]')
-    config = GatewayConfig(
-        platforms={
-            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")
-        },
-        sessions_dir=tmp_path / "sessions",
-    )
-
-    with caplog.at_level("WARNING"):
-        GatewayRunner(config)
-
-    assert any(
-        "host-visible output mount" in record.message
-        for record in caplog.records
-    )

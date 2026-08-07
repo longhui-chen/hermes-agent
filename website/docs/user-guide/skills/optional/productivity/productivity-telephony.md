@@ -1,14 +1,14 @@
 ---
-title: "Telephony — Give Hermes phone capabilities without core tool changes"
+title: "Telephony — Provision Twilio numbers, SMS/MMS, and AI outbound calls"
 sidebar_label: "Telephony"
-description: "Give Hermes phone capabilities without core tool changes"
+description: "Provision Twilio numbers, SMS/MMS, and AI outbound calls"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Telephony
 
-Give Hermes phone capabilities without core tool changes. Provision and persist a Twilio number, send and receive SMS/MMS, make direct calls, and place AI-driven outbound calls through Bland.ai or Vapi.
+Provision Twilio numbers, SMS/MMS, and AI outbound calls.
 
 ## Skill metadata
 
@@ -21,7 +21,7 @@ Give Hermes phone capabilities without core tool changes. Provision and persist 
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `telephony`, `phone`, `sms`, `mms`, `voice`, `twilio`, `bland.ai`, `vapi`, `calling`, `texting` |
-| Related skills | [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps), [`agentmail`](/docs/user-guide/skills/optional/email/email-agentmail) |
+| Related skills | [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps), `google-workspace`, [`agentmail`](/docs/user-guide/skills/optional/email/email-agentmail) |
 
 ## Reference: full SKILL.md
 
