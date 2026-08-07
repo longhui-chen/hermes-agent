@@ -216,6 +216,8 @@ def test_malformed_encoded_free_text_url_fails_closed() -> None:
         "HTTPS%253A%252F%252FExample.COM%252Fmagic link/opaque-credential",
         "https%3A%2G%2Gexample.com/magic/opaque-credential",
         "HTTPS%253A%252G%252Gexample.com%252Fmagic%252Fopaque-credential",
+        "https%3A%2G%2Gexample.com/magic link/opaque-credential",
+        "HTTPS%253A%252G%252Gexample.com%252Fmagic link/opaque-credential",
     ],
 )
 def test_ambiguous_free_text_url_boundary_fails_closed(target: str) -> None:
