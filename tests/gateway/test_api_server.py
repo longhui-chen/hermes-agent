@@ -4735,8 +4735,12 @@ class TestTakeoverUIHintOverSSE:
                 "success": True,
                 "url": "https://example.com/login?return_to=private",
                 "title": "Sign \ud800in 状态🦞",
-                "snapshot": '- heading "Sign in 状态🦞" [e1]\n- textbox "Email" [e2]: private@example.com',
-                "element_count": 2,
+                "snapshot": (
+                    '- heading "Sign in 状态🦞" [e1]\n'
+                    '- textbox "Email" [e2]: private@example.com\n'
+                    '- link "Open https%25253A%25252F%25252FExample.com%25252Fmagic%25252Fcredential" [e3]'
+                ),
+                "element_count": 3,
             }
         )
 
@@ -4797,6 +4801,7 @@ class TestTakeoverUIHintOverSSE:
         assert state["elements"] == [
             {"role": "heading", "label": "Sign in 状态🦞"},
             {"role": "textbox", "label": "Email"},
+            {"role": "link", "label": "Open example.com"},
         ]
         completed_wire = next(
             data for data in event_data if json.loads(data).get("status") == "completed"
@@ -4808,4 +4813,5 @@ class TestTakeoverUIHintOverSSE:
         assert "状态🦞" in completed_wire
         assert len(state_wire.encode("utf-8")) <= MAX_PREVIEW_BYTES
         assert "private@example.com" not in json.dumps(completed[0])
+        assert "credential" not in json.dumps(completed[0])
         assert "snapshot" not in completed[0]

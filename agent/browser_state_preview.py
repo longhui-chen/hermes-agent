@@ -26,6 +26,7 @@ MAX_TITLE_CHARS = 160
 MAX_SESSION_ID_CHARS = 256
 MAX_SNAPSHOT_SCAN_CHARS = 64 * 1024
 MAX_URL_SCAN_CHARS = 4096
+MAX_PERCENT_DECODE_ROUNDS = 8
 
 _TOOL_SOURCES = {
     "browser_navigate": "navigate",
@@ -175,7 +176,7 @@ def _replace_encoded_presentation_tokens(value: str) -> tuple[str, bool, bool]:
         nonlocal changed, unsafe_path
         raw = match.group(0)
         decoded = raw
-        for _ in range(2):
+        for _ in range(MAX_PERCENT_DECODE_ROUNDS):
             if _PERCENT_ESCAPE_RE.search(decoded) is None:
                 break
             try:
@@ -186,6 +187,12 @@ def _replace_encoded_presentation_tokens(value: str) -> tuple[str, bool, bool]:
             if next_value == decoded:
                 break
             decoded = next_value
+
+        if _PERCENT_ESCAPE_RE.search(decoded) is not None:
+            changed = True
+            if value[match.end() :].strip():
+                unsafe_path = True
+            return "[REDACTED]"
 
         if _MALFORMED_PERCENT_RE.search(decoded) and _UNSAFE_URL_LIKE_RE.search(decoded):
             changed = True

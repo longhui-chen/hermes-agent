@@ -1,4 +1,5 @@
 import json
+from urllib.parse import quote
 
 import pytest
 
@@ -165,6 +166,7 @@ def test_projection_replaces_lone_surrogates_before_utf8_serialization() -> None
         ("https://Example.COM/magic-login/raw-credential", "example.com"),
         ("https:%2F%2FExample.COM%2Fmagic-login%2Fcredential", "example.com"),
         ("https%253A%252F%252FExample.COM%252Fsigned%252Fcredential", "example.com"),
+        ("https%25253A%25252F%25252FExample.COM%25252Fmagic%25252Fcredential", "example.com"),
         ("https:%2F%2FExample.COM%2Fmagic%20link%2Fcredential", "example.com"),
         ("https%253A%252F%252FExample.COM%252Fsigned%2520link%252Fcredential", "example.com"),
         ("https:%2F%2FExample.COM%2Fmagic%0Alink%2Fcredential", "example.com"),
@@ -205,6 +207,21 @@ def test_malformed_encoded_free_text_url_fails_closed() -> None:
     assert preview is not None
     assert preview["title"] == "Continue at [REDACTED]"
     assert "magic" not in json.dumps(preview)
+
+
+def test_excessively_nested_encoded_free_text_url_fails_closed() -> None:
+    target = "https://example.com/magic/opaque-credential"
+    for _ in range(10):
+        target = quote(target, safe="")
+
+    preview = project_browser_state_preview(
+        "browser_navigate",
+        {"success": True, "title": f"Continue at {target}"},
+    )
+
+    assert preview is not None
+    assert preview["title"] == "Continue at [REDACTED]"
+    assert "opaque-credential" not in json.dumps(preview)
 
 
 @pytest.mark.parametrize(
