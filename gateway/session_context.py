@@ -739,10 +739,20 @@ _CRON_RUN_TS_RE = re.compile(r"_\d{8}_\d{6}$")
 # shows one card per chat turn instead of one per conversation.
 _TURN_SEGMENT_PREFIX = ":t"
 # ai-api truncates task_id at 128 chars. Cap the composed key below that so a
-# long client-minted turn id can never clip the session part of the key; past
-# the cap the turn segment degrades to a short digest instead.
+# long client-minted turn id cannot clip the session part of the key; past the
+# cap the turn segment degrades to a short digest instead. The cap can only
+# protect keys whose session part itself fits: a session id longer than
+# 128 - len(":t") - digest chars still overflows even in digest form, and
+# ai-api's truncation then collapses that session's turns back onto one card —
+# session-level attribution, same as before per-turn keys existed.
 _MAX_BILLING_USAGE_ID_LEN = 120
 _TURN_SEGMENT_DIGEST_LEN = 12
+
+# A turn id is emitted into the key verbatim only when it is entirely made of
+# these characters: unambiguous (no ``:`` — the key's own separator) and safe
+# for an HTTP header value (ASCII; httpx raises UnicodeEncodeError on anything
+# else at request-encode time, which would fail every model call of the turn).
+_TURN_SEGMENT_SAFE_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 # X-Task-Title carries one short line; longer user messages are cut here.
 _MAX_TURN_TITLE_LEN = 60
@@ -794,16 +804,23 @@ def billing_conversation_id() -> str:
 
 
 def _turn_key_segment(turn_id: Any) -> str:
-    """Normalize a turn id into one key segment: no colons, no whitespace.
+    """Normalize a turn id into one key segment: header-safe, no separators.
 
-    ``:`` separates the segments of a ledger key and whitespace is illegal in an
-    HTTP header value, so both are dropped rather than escaped — the segment only
-    has to be stable and unique within its session.
+    The upstream contract (api_server._extract_turn_id) deliberately accepts any
+    trimmed token free of whitespace/control chars — including colons, symbols
+    and non-ASCII. Those cannot pass into the composed X-Task-Id verbatim, and
+    *dropping* the offending characters would let two distinct turn ids (e.g.
+    ``turn:1`` / ``turn1``) collide on one ledger card. So: a token made purely
+    of ``[A-Za-z0-9._-]`` passes through unchanged; anything else becomes the
+    first :data:`_TURN_SEGMENT_DIGEST_LEN` hex chars of its sha1 — still
+    deterministic and unique per turn, always a legal header value.
     """
     text = str(turn_id or "").strip()
     if not text:
         return ""
-    return "".join(ch for ch in text if ch != ":" and not ch.isspace())
+    if _TURN_SEGMENT_SAFE_RE.fullmatch(text):
+        return text
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:_TURN_SEGMENT_DIGEST_LEN]
 
 
 def billing_usage_id_for(session_id: str, turn_id: Any = None) -> str:

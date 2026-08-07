@@ -94,12 +94,50 @@ def test_usage_id_falls_back_to_the_session_without_a_turn():
     )
 
 
-def test_usage_id_turn_segment_carries_no_separator_or_whitespace():
+def test_usage_id_digests_a_turn_id_with_separators_or_whitespace():
+    # ':' delimits the key's segments and whitespace is illegal in a header
+    # value. Such ids degrade to a short digest instead of dropping characters:
+    # dropping would let two distinct turn ids collide on one ledger card.
     usage_id = billing_usage_id_for("zettlab:u1:agent-a:abc", "turn: 7\tb")
-    assert usage_id == "zettlab:u1:agent-a:abc:tturn7b"
+    assert usage_id.startswith("zettlab:u1:agent-a:abc:t")
     # The session part must stay recoverable: exactly one ':t' separator beyond
     # the session's own three colons.
     assert usage_id.count(":") == 4
+    assert usage_id.isascii()
+    assert not any(c.isspace() for c in usage_id)
+    # Deterministic, and injective where the old strip-based scheme collided.
+    assert usage_id == billing_usage_id_for("zettlab:u1:agent-a:abc", "turn: 7\tb")
+    assert (
+        billing_usage_id_for("zettlab:u1:agent-a:abc", "turn:1")
+        != billing_usage_id_for("zettlab:u1:agent-a:abc", "turn1")
+    )
+
+
+def test_usage_id_digests_a_non_ascii_turn_id():
+    # metadata.turn_id's charset is deliberately unrestricted upstream
+    # (api_server._extract_turn_id), but X-Task-Id must stay a legal ASCII
+    # header value — httpx raises UnicodeEncodeError otherwise, which would
+    # fail every model call of the turn.
+    usage_id = billing_usage_id_for("zettlab:u1:agent-a:abc", "轮次一🌀")
+    assert usage_id.isascii()
+    assert usage_id.startswith("zettlab:u1:agent-a:abc:t")
+    segment = usage_id.rsplit(":t", 1)[1]
+    assert len(segment) == 12
+    assert all(c in "0123456789abcdef" for c in segment)
+
+
+def test_usage_id_length_cap_is_exclusive_at_120():
+    base = "zettlab:u1:agent-a:abc"
+    room = 120 - len(base) - len(":t")
+    at_cap = "x" * room
+    # Exactly 120 chars composed: the verbatim segment survives.
+    assert billing_usage_id_for(base, at_cap) == f"{base}:t{at_cap}"
+    # One char past the cap: the segment degrades to the 12-hex digest.
+    over_cap = "x" * (room + 1)
+    hashed = billing_usage_id_for(base, over_cap)
+    assert hashed != f"{base}:t{over_cap}"
+    assert len(hashed) == len(base) + len(":t") + 12
+    assert hashed == billing_usage_id_for(base, over_cap)
 
 
 def test_usage_id_hashes_an_over_long_turn_segment():

@@ -1457,13 +1457,17 @@ class ZetAgentAdapter(APIServerAdapter):
         # it (the first exchange) — not to a card of its own. The worker runs on
         # a bare thread whose ContextVars do NOT inherit the turn binding, so
         # capture the key and the title HERE and re-bind them inside the worker.
+        # The title snapshot reads the turn's own binding (pushed in _run_agent
+        # from trusted_user_message) rather than re-deriving from user_message,
+        # which for skill turns is the expanded boilerplate — one source of
+        # truth with the turn's main/tool/auxiliary calls.
         from gateway.session_context import (
             billing_usage_id_for,
-            summarize_turn_title,
+            zettlab_turn_title,
         )
 
         title_usage_id = billing_usage_id_for(effective_session_id, turn_id)
-        turn_title = summarize_turn_title(user_message)
+        turn_title = zettlab_turn_title()
 
         def _run_title_worker() -> None:
             from gateway.session_context import (
@@ -3147,9 +3151,25 @@ class ZetAgentAdapter(APIServerAdapter):
         # every model call of the turn stamps the same title. Synthetic
         # [ZETTLAB:...] turns are protocol traffic, not something a user typed —
         # they carry no title, exactly like the auto-title path skips them.
+        # Prefer the user-authored task text: for skill invocations
+        # ``user_message`` is the expanded activation boilerplate, and
+        # ``trusted_user_message`` is what the user actually asked. Bind only
+        # when this turn got a per-turn ledger key — without a turn_id the card
+        # stays session-scoped, and a per-turn title would just retitle that one
+        # card to whichever turn ran last.
+        # A skill invoked with no user instruction leaves trusted_user_message
+        # an empty str — that yields an empty title (header omitted), which is
+        # still better than the expanded boilerplate. Only a non-str (callers
+        # that don't thread the field) falls back to the raw message.
+        title_source = (
+            self._title_user_message(trusted_user_message)
+            if isinstance(trusted_user_message, str)
+            else title_user_message
+        )
         turn_title_token = push_zettlab_turn_title(
-            "" if title_user_message.startswith("[ZETTLAB:")
-            else summarize_turn_title(title_user_message)
+            ""
+            if not str(turn_id or "").strip() or title_source.startswith("[ZETTLAB:")
+            else summarize_turn_title(title_source)
         )
         interaction_queue_key = (
             self._interaction_queue_key(session_id) if session_id else gateway_session_key

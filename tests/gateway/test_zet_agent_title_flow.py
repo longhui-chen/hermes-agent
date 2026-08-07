@@ -107,6 +107,78 @@ async def test_native_title_is_emitted_before_stream_task_finishes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_native_title_worker_binds_billing_keys_on_a_bare_thread(monkeypatch):
+    """stream_q=None spawns a bare thread with a FRESH context — the only path
+    where the explicit capture-and-rebind of the turn key is load-bearing
+    (asyncio.to_thread copies the caller's context and would mask a regression
+    here), so it gets its own coverage."""
+    import threading
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    db = object()
+    agent = SimpleNamespace(
+        _session_db=db,
+        model="test-model",
+        provider="test-provider",
+        base_url="http://model.invalid/v1",
+        api_key="test-key",
+        api_mode="openai_chat",
+    )
+    agent_ref = [agent]
+    result = (
+        {
+            "final_response": "她的主要缺点是稳定性存疑。",
+            "messages": [
+                {"role": "user", "content": "她有什么缺点？"},
+                {"role": "assistant", "content": "她的主要缺点是稳定性存疑。"},
+            ],
+            "session_id": "zettlab:u1:main:s4",
+            "completed": True,
+        },
+        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", AsyncMock(return_value=result))
+
+    captured = {}
+    worker_done = threading.Event()
+
+    def fake_maybe_auto_title(
+        session_db, session_id, user_message, assistant_response, history, **kwargs
+    ):
+        try:
+            captured.update(
+                {
+                    "billing_usage_id": billing_usage_id(),
+                    "billing_conversation_id": billing_conversation_id(),
+                    "billing_task_title": unquote(billing_task_title_encoded()),
+                    "title_callback": kwargs.get("title_callback"),
+                }
+            )
+        finally:
+            worker_done.set()
+
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", fake_maybe_auto_title)
+
+    # No stream callbacks → _sniff_stream_q() → None → bare threading.Thread.
+    await adapter._run_agent(
+        user_message="她有什么缺点？",
+        conversation_history=[],
+        session_id="zettlab:u1:main:s4",
+        agent_ref=agent_ref,
+        turn_id="turn-1",
+    )
+
+    assert worker_done.wait(timeout=10), "bare-thread title worker never ran"
+    # F3 on the load-bearing path: a fresh thread context has no ambient turn
+    # binding at all — only the explicit snapshot can produce the turn key.
+    assert captured["billing_usage_id"] == "zettlab:u1:main:s4:tturn-1"
+    # 🔴 F5: routing / prompt-cache key stays at conversation granularity.
+    assert captured["billing_conversation_id"] == "zettlab:u1:main:s4"
+    assert captured["billing_task_title"] == "她有什么缺点？"
+    assert captured["title_callback"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("user_message", "expected_title"),
     [
@@ -146,6 +218,58 @@ async def test_turn_title_is_bound_for_the_whole_turn(
     assert captured["task_title"] == expected_title
     # The binding is turn-scoped: it must not outlive the request.
     assert billing_task_title_encoded() == ""
+
+
+@pytest.mark.asyncio
+async def test_turn_title_not_bound_without_a_turn_id(monkeypatch):
+    """Clients that don't send metadata.turn_id keep a session-scoped ledger
+    card; a per-turn title would just retitle that one card to whichever turn
+    ran last, so the title binds only alongside a per-turn key."""
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    captured = {}
+
+    async def _fake_run_agent(*_args, **_kwargs):
+        captured["task_title"] = unquote(billing_task_title_encoded())
+        return ({"final_response": "", "messages": [], "completed": True}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", _fake_run_agent)
+
+    await adapter._run_agent(
+        user_message="帮我整理这周的照片",
+        conversation_history=[],
+        session_id="zettlab:u1:main:s5",
+    )
+
+    assert captured["task_title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_turn_title_prefers_the_user_authored_task_text(monkeypatch):
+    """Skill invocations expand user_message into activation boilerplate; the
+    ledger card must show what the user actually asked (trusted_user_message),
+    not the same '[IMPORTANT: ...' prefix for every invocation of a skill."""
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    captured = {}
+
+    async def _fake_run_agent(*_args, **_kwargs):
+        captured["task_title"] = unquote(billing_task_title_encoded())
+        return ({"final_response": "", "messages": [], "completed": True}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", _fake_run_agent)
+
+    expanded = (
+        '[IMPORTANT: The user has invoked the "gif-search" skill, indicating '
+        "this task matches the skill's purpose.]\n\n找一张猫的 gif"
+    )
+    await adapter._run_agent(
+        user_message=expanded,
+        conversation_history=[],
+        session_id="zettlab:u1:main:s6",
+        turn_id="turn-9",
+        trusted_user_message="找一张猫的 gif",
+    )
+
+    assert captured["task_title"] == "找一张猫的 gif"
 
 
 @pytest.mark.asyncio
