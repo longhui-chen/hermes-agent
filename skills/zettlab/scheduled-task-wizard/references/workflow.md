@@ -70,30 +70,24 @@
 
 三档投递模式——大多数情况下默认即可，**只有用户主动表达不一样的需求时才走非默认**：
 
-| 模式 | `deliver` 值 | 用户表达 | 卡片展示 |
-|---|---|---|---|
-| 回当前对话（默认）| `origin` | 没说 / "发回这里" / "就在这" | 📍 当前对话：< 对话名 > |
-| 每次新建对话 | `new_session` | "每次给我开个新对话" / "每天一个独立对话" | 🆕 每次执行新建对话承接 |
-| 指定其它对话 | `<platform>:<chat_id>` | "发到飞书产品群" / "发到 APP 的 XX 对话" | 🎯 < 平台 > / < 对话名 > |
+| 模式 | `deliver` 值 | 用户表达 |
+|---|---|---|
+| 回当前对话（默认）| `origin` | 没说 / "发回这里" / "就在这" |
+| 每次新建对话 | `new_session` | "每次给我开个新对话" / "每天一个独立对话" |
+| 指定其它对话 | `<platform>:<chat_id>` | "发到飞书产品群" / "发到 APP 的 XX 对话" |
+
+非默认模式在落盘后那句确认里说清楚发去哪儿，别让用户以为还是发在当前对话。
 
 指定其它对话时定位顺序：
 
 1. 调 `channel_directory_lookup` 按用户给的关键词搜
-2. 命中 1 条 → 卡片直接填
+2. 命中 1 条 → 直接用它落盘
 3. 命中多条 → 反问"是 A 还是 B？"
 4. 命中 0 条 → "我看到你有这些可发送目标：[列表]，要哪个？"
 
 **不主动建议"发到别处"**——大多数预期就是"在哪儿建发回哪儿"，多问一次反而打扰。
 
-**用户主动表达多目的地**（"同时发飞书和 Slack" / "也给我发一份到产品群"）→ 接住，落到 `deliver` 逗号分隔多目的地（如 `origin,feishu:产品群`），卡片用多行展示投递目标：
-
-```
-发送到：
-  📍 当前对话
-  🎯 飞书 / 产品群
-```
-
-但不要主动建议 fan-out。
+**用户主动表达多目的地**（"同时发飞书和 Slack" / "也给我发一份到产品群"）→ 接住，落到 `deliver` 逗号分隔多目的地（如 `origin,feishu:产品群`），落盘后把每个目标都说出来。但不要主动建议 fan-out。
 
 ### 步骤 4：起一个任务名（`name`）
 
@@ -119,80 +113,13 @@ Agent cron 会在触发时启动全新 session，创建对话不会自动带过�
 
 例：中文对话里创建一个 prompt 只有 URL 的摘要任务，也要传 `"output_language": "zh-CN"`。中文对话中用户明确说“结果请用英文”，则传 `"output_language": "en"`。
 
-## 2. 创建预览卡片（APP 交互式路径优先）
+## 2. 创建
 
-当用户正在 APP / zet_agent 里用自然语言创建任务，且还没有明确确认时，优先把 4 类信息提炼成结构化卡片让用户过目。卡片有**两部分**：
+4 类信息齐了就直接调 `cronjob(action=create, ...)`，不做二次确认。信息不齐才按 §1 clarify。
 
-**(a) 人话 markdown 卡片**——webui / 不支持结构化卡的客户端看得到：
+落盘后一句话告诉用户结果，下次执行时间用 `cronjob` 返回的 `next_run_at`，不要自己算。不输出任何围栏（见 §5）。
 
-```
-🕐 < 任务名 >
-
-触发：< 人话描述，如"每天 09:00"或"下周二 10:00 一次性"或"每周一 09:00 共 4 次" >
-
-需要 Agent 做：
-< 提炼后的 prompt 全文 >
-
-发送到：< 三档之一的描述 >
-
-[创建] [修改] [取消]
-```
-
-**(b) 紧跟其后的 `cron-action-preview` JSON 围栏**——APP 端 fence parser 用它渲染可交互卡片：
-
-````
-```cron-action-preview
-{
-  "mode": "create",
-  "name": "<任务名>",
-  "schedule": "<hermes schedule: cron expr / ISO 时间 / every Nm 等>",
-  "cronExpr": "<可选，cron 表达式形态>",
-  "schedule_human": "<人话描述，与卡片"触发"一致>",
-  "prompt": "<提炼后的 prompt 全文>",
-  "output_language": "<LLM 从当前创建对话推断的 BCP 47 tag；mode=create 必填>",
-  "deliver": {
-    "mode": "origin" | "new_session" | "specified",
-    "chatName": "<对话名，origin/specified 模式必填>",
-    "sendTo": {
-      "channel": "<feishu / slack / zettlab_app / ...>",
-      "chatName": "<目标对话名>",
-      "chatType": "private" | "group"
-    }
-  },
-  "repeat": { "times": <null|1|N>, "completed": 0 }
-}
-```
-````
-
-落盘动作（**三条路并存**）：
-
-**A. APP 路径（用户点真按钮）—— 你不会观察到，但任务被建好了**
-
-用户在 APP 端点 `[创建]` 按钮，APP 直接走 `cronjob(action=create, ...)` 落盘，**完全不 ping 你**。卡片在 APP 端切到"✅ 已创建"小条就是用户反馈。这条路下，你的下一轮 input 会是用户的下一句话（可能是新话题，也可能跟刚才那条任务无关）—— **不要再为刚刚那条任务说一句"已创建"**，因为它已经在 APP 端反馈过了，你再说一遍是冗余；更不要再调 `cronjob(action=create)` 重建，会出现重复任务。如果用户后续问起，你可以调 `cronjob(action=list)` 确认任务真的在。
-
-**B. Fallback 路径（用户敲字而不是点按钮，例如在 webui 上）**
-
-- 用户回 "创建" / "确认" → 你调 `cronjob(action=create, ...)` 落盘 → 一句话确认（含下次执行时间）
-- 用户回 "修改 XXX" → 重出一张带 diff 的卡片（带 `cron-action-preview` 围栏 mode=edit），不要直接落盘
-- 用户回 "取消" → 不创建，"好的，没问题"
-
-**C. 直接落盘路径（不要为了卡片阻塞任务）**
-
-以下情况可以直接调 `cronjob(action=create/update/remove)`，不需要再生成预览卡片：
-
-- 用户已经在文字里明确确认（"确认创建"、"就这样"、"删掉吧"）。
-- 当前渠道不支持 APP 结构化卡片，或者你判断用户只需要普通文本反馈。
-- 这是 APP 按钮确认后的后台执行路径，系统/客户端已经完成用户确认。
-- 用户明确要求"直接创建/不要再确认"。
-
-直接落盘时也必须遵守 §1 的 canonical `schedule` 规则；不要传中文、英文或其它自然语言原文。
-
-卡片规则：
-
-- 卡片里 `prompt` 字段展示提炼后的版本，不展示用户原话——便于用户 review 提炼是否到位
-- 重复次数不是默认（一次/永远）就显式写出来——"共 4 次" / "持续 7 天" / "本周每天"
-- 投递模式显式标记——避免用户以为发哪都行实际只发到了当前对话
-- **JSON 围栏的字段值必须跟 markdown 卡片一一对应**——APP 端用 JSON，webui 用 markdown，两边数据要一致
+落盘失败（`Invalid schedule` 等）时告诉用户哪儿不对、你打算怎么改，然后重试。canonical `schedule` 规则见 §1 步骤 2。
 
 ---
 
@@ -201,44 +128,12 @@ Agent cron 会在触发时启动全新 session，创建对话不会自动带过�
 用户说"把那条早报改到 9 点" / "改发到飞书产品群" / "再加一句帮我总结重点"——
 
 1. **定位目标任务**：调 `cronjob(action=list)` 拿全部
-   - 用户点了名 + 候选 1 条 → 直接进确认
+   - 用户点了名 + 候选 1 条 → 直接改
    - 用户点了名 + 候选多条 → 反问"是每天 8 点那条还是周报？"
    - 用户没点名 → "你想改哪条？我看到你有：[列表]"
-2. **生成对照卡片**——分两部分：
+2. **直接调 `cronjob(action=update, job_id=..., ...)` 落盘**——同 §2，不做二次确认。只有第 1 步定位不出唯一目标时才反问。
 
-   **(a) 人话 markdown 对照卡片**：
-
-   ```
-   任务：AI 新闻早报
-   触发：~~每天 08:00~~ → 每天 09:00
-   需要 Agent 做：（未改）
-   发送到：（未改）
-   [确认] [取消]
-   ```
-
-   **(b) 紧跟其后的 `cron-action-preview` JSON 围栏**（`mode=edit`、必带 `job_id`、`changedFields` 列出变更字段、`previousValues` 给旧值用于 strikethrough diff）：
-
-   ````
-   ```cron-action-preview
-   {
-     "mode": "edit",
-     "job_id": "<目标 job_id>",
-     "name": "AI 新闻早报",
-     "schedule": "0 9 * * *",
-     "schedule_human": "每天 09:00",
-     "prompt": "<未改时也写全量>",
-     "deliver": { "mode": "origin", "chatName": "<对话名>" },
-     "repeat": { "times": null, "completed": 0 },
-     "changedFields": ["schedule"],
-     "previousValues": { "schedule": "每天 08:00" }
-   }
-   ```
-   ````
-
-3. 落盘动作分三条路（同 §2）：
-   - **APP 路径**：用户点 `[确认]` 按钮 → APP 直接走 `cronjob(action=update, job_id=..., ...)` 落盘，**不 ping 你**；卡片切到"✅ 已修改"小条就是反馈。下一轮 input 别再回"已修改"，更别重调 cronjob。
-   - **Fallback**：用户敲字 "确认" → 你调 `cronjob(action=update, ...)` → 一句话确认（含下次执行时间）
-   - **直接落盘**：用户已经明确授权修改，或当前渠道不支持卡片 → 直接调 `cronjob(action=update, ...)`，不要再生成卡片阻塞。
+3. 落盘后一句话说清改了什么 + 下次执行时间。同样不输出任何围栏。
 
 任何字段都可改：触发规则 / 任务名 / `prompt` / 投递目标 / 重复次数。
 
@@ -250,14 +145,14 @@ Agent cron 会在触发时启动全新 session，创建对话不会自动带过�
 |---|---|---|
 | 暂停 | `cronjob(action=pause, job_id=...)` | "好，已暂停。回来再说一声开启。" |
 | 开启 | `cronjob(action=resume, job_id=...)` | "好，已开启。下次 < 时间 > 执行。" |
-| 删除 | 需要确认；APP 可走删除卡片，已确认或不支持卡片时直接 `cronjob(action=remove, job_id=...)` | "确定删除「< 任务名 >」吗？运行历史会一起清掉。" → 确认 → "删了。" |
+| 删除 | **唯一需要确认的动作**；APP 走删除确认卡，已确认或不支持卡片时直接 `cronjob(action=remove, job_id=...)` | "确定删除「< 任务名 >」吗？运行历史会一起清掉。" → 确认 → "删了。" |
 | 立即执行一次 | `cronjob(action=run, job_id=...)` | "好——会在下次调度心跳（最多 60 秒内）执行一遍，结果按你设定的方式投递。" |
 
 定位任务的方式同 §3。
 
 ### 删除任务的二次确认卡片
 
-删除优先走"确认卡片 → 用户点[确认删除] → 落盘"流程；如果用户已经用文字明确确认删除，或当前渠道不支持 APP 卡片，就直接调用 `cronjob(action=remove, job_id=...)`。确认卡片同样分两部分：
+删除是唯一保留确认卡的动作（运行历史会一起清掉且不可逆）。优先走"确认卡片 → 用户点[确认删除] → 落盘"流程；如果用户已经用文字明确确认删除，或当前渠道不支持 APP 卡片，就直接调用 `cronjob(action=remove, job_id=...)`。任务的 `deliver` 是 `local` / `all` / 多目标时围栏无法表达（见 §5），改用纯文本二次确认，等用户回话再调 `remove`。确认卡片分两部分：
 
 **(a) 人话 markdown 卡片**：
 
@@ -278,13 +173,13 @@ Agent cron 会在触发时启动全新 session，创建对话不会自动带过�
   "name": "AI 新闻早报",
   "schedule": "0 9 * * *",
   "schedule_human": "每天 09:00",
-  "prompt": "<原 prompt 全文>",
+  "prompt": "<可选：cronjob(action=list) 返回的 prompt_preview 原样照抄；没拿到就整个字段省掉>",
   "deliver": { "mode": "origin", "chatName": "<对话名>" }
 }
 ```
 ````
 
-落盘动作分三条路（同 §2 / §3）：
+出了确认卡之后，落盘分三条路（**只有删除有这套流程**，创建/修改已经在 §2 / §3 直接落盘了）：
 
 - **APP 路径**：用户点 `[确认删除]` 按钮 → APP 直接走 `cronjob(action=remove, job_id=...)`，**不 ping 你**；卡片切到"✅ 已删除"小条就是反馈。下一轮别再回"已删除"，更别重调 cronjob。
 - **Fallback**：用户敲字 "确认" → 你调 `cronjob(action=remove, ...)` → 一句话确认。
@@ -292,32 +187,39 @@ Agent cron 会在触发时启动全新 session，创建对话不会自动带过�
 
 ---
 
-## 5. JSON 围栏字段规范（必读）
+## 5. JSON 围栏字段规范（仅删除确认卡）
 
-每张确认/预览卡都必须附带 `cron-action-preview` JSON 围栏，APP 端用它渲染可交互按钮。规范：
+`cron-action-preview` 围栏**只在删除确认卡（§4）里出现**，APP 端用它渲染[确认删除]按钮。创建和修改直接落盘，**不再输出任何围栏**（`mode=create` / `mode=edit` 已废弃）。
 
-| 字段 | 类型 | create | edit | delete | 说明 |
-|---|---|---|---|---|---|
-| `mode` | string | ✅ `"create"` | ✅ `"edit"` | ✅ `"delete"` | 卡片模式 |
-| `job_id` | string | ❌ | ✅ | ✅ | 目标 job ID（先 `cronjob(action=list)` 拿到）|
-| `name` | string | ✅ | ✅ | ✅ | 任务名 |
-| `schedule` | string | ✅ | ✅ | ✅ | hermes 原始 schedule（cron expr / ISO / `every Nm`）|
-| `cronExpr` | string | optional | optional | optional | 等价 cron 表达式（便于 APP 调试）|
-| `schedule_human` | string | ✅ | ✅ | ✅ | 人话描述，与 markdown 卡的"触发"行一致 |
-| `prompt` | string | ✅ | ✅ | ✅ | 提炼后的 prompt 全文 |
-| `output_language` | string | ✅ | optional | ❌ | LLM 从当前创建对话推断的 BCP 47 tag；APP 只透传，不得改用 App locale |
-| `deliver.mode` | string | ✅ | ✅ | ✅ | `"origin"` / `"new_session"` / `"specified"` |
-| `deliver.chatName` | string | optional | optional | optional | 对话名（用于 origin/specified 显示）|
-| `deliver.sendTo` | object | optional | optional | ❌ | 仅 specified 模式：`{channel, chatName, chatType}` |
-| `repeat.times` | number\|null | ✅ | ✅ | ❌ | `null`=永远 / `1`=一次 / `N`=N 次 |
-| `repeat.completed` | number | ✅ `0` | ✅ | ❌ | 已完成次数 |
-| `changedFields` | string[] | ❌ | ✅ | ❌ | 变更字段名列表 |
-| `previousValues` | object | ❌ | ✅ | ❌ | `{字段名: 旧值}`，给 APP 渲染 strikethrough diff |
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `mode` | string | ✅ 固定 `"delete"` | 卡片模式 |
+| `job_id` | string | ✅ | 目标 job ID（先 `cronjob(action=list)` 拿到）|
+| `name` | string | ✅ | 任务名 |
+| `schedule` | string | ✅ | hermes 原始 schedule（cron expr / ISO / `every Nm`）|
+| `cronExpr` | string | optional | 等价 cron 表达式（便于 APP 调试）|
+| `schedule_human` | string | ✅ | 人话描述，与 markdown 卡的"触发"行一致 |
+| `prompt` | string | optional | `cronjob(action=list)` 返回的 `prompt_preview`，原样照抄。**它最多 100 字（超长会带尾部 `...`），拿不到全文——不要补写、不要凭记忆重建。** 没有可用 preview 就省掉整个字段，APP 端允许缺省 |
+| `deliver` | object | ✅ | **必须是对象**，见下方映射表。APP 端拿到字符串会整张卡解析失败 |
+
+### `deliver`：把 list 的字符串翻成对象
+
+`cronjob(action=list)` 返回的 `deliver` 是**字符串**（`origin` / `new_session` / `local` / `all` / `<platform>:<chat_id>` / 逗号分隔多目标），而围栏必须给对象。**不能原样照抄** —— APP 端 `normalizeDeliver` 见到没有 `mode` 的值直接判空，整张删除卡废掉，用户看到一坨原始 JSON，删不了。
+
+| list 返回 | 围栏里写 |
+|---|---|
+| `origin` / 字段缺失 | `{"mode": "origin"}` |
+| `new_session` | `{"mode": "new_session"}` |
+| `<platform>:<chat_id>`（如 `feishu:oc_9a3f…`）| `{"mode": "specified", "sendTo": {"channel": "<平台，如 feishu>", "chatName": "<对话名>"}}` |
+| `local` / `all` / 逗号分隔多目标 | **无法表达 → 不出卡**，改用纯文本二次确认（"确定删除「X」吗？运行历史会一起清掉。"），等用户回话再调 `remove` |
+
+`specified` 的 `chatName`：优先用 `channel_directory_lookup` 拿真实对话名；查不到就**原样填 `chat_id`**，不要编一个名字——这是让用户拍板删不删的界面。`chatType` 不确定就整个省掉（APP 端默认 `group`）。
 
 注意事项：
 
 - 围栏内**必须**是合法 JSON——不要用注释、单引号、尾逗号
 - 围栏外的 markdown 卡片是降级渲染兜底，APP 端会用 JSON 重新渲染可交互卡片，不依赖 markdown
-- 卡片每出现一次，**必须**带一个对应的围栏——不要只发 markdown 没有 JSON
-- 不出卡片、直接落盘时，不要输出 `cron-action-preview` 围栏。
-- 落盘后的"一句话确认"用普通文本，不要再发围栏
+- 删除确认卡每出现一次，**必须**带一个对应的围栏——不要只发 markdown 没有 JSON
+- **创建 / 修改任何情况下都不要输出围栏**——你已经调过 `cronjob` 落盘了，APP 端再解析到围栏会重复落盘，用户看到两条任务
+
+- **绝不能输出 `cron-summary` 围栏**——那是系统在任务真正触发时写回会话的执行结果。上下文里见过一次就仿写，会让 APP 把还没到点的任务渲染成"已执行"卡片。同理不要提前编造任务的提醒正文。
