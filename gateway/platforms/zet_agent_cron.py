@@ -46,7 +46,7 @@ import re
 import stat as _stat
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,8 @@ _CRON_ATTACHMENT_TEMP_DIRS = frozenset({
     "tmp", "var/tmp", "private/tmp",
 })
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])/{1,3}[^\s\"'<>`|)]{2,}")
+# Profile directory name (= agent id). Anything else never becomes a path.
+_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
 def _scoped_env(name: str, default: str = "") -> str:
@@ -326,6 +328,239 @@ def _user_id_from(session_id: str) -> str:
     """zettlab:<userID>:<agentID>:<suffix> → userID（取不到返回空串）。"""
     parts = session_id.split(":", 3)
     return parts[1] if len(parts) == 4 and parts[0] == "zettlab" else ""
+
+
+def _agent_id_from(session_id: str) -> str:
+    """zettlab:<userID>:<agentID>:<suffix> → agentID（取不到返回空串）。"""
+    parts = session_id.split(":", 3)
+    return parts[2] if len(parts) == 4 and parts[0] == "zettlab" else ""
+
+
+def _profile_state_db_candidates(agent_id: str) -> List[Path]:
+    """``<root>/profiles/<agent_id>/state.db``；agent_id 来自 job.origin，只认纯 profile 名。"""
+    if not agent_id or not _PROFILE_ID_RE.match(agent_id):
+        return []
+    try:
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+        homes = [Path(get_hermes_home()), Path(get_process_hermes_home())]
+    except Exception as _e:
+        _dbg(f"_profile_state_db_candidates: home resolution FAILED: {_e!r}")
+        return []
+
+    out: List[Path] = []
+    seen: set = set()
+    for root in _state_db_roots(homes):
+        base = root / "profiles"
+        db_path = base / agent_id / "state.db"
+        try:
+            resolved = db_path.resolve()
+            base_prefix = str(base.resolve()) + os.sep
+        except OSError:
+            continue
+        if not str(resolved).startswith(base_prefix):
+            continue
+        if str(resolved) in seen:
+            continue
+        seen.add(str(resolved))
+        out.append(resolved)
+    return out
+
+
+def _state_db_roots(homes: Iterable[Path]) -> List[Path]:
+    """每个 home 归一到它的 multiprofile root：``<root>/profiles/<name>`` → ``<root>``。
+
+    home 自己**不能**同时当 root —— 否则会产出 ``<root>/profiles/<A>/profiles/<A>``
+    这种嵌套假路径，而它排在候选第一位，新会话会被建进一个没人读的库。
+    """
+    roots: List[Path] = []
+    for home in homes:
+        root = home.parent.parent if home.parent.name == "profiles" else home
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _root_state_db_candidates() -> List[Path]:
+    """各 multiprofile root 自己的 ``state.db``（不是 ``profiles/`` 下的）。
+
+    存量会话可能就住在 root 库里；而 cron 线程的 home override 常指向
+    ``<root>/profiles/<name>``，此时 ``get_hermes_home()/state.db`` 是 profile 库、
+    永远探不到 root 库 —— 漏了这一层，root-only 会话每次 run 都会被判成已删而派生 handoff。
+    """
+    try:
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+        homes = [Path(get_hermes_home()), Path(get_process_hermes_home())]
+    except Exception as _e:
+        _dbg(f"_root_state_db_candidates: home resolution FAILED: {_e!r}")
+        return []
+
+    out: List[Path] = []
+    seen: set = set()
+    for root in _state_db_roots(homes):
+        db_path = root / "state.db"
+        key = str(db_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(db_path)
+    return out
+
+
+def _db_has_session(db_path: Path, session_id: str) -> Optional[bool]:
+    """Read-only probe: does this state.db own ``session_id``?
+
+    三态：``True`` 拥有 / ``False`` 确认不拥有 / ``None`` 探测失败（库读不出来）。
+    ``None`` 绝不能被当成 ``False`` —— 那会把"库打不开"降级成"会话已删"，
+    进而派生 handoff 并永久改写 ``job.origin.chat_id``（无回滚路径）。
+    """
+    try:
+        if not db_path.exists():
+            return False
+    except OSError as _e:
+        _dbg(f"_db_has_session: stat FAILED db={db_path}: {_e!r}")
+        return None
+    try:
+        from hermes_state import SessionDB
+    except ImportError as _e:
+        _dbg(f"_db_has_session: SessionDB unavailable: {_e!r}")
+        return None
+    db = None
+    try:
+        db = SessionDB(db_path=db_path, read_only=True)
+        return db.get_session(session_id) is not None
+    except Exception as _e:
+        _dbg(f"_db_has_session: probe FAILED db={db_path} sid={session_id}: {_e!r}")
+        logger.warning(
+            "cron persist: state.db ownership probe failed db=%s session=%s err=%r",
+            db_path, session_id, _e,
+        )
+        return None
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _same_db_key(db_path: Path) -> str:
+    try:
+        return str(db_path.resolve())
+    except OSError:
+        return str(db_path)
+
+
+def _job_store_agent_id() -> str:
+    """执行中 job 所属 profile：当前 cron store 是 ``<root>/profiles/<X>/cron/jobs.json`` 时返回 X。
+
+    这是服务端事实（store 路径来自 ContextVar override / 模块常量 / active home，
+    不来自 job 内容），不依赖 profile secret scope 是否绑上；root/legacy store 返回空串。
+    """
+    try:
+        from cron.jobs import _current_cron_store
+        jobs_file = Path(_current_cron_store().jobs_file).resolve()
+    except Exception as _e:
+        _dbg(f"_job_store_agent_id: store resolution FAILED: {_e!r}")
+        return ""
+    parts = jobs_file.parts
+    if len(parts) >= 4 and parts[-4] == "profiles" and parts[-2] == "cron" and parts[-1] == "jobs.json":
+        candidate = parts[-3]
+        if _PROFILE_ID_RE.match(candidate):
+            return candidate
+    return ""
+
+
+def _resolve_persist_db_path(session_id: str) -> Tuple[Path, Optional[str]]:
+    """``(持有 session_id 的 state.db, 未决原因)``；见 zettlab-local-server/docs/cron-run-history.md §3.3。
+
+    顺序不能换：存量 root-only 会话若只看 profile 库会被判成已删 → 每次 run 派生 handoff 会话。
+    第二个返回值非空 = 有候选库探测失败、归属未决，调用方必须 fail-closed，
+    **不许**据此判定会话已删而新建会话。
+    """
+    from hermes_constants import get_hermes_home
+    current = Path(get_hermes_home()) / "state.db"
+    origin_agent_id = _agent_id_from(session_id)
+    # job 所属 profile 优先于 .env 身份：前者是服务端事实，后者在 scope 未绑时读的是根 .env
+    exec_agent_id = _job_store_agent_id() or _scoped_env("ZET_AGENT_ID").strip()
+    if origin_agent_id and exec_agent_id and origin_agent_id != exec_agent_id:
+        # session_id 来自调用方可控的 job.origin —— 跨 agent 的库一律不落
+        return current, (
+            f"origin agent {origin_agent_id!r} does not match executing agent "
+            f"{exec_agent_id!r} for session {session_id} — cross-agent persist refused"
+        )
+    agent_id = origin_agent_id or exec_agent_id
+    candidates = _profile_state_db_candidates(agent_id)
+
+    probed: Dict[str, Optional[bool]] = {}
+
+    def _owns(db_path: Path) -> Optional[bool]:
+        key = _same_db_key(db_path)
+        if key not in probed:
+            probed[key] = _db_has_session(db_path, session_id)
+        return probed[key]
+
+    unknown: List[str] = []
+
+    def _record_unknown(db_path: Path) -> None:
+        key = _same_db_key(db_path)
+        if key not in unknown:
+            unknown.append(key)
+
+    root_candidates = _root_state_db_candidates()
+
+    for db_path in candidates:
+        owned = _owns(db_path)
+        if owned is None:
+            _record_unknown(db_path)
+        elif owned and not unknown:
+            _warn_if_split_session(session_id, db_path, root_candidates, _owns)
+            return db_path, None
+
+    for db_path in root_candidates:
+        owned = _owns(db_path)
+        if owned is None:
+            _record_unknown(db_path)
+        elif owned and not unknown:
+            return db_path, None
+
+    owned = _owns(current)
+    if owned is None:
+        _record_unknown(current)
+    elif owned and not unknown:
+        return current, None
+
+    if unknown:
+        return current, (
+            "state.db ownership undetermined for session "
+            f"{session_id} (unreadable candidates: {', '.join(unknown)})"
+        )
+
+    for db_path in candidates:
+        if db_path.parent.is_dir():
+            return db_path, None
+    return current, None
+
+
+def _warn_if_split_session(session_id, profile_db, root_candidates, owns) -> None:
+    """§6.3: 同一会话同时存在于 profile 库和 root 库时必须告警，不许静默取 profile。"""
+    profile_key = _same_db_key(profile_db)
+    for db_path in root_candidates:
+        if _same_db_key(db_path) == profile_key:
+            continue
+        if owns(db_path) is True:
+            logger.warning(
+                "cron persist: split session detected — session=%s exists in both "
+                "profile store %s and root store %s; writing to the profile store "
+                "(metric=cron_persist_split_session)",
+                session_id, profile_db, db_path,
+            )
+            return
+
+
+def _cron_session_db():
+    """cron session 所在库。bare ``SessionDB()`` 是故意的：cron/scheduler.py 也是 bare，两边必须同库。"""
+    from hermes_state import SessionDB
+    return SessionDB()
 
 
 def _handoff_session_id(old_id: str) -> Optional[str]:
@@ -838,10 +1073,9 @@ def _count_tool_activity(job_id: str) -> Optional[int]:
     if not job_id:
         return None
     try:
-        from hermes_state import SessionDB
+        db = _cron_session_db()  # 换 profile 库 → 查不到 session → fake-success 检测静默失效
     except ImportError:
         return None
-    db = SessionDB()
     try:
         try:
             with db._lock:
@@ -874,10 +1108,9 @@ def _list_cron_session_ids(job_id: str) -> Optional[set]:
     if not job_id:
         return None
     try:
-        from hermes_state import SessionDB
+        db = _cron_session_db()  # 换 profile 库 → 返回 None → retry 的 silent 判定永远跳过
     except ImportError:
         return None
-    db = SessionDB()
     try:
         with db._lock:
             cursor = db._conn.execute(
@@ -900,10 +1133,9 @@ def _count_session_tool_activity(session_id: str) -> Optional[int]:
     if not session_id:
         return None
     try:
-        from hermes_state import SessionDB
+        db = _cron_session_db()  # 换 profile 库 → get_messages 返回 [] → 误判「没跑过工具」而重复 retry
     except ImportError:
         return None
-    db = SessionDB()
     try:
         try:
             messages = db.get_messages(session_id)
@@ -1368,9 +1600,14 @@ def _try_persist_to_session(
         _dbg(f"_try_persist: SessionDB ImportError: {_ie}")
         return f"zet_agent session persist unavailable: {_ie}"
 
-    # Resolve the profile's state.db at call time; bare SessionDB() is pinned to the import-time top-level DEFAULT_DB_PATH.
-    from hermes_constants import get_hermes_home
-    db = SessionDB(db_path=get_hermes_home() / "state.db")
+    # 落库跟着会话走：get_hermes_home() 的 profile override 在 cron 线程里不一定绑上
+    db_path, unresolved = _resolve_persist_db_path(origin_chat_id)
+    if unresolved:
+        # fail-closed：归属未决时新建会话会永久改写 job.origin.chat_id，没有回滚路径
+        _dbg(f"_try_persist: {unresolved}")
+        logger.warning("cron persist: job=%s fail-closed: %s", job_id, unresolved)
+        return f"zet_agent session persist deferred: {unresolved}"
+    db = SessionDB(db_path=db_path)
     try:
         # deliver=origin 但源对话已被 App 删除：直接 append 会撞 messages→sessions
         # 外键、cron 输出静默丢失。改为新建一个同 user/agent 的承接会话，把本次及
@@ -1392,6 +1629,11 @@ def _try_persist_to_session(
                 target_id = new_id
                 origin_recreated = True
                 _dbg(f"_try_persist: origin {origin_chat_id} gone → handoff session {new_id}")
+                logger.warning(
+                    "cron persist: origin session %s not found in %s — derived handoff "
+                    "session %s and rewriting job=%s origin.chat_id (irreversible)",
+                    origin_chat_id, db_path, new_id, job_id,
+                )
                 try:
                     from cron.jobs import update_job
                     _new_origin = dict(job.get("origin") or {})
@@ -1595,12 +1837,10 @@ def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dic
     if not job_id:
         return []
     try:
-        from hermes_state import SessionDB
+        db = _cron_session_db()  # 换 profile 库 → 查不到 cron session → cron 附件永远为空
     except ImportError as _ie:
         _dbg(f"_collect_produced_files: SessionDB ImportError: {_ie}")
         return []
-
-    db = SessionDB()
     try:
         try:
             with db._lock:
