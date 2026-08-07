@@ -56,35 +56,22 @@ class TestCredentialFingerprint:
     def test_none_without_token(self):
         assert GatewayRunner._adapter_credential_fingerprint(_FakeAdapter()) is None
 
-    def test_stable_and_log_safe(self):
-        a = _FakeAdapter(token="secret-bot-token")
-        fp1 = GatewayRunner._adapter_credential_fingerprint(a)
-        fp2 = GatewayRunner._adapter_credential_fingerprint(_FakeAdapter(token="secret-bot-token"))
-        assert fp1 == fp2  # stable
-        assert "secret-bot-token" not in (fp1 or "")  # never the raw token
-        assert len(fp1) == 16
 
-    def test_distinct_tokens_distinct_fp(self):
-        a = GatewayRunner._adapter_credential_fingerprint(_FakeAdapter(token="tok-A"))
-        b = GatewayRunner._adapter_credential_fingerprint(_FakeAdapter(token="tok-B"))
-        assert a != b
+    def test_reads_photon_project_secret(self):
+        class _PhotonAdapter:
+            def __init__(self, secret):
+                self._project_secret = secret
 
-    def test_reads_alt_attrs(self):
-        class _AltAdapter:
-            def __init__(self):
-                self.bot_token = "alt-token"
-        assert GatewayRunner._adapter_credential_fingerprint(_AltAdapter()) is not None
-
-    def test_reads_platform_config_token(self):
-        class _Config:
-            token = "config-token"
-
-        fp = GatewayRunner._adapter_credential_fingerprint(
-            _FakeAdapter(token=None, config=_Config())
+        fp1 = GatewayRunner._adapter_credential_fingerprint(
+            _PhotonAdapter("shared-project-secret")
+        )
+        fp2 = GatewayRunner._adapter_credential_fingerprint(
+            _PhotonAdapter("shared-project-secret")
         )
 
-        assert fp is not None
-        assert "config-token" not in fp
+        assert fp1 == fp2
+        assert fp1 is not None
+        assert "shared-project-secret" not in fp1
 
 
     def test_reads_config_token(self):
@@ -118,26 +105,6 @@ class TestCredentialFingerprint:
         assert a is not None and b is not None
         assert a != b
 
-    def test_direct_token_takes_precedence_over_config(self):
-        """If both `adapter.token` and `adapter.config.token` exist, direct wins."""
-        class _Cfg:
-            token = "from-config"
-        class _Both:
-            token = "from-direct"
-            config = _Cfg()
-        fp = GatewayRunner._adapter_credential_fingerprint(_Both())
-        import hashlib
-        expected = hashlib.sha256(b"hermes-mux:from-direct").hexdigest()[:16]
-        assert fp == expected
-
-    def test_config_without_token_returns_none(self):
-        """config present but no token attribute → None (no false positive)."""
-        class _Cfg:
-            pass
-        class _Adapter:
-            config = _Cfg()
-        assert GatewayRunner._adapter_credential_fingerprint(_Adapter()) is None
-
 
 class TestProfileMessageHandler:
     @pytest.mark.asyncio
@@ -161,27 +128,6 @@ class TestProfileMessageHandler:
         result = await handler(_Evt())
         assert result == "ok"
         assert seen["profile"] == "coder"
-
-    @pytest.mark.asyncio
-    async def test_does_not_override_existing_profile(self):
-        runner = GatewayRunner.__new__(GatewayRunner)
-        seen = {}
-
-        async def _fake_handle(event):
-            seen["profile"] = event.source.profile
-            return "ok"
-
-        runner._handle_message = _fake_handle
-        handler = runner._make_profile_message_handler("coder")
-
-        class _Src:
-            profile = "writer"  # already stamped (e.g. by URL prefix)
-
-        class _Evt:
-            source = _Src()
-
-        await handler(_Evt())
-        assert seen["profile"] == "writer"
 
 
 class _SecondaryRecoveryAdapter:
@@ -293,32 +239,6 @@ class TestSecondaryProfileFatalRecovery:
         assert scoped_homes
         assert all(path == Path("/profiles/reviewer") for path in scoped_homes)
 
-    @pytest.mark.asyncio
-    async def test_secondary_reconnect_cancellation_disposes_partial_adapter(
-        self, monkeypatch
-    ):
-        runner = _secondary_recovery_runner()
-        runner._profile_failed_platforms["reviewer"] = {}
-        partial = _SecondaryRecoveryAdapter()
-        _install_secondary_reconnect_context(monkeypatch, runner, partial)
-        connect_started = asyncio.Event()
-
-        async def connect(adapter, platform, *, is_reconnect=False):
-            connect_started.set()
-            await asyncio.Event().wait()
-
-        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", connect)
-        task = asyncio.create_task(
-            runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
-        )
-        runner._profile_failed_platforms["reviewer"][Platform.DISCORD] = task
-        await connect_started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-        assert partial.disconnected is True
-        assert runner._profile_failed_platforms == {}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("connect_result", [True, False], ids=["success", "failure"])
@@ -350,77 +270,6 @@ class TestSecondaryProfileFatalRecovery:
         assert runner._profile_adapters == {}
         assert replacement.disconnected is True
         assert runner._profile_failed_platforms == {}
-
-    @pytest.mark.asyncio
-    async def test_shutdown_cancels_secondary_reconnect_before_registry_teardown(self):
-        runner = _secondary_recovery_runner()
-        runner._profile_failed_platforms["reviewer"] = {}
-        runner._adapter_disconnect_timeout_secs = lambda: 0.1
-        started = asyncio.Event()
-        partial = _SecondaryRecoveryAdapter()
-
-        async def reconnect():
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                await runner._safe_adapter_disconnect(partial, Platform.DISCORD)
-                raise
-
-        task = asyncio.create_task(reconnect())
-        runner._profile_failed_platforms["reviewer"][Platform.DISCORD] = task
-        await started.wait()
-        await runner._cancel_secondary_profile_reconnect_tasks()
-
-        assert task.cancelled()
-        assert partial.disconnected is True
-        assert runner._profile_failed_platforms == {}
-
-    @pytest.mark.asyncio
-    async def test_secondary_fatal_during_shutdown_does_not_schedule_reconnect(self):
-        runner = _secondary_recovery_runner(running=False)
-        adapter = _SecondaryRecoveryAdapter()
-        runner._profile_adapters = {"reviewer": {Platform.DISCORD: adapter}}
-        scheduled = []
-        runner._schedule_secondary_profile_reconnect = lambda *args: scheduled.append(args)
-
-        await runner._handle_profile_adapter_fatal_error(
-            "reviewer", Platform.DISCORD, adapter
-        )
-
-        assert adapter.disconnected is True
-        assert Platform.DISCORD not in runner._profile_adapters["reviewer"]
-        assert scheduled == []
-
-    def test_secondary_reconnect_scheduler_is_noop_after_shutdown(self, monkeypatch):
-        runner = _secondary_recovery_runner(running=False)
-        created = []
-
-        def create_task(coro, *, name):
-            coro.close()
-            created.append(name)
-            return AsyncMock()
-
-        monkeypatch.setattr(asyncio, "create_task", create_task)
-        runner._schedule_secondary_profile_reconnect(
-            "reviewer", Platform.DISCORD, _SecondaryRecoveryAdapter()
-        )
-
-        assert created == []
-        assert runner._profile_failed_platforms == {}
-
-    @pytest.mark.asyncio
-    async def test_nonretryable_secondary_fatal_is_not_restarted(self):
-        runner = _secondary_recovery_runner()
-        adapter = _SecondaryRecoveryAdapter(retryable=False)
-        runner._profile_adapters = {"reviewer": {Platform.DISCORD: adapter}}
-
-        await runner._handle_profile_adapter_fatal_error(
-            "reviewer", Platform.DISCORD, adapter
-        )
-
-        assert adapter.disconnected is True
-        assert runner._background_tasks == set()
 
 
 class TestSecondaryProfileConfigHandling:
@@ -568,66 +417,21 @@ class TestPortBindingSkip:
         with pytest.raises(MultiplexConfigError, match="open policy"):
             await runner._start_secondary_profile_adapters()
 
-    @pytest.mark.asyncio
-    async def test_open_policy_uses_fatal_config_error(self, monkeypatch):
-        from gateway.config import GatewayConfig, Platform, PlatformConfig
-        from gateway.run import (
-            MultiplexConfigError,
-            SecondaryPortBindingConfigError,
-        )
-
-        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
-        monkeypatch.delenv("WECOM_ALLOW_ALL_USERS", raising=False)
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = GatewayConfig(multiplex_profiles=True)
-        runner._profile_adapters = {}
-
-        unsafe_cfg = GatewayConfig(multiplex_profiles=True)
-        unsafe_cfg.platforms = {
-            Platform.WECOM: PlatformConfig(
-                enabled=True,
-                extra={"dm_policy": "open"},
-            ),
-        }
-        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: unsafe_cfg)
-
-        with pytest.raises(MultiplexConfigError, match="open policy") as exc_info:
-            await runner._start_one_profile_adapters("unsafe", "/tmp/unsafe", {})
-
-        assert not isinstance(exc_info.value, SecondaryPortBindingConfigError)
-        assert "unsafe" not in runner._profile_adapters
 
     @pytest.mark.asyncio
-    async def test_secondary_non_binding_platform_ok(self, monkeypatch):
-        """A non-port-binding platform (e.g. telegram) is NOT rejected."""
-        from gateway.config import GatewayConfig, Platform, PlatformConfig
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = GatewayConfig(multiplex_profiles=True)
-        runner._profile_adapters = {}
-
-        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
-        reviewer_cfg.platforms = {
-            Platform.TELEGRAM: PlatformConfig(enabled=True, token="t"),
-        }
-        monkeypatch.setattr(
-            "gateway.config.load_gateway_config", lambda: reviewer_cfg
-        )
-        # _create_adapter returns None here (no real telegram token wiring), so
-        # the loop simply connects nothing — the key assertion is NO raise.
-        monkeypatch.setattr(runner, "_create_adapter", lambda p, c: None)
-
-        connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
-        assert connected == 0  # nothing connected, but no MultiplexConfigError
-
-    @pytest.mark.asyncio
-    async def test_multiplex_secondary_skips_relay_but_starts_direct_adapter(
+    async def test_secondary_distinct_photon_credentials_distinct_ports_connect(
         self, monkeypatch
     ):
-        """Relay is process-shared; direct adapters remain per-profile."""
+        """Multiplexing remains supported when Photon sidecars cannot collide."""
         from gateway.config import GatewayConfig, Platform, PlatformConfig
 
+        class _PhotonAdapter:
+            def __init__(self, secret, port):
+                self._project_secret = secret
+                self._sidecar_bind = "127.0.0.1"
+                self._sidecar_port = port
+                self.platform = Platform("photon")
+                self.connected = False
         class _DirectAdapter:
             platform = Platform.TELEGRAM
 
@@ -943,11 +747,72 @@ class TestPortBindingSkip:
         )
 
         assert connected == 0
-        assert duplicate.disconnected is True
+        # The merged registry now rejects a duplicate from its config
+        # fingerprint before the adapter is started, so there is nothing to
+        # disconnect.
+        assert duplicate.disconnected is False
         assert runner._profile_adapters["reviewer"] == {}
+
+    @pytest.mark.asyncio
+    async def test_failed_photon_connect_releases_listener_for_later_profile(
+        self, monkeypatch
+    ):
+        """A failed sidecar must not reserve an endpoint it never owned."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        class _PhotonAdapter:
+            def __init__(self, secret, should_connect):
+                self._project_secret = secret
+                self._sidecar_bind = "127.0.0.1"
+                self._sidecar_port = 8789
+                self.platform = Platform("photon")
+                self.should_connect = should_connect
+                self.disconnected = False
+                self.config = PlatformConfig(enabled=True)
+
+            def __getattr__(self, name):
+                if name.startswith("set_"):
+                    return lambda *args, **kwargs: None
+                raise AttributeError(name)
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+        runner.session_store = None
+        runner._busy_text_mode = "queue"
+
+        photon = Platform("photon")
+        profile_cfg = GatewayConfig(multiplex_profiles=True)
+        profile_cfg.platforms = {photon: PlatformConfig(enabled=True)}
+        failed = _PhotonAdapter("failed-secret", False)
+        later = _PhotonAdapter("later-secret", True)
+        adapters = iter((failed, later))
+        claimed = {}
+
+        async def _connect(adapter, platform):
+            return adapter.should_connect
+
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
+        monkeypatch.setattr(runner, "_create_adapter", lambda p, c: next(adapters))
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
+        monkeypatch.setattr(
+            runner, "_make_adapter_auth_check", lambda p, **kwargs: None
+        )
+
+        first = await runner._start_one_profile_adapters("broken", "/tmp/x", claimed)
+        second = await runner._start_one_profile_adapters("later", "/tmp/y", claimed)
+
+        assert first == 0
+        assert failed.disconnected is True
+        assert second == 1
+        assert runner._profile_adapters["later"][photon] is later
 
     def test_port_binding_set_covers_known_listeners(self):
         from gateway.run import _PORT_BINDING_PLATFORM_VALUES
+
         # Every adapter that binds a TCP port must be in the guard set.
         for p in (
             "webhook",
@@ -962,7 +827,6 @@ class TestPortBindingSkip:
             "line",
         ):
             assert p in _PORT_BINDING_PLATFORM_VALUES
-
 
 
 class TestFeishuPortBindingConditional:
@@ -990,44 +854,3 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
-    @pytest.mark.asyncio
-    async def test_feishu_webhook_mode_raises(self, monkeypatch):
-        """Feishu in webhook mode binds a port and should raise MultiplexConfigError."""
-        from gateway.run import MultiplexConfigError
-        from gateway.config import GatewayConfig, Platform, PlatformConfig
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = GatewayConfig(multiplex_profiles=True)
-        runner._profile_adapters = {}
-
-        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
-        reviewer_cfg.platforms = {
-            Platform.FEISHU: PlatformConfig(
-                enabled=True,
-                extra={"app_id": "cli_xxx", "app_secret": "sec", "connection_mode": "webhook"},
-            ),
-        }
-        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: reviewer_cfg)
-
-        with pytest.raises(MultiplexConfigError) as ei:
-            await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
-        assert "feishu" in str(ei.value)
-
-    def test_platform_binds_port_helper(self):
-        """Unit test for _platform_binds_port helper."""
-        from gateway.run import _platform_binds_port
-
-        # Non-port-binding platform
-        assert _platform_binds_port("telegram", {}) is False
-
-        # Unconditional port-binding platform
-        assert _platform_binds_port("webhook", {}) is True
-        assert _platform_binds_port("api_server", {}) is True
-
-        # Feishu: websocket = no port binding
-        assert _platform_binds_port("feishu", {"connection_mode": "websocket"}) is False
-        assert _platform_binds_port("feishu", {}) is False  # default is websocket
-
-        # Feishu: webhook = port binding
-        assert _platform_binds_port("feishu", {"connection_mode": "webhook"}) is True

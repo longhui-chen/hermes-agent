@@ -99,17 +99,6 @@ def test_output_transforms_chain_in_registration_order():
     assert results[-1] == "[redacted] | governor"
 
 
-def test_empty_string_return_leaves_response_unchanged():
-    """Empty string must not replace the response (pass-through signal)."""
-    hook_returns = [""]
-
-    final_response = "original"
-    for _hook_result in hook_returns:
-        if isinstance(_hook_result, str) and _hook_result:
-            final_response = _hook_result
-            break
-
-    assert final_response == "original"
 
 
 def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):

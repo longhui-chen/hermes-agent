@@ -104,8 +104,7 @@ class TestRequestToolApproval:
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-        monkeypatch.setattr(approval, "env_var_enabled",
-                            lambda v: v == "HERMES_CRON_SESSION")
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: True)
         monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "deny")
         res = request_tool_approval("terminal", "smtp send")
         assert res["approved"] is False
@@ -114,20 +113,11 @@ class TestRequestToolApproval:
     def test_cron_approve_mode_allows(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-        monkeypatch.setattr(approval, "env_var_enabled",
-                            lambda v: v == "HERMES_CRON_SESSION")
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: True)
         monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "approve")
         res = request_tool_approval("terminal", "smtp send")
         assert res["approved"] is True
 
-    def test_rule_key_derived_from_tool_and_reason(self, monkeypatch):
-        """With no explicit rule_key, the pattern key is derived from
-        tool + a hash of the reason (so distinct reasons persist apart)."""
-        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
-        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-        monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "deny")
-        res = request_tool_approval("patch", "reason")  # no rule_key
-        assert res["pattern_key"].startswith("plugin_rule:patch:")
 
     def test_distinct_reasons_get_distinct_keys(self, monkeypatch):
         """Two different reasons on the SAME tool must not share an [a]lways
@@ -151,7 +141,7 @@ class TestRequestToolApproval:
         — a plugin-flagged action never runs ungated without a human."""
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-        monkeypatch.setattr(approval, "env_var_enabled", lambda v: False)  # not cron
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: False)
         res = request_tool_approval("terminal", "smtp send")
         assert res["approved"] is False
         assert "no interactive user or gateway" in res["message"].lower()

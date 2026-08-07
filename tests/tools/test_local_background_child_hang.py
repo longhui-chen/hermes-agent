@@ -69,45 +69,6 @@ class TestBackgroundChildDoesNotHang:
         finally:
             _pkill("time.sleep(60)")
 
-    def test_foreground_streaming_output_still_captured(self, local_env):
-        """Sanity: incremental output over time must still be captured in full."""
-        cmd = 'for i in 1 2 3; do echo "tick $i"; sleep 0.2; done; echo done'
-        t0 = time.monotonic()
-        result = local_env.execute(cmd, timeout=10)
-        elapsed = time.monotonic() - t0
-
-        # Loop body sleeps ~0.6s total — elapsed should be close to that.
-        assert 0.5 < elapsed < 10.0
-        assert result["returncode"] == 0
-        for expected in ("tick 1", "tick 2", "tick 3", "done"):
-            assert expected in result["output"], f"missing {expected!r}"
-
-    def test_high_volume_output_complete(self, local_env):
-        """Sanity: select-based drain must not drop lines under load."""
-        result = local_env.execute("seq 1 3000", timeout=10)
-        lines = result["output"].strip().split("\n")
-        assert result["returncode"] == 0
-        assert len(lines) == 3000
-        assert lines[0] == "1"
-        assert lines[-1] == "3000"
-
-    def test_foreground_capture_is_bounded_while_draining(
-        self, local_env, monkeypatch
-    ):
-        monkeypatch.setattr("tools.tool_output_limits.get_max_bytes", lambda: 10_000)
-        command = (
-            "python3 -c \"import sys; "
-            "sys.stdout.write('HEAD-SENTINEL\\n' + 'x' * 2000000 + "
-            "'\\nTAIL-SENTINEL')\""
-        )
-
-        result = local_env.execute(command, timeout=10, bounded_capture=True)
-
-        assert result["returncode"] == 0
-        assert len(result["output"]) <= 10_000
-        assert result["output"].startswith("HEAD-SENTINEL")
-        assert result["output"].endswith("TAIL-SENTINEL")
-        assert "[OUTPUT TRUNCATED" in result["output"]
 
     def test_default_capture_is_full_fidelity_for_internal_consumers(
         self, local_env

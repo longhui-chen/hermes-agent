@@ -41,6 +41,7 @@ load_reconciled_env
 export HERMES_HOME="$DATA_DIR/hermes_home"
 export HERMES_BUNDLED_SKILLS="$APP_ROOT/lib/hermes-agent/skills"
 export HERMES_BUNDLED_PLUGINS="$APP_ROOT/lib/hermes-agent/plugins"
+export HERMES_BUNDLED_LOCALES="$APP_ROOT/lib/hermes-agent/locales"
 export HERMES_LAZY_INSTALL_TARGET="$DATA_DIR/lazy-packages"
 export HERMES_MANAGED_GATEWAY=1
 export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service

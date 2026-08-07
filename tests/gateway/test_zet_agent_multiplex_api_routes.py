@@ -17,9 +17,11 @@ from gateway.platforms.zet_agent import ZetAgentAdapter, _ClarifyEntry
 from gateway.session_context import clear_turn_vars, set_turn_vars
 from tools import approval
 
+TEST_API_KEY = "test-key-0123456789abcdef"
+
 
 def _make_adapter() -> ZetAgentAdapter:
-    return ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    return ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": TEST_API_KEY}))
 
 
 def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapter) -> None:
@@ -117,7 +119,7 @@ async def test_clarify_id_is_stable_across_stream_pending_and_exact_response():
     async with TestClient(TestServer(app)) as cli:
         pending = await cli.get(
             "/v1/sessions/sid-clarify-id/pending",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         pending_data = await pending.json()
         assert pending.status == 200
@@ -126,7 +128,7 @@ async def test_clarify_id_is_stable_across_stream_pending_and_exact_response():
         wrong = await cli.post(
             "/v1/sessions/sid-clarify-id/clarify/respond",
             json={"clarify_id": "not-the-live-card", "response": "wrong"},
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         assert wrong.status == 404
         assert thread.is_alive(), "a mismatched id must not consume FIFO state"
@@ -134,7 +136,7 @@ async def test_clarify_id_is_stable_across_stream_pending_and_exact_response():
         resolved = await cli.post(
             "/v1/sessions/sid-clarify-id/clarify/respond",
             json={"clarify_id": clarify_id, "response": "B"},
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         assert resolved.status == 200
         assert await resolved.json() == {"resolved": 1}
@@ -168,7 +170,7 @@ async def test_exact_clarify_response_keeps_pending_projection_on_fifo_head():
     _, first_payload = stream_q.get(timeout=1)
     _, second_payload = stream_q.get(timeout=1)
 
-    headers = {"Authorization": "Bearer test-key"}
+    headers = {"Authorization": "Bearer test-key-0123456789abcdef"}
     async with TestClient(TestServer(app)) as cli:
         pending = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
         assert (await pending.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
@@ -226,7 +228,7 @@ async def test_prefixed_profiles_isolate_same_named_clarify_session(profile_home
     _, coder_payload = coder_stream.get(timeout=1)
     assert main_payload["clarify_id"] != coder_payload["clarify_id"]
 
-    headers = {"Authorization": "Bearer test-key"}
+    headers = {"Authorization": "Bearer test-key-0123456789abcdef"}
     async with TestClient(TestServer(app)) as cli:
         main_pending = await cli.get(f"/p/main/v1/sessions/{same_session}/pending", headers=headers)
         coder_pending = await cli.get(f"/p/coder/v1/sessions/{same_session}/pending", headers=headers)
@@ -278,6 +280,11 @@ def profile_homes(tmp_path, monkeypatch):
     coder_home = root / "profiles" / "coder"
     default_home.mkdir(parents=True)
     coder_home.mkdir(parents=True)
+    for home in (default_home, coder_home):
+        (home / ".env").write_text(
+            f"API_SERVER_KEY={TEST_API_KEY}\n",
+            encoding="utf-8",
+        )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     monkeypatch.setattr(
@@ -285,6 +292,44 @@ def profile_homes(tmp_path, monkeypatch):
         lambda multiplex: [("default", default_home), ("coder", coder_home)],
     )
     return {"main": default_home, "coder": coder_home}
+
+
+@pytest.mark.asyncio
+async def test_prefixed_main_auth_uses_shared_zet_agent_key_without_profile_api_key(
+    tmp_path, monkeypatch
+):
+    """ZetAgent profile mirrors share the device-internal listener key."""
+    root = tmp_path / ".hermes"
+    coder_home = root / "profiles" / "coder"
+    root.mkdir(parents=True)
+    coder_home.mkdir(parents=True)
+    (root / ".env").write_text("", encoding="utf-8")
+    (coder_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("ZET_AGENT_KEY", TEST_API_KEY)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("default", root), ("coder", coder_home)],
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True))
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        accepted = await cli.get(
+            "/p/main/v1/models",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        rejected = await cli.get(
+            "/p/main/v1/models",
+            headers={"Authorization": "Bearer wrong-device-key"},
+        )
+
+    assert accepted.status == 200
+    assert rejected.status == 401
 
 
 @pytest.mark.asyncio
@@ -309,7 +354,7 @@ async def test_prefixed_models_route_is_registered(profile_homes):
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.get(
             "/p/coder/v1/models",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         data = await resp.json()
 
@@ -327,7 +372,7 @@ async def test_prefixed_interaction_delivery_route_is_registered(profile_homes):
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.get(
             "/p/coder/v1/sessions/session-1/interaction-deliveries/missing",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         data = await resp.json()
 
@@ -394,18 +439,18 @@ async def test_same_session_id_isolated_across_profile_interaction_queues(profil
         async with TestClient(TestServer(app)) as cli:
             main_pending = await cli.get(
                 "/p/main/v1/sessions/same-session/pending",
-                headers={"Authorization": "Bearer test-key"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
             )
             coder_pending = await cli.get(
                 "/p/coder/v1/sessions/same-session/pending",
-                headers={"Authorization": "Bearer test-key"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
             )
             assert (await main_pending.json())["approval"]["command"] == "main-command"
             assert (await coder_pending.json())["approval"]["command"] == "coder-command"
 
             main_approval = await cli.post(
                 "/p/main/v1/sessions/same-session/approval/respond",
-                headers={"Authorization": "Bearer test-key"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
                 json={"choice": "deny"},
             )
             assert main_approval.status == 200
@@ -414,7 +459,7 @@ async def test_same_session_id_isolated_across_profile_interaction_queues(profil
 
             main_clarify = await cli.post(
                 "/p/main/v1/sessions/same-session/clarify/respond",
-                headers={"Authorization": "Bearer test-key"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
                 json={"response": "main-answer"},
             )
             assert main_clarify.status == 200
@@ -473,7 +518,7 @@ async def test_same_delivery_ids_have_profile_scoped_durable_receipts(profile_ho
                 }
                 prepared = await cli.post(
                     f"/p/{profile}/v1/sessions/same-session/approval/respond",
-                    headers={"Authorization": "Bearer test-key"},
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
                     json={**body, "phase": "prepare"},
                 )
                 assert prepared.status == 200
@@ -483,7 +528,7 @@ async def test_same_delivery_ids_have_profile_scoped_durable_receipts(profile_ho
 
                 finalized = await cli.post(
                     f"/p/{profile}/v1/sessions/same-session/approval/respond",
-                    headers={"Authorization": "Bearer test-key"},
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
                     json={**body, "phase": "finalize"},
                 )
                 finalized_body = await finalized.json()
@@ -493,7 +538,7 @@ async def test_same_delivery_ids_have_profile_scoped_durable_receipts(profile_ho
                 assert entries[profile].event.is_set() is False
                 claim = await cli.post(
                     f"/p/{profile}/v1/sessions/same-session/interaction-deliveries/same-delivery/recovery-fence",
-                    headers={"Authorization": "Bearer test-key"},
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
                     json={
                         "action": "claim",
                         "expected_state_revision": finalized_body["state_revision"],
@@ -502,7 +547,7 @@ async def test_same_delivery_ids_have_profile_scoped_durable_receipts(profile_ho
                 assert claim.status == 200
                 ack = await cli.post(
                     f"/p/{profile}/v1/sessions/same-session/interaction-deliveries/same-delivery/recovery-fence",
-                    headers={"Authorization": "Bearer test-key"},
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
                     json={
                         "action": "ack",
                         "fence_id": finalized_body["fence_id"],
@@ -516,11 +561,11 @@ async def test_same_delivery_ids_have_profile_scoped_durable_receipts(profile_ho
 
             main_receipt = await cli.get(
                 "/p/main/v1/sessions/same-session/interaction-deliveries/same-delivery",
-                headers={"Authorization": "Bearer test-key"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
             )
             coder_receipt = await cli.get(
                 "/p/coder/v1/sessions/same-session/interaction-deliveries/same-delivery",
-                headers={"Authorization": "Bearer test-key"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
             )
             main_body = await main_receipt.json()
             coder_body = await coder_receipt.json()
@@ -560,7 +605,7 @@ async def test_prefixed_chat_hits_handler_inside_profile_scope(profile_homes, mo
                 "model": "hermes-agent",
                 "messages": [{"role": "user", "content": "hello coder"}],
             },
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         assert resp.status == 200
         data = await resp.json()
@@ -615,7 +660,7 @@ async def test_prefixed_chat_routes_connector_capability_through_zet_agent_overr
                 "messages": [{"role": "user", "content": "hello coder"}],
                 "metadata": {"connector_route_capability": capability},
             },
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         assert resp.status == 200
 
@@ -626,7 +671,7 @@ async def test_prefixed_chat_routes_connector_capability_through_zet_agent_overr
 async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeypatch):
     """The agent is created in an executor thread, so profile context must cross it."""
     (profile_homes["coder"] / ".env").write_text(
-        "ZET_AGENT_ID=coder\n",
+        f"API_SERVER_KEY={TEST_API_KEY}\nZET_AGENT_ID=coder\n",
         encoding="utf-8",
     )
     seen = []
@@ -665,7 +710,7 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
                 "model": "hermes-agent",
                 "messages": [{"role": "user", "content": "hello coder"}],
             },
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
 
     assert response.status == 200
@@ -688,12 +733,12 @@ async def test_prefixed_model_switch_writes_scoped_profile_config(profile_homes)
         main_resp = await cli.post(
             "/p/main/v1/model/switch",
             json={"model": "main-model", "provider": "custom"},
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         coder_resp = await cli.post(
             "/p/coder/v1/model/switch",
             json={"model": "coder-model", "provider": "custom"},
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
 
     assert main_resp.status == 200
@@ -725,11 +770,11 @@ async def test_prefixed_jobs_use_scoped_profile_home(profile_homes, monkeypatch)
     async with TestClient(TestServer(app)) as cli:
         resp_main = await cli.get(
             "/p/main/api/jobs?include_disabled=true",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         resp_coder = await cli.get(
             "/p/coder/api/jobs",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
 
     assert resp_main.status == 200
@@ -795,7 +840,7 @@ async def test_prefixed_profile_unload_calls_targeted_runner(profile_homes):
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post(
             "/p/coder/v1/profile/unload",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         data = await resp.json()
 
@@ -824,13 +869,465 @@ async def test_prefixed_profile_unload_blocks_active_sessions(profile_homes):
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post(
             "/p/coder/v1/profile/unload",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         data = await resp.json()
 
     assert resp.status == 409
     assert data["unloaded"] is False
     assert data["active_sessions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prefixed_responses_holds_profile_lease_until_agent_finishes(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "responses-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/responses",
+        adapter._profile_handler(adapter._handle_responses),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        response_task = asyncio.create_task(
+            cli.post(
+                "/p/coder/v1/responses",
+                json={"input": "hello"},
+                headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+            )
+        )
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        blocked_data = await blocked.json()
+        assert blocked.status == 409
+        assert blocked_data["active_api_runs"] >= 1
+
+        release.set()
+        response = await response_task
+        assert response.status == 200
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_responses_worker_keeps_profile_lease_until_thread_exits(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "cancelled-responses-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    with adapter._profile_api_scope("coder"):
+        agent_task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="cancelled-responses-session",
+            )
+        )
+    assert await asyncio.to_thread(started.wait, 2)
+
+    agent_task.cancel()
+    await asyncio.sleep(0)
+    assert not agent_task.done()
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+    async with TestClient(TestServer(app)) as cli:
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert blocked.status == 409
+        assert (await blocked.json())["active_api_runs"] == 1
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await agent_task
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_prefixed_runs_holds_profile_lease_until_background_task_finishes(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "runs-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/runs",
+        adapter._profile_handler(adapter._handle_runs),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        started_response = await cli.post(
+            "/p/coder/v1/runs",
+            json={"input": "hello", "session_id": "public-session"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert started_response.status == 202
+        run_id = (await started_response.json())["run_id"]
+
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        blocked_data = await blocked.json()
+        assert blocked.status == 409
+        assert blocked_data["active_api_runs"] >= 1
+
+        release.set()
+        for _ in range(100):
+            if run_id not in adapter._active_run_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert run_id not in adapter._active_run_tasks
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runs_worker_keeps_profile_lease_until_thread_exits(
+    profile_homes,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "cancelled-runs-agent"
+
+        def run_conversation(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    unregistered_approvals = []
+    original_unregister = approval.unregister_gateway_notify
+
+    def _spy_unregister(session_key):
+        unregistered_approvals.append(session_key)
+        original_unregister(session_key)
+
+    monkeypatch.setattr(
+        approval,
+        "unregister_gateway_notify",
+        _spy_unregister,
+    )
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/runs",
+        adapter._profile_handler(adapter._handle_runs),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        started_response = await cli.post(
+            "/p/coder/v1/runs",
+            json={"input": "hello", "session_id": "cancelled-public-session"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert started_response.status == 202
+        run_id = (await started_response.json())["run_id"]
+        assert await asyncio.to_thread(started.wait, 2)
+
+        run_task = adapter._active_run_tasks[run_id]
+        run_task.cancel()
+        await asyncio.sleep(0)
+        assert not run_task.done()
+        assert run_id in unregistered_approvals
+        assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+        blocked = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        assert blocked.status == 409
+        assert (await blocked.json())["active_api_runs"] == 1
+
+        release.set()
+        for _ in range(100):
+            if run_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert run_task.done()
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runs_releases_approval_registered_after_cancel(
+    profile_homes,
+    monkeypatch,
+):
+    register_entered = threading.Event()
+    allow_register = threading.Event()
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    unregister_calls = []
+    original_register = approval.register_gateway_notify
+    original_unregister = approval.unregister_gateway_notify
+
+    def _delayed_register(session_key, callback):
+        register_entered.set()
+        assert allow_register.wait(timeout=5)
+        original_register(session_key, callback)
+
+    def _spy_unregister(session_key):
+        unregister_calls.append(session_key)
+        original_unregister(session_key)
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "late-register-agent"
+
+        def run_conversation(self, **_kwargs):
+            worker_entered.set()
+            assert release_worker.wait(timeout=5)
+            return {"final_response": "cancelled", "completed": True}
+
+    monkeypatch.setattr(approval, "register_gateway_notify", _delayed_register)
+    monkeypatch.setattr(approval, "unregister_gateway_notify", _spy_unregister)
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/runs",
+        adapter._profile_handler(adapter._handle_runs),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        started_response = await cli.post(
+            "/p/coder/v1/runs",
+            json={"input": "hello", "session_id": "late-register-session"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        run_id = (await started_response.json())["run_id"]
+        assert await asyncio.to_thread(register_entered.wait, 2)
+
+        run_task = adapter._active_run_tasks[run_id]
+        run_task.cancel()
+        await asyncio.sleep(0)
+        assert unregister_calls == [run_id]
+        assert not run_task.done()
+
+        allow_register.set()
+        assert await asyncio.to_thread(worker_entered.wait, 2)
+        for _ in range(100):
+            if len(unregister_calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert unregister_calls[:2] == [run_id, run_id]
+        assert approval.list_gateway_approvals(run_id) == []
+        assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+        release_worker.set()
+        for _ in range(100):
+            if run_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert run_task.done()
+
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_profile_unload_barrier_rejects_new_agent_request_during_teardown(
+    profile_homes,
+    monkeypatch,
+):
+    unload_entered = asyncio.Event()
+    release_unload = asyncio.Event()
+
+    class FakeRunner:
+        async def unload_profile_runtime(self, profile):
+            assert profile == "coder"
+            unload_entered.set()
+            await release_unload.wait()
+            return {"evicted_sessions": 0, "disconnected_adapters": 0}
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = FakeRunner()
+    monkeypatch.setattr(
+        adapter,
+        "_create_agent",
+        lambda **_kwargs: pytest.fail("blocked request constructed an agent"),
+    )
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    app.router.add_post(
+        "/p/{profile}/v1/responses",
+        adapter._profile_handler(adapter._handle_responses),
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        unload_task = asyncio.create_task(
+            cli.post(
+                "/p/coder/v1/profile/unload",
+                headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+            )
+        )
+        await asyncio.wait_for(unload_entered.wait(), timeout=2)
+        assert adapter._runtime_import_profile_is_blocked(profile_homes["coder"])
+
+        rejected = await cli.post(
+            "/p/coder/v1/responses",
+            json={"input": "must not enter"},
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        rejected_data = await rejected.json()
+        assert rejected.status == 409
+        assert rejected_data["error"]["code"] == "profile_unloading"
+
+        release_unload.set()
+        unloaded = await unload_task
+        assert unloaded.status == 200
+
+
+@pytest.mark.asyncio
+async def test_cancelled_idempotent_waiter_cannot_transfer_released_profile_lease(
+    profile_homes,
+    monkeypatch,
+):
+    import gateway.platforms.api_server as api_server
+
+    child_waiting = asyncio.Event()
+    allow_claim = asyncio.Event()
+    child_tasks = []
+
+    async def _shielded_delayed_compute(_key, _fingerprint, compute_coro):
+        async def _delayed_compute():
+            child_waiting.set()
+            await allow_claim.wait()
+            return await compute_coro()
+
+        child_task = asyncio.create_task(_delayed_compute())
+        child_tasks.append(child_task)
+        return await asyncio.shield(child_task)
+
+    class _Request(dict):
+        def __init__(self):
+            super().__init__()
+            self.headers = {
+                "Authorization": f"Bearer {TEST_API_KEY}",
+                "Idempotency-Key": "cancel-before-claim",
+            }
+            self.match_info = {"profile": "coder"}
+            self.method = "POST"
+            self.path_qs = "/p/coder/v1/responses"
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+        async def json(self):
+            return {"input": "must not outlive released lease"}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_create_agent",
+        lambda **_kwargs: pytest.fail("stale idempotency task constructed an agent"),
+    )
+    monkeypatch.setattr(
+        api_server._idem_cache,
+        "get_or_set",
+        _shielded_delayed_compute,
+    )
+    handler = adapter._profile_handler(adapter._handle_responses)
+    request_task = asyncio.create_task(handler(_Request()))
+    await asyncio.wait_for(child_waiting.wait(), timeout=2)
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 1
+
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+    active_imports, active_api_runs, barrier_owner = (
+        adapter._block_runtime_import_profile(profile_homes["coder"])
+    )
+    assert (active_imports, active_api_runs) == (0, 0)
+    assert barrier_owner is not None
+
+    allow_claim.set()
+    try:
+        with pytest.raises(RuntimeError, match="profile is unloading"):
+            await child_tasks[0]
+    finally:
+        adapter._unblock_runtime_import_profile(
+            profile_homes["coder"], barrier_owner
+        )
+    assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
 
 
 @pytest.mark.asyncio
@@ -888,11 +1385,11 @@ async def test_prefixed_jobs_read_scoped_cron_store(profile_homes, monkeypatch):
     async with TestClient(TestServer(app)) as cli:
         main_resp = await cli.get(
             "/p/main/api/jobs?include_disabled=true",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         coder_resp = await cli.get(
             "/p/coder/api/jobs?include_disabled=true",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         main_data = await main_resp.json()
         coder_data = await coder_resp.json()
@@ -936,6 +1433,27 @@ async def test_prefixed_control_routes_registered(profile_homes):
     assert expected <= registered
 
 
+def test_zet_base_routes_match_advertised_api_surface():
+    """Zet must not hand-copy an older subset of APIServer routes while
+    inheriting a capability document that advertises the newer endpoints."""
+    adapter = _make_adapter()
+    app = web.Application()
+
+    adapter._register_base_http_routes(app.router)
+
+    registered = {resource.canonical for resource in app.router.resources()}
+    expected = {
+        "/api/model/options",
+        "/api/sessions/{session_id}/model",
+        "/api/sessions/{session_id}/chat",
+        "/v1/skills",
+        "/v1/toolsets",
+        "/v1/runs/{run_id}/approval",
+    }
+    assert expected <= registered
+    assert {f"/p/{{profile}}{path}" for path in expected} <= registered
+
+
 @pytest.mark.asyncio
 async def test_prefixed_reset_and_unload_return_ok(profile_homes):
     adapter = _make_adapter()
@@ -950,11 +1468,11 @@ async def test_prefixed_reset_and_unload_return_ok(profile_homes):
     async with TestClient(TestServer(app)) as cli:
         reset_resp = await cli.post(
             "/p/coder/v1/runtime/reset",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         unload_resp = await cli.post(
             "/p/coder/v1/profile/unload",
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         unload_data = await unload_resp.json()
 
@@ -1004,7 +1522,7 @@ async def test_deferred_approval_response_requires_matching_id(monkeypatch):
         "/v1/sessions/{session_id}/approval/respond",
         adapter._handle_approval_respond,
     )
-    headers = {"Authorization": "Bearer test-key"}
+    headers = {"Authorization": "Bearer test-key-0123456789abcdef"}
 
     async with TestClient(TestServer(app)) as cli:
         missing = await cli.post(
@@ -1089,7 +1607,7 @@ async def test_legacy_live_approval_uses_x_hermes_session_key(monkeypatch):
             response = await cli.post(
                 f"/v1/sessions/{session_id}/approval/respond",
                 json={"choice": "deny"},
-                headers={"Authorization": "Bearer test-key"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
             )
             data = await response.json()
 
@@ -1128,7 +1646,7 @@ async def test_interrupt_revokes_deferred_approval_before_stale_response():
         stale = await cli.post(
             f"/v1/sessions/{session_id}/approval/respond",
             json={"choice": "once", "approval_id": approval_id},
-            headers={"Authorization": "Bearer test-key"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
         )
         stale_data = await stale.json()
 

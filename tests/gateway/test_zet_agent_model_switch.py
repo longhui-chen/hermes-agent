@@ -144,10 +144,11 @@ async def test_session_model_switch_persists_override_no_note(monkeypatch):
     # Override persisted + cached agent evicted. The identity note is no longer
     # pushed here — it's injected at the session's next turn by _run_agent's
     # open-time effective-model compare.
-    assert gw._session_model_overrides[session_id]["model"] == "deepseek-v4"
-    assert gw._session_model_overrides[session_id]["supports_vision"] is False
-    assert gw._session_model_overrides[session_id]["auxiliary"] == {"vision": {}}
-    assert evicted == [session_id]
+    state_key = f"agent:main:zet_agent:dm:{session_id}"
+    assert gw._session_model_overrides[state_key]["model"] == "deepseek-v4"
+    assert gw._session_model_overrides[state_key]["supports_vision"] is False
+    assert gw._session_model_overrides[state_key]["auxiliary"] == {"vision": {}}
+    assert evicted == [adapter._interaction_queue_key(session_id)]
     assert not hasattr(gw, "_pending_model_notes")
 
 
@@ -236,8 +237,12 @@ def _seen_adapter(monkeypatch, *, config_model, seen, override=None):
 
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: config_model)
     adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    scoped_overrides = {
+        adapter._session_model_state_key(session_id): value
+        for session_id, value in dict(override or {}).items()
+    }
     adapter.gateway_runner = types.SimpleNamespace(
-        _session_model_overrides=dict(override or {})
+        _session_model_overrides=scoped_overrides
     )
     adapter._seen_models = OrderedDict(seen)
     adapter._seen_loaded = True
@@ -636,9 +641,10 @@ async def test_session_model_clear_pops_override_and_evicts(monkeypatch):
 
     evicted = []
     session_id = "zettlab:user1:agent-1:42"
+    state_key = f"agent:main:zet_agent:dm:{session_id}"
     gw = types.SimpleNamespace(
         _session_model_overrides={
-            session_id: {"model": "deepseek-v4", "provider": "custom"},
+            state_key: {"model": "deepseek-v4", "provider": "custom"},
             "other-session": {"model": "glm-5", "provider": "custom"},
         },
         _evict_cached_agent=lambda sid: evicted.append(sid),
@@ -654,10 +660,168 @@ async def test_session_model_clear_pops_override_and_evicts(monkeypatch):
     assert resp.payload["cleared"] is True
     assert resp.payload["session_id"] == session_id
     # Target session's override is gone; the unrelated entry survives.
-    assert session_id not in gw._session_model_overrides
+    assert state_key not in gw._session_model_overrides
     assert "other-session" in gw._session_model_overrides
     # Cached agent for this session was evicted so the next turn rebuilds.
-    assert evicted == [session_id]
+    assert evicted == [adapter._interaction_queue_key(session_id)]
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_isolates_same_id_by_profile(monkeypatch):
+    from gateway.platforms.api_server import _api_request_profile
+
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides={},
+        _evict_cached_agent=lambda _key: None,
+    )
+    session_id = "same-public-session"
+
+    main_token = _api_request_profile.set("main")
+    try:
+        await adapter._handle_session_model_switch(
+            _FakeRequest({"model": "model-main"}, {"session_id": session_id})
+        )
+    finally:
+        _api_request_profile.reset(main_token)
+
+    coder_token = _api_request_profile.set("coder")
+    try:
+        await adapter._handle_session_model_switch(
+            _FakeRequest({"model": "model-coder"}, {"session_id": session_id})
+        )
+    finally:
+        _api_request_profile.reset(coder_token)
+
+    assert adapter.gateway_runner._session_model_overrides == {
+        f"agent:main:zet_agent:dm:{session_id}": {"model": "model-main"},
+        f"agent:coder:zet_agent:dm:{session_id}": {"model": "model-coder"},
+    }
+
+
+def test_seen_models_cache_is_profile_local(tmp_path, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from gateway.session_seen_models import save_seen_models
+
+    main_home = tmp_path / "main"
+    coder_home = tmp_path / "coder"
+    save_seen_models({"main-session": "model-main"}, main_home / "session_seen_models.json")
+    save_seen_models({"coder-session": "model-coder"}, coder_home / "session_seen_models.json")
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+
+    main_token = set_hermes_home_override(str(main_home))
+    try:
+        main_seen = adapter._ensure_seen_models()
+    finally:
+        reset_hermes_home_override(main_token)
+
+    coder_token = set_hermes_home_override(str(coder_home))
+    try:
+        coder_seen = adapter._ensure_seen_models()
+        coder_seen["new-coder-session"] = "model-coder-2"
+        adapter._save_seen_models()
+    finally:
+        reset_hermes_home_override(coder_token)
+
+    assert main_seen == {"main-session": "model-main"}
+    assert coder_seen == {
+        "coder-session": "model-coder",
+        "new-coder-session": "model-coder-2",
+    }
+    assert "main-session" not in (
+        coder_home / "session_seen_models.json"
+    ).read_text(encoding="utf-8")
+
+
+def test_last_resolved_model_cache_is_bounded(tmp_path):
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._last_resolved_model_cap = 2
+    profile_home = tmp_path / "profile"
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        adapter._remember_last_resolved_model("s1", "m1")
+        adapter._remember_last_resolved_model("s2", "m2")
+        adapter._remember_last_resolved_model("s3", "m3")
+    finally:
+        reset_hermes_home_override(token)
+
+    prefix = str(profile_home.resolve())
+    assert set(adapter._last_resolved_model) == {
+        (prefix, "s2"),
+        (prefix, "s3"),
+        (prefix, None),
+    }
+
+
+def test_last_resolved_model_fallback_is_profile_scoped_and_unloadable(tmp_path):
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    main_home = tmp_path / "main"
+    coder_home = tmp_path / "coder"
+
+    main_token = set_hermes_home_override(str(main_home))
+    try:
+        adapter._remember_last_resolved_model("", "main-model")
+        assert adapter._last_resolved_model_for("") == "main-model"
+    finally:
+        reset_hermes_home_override(main_token)
+
+    coder_token = set_hermes_home_override(str(coder_home))
+    try:
+        assert adapter._last_resolved_model_for("") is None
+        adapter._remember_last_resolved_model("", "coder-model")
+        assert adapter._last_resolved_model_for("") == "coder-model"
+    finally:
+        reset_hermes_home_override(coder_token)
+
+    adapter._drop_profile_local_model_caches(str(coder_home))
+    assert (str(coder_home.resolve()), None) not in adapter._last_resolved_model
+    assert (str(main_home.resolve()), None) in adapter._last_resolved_model
+
+
+def test_response_format_precheck_uses_profile_scoped_model_override(monkeypatch):
+    import gateway.run as gateway_run
+    from gateway.platforms.api_server import _api_request_profile
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    profile_token = _api_request_profile.set("coder")
+    try:
+        adapter.gateway_runner = types.SimpleNamespace(
+            _session_model_overrides={
+                adapter._session_model_state_key("public-session"): {
+                    "provider": "anthropic",
+                    "api_mode": "anthropic_messages",
+                }
+            }
+        )
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai",
+                "api_mode": "responses",
+                "base_url": "",
+            },
+        )
+        error = adapter._response_format_transport_error(
+            {"response_format": {"type": "json_object"}},
+            gateway_session_key="public-session",
+        )
+    finally:
+        _api_request_profile.reset(profile_token)
+
+    assert error is not None and "Anthropic" in error
 
 
 @pytest.mark.asyncio

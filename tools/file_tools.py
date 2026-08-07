@@ -165,7 +165,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -650,7 +650,13 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
+    "/private/etc/",
+    # macOS: /private/var mirrors /var. Block the sensitive subtrees, NOT the
+    # whole thing — a blanket "/private/var/" refused every legitimate temp-file
+    # write, because $TMPDIR, /tmp, and /var/folders all realpath() into
+    # /private/var/folders/... on macOS (and _resolve_path_for_task resolves
+    # symlinks), and /private/var/tmp is a normal temp dir.
+    "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -1200,6 +1206,8 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
 _READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
 _DEDUP_CAP = 1000             # dict; skip-identical-reread guard
 _READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
+_NOT_FOUND_CAP = 500          # dict; per-task negative-result cache for missing paths
+_NOT_FOUND_TTL_SECONDS = 60.0 # short TTL — a path that didn't exist may be created soon
 _READ_DEDUP_STATUS_MESSAGE = (
     "File unchanged since last read. The content from "
     "the earlier read_file result in this conversation is "
@@ -1256,6 +1264,79 @@ def _cap_read_tracker_data(task_data: dict) -> None:
                 ts.pop(next(iter(ts)))
             except (StopIteration, KeyError):
                 break
+
+    nf = task_data.get("not_found")
+    if nf is not None and len(nf) > _NOT_FOUND_CAP:
+        excess = len(nf) - _NOT_FOUND_CAP
+        for _ in range(excess):
+            try:
+                nf.pop(next(iter(nf)))
+            except (StopIteration, KeyError):
+                break
+
+
+def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | None:
+    """Return cached not-found JSON for *(op, resolved_str)* if still fresh.
+
+    Skips the expensive subprocess + suggestion walk when the model retries
+    the same missing path. Observed in agent.log: a single typo'd path was
+    retried 13 times — each retry forked a shell to walk the parent directory
+    and score similar names.
+
+    *op* is "read" or "search" — kept separate because the two callers return
+    different error JSON shapes ("File not found:" vs "Path not found:").
+
+    Eviction: TTL or write_file/patch on the path (see invalidate_for_path).
+    """
+    import os as _os
+    import time
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        if not task_data:
+            return None
+        nf = task_data.get("not_found")
+        if not nf:
+            return None
+        entry = nf.get((op, resolved_str))
+        if entry is None:
+            return None
+        ts, cached_json = entry
+        if time.monotonic() - ts > _NOT_FOUND_TTL_SECONDS:
+            nf.pop((op, resolved_str), None)
+            return None
+    # Existence guard: the path may have been created since we cached the
+    # miss — by a terminal command, another agent, or any external process
+    # (write_file/patch invalidate explicitly, but they're not the only
+    # writers). The agent pattern "check file → create it → read it" is
+    # common; serving a stale miss for up to the TTL breaks it. One stat is
+    # ~free next to the subprocess walk we're skipping.
+    #
+    # The stat runs OUTSIDE _read_tracker_lock (matching the dedup mtime
+    # check below in read_file_tool): the lock is global across all tasks,
+    # and a hung stat on a dead network mount must not stall every other
+    # task's read/search bookkeeping.
+    if _os.path.exists(resolved_str):
+        with _read_tracker_lock:
+            task_data = _read_tracker.get(task_id)
+            nf = task_data.get("not_found") if task_data else None
+            if nf:
+                nf.pop((op, resolved_str), None)
+        return None
+    return cached_json
+
+
+def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str) -> None:
+    """Cache a not-found error so the next *op* call for *resolved_str* skips I/O."""
+    import time
+    with _read_tracker_lock:
+        task_data = _read_tracker.setdefault(task_id, {
+            "last_key": None, "consecutive": 0,
+            "read_history": set(), "dedup": {},
+            "dedup_hits": {}, "read_timestamps": {},
+        })
+        nf = task_data.setdefault("not_found", {})
+        nf[(op, resolved_str)] = (time.monotonic(), error_json)
+        _cap_read_tracker_data(task_data)
 
 
 def _is_internal_file_status_text(content: str) -> bool:
@@ -1449,12 +1530,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
+            if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
@@ -1513,7 +1595,7 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -1523,12 +1605,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # blocking on input).  Pure path check — no I/O.
         device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
-            return json.dumps({
-                "error": (
-                    f"Cannot read '{path}': this is a device file that would "
-                    "block or produce infinite output."
-                ),
-            })
+            return tool_error(
+                f"Cannot read '{path}': this is a device file that would "
+                "block or produce infinite output."
+            )
 
         _resolved = _resolve_path_for_task(path, task_id)
 
@@ -1599,12 +1679,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
-            return json.dumps({
-                "error": (
-                    f"Cannot read binary file '{path}' ({_ext}). "
-                    "Use vision_analyze for images, or terminal to inspect binary files."
-                ),
-            })
+            return tool_error(
+                f"Cannot read binary file '{path}' ({_ext}). "
+                "Use vision_analyze for images, or terminal to inspect binary files."
+            )
 
         # ── Hermes internal path guard ────────────────────────────────
         # Prevent prompt injection via catalog or hub metadata files,
@@ -1615,7 +1693,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # the Python process cwd, which can differ.
         block_error = get_read_block_error(str(_resolved))
         if block_error:
-            return json.dumps({"error": block_error})
+            return tool_error(block_error)
+
+        # ── Negative-result cache ─────────────────────────────────────
+        # If we already discovered this path doesn't exist (within TTL),
+        # return the cached error without spawning the subprocess +
+        # similar-files walk. Cleared by write_file/patch on the same path.
+        resolved_str_for_neg = str(_resolved)
+        cached_not_found = _check_not_found_cache("read", resolved_str_for_neg, task_id)
+        if cached_not_found is not None:
+            return cached_not_found
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -1653,19 +1740,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                         _cap_read_tracker_data(task_data)
 
                     if hits >= 2:
-                        return json.dumps({
-                            "error": (
-                                f"BLOCKED: You have called read_file on this "
-                                f"exact region {hits + 1} times and the file "
-                                "has NOT changed. STOP calling read_file for "
-                                "this path — the content from your earlier "
-                                "read_file result in this conversation is "
-                                "still current. Proceed with your task using "
-                                "the information you already have."
-                            ),
-                            "path": path,
-                            "already_read": hits + 1,
-                        }, ensure_ascii=False)
+                        return tool_error(
+                            f"BLOCKED: You have called read_file on this "
+                            f"exact region {hits + 1} times and the file "
+                            "has NOT changed. STOP calling read_file for "
+                            "this path — the content from your earlier "
+                            "read_file result in this conversation is "
+                            "still current. Proceed with your task using "
+                            "the information you already have.",
+                            path=path,
+                            already_read=hits + 1,
+                        )
 
                     return json.dumps({
                         "status": "unchanged",
@@ -1687,6 +1772,20 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(_ops_path(path, _resolved, task_id), offset, limit)
         result_dict = result.to_dict()
+
+        # ── Populate negative-result cache on not-found ───────────────
+        # _suggest_similar_files returns ReadResult(error="File not found: ..").
+        # Cache the JSON we'd return so a retry skips the parent-dir walk.
+        # Deliberately NO early return: on upstream, error results flow
+        # through the tracking block below (consecutive-loop detection,
+        # dedup bookkeeping via the resolved path) and the normal exit —
+        # short-circuiting here changes that behavior (and broke a real
+        # test interaction). Serving from the cache (above) is the
+        # optimization; recording must stay side-effect-identical.
+        _err = result_dict.get("error") or ""
+        if isinstance(_err, str) and _err.startswith("File not found:"):
+            _not_found_json = json.dumps(result_dict, ensure_ascii=False)
+            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -1797,15 +1896,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         if count >= 4:
             # Hard block: stop returning content to break the loop
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have read this exact file region {count} times in a row. "
-                    "The content has NOT changed. You already have this information. "
-                    "STOP re-reading and proceed with your task."
-                ),
-                "path": path,
-                "already_read": count,
-            }, ensure_ascii=False)
+            return tool_error(
+                f"BLOCKED: You have read this exact file region {count} times in a row. "
+                "The content has NOT changed. You already have this information. "
+                "STOP re-reading and proceed with your task.",
+                path=path,
+                already_read=count,
+            )
         elif count >= 3:
             result_dict["_warning"] = (
                 f"You have read this exact file region {count} times consecutively. "
@@ -1865,6 +1962,15 @@ def notify_other_tool_call(task_id: str = "default"):
             # progress, so clear per-key dedup hit counters too.
             if "dedup_hits" in task_data:
                 task_data["dedup_hits"].clear()
+            # Any other tool (terminal, delegate, ...) may have created a
+            # previously-missing path — a cached miss is no longer
+            # trustworthy. The serve-side existence guard in
+            # _check_not_found_cache already covers this, but clearing
+            # here keeps the cache honest and covers exotic cases the
+            # stat can't (e.g. permission flips).
+            nf = task_data.get("not_found")
+            if nf:
+                nf.clear()
 
 
 def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
@@ -1881,7 +1987,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     internally.
     """
     try:
-        resolved = str(_resolve_path(filepath))
+        resolved = str(_resolve_path(filepath, task_id))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -1889,12 +1995,18 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
         if task_data is None:
             return
         dedup = task_data.get("dedup")
-        if not dedup:
-            return
-        # Collect keys to remove (can't mutate dict during iteration).
-        stale_keys = [k for k in dedup if k[0] == resolved]
-        for k in stale_keys:
-            del dedup[k]
+        if dedup:
+            # Collect keys to remove (can't mutate dict during iteration).
+            stale_keys = [k for k in dedup if k[0] == resolved]
+            for k in stale_keys:
+                del dedup[k]
+        # Also evict from the negative-result cache: a write_file that
+        # creates the path means subsequent reads (or searches under it)
+        # must hit disk.
+        nf = task_data.get("not_found")
+        if nf:
+            nf.pop(("read", resolved), None)
+            nf.pop(("search", resolved), None)
 
 
 def _update_read_timestamp(filepath: str, task_id: str) -> None:
@@ -2343,15 +2455,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             count = task_data["consecutive"]
 
         if count >= 4:
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have run this exact search {count} times in a row. "
-                    "The results have NOT changed. You already have this information. "
-                    "STOP re-searching and proceed with your task."
-                ),
-                "pattern": pattern,
-                "already_searched": count,
-            }, ensure_ascii=False)
+            return tool_error(
+                f"BLOCKED: You have run this exact search {count} times in a row. "
+                "The results have NOT changed. You already have this information. "
+                "STOP re-searching and proceed with your task.",
+                pattern=pattern,
+                already_searched=count,
+            )
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
@@ -2365,7 +2475,20 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             return json.dumps({"error": sibling_error}, ensure_ascii=False)
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
+            return tool_error(block_error)
+
+        # ── Negative-result cache ─────────────────────────────────────
+        # Search returns "Path not found: <path>" when the search root
+        # doesn't exist. The error path also lists the parent directory
+        # (file_operations.py:1402) — expensive to repeat. Cache so the
+        # next call to a known-missing root skips both shells.
+        try:
+            resolved_search_path = str(_resolve_path_for_task(path, task_id))
+        except (OSError, ValueError):
+            resolved_search_path = path
+        cached_search_nf = _check_not_found_cache("search", resolved_search_path, task_id)
+        if cached_search_nf is not None:
+            return cached_search_nf
 
         # Search the path the block check just cleared. A relative path handed
         # to the ops layer anchors against the terminal cwd instead, so the
@@ -2391,6 +2514,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 f"{omitted} result(s) omitted because they target credential, "
                 "token, cache, or secret-bearing environment files."
             )
+
+        # Populate negative cache when search root was missing. No early
+        # return — same rationale as the read path: error results keep
+        # flowing through the consecutive-search bookkeeping below.
+        _search_err = result_dict.get("error") or ""
+        if isinstance(_search_err, str) and _search_err.startswith("Path not found:"):
+            _search_nf_json = json.dumps(result_dict, ensure_ascii=False)
+            _record_not_found("search", resolved_search_path, task_id, _search_nf_json)
 
         if count >= 3:
             result_dict["_warning"] = (
@@ -2430,7 +2561,7 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
         },
         "required": ["path"]
     }
@@ -2438,7 +2569,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
     "parameters": {
         "type": "object",
         "properties": {

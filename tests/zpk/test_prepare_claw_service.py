@@ -1195,6 +1195,7 @@ def test_start_claw_service_loads_reconciled_env_without_overriding_explicit(
         "HERMES_HOME=/stale/hermes-home\n"
         "HERMES_BUNDLED_SKILLS=/stale/skills\n"
         "HERMES_BUNDLED_PLUGINS=/stale/plugins\n"
+        "HERMES_BUNDLED_LOCALES=/stale/locales\n"
         "HERMES_LAZY_INSTALL_TARGET=/stale/lazy-packages\n"
         f"ZETTLAB_PRESETS_DIR={persisted_presets}\n"
         "GATEWAY_MULTIPLEX_PROFILES=false\n"
@@ -1208,6 +1209,8 @@ def test_start_claw_service_loads_reconciled_env_without_overriding_explicit(
     )
 
     gateway_log = app_root / "gateway-env.json"
+    packaged_locales = app_root / "lib" / "hermes-agent" / "locales"
+    shutil.copytree(repo_root / "locales", packaged_locales)
     hermes_entry = app_root / "bin" / "hermes"
     hermes_entry.write_text(
         f"""#!{sys.executable}
@@ -1215,6 +1218,9 @@ import json
 import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, {str(repo_root)!r})
+from agent.i18n import t
 
 Path({str(gateway_log)!r}).write_text(
     json.dumps({{
@@ -1225,11 +1231,14 @@ Path({str(gateway_log)!r}).write_text(
         "double": os.environ.get("CUSTOM_DOUBLE"),
         "multiplex": os.environ.get("GATEWAY_MULTIPLEX_PROFILES"),
         "managed_gateway": os.environ.get("HERMES_MANAGED_GATEWAY"),
+        "relay_core": os.environ.get("HERMES_NEMO_RELAY_CORE_ENABLED"),
         "managed_cgroup_root": os.environ.get("HERMES_MANAGED_CGROUP_ROOT"),
         "managed_cgroup_unit": os.environ.get("HERMES_MANAGED_CGROUP_UNIT"),
         "home": os.environ.get("HERMES_HOME"),
         "skills": os.environ.get("HERMES_BUNDLED_SKILLS"),
         "plugins": os.environ.get("HERMES_BUNDLED_PLUGINS"),
+        "locales": os.environ.get("HERMES_BUNDLED_LOCALES"),
+        "rendered": t("gateway.reset.header_default", lang="en"),
         "lazy_target": os.environ.get("HERMES_LAZY_INSTALL_TARGET"),
         "presets": os.environ.get("ZETTLAB_PRESETS_DIR"),
         "presets_override": os.environ.get("ZETTLAB_CLAW_PRESETS_DIR"),
@@ -1251,11 +1260,13 @@ Path({str(gateway_log)!r}).write_text(
         "HERMES_HOME": "/stale/hermes-home",
         "HERMES_BUNDLED_SKILLS": "/stale/skills",
         "HERMES_BUNDLED_PLUGINS": "/stale/plugins",
+        "HERMES_BUNDLED_LOCALES": "/stale/locales",
         "HERMES_LAZY_INSTALL_TARGET": "/stale/lazy-packages",
         "ZETTLAB_CLAW_PRESETS_DIR": str(explicit_presets),
     }
     if with_explicit_override:
         overrides["HERMES_MANAGED_DIR"] = str(explicit_managed)
+        overrides["HERMES_NEMO_RELAY_CORE_ENABLED"] = "true"
     overrides["ZETTLAB_CLAW_DATA_DIR"] = str(hermes_home.parent)
     subprocess.run(
         [str(start_script)],
@@ -1274,6 +1285,9 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["double"] == r"literal\nvalue"
     assert gateway_env["multiplex"] == "true"
     assert gateway_env["managed_gateway"] == "1"
+    assert gateway_env["relay_core"] == (
+        "true" if with_explicit_override else None
+    )
     assert gateway_env["managed_cgroup_root"] is None
     assert gateway_env["managed_cgroup_unit"] == "zettlab-claw.service"
     assert gateway_env["home"] == str(hermes_home)
@@ -1281,6 +1295,8 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["plugins"] == str(
         app_root / "lib" / "hermes-agent" / "plugins"
     )
+    assert gateway_env["locales"] == str(packaged_locales)
+    assert gateway_env["rendered"] != "gateway.reset.header_default"
     assert gateway_env["lazy_target"] == str(hermes_home.parent / "lazy-packages")
     assert gateway_env["presets"] == str(explicit_presets)
     assert gateway_env["presets_override"] is None
@@ -1293,6 +1309,7 @@ Path({str(gateway_log)!r}).write_text(
         "HERMES_HOME=",
         "HERMES_BUNDLED_SKILLS=",
         "HERMES_BUNDLED_PLUGINS=",
+        "HERMES_BUNDLED_LOCALES=",
         "HERMES_LAZY_INSTALL_TARGET=",
         "ZETTLAB_CLAW_PRESETS_DIR=",
     ):
@@ -1404,6 +1421,11 @@ def test_zpk_agent_service_names_are_device_facing():
     assert "RequiresMountsFor=/volume1" in service
     assert "Environment=GATEWAY_MULTIPLEX_PROFILES=true" in service
     assert "Environment=HERMES_MANAGED_GATEWAY=1" in service
+    assert "HERMES_NEMO_RELAY_CORE_ENABLED" not in service
+    assert (
+        "Environment=HERMES_BUNDLED_LOCALES="
+        "__APP_BASE__/current/lib/hermes-agent/locales" in service
+    )
     assert (
         "Environment=HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service"
         in service
@@ -1426,10 +1448,20 @@ def test_zpk_agent_service_names_are_device_facing():
         'exec "$HERMES_PYTHON" -I "$HERMES_LAUNCHER" "$HERMES_SCRIPT" "$@"'
         in hermes_wrapper
     )
+    assert (
+        'export HERMES_BUNDLED_LOCALES="${HERMES_BUNDLED_LOCALES:-$HERMES_SRC/locales}"'
+        in hermes_wrapper
+    )
+    assert "HERMES_NEMO_RELAY_CORE_ENABLED" not in hermes_wrapper
     assert '"$APP_ROOT/prepare-claw-service.sh" --emit-env' in start_wrapper
     assert "load_reconciled_env" in start_wrapper
     assert "export GATEWAY_MULTIPLEX_PROFILES=true" in start_wrapper
     assert "export HERMES_MANAGED_GATEWAY=1" in start_wrapper
+    assert "HERMES_NEMO_RELAY_CORE_ENABLED" not in start_wrapper
+    assert (
+        'export HERMES_BUNDLED_LOCALES="$APP_ROOT/lib/hermes-agent/locales"'
+        in start_wrapper
+    )
     assert 'export HERMES_LAZY_INSTALL_TARGET="$DATA_DIR/lazy-packages"' in start_wrapper
     assert (
         "export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service"

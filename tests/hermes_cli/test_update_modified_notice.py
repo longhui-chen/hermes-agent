@@ -18,14 +18,22 @@ import re
 from pathlib import Path
 
 import hermes_cli.main as main_mod
+import hermes_cli.update_cmd as update_mod
 
 
 _COUNT_RE = re.compile(r"user-modified \(kept\)")
 _HINT_RE = re.compile(r"hermes skills list-modified")
+_UP_TO_DATE_RE = re.compile(r"Skills are up to date")
 
 
 def _source_lines() -> list[str]:
-    return Path(main_mod.__file__).read_text(encoding="utf-8").splitlines()
+    # The update pipeline was extracted to hermes_cli/update_cmd.py
+    # (main.py decomposition); scan both homes of the notice.
+    return [
+        line
+        for mod in (main_mod, update_mod)
+        for line in Path(mod.__file__).read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def test_every_user_modified_notice_points_at_list_modified():
@@ -51,3 +59,25 @@ def test_every_user_modified_notice_points_at_list_modified():
             "`hermes skills list-modified` within the following lines — the "
             "update paths have drifted apart again:\n" + window
         )
+
+
+def test_every_up_to_date_notice_is_guarded_by_seed_policy_error():
+    lines = Path(update_mod.__file__).read_text(encoding="utf-8").splitlines()
+    notice_sites = [i for i, line in enumerate(lines) if _UP_TO_DATE_RE.search(line)]
+
+    assert notice_sites, "the skills update success notice was removed"
+    for idx in notice_sites:
+        window = "\n".join(lines[max(0, idx - 3) : idx + 1])
+        assert "_warn_if_seed_policy_error" in window, (
+            "an update path can report skills as current while a fail-closed "
+            f"seed-policy error is present:\n{window}"
+        )
+
+
+def test_seed_policy_error_warning_is_actionable(capsys):
+    assert main_mod._warn_if_seed_policy_error({"policy_error": True}) is True
+
+    output = capsys.readouterr().out
+    assert "Skills NOT seeded" in output
+    assert "config/skill_seed_policy.json" in output
+    assert "re-run" in output
