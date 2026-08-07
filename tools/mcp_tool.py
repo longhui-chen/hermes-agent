@@ -5061,6 +5061,31 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        call_meta = None
+        if _parse_boolish(
+            server._config.get("forward_context_meta", False), default=False
+        ):
+            try:
+                from gateway.session_context import get_session_env
+
+                forwarded = {
+                    "zettlab/profile_id": get_session_env("HERMES_SESSION_PROFILE", ""),
+                    "zettlab/session_id": get_session_env("HERMES_SESSION_ID", ""),
+                    "zettlab/turn_id": get_session_env("HERMES_TURN_ID", ""),
+                    "zettlab/account_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+                }
+                call_meta = {
+                    key: str(value).strip()[:512]
+                    for key, value in forwarded.items()
+                    if str(value or "").strip()
+                } or None
+            except Exception:
+                logger.debug(
+                    "MCP server '%s': failed to build forwarded context metadata",
+                    server_name,
+                    exc_info=True,
+                )
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -5070,7 +5095,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if call_meta:
+                        result = await server.session.call_tool(
+                            tool_name, arguments=args, meta=call_meta
+                        )
+                    else:
+                        result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably

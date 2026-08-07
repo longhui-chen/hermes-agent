@@ -87,6 +87,7 @@ import time
 import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -127,6 +128,16 @@ from gateway.platforms import zet_agent_cron as _zet_agent_cron
 _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
+
+_zettlab_request_account_id: ContextVar[str] = ContextVar(
+    "zettlab_request_account_id", default=""
+)
+
+
+def _request_account_id(request: "web.Request") -> str:
+    """Return the bounded account identity asserted by managed local-server."""
+    value = str(request.headers.get("X-Zettlab-Account-Id", "") or "").strip()
+    return value[:256]
 
 
 async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
@@ -754,9 +765,11 @@ class ZetAgentAdapter(APIServerAdapter):
         token = push_zettlab_browser_session_token(
             request.headers.get("X-Zettlab-Browser-Session-Token", "")
         )
+        account_token = _zettlab_request_account_id.set(_request_account_id(request))
         try:
             return await super()._handle_chat_completions(request)
         finally:
+            _zettlab_request_account_id.reset(account_token)
             pop_zettlab_browser_session_token(token)
 
     def _bind_turn_session_context(
@@ -798,9 +811,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 chat_id=session_id,
                 chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
                 thread_id="",
-                user_id="",
+                user_id=_zettlab_request_account_id.get(),
                 user_name="",
                 session_key=session_key or session_id,
+                profile=str(_api_request_profile.get() or "main").strip() or "main",
                 async_delivery=self.supports_async_delivery,
                 exec_ask="1",
             )
@@ -826,8 +840,10 @@ class ZetAgentAdapter(APIServerAdapter):
         return set_session_vars(
             platform="zet_agent",
             chat_id=chat_id,
+            user_id=_zettlab_request_account_id.get(),
             session_key=session_key,
             session_id=session_id,
+            profile=str(_api_request_profile.get() or "main").strip() or "main",
             async_delivery=self.supports_async_delivery,
             cron_session="",
             exec_ask="1",
@@ -2809,6 +2825,7 @@ class ZetAgentAdapter(APIServerAdapter):
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
             "platform": platform_key,
+            "user_id": _zettlab_request_account_id.get() or None,
             "stream_delta_callback": stream_delta_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,

@@ -496,6 +496,49 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_forward_context_meta_uses_trusted_session_context(self):
+        from gateway.session_context import (
+            clear_session_vars,
+            clear_turn_vars,
+            set_session_vars,
+            set_turn_vars,
+        )
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("stored", is_error=False)
+        )
+        server = _make_mock_server("memo_srv", session=mock_session)
+        server._config = {"forward_context_meta": True}
+        _servers["memo_srv"] = server
+        session_tokens = set_session_vars(
+            user_id="account-1",
+            session_id="session-1",
+            profile="main",
+        )
+        turn_tokens = set_turn_vars(turn_id="turn-1")
+
+        try:
+            handler = _make_tool_handler("memo_srv", "memo_write", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"statement": "用户喜欢咖啡"}))
+            assert result["result"] == "stored"
+            mock_session.call_tool.assert_called_once_with(
+                "memo_write",
+                arguments={"statement": "用户喜欢咖啡"},
+                meta={
+                    "zettlab/profile_id": "main",
+                    "zettlab/session_id": "session-1",
+                    "zettlab/turn_id": "turn-1",
+                    "zettlab/account_id": "account-1",
+                },
+            )
+        finally:
+            clear_turn_vars(turn_tokens)
+            clear_session_vars(session_tokens)
+            _servers.pop("memo_srv", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
