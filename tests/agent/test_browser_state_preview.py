@@ -208,6 +208,24 @@ def test_malformed_encoded_free_text_url_fails_closed() -> None:
 
 
 @pytest.mark.parametrize(
+    "target",
+    [
+        "https://Example.COM/magic link/opaque-credential",
+        "https:%2G%2Gexample.com/magic/opaque-credential",
+    ],
+)
+def test_ambiguous_free_text_url_boundary_fails_closed(target: str) -> None:
+    preview = project_browser_state_preview(
+        "browser_navigate",
+        {"success": True, "title": f"Continue at {target}"},
+    )
+
+    assert preview is not None
+    assert preview["title"] == "[REDACTED]"
+    assert "opaque-credential" not in json.dumps(preview)
+
+
+@pytest.mark.parametrize(
     "unsafe_text",
     [
         "Saved at /root/private browser state",

@@ -79,6 +79,7 @@ _PERCENT_TOKEN_RE = re.compile(r"[^\s<>\"']*%[0-9a-f]{2}[^\s<>\"']*", re.IGNOREC
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
 _MALFORMED_PERCENT_RE = re.compile(r"%(?![0-9a-f]{2})", re.IGNORECASE)
 _HTTP_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
+_HTTP_URL_LIKE_RE = re.compile(r"https?:", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
 _SAFE_STATES = (
     "disabled",
@@ -205,8 +206,17 @@ def _presentation_safe_paths_and_urls(value: str) -> tuple[str, bool]:
     candidate, encoded_changed, unsafe_path = _replace_encoded_presentation_tokens(value)
     if unsafe_path:
         return "[REDACTED]", True
+    raw_url = _EMBEDDED_HTTP_URL_RE.search(candidate)
+    if raw_url is not None and candidate[raw_url.end() :].strip():
+        # Raw whitespace cannot be distinguished from an invalid, unescaped
+        # URL path boundary. Do not preserve a possible credential suffix.
+        return "[REDACTED]", True
     candidate, urls_redacted = _hostname_only_embedded_urls(candidate)
-    if _EMBEDDED_FILE_URL_RE.search(candidate) or _LOCAL_PATH_RE.search(candidate):
+    if (
+        _HTTP_URL_LIKE_RE.search(candidate)
+        or _EMBEDDED_FILE_URL_RE.search(candidate)
+        or _LOCAL_PATH_RE.search(candidate)
+    ):
         return "[REDACTED]", True
     return candidate, encoded_changed or urls_redacted or candidate != value
 
