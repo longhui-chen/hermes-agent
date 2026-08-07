@@ -4749,19 +4749,28 @@ class TestTakeoverUIHintOverSSE:
             async def _mock_run_agent(**kwargs):
                 start = kwargs.get("tool_start_callback")
                 complete = kwargs.get("tool_complete_callback")
-                if start:
-                    start(
-                        "call_state",
-                        "browser_navigate",
-                        {"url": "https://example.com/login"},
-                    )
-                if complete:
-                    complete(
-                        "call_state",
-                        "browser_navigate",
-                        {"url": "https://example.com/login"},
-                        result,
-                    )
+                from agent.codex_runtime import make_codex_app_server_event_bridge
+
+                bridge = make_codex_app_server_event_bridge(types.SimpleNamespace(
+                    tool_progress_callback=None,
+                    tool_start_callback=start,
+                    tool_complete_callback=complete,
+                ))
+                item = {
+                    "type": "mcpToolCall",
+                    "id": "call_state",
+                    "server": "hermes-tools",
+                    "tool": "browser_navigate",
+                    "arguments": {"url": "https://example.com/login"},
+                }
+                bridge({"method": "item/started", "params": {"item": item}})
+                bridge({
+                    "method": "item/completed",
+                    "params": {"item": {
+                        **item,
+                        "result": {"content": [{"type": "text", "text": result}]},
+                    }},
+                })
                 return (
                     {"final_response": "Opened.", "messages": [], "api_calls": 1},
                     {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},

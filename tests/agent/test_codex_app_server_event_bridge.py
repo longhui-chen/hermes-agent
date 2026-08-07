@@ -34,6 +34,8 @@ def _make_stub_agent() -> SimpleNamespace:
     """Minimal stand-in for AIAgent that records every callback fire."""
     return SimpleNamespace(
         tool_progress_callback=MagicMock(name="tool_progress_callback"),
+        tool_start_callback=MagicMock(name="tool_start_callback"),
+        tool_complete_callback=MagicMock(name="tool_complete_callback"),
         _fire_stream_delta=MagicMock(name="_fire_stream_delta"),
         _fire_reasoning_delta=MagicMock(name="_fire_reasoning_delta"),
         _emit_interim_assistant_message=MagicMock(
@@ -149,6 +151,33 @@ class TestCodexItemCompletionPayload:
         assert "[error]" in result
         assert is_error is True
 
+    def test_internal_hermes_mcp_unwraps_the_native_result_without_truncation(self):
+        raw = json.dumps({
+            "success": True,
+            "snapshot": '- heading "Account" [e1]\n' + "x" * 8_000,
+        })
+        result, is_error = _codex_item_completion_payload({
+            "type": "mcpToolCall",
+            "server": "hermes-tools",
+            "tool": "browser_snapshot",
+            "result": {"content": [{"type": "text", "text": raw}]},
+        })
+
+        assert result == raw
+        assert len(result) > 4_000
+        assert is_error is False
+
+    def test_external_mcp_keeps_the_serialized_envelope(self):
+        result, is_error = _codex_item_completion_payload({
+            "type": "mcpToolCall",
+            "server": "external",
+            "tool": "browser_snapshot",
+            "result": {"content": [{"type": "text", "text": '{"success": true}'}]},
+        })
+
+        assert result.startswith('{"content":')
+        assert is_error is False
+
 
 
 # ---------- bridge: dispatch contracts ----------
@@ -220,6 +249,26 @@ class TestToolProgressDispatch:
         assert completed.kwargs["duration"] == pytest.approx(0.042)
         assert completed.kwargs["is_error"] is False
         assert completed.kwargs["result"] == "hi\n"
+
+    def test_internal_hermes_mcp_completion_callback_receives_native_result(self):
+        raw = json.dumps({"success": True, "snapshot": '- heading "Account" [e1]'})
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        started_item = {
+            "type": "mcpToolCall",
+            "id": "mcp-browser-1",
+            "server": "hermes-tools",
+            "tool": "browser_snapshot",
+            "arguments": {},
+        }
+        bridge(_item_started(started_item))
+        bridge(_item_completed({
+            **started_item,
+            "result": {"content": [{"type": "text", "text": raw}]},
+        }))
+
+        assert agent.tool_complete_callback.call_args.args[1] == "browser_snapshot"
+        assert agent.tool_complete_callback.call_args.args[3] == raw
 
 
 

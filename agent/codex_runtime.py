@@ -310,6 +310,31 @@ _CODEX_TOOL_ITEM_TYPES = frozenset(
 _INTERNAL_MCP_SERVER = "hermes-tools"
 
 
+def _internal_mcp_result_text(item: dict, result: Any) -> str | None:
+    """Return the native Hermes result carried by its trusted MCP wrapper.
+
+    Codex app-server exposes MCP results as a content-block envelope.  Native
+    Hermes callbacks receive the tool's text result itself, so unwrap the
+    single text block for the internal server only.  External MCP payloads keep
+    their existing serialized-envelope behavior.
+    """
+    if item.get("server") != _INTERNAL_MCP_SERVER or not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    text_blocks = [
+        block.get("text")
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+    if len(text_blocks) != 1:
+        return None
+    return text_blocks[0]
+
+
 def _codex_item_to_tool_name(item: dict) -> str:
     """Synthetic Hermes tool name for a codex item. Mirrors
     CodexEventProjector so the progress bubble and the projected
@@ -411,6 +436,9 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
                 True,
             )
         result = item.get("result")
+        internal_text = _internal_mcp_result_text(item, result)
+        if internal_text is not None:
+            return internal_text, False
         return (
             json.dumps(result, ensure_ascii=False)[:4000]
             if result is not None else "",
