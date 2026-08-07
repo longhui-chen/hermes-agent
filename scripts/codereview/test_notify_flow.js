@@ -15,6 +15,7 @@ const {
   EVENT_MARK,
   BOOTSTRAP_MARK,
   BOOTSTRAP_PROGRESS_RESERVE_MS,
+  COMMENT_MINIMIZE_TIMEOUT_MS,
   GITHUB_ATTEMPT_BUDGET_MS,
   GITHUB_REQUEST_TIMEOUT_MS,
   HISTORY_MAX_PAGES,
@@ -62,6 +63,7 @@ const {
   withGithubAttemptBudget,
   withGithubRetry,
   githubGraphqlWithTimeout,
+  minimizeLedgerCommentBestEffort,
   MAX_GITHUB_RETRY_DELAY_MS,
   FEISHU_RATE_LIMIT_MAX_ATTEMPTS,
   FEISHU_RATE_LIMIT_MAX_INLINE_DELAY_MS,
@@ -106,7 +108,14 @@ function makeCore() {
 }
 
 function botComment(id, body) {
-  return { id, body, author_association: 'NONE', user: { login: 'github-actions[bot]', type: 'Bot' } };
+  return {
+    id,
+    node_id: `IC_${id}`,
+    body,
+    is_minimized: false,
+    author_association: 'NONE',
+    user: { login: 'github-actions[bot]', type: 'Bot' },
+  };
 }
 
 const HEAD = 'a'.repeat(40);
@@ -158,6 +167,7 @@ function makeGithub({
   onGraphql = null,
   onCreateComment = null,
   bootstrapCreateLosesResponse = false,
+  minimizeCommentFails = false,
 } = {}) {
   const listComments = async (options) => {
     assert(options.request.timeout === GITHUB_REQUEST_TIMEOUT_MS, 'comment list API timeout');
@@ -178,8 +188,10 @@ function makeGithub({
   let checkpointResponseLost = false;
   let checkpointCreateCount = 0;
   let checkpointInterleaved = false;
+  const minimizedCommentIds = [];
   const github = {
     dispatches,
+    minimizedCommentIds,
     pullListPages: [],
     prReads: [],
     commentReads: 0,
@@ -188,9 +200,19 @@ function makeGithub({
     associationReads: [],
     jobReads: 0,
     failThreadRelease: threadReleaseFails,
-    graphql: async (_query, variables) => {
+    graphql: async (query, variables) => {
       assert(variables.request && variables.request.signal instanceof AbortSignal,
         'GraphQL locator 必须透传 AbortController signal');
+      if (String(query).includes('minimizeComment')) {
+        assert(variables.request.timeout === COMMENT_MINIMIZE_TIMEOUT_MS,
+          'comment minimize 使用独立短 timeout');
+        if (minimizeCommentFails) throw new Error('simulated minimize failure');
+        const comment = comments.find((item) => item.node_id === variables.subjectId);
+        if (!comment) throw new Error('comment node not found');
+        comment.is_minimized = true;
+        minimizedCommentIds.push(comment.id);
+        return { minimizeComment: { minimizedComment: { isMinimized: true, minimizedReason: 'outdated' } } };
+      }
       if (onGraphql) onGraphql(variables);
       const listed = comments.slice().sort((a, b) => Number(a.id) - Number(b.id));
       const end = variables.before === null || typeof variables.before === 'undefined'
@@ -199,7 +221,7 @@ function makeGithub({
       return { repository: { pullRequest: { comments: {
         pageInfo: { hasPreviousPage: start > 0, startCursor: String(start) },
         nodes: listed.slice(start, end).map((comment) => ({
-          databaseId: Number(comment.id), body: comment.body,
+          id: comment.node_id, databaseId: Number(comment.id), body: comment.body,
           createdAt: comment.created_at || CREATED,
           authorAssociation: comment.author_association || 'NONE',
           author: { login: comment.user && comment.user.login, __typename: comment.user && comment.user.type || 'User' },
@@ -396,6 +418,7 @@ async function main() {
   try {
     assert(GITHUB_ATTEMPT_BUDGET_MS === 180000, '共享 GitHub attempt budget 固定 180s');
     assert(GITHUB_REQUEST_TIMEOUT_MS === 15000, 'GitHub API timeout 固定 15s');
+    assert(COMMENT_MINIMIZE_TIMEOUT_MS === 5000, '账本评论折叠使用独立 5s 短 timeout');
     assert(BOOTSTRAP_PROGRESS_RESERVE_MS > 2 * GITHUB_REQUEST_TIMEOUT_MS,
       'bootstrap 为 create + response-loss tail confirm 预留两个 GitHub 请求与 runner overhead');
     assert(DRAIN_BATCH_SIZE > 0 && DRAIN_BATCH_SIZE <= 10, 'drain batch 必须有小型上限');
@@ -426,6 +449,28 @@ async function main() {
       }, { deadlineMs: 999999, nowFn: () => 1001 });
     }, { deadlineMs: GITHUB_REQUEST_TIMEOUT_MS + 1000, nowFn: () => 0 });
     assert(nestedOperations === 0, '预算不足时不发 GitHub 请求');
+
+    const minimizeComments = [botComment(901, `${EVENT_MARK} unit -->`)];
+    const minimizeGithub = makeGithub({ comments: minimizeComments });
+    const minimizeCore = makeCore();
+    const minimized = await minimizeLedgerCommentBestEffort({
+      github: minimizeGithub, core: minimizeCore, comment: minimizeComments[0],
+    });
+    assert(minimized && minimizeComments[0].is_minimized &&
+      JSON.stringify(minimizeGithub.minimizedCommentIds) === JSON.stringify([901]) &&
+      minimizeCore.failures.length === 0,
+    '账本评论写入后的 GraphQL minimize 只改变展示状态');
+    const failedMinimizeComments = [botComment(902, `${EVENT_MARK} unit-failure -->`)];
+    const failedMinimizeCore = makeCore();
+    const failedMinimize = await minimizeLedgerCommentBestEffort({
+      github: makeGithub({ comments: failedMinimizeComments, minimizeCommentFails: true }),
+      core: failedMinimizeCore,
+      comment: failedMinimizeComments[0],
+    });
+    assert(!failedMinimize && !failedMinimizeComments[0].is_minimized &&
+      failedMinimizeCore.failures.length === 0 &&
+      failedMinimizeCore.warnings.some((message) => message.includes('继续主流程')),
+    '折叠失败仅 warning，不得把展示层失败升级为业务流程失败');
 
     const workflow = fs.readFileSync(path.join(__dirname, '../../.github/workflows/codex-review-feishu.yml'), 'utf8');
     const consumer = fs.readFileSync(path.join(__dirname, '../../.github/workflows/codex-review-feishu-consumer.yml'), 'utf8');
@@ -511,7 +556,26 @@ async function main() {
     await enqueueEventRef({ github: queueGithub, context: context(), core: makeCore(), ref });
     await enqueueEventRef({ github: queueGithub, context: context(), core: makeCore(), ref });
     const queue = await readEventQueue({ github: queueGithub, context: context(), core: makeCore(), prNum: 42 });
-    assert(queue.ok && queue.events.length === 1 && queueComments.length === 1, '重复 delivery 的 immutable ref 折叠且不丢失');
+    assert(queue.ok && queue.events.length === 1 && queueComments.length === 1 &&
+      queueComments[0].is_minimized && decodeEventRef(queueComments[0].body).eventKey === ref.eventKey,
+    '折叠后的 immutable ref body 仍可读，重复 delivery 去重且不丢失');
+
+    const minimizeFailureComments = [];
+    const minimizeFailureCore = makeCore();
+    const minimizeFailureGithub = makeGithub({
+      comments: minimizeFailureComments,
+      minimizeCommentFails: true,
+    });
+    await enqueueEventRef({
+      github: minimizeFailureGithub, context: context(), core: minimizeFailureCore, ref: eventRef('503'),
+    });
+    const minimizeFailureQueue = await readEventQueue({
+      github: minimizeFailureGithub, context: context(), core: makeCore(), prNum: 42,
+    });
+    assert(minimizeFailureQueue.ok && minimizeFailureQueue.events.length === 1 &&
+      minimizeFailureCore.failures.length === 0 &&
+      minimizeFailureCore.warnings.some((message) => message.includes('继续主流程')),
+    'GitHub minimize 不可用时 durable enqueue 与后续读取照常完成');
 
     const eventPayload = {
       check_run: makeCheck(502),

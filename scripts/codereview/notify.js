@@ -30,6 +30,7 @@ const EVENT_VERSION = 1;
 const DELIVERY_VERSION = 1;
 const MARKER_IO_ATTEMPTS = 3;
 const GITHUB_REQUEST_TIMEOUT_MS = 15000;
+const COMMENT_MINIMIZE_TIMEOUT_MS = 5000;
 const GITHUB_RETRY_BASE_MS = 1000;
 const MAX_GITHUB_RETRY_DELAY_MS = 30000;
 const GITHUB_ATTEMPT_BUDGET_MS = 180000;
@@ -241,6 +242,42 @@ async function githubGraphqlWithTimeout(github, query, variables = {}, timeoutMs
     throw timeoutError;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// PR comments are the durable source of truth for the notifier, but they are
+// implementation details rather than review conversation. Minimize only after
+// GitHub has confirmed the comment write. This mutation is deliberately
+// best-effort and never retried: a presentation-layer failure must not replay a
+// createComment operation or fail Feishu delivery.
+async function minimizeLedgerCommentBestEffort({
+  github, core = noopCore(), comment, label = '折叠 Codex 通知账本评论', nowFn = Date.now,
+}) {
+  const subjectId = String(comment && (comment.node_id || comment.nodeId) || '').trim();
+  if (!subjectId || typeof github.graphql !== 'function') {
+    core.warning(`${label}跳过：GitHub comment node_id 或 GraphQL client 不可用`);
+    return false;
+  }
+  // Preserve enough outer attempt budget for one normal 15s state request.
+  if (!hasGithubRequestBudget(nowFn(), COMMENT_MINIMIZE_TIMEOUT_MS)) {
+    core.warning(`${label}跳过：GitHub attempt budget 不足`);
+    return false;
+  }
+  try {
+    const result = await githubGraphqlWithTimeout(github, `mutation($subjectId:ID!){
+      minimizeComment(input:{subjectId:$subjectId,classifier:OUTDATED}){
+        minimizedComment{isMinimized minimizedReason}
+      }
+    }`, { subjectId }, COMMENT_MINIMIZE_TIMEOUT_MS);
+    const minimized = result && result.minimizeComment && result.minimizeComment.minimizedComment;
+    if (!minimized || minimized.isMinimized !== true) {
+      core.warning(`${label}未获 GitHub 最小化确认`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    core.warning(`${label}失败，保留可见评论且继续主流程: ${errorMessage(error)}`);
+    return false;
   }
 }
 
@@ -463,7 +500,7 @@ async function readCheckpointTail({
       operation: () => githubGraphqlWithTimeout(github, `query($owner:String!,$repo:String!,$pr:Int!,$before:String){
         repository(owner:$owner,name:$repo){pullRequest(number:$pr){comments(last:100,before:$before){
           pageInfo{hasPreviousPage startCursor}
-          nodes{databaseId body createdAt authorAssociation author{login __typename}}
+          nodes{id databaseId body createdAt authorAssociation author{login __typename}}
         }}}
       }`, { owner: context.repo.owner, repo: context.repo.repo, pr: prNum, before }),
     });
@@ -474,7 +511,7 @@ async function readCheckpointTail({
             String(node.body || '').includes(BOOTSTRAP_MARK)) ||
           String(node.author && node.author.login || '').toLowerCase() !== GITHUB_ACTIONS_BOT) continue;
       found.push({
-        id: Number(node.databaseId), body: node.body, created_at: node.createdAt,
+        id: Number(node.databaseId), node_id: node.id, body: node.body, created_at: node.createdAt,
         author_association: node.authorAssociation,
         user: { login: node.author.login, type: node.author.__typename === 'Bot' ? 'Bot' : 'User' },
       });
@@ -586,7 +623,12 @@ async function appendBootstrapProgress({
       request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
-  if (result.ok) return true;
+  if (result.ok) {
+    await minimizeLedgerCommentBestEffort({
+      github, core, comment: result.value.data, label: '折叠 bootstrap progress 评论', nowFn,
+    });
+    return true;
+  }
   // createComment may have committed even though its response was lost. Spend exactly the
   // second reserved request on a one-page/one-attempt tail confirmation; further recovery is
   // delegated to the next run's source scan rather than exceeding the shared outer budget.
@@ -594,12 +636,17 @@ async function appendBootstrapProgress({
   const tail = await readCheckpointTail({
     github, context, core, prNum, nowFn, attempts: 1, maxPages: 1,
   });
-  const confirmed = tail && tail.some((comment) => {
+  const confirmed = tail && tail.find((comment) => {
     const candidate = decodeBootstrapProgress(comment.body);
     return candidate && candidate.repo === repositoryName(context) && candidate.pr === prNum &&
       canonicalHash(candidate) === targetHash;
   });
-  if (confirmed) return true;
+  if (confirmed) {
+    await minimizeLedgerCommentBestEffort({
+      github, core, comment: confirmed, label: '折叠已恢复的 bootstrap progress 评论', nowFn,
+    });
+    return true;
+  }
   core.setFailed('bootstrap progress POST 未确认；下轮从 GitHub source 重新扫描');
   return false;
 }
@@ -1027,7 +1074,7 @@ function stateCommentBody(state, repair = null, repairPrivateKey = null, threadR
 }
 
 async function createComment({ github, context, core, prNum, body, label }) {
-  return withGithubRetry({
+  const created = await withGithubRetry({
     core,
     label,
     setFailedOnExhausted: false,
@@ -1039,6 +1086,12 @@ async function createComment({ github, context, core, prNum, body, label }) {
       request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
     }),
   });
+  if (created.ok) {
+    await minimizeLedgerCommentBestEffort({
+      github, core, comment: created.value.data, label: `折叠 ${label}评论`,
+    });
+  }
+  return created;
 }
 
 async function appendStateAndConfirm({
@@ -1196,6 +1249,11 @@ async function persistThreadMarker({ github, context, core = noopCore(), markerC
         body: markBody, request: { timeout: GITHUB_REQUEST_TIMEOUT_MS },
       }),
   });
+  if (result.ok && !markerCommentId) {
+    await minimizeLedgerCommentBestEffort({
+      github, core, comment: result.value && result.value.data, label: '折叠 legacy 话题标记评论',
+    });
+  }
   return result.ok;
 }
 
@@ -3277,6 +3335,9 @@ async function persistCheckpoint({ github, context, core, prNum, comments, queue
       });
       metadata.commentId = Number(created.data.id);
       metadata.checkpoint = checkpoint;
+      await minimizeLedgerCommentBestEffort({
+        github, core, comment: created.data, label: '折叠 compact checkpoint 评论',
+      });
       return true;
     } catch (error) {
       core.warning(`checkpoint POST 响应不确定，执行有界 prefix 核对: ${errorMessage(error)}`);
@@ -3286,7 +3347,7 @@ async function persistCheckpoint({ github, context, core, prNum, comments, queue
       const found = tail.map((comment) => {
         const candidate = decodeCheckpoint(comment.body);
         return candidate && candidate.repo === repositoryName(context) && candidate.pr === prNum
-          ? { hash: canonicalHash(candidate), commentId: Number(comment.id), checkpoint: candidate }
+          ? { hash: canonicalHash(candidate), commentId: Number(comment.id), nodeId: comment.node_id, checkpoint: candidate }
           : null;
       }).filter((candidate) => candidate && candidate.checkpoint.revision === checkpoint.revision);
       const expected = found.filter(({ hash }) => hash === targetHash);
@@ -3295,6 +3356,9 @@ async function persistCheckpoint({ github, context, core, prNum, comments, queue
           expected.every(({ checkpoint: candidate }) => candidate.parentHash === checkpoint.parentHash)) {
         metadata.commentId = expected[0].commentId;
         metadata.checkpoint = expected[0].checkpoint;
+        await minimizeLedgerCommentBestEffort({
+          github, core, comment: { nodeId: expected[0].nodeId }, label: '折叠已恢复的 compact checkpoint 评论',
+        });
         return true;
       }
       core.setFailed('checkpoint POST 未确认或发现不一致 lineage，保留旧 high-watermark');
@@ -4072,6 +4136,7 @@ module.exports = {
   isCodexCheckRun,
   isCodexPullRequestReview,
   GITHUB_REQUEST_TIMEOUT_MS,
+  COMMENT_MINIMIZE_TIMEOUT_MS,
   GITHUB_ATTEMPT_BUDGET_MS,
   BOOTSTRAP_PROGRESS_RESERVE_MS,
   MAX_GITHUB_RETRY_DELAY_MS,
@@ -4096,6 +4161,7 @@ module.exports = {
   withGithubAttemptBudget,
   withGithubRetry,
   githubGraphqlWithTimeout,
+  minimizeLedgerCommentBestEffort,
   readThreadMarkerComments,
   persistThreadMarker,
   MARK,
