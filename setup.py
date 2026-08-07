@@ -1,106 +1,73 @@
-from __future__ import annotations
+"""
+setup.py — wheel/sdist build guard.
 
-from collections import defaultdict
-from pathlib import Path
-import tempfile
+pip/PyPI and Homebrew are no longer supported distribution methods for
+Hermes Agent (see website/docs/getting-started/platform-support.md). The
+wheel would ship without bundled assets (locales, skills, optional-mcps,
+web_dist, tui_dist, plugin manifests) since those are resolved at runtime
+via env-var overrides set by the Nix/ZPK wrapper or the source-checkout layout.
+
+This file overrides the ``bdist_wheel`` and ``sdist`` setuptools commands
+to raise an error outside an explicitly authorized package build. The PEP 517
+``build_wheel`` / ``build_sdist`` hooks in ``setuptools.build_meta`` call these
+commands internally, so the guard fires for ``uv build``, ``pip wheel``,
+``python -m build``, and direct ``setup.py`` invocations alike.
+
+The legitimate consumers are uv2nix and the Zettlab ZPK builder. Nix sets
+``HERMES_NIX_BUILD=1`` on the package derivation; the ZPK Makefile sets
+``HERMES_ZPK_BUILD=1`` while installing the locked, non-editable project wheel
+into the packaged venv.
+
+Editable installs (``uv sync``, ``pip install -e .``, ``nix develop``)
+use ``build_editable``, which does NOT call ``bdist_wheel`` — it calls
+``build_ext`` in editable mode. So the guard does not affect development.
+"""
+
+import os
 
 from setuptools import setup
-from setuptools.command.build import build as _build
-from setuptools.command.egg_info import egg_info as _egg_info
+from setuptools.command.sdist import sdist
 
-
-REPO_ROOT = Path(__file__).parent.resolve()
-
-
-def _source_tree_is_writable() -> bool:
-    probe = REPO_ROOT / ".setuptools-write-probe"
-    try:
-        with probe.open("w", encoding="utf-8") as handle:
-            handle.write("")
-        probe.unlink()
-    except OSError:
-        try:
-            probe.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
-    return True
-
-
-def _temporary_build_dir(kind: str) -> str:
-    return tempfile.mkdtemp(prefix=f"hermes-agent-{kind}-")
-
-
-def _would_write_under_source(path_value: str | None) -> bool:
-    if path_value is None:
-        return True
-    path = Path(path_value)
-    if not path.is_absolute():
-        path = REPO_ROOT / path
-    try:
-        path.resolve().relative_to(REPO_ROOT)
-    except ValueError:
-        return False
-    return True
-
-
-class ReadOnlySourceBuild(_build):
-    def finalize_options(self) -> None:
-        if (
-            not _source_tree_is_writable()
-            and _would_write_under_source(self.build_base)
-        ):
-            self.build_base = _temporary_build_dir("build")
-        super().finalize_options()
-
-
-class ReadOnlySourceEggInfo(_egg_info):
-    def finalize_options(self) -> None:
-        if (
-            not _source_tree_is_writable()
-            and _would_write_under_source(self.egg_base)
-        ):
-            self.egg_base = _temporary_build_dir("egg-info")
-        super().finalize_options()
-
-
-def _data_file_tree(root_name: str) -> list[tuple[str, list[str]]]:
-    root = REPO_ROOT / root_name
-    grouped: defaultdict[str, list[str]] = defaultdict(list)
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        rel_path = path.relative_to(REPO_ROOT)
-        grouped[str(rel_path.parent)].append(str(rel_path))
-    return sorted(grouped.items())
-
-
-setup(
-    cmdclass={
-        "build": ReadOnlySourceBuild,
-        "egg_info": ReadOnlySourceEggInfo,
-    },
-    # NOTE: data_files is declared HERE (programmatically) rather than in
-    # pyproject.toml's [tool.setuptools.data-files] on purpose. A wheel must ship
-    # the bundled skill TREES (skills/, optional-skills/) with their nested
-    # category/skill structure preserved — static pyproject data-files globs
-    # flatten everything into one target dir, which breaks skill discovery.
-    # _data_file_tree() walks each tree and emits one (target_dir, files) pair
-    # per subdirectory, preserving structure, and picks up new skills
-    # automatically (no per-skill list to maintain).
-    #
-    # Because pyproject fields take precedence over setup.py, [tool.setuptools.
-    # data-files] MUST stay absent from pyproject.toml — otherwise it silently
-    # overrides this list and the wheel ships zero skills. locales/ lives here too
-    # for the same reason (it used to be the lone pyproject entry; #27632/#35374).
-    data_files=[
-        *_data_file_tree("skills"),
-        *_data_file_tree("optional-skills"),
-        # i18n catalogs (locales/ is a bare data dir, not a package). Without these
-        # in the wheel, sealed installs surface raw i18n keys (#27632/#35374/#23943).
-        *_data_file_tree("locales"),
-        # Ship the seed policy + fallback manifest alongside skills/ so a wheel
-        # install resolves them (else the seed filter silently no-ops).
-        ("config", ["config/skill_seed_policy.json", "config/seed_fallback_manifest.txt"]),
-    ]
+_IN_AUTHORIZED_PACKAGE_BUILD = (
+    os.environ.get("HERMES_NIX_BUILD") == "1"
+    or os.environ.get("HERMES_ZPK_BUILD") == "1"
 )
+
+_BLOCK_MESSAGE = (
+    "Building wheels or sdists for hermes-agent is not supported outside "
+    "an authorized Nix or Zettlab ZPK package build.\n"
+    "Hermes is distributed via the shell installer, Docker image, Nix, "
+    "or the Zettlab device package.\n"
+    "See: https://hermes-agent.nousresearch.com/docs/getting-started/installation\n"
+    "\n"
+    "If you are developing, use an editable install instead:\n"
+    "  uv sync          # or: uv pip install -e .\n"
+)
+
+
+class _GuardedSdist(sdist):
+    def run(self, *args, **kwargs):
+        if not _IN_AUTHORIZED_PACKAGE_BUILD:
+            raise RuntimeError(_BLOCK_MESSAGE)
+        return super().run(*args, **kwargs)
+
+
+cmdclass = {"sdist": _GuardedSdist}
+
+# bdist_wheel is only available when the ``wheel`` package is installed.
+# setuptools.build_meta.build_wheel() calls it internally, so the guard fires
+# for all PEP 517 wheel build paths.
+try:
+    from setuptools.command.bdist_wheel import bdist_wheel
+
+    class _GuardedBdistWheel(bdist_wheel):
+        def run(self, *args, **kwargs):
+            if not _IN_AUTHORIZED_PACKAGE_BUILD:
+                raise RuntimeError(_BLOCK_MESSAGE)
+            return super().run(*args, **kwargs)
+
+    cmdclass["bdist_wheel"] = _GuardedBdistWheel
+except ImportError:
+    pass
+
+setup(cmdclass=cmdclass)

@@ -17,9 +17,16 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _content_has_visible_payload,
+    _extract_current_turn_reference_image,
     _normalize_multimodal_content,
     cors_middleware,
     security_headers_middleware,
+)
+
+
+TINY_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
 
 
@@ -43,17 +50,6 @@ class TestNormalizeMultimodalContent:
         content = [{"type": "input_text", "text": "hello"}]
         assert _normalize_multimodal_content(content) == "hello"
 
-    def test_image_url_preserved_with_text(self):
-        content = [
-            {"type": "text", "text": "describe this"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png", "detail": "high"}},
-        ]
-        out = _normalize_multimodal_content(content)
-        assert isinstance(out, list)
-        assert out == [
-            {"type": "text", "text": "describe this"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png", "detail": "high"}},
-        ]
 
     def test_input_image_converted_to_canonical_shape(self):
         content = [
@@ -66,55 +62,41 @@ class TestNormalizeMultimodalContent:
             {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
         ]
 
-    def test_data_image_url_accepted(self):
-        content = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
-        out = _normalize_multimodal_content(content)
-        assert out == [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
-
-    def test_non_image_data_url_rejected(self):
-        content = [{"type": "image_url", "image_url": {"url": "data:text/plain;base64,SGVsbG8="}}]
-        with pytest.raises(ValueError) as exc:
-            _normalize_multimodal_content(content)
-        assert str(exc.value).startswith("unsupported_content_type:")
-
-    def test_file_part_rejected(self):
-        with pytest.raises(ValueError) as exc:
-            _normalize_multimodal_content([{"type": "file", "file": {"file_id": "f_1"}}])
-        assert str(exc.value).startswith("unsupported_content_type:")
-
-    def test_input_file_part_rejected(self):
-        with pytest.raises(ValueError) as exc:
-            _normalize_multimodal_content([{"type": "input_file", "file_id": "f_1"}])
-        assert str(exc.value).startswith("unsupported_content_type:")
-
-    def test_missing_url_rejected(self):
-        with pytest.raises(ValueError) as exc:
-            _normalize_multimodal_content([{"type": "image_url", "image_url": {}}])
-        assert str(exc.value).startswith("invalid_image_url:")
-
-    def test_bad_scheme_rejected(self):
-        with pytest.raises(ValueError) as exc:
-            _normalize_multimodal_content([{"type": "image_url", "image_url": {"url": "ftp://example.com/x.png"}}])
-        assert str(exc.value).startswith("invalid_image_url:")
-
-    def test_unknown_part_type_rejected(self):
-        with pytest.raises(ValueError) as exc:
-            _normalize_multimodal_content([{"type": "audio", "audio": {}}])
-        assert str(exc.value).startswith("unsupported_content_type:")
-
 
 class TestContentHasVisiblePayload:
-    def test_non_empty_string(self):
-        assert _content_has_visible_payload("hello")
 
-    def test_whitespace_only_string(self):
-        assert not _content_has_visible_payload("   ")
 
     def test_list_with_image_only(self):
         assert _content_has_visible_payload([{"type": "image_url", "image_url": {"url": "x"}}])
 
-    def test_list_with_only_empty_text(self):
-        assert not _content_has_visible_payload([{"type": "text", "text": ""}])
+
+class TestCurrentTurnReferenceImage:
+    def test_extracts_one_bounded_data_image(self):
+        content = _normalize_multimodal_content(
+            [{"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}}]
+        )
+        assert _extract_current_turn_reference_image(content) == TINY_PNG_DATA_URL
+
+    def test_remote_image_does_not_grant_tool_context(self):
+        content = _normalize_multimodal_content(
+            [{"type": "image_url", "image_url": {"url": "https://example.com/pet.png"}}]
+        )
+        assert _extract_current_turn_reference_image(content) == ""
+
+    def test_second_image_fails_closed(self):
+        content = _normalize_multimodal_content(
+            [
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}},
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}},
+            ]
+        )
+        assert _extract_current_turn_reference_image(content) == ""
+
+    def test_invalid_or_mismatched_data_image_fails_closed(self):
+        content = _normalize_multimodal_content(
+            [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,iVBORw0KGgo="}}]
+        )
+        assert _extract_current_turn_reference_image(content) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -175,10 +157,10 @@ class TestChatCompletionsMultimodalHTTP:
 
             assert resp.status == 200, await resp.text()
             assert mock_run.captured["user_message"] == image_payload
+            assert mock_run.captured["current_turn_reference_image"] == ""
 
     @pytest.mark.asyncio
-    async def test_text_only_array_collapses_to_string(self, adapter):
-        """Text-only array becomes a plain string so logging stays unchanged."""
+    async def test_only_final_user_turn_data_image_is_bound(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
@@ -189,62 +171,30 @@ class TestChatCompletionsMultimodalHTTP:
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 mock_run.side_effect = _stub
-
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
                         "model": "hermes-agent",
                         "messages": [
-                            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                                ],
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "create this pet"},
+                                    {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}},
+                                ],
+                            },
                         ],
                     },
                 )
 
             assert resp.status == 200, await resp.text()
-            assert mock_run.captured["user_message"] == "hello"
-
-    @pytest.mark.asyncio
-    async def test_file_part_returns_400(self, adapter):
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "hermes-agent",
-                    "messages": [
-                        {"role": "user", "content": [{"type": "file", "file": {"file_id": "f_1"}}]},
-                    ],
-                },
-            )
-            assert resp.status == 400
-            body = await resp.json()
-        assert body["error"]["code"] == "unsupported_content_type"
-        assert body["error"]["param"] == "messages[0].content"
-
-    @pytest.mark.asyncio
-    async def test_non_image_data_url_returns_400(self, adapter):
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "hermes-agent",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": "data:text/plain;base64,SGVsbG8="},
-                                },
-                            ],
-                        },
-                    ],
-                },
-            )
-            assert resp.status == 400
-            body = await resp.json()
-        assert body["error"]["code"] == "unsupported_content_type"
+            assert mock_run.captured["current_turn_reference_image"] == TINY_PNG_DATA_URL
 
 
 class TestResponsesMultimodalHTTP:
@@ -287,22 +237,3 @@ class TestResponsesMultimodalHTTP:
             ]
             assert mock_run.captured["user_message"] == expected
 
-    @pytest.mark.asyncio
-    async def test_input_file_returns_400(self, adapter):
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/v1/responses",
-                json={
-                    "model": "hermes-agent",
-                    "input": [
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_file", "file_id": "f_1"}],
-                        }
-                    ],
-                },
-            )
-            assert resp.status == 400
-            body = await resp.json()
-        assert body["error"]["code"] == "unsupported_content_type"

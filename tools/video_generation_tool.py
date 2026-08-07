@@ -529,6 +529,11 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
             "- supports both text-to-video (omit image_url) and "
             "image-to-video (pass image_url) — routes automatically"
         )
+    elif "modalities" in caps and not modalities:
+        parts.append(
+            "- this model currently has no usable input modality; generation "
+            "calls will be rejected until the backend capability is corrected"
+        )
 
     if caps.get("aspect_ratios"):
         parts.append(f"- aspect_ratio choices: {', '.join(caps['aspect_ratios'])}")
@@ -561,7 +566,23 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
         if notice:
             parts.append(f"- storage: {notice}")
 
-    return {"description": "\n".join(parts)}
+    overrides: Dict[str, Any] = {"description": "\n".join(parts)}
+    input_description = caps.get("image_input_description")
+    if "image" not in modalities:
+        input_description = "Not supported by the active backend/model; omit image_url."
+    if isinstance(input_description, str) and input_description.strip():
+        parameters = {**VIDEO_GENERATE_SCHEMA["parameters"]}
+        parameters["properties"] = {
+            key: dict(value)
+            for key, value in VIDEO_GENERATE_SCHEMA["parameters"]["properties"].items()
+        }
+        parameters["properties"]["image_url"]["description"] = input_description.strip()
+        if not caps.get("max_reference_images"):
+            parameters["properties"]["reference_image_urls"]["description"] = (
+                "Not supported by the active backend/model; omit reference_image_urls."
+            )
+        overrides["parameters"] = parameters
+    return overrides
 
 
 # ---------------------------------------------------------------------------

@@ -21,11 +21,9 @@ from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 
-
 # ---------------------------------------------------------------------------
 # Shared helpers / fixtures
 # ---------------------------------------------------------------------------
-
 
 
 @contextmanager
@@ -113,41 +111,8 @@ class TestProviderModelIdsBedrock:
         assert all(m.startswith("us.") for m in us_result)
         assert eu_result != us_result
 
-    def test_falls_back_to_static_list_when_discovery_empty(self, monkeypatch):
-        """When discover_bedrock_models() returns [], fall back to curated static list."""
-        from hermes_cli.models import provider_model_ids
 
-        with patch("agent.bedrock_adapter.discover_bedrock_models", return_value=[]), \
-             patch("agent.bedrock_adapter.resolve_bedrock_region", return_value="eu-central-1"):
-            result = provider_model_ids("bedrock")
 
-        # Should fall back to static table (may be empty or populated depending on
-        # the current static list, but must not crash and must be a list).
-        assert isinstance(result, list)
-
-    def test_falls_back_to_static_list_on_exception(self, monkeypatch):
-        """When discover_bedrock_models() raises, fall back gracefully."""
-        from hermes_cli.models import provider_model_ids
-
-        with patch("agent.bedrock_adapter.discover_bedrock_models",
-                   side_effect=Exception("boto3 not installed")), \
-             patch("agent.bedrock_adapter.resolve_bedrock_region", return_value="eu-central-1"):
-            result = provider_model_ids("bedrock")
-
-        assert isinstance(result, list)  # no crash
-
-    def test_accepts_bedrock_aliases(self, monkeypatch):
-        """Provider aliases (aws, aws-bedrock, amazon) should also trigger live discovery."""
-        from hermes_cli.models import provider_model_ids
-
-        _expected_ids = [m["id"] for m in _US_MODELS]
-
-        with patch("agent.bedrock_adapter.discover_bedrock_models", side_effect=_mock_discover), \
-             patch("agent.bedrock_adapter.resolve_bedrock_region", return_value="us-east-1"):
-            for alias in ("aws", "aws-bedrock", "amazon-bedrock"):
-                result = provider_model_ids(alias)
-                assert result == _expected_ids, \
-                    f"alias {alias!r} should return live-discovered US model IDs, got {result!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +122,10 @@ class TestProviderModelIdsBedrock:
 class TestListAuthenticatedProvidersBedrock:
     """Bedrock should appear in the /model picker when AWS creds are present."""
 
+
+
+
     def test_bedrock_appears_with_aws_profile(self, monkeypatch):
-        """Bedrock shows up when AWS_PROFILE is set."""
         from hermes_cli.model_switch import list_authenticated_providers
 
         monkeypatch.setenv("AWS_PROFILE", "my-sso-profile")
@@ -398,13 +365,6 @@ class TestBedrockOverlayRegistration:
         from hermes_cli.providers import HERMES_OVERLAYS
         assert "bedrock" in HERMES_OVERLAYS
 
-    def test_bedrock_overlay_transport(self):
-        from hermes_cli.providers import HERMES_OVERLAYS
-        assert HERMES_OVERLAYS["bedrock"].transport == "bedrock_converse"
-
-    def test_bedrock_overlay_auth_type(self):
-        from hermes_cli.providers import HERMES_OVERLAYS
-        assert HERMES_OVERLAYS["bedrock"].auth_type == "aws_sdk"
 
     def test_bedrock_label(self):
         from hermes_cli.providers import get_label

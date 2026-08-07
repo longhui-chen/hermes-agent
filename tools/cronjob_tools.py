@@ -9,6 +9,8 @@ import json
 import logging
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -16,6 +18,22 @@ from hermes_constants import display_hermes_home
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+# Cadence for the heartbeat that keeps the calling agent's inactivity watchdog
+# at bay while a manual `cronjob(action="run")` executes the job synchronously
+# in-process (#76502). Mirrors the 10s cadence of
+# tools/environments/base.py::touch_activity_if_due (delegate_task's heartbeat
+# uses 30s) — comfortably below the 1800s default HERMES_AGENT_TIMEOUT.
+_CRON_RUN_HEARTBEAT_INTERVAL = 10.0
+
+# Hard ceiling on how long the heartbeat keeps the parent watchdog at bay.
+# The child cron run has its own inactivity watchdog (HERMES_CRON_TIMEOUT,
+# default 600s) that bounds a wedged job, but with HERMES_CRON_TIMEOUT=0
+# (explicit "unlimited") a truly hung run_one_job would otherwise mask the
+# gateway watchdog forever — pre-#76502 the parent was at least reaped at
+# ~1800s. After this ceiling the heartbeat stops and the gateway watchdog
+# regains authority over the turn.
+_CRON_RUN_HEARTBEAT_CEILING = 6 * 3600.0
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -82,7 +100,7 @@ _CRON_THREAT_PATTERNS = [
     (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
     (r'system\s+prompt\s+override', "sys_prompt_override"),
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass)', "read_secrets"),
+    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|id_rsa|id_ed25519|id_ecdsa)', "read_secrets"),
     (r'authorized_keys', "ssh_backdoor"),
     (r'/etc/sudoers|visudo', "sudoers_mod"),
     (r'rm\s+-rf\s+/', "destructive_root_rm"),
@@ -291,6 +309,35 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _cron_connector_execution_required(skills: List[str]) -> bool:
+    try:
+        from cron.connector_execution import enabled, supports_exclusive_linear_execution
+
+        return enabled() and supports_exclusive_linear_execution(skills)
+    except Exception:
+        return False
+
+
+def _cron_connector_execution_mixed_skills_blocked(skills: List[str]) -> bool:
+    """Do not migrate a multi-Connector task to a one-Connector lease."""
+    try:
+        from cron.connector_execution import (
+            enabled,
+            supports_exclusive_linear_execution,
+            wants_linear_execution,
+        )
+
+        return enabled() and wants_linear_execution(skills) and not supports_exclusive_linear_execution(skills)
+    except Exception:
+        return False
+
+
+_MIXED_LINEAR_CONNECTOR_EXECUTION_ERROR = (
+    "当前定时任务同时使用 Linear 和其他技能/连接器。为避免单一 Linear 授权导致部分执行，"
+    "请拆分为独立的 Linear 定时任务后再创建或更新。"
+)
+
+
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
@@ -354,48 +401,6 @@ def _canonical_skills(skill: Optional[str] = None, skills: Optional[Any] = None)
     return normalized
 
 
-
-
-def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
-    """Resolve a model override object into (provider, model) for job storage.
-
-    If provider is omitted, pins the current main provider from config so the
-    job doesn't drift when the user later changes their default via hermes model.
-
-    Returns (provider_str_or_none, model_str_or_none).
-    """
-    if not model_obj or not isinstance(model_obj, dict):
-        return (None, None)
-    model_name = (model_obj.get("model") or "").strip() or None
-    provider_name = (model_obj.get("provider") or "").strip() or None
-    # Bare "custom" is usually an incomplete spec — the canonical form is
-    # "custom:<name>" matching a custom_providers entry, and LLMs frequently
-    # supply the bare type because the schema does not advertise the
-    # ":<name>" suffix. It is only a problem when it can't resolve at runtime:
-    # a user may literally name a ``providers.custom`` (or custom_providers
-    # "custom") entry, in which case the job should keep ``provider="custom"``
-    # and run against that endpoint. Only when no such entry exists do we treat
-    # the bare value as "no provider supplied" and pin the current main
-    # provider below — otherwise pinning to ``model.provider`` (e.g. codex)
-    # silently hijacks a job that meant to use the configured custom endpoint.
-    if provider_name == "custom":
-        try:
-            from hermes_cli.runtime_provider import has_named_custom_provider
-            if not has_named_custom_provider("custom"):
-                provider_name = None
-        except Exception:
-            provider_name = None
-    if model_name and not provider_name:
-        # Pin to the current main provider so the job is stable
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config()
-            model_cfg = cfg.get("model", {})
-            if isinstance(model_cfg, dict):
-                provider_name = model_cfg.get("provider") or None
-        except Exception:
-            pass  # Best-effort; provider stays None
-    return (provider_name, model_name)
 
 
 def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash: bool = False) -> Optional[str]:
@@ -628,7 +633,70 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job, triggered_at=triggered_at)
+        #
+        # A manual `run` executes the job synchronously on the caller's thread,
+        # and a cron job is itself a full agent run that routinely takes
+        # minutes. The calling turn emits no tool activity for that entire
+        # window, so the gateway inactivity watchdog concludes the agent is
+        # hung and kills the parent turn (#76502). Fire a heartbeat into the
+        # caller's activity tracker (the same signal tool progress uses) while
+        # the job runs, so the watchdog sees a working tool instead of a
+        # silent one — mirrors the delegate_task heartbeat pattern. Best-effort:
+        # if no activity callback is registered (direct Python callers, tests),
+        # behavior is unchanged.
+        try:
+            from tools.environments.base import get_activity_callback
+
+            # Capture on THIS thread: the callback is thread-local (installed
+            # by the tool executor as the calling agent's _touch_activity), so
+            # a freshly spawned thread cannot read it back.
+            activity_cb = get_activity_callback()
+        except Exception:
+            activity_cb = None
+
+        _heartbeat_stop = threading.Event()
+        _heartbeat_thread = None
+
+        if activity_cb is not None:
+            job_name = str(job.get("name") or job_id)
+
+            def _heartbeat_loop() -> None:
+                started = time.monotonic()
+                while not _heartbeat_stop.wait(_CRON_RUN_HEARTBEAT_INTERVAL):
+                    elapsed = time.monotonic() - started
+                    if elapsed > _CRON_RUN_HEARTBEAT_CEILING:
+                        # Stop masking the gateway watchdog — a run this long
+                        # with an unlimited child watchdog is likely wedged.
+                        logger.warning(
+                            "cronjob run heartbeat ceiling reached for job "
+                            "'%s' (%.0fs) — stopping heartbeat; gateway "
+                            "watchdog regains authority",
+                            job_name, elapsed,
+                        )
+                        return
+                    try:
+                        activity_cb(
+                            f"cronjob: running job '{job_name}' ({int(elapsed)}s elapsed)"
+                        )
+                    except Exception:
+                        # Never break the job run; keep heartbeating — one
+                        # transient callback error must not silently drop
+                        # watchdog protection for the rest of a long job.
+                        continue
+
+            _heartbeat_thread = threading.Thread(
+                target=_heartbeat_loop,
+                daemon=True,
+                name="cronjob-run-heartbeat",
+            )
+            _heartbeat_thread.start()
+
+        try:
+            processed = run_one_job(job, triggered_at=triggered_at)
+        finally:
+            _heartbeat_stop.set()
+            if _heartbeat_thread is not None:
+                _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -681,6 +749,8 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
+            if _cron_connector_execution_mixed_skills_blocked(canonical_skills):
+                return tool_error(_MIXED_LINEAR_CONNECTOR_EXECUTION_ERROR, success=False)
             _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
@@ -745,6 +815,24 @@ def cronjob(
                 timezone=_normalize_optional_job_value(timezone),
                 output_language=output_language,
             )
+
+            # Grant a connector-backed job while this exact Chat route still
+            # exists. If that proof is unavailable, remove the new record so a
+            # later tick cannot run partially and fabricate an empty report.
+            if _cron_connector_execution_required(canonical_skills):
+                try:
+                    from cron.connector_execution import create_grant
+
+                    execution = create_grant(job["id"], "linear")
+                    if execution:
+                        job = update_job(job["id"], {"connector_execution": execution})
+                except Exception:
+                    remove_job(job["id"])
+                    _notify_provider_jobs_changed_safe()
+                    return tool_error(
+                        "定时任务连接未授权/已过期；请先在当前会话重新授权 Linear 后再创建任务。",
+                        success=False,
+                    )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
@@ -836,6 +924,12 @@ def cronjob(
             # _execute_job_now advances next_run_at and blocks a concurrent tick
             # from double-firing.
             exec_result = _execute_job_now(job)
+            # A claimed direct run advances next_run_at and may race the
+            # external one-shot for the same occurrence. If Chronos loses that
+            # claim, its consumed fire cannot re-arm itself; reconcile from the
+            # winning direct path after the run has persisted its final state.
+            if exec_result.get("claimed", False):
+                _notify_provider_jobs_changed_safe()
             # Re-read so the response reflects the post-run last_run_at/last_status.
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
@@ -958,6 +1052,31 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
+
+            effective_skills = _canonical_skills(
+                updates.get("skill", job.get("skill")),
+                updates.get("skills", job.get("skills")),
+            )
+            if _cron_connector_execution_mixed_skills_blocked(effective_skills):
+                return tool_error(_MIXED_LINEAR_CONNECTOR_EXECUTION_ERROR, success=False)
+            if _cron_connector_execution_required(effective_skills):
+                try:
+                    from cron.connector_execution import create_grant
+
+                    # Updating a Linear task is the deliberate one-time
+                    # migration path for jobs created before this feature.
+                    # The grant is refreshed while this exact Chat route is
+                    # live; Cron itself never reconstructs that route later.
+                    updates["connector_execution"] = create_grant(job_id, "linear")
+                except Exception:
+                    return tool_error(
+                        "定时任务连接未授权/已过期；请先在当前会话重新授权 Linear 后再更新任务。",
+                        success=False,
+                    )
+            elif "skills" in updates or "skill" in updates:
+                # Removing Linear from a task makes any old grant inert and
+                # prevents a stale secret from staying in its job record.
+                updates["connector_execution"] = None
             updated = update_job(job_id, updates)
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
@@ -1071,21 +1190,6 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "items": {"type": "string"},
                 "description": "Optional ordered list of skill names to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
             },
-            "model": {
-                "type": "object",
-                "description": "Optional per-job model override. If provider is omitted, the current main provider is pinned at creation time so the job stays stable.",
-                "properties": {
-                    "provider": {
-                        "type": "string",
-                        "description": "Provider name (e.g. 'openrouter', 'anthropic', or 'custom:<name>' for a provider defined in custom_providers config — always include the ':<name>' suffix, never pass the bare 'custom'). Omit to use and pin the current provider."
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Model name (e.g. 'anthropic/claude-sonnet-4', 'claude-sonnet-4')"
-                    }
-                },
-                "required": ["model"]
-            },
             "script": {
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
@@ -1181,18 +1285,18 @@ def check_cronjob_requirements() -> bool:
     leave the tool disabled. Uses the shared ``env_var_enabled`` helper so
     every consumer of these flags agrees on the truthy set.
     """
-    from utils import env_var_enabled
+    from gateway.session_context import get_session_env
+    from utils import env_var_enabled, is_truthy_value
 
     return (
         env_var_enabled("HERMES_INTERACTIVE")
         or env_var_enabled("HERMES_GATEWAY_SESSION")
-        or env_var_enabled("HERMES_EXEC_ASK")
+        or is_truthy_value(get_session_env("HERMES_EXEC_ASK", ""))
     )
 
 
 # --- Registry ---
 from tools.registry import registry, tool_error
-
 
 def _cronjob_registry_handler(args: Dict[str, Any], **kwargs) -> str:
     """Dispatch the LLM-facing tool with conversation-only requirements.
@@ -1213,7 +1317,6 @@ def _cronjob_registry_handler(args: Dict[str, Any], **kwargs) -> str:
             success=False,
         )
 
-    model_provider, model_name = _resolve_model_override(args.get("model"))
     return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
@@ -1225,9 +1328,11 @@ def _cronjob_registry_handler(args: Dict[str, Any], **kwargs) -> str:
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        model=model_name,
-        provider=model_provider or args.get("provider"),
-        base_url=args.get("base_url"),
+        # model / provider / base_url are intentionally NOT read from the
+        # agent's arguments: per-job inference pins are user-owned (dashboard,
+        # `hermes cron create/edit --model`, or hand-edited jobs). The agent
+        # must not be able to point unattended spend at a different model.
+        # Programmatic callers of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),
         context_from=args.get("context_from"),

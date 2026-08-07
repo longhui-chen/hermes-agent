@@ -65,8 +65,13 @@ def _install(monkeypatch, *replies):
     return rec
 
 
-def test_dispatch_refuses_write_when_snapshot_unavailable_flow(monkeypatch, tmp_path):
-    """The core invariant: no recovery point → the file is not touched."""
+def test_dispatch_writes_through_when_snapshot_unavailable_flow(monkeypatch, tmp_path):
+    """本特性完全不可用时，行为与 2026-07-29 引入它之前完全一致（PRD 附录 B #18，
+    验收 §19 #1b）。
+
+    这是 #18 的核心验收项：local-server 挂了 → 拿不到恢复点 → **写入照常发生**。
+    原用例断言的正好相反（「文件不该被动」），那是降级前的口径。
+    """
     _install(monkeypatch, urllib.error.URLError("local-server down"))
     target = tmp_path / "预算.xlsx"
     target.write_text("original", encoding="utf-8")
@@ -78,8 +83,10 @@ def test_dispatch_refuses_write_when_snapshot_unavailable_flow(monkeypatch, tmp_
         turn_id="turn_1",
     )
 
-    assert "error" in json.loads(result)
-    assert target.read_text(encoding="utf-8") == "original", "guard must run before the mutation"
+    assert "error" not in json.loads(result), "入口挂了不该把用户的活干不下去"
+    assert target.read_text(encoding="utf-8") == "overwritten", (
+        "#18：拿不到恢复点也要照常写入——本特性只增加恢复点，不增加限制"
+    )
 
 
 def test_dispatch_allows_write_on_unprotected_folder_flow(monkeypatch, tmp_path):
@@ -205,7 +212,9 @@ def test_snapshot_gate_sees_final_middleware_rewritten_args_flow(monkeypatch, tm
         task_id="t",
         turn_id="turn_1",
     )
-
-    assert "error" in json.loads(result)
+    # #18：ready=false 不再阻断，所以这条用例的判据从「被挡住了」换成
+    # 「ensure 请求里带的是改写**之后**的路径」——那才是它真正要守的东西。
+    assert "error" not in json.loads(result)
     assert rec.requests[0]["body"]["paths"] == [str(real)], "ensure 必须看到改写后的最终路径"
-    assert real.read_text(encoding="utf-8") == "r", "阻断先于真实写入"
+    assert real.read_text(encoding="utf-8") == "overwritten", "写入落在改写后的目标上"
+    assert decoy.read_text(encoding="utf-8") == "d", "诱饵路径不该被动"

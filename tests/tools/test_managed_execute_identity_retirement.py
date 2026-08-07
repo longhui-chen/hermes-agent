@@ -60,9 +60,9 @@ def test_retirement_keeps_reservation_when_termination_fails(monkeypatch):
 
 @pytest.mark.skipif(
     sys.platform != "linux" or os.geteuid() != 0,
-    reason="requires Linux root identity isolation",
+    reason="requires Linux root cgroup delegation",
 )
-def test_retirement_kills_detached_descendant(tmp_path, monkeypatch):
+def test_retirement_kills_root_detached_descendant(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.setenv("ZET_AGENT_KEY", "managed-execute-retirement-test")
     env = {"HERMES_HOME": str(tmp_path / "profile")}
@@ -73,15 +73,13 @@ def test_retirement_kills_detached_descendant(tmp_path, monkeypatch):
     uid = local._prepare_managed_execute_code_workspace(
         str(workspace), [], env=env, execution_scope=scope
     )
-    env["HOME"] = str(workspace)
-    marker_name = f"hermes-private-tmp-{os.getpid()}-{uid}"
-    host_marker = Path("/tmp") / marker_name
+    descendant_file = workspace / "descendant.pid"
     child_code = (
         "import pathlib,subprocess,sys;"
-        f"pathlib.Path('/tmp/{marker_name}').write_text('isolated');"
-        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
+        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
         "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
-        "stderr=subprocess.DEVNULL,start_new_session=True)"
+        "stderr=subprocess.DEVNULL,start_new_session=True);"
+        f"pathlib.Path({str(descendant_file)!r}).write_text(str(p.pid))"
     )
     argv = local._managed_execute_code_sandbox_argv(
         [sys.executable, "-c", child_code],
@@ -90,16 +88,20 @@ def test_retirement_kills_detached_descendant(tmp_path, monkeypatch):
         workspace=str(workspace),
     )
 
+    descendant_pid = None
     try:
         subprocess.run(argv, check=True, timeout=10)
-        assert (workspace / marker_name).read_text() == "isolated"
-        assert not host_marker.exists()
-        deadline = time.monotonic() + 2
-        while not local._managed_uid_processes(uid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert local._managed_uid_processes(uid)
+        descendant_pid = int(descendant_file.read_text())
+        assert Path(f"/proc/{descendant_pid}").exists()
 
-        assert local.retire_managed_execute_code_identity(uid, env, scope) >= 1
+        assert local.retire_managed_execute_code_identity(uid, env, scope) == 0
+        deadline = time.monotonic() + 2
+        while (
+            Path(f"/proc/{descendant_pid}").exists()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert not Path(f"/proc/{descendant_pid}").exists()
         assert local._managed_uid_processes(uid) == set()
         assert uid not in local._MANAGED_TERMINAL_SCOPE_BY_UID
     finally:
@@ -118,15 +120,22 @@ def test_retirement_kills_detached_descendant(tmp_path, monkeypatch):
                     pass
         local._MANAGED_TERMINAL_SCOPE_BY_UID.pop(uid, None)
         local._MANAGED_EXECUTE_CODE_CGROUP_BY_UID.pop(uid, None)
-        host_marker.unlink(missing_ok=True)
+        if (
+            descendant_pid is not None
+            and Path(f"/proc/{descendant_pid}").exists()
+        ):
+            try:
+                os.kill(descendant_pid, 9)
+            except ProcessLookupError:
+                pass
         shutil.rmtree(workspace, ignore_errors=True)
 
 
 @pytest.mark.skipif(
     sys.platform != "linux" or os.geteuid() != 0,
-    reason="requires Linux root identity isolation",
+    reason="requires Linux root cgroup delegation",
 )
-def test_private_tmp_preserves_rpc_peer_pid(tmp_path, monkeypatch):
+def test_root_execute_code_preserves_rpc_peer_pid(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.setenv("ZET_AGENT_KEY", "managed-execute-rpc-peer-test")
     env = {"HERMES_HOME": str(tmp_path / "profile")}
@@ -135,8 +144,7 @@ def test_private_tmp_preserves_rpc_peer_pid(tmp_path, monkeypatch):
         tempfile.mkdtemp(prefix="hermes-execute-rpc-", dir="/tmp")
     )
     socket_path = workspace / "rpc.sock"
-    marker_name = f"hermes-private-rpc-{os.getpid()}"
-    host_marker = Path("/tmp") / marker_name
+    marker = workspace / "rpc-marker"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(socket_path))
     os.chmod(socket_path, 0o600)
@@ -152,7 +160,7 @@ def test_private_tmp_preserves_rpc_peer_pid(tmp_path, monkeypatch):
         "import os,pathlib,socket;"
         "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);"
         "s.connect(os.environ['HERMES_RPC_SOCKET']);"
-        f"pathlib.Path('/tmp/{marker_name}').write_text(str(os.getpid()));"
+        f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()));"
         "s.sendall(b'connected');s.close()"
     )
     argv = local._managed_execute_code_sandbox_argv(
@@ -162,18 +170,20 @@ def test_private_tmp_preserves_rpc_peer_pid(tmp_path, monkeypatch):
         workspace=str(workspace),
     )
     child_env = os.environ.copy()
-    child_env["HERMES_RPC_SOCKET"] = "/tmp/rpc.sock"
+    child_env["HERMES_RPC_SOCKET"] = str(socket_path)
     proc = None
     connection = None
 
     try:
         proc = subprocess.Popen(argv, env=child_env)
         connection, _ = server.accept()
-        code_execution_module._validate_rpc_peer(connection, (proc.pid, uid))
+        code_execution_module._validate_rpc_peer(
+            connection,
+            (proc.pid, getattr(os, "geteuid", lambda: -1)()),
+        )
         assert connection.recv(32) == b"connected"
         assert proc.wait(timeout=10) == 0
-        assert (workspace / marker_name).read_text() == str(proc.pid)
-        assert not host_marker.exists()
+        assert marker.read_text() == str(proc.pid)
         local.retire_managed_execute_code_identity(uid, env, scope)
         assert uid not in local._MANAGED_TERMINAL_SCOPE_BY_UID
     finally:
@@ -194,5 +204,4 @@ def test_private_tmp_preserves_rpc_peer_pid(tmp_path, monkeypatch):
             pass
         local._MANAGED_TERMINAL_SCOPE_BY_UID.pop(uid, None)
         local._MANAGED_EXECUTE_CODE_CGROUP_BY_UID.pop(uid, None)
-        host_marker.unlink(missing_ok=True)
         shutil.rmtree(workspace, ignore_errors=True)

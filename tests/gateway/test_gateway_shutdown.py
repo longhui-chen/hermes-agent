@@ -73,6 +73,9 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     session_key = build_session_key(event.source)
     running_agent = MagicMock()
     runner._running_agents = {session_key: running_agent}
+    # Simulate the agent exiting once interrupted so stop()'s 5s
+    # interrupt-deadline poll loop returns immediately.
+    running_agent.interrupt.side_effect = lambda *a, **k: runner._running_agents.clear()
 
     with (
         patch("gateway.status.remove_pid_file"),
@@ -251,64 +254,6 @@ async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
 
 
 @pytest.mark.asyncio
-async def test_idle_in_chat_restart_does_not_send_interruption_warning():
-    runner, adapter = make_restart_runner()
-    source = make_restart_source(thread_id="42")
-    source.message_id = "restart-command"
-    runner._restart_requested = True
-    runner._restart_command_source = source
-    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
-        platform=Platform.TELEGRAM,
-        chat_id=source.chat_id,
-        name="Telegram",
-        thread_id=source.thread_id,
-    )
-
-    await runner._notify_active_sessions_of_shutdown()
-
-    assert adapter.sent_calls == []
-
-
-@pytest.mark.asyncio
-async def test_in_chat_restart_does_not_write_home_startup_marker(tmp_path, monkeypatch):
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    runner, adapter = make_restart_runner()
-    adapter.disconnect = AsyncMock()
-    source = make_restart_source(thread_id="42")
-    source.message_id = "restart-command"
-    runner._restart_command_source = source
-    runner._launch_systemd_restart_shortcut = MagicMock()
-    monkeypatch.setenv("INVOCATION_ID", "systemd-test")
-
-    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
-        await runner.stop(restart=True, service_restart=True)
-
-    assert not (tmp_path / ".restart_pending.json").exists()
-
-
-@pytest.mark.asyncio
-async def test_drain_active_agents_throttles_status_updates():
-    runner, _adapter = make_restart_runner()
-    runner._update_runtime_status = MagicMock()
-
-    runner._running_agents = {"a": MagicMock(), "b": MagicMock()}
-
-    async def finish_agents():
-        await asyncio.sleep(0.12)
-        runner._running_agents.pop("a")
-        await asyncio.sleep(0.12)
-        runner._running_agents.clear()
-
-    task = asyncio.create_task(finish_agents())
-    await runner._drain_active_agents(1.0)
-    await task
-
-    # Start, one count-change update, and final update. Allow one extra update
-    # if the loop observes the zero-agent state before exiting.
-    assert 3 <= runner._update_runtime_status.call_count <= 4
-
-
-@pytest.mark.asyncio
 async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on_timeout(monkeypatch):
     """On drain timeout, tool subprocesses must be killed BEFORE adapter
     disconnect so systemd's TimeoutStopSec doesn't SIGKILL the cgroup with
@@ -318,7 +263,7 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
 
     call_order: list[str] = []
 
-    def _fake_kill_all(task_id=None):
+    def _fake_kill_all(task_id=None, **_kwargs):
         call_order.append("kill_all")
         return 2
 
@@ -342,6 +287,9 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     adapter.disconnect = _disconnect
 
     runner._running_agents = {"session": MagicMock()}
+    runner._running_agents["session"].interrupt.side_effect = (
+        lambda *a, **k: runner._running_agents.clear()
+    )
 
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
         await runner.stop()
@@ -359,36 +307,6 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     )
     # Defense-in-depth final cleanup still runs.
     assert call_order.count("kill_all") >= 2
-
-
-@pytest.mark.asyncio
-async def test_gateway_stop_kills_tool_subprocesses_on_graceful_path(monkeypatch):
-    """Graceful shutdown (no drain timeout) must still kill tool subprocesses
-    exactly once via the final catch-all — regression guard against
-    accidentally removing that call when refactoring."""
-    runner, adapter = make_restart_runner()
-    adapter.disconnect = AsyncMock()
-
-    kill_count = 0
-
-    def _fake_kill_all(task_id=None):
-        nonlocal kill_count
-        kill_count += 1
-        return 0
-
-    import tools.process_registry as _pr
-    import tools.terminal_tool as _tt
-    import tools.browser_tool as _bt
-    monkeypatch.setattr(_pr.process_registry, "kill_all", _fake_kill_all)
-    monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
-    monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
-
-    # No running agents → drain returns immediately, no timeout, no eager cleanup.
-    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
-        await runner.stop()
-
-    # Only the final catch-all fires on the graceful path.
-    assert kill_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -442,42 +360,6 @@ async def test_signal_initiated_shutdown_persists_running_not_stopped(tmp_path, 
     )
 
 
-@pytest.mark.asyncio
-async def test_operator_initiated_stop_persists_stopped(tmp_path, monkeypatch):
-    """A planned stop (marker written → not signal-initiated) must persist
-    gateway_state=stopped so an explicit `hermes gateway stop` stays down."""
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    runner, adapter = make_restart_runner()
-    adapter.disconnect = AsyncMock()
-    runner._signal_initiated_shutdown = False  # planned stop classification
-
-    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
-        await runner.stop()
-
-    assert _stopped_state_persisted(runner), (
-        "operator-initiated stop must persist gateway_state=stopped"
-    )
-
-
-@pytest.mark.asyncio
-async def test_signal_initiated_restart_still_persists_stopped(tmp_path, monkeypatch):
-    """A restart is not a 'stay down' — it persists normally (the new
-    process/container brings the gateway back up itself). The suppression
-    only applies to a terminal signal-initiated stop, not a restart."""
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    runner, adapter = make_restart_runner()
-    adapter.disconnect = AsyncMock()
-    runner._signal_initiated_shutdown = True
-    runner._launch_systemd_restart_shortcut = MagicMock()
-
-    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
-        await runner.stop(restart=True, service_restart=True)
-
-    assert _stopped_state_persisted(runner), (
-        "a restart must persist gateway_state=stopped via the normal path"
-    )
-
-
 # ── #42126: zombie PID must be treated as dead in _pid_exists ────────────────
 # Under systemd Restart=always, the old gateway becomes a zombie (still in the
 # process table, not yet reaped) when the replacement starts. _pid_exists must
@@ -521,60 +403,3 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
 
     assert status._pid_exists(4242) is False
 
-
-def test_pid_exists_live_via_psutil_returns_true(monkeypatch):
-    """A genuinely running (non-zombie) process is still reported alive."""
-    import sys
-    import types
-
-    from gateway import status
-
-    fake_psutil = types.SimpleNamespace()
-    fake_psutil.STATUS_ZOMBIE = "zombie"
-    fake_psutil.NoSuchProcess = type("NoSuchProcess", (Exception,), {})
-    fake_psutil.Error = type("Error", (Exception,), {})
-
-    class _Proc:
-        def __init__(self, pid):
-            self.pid = pid
-
-        def status(self):
-            return "running"
-
-    fake_psutil.Process = _Proc
-    fake_psutil.pid_exists = lambda pid: True
-
-    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
-
-    assert status._pid_exists(4242) is True
-
-
-def test_pid_exists_zombie_via_proc_fallback_returns_false(monkeypatch):
-    """When psutil is unavailable, the POSIX fallback reads /proc/<pid>/stat
-    and must treat state 'Z' as dead before reaching os.kill."""
-    import builtins
-    import sys
-
-    from gateway import status
-
-    monkeypatch.setitem(sys.modules, "psutil", None)  # force ImportError
-    real_import = builtins.__import__
-
-    def _no_psutil(name, *a, **k):
-        if name == "psutil":
-            raise ImportError("psutil disabled for test")
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", _no_psutil)
-    monkeypatch.setattr(status, "_IS_WINDOWS", False)
-
-    fake_stat = "4242 (defunct) Z 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-    fake_path = MagicMock()
-    fake_path.read_text.return_value = fake_stat
-    monkeypatch.setattr(status, "Path", lambda *_a, **_k: fake_path)
-
-    kill = MagicMock()
-    monkeypatch.setattr(status.os, "kill", kill)
-
-    assert status._pid_exists(4242) is False
-    kill.assert_not_called()

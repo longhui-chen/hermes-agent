@@ -103,7 +103,7 @@ assert(classifyCheckRun(CR.timedOut).verdict === 'fail' && classifyCheckRun(CR.t
 assert(classifyCheckRun(CR.inconclusive).verdict === 'skip' && classifyCheckRun(CR.inconclusive).reason === 'inconclusive', '无标记且标题不明确 → skip(不可判定)');
 const cTw = classifyCheckRun(CR.failWithTimeoutWord);
 assert(cTw.verdict === 'fail' && cTw.count === 1, '缺陷正文含 "timed out" 字样仍判 fail(不被 error/timeout 守卫误吞)');
-assert(isCodexCheckRun({ name: 'Codex Code Review', app: { name: 'Codex' } }) === true, 'Codex check_run 名称识别');
+assert(isCodexCheckRun({ name: 'Codex Code Review', app: { slug: 'chatgpt-codex-connector' } }) === true, 'Codex check_run 名称识别');
 assert(isCodexCheckRun({ name: 'unit tests', app: { name: 'GitHub Actions' } }) === false, '非 Codex check_run 跳过');
 
 // ── 官方 PR review 适配器 ──
@@ -168,7 +168,7 @@ assert(prReviewP2Only.verdict === 'pass' && prReviewP2Only.reason === 'non_block
 assert(prReviewP2Any.verdict === 'fail' && prReviewP2Any.count === 1, 'PR review 只有 P2 + NOTIFY_ON=any → 不通过(发)');
 assert(prReviewPass.verdict === 'pass', 'PR review 明确无问题 → 通过');
 assert(prReviewInfra.verdict === 'fail' && prReviewInfra.reason === 'infra_failure', 'PR review 报错/超时正文 → 基础设施失败');
-assert(isCodexPullRequestReview({ user: { login: 'codex[bot]', type: 'Bot' } }) === true, 'Codex PR reviewer 识别');
+assert(isCodexPullRequestReview({ user: { id: 199175422, login: 'chatgpt-codex-connector[bot]', type: 'Bot' } }) === true, 'Codex PR reviewer 识别');
 assert(isCodexPullRequestReview({ user: { login: 'gezhengbin888', type: 'User' } }) === false, '人工 PR reviewer 跳过');
 
 // ── Action 适配器 ──

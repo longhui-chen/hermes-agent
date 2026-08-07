@@ -172,9 +172,51 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     assert all(call[1]["fail_fast"] is True for call in llm.calls)
     instructions = llm.calls[0][0][0]["content"]
     assert "high-recall zero-shot" in instructions
-    assert "ongoing external work domain" in instructions
+    assert "Bounded one-shot veto" in instructions
     assert "today" in instructions
     assert "not by itself a future trigger" in instructions
+
+
+def test_freshness_maintenance_prefers_task_without_topic_keywords():
+    plugin = _load_plugin()
+    context = _Context()
+    plugin.register(context)
+
+    instructions = plugin._DETECTOR_INSTRUCTIONS
+    description = context.tools[0]["schema"]["description"]
+
+    assert "Freshness-over-method rule" in instructions
+    assert "An explicit cadence is not required to recommend task" in instructions
+    assert "keeping one persistent result" in instructions
+    assert "Never\ninvent a daily, weekly, or other schedule" in instructions
+    assert "Existing-capability gate takes priority" in instructions
+    assert "configuring, seeding, previewing, or using" in instructions
+    assert "never write internal reasoning" in instructions
+    assert "keeping a derived result current as its source changes" in description
+    assert "An explicit cadence is not required" in description
+    assert "must not be invented" in description
+    assert "keep one persistent result fresh" in description
+    assert "Flomo" not in instructions
+    assert "user.md" not in instructions
+
+
+def test_bounded_one_shot_policy_and_pending_upload_gate():
+    plugin = _load_plugin()
+    context = _Context()
+    plugin.register(context)
+
+    instructions = plugin._DETECTOR_INSTRUCTIONS
+    description = context.tools[0]["schema"]["description"]
+    assert "one finite file, table" in instructions
+    assert "friction, not evidence for a durable Agent" in instructions
+    assert "the analysis verb alone is not evidence for an Agent" in description
+    assert "one finite file, table, questionnaire" in description
+
+    response = (
+        "目前最直接的替代办法是把 Google 表格下载成 CSV，然后把 CSV 文件上传给我。"
+        "我拿到文件后就能直接完成问卷总结。"
+    )
+    assert plugin._response_delivery_block_reason(response) == "blocked_or_unexecuted"
 
 
 def test_missing_fast_route_retries_once_on_active_main_model():
@@ -250,7 +292,19 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
         "expires_at": payload["expires_at"],
         "creation_type": "agent",
         "title": "Google Ads Analyst",
-        "reason": "Retained account context and judgment will improve future analysis.",
+        "reason": (
+            "Retained account context and judgment will improve future analysis. "
+            "Accepting opens the native assistant creation flow and asks you to "
+            "confirm the configuration before creation."
+        ),
+        "proposal_text": (
+            "Would you like me to create this Google Ads Analyst Agent?"
+        ),
+        "action_label": "Create assistant",
+        "action_consequence": (
+            "Accepting opens the native assistant creation flow and asks you to "
+            "confirm the configuration before creation."
+        ),
         "dedup_key": "agent:google-ads-analyst",
         "confidence": 0.82,
         "evidence_turn_ids": ["evidence-1"],
@@ -263,6 +317,106 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
         )
         is None
     )
+
+
+def test_unexecuted_connector_block_suppresses_card_without_starting_cooldown():
+    plugin = _load_plugin()
+    candidate = _candidate(
+        suggested_name="谷歌广告效果分析",
+        reason="持续保留账户背景可以改善后续判断。",
+        proposal_text="要创建谷歌广告分析助手吗？",
+    )
+    plugin.register(_Context(_FakeLlm([candidate])))
+    plugin._on_pre_llm_call(
+        session_id="blocked-delivery",
+        user_message="最近谷歌广告效果如何",
+        conversation_history=[],
+    )
+
+    blocked_response = (
+        "你是指你自己账户里的谷歌广告投放效果，还是想了解谷歌广告整体的行业趋势？\n\n"
+        "如果你问的是自己的广告账户数据，我目前没有接入 Google Ads 连接器，"
+        "无法直接读取你的投放报表。确认一下方向我好帮你。"
+    )
+    assert plugin._transform_llm_output(
+        session_id="blocked-delivery",
+        response_text=blocked_response,
+        completed=True,
+        failed=False,
+    ) is None
+
+    state_key = plugin._session_key({"session_id": "blocked-delivery"})
+    state = plugin._session_states[state_key]
+    assert state["last_proposal"] is None
+    assert state["last_prompt_turn"] == -10_000
+
+    retry = json.loads(
+        plugin._detect_creation_opportunity(
+            candidate,
+            session_id="blocked-delivery",
+        )
+    )
+    assert retry["status"] == "proposal_ready"
+    delivered = plugin._transform_llm_output(
+        session_id="blocked-delivery",
+        response_text="广告系列 A 的 ROAS 最高，主要由品牌搜索贡献。",
+    )
+    assert delivered is not None
+    assert "creation-recommendation:start" in delivered
+
+
+def test_clarification_only_suppresses_card_but_optional_followup_does_not():
+    plugin = _load_plugin()
+    plugin.register(_Context(_FakeLlm([_candidate(), _candidate()])))
+
+    plugin._on_pre_llm_call(
+        session_id="clarification-only",
+        user_message="分析一下效果",
+        conversation_history=[],
+    )
+    assert plugin._transform_llm_output(
+        session_id="clarification-only",
+        response_text="你是指广告账户效果，还是网站自然流量效果？",
+    ) is None
+
+    plugin._on_pre_llm_call(
+        session_id="completed-with-followup",
+        user_message="分析广告效果",
+        conversation_history=[],
+    )
+    delivered = plugin._transform_llm_output(
+        session_id="completed-with-followup",
+        response_text=(
+            "Campaign A had the strongest ROAS at 4.2, led by branded search. "
+            "Would you like a campaign-level breakdown?"
+        ),
+    )
+    assert delivered is not None
+    assert "creation-recommendation:start" in delivered
+
+
+def test_same_turn_existing_capability_delivery_suppresses_parallel_recommendation():
+    plugin = _load_plugin()
+    plugin.register(_Context(_FakeLlm([_candidate()])))
+
+    plugin._on_pre_llm_call(
+        session_id="dashboard-already-delivered",
+        user_message="你先摘要两条新闻",
+        conversation_history=[],
+    )
+    response = (
+        "已在存储新闻 Dashboard 预置两条新闻，并更新了定时归档任务。"
+        "打开即可查看最新内容。"
+    )
+    assert plugin._transform_llm_output(
+        session_id="dashboard-already-delivered",
+        response_text=response,
+    ) is None
+
+    state_key = plugin._session_key({"session_id": "dashboard-already-delivered"})
+    state = plugin._session_states[state_key]
+    assert state["last_proposal"] is None
+    assert state["last_prompt_turn"] == -10_000
 
 
 def test_checkpoint_failure_degrades_without_a_second_blocking_model_call():

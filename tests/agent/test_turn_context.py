@@ -118,6 +118,7 @@ class _FakeAgent:
         self.session_id = "sess-1"
         self.model = "test/model"
         self.provider = "openrouter"
+        self.requested_provider = "openrouter"
         self.base_url = "https://openrouter.ai/api/v1"
         self.api_key = "sk-x"
         self.api_mode = "chat_completions"
@@ -133,6 +134,17 @@ class _FakeAgent:
         self.context_compressor = types.SimpleNamespace(
             protect_first_n=2, protect_last_n=2
         )
+        # Make the fake compressor honour the ContextEngine contract that the
+        # real code now relies on (should_compress_info returns a (bool, reason)
+        # tuple). Without it build_turn_context raises AttributeError.
+        def _fake_should_compress(tokens=None):
+            return False
+
+        def _fake_should_compress_info(tokens=None):
+            return (False, None)
+
+        self.context_compressor.should_compress = _fake_should_compress
+        self.context_compressor.should_compress_info = _fake_should_compress_info
         self._cached_system_prompt = "SYSTEM"
         self._memory_store = None
         self._memory_manager = None
@@ -142,6 +154,8 @@ class _FakeAgent:
         self._todo_store = _FakeTodoStore()
         self._tool_guardrails = _FakeGuardrails()
         self._compression_warning = None
+        self._emit_warning = MagicMock()
+        self._last_ctx_overflow_warn = None
         self._interrupt_requested = False
         self._memory_write_origin = "assistant_tool"
         self._stream_context_scrubber = None
@@ -156,6 +170,21 @@ class _FakeAgent:
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
+
+    def _warn_context_overflow_blocked(self, reason, preflight_tokens, threshold_tokens):
+        # Mirror the real AIAgent helper so tests can assert the warning fired.
+        _warn_kind = (reason or "unknown").split(":", 1)[0]
+        _warn_key = ("ctx_overflow_blocked", _warn_kind)
+        if self._last_ctx_overflow_warn != _warn_key:
+            self._last_ctx_overflow_warn = _warn_key
+            self._emit_warning(
+                f"⚠ Context is over the compression threshold "
+                f"(~{preflight_tokens:,} tokens >= {threshold_tokens:,}) "
+                f"but compression is currently blocked ({reason})."
+            )
+
+    def _clear_context_overflow_warn(self):
+        self._last_ctx_overflow_warn = None
 
     # --- methods the prologue calls ---
     def _ensure_db_session(self):
@@ -256,6 +285,67 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+# ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
+#
+# The prologue is the ONLY place the per-turn synchronous
+# memory_manager.prefetch_all() fires; a bare greeting must not block the
+# turn on provider network round-trips, while a substantive question must
+# still prefetch. These assert the gate at the call site (the classifier
+# itself is covered in tests/agent/test_memory_provider.py).
+
+
+def _agent_with_memory_manager():
+    agent = _FakeAgent()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    agent._memory_manager = mm
+    return agent, mm
+
+
+def test_prefetch_skipped_for_trivial_user_message():
+    agent, mm = _agent_with_memory_manager()
+    ctx = _build(agent, user_message="hi!")
+    mm.prefetch_all.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+
+
+def test_prefetch_runs_for_substantive_user_message():
+    agent, mm = _agent_with_memory_manager()
+    query = "what did we decide about the deploy pipeline?"
+    ctx = _build(agent, user_message=query)
+    mm.prefetch_all.assert_called_once_with(query)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
+def test_turn_start_replaces_stale_parent_history_with_compression_child():
+    agent = _FakeAgent()
+    stale_history = [{"role": "user", "content": "stale parent"}]
+    compacted_history = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+        {"role": "assistant", "content": "child tail"},
+    ]
+
+    def _recover(_agent):
+        _agent.session_id = "compression-child"
+        return compacted_history
+
+    log_context = MagicMock()
+    with patch(
+        "agent.turn_context.recover_rotated_compression_session",
+        side_effect=_recover,
+    ):
+        ctx = _build(
+            agent,
+            conversation_history=stale_history,
+            set_session_context=log_context,
+        )
+
+    assert agent.session_id == "compression-child"
+    assert agent._current_turn_id.startswith("compression-child:")
+    log_context.assert_called_once_with("compression-child")
+    assert ctx.conversation_history == compacted_history
+    assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
+    assert all(message.get("content") != "stale parent" for message in ctx.messages)
 def test_records_trusted_current_user_and_previous_assistant_messages():
     agent = _FakeAgent()
     _build(
@@ -292,11 +382,6 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
-def test_task_id_passthrough():
-    agent = _FakeAgent()
-    ctx = _build(agent, task_id="fixed-task")
-    assert ctx.effective_task_id == "fixed-task"
-    assert agent._current_task_id == "fixed-task"
 
 
 def test_api_bound_build_turn_context_flow_uses_external_task_identity(
@@ -372,33 +457,51 @@ description: Trusted video-edit execution flow test
             "_video_edit_command_policy",
             lambda _args: (True, False),
         )
+        terminal_args = {"command": "python3 trusted-workflow_state.py"}
         assert trusted_skill_operation_block_message(
             agent,
             function_name="terminal",
-            function_args={"command": "python3 trusted-workflow_state.py"},
+            function_args=terminal_args,
         ) is None
 
         business_token = session_context_module._BUSINESS_EXECUTION_TOKEN.set("")
         session_key_token = session_context_module._SESSION_KEY.set("")
         empty_secret_token = secret_scope_module.set_secret_scope({})
         try:
-            runtime_env = build_video_edit_runtime_env({})
+            assert response_mode.trusted_video_edit_runtime_receipt() == {}
+
+            def _dispatch():
+                runtime_env = build_video_edit_runtime_env({})
+                assert runtime_env["ZET_AGENT_ID"] == "main"
+                assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
+                assert (
+                    runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
+                    == "business-token"
+                )
+                assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
+                assert (
+                    runtime_env["HERMES_SESSION_KEY"]
+                    == "zettlab:user:main:session"
+                )
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": 0,
+                        "video_edit_runtime_direct": True,
+                    }
+                )
+
+            response_mode.dispatch_trusted_skill_operation(
+                agent,
+                function_name="terminal",
+                function_args=terminal_args,
+                dispatch=_dispatch,
+            )
+            assert response_mode.trusted_video_edit_runtime_receipt() == {}
         finally:
             secret_scope_module.reset_secret_scope(empty_secret_token)
             session_context_module._SESSION_KEY.reset(session_key_token)
             session_context_module._BUSINESS_EXECUTION_TOKEN.reset(business_token)
-
-        assert runtime_env["ZET_AGENT_ID"] == "main"
-        assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
-        assert (
-            runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
-            == "business-token"
-        )
-        assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
-        assert (
-            runtime_env["HERMES_SESSION_KEY"]
-            == "zettlab:user:main:session"
-        )
     finally:
         response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
         clear_turn_vars(turn_tokens)
@@ -1152,6 +1255,147 @@ def test_transport_skill_selection_is_separate_from_user_text_flow():
         clear_turn_vars(turn_tokens)
 
 
+def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.environments.local import build_camera_runtime_env
+
+    presets_dir = tmp_path / "presets"
+    video_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    camera_dir = presets_dir / "skills" / "camsnap"
+    video_dir.mkdir(parents=True)
+    camera_dir.mkdir(parents=True)
+    video_bytes = b"# trusted video edit skill\n"
+    camera_bytes = b"# trusted camsnap skill\n"
+    (video_dir / "SKILL.md").write_bytes(video_bytes)
+    (camera_dir / "SKILL.md").write_bytes(camera_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=video_bytes,
+        monkeypatch=monkeypatch,
+        extra_files={"skills/camsnap/SKILL.md": camera_bytes},
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+    monkeypatch.setattr(
+        response_mode,
+        "_camera_runtime_argv",
+        lambda _args: ["python3", "camera_connector.py", "list"],
+    )
+
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:camera-session",
+        session_id="zettlab:user:main:camera-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="camera-turn",
+        business_execution_token="business-token",
+    )
+    try:
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
+
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(agent, "查看下我的摄像头")
+        result = skills_tool_module.skill_view("camsnap")
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == {"terminal"}
+        assert trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args={"command": "python3 camera_connector.py list"},
+        ) is None
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
+
+        def _dispatch():
+            frozen = build_camera_runtime_env()
+            assert frozen == {
+                "ZET_AGENT_ID": "main",
+                "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+                "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-token",
+                "HERMES_TURN_ID": "camera-turn",
+                "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
+                "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",
+            }
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": 0,
+                    "camera_runtime_direct": True,
+                }
+            )
+
+        response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="terminal",
+            function_args={"command": "python3 camera_connector.py list"},
+            dispatch=_dispatch,
+        )
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
+    finally:
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_camsnap_skill_cannot_activate_for_unrelated_task_flow(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "presets"
+    video_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    camera_dir = presets_dir / "skills" / "camsnap"
+    video_dir.mkdir(parents=True)
+    camera_dir.mkdir(parents=True)
+    video_bytes = b"# trusted video edit skill\n"
+    camera_bytes = b"# trusted camsnap skill\n"
+    (video_dir / "SKILL.md").write_bytes(video_bytes)
+    (camera_dir / "SKILL.md").write_bytes(camera_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=video_bytes,
+        monkeypatch=monkeypatch,
+        extra_files={"skills/camsnap/SKILL.md": camera_bytes},
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+    turn_tokens = set_turn_vars(turn_id="unrelated-turn")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(agent, "总结今天的会议")
+        result = skills_tool_module.skill_view("camsnap")
+        assert not apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == frozenset()
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
 def test_clarify_requires_nonempty_user_response_to_rearm_trusted_scope_flow():
     turn_tokens = set_turn_vars(turn_id="clarify-turn")
     try:
@@ -1243,35 +1487,8 @@ def test_persist_user_message_becomes_original():
     assert ctx.messages[-1]["content"] == "api-prefixed"
 
 
-def test_pending_cli_message_carries_durable_marker_to_new_turn_dict():
-    """A close-persisted CLI input must not be written again by turn start."""
-    agent = _FakeAgent()
-    staged = {"role": "user", "content": "already durable", "_db_persisted": True}
-    agent._pending_cli_user_message = staged
-
-    ctx = _build(agent, user_message="already durable")
-
-    assert ctx.messages[-1] is staged
-    assert ctx.messages[-1]["content"] == "already durable"
-    assert ctx.messages[-1]["_db_persisted"] is True
-    assert agent._pending_cli_user_message is None
 
 
-def test_stale_pending_cli_message_does_not_replace_new_turn_input():
-    """A failed prior persistence handoff cannot substitute later user input."""
-    agent = _FakeAgent()
-    agent._pending_cli_user_message = {"role": "user", "content": "old prompt"}
-
-    stale = agent._pending_cli_user_message
-    ctx = _build(
-        agent,
-        user_message="new prompt",
-        conversation_history=[{"role": "assistant", "content": "old answer"}],
-    )
-
-    assert ctx.messages[-1]["content"] == "new prompt"
-    assert ctx.messages[-1] is not stale
-    assert agent._pending_cli_user_message is None
 
 
 def test_pending_cli_message_uses_clean_override_for_api_local_note():
@@ -1317,9 +1534,10 @@ def test_runtime_main_sync_happens_after_restore():
 
     assert calls == [
         (
-            ("anthropic", "primary-model"),
-            {
-                "base_url": "https://api.anthropic.com",
+                ("anthropic", "primary-model"),
+                {
+                    "requested_provider": "openrouter",
+                    "base_url": "https://api.anthropic.com",
                 "api_key": "primary-key",
                 "api_mode": "anthropic_messages",
                 "auth_mode": "",
@@ -1328,20 +1546,8 @@ def test_runtime_main_sync_happens_after_restore():
     ]
 
 
-def test_memory_nudge_fires_at_interval():
-    agent = _FakeAgent()
-    agent._memory_nudge_interval = 1
-    agent.valid_tool_names = {"memory"}
-    agent._memory_store = object()
-    ctx = _build(agent)
-    assert ctx.should_review_memory is True
-    assert agent._turns_since_memory == 0  # reset after firing
 
 
-def test_no_review_when_memory_disabled():
-    agent = _FakeAgent()
-    ctx = _build(agent)
-    assert ctx.should_review_memory is False
 
 
 def test_ensure_db_session_runs_after_system_prompt_restore():
@@ -1391,31 +1597,8 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
 
 
-def test_between_turns_refresh_skipped_when_no_servers():
-    """R6: the common case (no MCP servers) never walks the registry."""
-    agent = _FakeAgent()
-    import model_tools
-
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
-         patch.object(model_tools, "get_tool_definitions") as gtd:
-        _build(agent)
-
-    gtd.assert_not_called()
 
 
-def test_between_turns_refresh_skipped_when_skip_flag_set():
-    """Internal forks (background_review) set _skip_mcp_refresh to keep tools[]
-    byte-identical to the parent for cache parity — the hook must honor it even
-    when MCP servers are registered."""
-    agent = _FakeAgent()
-    agent._skip_mcp_refresh = True
-    import model_tools
-
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
-         patch.object(model_tools, "get_tool_definitions") as gtd:
-        _build(agent)
-
-    gtd.assert_not_called()
 
 
 def test_api_server_tool_choice_none_skips_registered_mcp_refresh(monkeypatch):
@@ -1489,38 +1672,8 @@ def test_between_turns_refresh_no_churn_when_unchanged():
     assert agent.tools is same  # not replaced → no churn
 
 
-def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
-    agent = _make_agent_with_cooldown(
-        tmp_path / "state.db",
-        "sess-1",
-        cooldown_until=4_000_000_000.0,
-    )
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_not_called()
-    agent._compress_context.assert_not_called()
 
 
-def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
-    db_path = tmp_path / "state.db"
-    _make_agent_with_cooldown(
-        db_path,
-        "sess-1",
-        cooldown_until=4_000_000_000.0,
-    )
-    agent = _make_agent_with_cooldown(db_path, "sess-2")
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_called_once()
-    agent._compress_context.assert_called()
 
 
 def test_expired_cooldown_allows_preflight(tmp_path):

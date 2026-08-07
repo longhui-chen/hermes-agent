@@ -96,7 +96,7 @@ def test_zpk_runtime_bootstrap_is_exact_and_hash_locked() -> None:
     optional_dependencies = _optional_dependencies()
     assert optional_dependencies["zpk-runtime"] == [
         "pip==26.1.2",
-        "setuptools==81.0.0",
+        "setuptools==83.0.0",
     ]
 
     with (REPO_ROOT / "uv.lock").open("rb") as handle:
@@ -108,7 +108,7 @@ def test_zpk_runtime_bootstrap_is_exact_and_hash_locked() -> None:
     }
     assert {
         name: package["version"] for name, package in locked_packages.items()
-    } == {"pip": "26.1.2", "setuptools": "81.0.0"}
+    } == {"pip": "26.1.2", "setuptools": "83.0.0"}
 
     for package in locked_packages.values():
         artifacts = [package["sdist"], *package["wheels"]]
@@ -122,8 +122,8 @@ def test_zpk_runtime_bootstrap_is_exact_and_hash_locked() -> None:
 def test_zpk_project_build_uses_exact_locked_backend() -> None:
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)
-    assert pyproject["build-system"]["requires"] == ["setuptools==81.0.0"]
-    assert "setuptools==81.0.0" in pyproject["project"][
+    assert pyproject["build-system"]["requires"] == ["setuptools==83.0.0"]
+    assert "setuptools==83.0.0" in pyproject["project"][
         "optional-dependencies"
     ]["zpk-runtime"]
 
@@ -370,7 +370,7 @@ def test_uv_lock_check_rejects_project_drift(tmp_path: Path) -> None:
     assert current.returncode == 0, current.stdout + current.stderr
 
     zpk_runtime = (
-        'zpk-runtime = ["pip==26.1.2", "setuptools==81.0.0"]'
+        'zpk-runtime = ["pip==26.1.2", "setuptools==83.0.0"]'
     )
     drifted_pyproject = pyproject.replace(
         zpk_runtime,

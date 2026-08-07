@@ -65,14 +65,48 @@ def _module_registers_tools(module_path: Path) -> bool:
 
 
 def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
-    """Import built-in self-registering tool modules and return their module names."""
+    """Import built-in self-registering tool modules and return their module names.
+
+    The per-file AST scan (:func:`_module_registers_tools`) costs ~145 ms over
+    ~100 files on a warm cache, so verdicts are memoized on disk keyed by
+    ``(mtime_ns, size)``. A file whose mtime_ns+size match the cached entry is
+    trusted without re-reading; any mismatch (or a corrupt/missing cache file)
+    falls back to a fresh scan for that file. The cache write is best-effort
+    and atomic, so concurrent processes can race harmlessly.
+    """
     tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
-    module_names = [
-        f"tools.{path.stem}"
-        for path in sorted(tools_path.glob("*.py"))
-        if path.name not in {"__init__.py", "registry.py", "mcp_tool.py"}
-        and _module_registers_tools(path)
-    ]
+
+    cache = _load_discovery_cache()
+    fresh_cache: Dict[str, list] = {}
+    cache_dirty = False
+
+    module_names: List[str] = []
+    for path in sorted(tools_path.glob("*.py")):
+        if path.name in {"__init__.py", "registry.py", "mcp_tool.py"}:
+            continue
+        abs_path = str(path.resolve())
+        try:
+            st = path.stat()
+            stat_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+        cached = cache.get(abs_path)
+        if (
+            isinstance(cached, (list, tuple))
+            and len(cached) == 3
+            and (cached[0], cached[1]) == stat_key
+        ):
+            registers = bool(cached[2])
+        else:
+            registers = _module_registers_tools(path)
+            cache_dirty = True
+        fresh_cache[abs_path] = [stat_key[0], stat_key[1], registers]
+        if registers:
+            module_names.append(f"tools.{path.stem}")
+
+    # Drop entries for files that no longer exist; rewrite only when changed.
+    if cache_dirty or set(fresh_cache) != set(cache):
+        _save_discovery_cache(fresh_cache)
 
     imported: List[str] = []
     for mod_name in module_names:
@@ -82,6 +116,45 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
         except Exception as e:
             logger.warning("Could not import tool module %s: %s", mod_name, e)
     return imported
+
+
+def _discovery_cache_path() -> Optional[Path]:
+    """Path of the tool-discovery verdict cache, or None if unresolvable."""
+    try:
+        # Deferred import keeps tools/registry.py a no-deps leaf at module
+        # import time (hermes_constants itself is stdlib-only, so no cycle).
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()) / "cache" / "tool_discovery_cache.json"
+    except Exception:
+        return None
+
+
+def _load_discovery_cache() -> Dict[str, list]:
+    """Read the discovery cache; any error → empty dict (full scan)."""
+    path = _discovery_cache_path()
+    if path is None:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_discovery_cache(cache: Dict[str, list]) -> None:
+    """Best-effort atomic write of the discovery cache. Never raises."""
+    path = _discovery_cache_path()
+    if path is None:
+        return
+    try:
+        from utils import atomic_json_write  # stdlib+yaml only; no cycle
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, cache, indent=0)
+    except Exception as e:
+        logger.debug("Could not write tool discovery cache %s: %s", path, e)
 
 
 class ToolEntry:
@@ -145,10 +218,54 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
-_check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
+_CHECK_FN_CACHE_MAX = 512
+_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
-_check_fn_last_good: Dict[Callable, float] = {}
+_check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
 _check_fn_cache_lock = threading.Lock()
+CHECK_FN_CACHE_BYPASS = ""
+
+
+def _prune_check_fn_caches(now: float) -> None:
+    """Expire stale entries and cap profile-dimensional cache growth.
+
+    Caller must hold ``_check_fn_cache_lock``.
+    """
+    for key, (timestamp, _) in list(_check_fn_cache.items()):
+        if now - timestamp >= _CHECK_FN_TTL_SECONDS:
+            _check_fn_cache.pop(key, None)
+    for key, timestamp in list(_check_fn_last_good.items()):
+        if now - timestamp >= _CHECK_FN_FAILURE_GRACE_SECONDS:
+            _check_fn_last_good.pop(key, None)
+    while len(_check_fn_cache) >= _CHECK_FN_CACHE_MAX:
+        _check_fn_cache.pop(next(iter(_check_fn_cache)))
+    while len(_check_fn_last_good) >= _CHECK_FN_CACHE_MAX:
+        _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
+
+
+def check_fn_cache_scope() -> Optional[str]:
+    """Return the active profile key when availability is profile-scoped.
+
+    Single-profile processes intentionally keep the historical process-wide
+    cache. A multiplex gateway installs a Hermes-home override for every
+    profile turn, so the canonical profile key is the stable isolation
+    boundary across repeated turns for that profile.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return None
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if not override:
+            return CHECK_FN_CACHE_BYPASS
+        return str(Path(override).expanduser().resolve())
+    except Exception:
+        # Fail closed: bypass both cache layers rather than aliasing requests
+        # whose multiplex profile identity could not be resolved.
+        return CHECK_FN_CACHE_BYPASS
 
 
 def _must_recheck_profile_scope(fn: Callable) -> bool:
@@ -162,6 +279,46 @@ def _must_recheck_profile_scope(fn: Callable) -> bool:
         return False
 
 
+def _profile_scoped_check(fn: Callable) -> bool:
+    """Evaluate a profile-scoped check_fn with no caching at all.
+
+    Deliberately uncached: a function-global TTL/last-good verdict would let
+    one profile's grant expose a tool for another, or outlive a revoke — see
+    ``test_mutation_dispatch_flow_rechecks_revoked_profile_after_cached_gate``.
+    Callers still de-duplicate within a single get_definitions() pass.
+
+    That makes the cost of the probe itself the thing to keep small; caching
+    belongs behind the check (e.g. a cached capability document), not in front
+    of the authorization decision.
+    """
+    try:
+        value = bool(fn())
+    except Exception:
+        # A raise is a malfunction, not an answer: log it here because the
+        # check itself may have had no chance to.
+        logger.warning(
+            "profile-scoped check_fn %s raised; dependent tools are "
+            "unavailable this turn",
+            getattr(fn, "__qualname__", fn),
+            exc_info=True,
+        )
+        return False
+
+    if not value:
+        # A plain False is the designed answer for every optional tool whose
+        # prerequisite is absent — no grant, no provider configured — and this
+        # runs uncached on every agent construction. Warning here buried the
+        # real alarms in agent.log within minutes. Checks that fail for a
+        # reason the operator needs (the media capability probe timing out,
+        # say) log that reason themselves, where it can be stated.
+        logger.debug(
+            "profile-scoped check_fn %s returned False; dependent tools are "
+            "unavailable this turn",
+            getattr(fn, "__qualname__", fn),
+        )
+    return value
+
+
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
@@ -172,22 +329,25 @@ def _check_fn_cached(fn: Callable) -> bool:
     contention, probe timeout) from silently stripping tools mid-session.
     """
     if _must_recheck_profile_scope(fn):
-        # A function-global TTL/last-good cache is unsafe here: profile A's
-        # grant can otherwise expose a tool for profile B, or outlive revoke.
-        # Keep the normal per-definitions-pass de-duplication in callers, but
-        # re-evaluate across multiplexed profile scopes.
+        return _profile_scoped_check(fn)
+
+    now = time.monotonic()
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
         try:
             return bool(fn())
         except Exception:
             logger.warning(
-                "profile-scoped check_fn %s raised; dependent tools are unavailable this turn",
+                "check_fn %s raised while profile cache scope was unresolved; "
+                "dependent tools will be unavailable this turn",
                 getattr(fn, "__qualname__", fn),
+                exc_info=True,
             )
             return False
-
-    now = time.monotonic()
+    cache_key = (fn, scope)
     with _check_fn_cache_lock:
-        cached = _check_fn_cache.get(fn)
+        _prune_check_fn_caches(now)
+        cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
@@ -201,12 +361,13 @@ def _check_fn_cached(fn: Callable) -> bool:
         raised = True
 
     with _check_fn_cache_lock:
+        _prune_check_fn_caches(now)
         if value:
-            _check_fn_last_good[fn] = now
-            _check_fn_cache[fn] = (now, True)
+            _check_fn_last_good[cache_key] = now
+            _check_fn_cache[cache_key] = (now, True)
             return True
 
-        last_good = _check_fn_last_good.get(fn)
+        last_good = _check_fn_last_good.get(cache_key)
         if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
             # Recent success → treat this failure as a flake. Serve last-good
             # True and do NOT cache the failure, so the next call re-probes
@@ -227,7 +388,7 @@ def _check_fn_cached(fn: Callable) -> bool:
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",
         )
-        _check_fn_cache[fn] = (now, False)
+        _check_fn_cache[cache_key] = (now, False)
         return False
 
 
@@ -237,6 +398,30 @@ def invalidate_check_fn_cache() -> None:
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+
+
+def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+    """Return the current cached verdict for *fn* if its TTL is still valid.
+
+    Unlike :func:`_check_fn_cached`, this NEVER executes the probe. It is for
+    read-only surfaces (e.g. dashboard status panels) that need the last-known
+    availability without triggering network / auth / SDK work inside a request
+    path. Returns ``None`` when there is no fresh cached verdict.
+    """
+    now = time.monotonic()
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        # Unresolved profile identity bypasses the cache entirely; there is no
+        # trustworthy cached verdict to report.
+        return None
+    with _check_fn_cache_lock:
+        cached = _check_fn_cache.get((fn, scope))
+        if cached is None:
+            return None
+        ts, value = cached
+        if now - ts < _CHECK_FN_TTL_SECONDS:
+            return value
+        return None
 
 
 def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]:
@@ -264,6 +449,37 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
                 ensure_ascii=False,
             )
         return None
+
+
+def _resolve_runtime_tool_args(name: str, args: dict) -> dict:
+    """Resolve platform-owned semantic arguments before any execution gate."""
+    if not isinstance(args, dict):
+        return args
+
+    from tools.runtime_workdir import (
+        AGENT_OUTPUT_ARG,
+        AGENT_OUTPUT_WORKDIR,
+        resolve_runtime_workdir,
+    )
+
+    # HR3：AGENT_OUTPUT_ARG 只允许由本函数注入。模型可控入参可能自带同名
+    # key 冒充「平台已解析」，所以所有分支一律先剥（拷贝、不就地改调用方
+    # dict），只有真正解析了 alias 才重新注入。标记走字典带内传递而非对象
+    # 属性，是为了让中间层的 dict(args) 浅拷贝不弄丢它。
+    if AGENT_OUTPUT_ARG in args:
+        args = {k: v for k, v in args.items() if k != AGENT_OUTPUT_ARG}
+
+    if name != "terminal":
+        return args
+
+    workdir = args.get("workdir")
+    if workdir != AGENT_OUTPUT_WORKDIR:
+        return args
+    resolved_workdir = resolve_runtime_workdir(workdir)
+    resolved_args = dict(args)
+    resolved_args[AGENT_OUTPUT_ARG] = True
+    resolved_args["workdir"] = resolved_workdir
+    return resolved_args
 
 
 class ToolRegistry:
@@ -440,18 +656,7 @@ class ToolRegistry:
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
-                # Allow MCP-to-MCP overwrites (legitimate: server refresh,
-                # or two MCP servers with overlapping tool names).
-                both_mcp = (
-                    existing.toolset.startswith("mcp-")
-                    and toolset.startswith("mcp-")
-                )
-                if both_mcp:
-                    logger.debug(
-                        "Tool '%s': MCP toolset '%s' overwriting MCP toolset '%s'",
-                        name, toolset, existing.toolset,
-                    )
-                elif override:
+                if override:
                     _owner = self._plugin_owner_of(handler)
                     if _owner is not None and not self._plugin_override_policy.get(_owner, False):
                         logger.error(
@@ -475,8 +680,9 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                 else:
-                    # Reject shadowing — prevent plugins/MCP from overwriting
-                    # built-in tools or vice versa.
+                    # Reject every cross-toolset shadow, including MCP-to-MCP
+                    # collisions. Legitimate MCP reconnect/refresh re-registers
+                    # within the same canonical toolset and remains allowed.
                     logger.error(
                         "Tool registration REJECTED: '%s' (toolset '%s') would "
                         "shadow existing tool from toolset '%s'. Pass "
@@ -656,12 +862,12 @@ class ToolRegistry:
             name,
             result_type,
         )
-        return json.dumps({
-            "error": f"Tool handler returned unsupported result type: {result_type}",
-            "error_type": "tool_result_contract",
-            "tool": name,
-            "result_type": result_type,
-        }, ensure_ascii=False)
+        return tool_error(
+            f"Tool handler returned unsupported result type: {result_type}",
+            error_type="tool_result_contract",
+            tool=name,
+            result_type=result_type,
+        )
 
     def dispatch(self, name: str, args: dict, **kwargs) -> str | dict:
         """Execute a tool handler by name.
@@ -672,6 +878,21 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        # Runtime aliases must become one stable physical path before both the
+        # snapshot gate and handler. Resolving twice would allow a concurrent
+        # environment update to snapshot one directory and execute in another.
+        try:
+            args = _resolve_runtime_tool_args(name, args)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "error": str(exc),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+
         # Zettlab file-change protection：registry.dispatch 是所有工具执行的
         # 统一汇聚点，gate 必须在这里——除 model_tools.handle_function_call
         # 外，插件公开 API ctx.dispatch_tool()（slash command / hook）也直连
@@ -685,7 +906,7 @@ class ToolRegistry:
             return blocked
         entry = self.get_entry(name)
         if not entry:
-            return json.dumps({"error": f"Unknown tool: {name}"})
+            return tool_error(f"Unknown tool: {name}")
         try:
             if entry.is_async:
                 from model_tools import _run_async
@@ -704,7 +925,7 @@ class ToolRegistry:
                 sanitized = _sanitize_tool_error(raw)
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
-            return json.dumps({"error": sanitized})
+            return tool_error(sanitized)
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

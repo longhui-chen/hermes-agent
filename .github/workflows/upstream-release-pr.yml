@@ -127,9 +127,10 @@ jobs:
             --jq '.[0].number // empty')
 
           if [ -n "$EXISTING" ]; then
-            echo "PR #$EXISTING already open for $BRANCH; updating body via REST PATCH."
-            gh api -X PATCH "repos/zettlab/hermes-agent/pulls/$EXISTING" \
-              -f body="$BODY" >/dev/null
+            # The PR body becomes the durable review/conflict-resolution record
+            # after creation. Never replace it on a scheduled refresh: doing so
+            # would erase manual review notes and completed checklists.
+            echo "PR #$EXISTING already open for $BRANCH; preserving its body."
             PR_NUM="$EXISTING"
           else
             echo "Creating PR for $BRANCH -> main via REST POST."

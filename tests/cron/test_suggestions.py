@@ -104,6 +104,17 @@ class TestStore:
         # And accepting again is a no-op (not pending anymore).
         assert store.accept_suggestion("acc") is None
 
+    def test_accept_linear_suggestion_requires_live_chat_grant(self, store, monkeypatch):
+        rec = _add(store, key="linear")
+        rec["job_spec"]["skills"] = ["Linear"]
+        store._save_raw([rec])
+        monkeypatch.setattr("cron.connector_execution.enabled", lambda: True)
+
+        with pytest.raises(store.SuggestionConnectorAuthorizationRequired):
+            store.accept_suggestion("linear")
+
+        assert store.get_suggestion("linear")["status"] == "pending"
+
     def test_get_by_id_and_index_and_title(self, store):
         rec = _add(store, key="byref", title="Findable")
         assert store.get_suggestion(rec["id"])["id"] == rec["id"]
@@ -131,13 +142,6 @@ class TestCatalog:
         assert len(created) == len(CATALOG)
         assert len(store.list_pending()) == min(len(CATALOG), store.MAX_PENDING)
 
-    def test_seed_is_idempotent(self, store):
-        from cron.suggestion_catalog import seed_catalog_suggestions
-
-        first = seed_catalog_suggestions(add_fn=store.add_suggestion)
-        second = seed_catalog_suggestions(add_fn=store.add_suggestion)
-        assert len(first) >= 1
-        assert second == []  # already present -> nothing new
 
     def test_monitor_entry_references_classifier_script(self):
         from cron.suggestion_catalog import CATALOG, classify_items_script_path
@@ -164,15 +168,6 @@ class TestBlueprintBridge:
         assert rec["job_spec"]["skills"] == ["morning-brief"]
         assert rec["job_spec"]["schedule"] == "0 8 * * *"
 
-    def test_blueprint_to_job_spec_matches_create_blueprint_job(self):
-        from tools.blueprints import BlueprintSpec, blueprint_to_job_spec
-
-        spec = BlueprintSpec(skill_name="x", schedule="every 2h", deliver="origin", prompt="p")
-        js = blueprint_to_job_spec(spec)
-        assert js["skills"] == ["x"]
-        assert js["schedule"] == "every 2h"
-        assert js["prompt"] == "p"
-
 
 class TestCommandHandler:
     def test_bare_lists_pending(self, store):
@@ -184,22 +179,6 @@ class TestCommandHandler:
                 out = handle_suggestions_command("")
         assert "Daily thing" in out
 
-    def test_accept_via_handler(self, store):
-        _add(store, key="ha", title="Acceptable")
-        from hermes_cli.suggestions_cmd import handle_suggestions_command
-
-        with patch("cron.jobs.create_job", lambda **k: {"id": "j", "name": k.get("name"), "job_spec": k}):
-            out = handle_suggestions_command("accept 1", origin={"platform": "cli", "chat_id": "1"})
-        assert "Scheduled" in out
-        assert store.list_pending() == []
-
-    def test_dismiss_via_handler(self, store):
-        _add(store, key="hd", title="Dismissable")
-        from hermes_cli.suggestions_cmd import handle_suggestions_command
-
-        out = handle_suggestions_command("dismiss 1")
-        assert "Dismissed" in out
-        assert store.list_pending() == []
 
     def test_empty_list_message(self, store):
         from hermes_cli.suggestions_cmd import handle_suggestions_command

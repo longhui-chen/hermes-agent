@@ -35,7 +35,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "detect_creation_opportunity"
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.9.3"
 MIN_CONFIDENCE = 0.55
 AUXILIARY_TASK_NAME = "creation_governor_checkpoint"
 AUXILIARY_MODEL_ALIAS = "zettlab-creation-fast"
@@ -98,6 +98,42 @@ _EXPLICIT_CREATION_RE = re.compile(
 _DIRECT_SCHEDULE_RE = re.compile(
     r"(?:每天|每日|每周|每月|每个工作日|定时|提醒我|"
     r"every\s+(?:day|week|month)|daily|weekly|monthly|remind\s+me)",
+    re.IGNORECASE,
+)
+_UNFINISHED_TASK_RE = re.compile(
+    r"(?:无法|不能|没法|尚不能|暂时不能).{0,64}"
+    r"(?:读取|访问|获取|查询|分析|执行|完成|继续)|"
+    r"(?:没有|尚未|还没|未能).{0,32}(?:接入|连接|授权|获得|拿到).{0,64}"
+    r"(?:连接器|账号|账户|权限|数据|文件|报表|系统)|"
+    r"(?:需要|请).{0,16}(?:先)?(?:连接|接入|授权|提供|上传).{0,80}"
+    r"(?:才能|之后|以后|再)|"
+    r"(?:cannot|can't|unable to|not able to).{0,64}"
+    r"(?:access|read|retrieve|query|analy[sz]e|execute|complete|continue)|"
+    r"(?:not connected|isn't connected|missing (?:access|authorization|permission|data))|"
+    r"(?:please|need you to).{0,24}(?:connect|authorize|provide|upload).{0,80}"
+    r"(?:before|then|so I can)|"
+    r"(?:拿到|收到|获得).{0,48}(?:文件|数据|表格|问卷|CSV)?.{0,32}"
+    r"(?:后|以后|之后).{0,24}(?:就能|才能|才可以|可以继续).{0,64}"
+    r"(?:完成|继续|总结|分析|处理)|"
+    r"(?:once|after).{0,80}(?:upload|send|provide|receive|have).{0,80}"
+    r"(?:can|will be able to).{0,64}(?:complete|continue|analy[sz]e|summari[sz]e)",
+    re.IGNORECASE,
+)
+_CLARIFICATION_REQUIRED_RE = re.compile(
+    r"(?:你是指|你的意思是|请确认一下|需要你确认|还需要确认|我需要先确认).{0,180}[？?]|"
+    r"(?:do you mean|which .{0,80} do you mean|please clarify|could you clarify).{0,180}[?]?",
+    re.IGNORECASE,
+)
+_CAPABILITY_DELIVERED_RE = re.compile(
+    r"(?:已|已经).{0,20}(?:创建|新建|设置|配置|更新|部署|预置|同步|写入).{0,80}"
+    r"(?:agent|智能体|助手|skill|技能|定时任务|dashboard|看板|应用|app)|"
+    r"(?:已|已经).{0,20}(?:agent|智能体|助手|skill|技能|定时任务|dashboard|看板|应用|app)"
+    r".{0,80}(?:创建|新建|设置|配置|更新|部署|预置|同步|写入)|"
+    r"(?:created|configured|updated|deployed|seeded|synchronized|synced).{0,80}"
+    r"(?:agent|assistant|skill|scheduled task|dashboard|application|app)|"
+    r"(?:agent|assistant|skill|scheduled task|dashboard|application|app).{0,80}"
+    r"(?:was|has been|is now).{0,24}"
+    r"(?:created|configured|updated|deployed|seeded|synchronized|synced)",
     re.IGNORECASE,
 )
 _RECOMMENDATION_RESPONSE_RE = re.compile(
@@ -362,6 +398,7 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "last_evaluation_turn": 0,
             "last_prompt_turn": -10_000,
             "last_delivery_turn": -10_000,
+            "candidate_turn": -10_000,
             "last_candidate": None,
             "last_proposal": None,
             "proposal_stage": None,
@@ -398,12 +435,40 @@ def _claim_prompt_slot(session_id: str, candidate: dict[str, Any], now: float) -
             identity_source.encode("utf-8")
         ).hexdigest()[:32]
         candidate["expires_at"] = time.time() + PROPOSAL_TTL_SECONDS
-        state["last_prompt_turn"] = state["turn"]
-        state["last_delivery_turn"] = -10_000
+        state["candidate_turn"] = state["turn"]
         state["last_candidate"] = dict(candidate)
         state["last_proposal"] = dict(candidate)
         state["proposal_stage"] = "proposal_shown"
         return True
+
+
+def _discard_staged_proposal_locked(
+    session_id: str, state: dict[str, Any], *, release_claim: bool
+) -> None:
+    proposal = state.get("last_proposal")
+    if release_claim and isinstance(proposal, dict):
+        dedup_key = _text(proposal.get("dedup_key"), 120)
+        if dedup_key:
+            _recent_proposals.pop((session_id, dedup_key), None)
+    state["last_candidate"] = None
+    state["last_proposal"] = None
+    state["proposal_stage"] = None
+    state["candidate_turn"] = -10_000
+
+
+def _response_delivery_block_reason(response_text: str) -> str:
+    """Explain why a staged card must stay hidden for an unfinished task."""
+
+    normalized = " ".join(str(response_text or "").split())[:6000]
+    if not normalized:
+        return "empty_response"
+    if _UNFINISHED_TASK_RE.search(normalized):
+        return "blocked_or_unexecuted"
+    if _CLARIFICATION_REQUIRED_RE.search(normalized):
+        return "clarification_required"
+    if _CAPABILITY_DELIVERED_RE.search(normalized):
+        return "capability_already_delivered"
+    return ""
 
 
 def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
@@ -558,52 +623,98 @@ _DETECTOR_SCHEMA = {
 _DETECTOR_INSTRUCTIONS = """Perform one high-recall zero-shot product judgment.
 
 Return exactly one of agent, skill, task, or none. Do not classify by topic words and do not use
-memorized examples. A single substantive request is enough when a reasonable user would benefit
-from reusing the capability. Do not require the user to mention repetition, frequency, saving, or
-creation. Ask whether a durable capability would materially reduce friction or improve judgment
-the next time a related need appears.
+memorized examples. A single substantive request can be enough only when the conversation itself
+supports durable future value; the mere possibility that a capability could be reused is not enough.
+Do not require magic words such as repetition, saving, or creation, but require affirmative semantic
+evidence that the account, project, source, responsibility, or class of future inputs continues beyond
+this bounded request.
 
 Definitions and conflict order:
 1. task: the desired future value depends on a recurring time trigger, event trigger, background
-   monitoring, or repeated refresh of new information. A word such as 'today' that merely scopes
-   the current data is not by itself a future trigger.
+   monitoring, repeated refresh of new information, or keeping a derived result current as its
+   source changes. A word such as 'today' merely scopes the current data; it is not by itself a future trigger.
 2. agent: future work needs a long-lived responsible role, retained domain context, judgment,
    autonomous choice among tools, decisions about the next step, or repeated interpretation of a
    changing real-world business domain, account, operation, project, or body of evidence.
 3. skill: future inputs vary but a stable input-to-output method can be reused without an
-   independent identity or durable state.
+   independent identity or durable state. Do not choose skill when the primary future value is
+   keeping one persistent result, profile, summary, index, report, or state up to date.
 4. none: small talk, a trivial transformation, a low-value closed-world fact lookup, an explicit
    request to create/configure/schedule something through Hermes' native flow, or no reasonable
    reuse value.
 
-High-recall boundary: a substantive request to inspect, compare, diagnose, research, optimize, or
-make a judgment about an ongoing external work domain should normally be agent rather than none,
-even on the first request and even when the requested snapshot is scoped to today/current/latest.
-Choose none only when reuse value is genuinely absent, not merely unstated.
+Bounded one-shot veto: return none when the user only wants a result from one finite file, table,
+questionnaire, document, import, dataset, or other bounded item and the conversation does not support
+future recurrence, ongoing ownership, background refresh, or retained-context judgment. Needing an
+upload, authorization, connector, or other setup step to finish the current request is execution
+friction, not evidence for a durable Agent. If the same method is expected across future inputs,
+skill may qualify; if freshness or a future trigger is the value, task may qualify; if continuing
+responsibility and autonomous judgment are both present, agent may qualify.
 
-Apply this semantic gate before returning none. Ask, in order: (a) will the underlying information,
-account, project, or operating environment change after this turn; (b) would a responsible role with
-retained context make a future judgment better; (c) would a stable method save meaningful effort on
-a different future input? If any answer is yes, none is forbidden: choose task for a future trigger,
-otherwise agent for continuing ownership/judgment, otherwise skill for the reusable method. Ambiguity
-about whether the user will repeat the request is not evidence for none. Do not reduce an analytical
-request to a fact lookup merely because the current data or connector is unavailable.
+High-recall boundary: a substantive request to inspect, compare, diagnose, research, optimize, or
+make a judgment may qualify on the first request when it concerns an ongoing external account,
+project, operation, or responsibility whose future state and decisions remain after this turn. The
+verb alone never makes it an Agent. Choose none when durable reuse value is absent from the meaning
+of the conversation, including bounded one-shot work.
+
+Existing-capability gate takes priority over high recall. If the conversation shows that an
+existing Agent, Skill, scheduled Task, Dashboard, or application already performs the same future
+job, return none unless the new object would add a materially different responsibility that the
+existing capability cannot provide. Do not recommend a parallel Agent or Skill merely because the
+user is configuring, seeding, previewing, or using an object that was just created.
+
+Freshness-over-method rule: prefer task over skill when at least two of these semantic properties
+are clearly supported by the conversation: (a) the source, account, file, feed, or evidence changes
+over time; (b) the generated result becomes stale when the source changes; (c) automatic refresh
+would remove repeated manual work. An explicit cadence is not required to recommend task. Never
+invent a daily, weekly, or other schedule in the recommendation. After the user confirms creation,
+Hermes' native task/cronjob flow must ask for any missing schedule or event trigger. Stable refresh
+steps do not make the opportunity a skill when freshness is the core value.
+
+Apply this semantic gate before returning a positive decision. Ask, in order: (a) is this merely one
+bounded item whose requested result ends the work; (b) will the underlying information, account,
+project, or operating environment continue after this turn; (c) would a responsible role with
+retained context make a future judgment better; (d) is there evidence that a stable method will be
+used on materially different future inputs? If (a) is yes and (b)-(d) are no, return none. Otherwise,
+when no existing capability already covers the need, choose task for a future trigger,
+background refresh, or freshness maintenance; otherwise agent for continuing ownership/judgment,
+otherwise skill for the reusable method. Do not infer recurrence merely because a method is
+theoretically reusable. Do not reduce an ongoing analytical responsibility to a fact lookup merely
+because the current data or connector is unavailable.
 
 Judge reuse value separately from current execution availability. Missing authorization,
-connectors, data, or tools may block today's execution but is not a reason to ignore a clear
-long-term need. Recommend only the first-layer object the user most needs, never multiple objects.
-Match the user's language. For a positive decision, provide a concise name, concrete reason,
-one-sentence optional proposal_text asking whether to create it, confidence, a stable semantic
+connectors, data, or tools may still reveal a long-term need, but the plugin separately suppresses
+display unless the current response actually delivers the user's task. Recommend only the
+first-layer object the user most needs, never multiple objects. Match the user's language. For a
+positive decision, write concise user-facing card copy: name the object clearly; explain what it
+will do for the user and why it helps; never write internal reasoning such as "the user..." or
+“用户……”. Make proposal_text a direct call to action that names the creation action and says that
+Hermes will enter its native creation/configuration flow. Provide confidence, a stable semantic
 dedup_key, and evidence_turn_ids chosen only from the supplied labels. For none, use empty strings,
 an empty evidence list, and confidence 0. Never claim anything was created.
 
-中文请求必须按同一套语义规则判断，不要因为用户没有说“重复”“以后”“保存”或“创建”就返回
-none。先判断需求所涉及的账户、项目、业务环境或信息是否会继续变化；如果会变化且后续判断需要
-保留背景、综合数据或自主选择工具，选择 agent。如果价值来自未来的时间、事件、后台监控或提醒，
-选择 task。如果输入会变化但处理方法相对稳定，选择 skill。只有寒暄、低价值封闭事实、微小的一次性
-转换、用户已经明确要求创建，或 Agent/Skill/Task 三种长期价值都确实不存在时，才选择 none。
+For a task recommendation, name the ongoing outcome that should stay current instead of naming a
+generic method. Explain what changing source would make the current result stale, but do not claim
+or imply a cadence the user did not provide.
+
+中文请求必须按同一套语义规则判断，不依赖“重复”“以后”“保存”或“创建”等触发词，但必须从语义
+上找到任务在本轮之后仍会继续的证据。只处理一份确定的文件、表格、问卷、文档、导入数据或其他
+有限对象，并且完成本次结果后工作即结束时，优先返回 none；不能因为还需要用户上传文件、授权或
+连接 Connector 才能完成本轮任务，就推断需要一个长期 Agent。先判断需求所涉及的账户、项目、
+业务环境或信息是否会继续变化；如果会变化且后续判断需要
+保留背景、综合数据或自主选择工具，选择 agent。如果价值来自未来的时间、事件、后台监控、提醒，
+或让一个随来源变化而过期的画像、摘要、索引、报告或状态持续保持最新，选择 task。只要“来源会
+变化”“结果会过期”“自动刷新能减少反复手工操作”中至少两项在语义上成立，就可以优先 task，
+不要求用户先说每天、每周或具体频率；推荐时不得虚构周期，用户确认后再由 Hermes 原生 cronjob
+流程补问缺失的时间或事件条件。如果对话显示已有 Agent、Skill、定时任务、Dashboard 或应用已经
+覆盖同一长期需求，优先返回 none；不能因为用户正在配置、预置、预览或使用刚创建的对象，就再推荐
+一个平行的 Agent 或 Skill。如果有证据表明未来还会处理不同输入，且价值只是重复使用一套稳定
+方法、又不存在保持结果新鲜的需求，才选择 skill。只有寒暄、低价值封闭事实、微小的一次性转换、
+有限对象的一次性处理、用户已经明确要求创建，或 Agent/Skill/Task 三种长期价值都确实不存在时，
+才选择 none。
 “今天”“最近”“当前”只是本次数据范围，不等于没有长期价值。缺少授权、连接器或数据只影响本次
-执行，不能作为返回 none 的理由。名称、原因和询问是否创建的 proposal_text 使用用户的语言。"""
+执行，但插件会在当前任务没有实际交付时阻止卡片展示。名称、原因和 proposal_text 必须使用面向
+用户的语言，不能写“用户已……”这类内部判定；proposal_text 要明确说明将进入哪种原生创建流程。"""
 
 
 def _run_forced_evaluation(
@@ -1039,6 +1150,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
 
 
 def _encode_recommendation(candidate: dict[str, Any]) -> str:
+    action_label, action_consequence = _recommendation_action_copy(candidate)
     payload = {
         "version": 1,
         "type": "creation_recommendation",
@@ -1046,7 +1158,10 @@ def _encode_recommendation(candidate: dict[str, Any]) -> str:
         "expires_at": candidate["expires_at"],
         "creation_type": candidate["creation_type"],
         "title": candidate["suggested_name"],
-        "reason": candidate["reason"],
+        "reason": f"{candidate['reason']} {action_consequence}",
+        "proposal_text": candidate["proposal_text"],
+        "action_label": action_label,
+        "action_consequence": action_consequence,
         "dedup_key": candidate["dedup_key"],
         "confidence": candidate["confidence"],
         "evidence_turn_ids": candidate.get("evidence_turn_ids") or [],
@@ -1056,17 +1171,65 @@ def _encode_recommendation(candidate: dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+def _recommendation_action_copy(candidate: dict[str, Any]) -> tuple[str, str]:
+    creation_type = candidate["creation_type"]
+    sample = (
+        str(candidate.get("suggested_name") or "")
+        + str(candidate.get("reason") or "")
+        + str(candidate.get("proposal_text") or "")
+    )
+    if _CJK_RE.search(sample):
+        labels = {
+            "agent": "创建助手",
+            "skill": "创建 Skill",
+            "task": "设置定时任务",
+        }
+        consequences = {
+            "agent": "接受后会进入“创建助手”流程，并在真正创建前让你确认配置。",
+            "skill": "接受后会进入“创建 Skill”流程，并在真正创建前让你确认配置。",
+            "task": "接受后会进入“设置定时任务”流程，并在真正创建前确认执行时间。",
+        }
+    else:
+        labels = {
+            "agent": "Create assistant",
+            "skill": "Create Skill",
+            "task": "Set up scheduled task",
+        }
+        consequences = {
+            "agent": (
+                "Accepting opens the native assistant creation flow and asks you to "
+                "confirm the configuration before creation."
+            ),
+            "skill": (
+                "Accepting opens the native Skill creation flow and asks you to "
+                "confirm the configuration before creation."
+            ),
+            "task": (
+                "Accepting opens the native scheduled-task flow and asks you to "
+                "confirm the execution time before creation."
+            ),
+        }
+    return labels[creation_type], consequences[creation_type]
+
+
 def _fallback_text(candidate: dict[str, Any]) -> str:
     creation_type = candidate["creation_type"]
     name = candidate["suggested_name"]
     reason = candidate["reason"]
     proposal_text = candidate["proposal_text"]
+    action_label, action_consequence = _recommendation_action_copy(candidate)
     chinese = bool(_CJK_RE.search(name + reason + proposal_text))
     if chinese:
         label = {"agent": "Agent", "skill": "Skill", "task": "Task"}[creation_type]
-        return f"💡 可以沉淀为一个 {label}\n\n**「{name}」**\n\n{reason}\n\n{proposal_text}"
+        return (
+            f"💡 可以沉淀为一个 {label}\n\n**「{name}」**\n\n{reason}\n\n"
+            f"**{action_label}：** {action_consequence}\n\n{proposal_text}"
+        )
     label = {"agent": "Agent", "skill": "Skill", "task": "Task"}[creation_type]
-    return f"💡 This could become a reusable {label}\n\n**{name}**\n\n{reason}\n\n{proposal_text}"
+    return (
+        f"💡 This could become a reusable {label}\n\n**{name}**\n\n{reason}\n\n"
+        f"**{action_label}:** {action_consequence}\n\n{proposal_text}"
+    )
 
 
 def _recommendation_envelope(candidate: dict[str, Any]) -> str:
@@ -1099,17 +1262,17 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             if state.get("proposal_stage") == "create_action_pending":
                 state["proposal_stage"] = "proposal_shown"
             elif state.get("proposal_stage") == "proposal_shown":
-                state["last_candidate"] = None
-                state["last_proposal"] = None
-                state["proposal_stage"] = None
+                _discard_staged_proposal_locked(
+                    session_id, state, release_claim=True
+                )
         return None
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
         if state.get("proposal_stage") == "create_action_pending":
-            state["last_candidate"] = None
-            state["last_proposal"] = None
-            state["proposal_stage"] = None
+            _discard_staged_proposal_locked(
+                session_id, state, release_claim=False
+            )
     if _is_session_muted(session_id):
         return None
     with _state_lock:
@@ -1118,16 +1281,46 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         current_turn = int(state["turn"])
         if (
             not isinstance(proposal, dict)
-            or int(state["last_prompt_turn"]) != current_turn
+            or int(state["candidate_turn"]) != current_turn
             or int(state["last_delivery_turn"]) == current_turn
         ):
             return None
-        state["last_delivery_turn"] = current_turn
 
     if "<!--creation-recommendation:start " in response_text:
         return None
     if _is_session_muted(session_id):
         return None
+    delivery_block_reason = _response_delivery_block_reason(response_text)
+    if delivery_block_reason:
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            current = state.get("last_proposal")
+            if (
+                isinstance(current, dict)
+                and current.get("proposal_id") == proposal.get("proposal_id")
+            ):
+                _discard_staged_proposal_locked(
+                    session_id, state, release_claim=True
+                )
+        logger.info(
+            "creation recommendation suppressed reason=%s title=%s turn=%s",
+            delivery_block_reason,
+            _text(proposal.get("suggested_name"), 80),
+            current_turn,
+        )
+        return None
+    with _state_lock:
+        state = _state_locked(session_id, now)
+        current = state.get("last_proposal")
+        if (
+            not isinstance(current, dict)
+            or current.get("proposal_id") != proposal.get("proposal_id")
+            or int(state["last_delivery_turn"]) == current_turn
+        ):
+            return None
+        state["last_prompt_turn"] = current_turn
+        state["last_delivery_turn"] = current_turn
+        state["candidate_turn"] = -10_000
     logger.info(
         "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
         proposal.get("creation_type"),
@@ -1190,22 +1383,40 @@ def register(ctx: Any) -> None:
             "name": TOOL_NAME,
             "description": (
                 "Perform one high-recall zero-shot semantic choice among Agent, Skill, Task, and "
-                "none. A single substantive request is enough; never require the user to mention "
-                "repetition, saving, or creation. Use "
+                "none. Do not require magic words such as repetition, saving, or creation, but "
+                "require semantic evidence that durable future value continues beyond the current "
+                "bounded request. Use "
                 "meaning and conversation context, never topic keyword matching or memorized "
-                "examples. Task means desired future time/event/background execution; a current "
-                "data range such as today is not by itself a trigger. Agent means a long-lived "
+                "examples. Task means desired future time/event/background execution or keeping "
+                "a derived result current as its source changes; a current data range such as "
+                "today is not by itself a trigger. Prefer Task over Skill when at least two are "
+                "true: the source changes over time, the result becomes stale, and automatic "
+                "refresh removes repeated manual work. An explicit cadence is not required for "
+                "the recommendation, must not be invented, and is collected by Hermes' native "
+                "task flow after confirmation. Agent means a long-lived "
                 "responsible role with retained context, judgment, autonomous tool choice, or "
-                "interpretation of a changing real-world work domain. A substantive first request "
-                "to inspect, compare, diagnose, research, optimize, or make a judgment about an "
-                "ongoing external work domain should normally be Agent rather than none. "
+                "interpretation of a changing real-world work domain. A first request may qualify "
+                "only when it concerns an ongoing account, project, operation, or responsibility; "
+                "the analysis verb alone is not evidence for an Agent. A request that only processes "
+                "one finite file, table, questionnaire, document, import, or dataset returns none "
+                "unless future recurrence, freshness, or ongoing ownership is supported. Requiring "
+                "an upload, authorization, or connector to finish the current request is execution "
+                "friction, not reuse evidence. "
+                "If an existing Agent, Skill, scheduled Task, Dashboard, or application already "
+                "does the same future job, return none unless the new object adds a materially "
+                "different responsibility. Configuring, seeding, previewing, or using a newly "
+                "created object is not a reason to recommend a parallel Agent or Skill. "
                 "Skill means a stable reusable input-to-output method without an independent "
-                "identity. Missing connectors or authorization affect current execution, not "
+                "identity or a need to keep one persistent result fresh. Missing connectors or "
+                "authorization affect current execution, not "
                 "reuse value. Explicit creation requests use Hermes' native flow and return none. "
+                "Write user-facing card copy that states what will be created, why it helps, and "
+                "that acceptance enters Hermes' native creation/configuration flow; never expose "
+                "internal reasoning such as 'the user...'. "
                 "Call only between scheduled checkpoints when one unusually clear opportunity "
                 "emerges. The tool never creates and may return none. The plugin owns cooldown, "
-                "deduplication, dismissal, and conditional card/text delivery after the current "
-                "task is complete."
+                "deduplication, dismissal, and conditional card/text delivery only after the "
+                "current task has actually delivered a result."
             ),
             "parameters": _DETECTOR_SCHEMA,
         },

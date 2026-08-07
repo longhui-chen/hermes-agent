@@ -8,14 +8,15 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [PDF, Documents, Research, Arxiv, Text-Extraction, OCR]
-    related_skills: [powerpoint]
+    related_skills: [pdf, docx, powerpoint]
 ---
 
 # PDF & Document Extraction
 
-For DOCX: use `python-docx` (parses actual document structure, far better than OCR).
-For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
-This skill covers **PDFs and scanned documents**.
+For DOCX: see the `docx` skill (create/edit) or use `python-docx` for structured reads.
+For PPTX: see the `powerpoint` skill (full create/read/edit support).
+For PDF manipulation (merge, split, forms, watermarks, creation): see the `pdf` skill.
+This skill covers **text extraction from PDFs and scanned documents**.
 
 ## Step 1: Remote URL Available?
 
@@ -64,12 +65,12 @@ pip install pymupdf pymupdf4llm
 
 **Via helper script**:
 ```bash
-python scripts/extract_pymupdf.py document.pdf              # Plain text
-python scripts/extract_pymupdf.py document.pdf --markdown    # Markdown
-python scripts/extract_pymupdf.py document.pdf --tables      # Tables
-python scripts/extract_pymupdf.py document.pdf --images out/ # Extract images
-python scripts/extract_pymupdf.py document.pdf --metadata    # Title, author, pages
-python scripts/extract_pymupdf.py document.pdf --pages 0-4   # Specific pages
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf              # Plain text
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --markdown    # Markdown
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --tables      # Tables
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --images out/ # Extract images
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --metadata    # Title, author, pages
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --pages 0-4   # Specific pages
 ```
 
 **Inline**:
@@ -88,18 +89,18 @@ for page in doc:
 
 ```bash
 # Check disk space first
-python scripts/extract_marker.py --check
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" --check
 
 pip install marker-pdf
 ```
 
 **Via helper script**:
 ```bash
-python scripts/extract_marker.py document.pdf                # Markdown
-python scripts/extract_marker.py document.pdf --json         # JSON with metadata
-python scripts/extract_marker.py document.pdf --output_dir out/  # Save images
-python scripts/extract_marker.py scanned.pdf                 # Scanned PDF (OCR)
-python scripts/extract_marker.py document.pdf --use_llm      # LLM-boosted accuracy
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf                # Markdown
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf --json         # JSON with metadata
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf --output_dir out/  # Save images
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" scanned.pdf                 # Scanned PDF (OCR)
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf --use_llm      # LLM-boosted accuracy
 ```
 
 **CLI** (installed with marker-pdf):

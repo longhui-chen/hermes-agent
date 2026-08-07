@@ -29,242 +29,13 @@ from urllib.parse import SplitResult, quote, unquote, urlsplit, urlunsplit
 
 import requests
 
+from agent.secret_scope import get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 
 
 # Camofox tab IDs are opaque handles; anything outside this alphabet cannot be
 # a legitimate ID and must never reach a request path.
 _TAB_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
-
-_HANDBACK_SENSITIVE_CONTROL = re.compile(
-    r"(?ix)"
-    r"\b(?:password|passcode|one[- ]?time(?:\s+(?:password|code))?|otp|"
-    r"verification(?:\s+code)?|security\s+code|\d+[- ]digit\s+code|pin|"
-    r"card\s+number|credit\s+card|debit\s+card|cvv|cvc|social\s+security|"
-    r"ssn|passport|tax\s+id)\b|密码|验证码|银行卡|身份证"
-)
-_HANDBACK_EDITABLE_CONTROL = re.compile(
-    r"(?i)^\s*(?:-\s*)?(?:textbox|searchbox|combobox|listbox|option|spinbutton|slider|checkbox|radio|switch)\b"
-)
-_HANDBACK_VALUE_ATTRIBUTE = re.compile(
-    r"(?i)\bvalue=(?:\"[^\"]*\"|'[^']*'|\S+)"
-)
-# The optional bracketed group is what makes an IPv6 authority match at all:
-# without it `https://[2001:db8::1]/cb?code=…` is skipped entirely (brackets are
-# excluded from the tail so a URL inside markdown/parentheses is not swallowed),
-# and the whole query would reach the model verbatim.
-_HANDBACK_URL = re.compile(
-    # userinfo may precede a bracketed IPv6 authority, and both are optional.
-    # Without allowing that combination the match stops at the "@" and the rest
-    # of the URL — path, query, OAuth code — is left in the text verbatim.
-    # The brackets themselves delimit the authority, so anything up to the
-    # closing one is accepted — an RFC 6874 zone identifier (`[fe80::1%25eth0]`)
-    # contains letters outside the hex alphabet and would otherwise stop the
-    # match at the scheme, leaving the path and query in the text.
-    # Parentheses are legal in a path (`/(S(secret))/callback`), so excluding
-    # them left the sensitive tail in the text. They are accepted here and the
-    # whole match is replaced by the origin; over-matching a trailing delimiter
-    # from surrounding prose costs a bracket, under-matching costs a token.
-    r"(?i)\bhttps?://(?:[^\s\"'<>\[\]/@]*@)?(?:\[[^\]\s]+\])?[^\s\"'<>]*"
-)
-
-
-def _url_origin_only(url: str) -> str:
-    """Reduce a URL to its origin.
-
-    Pages a human just controlled routinely carry session material in URL
-    paths and queries (OAuth codes, reset tokens, pre-signed links), and the
-    general redaction policy deliberately preserves web URL queries — so the
-    handback privacy filter must drop everything past the origin itself.
-    """
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return "[REDACTED URL]"
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return "[REDACTED URL]"
-    # Rebuild from hostname (+ port) only. netloc would keep any
-    # ``user:password@`` userinfo, which is exactly the kind of credential a
-    # human may have typed into a basic-auth URL during handback.
-    host = parsed.hostname
-    if ":" in host:
-        # urlsplit strips the brackets off an IPv6 literal; put them back or
-        # the rebuilt origin is not a valid URL.
-        host = f"[{host}]"
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
-    authority = f"{host}:{port}" if port is not None else host
-    return f"{parsed.scheme}://{authority}/"
-
-
-def _reduce_urls_to_origin(value: str) -> str:
-    return _HANDBACK_URL.sub(lambda match: _url_origin_only(match.group(0)), value)
-
-
-def _redact_handback_page_state(value: str) -> str:
-    """Apply mandatory privacy filtering to state captured after human control."""
-    from tools.browser_tool import _redact_browser_output
-
-    redacted = _redact_browser_output(value)
-    lines = []
-    for line in redacted.splitlines():
-        if _HANDBACK_EDITABLE_CONTROL.search(line) or _HANDBACK_SENSITIVE_CONTROL.search(line):
-            lines.append("[REDACTED sensitive form control]")
-        else:
-            lines.append(_HANDBACK_VALUE_ATTRIBUTE.sub("value=\"[REDACTED]\"", line))
-    return _reduce_urls_to_origin("\n".join(lines))
-
-
-_EPOCH_HEADER = "X-Zettlab-Browser-Epoch"
-
-
-def _session_epoch_header(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    """Declare the page epoch this session last synchronized with."""
-    if not isinstance(session, dict):
-        return {}
-    epoch = session.get("epoch")
-    if not isinstance(epoch, int) or isinstance(epoch, bool):
-        return {}
-    return {_EPOCH_HEADER: str(epoch)}
-
-
-def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
-    """Record the server-reported page epoch on the session.
-
-    The epoch increments whenever human control of the page ends, so a change
-    means the page content is no longer what the Agent last saw and any values
-    a human typed may still be present. Adopting a changed epoch therefore
-    also enables the handback privacy filter; the filter clears when the Agent
-    navigates away. Keys are written without the session lock because single
-    key access is atomic and callers may already hold the lock.
-    """
-    if not isinstance(session, dict) or not isinstance(epoch, int) or isinstance(epoch, bool):
-        return
-    previous = session.get("epoch")
-    if previous is not None and previous != epoch:
-        session["privacy_filter_after_handback"] = True
-        # Which document it is for is not known here — the response that
-        # carried this epoch has no URL — so it is filled in by the first read
-        # that does establish it, and by _left_handback_document below.
-        # The epoch only moves when a human took the tab and gave it back, so
-        # the document every outstanding ref describes is the one they left
-        # behind. Turns sharing this physical tab keep their own session entry
-        # and their own stamp, so invalidate by document rather than by
-        # clearing this session's — otherwise a concurrent turn would still
-        # act on refs from before the takeover.
-    session["epoch"] = epoch
-
-
-def _adopt_epoch_from_response(
-    session: Optional[Dict[str, Any]],
-    resp: "requests.Response",
-    *,
-    tab_operation: bool = False,
-) -> bool:
-    """Adopt the epoch header a managed local-server proxy adds to responses.
-
-    On a managed deployment the epoch is the only thing that tells this process
-    a human touched the page. If a tab operation comes back without a usable
-    one — a local-server too old to send it, a proxy that drops it, a garbled
-    value — the handback filter would silently never engage and the next read
-    would hand over whatever the human typed. Once this session has seen a
-    valid epoch, a later tab response without one is a protocol failure, and
-    the safe reading of it is "assume the page changed".
-    """
-    before = bool(session.get("privacy_filter_after_handback")) if isinstance(session, dict) else False
-    status = getattr(resp, "status_code", None)
-    succeeded = isinstance(status, int) and 200 <= status < 300
-    # Only a response that describes a completed operation may move the epoch.
-    # This runs before _raise_for_status, so an older or hostile proxy putting a
-    # header on its own 409 browser_epoch_stale would otherwise hand the Agent
-    # the very epoch that refusal was protecting — and if the recovery snapshot
-    # then failed, the next press or back would carry it and be accepted.
-    value = resp.headers.get(_EPOCH_HEADER) if (resp is not None and succeeded) else None
-    if value is not None:
-        try:
-            _adopt_session_epoch(session, int(str(value).strip()))
-            if isinstance(session, dict) and not before and session.get("privacy_filter_after_handback"):
-                _response_facts.started_handback = True
-            return True
-        except (TypeError, ValueError):
-            pass
-    if not tab_operation or not isinstance(session, dict):
-        return False
-    if not succeeded:
-        # Error envelopes are generated before dispatch and carry no page data,
-        # so a missing header there says nothing about the page.
-        return False
-    if not session.get("local_server_managed"):
-        return False
-    logger.warning("Camofox managed tab response carried no usable %s header", _EPOCH_HEADER)
-    session["privacy_filter_after_handback"] = True
-    _response_facts.started_handback = True
-    return False
-
-
-def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool, document: str = "") -> None:
-    """Persist handback privacy filtering for subsequent reads of this tab.
-
-    Turning it off does not forget which document it was for. Navigating away
-    clears the filter, but history and bfcache keep that page — including what
-    the human typed into it and a URL that may carry an OAuth code or a reset
-    token — so coming back to it has to filter again.
-    """
-    with _session_lock(session):
-        session["privacy_filter_after_handback"] = enabled
-        if enabled and document:
-            session["handback_document"] = document
-
-
-def _refilter_if_back_on_the_handback_document(session: Dict[str, Any], landed_url: Any) -> None:
-    """Re-enable the filter when a navigation lands back on the human's page."""
-    if not isinstance(session, dict):
-        return
-    with _session_lock(session):
-        remembered = str(session.get("handback_document") or "")
-    if not remembered:
-        return
-    if _document_identity(landed_url) != remembered:
-        return
-    with _session_lock(session):
-        session["privacy_filter_after_handback"] = True
-
-
-def _handback_privacy_filter_enabled(session: Dict[str, Any]) -> bool:
-    """Return whether raw page reads are blocked after human control."""
-    with _session_lock(session):
-        return bool(session.get("privacy_filter_after_handback"))
-
-
-def _filter_page_state_after_handback(
-    session: Dict[str, Any], value: str, filtered_at_request: bool = False
-) -> str:
-    """Filter page state while a human-mutated page remains current.
-
-    ``filtered_at_request`` carries the state from when the read was issued.
-    Concurrent turns share one session dict, so a navigate finishing in between
-    could otherwise clear the flag and let a capture taken under the filter
-    through unredacted.
-    """
-    if filtered_at_request or _handback_privacy_filter_enabled(session):
-        return _redact_handback_page_state(value)
-    return value
-
-
-def _filter_url_after_handback(session: Dict[str, Any], url: Any, revealed: bool = False) -> Any:
-    """Reduce an operation-result URL to its origin while the filter is active.
-
-    Click/back results report the page URL the human left behind; without this
-    the origin-only policy applied to snapshots could be bypassed by reading
-    the same URL from an action result.
-    """
-    if not isinstance(url, str) or not url:
-        return url
-    if not revealed and not _handback_privacy_filter_enabled(session):
-        return url
-    return _url_origin_only(url)
 
 
 from tools.browser_camofox_state import get_camofox_identity
@@ -661,8 +432,8 @@ def _session_cache_key(task_id: str, identity: Dict[str, str], owner: str = "") 
     profiles in one multiplex gateway that were given the same explicit
     CAMOFOX_USER_ID and session key collide on a single entry: they are
     isolated by different action tokens and talk to different runtimes, but
-    they would share a tab id, an epoch and a handback privacy flag, so one
-    profile would drive the other's tab and could clear its privacy state.
+    they would share a single tab id, so one profile would drive the other's
+    tab.
     """
     return f"{owner}\x00{identity['user_id']}\x00{identity['session_key']}\x00{task_id}"
 
@@ -706,53 +477,6 @@ def _session_lock(session: Dict[str, Any]) -> threading.Lock:
         return lock
 
 
-# Last epoch this process observed per tab. It deliberately outlives the
-# per-turn session cache so an ordinary multi-turn continuation can be told
-# apart from a gateway restart; bounded because a stale entry is only ever a
-# missed filter-suppression, never a leak.
-_MAX_REMEMBERED_TAB_EPOCHS = 256
-_remembered_tab_epochs: Dict[str, tuple] = {}
-
-
-def _tab_epoch_memory_key(session: Dict[str, Any], tab_id: str) -> str:
-    # Keyed by the credential-derived owner as well, like the session cache and
-    # the document registry. Two profiles in one multiplex gateway can be given
-    # the same explicit identity and be handed the same tab id by their own
-    # runtimes; sharing this record would let one profile's "filter was off"
-    # become the other's trusted state and clear a live handback filter.
-    return (
-        f"{session.get('release_owner') or ''}\x00{session.get('user_id')}"
-        f"\x00{session.get('session_key')}\x00{tab_id}"
-    )
-
-
-def _remembered_tab_state(session: Dict[str, Any], tab_id: str) -> Optional[tuple]:
-    with _sessions_lock:
-        return _remembered_tab_epochs.get(_tab_epoch_memory_key(session, tab_id))
-
-
-def _remember_tab_epoch(session: Optional[Dict[str, Any]]) -> None:
-    """Record the epoch a still-owned tab was last seen at, with its filter.
-
-    The privacy flag travels with the epoch because it does not follow from it:
-    a handback detected during this turn leaves the filter on at an epoch the
-    server also reports, so remembering the epoch alone would let the next
-    turn's adoption conclude "nothing happened" and clear the filter over a
-    page the human just typed into.
-    """
-    if not isinstance(session, dict):
-        return
-    tab_id = session.get("tab_id")
-    epoch = session.get("epoch")
-    if not tab_id or not isinstance(epoch, int) or isinstance(epoch, bool):
-        return
-    filtered = bool(session.get("privacy_filter_after_handback"))
-    with _sessions_lock:
-        if len(_remembered_tab_epochs) >= _MAX_REMEMBERED_TAB_EPOCHS:
-            _remembered_tab_epochs.clear()
-        _remembered_tab_epochs[_tab_epoch_memory_key(session, tab_id)] = (epoch, filtered)
-
-
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     """Attach process-local state to an already-open managed Camofox tab.
 
@@ -785,29 +509,6 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     tab_id = _validated_tab_id(latest.get("tabId")) if isinstance(latest, dict) else None
     if tab_id:
         session["tab_id"] = tab_id
-        adopted_epoch = latest.get("epoch")
-        _adopt_session_epoch(session, adopted_epoch)
-        # The in-process session cache is dropped at the end of every turn by
-        # cleanup_task_resources, so most adoptions are an ordinary multi-turn
-        # continuation, not a gateway restart. Filtering those would blank out
-        # every form control and block vision/eval from the second turn on.
-        # Compare against the last epoch this process saw for the tab instead:
-        # unchanged means no handback happened, anything else (including no
-        # record at all, i.e. a genuine restart) filters until the Agent
-        # navigates.
-        remembered = _remembered_tab_state(session, tab_id)
-        recognized = (
-            remembered is not None
-            and isinstance(adopted_epoch, int)
-            and not isinstance(adopted_epoch, bool)
-            and remembered[0] == adopted_epoch
-        )
-        # Recognized means this process saw the tab at exactly this epoch last
-        # turn, so restore the filter state it had then — which stays on when
-        # that turn ended mid-handback. Anything else (moved epoch, or no
-        # record at all, i.e. a genuine restart) filters until the Agent
-        # navigates away.
-        session["privacy_filter_after_handback"] = remembered[1] if recognized else True
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
 
     return session
@@ -878,8 +579,6 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "session_key": identity_override["session_key"],
                     "managed": True,
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
-                    "privacy_filter_after_handback": False,
-                    "epoch": None,
                     "task_id": task_id,
                     "local_server_managed": local_server_managed,
                     "release_url": release_url,
@@ -897,8 +596,6 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "session_key": profile_identity["session_key"],
                     "managed": True,
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
-                    "privacy_filter_after_handback": False,
-                    "epoch": None,
                     "task_id": task_id,
                     "local_server_managed": local_server_managed,
                     "release_url": release_url,
@@ -916,8 +613,6 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "session_key": profile_identity["session_key"],
                     "managed": False,
                     "adopt_existing_tab": False,
-                    "privacy_filter_after_handback": False,
-                    "epoch": None,
                     "task_id": task_id,
                     "local_server_managed": local_server_managed,
                     "release_url": release_url,
@@ -1078,13 +773,11 @@ _MAX_TRACKED_SESSIONS = 64
 def _capture_guard(session: Optional[Dict[str, Any]]):
     """Hold the tab identity across a read whose content must be judged.
 
-    Unconditional, and that is the point. The capture and the URL check that
-    decides whether the Agent may read it have to describe the same moment: a
-    concurrent turn's navigate landing between them would let content captured
-    on a page the Agent may not read pass, because the tab had since moved to
-    one it may. Deciding by the filter state before the request cannot work —
-    the first post-handback capture is the response that turns the filter on,
-    which is exactly the capture that needs protecting.
+    Unconditional, and that is the point. The capture and the private-URL
+    check that decides whether the Agent may read it have to describe the same
+    moment: a concurrent turn's navigate landing between them would let content
+    captured on a page the Agent may not read pass, because the tab had since
+    moved to one it may.
 
     Only the HTTP capture is inside: vision's model round trip, which can run
     for minutes, happens outside it.
@@ -1475,8 +1168,8 @@ def _release_owner_key(user_id: str, headers: Dict[str, str], base_url: str = ""
     credential is hashed rather than stored a second time; the digest only has
     to distinguish profiles inside this process.
 
-    The endpoint belongs in it because a tab id, an epoch and a ref generation
-    mean nothing outside the runtime that issued them. A profile whose
+    The endpoint belongs in it because a tab id and a ref generation mean
+    nothing outside the runtime that issued them. A profile whose
     CAMOFOX_URL is repointed while its entry is alive would otherwise keep
     hitting the cached tab state against a different runtime — 404s at best,
     the wrong page if the new one happens to reuse the id. Two multiplex
@@ -1612,14 +1305,10 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
     """
     if not isinstance(session, dict):
         return
-    # The record may only go when the tab it names is really gone. A direct
-    # session owns its server-side session outright, so DELETE takes the tab
-    # with it. A managed one only gives back a shared runtime lease — and may
-    # not even do that, if another turn is still holding the profile — so its
-    # tab outlives this call. Dropping a blocked record there would let the
-    # next adoption of the same listItemId read the page this one was refused
-    # for: an ordinary redirect leaves the privacy filter off, so nothing else
-    # would stop it.
+    # A direct session owns its server-side session outright, so DELETE takes
+    # the tab with it. A managed one only gives back a shared runtime lease —
+    # and may not even do that, if another turn is still holding the profile —
+    # so its tab outlives this call.
     if session.get("local_server_managed"):
         owner = str(session.get("release_owner") or "")
         # The check and the release are one critical section: otherwise another
@@ -1661,8 +1350,7 @@ def _repoint_shared_entries(session: Dict[str, Any], stale_tab_id: Any) -> None:
     """Move every entry that held ``stale_tab_id`` onto this session's new one.
 
     The tab belongs to the browser identity, so a rebuild is a fact about all of
-    them. Their ref stamps and epochs described the tab that is gone, so those
-    are cleared too — the next read re-establishes both.
+    them.
     """
     stale = str(stale_tab_id or "")
     fresh = str(session.get("tab_id") or "")
@@ -1676,7 +1364,6 @@ def _repoint_shared_entries(session: Dict[str, Any], stale_tab_id: Any) -> None:
             if _browser_identity_key(other) != identity:
                 continue
             other["tab_id"] = fresh
-            other["epoch"] = None
 
 
 def _tab_id_from_error(exc: BaseException) -> Optional[str]:
@@ -1723,14 +1410,12 @@ def _forget_stale_tab(session: Optional[Dict[str, Any]], stale_tab_id: Optional[
     with _held_owner_lock(identity), _sessions_lock:
         if str(session.get("tab_id") or "") == stale:
             session["tab_id"] = None
-            session["epoch"] = None
         for other in _sessions.values():
             if other is session or str(other.get("tab_id") or "") != stale:
                 continue
             if _browser_identity_key(other) != identity:
                 continue
             other["tab_id"] = None
-            other["epoch"] = None
 
 
 def _tab_still_shared(session: Dict[str, Any]) -> bool:
@@ -1830,7 +1515,14 @@ def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> Non
 
 
 def _takeover_ui_hint(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Build the opaque identifiers the App needs to claim this exact tab."""
+    """Build the opaque locator a client needs to open this exact tab.
+
+    Pure addressing under the shared model — nothing here grants or transfers
+    control, and the client may open the browser view without it. The ``type``
+    string stays ``takeover_browser`` because it is a wire value older clients
+    match on; only its meaning changed, from "authorize a takeover" to "here is
+    where to look".
+    """
     if not _local_server_managed():
         return None
     agent_id = _runtime_value("ZET_AGENT_ID").strip()
@@ -1863,10 +1555,6 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
         # closed and would strand the entry plus its local-server lease.
         if not session.get("managed"):
             return False
-        # The tab survives this cleanup (that is the point of the soft path),
-        # so carry its epoch forward: the next turn re-adopts it and must be
-        # able to tell "same page, no handback" from a genuine restart.
-        _remember_tab_epoch(session)
         if session.get("local_server_managed"):
             # Deliberately no release here, and the entry stays. How long a
             # turn will keep using the browser is not observable from this
@@ -1942,32 +1630,7 @@ def _raise_for_status(resp: requests.Response) -> None:
 
 
 def _request_headers(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    return {**_auth_headers(), **_session_epoch_header(session)}
-
-
-# Facts about the most recent response on this thread. A turn runs its browser
-# calls synchronously, so "the last response on this thread" is precisely "this
-# call's response" — unlike anything stored on the shared session dict.
-_response_facts = threading.local()
-
-
-def _last_response_epoch_verified() -> bool:
-    return bool(getattr(_response_facts, "epoch_verified", False))
-
-
-def _last_response_started_handback() -> bool:
-    """Whether the response just received is the one that revealed a handback.
-
-    The shared flag it sets can be cleared again by a concurrent turn before
-    this response's caller gets to look at it, so the caller has to remember
-    what its own response reported.
-    """
-    return bool(getattr(_response_facts, "started_handback", False))
-
-
-def _is_tab_operation(path: str) -> bool:
-    """Whether this path targets one specific tab, i.e. carries an epoch."""
-    return path.startswith("/tabs/")
+    return dict(_auth_headers())
 
 
 # Bounded retry for reads only. A cold camofox start or a loaded device makes
@@ -2016,24 +1679,12 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    _response_facts.started_handback = False
     _begin_session_call(session)
     try:
         resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session),
                              allow_redirects=False, proxies=_NO_ENV_PROXIES)
     finally:
         _end_session_call(session)
-    # POST /tabs establishes the baseline epoch for the new tab. Without it a
-    # later response's epoch looks like the first one ever seen and is taken as
-    # a safe baseline, so a takeover between creation and the first read would
-    # go unnoticed.
-    # Response-local, not session state: concurrent turns share the session
-    # dict, so another response landing in between could flip a shared flag
-    # before this caller reads it. A thread-local is exactly the scope of one
-    # synchronous request/response pair.
-    _response_facts.epoch_verified = _adopt_epoch_from_response(
-        session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs"
-    )
     _raise_for_status(resp)
     return resp.json()
 
@@ -2049,11 +1700,6 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
 
-    # Reset once for the whole call, not per attempt: an earlier attempt can
-    # carry the epoch that reveals a handback and still fail retryably, and
-    # that fact has to reach the caller.
-    _response_facts.started_handback = False
-
     def _once() -> requests.Response:
         _begin_session_call(session)
         try:
@@ -2061,7 +1707,6 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
                                 allow_redirects=False, proxies=_NO_ENV_PROXIES)
         finally:
             _end_session_call(session)
-        _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path))
         _raise_for_status(resp)
         return resp
 
@@ -2075,7 +1720,6 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None, session
     url = f"{get_camofox_url()}{path}"
     resp = requests.delete(url, json=body, timeout=timeout, headers=_request_headers(session),
                            allow_redirects=False, proxies=_NO_ENV_PROXIES)
-    _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()
 
@@ -2159,59 +1803,6 @@ def _document_identity(url: Any) -> str:
     return urlunsplit(SplitResult(parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
 
 
-def _left_handback_document(session: Dict[str, Any], document_before: str, landed_url: Any) -> bool:
-    """Whether a navigation actually left the page the human handed back.
-
-    A fragment-only navigation keeps the same document — the DOM and every
-    value the human typed into it survive — and does not advance the handback
-    epoch, so "the epoch stood still" is not enough to clear the filter. When
-    the document identity cannot be established, keep filtering.
-    """
-    if not _handback_privacy_filter_enabled(session):
-        return True
-    if not document_before:
-        return False
-    landed = _document_identity(landed_url)
-    if not landed:
-        return False
-    return landed != document_before
-
-
-def _handback_page_readable(session: Dict[str, Any], snapshot_data: Any = None) -> bool:
-    """Whether a post-handback page may be read at all.
-
-    Redaction is not enough on its own: the human may have left the tab on
-    cloud metadata or an intranet host, which the Agent is not allowed to read
-    in any form. Only consulted while the handback filter is on, so the extra
-    lookup costs nothing on the normal path. Fails closed when the URL cannot
-    be established.
-
-    The capture's own URL decides when it carries one: that is the page the
-    content actually came from. Camofox does not always send it, and a /tabs
-    lookup only describes where the tab is *now* — which a concurrent navigate
-    could make a different page. Callers therefore run the capture and this
-    check inside :func:`_capture_guard`, which holds the tab identity for the
-    whole read so nothing in this process can move the tab in between.
-    """
-    if isinstance(snapshot_data, dict):
-        captured = snapshot_data.get("url")
-        if isinstance(captured, str) and captured and not _recovery_target_allowed(captured):
-            return False
-    landed_url = _current_tab_url(session)
-    if not landed_url:
-        return False
-    return _recovery_target_allowed(landed_url)
-
-
-def _blocked_handback_page_error() -> str:
-    return tool_error(
-        "The human left the browser on a page this Agent is not allowed to read "
-        "(cloud metadata or a private-network address). Navigate to an allowed "
-        "page before continuing.",
-        success=False,
-    )
-
-
 def _landing_floor_allows(url: str) -> bool:
     """The two rules hermes applies to a navigation whatever the backend.
 
@@ -2237,156 +1828,36 @@ def _landing_floor_allows(url: str) -> bool:
         return False
 
 
-def _recovery_target_allowed(url: str) -> bool:
-    """Whether the Agent may read the page the human handed back.
-
-    Two separate policies have to hold. The SSRF guards keep the Agent off
-    cloud metadata and private-network addresses, and the configured website
-    policy (``security.website_blocklist``) says which sites this deployment
-    refuses to hand to a model at all — browser_navigate() enforces the latter,
-    so a page reached by human takeover instead of by navigation must not slip
-    past it.
-
-    Fails closed: if the guards cannot be imported or a check raises, the page
-    is treated as off limits.
-    """
-    try:
-        from tools.browser_tool import _is_always_blocked_url, _is_safe_url
-
-        if _is_always_blocked_url(url) or not _is_safe_url(url):
-            return False
-    except Exception:
-        return False
-    try:
-        from tools.website_policy import check_website_access
-
-        return check_website_access(url) is None
-    except ImportError:
-        # Same fail-open as browser_tool's own import guard: a deployment
-        # without the policy module has no blocklist to enforce.
-        return True
-    except Exception:
-        return False
-
-
 def _retryable_control_result(
     exc: BaseException,
     session: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Translate the epoch-staleness conflict into a retryable tool result.
+    """Translate an older local-server's control conflict into a plain retry.
 
-    A human controlled this page since the Agent last looked, so its element
-    refs are stale. Recovery is stateless and idempotent: adopt the current
-    epoch from the conflict payload, take one privacy-filtered snapshot (the
-    proxy always admits snapshots), and ask the model to retry with fresh
-    refs. There is no handshake to complete, so nothing here can strand the
-    session; a failed snapshot simply leaves the result retryable.
+    The control protocol is gone, but during a firmware upgrade window a device
+    can still be running the previous local-server, which answers 409 with one
+    of its control codes. Reporting that as the generic retryable shape keeps
+    the window bounded: the Agent re-snapshots and carries on, and no unknown
+    error form reaches the model. Nothing is recovered here — the browser is
+    shared, so "the page changed" is ordinary and a fresh snapshot is the whole
+    remedy.
     """
     payload = _control_error_payload(exc)
     if payload is None:
         return None
-
-    result: Dict[str, Any] = {
-        "success": False,
-        "error": "browser_epoch_stale",
-        "retryable": True,
-        "resnapshot_completed": False,
-        "message": (
-            "Page state changed while a human controlled the browser. "
-            "A fresh privacy-filtered snapshot is included; retry using its refs."
-        ),
-    }
-    takeover_session_id = payload.get("takeover_session_id")
-    if isinstance(takeover_session_id, str) and takeover_session_id:
-        result["takeover_session_id"] = takeover_session_id[:256]
-
-    if not session or not session.get("tab_id") or not session.get("user_id"):
-        return json.dumps(result)
-
-    # Human-entered values can remain in the page state. Filter every later
-    # read until the Agent explicitly leaves this page. The refusal also means
-    # a human held this tab, so whatever refs the Agent still has describe the
-    # page from before that — invalidate them here rather than relying on an
-    # epoch header this error envelope may not carry.
-    _set_handback_privacy_filter(session, True)
-    # Deliberately not adopting any epoch the refusal itself carries. Copying it
-    # into the next request would clear the barrier without the snapshot that
-    # carries the human's page state — which is the whole point of the barrier.
-    # The recovery snapshot below reports the epoch through the response header
-    # like every other read, and if it fails this session keeps its old epoch
-    # and is refused again.
-
-    # Where the human left the page is not where the Agent may follow. The
-    # deleted resume handshake used to validate this before acking; without an
-    # equivalent here, a handback on 169.254.169.254 or an intranet page would
-    # hand its contents to the model through the recovery snapshot, straight
-    # past the guard browser_navigate applies to the Agent's own navigations.
-    if not _handback_page_readable(session):
-        result["message"] = (
-            "The human left the browser on a page this Agent is not allowed to read "
-            "(cloud metadata or a private-network address). Page state was not captured. "
-            "Navigate to an allowed page before continuing."
-        )
-        result["blocked_page"] = True
-        return json.dumps(result)
-
-    try:
-        # Sampled before the capture and registered after, exactly like every
-        # other snapshot: the refs this recovery hands back are the ones the
-        # message tells the Agent to retry with, so they have to be stamped or
-        # the next call refuses them — and they must not be stamped onto a
-        # generation the capture does not describe.
-        with _capture_guard(session):
-            snapshot_data = _get(
-                _tab_path(session, "/snapshot"),
-                params={"userId": session["user_id"]},
-                session=session,
-            )
-            # Re-check after the response: the human can take over again
-            # between the pre-check and this reply, and a snapshot is always
-            # admitted, so nothing else would stop the new page from coming
-            # back.
-            if not _handback_page_readable(session, snapshot_data):
-                result["message"] = (
-                    "The human left the browser on a page this Agent is not allowed to read "
-                    "(cloud metadata or a private-network address). Page state was not captured. "
-                    "Navigate to an allowed page before continuing."
-                )
-                result["blocked_page"] = True
-                return json.dumps(result)
-
-        snapshot = snapshot_data.get("snapshot", "")
-        if not isinstance(snapshot, str):
-            snapshot = ""
-
-        from tools.browser_tool import (
-            SNAPSHOT_SUMMARIZE_THRESHOLD,
-            _truncate_snapshot,
-        )
-
-        if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-            snapshot = _truncate_snapshot(snapshot)
-        result["snapshot"] = _redact_handback_page_state(snapshot)
-        result["element_count"] = snapshot_data.get("refsCount", 0)
-        result["resnapshot_completed"] = True
-    except Exception as snapshot_exc:
-        logger.warning("Camofox post-handback snapshot failed: %s", snapshot_exc)
-    return json.dumps(result)
-
-
-def _epoch_moved_result(session: Optional[Dict[str, Any]]) -> str:
-    payload = {
-        "success": False,
-        "error": "browser_epoch_stale",
-        "message": (
-            "Page state changed while this action waited for the browser tab. "
-            "Take a fresh snapshot and retry using its refs."
-        ),
-        "retryable": True,
-    }
-    if isinstance(session, dict) and session.get("epoch") is not None:
-        payload["epoch"] = session["epoch"]
-    return json.dumps(payload, ensure_ascii=False)
+    error = payload.get("error")
+    return json.dumps(
+        {
+            "success": False,
+            "error": error if isinstance(error, str) and error else "browser_state_changed",
+            "retryable": True,
+            "message": (
+                "The page changed while the browser was in use. "
+                "Take a fresh snapshot and retry using its refs."
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 def _tool_error_from_exception(
@@ -2396,8 +1867,6 @@ def _tool_error_from_exception(
     prefix: str = "",
     extra: Optional[Dict[str, Any]] = None,
 ) -> str:
-    if isinstance(exc, CamofoxEpochMoved):
-        return _epoch_moved_result(session)
     if isinstance(exc, CamofoxSessionsBusy):
         # Backpressure, not a failure of this request: the cache is full of work
         # in flight, and one of those calls finishing frees a slot.
@@ -2409,31 +1878,6 @@ def _tool_error_from_exception(
                 "browser session that is no longer needed."
             ),
             "retryable": True,
-        }
-        if extra:
-            payload.update(extra)
-        return json.dumps(payload, ensure_ascii=False)
-    if isinstance(exc, CamofoxEpochUnavailable):
-        payload = {
-            "success": False,
-            "error": "browser_epoch_unavailable",
-            "message": (
-                "This browser session has no page-state baseline yet, so running "
-                "JavaScript is refused. Take a snapshot first, or reach the page "
-                "through clicks and typing instead."
-            ),
-            "retryable": True,
-        }
-        if extra:
-            payload.update(extra)
-        return json.dumps(payload, ensure_ascii=False)
-    if isinstance(exc, CamofoxEvaluateBlocked):
-        payload = {
-            "success": False,
-            "error": (
-                "Browser evaluation is blocked after human control until the "
-                "Agent navigates to a new page or closes the session."
-            ),
         }
         if extra:
             payload.update(extra)
@@ -2492,31 +1936,8 @@ def _tool_error_from_exception(
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-class CamofoxEpochMoved(Exception):
-    """Raised when the page moved on while a mutation waited for the tab."""
-
-
-
-
 class CamofoxSessionsBusy(Exception):
     """Raised when every tracked browser session is in use."""
-
-
-class CamofoxEpochUnavailable(Exception):
-    """Raised when a managed session has no epoch baseline to mutate against."""
-
-
-class CamofoxEvaluateBlocked(Exception):
-    """Raised when arbitrary JavaScript is refused because a human held the tab."""
-
-
-
-
-# Document generation per physical tab. The epoch contract only advances on a
-# human handback, so it cannot see an ordinary navigate — and turns that share
-# a HERMES_SESSION_KEY share the tab while keeping their own session entry. A
-# parent's ``e1`` would otherwise still validate after its subagent navigated,
-# and land on whatever element reuses that ref on the new page.
 
 
 def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -2530,42 +1951,12 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
     long reads such as vision behind every mutation would cost more than it
     buys.
     """
-    # The refs in this call describe the page as it was when the Agent last
-    # read it. Another turn can advance the epoch while this one waits for the
-    # tab, and the request header is built from the shared session — so without
-    # this check the proxy would see a current epoch attached to stale refs and
-    # accept them, clicking or typing on a page the human just handed back.
-    observed_epoch = session.get("epoch")
     with _held_owner_lock(_browser_identity_key(session)):
-        if session.get("epoch") != observed_epoch:
-            raise CamofoxEpochMoved(
-                "the page changed while this operation waited for the browser tab"
-            )
-        # Only evaluate is held to the stricter bar. A click or a type names one
-        # ref and can only reach what that ref is; JavaScript names nothing and
-        # can read the whole document, rewrite it, or issue requests as the
-        # human's session, and discarding the result afterwards undoes none of
-        # that. Both checks below are re-evaluated here rather than trusted from
-        # the caller, because another turn's response can move the session
-        # between a caller's check and this lock.
-        if path_suffix == "/evaluate":
-            # Without a baseline no X-Zettlab-Browser-Epoch goes out, so neither
-            # side would stop this script from running on a page a human is in
-            # the middle of.
-            if session.get("local_server_managed") and session.get("epoch") is None:
-                raise CamofoxEpochUnavailable(
-                    "this browser session has no page-state baseline yet; take a snapshot first"
-                )
-            if _handback_privacy_filter_enabled(session):
-                raise CamofoxEvaluateBlocked(
-                    "browser evaluation is blocked after human control until the Agent "
-                    "navigates to a new page or closes the session"
-                )
         return _post(_tab_path(session, path_suffix), body, session=session)
 
 
 def _navigation_tab_context(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return enough opaque tab identity for takeover after navigation fails."""
+    """Return enough opaque tab identity to open the browser view on a failure."""
     if not session or not session.get("tab_id"):
         return {}
     context: Dict[str, Any] = {"tabId": session["tab_id"]}
@@ -2636,23 +2027,6 @@ def _navigate_within_identity(
 ) -> str:
     rebound_session: Optional[Dict[str, Any]] = None
     try:
-        # An epoch advance during this call means a human took over and handed
-        # back while the navigation was in flight, so the page the Agent is
-        # about to read is not the one it asked for. Clearing the filter
-        # unconditionally below would let those values through, and the fresh
-        # epoch means the server will not flag the next read as stale either.
-        epoch_before_navigate = session.get("epoch")
-        # Declared before the request goes out, not after it returns: from this
-        # moment the document every outstanding ref describes is on its way out,
-        # and a concurrent turn's click must fail rather than race the landing.
-        navigate_filtered_at_request = _handback_privacy_filter_enabled(session)
-        # Only meaningful while the filter is on, and it costs a round trip, so
-        # it is not taken on the normal path.
-        document_before_navigate = (
-            _document_identity(_current_tab_url(session))
-            if _handback_privacy_filter_enabled(session)
-            else ""
-        )
         try:
             data = _post(
                 _tab_path(session, "/navigate"),
@@ -2706,37 +2080,8 @@ def _navigate_within_identity(
                 "(cloud metadata or a blocked site). Page state was not captured.",
                 success=False,
             )
-        # Three things must hold before the page counts as left behind: this
-        # response actually carried a verified epoch (a protocol downgrade must
-        # not read as "nothing happened"), the epoch did not move, and the
-        # document identity really changed.
-        # The epoch requirement only applies where the protocol exists: a
-        # direct Camofox session has no epoch to verify.
-        epoch_protocol_ok = _last_response_epoch_verified() or not session.get("local_server_managed")
-        if (
-            epoch_protocol_ok
-            and session.get("epoch") == epoch_before_navigate
-            and _left_handback_document(session, document_before_navigate, data.get("url", browser_url))
-        ):
-            _set_handback_privacy_filter(session, False, document_before_navigate)
-        # Landing back on it — history, bfcache, or simply navigating to the
-        # same URL again — puts the human's page in front of the Agent once
-        # more, so the filter comes back with it.
-        _refilter_if_back_on_the_handback_document(session, data.get("url", browser_url))
-        # A handback that landed mid-navigation leaves the filter on, and the
-        # page the human ended on is reported here: an OAuth callback, a reset
-        # link or any URL with personal query parameters would otherwise reach
-        # the model in full, with the title alongside it.
         landed_url = data.get("url", browser_url)
         landed_title = data.get("title", "")
-        # Same three signals the reads use: the state when the request went
-        # out, whether this response is the one that revealed the handback, and
-        # the state now. A concurrent navigate can clear the shared flag before
-        # this line runs.
-        landed_handback_revealed = navigate_filtered_at_request or _last_response_started_handback()
-        if landed_handback_revealed or _handback_privacy_filter_enabled(session):
-            landed_url = _filter_url_after_handback(session, landed_url, True)
-            landed_title = "[REDACTED]" if landed_title else landed_title
         result = {
             "success": True,
             "url": landed_url,
@@ -2765,12 +2110,10 @@ def _navigate_within_identity(
         # the tab is still on a page a refused navigation left it on: this
         # response reported no landing URL, so nothing has proven it moved.
         try:
-            snapshot_filtered_at_request = _handback_privacy_filter_enabled(session)
             # No _capture_guard here: _navigate_locked already holds this tab's
-            # identity for the whole navigate, so this capture and the
-            # readability check below are inside the same critical section the
-            # guard would take. The lock is reentrant, so adding one would be
-            # harmless — just redundant.
+            # identity for the whole navigate, so this capture is inside the
+            # same critical section the guard would take. The lock is
+            # reentrant, so adding one would be harmless — just redundant.
             snap_data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
@@ -2783,22 +2126,8 @@ def _navigate_within_identity(
             )
             if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
                 snapshot_text = _truncate_snapshot(snapshot_text)
-            # Same rule as camofox_snapshot(): the epoch that enables the
-            # filter arrives with this very response, so a human who took over
-            # and handed back between the navigate and the snapshot must not
-            # have what they typed land in the tool result — and if they left
-            # the tab somewhere the Agent may not read at all, redaction is not
-            # enough, the snapshot is dropped.
-            snapshot_handback_revealed = snapshot_filtered_at_request or _last_response_started_handback()
-            if (snapshot_handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
-                result["snapshot_withheld"] = True
-                result["warning"] = (
-                    "A human took over and left the browser on a page this Agent is not "
-                    "allowed to read. Page state was not captured."
-                )
-            else:
-                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_handback_revealed)
-                result["element_count"] = snap_data.get("refsCount", 0)
+            result["snapshot"] = snapshot_text
+            result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
 
@@ -2842,11 +2171,7 @@ def _camofox_private_page_block(session: Dict[str, Any], task_id: Optional[str],
 
     if not _eval_ssrf_guard_active(task_id or "default"):
         return None
-    if _handback_privacy_filter_enabled(session):
-        return _blocked_handback_page_error()
     blocked_url = _camofox_current_page_private_url(session)
-    if _last_response_started_handback() or _handback_privacy_filter_enabled(session):
-        return _blocked_handback_page_error()
     if not blocked_url:
         return None
     return json.dumps({
@@ -2867,12 +2192,7 @@ def _private_page_guarded_mutating_call(
     body: Dict[str, Any],
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Probe and mutate one shared tab under the same identity lock."""
-    observed_epoch = session.get("epoch")
     with _held_owner_lock(_browser_identity_key(session)):
-        if session.get("epoch") != observed_epoch:
-            raise CamofoxEpochMoved(
-                "the page changed while this operation waited for the browser tab"
-            )
         blocked = _camofox_private_page_block(session, task_id, action)
         if blocked:
             return None, blocked
@@ -2887,33 +2207,23 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        # Held across the capture and the readability check when the filter is
-        # already on, so the two describe the same page.
+        # Held across the private-URL check and the capture so the two describe
+        # the same page.
         with _capture_guard(session):
             blocked = _camofox_private_page_block(
                 session, task_id, "read a page snapshot"
             )
             if blocked:
                 return blocked
-            filtered_at_request = _handback_privacy_filter_enabled(session)
             data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
                 session=session,
             )
-            handback_revealed = filtered_at_request or _last_response_started_handback()
-            if (handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
-                return _blocked_handback_page_error()
 
-        # The response is what advances the epoch, so the filter can only be
-        # known to be on at this point — the guard has to run here, not before
-        # the request. The request-time state is carried alongside it: a
-        # concurrent navigate could clear the flag while this read was in
-        # flight, and the capture was still taken under it.
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot, handback_revealed)
         refs_count = data.get("refsCount", 0)
 
         # Apply same summarization logic as the main browser tool
@@ -2956,7 +2266,6 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         # Strip @ prefix if present (our tool convention)
         clean_ref = ref.lstrip("@")
 
-        filtered_at_request = _handback_privacy_filter_enabled(session)
         data, blocked = _private_page_guarded_mutating_call(
             session,
             task_id,
@@ -2966,19 +2275,10 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         )
         if blocked:
             return blocked
-        # The result reports where the click landed, which is where the human
-        # is if one took over. Judged on the request-time state and this
-        # response's own fact, not just the shared flag a concurrent turn can
-        # clear.
-        result_handback_revealed = filtered_at_request or _last_response_started_handback()
-        # The page this landed on was compared against the snapshot's inside
-        # _mutating_tab_call, while it still held the tab identity: doing it
-        # here would leave a window for another turn to take the lock and act
-        # on refs this click had already invalidated.
         return json.dumps({
             "success": True,
             "clicked": clean_ref,
-            "url": _filter_url_after_handback(session, data.get("url", ""), result_handback_revealed),
+            "url": data.get("url", ""),
         })
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
@@ -3062,16 +2362,8 @@ def camofox_back(task_id: Optional[str] = None) -> str:
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        filtered_at_request = _handback_privacy_filter_enabled(session)
         data = _mutating_tab_call(session, "/back", {"userId": session["user_id"]})
-        # Going back is how the human's page most easily returns.
-        _refilter_if_back_on_the_handback_document(session, data.get("url", ""))
-        result_handback_revealed = (
-            filtered_at_request
-            or _last_response_started_handback()
-            or _handback_privacy_filter_enabled(session)
-        )
-        return json.dumps({"success": True, "url": _filter_url_after_handback(session, data.get("url", ""), result_handback_revealed)})
+        return json.dumps({"success": True, "url": data.get("url", "")})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
     finally:
@@ -3188,23 +2480,14 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
             )
             if blocked:
                 return blocked
-            images_filtered_at_request = _handback_privacy_filter_enabled(session)
             data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
                 session=session,
             )
-            images_handback_revealed = images_filtered_at_request or _last_response_started_handback()
-            if (images_handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
-                return _blocked_handback_page_error()
-        # Image alt/src are page content too: redaction only strips form values
-        # and secret-shaped text, so intranet metadata would pass straight
-        # through. Same guard as camofox_snapshot, applied after the response
-        # because that is what turns the filter on.
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot, images_handback_revealed)
 
         # Parse img elements from the accessibility tree.
         # Format: img "alt text" or img "alt text" [eN]
@@ -3245,42 +2528,27 @@ def camofox_vision(question: str, annotate: bool = False,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
-        if _handback_privacy_filter_enabled(session):
-            return tool_error(
-                "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
-                success=False,
-            )
         # The reference _get_session took covers the whole call: the model round
         # trip between the screenshot and the annotation snapshot can run for
         # minutes, and the session is in use throughout. Released in the finally
-        # below, which must not be conditional — the early returns above (no
-        # tab, filter engaged) are ordinary outcomes, not exemptions.
+        # below, which must not be conditional — the early return above (no tab)
+        # is an ordinary outcome, not an exemption.
 
         # Get screenshot as binary PNG
         # A screenshot is a capture like any other — it just returns pixels
         # instead of a tree — so it takes the same critical section, which also
-        # re-checks the blocked-landing state under the lock.
+        # re-checks the private-page state under the lock.
         with _capture_guard(session):
             blocked = _camofox_private_page_block(
                 session, task_id, "capture a screenshot"
             )
             if blocked:
                 return blocked
-            screenshot_filtered_at_request = _handback_privacy_filter_enabled(session)
             resp = _get_raw(
                 _tab_path(session, "/screenshot"),
                 params={"userId": session["user_id"]},
                 session=session,
             )
-            # Judged on the state when the capture was issued as well as now:
-            # the epoch that turns the filter on arrives with this very
-            # response, and a concurrent navigate could clear the shared flag
-            # before this check — either way the image is of the human's screen.
-            if screenshot_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session):
-                return tool_error(
-                    "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
-                    success=False,
-                )
 
         # Save screenshot to cache
         from hermes_constants import get_hermes_home
@@ -3304,23 +2572,15 @@ def camofox_vision(question: str, annotate: bool = False,
                     )
                     if blocked:
                         return blocked
-                    annotation_filtered_at_request = _handback_privacy_filter_enabled(session)
                     snap_data = _get(
                         _tab_path(session, "/snapshot"),
                         params={"userId": session["user_id"]},
                         session=session,
                     )
-                    annotation_handback_revealed = annotation_filtered_at_request or _last_response_started_handback()
-                    if (annotation_handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
-                        return _blocked_handback_page_error()
-                # A takeover can land between the screenshot and this call, and
-                # the filter it turns on only strips form values — ordinary
-                # intranet text would still reach the vision model.
                 snapshot = snap_data.get("snapshot", "")
                 if not isinstance(snapshot, str):
                     snapshot = ""
-                snapshot = _filter_page_state_after_handback(session, snapshot, annotation_handback_revealed)
-                annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
+                annotation_context =f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
             except Exception:
                 pass
 

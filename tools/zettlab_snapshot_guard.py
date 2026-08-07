@@ -52,10 +52,22 @@ _ACTION_TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
 
 _ENSURE_PATH = "/api/v1/internal/snapshot/agent-protection/ensure"
 _FINISH_PATH = "/api/v1/internal/snapshot/agent-protection/finish"
+# 只读还原互斥探测：不建 operation、不拍快照、不占 pin。给那些**本来就不走
+# ensure** 的放行分支用，见 _restore_probe_blocks。
+_PROBE_PATH = "/api/v1/internal/snapshot/agent-protection/restore-probe"
 
 # 服务端 ensure 的同步上限是 30s，客户端留一点余量再放弃。
-_ENSURE_TIMEOUT = 35.0
+# PRD 附录 B #18：降级为记录器后，Agent 不该为一张可有可无的快照长时间干等——
+# 原 35s（服务端 30s + 5s 余量）会让「加了这功能之后 Agent 变慢了」成为用户体感。
+# btrfs CoW 正常在毫秒级完成，3s 已覆盖健康路径；超时即按 broker_unavailable 放行。
+_ENSURE_TIMEOUT = 3.0
 _FINISH_TIMEOUT = 10.0
+# 探测只读两张表、不碰 btrfs，而调用它的全是「本来就要放行」的分支——让那些写入
+# 为一次探测卡住得不偿失。超时按放行处理（服务端 ProbeTimeout 是 2s）。
+_PROBE_TIMEOUT = 2.5
+# 单次探测的路径数上限，远低于服务端 MaxEnsurePaths(256)：整批超限会 400，把某条
+# 路径上真实存在的还原冲突整个吃掉。分批还隔离了单批失败。
+_PROBE_BATCH = 64
 
 # 响应体上限：正常载荷只有几个 ID 和状态字符串。
 _MAX_RESPONSE_BYTES = 256 * 1024
@@ -78,6 +90,10 @@ _MAX_TASK_TURNS = 64
 # 文件工具，所以 execute_code 本体也要在启动前保护实际 cwd（Codex review P1）。
 # text_to_speech 也是文件写入面：自定义 output_path 会先删再写任意路径
 # （tts_tool），已存在的用户文件必须先有恢复点（Codex review P1）。
+# 属于「设备故障」的无保护原因，走 WARN：保护能力正在静默流失，运维要看得见。
+# 其余原因（用户关了开关、后端形态、归属不明）是预期内的，走 INFO。
+_DEVICE_FAULT_REASONS = frozenset({"snapshot_failed", "broker_unavailable"})
+
 _FILE_MUTATING_TOOLS = frozenset({"write_file", "patch", "text_to_speech"})
 _GUARDED_TOOLS = _FILE_MUTATING_TOOLS | {"terminal", "execute_code"}
 
@@ -367,6 +383,15 @@ def _terminal_backend_is_remote() -> bool:
 
     远端文件系统不在本机快照的覆盖面内，按本机路径 ensure 只会造出假恢复点
     （Codex review P1）。
+
+    ⚠️ **ssh 一律按远端处置，包括 host 写着 localhost 的**。曾尝试把 loopback /
+    本机 hostname 识别成本机以便照常 ensure，review 击穿了三条（Codex review
+    P1 ×3）：`TERMINAL_SSH_PORT` 可能把 localhost 转发进 VM / 容器；
+    `~/.ssh/config` 的 HostName 可以把任意别名重映射到别的机器；即使真是本机，
+    ssh 的默认 cwd 是目标用户的 `~`，与守卫按本进程 cwd 算出的 ensure 路径对不
+    上。三条的共同点：**host 字面量推不出「写入落在守卫算出的那些路径上」**，
+    而对着算错的路径 ensure 会拍出一张护不住实际写入的假恢复点——比诚实记成
+    无保护更糟。
     """
     return _terminal_env_type() == "ssh"
 
@@ -529,6 +554,27 @@ def _resolve_write_path(path: Any, task_id: str) -> str:
     return _map_container_path(_abs_path(raw))
 
 
+def _managed_effective_workdir(cwd: str) -> str:
+    """把候选 cwd 过一遍执行侧同一个解析器，返回命令真正会跑的目录。
+
+    必须调用 ``_managed_terminal_cwd`` 使用的同一个函数，确保已存在的 cwd 继续
+    作为 root 命令和恢复点的共同锚点，不存在的 cwd 才回退到平台 output。两边
+    各自推导会漂移成「快照拍在 A、命令跑在 B」，那正是本守卫要防的裂缝。非
+    受管 / Windows / 模块缺失时原样返回，绝不抛。
+    """
+    # 只有 local backend 的命令才会经过 _managed_terminal_cwd。容器 / 远端
+    # backend 下套用本机解析，会把已映射的容器 cwd 判成不可用而改锚到本机
+    # output 目录——命令仍在容器里跑，快照却拍在宿主机，正是要防的分叉。
+    if _terminal_env_type() != "local":
+        return cwd
+    try:
+        from tools.environments.local import managed_effective_cwd
+
+        return str(managed_effective_cwd(cwd) or cwd)
+    except Exception:
+        return cwd
+
+
 def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     """破坏性 shell 命令报工作目录而不是解析命令行里的路径。
 
@@ -562,7 +608,22 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     if session_cwd:
         session_cwd = _map_container_path(_abs_path(session_cwd))
 
-    explicit = str(arguments.get("workdir") or "").strip()
+    raw_workdir = arguments.get("workdir")
+    explicit = str(raw_workdir or "").strip()
+    if explicit:
+        try:
+            from tools.runtime_workdir import resolve_runtime_workdir
+
+            # 别名匹配必须用未预处理的原值。registry.dispatch 和 terminal_tool
+            # 都对 `agent_output` 做精确比较，这里先 strip 会让 " agent_output "
+            # 只在守卫侧解析成平台 output 目录，而命令仍 `cd` 进那个字面相对
+            # 路径——快照拍在 A、破坏性命令改的是 B，正是本 gate 要防的分叉。
+            explicit = str(resolve_runtime_workdir(raw_workdir) or "").strip()
+        except ValueError:
+            # Registry dispatch rejects an unavailable semantic alias before
+            # this gate. Direct guard calls still fail safe by protecting the
+            # fallback cwd; the terminal handler will reject the same alias.
+            explicit = ""
     if explicit:
         # `~` 按工具子进程实际生效的 HOME 展开：workdir 的 `cd` 由 shell 按子
         # 进程 $HOME 解释，home_mode=profile / 缺 HOME fallback 时它是
@@ -585,17 +646,16 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
             base = session_cwd or _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
             p = _map_container_path(os.path.normpath(os.path.join(base, expanded)))
         if os.path.isdir(p):
-            return p
+            return _managed_effective_workdir(p)
     if session_cwd and os.path.isdir(session_cwd):
-        return session_cwd
+        return _managed_effective_workdir(session_cwd)
     # TERMINAL_CWD 本身可能就是容器口径（config 把 cwd 写成 /workspace）：显式
     # workdir 与 session_cwd 都做了反解，fallback 不反解会给本机字面 /workspace
     # 建快照，真实被写的是 bind 到它的 host 目录（Codex review P1）。
-    return _map_container_path(_abs_path(os.getenv("TERMINAL_CWD") or os.getcwd()))
+    return _managed_effective_workdir(
+        _map_container_path(_abs_path(os.getenv("TERMINAL_CWD") or os.getcwd()))
+    )
 
-
-# 单个 `&`（非 `&&` / `2>&1` / `&>`）把命令甩到后台。
-_SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
 
 # nohup / setsid 把子进程甩出保护窗口；env / command / exec / nice 一类包裹层
 # 不改变「最终执行谁」，判定时逐层剥掉再看真正的命令头。值集合列出的 flag 会
@@ -709,6 +769,11 @@ def _segment_daemonizes(words: list[str]) -> bool:
     return False
 
 
+# 单个 `&`（非 `&&` / `2>&1` / `&>` / `|&`）把命令甩到后台。只用于扫描 shlex 切
+# 出的**标点 token**，不再扫原始字符串——那会把引号里的字面 `&` 也当成操作符。
+_SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
+
+
 def _shell_self_backgrounds(command: str) -> bool:
     """报告一条 shell 命令是否会自行后台化（`cmd &`、nohup / setsid 包裹）。
 
@@ -719,14 +784,30 @@ def _shell_self_backgrounds(command: str) -> bool:
     作符重新分段判定。引号不配对等解析不了的形态 fail-closed 按自后台化处理
     ——识别不准就不放行。
     """
-    if _SHELL_AMP_BACKGROUND_RE.search(command):
-        return True
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:
         return True
+    # 单个 `&`（不是 `&&` / `&>` / `>&`）把命令甩到后台。**必须按 shell word 语义
+    # 判**：原先这里先用裸正则扫原始字符串，把引号里的字面 `&` 也当成操作符——
+    # `printf 'R&D' > notes.txt`、带 query string 的 URL 都会被误判成自后台化，
+    # 于是跳过 ensure，用户静默失去本该有的写入前恢复点（Codex review P1）。
+    #
+    # shlex 的 punctuation_chars 模式已经把这几种形态分得很干净：`&&` / `&>` /
+    # `>&` 各是独立 token，引号里的 `&` 留在 word 内部，后台操作符只出现在**标点
+    # token** 里。未加引号的 `echo A&B` 判成后台化是**对的**——bash 里它确实是
+    # 「A 后台执行、再跑 B」。
+    #
+    # 不能只认 `word == "&"`：贴括号的子 shell 后台化（`(rm -rf data)&`）会把
+    # 相邻标点合成一个 token `)&`（Codex review P1）。对标点 token 整体跑一遍
+    # 「`&` 且不是 `&&` / `&>` / `>&` / `|&` 的一部分」的判定——正则只扫操作符
+    # token，引号里的字面 `&` 在普通 word 里，到不了这里。
+    for word in words:
+        if word and all(ch in _SHELL_PUNCT_CHARS for ch in word):
+            if _SHELL_AMP_BACKGROUND_RE.search(word):
+                return True
     segment: list[str] = []
     segments = [segment]
     for word in words:
@@ -869,8 +950,20 @@ def _command_is_probably_readonly(command: str) -> bool:
     return True
 
 
-def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> list[str]:
+def _ancillary_abs_paths(
+    text: str,
+    primary: list[str],
+    base_dir: str = "",
+    *,
+    include_missing: bool = False,
+) -> list[str]:
     """从命令 / 脚本文本里抽出**已存在**的写入目标，作为 cwd 之外的附加保护。
+
+    ``include_missing=True`` 时连**尚不存在**的目标一起返回。快照保护用不上它们
+    （纯新增没有「改动前的原始状态」可存），但**还原互斥用得上**：还原正在把目录
+    换回快照时点的内容，此刻新建的文件会被直接丢掉，所以 `touch <正在还原的目录>
+    /new.txt &` 同样必须挡住（Codex review P1）。服务端的 canonicalPath 会把不存在
+    的尾部逐级上溯解析出所属 target，路径原样发过去即可。
 
     覆盖绝对路径、home 前缀（~ / $HOME / ${HOME}，按当前 profile 的 home 展
     开）与 `../` 相对目标（锚到 base_dir，即主保护用的工作目录）。引号字面量
@@ -1015,7 +1108,9 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
             # 父目录放前面：截断时它最该保住——整个目录的恢复点覆盖面最大。
             expanded = ([parent] if parent else []) + matches
         for item in expanded:
-            if not item or item in seen or not os.path.lexists(item):
+            if not item or item in seen:
+                continue
+            if not include_missing and not os.path.lexists(item):
                 continue
             seen.add(item)
             out.append(item)
@@ -1057,6 +1152,7 @@ _TRUSTED_VIDEO_EDIT_WRITE_OPTIONS = frozenset({
     "--state-file",
     "--workflow-state",
 })
+_TRUSTED_CAMERA_SCRIPT_NAME = "camera_connector.py"
 
 
 def _trusted_video_edit_write_paths(
@@ -1130,6 +1226,37 @@ def _trusted_video_edit_write_paths(
     return paths
 
 
+def _trusted_camera_write_paths(command: str) -> Optional[list[str]]:
+    """Return no user-file writes for an exact trusted camera action.
+
+    ``terminal_tool`` intercepts these commands before shell execution. The
+    helper only calls the device-local CameraService with a fixed action and a
+    registered camera ID; any snapshot or clip is allocated as a new service-
+    owned attachment. Reuse the runtime's strict parser so arbitrary Python,
+    wrapped shell commands, and unsupported camera arguments retain the generic
+    cwd protection path.
+    """
+    if _TRUSTED_CAMERA_SCRIPT_NAME not in command:
+        return None
+    try:
+        from tools.terminal_tool import _parse_camera_runtime_command
+
+        parsed = _parse_camera_runtime_command(command)
+    except Exception as exc:
+        logger.debug(
+            "zettlab snapshot guard: trusted camera parse unavailable: %s",
+            exc,
+        )
+        return None
+    if (
+        parsed is None
+        or len(parsed.argv) < 2
+        or os.path.basename(str(parsed.argv[1])) != _TRUSTED_CAMERA_SCRIPT_NAME
+    ):
+        return None
+    return []
+
+
 def _extract_v4a_paths(patch_body: str) -> list[str]:
     """按 patch_parser 的等价规则抽取 V4A patch 触达的所有路径。"""
     paths: list[str] = []
@@ -1161,6 +1288,9 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
 
     if tool_name == "terminal":
         command = str(arguments.get("command") or "")
+        trusted_camera_paths = _trusted_camera_write_paths(command)
+        if trusted_camera_paths is not None:
+            return trusted_camera_paths
         trusted_video_paths = _trusted_video_edit_write_paths(
             command,
             arguments,
@@ -1264,6 +1394,11 @@ def _post(path_suffix: str, payload: dict[str, Any], timeout: float) -> tuple[Op
             # ——错误体解析不出 code 时也不能退化成「未知失败」而阻断整条命令
             # （Codex review P1 的既有语义）。
             return _error_payload(detail), "out_of_scope"
+        if exc.code == 409 and "BLOCKED_BY_RESTORE" in detail:
+            # 还原互斥是 #18 唯一保留的阻断，必须能被识别出来而不是混进
+            # http_error 一起降级放行。409 上还有 TURN_FINISHED，那个该降级，
+            # 所以这里连错误码一起判，不只看状态码。
+            return _error_payload(detail), "blocked_by_restore"
         return _error_payload(detail), "http_error"
     except Exception as exc:
         logger.warning("zettlab snapshot guard: request to %s failed: %s", path_suffix, exc)
@@ -1287,21 +1422,36 @@ def _error_payload(detail: str) -> Optional[dict]:
     return None
 
 
-def _blocked(message: str, *, outcome: str = "unknown", tool: str = "", started: float = 0.0) -> str:
-    """阻断一次破坏性操作，并留下一条结构化日志。
+def _unprotected(
+    reason: str, *, tool: str = "", started: float = 0.0
+) -> None:
+    """记录一次**没有恢复点**的放行，然后放行。
 
-    这条日志是这套 fail-closed 机制在板子上唯一的可观测出口：被挡住的写入，用户
-    的体感只是「Agent 突然不肯改文件了」，基本不会有人提单。只记枚举、工具名和耗
-    时——**不记路径**（路径只进 local-server 受权限控制的审计表）。
+    PRD 附录 B #18（2026-08-05）：本守卫由门禁降级为记录器。Agent 能做什么完全回到
+    2026-07-29 引入本特性之前，一步不少；本模块唯一的产出是恢复点，**拿不到恢复点
+    不构成拒绝理由**。故本函数恒返回 ``None``（放行）。
+
+    保留每个判定点、只换掉后果，是有意为之：这些判定算出的 ``reason`` 正是事后唯一
+    的追溯依据，也是验收 B 组改写后要断言的对象。删掉判定 = 放行了但不知道为什么。
+
+    级别按「谁的锅」分：设备故障（拍不出快照 / 入口不可达）走 WARN——保护能力正在
+    静默流失，必须在默认级别可见；其余（用户配置、后端形态、归属不明）走 INFO。
+    只记枚举、工具名和耗时——**不记路径**（路径只进 local-server 受权限控制的审计表）。
+
+    ⚠️ 已知缺口：在 ensure 之前就判定的那几类（remote backend / 后台化 / 无轮标识），
+    local-server 收不到任何请求，因此 ``agent_operation`` 与 ``agent_file_audit``
+    都不会有行——设备日志是它们唯一的现场。
     """
     elapsed_ms = int((time.monotonic() - started) * 1000) if started else -1
-    logger.warning(
-        "zettlab snapshot guard blocked a write: outcome=%s tool=%s duration_ms=%d",
-        outcome,
+    log = logger.warning if reason in _DEVICE_FAULT_REASONS else logger.info
+    log(
+        "zettlab snapshot guard: allowing a write with no recovery point "
+        "(reason=%s tool=%s duration_ms=%d)",
+        reason,
         tool or "unknown",
         elapsed_ms,
     )
-    return json.dumps({"error": message}, ensure_ascii=False)
+    return None
 
 
 def _note_task_turn_locked(task_id: str, turn_id: str) -> None:
@@ -1347,11 +1497,15 @@ def maybe_require_snapshot(
     turn_id: str = "",
     task_id: str = "",
 ) -> Optional[str]:
-    """破坏性文件操作前确保保护快照就绪。
+    """破坏性文件操作前**尽力**建一个恢复点。
 
-    返回 ``None`` 表示放行；返回 JSON 错误字符串表示**不要执行这次操作**，该字符
-    串会作为工具结果回给模型。设备环境里任何不确定的情况一律阻断（fail-closed）：
-    没有恢复点就动用户文件，是这套机制唯一不能接受的失败方式。
+    **恒返回 ``None``（放行）**——PRD 附录 B #18（2026-08-05）把本机制由门禁降级为
+    记录器：Agent 能做什么完全回到 2026-07-29（``f4d669958``）引入本特性之前，一步
+    不少；能拍到快照就拍一张、记一笔，拍不到就记原因后照常执行。
+
+    返回类型保留 ``Optional[str]`` 而非改成 ``None``：调用方 ``handle_function_call``
+    的挂接契约（非 None 即中止）不变，Phase 2 broker 仍可能需要真正的拒绝能力，
+    改签名会波及所有调用点且无收益。
     """
     global _degraded_logged
 
@@ -1391,56 +1545,40 @@ def maybe_require_snapshot(
 
     # 设备环境判定先于一切：非设备环境（CLI / 单测 / 未注入回调与 token 的部署）
     # 完全不介入，嵌套 dispatch 与 MCP bridge 不该在这里被 turn 契约挡住
-    # （Codex review P1）。但 multiplex 下 profile scope 未绑定属于**判定不
-    # 了**，不是「不是设备环境」——放行会让该 profile 的用户文件在无恢复点的
-    # 情况下被改，所以 fail-closed（Codex review P1）。
+    # （Codex review P1）。multiplex 下 profile scope 未绑定属于**判定不了**，
+    # 不是「不是设备环境」——原先 fail-closed，#18 起改为记原因后放行。
     try:
         if not _local_server_origin() or not _scoped_env(_ACTION_TOKEN_ENV, "").strip():
             return None
     except _UnresolvableScope as exc:
         logger.warning("zettlab snapshot guard: profile scope unbound: %s", exc)
-        return _blocked(
-            "File protection is unavailable: this tool call is not bound to an "
-            "agent profile, so the device cannot create a recovery point. The "
-            "file was NOT modified.",
-            outcome="unbound_scope", tool=tool_name, started=started,
-        )
+        return _unprotected("broker_unavailable", tool=tool_name, started=started)
 
     if tool_name in _REMOTE_UNSAFE_TOOLS and _terminal_backend_is_remote():
         # ssh backend 的写入在**远端主机**执行——不止 terminal：file_tools 的
         # _get_file_ops 按 env_type=ssh 建 SSHEnvironment，execute_code 在非
         # local 时走 _execute_remote（Codex review P1 ×2）。本机快照护不住远端
-        # 文件，按本机路径 ensure 出来的是一个看似成功的假恢复点；远端还可能就
-        # 是设备自己（ssh 到 loopback），那更是绕开保护直改用户文件。设备形态
-        # 只用 local / docker，这里 fail-closed；只读命令不受影响（在
-        # _paths_for 已放行）。
-        return _blocked(
-            "File modifications on the ssh backend run on a remote host; the "
-            "device cannot create a recovery point for remote files. Use a "
-            "local/docker backend for file modifications. The operation was "
-            "NOT executed.",
-            outcome="remote_backend", tool=tool_name, started=started,
-        )
+        # 文件，按本机路径 ensure 出来的是一个看似成功的**假**恢复点。
+        # #18 起放行（引入本特性前 ssh 写入本就能跑），但**依然不 ensure**：
+        # 拍一张护不住目标文件的快照比不拍更坏——它会让审计与快照列表都显示
+        # 「这次写入有恢复点」。宁可诚实地记成无保护。
+        return _unprotected("remote_backend", tool=tool_name, started=started)
     if tool_name == "terminal" and bool(arguments.get("background")):
         # 后台破坏性命令会跑到 turn 结束、pin 释放之后，恢复点可能在写入完成前
-        # 就被清理；保护窗口对不上就不放行，让模型改用前台执行
-        # （Codex review P1）。
-        return _blocked(
-            "Background terminal commands that modify files are not covered by "
-            "protection snapshots. Re-run the command in the foreground "
-            "(background=false). The command was NOT executed.",
-            outcome="background_write", tool=tool_name, started=started,
-        )
+        # 就被清理；保护窗口对不上（Codex review P1）。#18 起放行，但**放行前仍
+        # 要过还原互斥**——见 _restore_probe_blocks。
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
+        if blocked is not None:
+            return blocked
+        return _unprotected("background_write", tool=tool_name, started=started)
     if tool_name == "terminal" and _shell_self_backgrounds(str(arguments.get("command") or "")):
         # shell 自行后台化（结尾 `&`、nohup / setsid 包裹）与 background=true
         # 同罪：finish 解 pin 时子进程可能仍在写（Codex review P1）。只对非只
-        # 读命令生效——只读命令在 _paths_for 就被放行了。
-        return _blocked(
-            "Commands that background themselves ('&', nohup, setsid) are not "
-            "covered by protection snapshots. Re-run the command in the "
-            "foreground. The command was NOT executed.",
-            outcome="background_write", tool=tool_name, started=started,
-        )
+        # 读命令生效——只读命令在 _paths_for 就被放行了。#18 起放行。
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
+        if blocked is not None:
+            return blocked
+        return _unprotected("background_write", tool=tool_name, started=started)
 
     ambiguous_turn = False
     if not turn and task:
@@ -1454,27 +1592,27 @@ def maybe_require_snapshot(
                     ambiguous_turn = True
     if not turn:
         if ancillary_only:
-            return None  # 加餐保护做不了幂等就不做，不阻断
+            # 加餐保护做不了幂等就不做（ensure 会把每次写入变成一张新快照），但
+            # 还原互斥仍要过：strict execute_code 的脚本照样能写正在还原的目录
+            # （Codex review P1）。paths 为空，目标全部来自代码文本提取。
+            return _restore_probe_blocks(
+                paths, tool_name, arguments, task, started)
+        # 这两条同样绕开了 ensure，放行前补还原互斥探测（见 _restore_probe_blocks）。
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
+        if blocked is not None:
+            return blocked
         if ambiguous_turn:
             # 共享容器里多轮并发：折叠 key 分不清这次写入属于哪一轮，归错轮
-            # 会随对方 finish 提前解 pin。不确定就不放行（Codex review P1）。
-            return _blocked(
-                "File protection snapshot unavailable: multiple concurrent turns "
-                "share this sandbox, so this write cannot be attributed to a turn. "
-                "Re-run after the other turn finishes. The file was NOT modified.",
-                outcome="ambiguous_turn", tool=tool_name, started=started,
-            )
-        # 没有轮标识就无法做幂等，会把每次写入都变成一张新快照。这属于调度层
-        # 契约被破坏，放行比拍一堆快照更糟，所以阻断。
-        return _blocked(
-            "File protection snapshot unavailable: missing turn id. The file was not modified.",
-            outcome="missing_turn_id", tool=tool_name, started=started,
-        )
+            # 会随对方 finish 提前解 pin（Codex review P1）。#18 起放行。
+            return _unprotected("ambiguous_turn", tool=tool_name, started=started)
+        # 没有轮标识就无法做幂等，ensure 会把每次写入都变成一张新快照——所以这里
+        # 依然**不 ensure**，只记录后放行：拍一堆重复快照会刷爆用户的快照列表，
+        # 比没有恢复点更糟。
+        return _unprotected("missing_turn_id", tool=tool_name, started=started)
 
     if ancillary_only:
-        # strict execute_code 的唯一保护就是这次 ancillary ensure：建不起恢复
-        # 点必须阻断（required=True，fail-closed），不能保护失败还放行写入
-        # （Codex review P1）。
+        # strict execute_code 的唯一保护就是这次 ancillary ensure。#18 起
+        # required 不再意味着「失败即阻断」，只意味着「失败要记 WARN」。
         return _ensure_ancillary(
             tool_name, arguments, turn, [], task=task, required=True, started=started)
 
@@ -1490,7 +1628,7 @@ def maybe_require_snapshot(
 
     data, err = _post(
         _ENSURE_PATH,
-        {"turnId": turn, "paths": paths, "title": _title_for(paths)},
+        _ensure_body(turn, paths),
         _ENSURE_TIMEOUT,
     )
 
@@ -1505,22 +1643,39 @@ def maybe_require_snapshot(
             )
         return None
     if err or data is None:
-        detail = ""
-        if isinstance(data, dict) and isinstance(data.get("_error"), dict):
-            detail = str(data["_error"].get("message") or "")
-        return _blocked(
-            "Could not create a protection snapshot before modifying files"
-            + (f" ({detail})" if detail else "")
-            + ". The file was NOT modified. Tell the user the change did not happen; do not retry blindly.",
-            outcome=f"ensure_{err or 'bad_response'}", tool=tool_name, started=started,
+        # 原先这里会给模型回一条错误串，并在 scope 越界时附带
+        # 「retry with workdir='agent_output'」的指路。#18 之后不再有错误串，
+        # 那条指路也随之失效——锚点契约改由平台 prompt 直接教（zet_agent.py），
+        # 不再依赖「撞墙后被告知」这条路径。
+        #
+        # scope 越界单独归因：新版 local-server 会自己判成 unprotected 并返回
+        # ready，走不到这里；只有**新 hermes + 老 local-server** 的过渡组合才会
+        # 在这里看到 403。分开记，好在灰度期区分「入口是老的」和「入口挂了」。
+        if _is_blocked_by_restore(data, err):
+            # #18 唯一保留的阻断，见 _is_blocked_by_restore 的注释。
+            return _restore_conflict_error(tool_name, started)
+        # 整批错误会**遮蔽还原冲突**：多路径 ensure（V4A patch 改多个文件、
+        # trusted helper 上报多个输出）里只要一条先触发 403/400，服务端本要为另
+        # 一条正在还原的路径返的 409 就永远到不了这里，Agent 照写
+        # （Codex review P1）。降级放行之前用只读探测把这批路径再问一遍——它逐
+        # 路径归 target、坏路径只跳过自己，不会被同一条坏路径再遮一次。
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
+        if blocked is not None:
+            return blocked
+        reason = (
+            "outside_scope"
+            if _is_out_of_scope(data, err)
+            else "broker_unavailable"
         )
+        return _unprotected(reason, tool=tool_name, started=started)
 
     if not data.get("ready"):
         # 服务端只在真正失败时才会给 ready=false（无保护路径它自己就放行了）。
-        return _blocked(
-            "The protection snapshot is not ready. The file was NOT modified.",
-            outcome="not_ready", tool=tool_name, started=started,
-        )
+        # 同上：ready=false 是整批结论，可能盖着某条路径的还原冲突。
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
+        if blocked is not None:
+            return blocked
+        return _unprotected("snapshot_failed", tool=tool_name, started=started)
 
     _log_unprotected(data, tool_name)
 
@@ -1535,12 +1690,29 @@ def maybe_require_snapshot(
                 state.created.add(p)
 
     if tool_name in ("terminal", "execute_code"):
-        # 主 cwd 之外的目标同样 fail-closed（required=True）：范围外路径逐个跳
-        # 过，范围内的建不出恢复点就阻断——它们是货真价实的用户文件，只记日志
-        # 放行等于让写入无恢复点发生（Codex review P1）。
+        # 主 cwd 之外的目标：范围外路径逐个跳过，范围内的尽力建恢复点。
+        # required=True 在 #18 之后只影响日志级别（WARN vs INFO），不再影响放行。
         return _ensure_ancillary(
             tool_name, arguments, turn, paths, task=task, required=True, started=started)
     return None
+
+
+def _ensure_body(turn: str, paths: list[str]) -> dict[str, Any]:
+    """ensure 请求体。带上 ``deadlineMs``——**客户端自己还会等多久**。
+
+    服务端据此把同步上限收窄到同一刻。不带的话服务端会一路跑到它自己的 30s 上限，
+    而客户端 3s 就放行了：那之后服务端若仍登记成功，就留下一张**调用方并不知情**
+    的保护快照，而 Agent 此刻正在写文件——用户看到的是一个恢复不回写入前状态的
+    「恢复点」，比没有恢复点更糟（Codex review P1）。
+
+    字段可选，老 local-server 忽略未知字段，行为不变（HR4）。
+    """
+    return {
+        "turnId": turn,
+        "paths": paths,
+        "title": _title_for(paths),
+        "deadlineMs": int(_ENSURE_TIMEOUT * 1000),
+    }
 
 
 def _title_for(paths: list[str]) -> str:
@@ -1572,6 +1744,139 @@ def _log_unprotected(data: dict, tool_name: str) -> None:
     )
 
 
+def _is_blocked_by_restore(data: Optional[dict], err: str = "") -> bool:
+    """报告一次 ensure 失败是否为「用户正在还原该目录」。
+
+    这是 PRD 附录 B #18 **唯一保留的阻断**：本特性其余判定全部降级成记录器，但
+    还原互斥单独豁免——它挡的不是「Agent 没有恢复点」，而是「用户点了还原、反而
+    丢数据」。全量还原在 `rename(target→bak)` 与 `rename(tmp→target)` 之间有一个
+    目标目录不存在的窗口，Agent 此刻写入会让还原失败且回滚也失败，用户原始数据
+    滞留在 `.bak`。
+
+    ⚠️ 服务端把它挡住了，客户端也**必须**跟着阻断：只在服务端拒绝而客户端照写，
+    等于这道豁免完全没生效——ensure 没建成恢复点，写入却照常落盘。
+    """
+    if err == "blocked_by_restore":
+        return True
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("_error"), dict)
+        and str(data["_error"].get("code") or "") == "SNAPSHOT_AGENT_BLOCKED_BY_RESTORE"
+    )
+
+
+def _ancillary_targets(
+    tool_name: str,
+    arguments: dict[str, Any],
+    exclude: list[str],
+    task: str,
+    *,
+    include_missing: bool = False,
+) -> list[str]:
+    """命令 / 脚本文本里 cwd 之外的写入目标。
+
+    ensure 与还原互斥探测共用这一套**提取**：两侧各自推导必然漂移，而漏掉的那一侧
+    就是 Agent 写进正在还原的目录（Codex review P1）。只对 terminal /
+    execute_code 有意义——文件工具的目标已经全在 paths 里。
+
+    ⚠️ 共用提取，**不共用存在性过滤**：ensure 只保护已存在的文件（纯新增没有原始
+    状态可存），而还原互斥不分新旧——还原会把目录换回快照时点的内容，此刻新建的
+    文件同样会被丢掉。所以探测侧传 ``include_missing=True``。
+
+    结果受 `_MAX_ANCILLARY_PATHS` 界住（HR1）。
+    """
+    if tool_name not in ("terminal", "execute_code"):
+        return []
+    text = str(arguments.get("command") or arguments.get("code") or "")
+    return _ancillary_abs_paths(
+        text,
+        exclude,
+        base_dir=_terminal_workdir(arguments, task),
+        include_missing=include_missing,
+    )
+
+
+def _restore_probe_blocks(
+    paths: list[str],
+    tool_name: str,
+    arguments: dict[str, Any],
+    task: str,
+    started: float,
+    *,
+    expand_ancillary: bool = True,
+) -> Optional[str]:
+    """给**不走 ensure 的放行分支**补上还原互斥检查。
+
+    后台命令（``background=true`` / shell 自后台化）、归属不明的轮、拿不到 turn
+    标识的写入——这些分支在 PRD 附录 B #18 之前是**硬阻断**（`cc9daf5f4` 起），
+    #18 改成放行之后就绕开了还原互斥这道唯一保留的守卫：写入照样会落进全量还原
+    `rename(target→bak)` 与 `rename(tmp→target)` 之间那个目标目录不存在的窗口，
+    让还原失败且回滚也失败，用户原始数据滞留在 `.bak`（Codex review P1）。
+
+    不能改走 ensure 代替：那会为后台命令拍一张保护窗口对不上的快照并占 pin
+    （pin 在 finish 时释放，而后台进程还在写），等于用一个新问题去修另一个。
+
+    **只在探测到「确有还原在跑」时才阻断**，其余一律放行：
+    - 老 local-server 没有这个端点（404 → ``not_supported``）
+    - 探测超时 / 断连 / 500
+
+    这三种下服务端本来就管不了这批写入，为它们 fail-closed 会把整批后台命令挂死
+    在一个环境问题上。与 LS 侧「查不出来就当有还原」的取舍不同——那边是已经确定
+    要查某个 target、只是查询失败；这边是连服务端都联系不上。
+
+    ⚠️ 探测范围**必须与实际写入范围一致**：`paths` 对 terminal 只有主 workdir，
+    而 `rm -rf /home/user/Documents/a &` 真正写的是命令文本里那个绝对路径。只查主
+    workdir 会 clear 后放行，Agent 照样写进正在还原的目录（Codex review P1）。所以
+    这里合并 `_ancillary_targets`——与 `_ensure_ancillary` 同一套提取。
+    """
+    targets = list(paths)
+    if expand_ancillary:
+        for extra in _ancillary_targets(
+            tool_name, arguments, list(paths), task, include_missing=True
+        ):
+            if extra not in targets:
+                targets.append(extra)
+    if not targets:
+        return None
+    # **分批发**，不要一次性把主路径与加餐目标塞进同一个请求。
+    #
+    # 一次请求的路径数受服务端 MaxEnsurePaths 约束，主 paths + 加餐目标合起来可能
+    # 超限而整批 400——那会把某条路径上真实存在的还原冲突整个吃掉，探测等于没做。
+    # 分批还顺带隔离了单批失败：一批查不了不影响其余批（Codex review P1 ×2）。
+    #
+    # 剩下的整批失败（网络、500、404）无论怎么切都查不出来，按探测的既定语义
+    # fail-open——那三种下服务端本来就管不了这批写入。
+    #
+    # 坏路径不需要客户端再切细：服务端的探测端点逐路径归 target，解析不了的只跳过
+    # 它自己，不会连累同批其余路径（见 LS 侧 ProbeRestore）。
+    for i in range(0, len(targets), _PROBE_BATCH):
+        data, err = _post(_PROBE_PATH, {"paths": targets[i:i + _PROBE_BATCH]}, _PROBE_TIMEOUT)
+        if _is_blocked_by_restore(data, err):
+            return _restore_conflict_error(tool_name, started)
+    return None
+
+
+def _restore_conflict_error(tool_name: str, started: float) -> str:
+    """#18 唯一保留的阻断的统一出口：记 WARN 并返回给模型的错误串。
+
+    抽成函数是为了让主 ensure 与 ancillary ensure 走**同一条**出口——两侧各自
+    处理必然漂移，而漏判的那一侧会让 Agent 在还原换目录的窗口里写文件，正是这道
+    豁免要防的那件事（Codex review P1）。
+    """
+    elapsed_ms = int((time.monotonic() - started) * 1000) if started else -1
+    logger.warning(
+        "zettlab snapshot guard blocked a write: outcome=blocked_by_restore "
+        "tool=%s duration_ms=%d",
+        tool_name or "unknown",
+        elapsed_ms,
+    )
+    return json.dumps({"error": (
+        "A restore is running on this folder right now; writing to it would "
+        "corrupt the restore and can lose the user's data. The file was NOT "
+        "modified. Wait for the restore to finish and try again."
+    )}, ensure_ascii=False)
+
+
 def _is_out_of_scope(data: Optional[dict], err: str = "") -> bool:
     """报告一次 ensure 失败是否为范围外路径。
 
@@ -1599,22 +1904,30 @@ def _ensure_ancillary(
 ) -> Optional[str]:
     """给命令 / 脚本文本里 cwd 之外的绝对路径目标建恢复点。
 
-    terminal 下这是主保护（cwd）之外的加餐：任何失败只记日志不阻断。strict
-    execute_code 下（required=True）这是**唯一**的保护：传输失败 / ready=false
-    时必须阻断——否则恢复点没建成脚本仍会覆盖用户文件，违背 fail-closed 底线
-    （Codex review P1）。范围外路径（403）在两种模式下都只跳过：脚本引用
-    /etc 一类范围外文件多是只读，硬拒绝会把整条命令误杀（Codex review P1）；
-    范围外的**写入**本就不在保护范围承诺内。成功后标记本轮 ensured，finish
-    才会释放这些 operation 的 pin。
+    **恒返回 ``None``（放行）**——PRD 附录 B #18。``required`` 参数保留，但语义已从
+    「失败即阻断」收窄为「失败记 WARN 而非 INFO」：strict execute_code 下这是唯一的
+    保护，拍不出来值得运维看见；terminal 下这只是主保护（cwd）之外的加餐，拍不出来
+    是常态。范围外路径两种模式下都只跳过——脚本引用 /etc 一类范围外文件多是只读。
+    成功后标记本轮 ensured，finish 才会释放这些 operation 的 pin。
     """
-    extras = _ancillary_abs_paths(
-        str(arguments.get("command") or arguments.get("code") or ""), exclude,
-        base_dir=_terminal_workdir(arguments, task))
+    # 一次提取、按存在性划分——提取跑两遍会把 glob 枚举等开销也翻倍（HR1）。
+    targets_all = _ancillary_targets(
+        tool_name, arguments, exclude, task, include_missing=True)
+    extras = [p for p in targets_all if os.path.lexists(p)]
+    # **尚不存在**的加餐目标不进 ensure（纯新增没有原始状态可存），但还原互斥要
+    # 单独过：`touch <正在还原的目录>/new.txt` 的新文件会被还原直接丢掉，而它不在
+    # ensure 请求里、服务端连 fence 都不会建（Codex review P1）。
+    missing = [p for p in targets_all if p not in extras]
+    if missing:
+        blocked = _restore_probe_blocks(
+            missing, tool_name, arguments, task, started, expand_ancillary=False)
+        if blocked is not None:
+            return blocked
     if not extras:
         return None
     data, err = _post(
         _ENSURE_PATH,
-        {"turnId": turn, "paths": extras, "title": _title_for(extras)},
+        _ensure_body(turn, extras),
         _ENSURE_TIMEOUT,
     )
     if not err and isinstance(data, dict) and data.get("ready"):
@@ -1622,6 +1935,13 @@ def _ensure_ancillary(
         with _lock:
             _state_for_locked(turn).ensured = True
         return None
+    # 还原互斥先于一切降级判定：这批加餐路径里只要有一个正在被还原，整条命令就
+    # 不能跑——它写进去会让还原的 rename 撞非空目标而失败、回滚也失败，用户原始
+    # 数据滞留在 .bak。归成 snapshot_failed 放行等于服务端拒了客户端照写，这道
+    # 豁免完全没生效（Codex review P1）。与 required 无关：required 在 #18 之后
+    # 只决定日志级别，而这里决定的是用户数据的死活。
+    if _is_blocked_by_restore(data, err):
+        return _restore_conflict_error(tool_name, started)
     if err in ("unconfigured", "not_supported"):
         return None  # 不是设备环境 / 老 local-server：本机制不适用
     if not required:
@@ -1630,12 +1950,13 @@ def _ensure_ancillary(
     if _is_out_of_scope(data, err):
         if len(extras) == 1:
             return None  # 单路径批次：批量结果就是它自己的结果，无需重试
-        # 批量里混了范围外路径会整批 403：逐路径重试，范围外跳过，其余必须建成。
+        # 批量里混了范围外路径会整批 403：逐路径重试，范围外跳过，其余尽力建成。
+        # （新版 local-server 不再整批 403，这条只在灰度期的老服务端上生效。）
         ensured_any = False
         for p in extras:
             d2, e2 = _post(
                 _ENSURE_PATH,
-                {"turnId": turn, "paths": [p], "title": _title_for([p])},
+                _ensure_body(turn, [p]),
                 _ENSURE_TIMEOUT,
             )
             if not e2 and isinstance(d2, dict) and d2.get("ready"):
@@ -1644,22 +1965,30 @@ def _ensure_ancillary(
                 continue
             if e2 in ("unconfigured", "not_supported") or _is_out_of_scope(d2, e2):
                 continue
-            return _blocked(
-                "Could not create a protection snapshot for the file paths this "
-                "script modifies. The script was NOT executed. Tell the user the "
-                "change did not happen; do not retry blindly.",
-                outcome=f"ancillary_{e2 or 'not_ready'}", tool=tool_name, started=started,
-            )
+            if _is_blocked_by_restore(d2, e2):
+                # 逐路径重试同样要阻断（同上）。已经拍成的那些先标 ensured，
+                # 否则 finish 收不到它们、pin 只能等 TTL 过期。
+                if ensured_any:
+                    with _lock:
+                        _state_for_locked(turn).ensured = True
+                return _restore_conflict_error(tool_name, started)
+            # 逐路径重试里的失败：记一笔继续跑完剩下的路径。#18 之前这里 return
+            # 阻断，顺带把**后面还没试的路径**一并跳过；现在既然不阻断，就没有
+            # 理由半途而废——每条路径都值得尝试建恢复点。
+            _unprotected("snapshot_failed", tool=tool_name, started=started)
         if ensured_any:
             with _lock:
                 _state_for_locked(turn).ensured = True
         return None
-    return _blocked(
-        "Could not create a protection snapshot for the file paths this "
-        "script modifies. The script was NOT executed. Tell the user the "
-        "change did not happen; do not retry blindly.",
-        outcome=f"ancillary_{err or 'not_ready'}", tool=tool_name, started=started,
-    )
+    # 非 403 的整批失败（悬空 symlink 一类坏路径让服务端整批 400/500）不走上面
+    # 那条逐路径重试，于是这批加餐目标里若有一个正在还原，服务端的 409 就被这个
+    # 整批错误遮掉了（Codex review P1）。降级放行之前用只读探测把这批目标再问一
+    # 遍——它逐路径归 target，坏路径只跳过自己。
+    blocked = _restore_probe_blocks(
+        extras, tool_name, arguments, task, started, expand_ancillary=False)
+    if blocked is not None:
+        return blocked
+    return _unprotected("snapshot_failed", tool=tool_name, started=started)
 
 
 def finish_turn(
