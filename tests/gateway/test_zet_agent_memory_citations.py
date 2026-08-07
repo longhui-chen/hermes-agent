@@ -224,3 +224,51 @@ def test_answer_attribution_skips_trivial_answers(monkeypatch):
     collect_answer_attribution_citations(agent, "好的")
     assert not called
     assert not getattr(agent, "_zet_memory_citations", None)
+
+
+def test_collect_memory_saves_records_add_and_replace_only():
+    """memory.saved 采集：写入成功才记；add/replace 记新内容，remove 不记。"""
+    from agent.agent_runtime_helpers import collect_memory_saves
+
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    collect_memory_saves(agent, {
+        "operations": [
+            {"action": "add", "target": "memory", "content": "产品周会每周五下午 3 点"},
+            {"action": "remove", "target": "memory", "old_text": "旧条目"},
+            {"action": "replace", "target": "user", "content": "用户偏好中文回复"},
+        ],
+    }, '{"success": true}')
+    sink = agent._zet_memory_saves
+    assert len(sink) == 2
+    sources = sorted(v["source"] for v in sink.values())
+    assert sources == ["memory", "user"]
+
+    # 失败结果不记
+    agent2 = _Agent()
+    collect_memory_saves(agent2, {"action": "add", "content": "x"}, '{"success": false, "error": "full"}')
+    assert not getattr(agent2, "_zet_memory_saves", None)
+
+
+def test_push_memory_saved_emits_ms_attachment():
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    class _Q:
+        def __init__(self):
+            self.items = []
+        def qsize(self):
+            return 0
+        def put(self, item):
+            self.items.append(item)
+
+    q = _Q()
+    ok = ZetAgentAdapter._push_memory_saved(q, "t-42", "s-1", [
+        {"id": "abc", "source": "memory", "excerpt": "产品周会每周五下午 3 点"},
+    ])
+    assert ok and len(q.items) == 1
+    att = q.items[0][1]["attachment"]
+    assert att["id"] == "ms-t-42"
+    assert att["kind"] == "memory.saved"
+    assert att["payload"]["items"][0]["source"] == "memory"

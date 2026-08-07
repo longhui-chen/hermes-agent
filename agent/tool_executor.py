@@ -1006,6 +1006,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             # memory.citations 采集：所有工具执行路径的结果汇聚点（并行路径）。
             from agent.agent_runtime_helpers import collect_memory_citations
             collect_memory_citations(agent, function_result)
+        elif name == "memory":
+            # memory.saved 采集（写方向透明化，并行路径）。
+            from agent.agent_runtime_helpers import collect_memory_saves
+            collect_memory_saves(agent, args, function_result)
 
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -1752,6 +1756,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # memory.citations 采集：所有工具执行路径的结果汇聚点（串行路径）。
             from agent.agent_runtime_helpers import collect_memory_citations
             collect_memory_citations(agent, function_result)
+        elif function_name == "memory":
+            # memory.saved 采集（写方向透明化，串行路径）。
+            from agent.agent_runtime_helpers import collect_memory_saves
+            collect_memory_saves(agent, function_args, function_result)
 
         function_result = maybe_persist_tool_result(
             content=function_result,

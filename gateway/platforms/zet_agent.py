@@ -1507,6 +1507,54 @@ class ZetAgentAdapter(APIServerAdapter):
             return False
 
     @classmethod
+    def _push_memory_saved(
+        cls,
+        stream_q: Any,
+        turn_id: Any,
+        session_id: Any,
+        items: list,
+    ) -> bool:
+        """Push one turn-level memory.saved attachment（记忆写入透明化）。
+
+        与 _push_memory_citations 同款语义：同 turn 恒定 id（ms-<turn>）upsert、
+        无 actions、state 恒 active，客户端渲染为「记住了 N 条」折叠角标。
+        背压/超限放弃——透明化是旁路产物。"""
+        try:
+            if stream_q.qsize() > cls._ATTACHMENT_STREAM_BACKLOG_MAX:
+                return False
+            trimmed = [
+                {
+                    "id": str(item.get("id") or "")[:64],
+                    "source": str(item.get("source") or "")[:120],
+                    "excerpt": str(item.get("excerpt") or "")[:240],
+                }
+                for item in items[: cls._MEMORY_CITATION_MAX_ITEMS]
+                if isinstance(item, dict) and item.get("id")
+            ]
+            if not trimmed:
+                return False
+            anchor = str(turn_id or "").strip() or uuid.uuid5(
+                uuid.NAMESPACE_OID, f"ms:{session_id}"
+            ).hex[:12]
+            stream_q.put((
+                "__tool_progress__",
+                {
+                    "type": "hermes.attachment",
+                    "attachment": {
+                        "id": f"ms-{anchor}",
+                        "kind": "memory.saved",
+                        "v": 1,
+                        "state": "active",
+                        "payload": {"items": trimmed},
+                    },
+                },
+            ))
+            return True
+        except Exception:
+            logger.warning("[zet_agent] memory saved push failed", exc_info=True)
+            return False
+
+    @classmethod
     def _make_delegation_progress_cb(cls, stream_q: Any):
         """Return a parent ``tool_progress_callback`` bridging child progress.
 
@@ -2166,6 +2214,12 @@ class ZetAgentAdapter(APIServerAdapter):
                         stream_q, turn_id, session_id, list(citations.values())
                     )
                     _cit_agent._zet_memory_citations = {}
+                saves = getattr(_cit_agent, "_zet_memory_saves", None)
+                if stream_q is not None and isinstance(saves, dict) and saves:
+                    self._push_memory_saved(
+                        stream_q, turn_id, session_id, list(saves.values())
+                    )
+                    _cit_agent._zet_memory_saves = {}
             except Exception:
                 logger.debug("[zet_agent] memory citations push failed", exc_info=True)
             # Goal loop post-turn hook (ZET goal driver): if this session has

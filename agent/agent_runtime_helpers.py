@@ -2396,6 +2396,47 @@ def collect_prefetch_citations(agent, parts) -> None:
         pass
 
 
+def collect_memory_saves(agent, tool_args, raw_result) -> None:
+    """memory.saved 采集（写方向透明化）：memory 工具写入成功后，把本轮
+    新增/更新的条目记到有界容器，zet_agent 在 turn 收尾汇总为一张
+    memory.saved 附件（「记住了 N 条」角标）。只登记 add/replace 的新内容
+    （remove 无展示意义）；静默失败——透明化是旁路，绝不影响工具结果。"""
+    try:
+        parsed = json.loads(raw_result)
+        if not isinstance(parsed, dict) or not parsed.get("success"):
+            return
+        args = tool_args if isinstance(tool_args, dict) else {}
+        ops = args.get("operations")
+        if not isinstance(ops, list):
+            ops = [{
+                "action": args.get("action"),
+                "target": args.get("target"),
+                "content": args.get("content"),
+            }]
+        sink = getattr(agent, "_zet_memory_saves", None)
+        if sink is None:
+            sink = {}
+            agent._zet_memory_saves = sink
+        import hashlib
+        default_target = str(args.get("target") or "memory")
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            if str(op.get("action") or "") not in ("add", "replace"):
+                continue
+            content = str(op.get("content") or "").strip()
+            if not content or len(sink) >= 16:
+                continue
+            digest = hashlib.sha1(content.encode("utf-8", "ignore")).hexdigest()[:12]
+            sink.setdefault(digest, {
+                "id": digest,
+                "source": str(op.get("target") or default_target),
+                "excerpt": content[:240],
+            })
+    except Exception:
+        pass
+
+
 def collect_answer_attribution_citations(agent, answer_text) -> None:
     """系统提示常驻记忆的事后归因（需求 3 第三通道，真机缺口）：MEMORY.md/
     USER.md 全文常驻系统提示，模型不调 search_memory 也能答出记忆内容，此时
