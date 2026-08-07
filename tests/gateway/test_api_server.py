@@ -115,6 +115,37 @@ class TestToolCompletionPayload:
             "outcome": "success",
         }
 
+    def test_native_browser_vision_flow_emits_safe_text_only(self):
+        payload = _tool_completion_payload(
+            "call_native_vision",
+            "browser_vision",
+            {
+                "_multimodal": True,
+                "text_summary": (
+                    "Image attached natively. "
+                    "Screenshot path: /volume1/agents/main/browser_screenshot.png"
+                ),
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,private-image"},
+                    }
+                ],
+                "meta": {
+                    "screenshot_path": "/volume1/agents/main/browser_screenshot.png"
+                },
+            },
+        )
+
+        assert payload["browserState"] == {
+            "version": 1,
+            "source": "vision",
+            "summary": "Image attached natively.",
+        }
+        encoded = json.dumps(payload, ensure_ascii=False)
+        assert "base64" not in encoded
+        assert "/volume1" not in encoded
+
     def test_emits_only_bounded_takeover_hint_for_live_clients(self):
         payload = _tool_completion_payload(
             "call_browser_1",

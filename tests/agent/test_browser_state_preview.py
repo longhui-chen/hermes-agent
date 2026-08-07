@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from agent.browser_state_preview import (
     MAX_ELEMENTS,
     MAX_PREVIEW_BYTES,
@@ -124,6 +126,22 @@ def test_snapshot_parses_only_attribute_state_and_prioritizes_known_roles() -> N
     assert any(item["role"] == "other" for item in preview["elements"])
 
 
+def test_snapshot_emits_only_one_closed_element_state() -> None:
+    preview = project_browser_state_preview(
+        "browser_snapshot",
+        {
+            "success": True,
+            "snapshot": '- button "Save" [ref=e1] [disabled, selected, private-input]',
+        },
+    )
+
+    assert preview is not None
+    assert preview["elements"] == [
+        {"role": "button", "label": "Save", "state": "disabled"}
+    ]
+    assert "private-input" not in json.dumps(preview)
+
+
 def test_projection_replaces_lone_surrogates_before_utf8_serialization() -> None:
     preview = project_browser_state_preview(
         "browser_navigate",
@@ -141,6 +159,37 @@ def test_projection_replaces_lone_surrogates_before_utf8_serialization() -> None
     json.dumps(preview, ensure_ascii=False).encode("utf-8")
 
 
+@pytest.mark.parametrize(
+    "credential_path",
+    [
+        "magic-login/raw-credential",
+        "magic-login/%34%66%38%63%2dcredential",
+        "magic-login/%252Fdouble%252Dcredential",
+    ],
+)
+def test_free_text_urls_keep_only_hostname(credential_path: str) -> None:
+    preview = project_browser_state_preview(
+        "browser_navigate",
+        {
+            "success": True,
+            "title": f"Continue at https://Example.COM/{credential_path}?token=private.",
+            "snapshot": (
+                f'- button "Open https://Example.COM/{credential_path}#secret" [ref=e1]'
+            ),
+        },
+    )
+
+    assert preview is not None
+    assert preview["title"] == "Continue at example.com."
+    assert preview["elements"] == [
+        {"role": "button", "label": "Open example.com"}
+    ]
+    encoded = json.dumps(preview, ensure_ascii=False)
+    assert credential_path not in encoded
+    assert "token=private" not in encoded
+    assert "#secret" not in encoded
+
+
 def test_vision_projects_analysis_but_not_local_screenshot_path() -> None:
     preview = project_browser_state_preview(
         "browser_vision",
@@ -156,6 +205,35 @@ def test_vision_projects_analysis_but_not_local_screenshot_path() -> None:
     assert preview["source"] == "vision"
     assert "top-secret-value" not in encoded
     assert "screenshot_path" not in encoded
+    assert "/volume1" not in encoded
+
+
+def test_native_vision_projects_only_safe_text_summary() -> None:
+    preview = project_browser_state_preview(
+        "browser_vision",
+        {
+            "_multimodal": True,
+            "text_summary": (
+                "Image attached natively for the main model. "
+                "Screenshot path: /volume1/agents/main/browser_screenshot.png"
+            ),
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,private-image"},
+                }
+            ],
+            "meta": {"screenshot_path": "/volume1/agents/main/browser_screenshot.png"},
+        },
+    )
+
+    assert preview == {
+        "version": 1,
+        "source": "vision",
+        "summary": "Image attached natively for the main model.",
+    }
+    encoded = json.dumps(preview, ensure_ascii=False)
+    assert "base64" not in encoded
     assert "/volume1" not in encoded
 
 

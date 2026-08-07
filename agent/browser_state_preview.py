@@ -67,6 +67,8 @@ _HIDDEN_STATE_RE = re.compile(
     r"\[[^\]]*\bhidden\b[^\]]*\]|aria-hidden\s*=\s*true", re.IGNORECASE
 )
 _BRACKET_RE = re.compile(r"\[([^\]]+)\]")
+_EMBEDDED_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
 _SAFE_STATES = (
     "disabled",
     "checked",
@@ -78,6 +80,32 @@ _SAFE_STATES = (
     "readonly",
     "pressed",
 )
+
+
+def _hostname_only_embedded_urls(value: str) -> tuple[str, bool]:
+    """Replace absolute HTTP(S) URLs in presentation text with hostnames.
+
+    Titles and accessibility labels are free text, so a URL can bypass the
+    structured ``url`` field entirely.  Paths are never presentation-safe:
+    magic links and signed resources routinely place credentials there.  URL-
+    like text that cannot be parsed fails closed instead of preserving it.
+    """
+    changed = False
+
+    def _replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        token = match.group(0)
+        trailing = ""
+        while token and token[-1] in _URL_TRAILING_PUNCTUATION:
+            trailing = token[-1] + trailing
+            token = token[:-1]
+        safe_url, _ = _safe_url(token)
+        changed = True
+        if safe_url is None:
+            return f"[REDACTED]{trailing}"
+        return f"{safe_url['hostname']}{trailing}"
+
+    return _EMBEDDED_HTTP_URL_RE.sub(_replace, value), changed
 
 
 def _clean_text(value: Any, max_chars: int) -> tuple[str, bool]:
@@ -96,6 +124,8 @@ def _clean_text(value: Any, max_chars: int) -> tuple[str, bool]:
         # into the tool-completion path.
         value = value.encode("utf-8", errors="replace").decode("utf-8")
         truncated = True
+    value, urls_redacted = _hostname_only_embedded_urls(value)
+    truncated = truncated or urls_redacted
     value = redact_sensitive_text(value, force=True, redact_url_credentials=True)
     value = " ".join(value.split())
     if len(value) > max_chars:
@@ -147,14 +177,12 @@ def _decode_label(value: str) -> str:
 
 
 def _safe_state(line: str) -> str:
-    states: list[str] = []
     for bracket in _BRACKET_RE.findall(line):
         normalized = bracket.lower().replace("_", "-")
         for state in _SAFE_STATES:
             if re.search(rf"(?:^|[\s,;]){re.escape(state)}(?:$|[\s,;=])", normalized):
-                if state not in states:
-                    states.append(state)
-    return ", ".join(states)
+                return state
+    return ""
 
 
 def _snapshot_elements(snapshot: Any) -> tuple[list[dict[str, str]], int, bool]:
@@ -262,7 +290,13 @@ def project_browser_state_preview(
     successful results and allowlisted fields can produce a preview.
     """
     source = _TOOL_SOURCES.get(tool_name)
-    if source is None or output.get("success") is not True:
+    native_vision = (
+        source == "vision"
+        and output.get("success") is not False
+        and output.get("_multimodal") is True
+        and isinstance(output.get("text_summary"), str)
+    )
+    if source is None or (output.get("success") is not True and not native_vision):
         return None
 
     preview: dict[str, Any] = {"version": 1, "source": source}
@@ -310,8 +344,16 @@ def project_browser_state_preview(
         preview["elementCount"] = element_count
 
     if source == "vision":
+        raw_summary = output.get("analysis")
+        if native_vision:
+            # browser_vision appends the device-local screenshot path to the
+            # model-facing fallback.  Only the bounded prose before that marker
+            # is eligible for the UI projection; content/meta are never read.
+            raw_summary = output.get("text_summary", "").split(
+                "Screenshot path:", 1
+            )[0].rstrip()
         summary, summary_truncated = _clean_text(
-            output.get("analysis"), MAX_SUMMARY_CHARS
+            raw_summary, MAX_SUMMARY_CHARS
         )
         truncated = truncated or summary_truncated
         if summary:
