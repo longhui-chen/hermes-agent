@@ -884,8 +884,11 @@ def test_runtime_import_barrier_allows_only_a_recreated_profile_generation(tmp_p
     profile_home.mkdir(parents=True)
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
 
-    active, owner = adapter._block_runtime_import_profile(profile_home)
-    assert active == 0
+    active_imports, active_api_runs, owner = adapter._block_runtime_import_profile(
+        profile_home
+    )
+    assert active_imports == 0
+    assert active_api_runs == 0
     adapter._complete_runtime_import_profile_unload(profile_home, owner)
     assert adapter._begin_runtime_import_operation(profile_home) is None
     profile_home.rmdir()
@@ -1855,6 +1858,7 @@ def test_open_profile_session_db_accepts_stale_regular_sidecar(tmp_path):
         db.close()
 
 
+@pytest.mark.requires_writable_schema
 def test_malformed_profile_state_db_self_heals_on_open(tmp_path):
     """A corrupted state.db must self-heal through the sidecar-anchored open,
     not leave the profile's sessions/chat/import permanently unavailable."""

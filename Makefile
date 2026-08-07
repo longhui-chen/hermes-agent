@@ -92,7 +92,8 @@ override ZPK_UV_ENV := env \
 	-u UV_VENV_RELOCATABLE \
 	-u UV_VENV_SEED \
 	-u UV_WORKING_DIR \
-	UV_NO_CONFIG=1
+	UV_NO_CONFIG=1 \
+	HERMES_ZPK_BUILD=1
 
 ZPK_GLOBAL_EXCLUDES := \
 	--exclude=.git \

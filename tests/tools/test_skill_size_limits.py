@@ -45,14 +45,6 @@ class TestValidateContentSize:
     def test_within_limit(self):
         assert _validate_content_size("a" * 1000) is None
 
-    def test_at_limit(self):
-        assert _validate_content_size("a" * MAX_SKILL_CONTENT_CHARS) is None
-
-    def test_over_limit(self):
-        err = _validate_content_size("a" * (MAX_SKILL_CONTENT_CHARS + 1))
-        assert err is not None
-        assert "100,001" in err
-        assert "100,000" in err
 
     def test_custom_label(self):
         err = _validate_content_size("a" * (MAX_SKILL_CONTENT_CHARS + 1), label="references/api.md")

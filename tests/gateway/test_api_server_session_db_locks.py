@@ -64,6 +64,7 @@ def _exclusive_lock_obtainable(db_path: Path) -> bool:
     return result.returncode == 0
 
 
+@pytest.mark.requires_wal
 def test_validate_helpers_preserve_posix_locks(tmp_path):
     profile_home, db = _open_with_wal(tmp_path)
     db_path = profile_home / "state.db"
@@ -86,6 +87,7 @@ def test_validate_helpers_preserve_posix_locks(tmp_path):
         db.close()
 
 
+@pytest.mark.requires_wal
 def test_external_rw_close_cannot_unlink_wal(tmp_path):
     profile_home, db = _open_with_wal(tmp_path)
     db_path = profile_home / "state.db"

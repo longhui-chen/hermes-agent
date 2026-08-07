@@ -29,6 +29,7 @@ from urllib.parse import SplitResult, quote, unquote, urlsplit, urlunsplit
 
 import requests
 
+from agent.secret_scope import get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 
 

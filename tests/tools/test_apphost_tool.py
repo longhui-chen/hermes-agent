@@ -945,7 +945,9 @@ def test_delegated_children_never_get_app_host(monkeypatch):
         parent_names = {
             d["function"]["name"]
             for d in model_tools.get_tool_definitions(
-                enabled_toolsets=enabled, quiet_mode=True
+                enabled_toolsets=enabled,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
             )
         }
         child_names = {
@@ -954,6 +956,7 @@ def test_delegated_children_never_get_app_host(monkeypatch):
                 enabled_toolsets=enabled,
                 disabled_toolsets=_blocked_toolsets_for_role("worker"),
                 quiet_mode=True,
+                skip_tool_search_assembly=True,
             )
         }
     assert "app_host" in parent_names  # control: reachable before the block

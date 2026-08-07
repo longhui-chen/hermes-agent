@@ -623,6 +623,10 @@ def test_zet_agent_exposes_video_tool_when_gateway_capability_is_enabled(monkeyp
     definitions = model_tools.get_tool_definitions(
         enabled_toolsets=sorted(enabled),
         quiet_mode=True,
+        # Progressive tool search may defer plugin schemas from the eager
+        # model-facing list.  This assertion verifies the capability-filtered
+        # source catalog before that presentation layer is applied.
+        skip_tool_search_assembly=True,
     )
 
     assert "video_generate" in {item["function"]["name"] for item in definitions}

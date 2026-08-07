@@ -49,7 +49,7 @@ def _ensure_singularity_available() -> str:
     exe = _find_singularity_executable()
     try:
         result = subprocess.run(
-            [exe, "version"], capture_output=True, text=True, timeout=10,
+            [exe, "version"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
             stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
@@ -133,14 +133,17 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
         tmp_dir = cache_dir / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        env = os.environ.copy()
+        # apptainer/singularity build: external tool, may need registry
+        # credentials from the user env — exact preservation.
+        from tools.environments.local import build_subprocess_env
+        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
         env["APPTAINER_TMPDIR"] = str(tmp_dir)
         env["APPTAINER_CACHEDIR"] = str(cache_dir)
 
         try:
             result = subprocess.run(
                 [executable, "build", str(sif_path), image],
-                capture_output=True, text=True, timeout=600, env=env,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600, env=env,
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
@@ -228,6 +231,8 @@ class SingularityEnvironment(BaseEnvironment):
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
                 stdin=subprocess.DEVNULL,
                 env=_sanitize_subprocess_env(os.environ),
@@ -278,7 +283,7 @@ class SingularityEnvironment(BaseEnvironment):
             try:
                 subprocess.run(
                     [self.executable, "instance", "stop", self.instance_id],
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30,
                     stdin=subprocess.DEVNULL,
                 )
                 logger.info("Singularity instance %s stopped", self.instance_id)
