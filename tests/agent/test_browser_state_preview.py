@@ -160,34 +160,54 @@ def test_projection_replaces_lone_surrogates_before_utf8_serialization() -> None
 
 
 @pytest.mark.parametrize(
-    "credential_path",
+    ("target", "hostname"),
     [
-        "magic-login/raw-credential",
-        "magic-login/%34%66%38%63%2dcredential",
-        "magic-login/%252Fdouble%252Dcredential",
+        ("https://Example.COM/magic-login/raw-credential", "example.com"),
+        ("https:%2F%2FExample.COM%2Fmagic-login%2Fcredential", "example.com"),
+        ("https%253A%252F%252FExample.COM%252Fsigned%252Fcredential", "example.com"),
     ],
 )
-def test_free_text_urls_keep_only_hostname(credential_path: str) -> None:
+def test_free_text_urls_keep_only_hostname(target: str, hostname: str) -> None:
     preview = project_browser_state_preview(
         "browser_navigate",
         {
             "success": True,
-            "title": f"Continue at https://Example.COM/{credential_path}?token=private.",
+            "title": f"Continue at {target}?token=private.",
             "snapshot": (
-                f'- button "Open https://Example.COM/{credential_path}#secret" [ref=e1]'
+                f'- button "Open {target}#secret" [ref=e1]'
             ),
         },
     )
 
     assert preview is not None
-    assert preview["title"] == "Continue at example.com."
+    assert preview["title"] == f"Continue at {hostname}."
     assert preview["elements"] == [
-        {"role": "button", "label": "Open example.com"}
+        {"role": "button", "label": f"Open {hostname}"}
     ]
     encoded = json.dumps(preview, ensure_ascii=False)
-    assert credential_path not in encoded
+    assert "credential" not in encoded
     assert "token=private" not in encoded
     assert "#secret" not in encoded
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "Saved at /root/private browser state",
+        "Saved at %2Froot%2Fprivate%20browser%20state",
+        "Saved at file:///volume1/agents/main/private.png",
+    ],
+)
+def test_free_text_local_paths_fail_closed(unsafe_text: str) -> None:
+    preview = project_browser_state_preview(
+        "browser_vision",
+        {"success": True, "analysis": unsafe_text},
+    )
+
+    assert preview is not None
+    assert preview["summary"] == "[REDACTED]"
+    assert "root" not in json.dumps(preview)
+    assert "volume1" not in json.dumps(preview)
 
 
 def test_vision_projects_analysis_but_not_local_screenshot_path() -> None:
@@ -235,6 +255,23 @@ def test_native_vision_projects_only_safe_text_summary() -> None:
     encoded = json.dumps(preview, ensure_ascii=False)
     assert "base64" not in encoded
     assert "/volume1" not in encoded
+
+
+def test_native_vision_redacts_local_path_before_screenshot_marker() -> None:
+    preview = project_browser_state_preview(
+        "browser_vision",
+        {
+            "_multimodal": True,
+            "text_summary": (
+                "Cached at /root/private/capture.png. "
+                "Screenshot path: /volume1/agents/main/browser_screenshot.png"
+            ),
+        },
+    )
+
+    assert preview is not None
+    assert preview["summary"] == "[REDACTED]"
+    assert "/root" not in json.dumps(preview)
 
 
 def test_action_result_requires_and_sanitizes_landing_url() -> None:

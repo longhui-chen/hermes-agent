@@ -13,7 +13,7 @@ import ipaddress
 import json
 import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from agent.redact import redact_sensitive_text
 
@@ -68,6 +68,13 @@ _HIDDEN_STATE_RE = re.compile(
 )
 _BRACKET_RE = re.compile(r"\[([^\]]+)\]")
 _EMBEDDED_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_EMBEDDED_FILE_URL_RE = re.compile(
+    r"\bfile:(?://[^\s/\"'<>]*)?/[^\s\"'<>]+", re.IGNORECASE
+)
+_LOCAL_PATH_RE = re.compile(
+    r"(^|[^a-z0-9/])(?:/[^\s\"'<>]+|[a-z]:\\[^\s\"'<>]+)",
+    re.IGNORECASE,
+)
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
 _SAFE_STATES = (
     "disabled",
@@ -108,6 +115,34 @@ def _hostname_only_embedded_urls(value: str) -> tuple[str, bool]:
     return _EMBEDDED_HTTP_URL_RE.sub(_replace, value), changed
 
 
+def _presentation_safe_paths_and_urls(value: str) -> tuple[str, bool]:
+    """Apply bounded raw/encoded URL and local-path presentation policy."""
+    candidate = value
+    decoded = value
+    decoded_rounds = 0
+    for _ in range(2):
+        try:
+            next_value = unquote(decoded, errors="strict")
+        except UnicodeError:
+            return "[REDACTED]", True
+        if next_value == decoded:
+            break
+        decoded = next_value
+        decoded_rounds += 1
+
+    if decoded_rounds and (
+        _EMBEDDED_HTTP_URL_RE.search(decoded)
+        or _EMBEDDED_FILE_URL_RE.search(decoded)
+        or _LOCAL_PATH_RE.search(decoded)
+    ):
+        candidate = decoded
+
+    candidate, urls_redacted = _hostname_only_embedded_urls(candidate)
+    if _EMBEDDED_FILE_URL_RE.search(candidate) or _LOCAL_PATH_RE.search(candidate):
+        return "[REDACTED]", True
+    return candidate, urls_redacted or candidate != value
+
+
 def _clean_text(value: Any, max_chars: int) -> tuple[str, bool]:
     if not isinstance(value, str) or not value:
         return "", False
@@ -124,8 +159,8 @@ def _clean_text(value: Any, max_chars: int) -> tuple[str, bool]:
         # into the tool-completion path.
         value = value.encode("utf-8", errors="replace").decode("utf-8")
         truncated = True
-    value, urls_redacted = _hostname_only_embedded_urls(value)
-    truncated = truncated or urls_redacted
+    value, unsafe_content_removed = _presentation_safe_paths_and_urls(value)
+    truncated = truncated or unsafe_content_removed
     value = redact_sensitive_text(value, force=True, redact_url_credentials=True)
     value = " ".join(value.split())
     if len(value) > max_chars:
