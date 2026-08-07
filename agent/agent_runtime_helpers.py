@@ -2420,13 +2420,27 @@ def collect_answer_attribution_citations(agent, answer_text) -> None:
         items = parsed.get("items") if isinstance(parsed, dict) else None
         if not isinstance(items, list):
             return
-        floor = max(6.0, 0.35 * token_count)
-        kept = [it for it in items
-                if isinstance(it, dict) and float(it.get("score", 0) or 0) >= floor]
+        # 判据 = 条目覆盖率：score 是"答案 token 命中条目"的计数，上限受条目
+        # 长度约束（短条目永远到不了答案 token 的 35%——首版阈值把真命中卡死，
+        # 真机复测抓到）。改为"条目自身去重 token 的一半以上被答案覆盖"，
+        # 保底 6 个字符命中。
+        kept = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            score = float(it.get("score", 0) or 0)
+            entry_tokens = len(set(_TOKEN_RE.findall(str(it.get("excerpt") or "").lower())))
+            floor = max(6.0, 0.5 * entry_tokens)
+            if score >= floor:
+                kept.append(it)
+        logging.getLogger(__name__).warning(
+            "[citations-attr] answer_tokens=%s candidates=%s kept=%s",
+            token_count, [round(float(i.get("score", 0) or 0), 1) for i in items if isinstance(i, dict)],
+            len(kept))
         if kept:
             collect_memory_citations(agent, json.dumps({"items": kept}, ensure_ascii=False))
     except Exception:
-        pass
+        logging.getLogger(__name__).warning("[citations-attr] failed", exc_info=True)
 
 
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
