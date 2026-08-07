@@ -1299,6 +1299,26 @@ def managed_effective_cwd(
     return managed_fallback_cwd(env, home=home) or home or cwd
 
 
+def _wire_lark_cli_relay(env: dict[str, str]) -> None:
+    """Prepend the brokered lark-cli shim for managed sandbox subprocesses.
+
+    Skill scripts spawn lark-cli from inside python, invisible to the terminal
+    command interception layer; the shim routes those calls through the
+    gateway relay to the credential broker. Best-effort: any failure degrades
+    to the pre-relay behaviour instead of blocking the terminal.
+    """
+
+    try:
+        scope = _managed_terminal_profile_scope(env)
+        agent_id = Path(scope).name
+        uid, _gid = _managed_terminal_identity(env)
+        from tools.lark_cli_relay import ensure_relay_env
+
+        ensure_relay_env(agent_id, uid, env)
+    except Exception:
+        logger.debug("lark-cli relay wiring skipped", exc_info=True)
+
+
 def _managed_terminal_cwd(
     cwd: str,
     *,
@@ -1309,6 +1329,7 @@ def _managed_terminal_cwd(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return cwd
     home = _prepare_managed_terminal_home(env)
+    _wire_lark_cli_relay(env)
     try:
         _prepare_managed_profile_runtime(env)
     except OSError as exc:
