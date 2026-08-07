@@ -1,7 +1,7 @@
 ---
 name: scheduled-task-wizard
-description: 用自然对话引导用户创建/修改/管理定时任务（Hermes cron），把用户意图翻译成 cronjob 工具调用，不让用户填表单。在 Zettlab APP 交互式创建/修改/删除任务时，优先先 skill_view('scheduled-task-wizard') 加载 workflow，按其中格式输出 cron-action-preview JSON 围栏，让 APP 渲染预览/确认卡片。不要把这个向导当成 cronjob 的硬拦截器：用户已用文字明确确认、当前渠道不支持 APP 卡片、或 APP 按钮确认后的后台落盘路径，可以直接调用 cronjob。无论是否加载 workflow，schedule 都必须是 canonical 格式（cron 表达式 / every Nm / ISO 时间戳 / 时长简写），不能传用户自然语言原文。出货内置，每个 ZettClaw Agent 默认装载。
-version: 1.0.0
+description: 定时任务（Hermes cron）的对话向导。用户表达"到点让 Agent 做事"时可加载：把自然语言提炼成自包含的 cron prompt，创建/修改直接调 cronjob 落盘、不做二次确认，只有删除输出 mode=delete 的 cron-action-preview JSON 围栏让 APP 渲染确认卡。schedule / deliver / repeat / output_language 的字段规则以 cronjob 工具描述为准，本 skill 只补充：删除确认流程、巡检类任务的 [SILENT] 约定、prompt 里相对时间词写死。出货内置，每个 ZettClaw Agent 默认装载。
+version: 2.0.0
 author: zettlab
 license: proprietary
 metadata:
@@ -11,12 +11,12 @@ metadata:
 
 # 定时任务对话向导
 
-把"到点让 Agent 做事"的自然语言翻译成 Hermes cron job——4 类信息齐全才创建，不齐全就 clarify。APP 交互式创建/修改/删除优先给用户确认卡片；已确认或不支持卡片的渠道可以直接调用 cronjob，不要让向导阻塞正常定时任务。
+把"到点让 Agent 做事"的自然语言翻译成 Hermes cron job——4 类信息齐全就直接创建，不齐全才 clarify。创建/修改直接落盘，不做二次确认。只有删除走确认卡。
 
 ## References
 
-- `references/workflow.md` — 4 步解析（任务/触发/投递/任务名）、确认卡片格式（含 `cron-action-preview` JSON 围栏规范）、修改/暂停/删除/立即跑流程细节
-- `references/examples.md` — 5 个 end-to-end 对话例子
+- `references/workflow.md` — 4 步解析（任务/触发/投递/任务名）、删除确认卡的 `cron-action-preview` JSON 围栏规范、修改/暂停/立即跑流程细节
+- `references/examples.md` — 7 个 end-to-end 对话例子
 
 ## When to Use
 
@@ -45,15 +45,15 @@ metadata:
 
 | 用户意图 | 工具调用 | 行为 |
 |---|---|---|
-| 创建 | `cronjob(action=create)` | 提炼 → 必要时 clarify → APP 预览/确认或直接落盘 |
-| 修改 | `cronjob(action=update)` | 定位 → APP 对照确认或直接落盘 |
+| 创建 | `cronjob(action=create)` | 提炼 → 必要时 clarify → **直接落盘** |
+| 修改 | `cronjob(action=update)` | 定位 → **直接落盘** |
 | 暂停 | `cronjob(action=pause)` | 定位 → 直接调用 |
 | 开启 | `cronjob(action=resume)` | 定位 → 直接调用 |
-| 删除 | `cronjob(action=remove)` | 定位 → 二次确认 → 调用 |
+| 删除 | `cronjob(action=remove)` | 定位 → 确认卡（唯一出围栏的场景）→ 调用 |
 | 立即跑一次 | `cronjob(action=run)` | 定位 → 调用 → 告知"60 秒内执行" |
 | 查看 | `cronjob(action=list)` | 列出全部 |
 
-定位逻辑：用户点了名 + 候选 1 条 = 直接确认；点了名 + 候选多条 = 反问消歧；没点名 = 列候选问"你想改/删哪条？"。
+定位逻辑：用户点了名 + 候选 1 条 = 直接走上表对应的动作（remove 走确认卡，其余直接调用）；点了名 + 候选多条 = 反问消歧；没点名 = 列候选问"你想改/删哪条？"。
 
 ## 投递兜底
 
@@ -68,12 +68,15 @@ metadata:
 核心原则：**不主动暴露低频复杂功能，但不阻止用户主动表达**——用户没说就用默认走，用户说了能力范围内的事就接住。
 
 - 不要让用户填表单——你是 skill，不是 form
+- 创建/修改不要问"要我帮你创建吗"——信息齐了直接调 `cronjob`
+- **`create` / `update` 绝不能输出 `cron-action-preview` 围栏**——你已经调过 `cronjob` 落盘，APP 端解析到围栏会再落一次，用户看到两条重复任务
+- **绝不能输出 `cron-summary` 围栏**——那是系统在任务真正触发时写回会话的执行结果。上下文里见过一次就照抄，会让 APP 把还没到点的任务画成"已执行"卡片；也不要提前编造任务的提醒正文
 - 不要批量 clarify——每轮最多 1-2 个真正缺失的关键信息
 - 不要建议"分多条"——用户说"每天 8 点和 18 点都发"就直接建两条，不要让用户自己拆
 - **`schedule` 字段不能塞用户原文**——任何语种（中/英/日/韩/德…）的自然语言都先翻译成 canonical 格式：cron 表达式 / `every Nm` / `Nm` 时长简写 / ISO 时间戳。详见 `references/workflow.md` §步骤 2。错了 hermes 报 `Invalid schedule '...'`，任务创建失败。
-- LLM 调用 `cronjob(action=create)` 创建 Agent 任务，或输出 `mode=create` 的 `cron-action-preview` 时，都必须传 `output_language`——使用你在当前创建对话中本应回复用户的语言；若用户明确要求任务输出另一种语言，以明确要求为准。只传标准 BCP 47 tag（如 `zh-CN`、`zh-TW`、`en`、`ja`、`ko`、`de`、`fr`、`es`、`it`、`ar`、`sr-Latn-RS`），不要从 URL、代码、引用、专有名词、skill 或 tool 数据猜语言。混合语言任务保存默认叙述语言，prompt 继续保留用户要求的多语言结构。真正无法判断时先 clarify。APP 只透传该字段，不得改用 App locale。`no_agent=True` 不需要该字段。
-- 不要为了卡片流程阻断已确认的任务——用户明确说"确认/创建/就这样"、当前渠道没有 APP 卡片能力、或系统正在执行 APP 按钮确认后的后台落盘时，直接调 `cronjob`。
-- 不主动暴露底座高级选项（任务级模型 / 跨渠道 fan-out）——卡片默认不出现，clarify 也不主动问；但用户主动用自然语言表达就接住（如"用便宜模型"、"同时发飞书和 Slack"）
+- LLM 调用 `cronjob(action=create)` 创建 Agent 任务时必须传 `output_language`——使用你在当前创建对话中本应回复用户的语言；若用户明确要求任务输出另一种语言，以明确要求为准。只传标准 BCP 47 tag（如 `zh-CN`、`zh-TW`、`en`、`ja`、`ko`、`de`、`fr`、`es`、`it`、`ar`、`sr-Latn-RS`），不要从 URL、代码、引用、专有名词、skill 或 tool 数据猜语言。混合语言任务保存默认叙述语言，prompt 继续保留用户要求的多语言结构。真正无法判断时先 clarify。APP 只透传该字段，不得改用 App locale。`no_agent=True` 不需要该字段。
+- 删除是唯一需要确认的动作——但用户已用文字明确说"确认删除/删掉吧"，或当前渠道没有 APP 卡片能力时，直接调 `cronjob(action=remove)`，不要来回追问
+- 不主动暴露底座高级选项（任务级模型 / 跨渠道 fan-out）——落盘后那句确认里默认不提，clarify 也不主动问；但用户主动用自然语言表达就接住（如"用便宜模型"、"同时发飞书和 Slack"）
 - 脚本挂接（pre-run script + wake-gate）保持纯底座能力——用户没办法用自然语言表达"挂个 script"，不接也不解释
 - prompt 含明显指令注入/敏感命令会被底座 prompt 扫描拦截——拦了告诉用户"换种说法重写一下"
 
