@@ -3002,7 +3002,7 @@ def advance_next_runs(job_ids) -> int:
             kind = job.get("schedule", {}).get("kind")
             if kind not in {"cron", "interval"}:
                 continue
-            new_next = compute_next_run(job["schedule"], now)
+            new_next = compute_next_run(job["schedule"], now, tz_name=job.get("timezone"))
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
                 advanced += 1
