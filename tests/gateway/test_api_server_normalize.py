@@ -5,6 +5,8 @@ import pytest
 from gateway.platforms import api_server
 from gateway.platforms.api_server import (
     _business_execution_authorization_url,
+    _business_execution_request_digest,
+    _extract_agent_action_token,
     _extract_execution_scope,
     _extract_business_execution_token,
     _extract_requested_execution_policy,
@@ -25,6 +27,51 @@ class TestExtractBusinessExecutionToken:
         assert _extract_business_execution_token("short") == ""
         assert _extract_business_execution_token("a" * 64 + "\r\nX-Evil: 1") == ""
         assert _extract_business_execution_token("A" * 64) == ""
+
+
+class TestExtractAgentActionToken:
+    def test_bounded_opaque_token_is_preserved(self):
+        token = "profile/action-token.v2:+="
+        assert _extract_agent_action_token(token) == token
+
+    @pytest.mark.parametrize(
+        "token",
+        ["", "bad\nvalue", "bad\n", "bad\x7fvalue", "x" * 4097],
+    )
+    def test_empty_control_or_oversized_token_is_rejected(self, token):
+        assert _extract_agent_action_token(token) == ""
+
+
+class TestBusinessExecutionRequestDigest:
+    def test_matches_cross_language_vector_and_binds_both_inputs(self):
+        digest = _business_execution_request_digest(
+            "制作杭州周记忆",
+            "video-edit-workflow-mini",
+        )
+        assert digest == (
+            "af94a8ccd84de26e8b86fc01a07c81c6"
+            "e651b224eabe55aa933bdb6f573d2d45"
+        )
+        assert digest != _business_execution_request_digest(
+            "制作上海周记忆",
+            "video-edit-workflow-mini",
+        )
+        assert digest != _business_execution_request_digest(
+            "制作杭州周记忆",
+            "another-skill",
+        )
+
+    def test_matches_local_server_task_normalization_vector(self):
+        task = api_server._trusted_skill_task_message(
+            "\u2003/video-edit-workflow-mini\u2002first  \r\n\r\n"
+            "second\u2028/video-edit-workflow-mini\tthird\x1c",
+            "video-edit-workflow-mini",
+        )
+        assert task == "first\nsecond\n\tthird"
+        assert _business_execution_request_digest(
+            task,
+            "video-edit-workflow-mini",
+        ) == "f3b5771e16b80f6f966591d3eb2e55da9c2e6e706e459f8fa6d7bd191f3006e6"
 
 
 class TestExtractExecutionPolicy:
@@ -137,6 +184,7 @@ class TestBusinessAuthorizationRequest:
             session_id="lineage-1",
             session_key="stable-1",
             scope={"operation": "weekly_memory", "task_id": "task-1"},
+            request_digest="c" * 64,
         )
 
         request = captured["request"]
@@ -144,7 +192,8 @@ class TestBusinessAuthorizationRequest:
         assert response == {"ok": True}
         assert request.get_method() == "POST"
         assert request.data == (
-            b'{"scope":{"operation":"weekly_memory","task_id":"task-1"}}'
+            b'{"request_digest":"' + b"c" * 64
+            + b'","scope":{"operation":"weekly_memory","task_id":"task-1"}}'
         )
         assert headers["x-zettlab-agent-action-token"] == "a" * 64
         assert headers["x-zettlab-business-execution-token"] == "b" * 64
@@ -160,12 +209,15 @@ class TestBusinessAuthorizationRequest:
 class TestBusinessAuthorization:
     @pytest.mark.asyncio
     async def test_requires_exact_local_server_receipt(self, monkeypatch):
-        action_token = "a" * 64
+        action_token = "profile/action-token.v2:+="
         business_token = "b" * 64
         turn_id = "turn-1"
         session_id = "api-lineage-1"
         session_key = "zettlab:user:agent-1:session-1"
         scope = {"operation": "weekly_memory", "task_id": "task-1"}
+        task = "render weekly memory"
+        skill_slug = "video-edit-workflow-mini"
+        request_digest = _business_execution_request_digest(task, skill_slug)
         secrets = {
             "ZETTLAB_AGENT_ACTION_TOKEN": action_token,
             "ZET_AGENT_ID": "agent-1",
@@ -183,7 +235,9 @@ class TestBusinessAuthorization:
         response = {
             "ok": True,
             "scope_matched": True,
+            "request_matched": True,
             "scope_digest": "c" * 64,
+            "request_digest": request_digest,
             "agent_id": "agent-1",
             "turn_id": turn_id,
             "session_id": session_id,
@@ -207,6 +261,8 @@ class TestBusinessAuthorization:
             session_id=session_id,
             session_key=session_key,
             scope=scope,
+            trusted_task_message=task,
+            skill_slug=skill_slug,
         )
 
         assert receipt == {
@@ -215,11 +271,13 @@ class TestBusinessAuthorization:
             "session_id": session_id,
             "session_key": session_key,
             "scope_digest": "c" * 64,
+            "request_digest": request_digest,
             "authorization_mode": "automatic",
         }
         assert captured["action_token"] == action_token
         assert captured["business_execution_token"] == business_token
         assert captured["scope"] == scope
+        assert captured["request_digest"] == request_digest
 
         response["session_key"] = "another-session"
         assert await api_server._authorize_business_execution(
@@ -228,6 +286,20 @@ class TestBusinessAuthorization:
             session_id=session_id,
             session_key=session_key,
             scope=scope,
+            trusted_task_message=task,
+            skill_slug=skill_slug,
+        ) is None
+
+        response["session_key"] = session_key
+        response["request_digest"] = "f" * 64
+        assert await api_server._authorize_business_execution(
+            business_execution_token=business_token,
+            turn_id=turn_id,
+            session_id=session_id,
+            session_key=session_key,
+            scope=scope,
+            trusted_task_message=task,
+            skill_slug=skill_slug,
         ) is None
 
 

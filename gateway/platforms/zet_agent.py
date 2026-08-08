@@ -2916,6 +2916,7 @@ class ZetAgentAdapter(APIServerAdapter):
             "gateway_session_key": gateway_session_key,
             "skip_memory": execution_policy == "silent_automation",
             "strict_memory_isolation": execution_policy == "silent_automation",
+            "skip_context_files": execution_policy == "silent_automation",
             "request_overrides": agent_request_overrides or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:

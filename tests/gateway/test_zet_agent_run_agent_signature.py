@@ -182,6 +182,8 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
     assert constructed[1]["skip_memory"] is False
     assert constructed[0]["strict_memory_isolation"] is True
     assert constructed[1]["strict_memory_isolation"] is False
+    assert constructed[0]["skip_context_files"] is True
+    assert constructed[1]["skip_context_files"] is False
     assert instances[0]._persist_disabled is True
     assert instances[0]._session_db is None
     assert instances[0]._session_json_enabled is False

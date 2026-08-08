@@ -626,6 +626,9 @@ _BUSINESS_EXECUTION_SCOPE_MAX_ENTRIES = 64
 _BUSINESS_EXECUTION_SCOPE_MAX_KEY_BYTES = 128
 _BUSINESS_EXECUTION_SCOPE_MAX_VALUE_BYTES = 1024
 _BUSINESS_EXECUTION_SCOPE_MAX_BYTES = 16 << 10
+_BUSINESS_EXECUTION_ACTION_TOKEN_MAX_BYTES = 4096
+_BUSINESS_EXECUTION_SKILL_SLUG_MAX_BYTES = 128
+_BUSINESS_EXECUTION_REQUEST_DOMAIN = b"zettlab-business-execution-request-v1"
 _BUSINESS_EXECUTION_SCOPE_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -656,6 +659,45 @@ def _valid_execution_scope_text(value: str, max_bytes: int, *, allow_empty: bool
         len(encoded) <= max_bytes
         and all(ord(char) >= 0x20 and ord(char) != 0x7F for char in value)
     )
+
+
+def _extract_agent_action_token(raw: Any) -> str:
+    """Accept the profile action token as a bounded opaque header value."""
+    if not isinstance(raw, str):
+        return ""
+    if not _valid_execution_scope_text(
+        raw,
+        _BUSINESS_EXECUTION_ACTION_TOKEN_MAX_BYTES,
+        allow_empty=False,
+    ):
+        return ""
+    token = raw.strip()
+    return token if token else ""
+
+
+def _business_execution_request_digest(task: Any, skill_slug: Any) -> str:
+    """Bind authorization to the exact normalized task and selected skill."""
+    if not isinstance(task, str) or not isinstance(skill_slug, str):
+        return ""
+    slug = skill_slug.strip().lstrip("/")
+    if not _valid_execution_scope_text(
+        slug,
+        _BUSINESS_EXECUTION_SKILL_SLUG_MAX_BYTES,
+        allow_empty=True,
+    ):
+        return ""
+    try:
+        task_digest = hashlib.sha256(task.encode("utf-8")).hexdigest()
+        canonical = b"\0".join(
+            (
+                _BUSINESS_EXECUTION_REQUEST_DOMAIN,
+                task_digest.encode("ascii"),
+                slug.encode("utf-8"),
+            )
+        )
+    except UnicodeEncodeError:
+        return ""
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _extract_execution_scope(body: Dict[str, Any]) -> Dict[str, str]:
@@ -753,9 +795,10 @@ def _business_execution_authorization_request(
     session_id: str,
     session_key: str,
     scope: Dict[str, str],
+    request_digest: str,
 ) -> Dict[str, Any]:
     payload = json.dumps(
-        {"scope": scope},
+        {"request_digest": request_digest, "scope": scope},
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -829,15 +872,21 @@ async def _authorize_business_execution(
     session_id: str,
     session_key: str,
     scope: Dict[str, str],
+    trusted_task_message: Any,
+    skill_slug: str,
 ) -> Optional[Dict[str, Any]]:
     """Validate one silent turn against local-server's generic capability store."""
-    action_token = str(
-        _get_scoped_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
-    ).strip()
+    action_token = _extract_agent_action_token(
+        _get_scoped_secret("ZETTLAB_AGENT_ACTION_TOKEN", "")
+    )
     agent_id = str(_get_scoped_secret("ZET_AGENT_ID", "") or "").strip()
     url = _business_execution_authorization_url()
+    request_digest = _business_execution_request_digest(
+        trusted_task_message,
+        skill_slug,
+    )
     if (
-        _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(action_token) is None
+        not action_token
         or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(
             business_execution_token
         )
@@ -847,6 +896,7 @@ async def _authorize_business_execution(
         or not _valid_authorization_identifier(session_id, 1024)
         or not _valid_authorization_identifier(session_key, 1024)
         or not scope
+        or not request_digest
         or not url
     ):
         return None
@@ -863,6 +913,7 @@ async def _authorize_business_execution(
                 session_id=session_id,
                 session_key=session_key,
                 scope=scope,
+                request_digest=request_digest,
             )
             break
         except _BusinessExecutionAuthorizationError as exc:
@@ -877,16 +928,19 @@ async def _authorize_business_execution(
     if response is None:
         return None
     scope_digest = response.get("scope_digest")
+    returned_request_digest = response.get("request_digest")
     authorization_mode = response.get("authorization_mode")
     if (
         response.get("ok") is not True
         or response.get("scope_matched") is not True
+        or response.get("request_matched") is not True
         or response.get("agent_id") != agent_id
         or response.get("turn_id") != turn_id
         or response.get("session_id") != session_id
         or response.get("session_key") != session_key
         or not isinstance(scope_digest, str)
         or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(scope_digest) is None
+        or returned_request_digest != request_digest
         or authorization_mode not in {"automatic", "plan_confirmation"}
     ):
         return None
@@ -896,6 +950,7 @@ async def _authorize_business_execution(
         "session_id": session_id,
         "session_key": session_key,
         "scope_digest": scope_digest,
+        "request_digest": request_digest,
         "authorization_mode": authorization_mode,
     }
 
@@ -2158,12 +2213,17 @@ def _make_silent_automation_fingerprint(
         "turn_id": authorization.get("turn_id"),
         "session_key": authorization.get("session_key"),
         "scope_digest": authorization.get("scope_digest"),
+        "request_digest": authorization.get("request_digest"),
         "authorization_mode": authorization.get("authorization_mode"),
     }
     if (
         not all(isinstance(value, str) and value for value in claims.values())
         or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(
             str(claims["scope_digest"])
+        )
+        is None
+        or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(
+            str(claims["request_digest"])
         )
         is None
     ):
@@ -5790,6 +5850,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_id=session_id,
                         session_key=gateway_session_key or "",
                         scope=execution_scope,
+                        trusted_task_message=trusted_task_message,
+                        skill_slug=skill_slug,
                     )
                     or {}
                 )

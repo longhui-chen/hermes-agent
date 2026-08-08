@@ -401,6 +401,7 @@ class TestIdempotencyCache:
             "turn_id": "turn-1",
             "session_key": "zettlab:user:agent-1:session-1",
             "scope_digest": "c" * 64,
+            "request_digest": "e" * 64,
             "authorization_mode": "automatic",
         }
         fingerprint = api_server_module._make_silent_automation_fingerprint(
@@ -418,6 +419,9 @@ class TestIdempotencyCache:
         )
         assert fingerprint != api_server_module._make_silent_automation_fingerprint(
             {**authorization, "scope_digest": "d" * 64}
+        )
+        assert fingerprint != api_server_module._make_silent_automation_fingerprint(
+            {**authorization, "request_digest": "f" * 64}
         )
         assert token_a not in fingerprint
         assert token_b not in fingerprint
@@ -1704,12 +1708,17 @@ class TestChatCompletionsEndpoint:
         skill_slug = "video-edit-workflow-mini"
         task = "run the selected skill"
         scope = {"operation": "weekly_memory_video", "task_id": turn_id}
+        request_digest = api_server_module._business_execution_request_digest(
+            task,
+            skill_slug,
+        )
         authorization = {
             "agent_id": "memory-agent",
             "turn_id": turn_id,
             "session_id": session_id,
             "session_key": session_id,
             "scope_digest": "d" * 64,
+            "request_digest": request_digest,
             "authorization_mode": "automatic",
         }
         payload = {
@@ -1732,13 +1741,21 @@ class TestChatCompletionsEndpoint:
             "X-Zettlab-Execution-Scope-Digest": "d" * 64,
         }
 
+        async def authorize_request(**kwargs):
+            if (
+                kwargs["trusted_task_message"] != task
+                or kwargs["skill_slug"] != skill_slug
+            ):
+                return None
+            return authorization
+
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(
                 api_server_module,
                 "_authorize_business_execution",
                 new_callable=AsyncMock,
-                return_value=authorization,
+                side_effect=authorize_request,
             ) as authorize, patch.object(
                 auth_adapter,
                 "_run_agent",
@@ -1750,7 +1767,7 @@ class TestChatCompletionsEndpoint:
                     json=payload,
                     headers=headers,
                 )
-                retried_with_rebuilt_manifest = await cli.post(
+                retried_with_mutated_request = await cli.post(
                     "/v1/chat/completions",
                     json={
                         **payload,
@@ -1766,7 +1783,7 @@ class TestChatCompletionsEndpoint:
                 )
 
         assert trusted.status == 200
-        assert retried_with_rebuilt_manifest.status == 200
+        assert retried_with_mutated_request.status == 403
         assert authorize.await_count == 2
         assert authorize.await_args_list[0].kwargs == {
             "business_execution_token": token,
@@ -1774,6 +1791,8 @@ class TestChatCompletionsEndpoint:
             "session_id": session_id,
             "session_key": session_id,
             "scope": scope,
+            "trusted_task_message": task,
+            "skill_slug": skill_slug,
         }
         assert mock_run.await_count == 1
         assert mock_run.await_args.kwargs["execution_policy"] == "silent_automation"
@@ -2018,6 +2037,10 @@ class TestChatCompletionsEndpoint:
             "session_id": session_id,
             "session_key": session_id,
             "scope_digest": "1" * 64,
+            "request_digest": api_server_module._business_execution_request_digest(
+                task,
+                skill_slug,
+            ),
             "authorization_mode": "automatic",
         }
 
@@ -2163,6 +2186,10 @@ class TestChatCompletionsEndpoint:
             "session_id": session_id,
             "session_key": session_id,
             "scope_digest": "2" * 64,
+            "request_digest": api_server_module._business_execution_request_digest(
+                task,
+                skill_slug,
+            ),
             "authorization_mode": "automatic",
         }
 
@@ -2253,6 +2280,10 @@ class TestChatCompletionsEndpoint:
             "session_id": session_id,
             "session_key": session_id,
             "scope_digest": "3" * 64,
+            "request_digest": api_server_module._business_execution_request_digest(
+                task,
+                skill_slug,
+            ),
             "authorization_mode": "automatic",
         }
         policies = []
@@ -2339,6 +2370,10 @@ class TestChatCompletionsEndpoint:
             "turn_id": turn_id,
             "session_id": session_id,
             "session_key": session_id,
+            "request_digest": api_server_module._business_execution_request_digest(
+                "run the manifest",
+                "",
+            ),
             "authorization_mode": "automatic",
         }
         authorization_by_token = {
