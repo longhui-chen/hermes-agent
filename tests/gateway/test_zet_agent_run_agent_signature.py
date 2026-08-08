@@ -180,6 +180,8 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
 
     assert constructed[0]["skip_memory"] is True
     assert constructed[1]["skip_memory"] is False
+    assert constructed[0]["strict_memory_isolation"] is True
+    assert constructed[1]["strict_memory_isolation"] is False
     assert instances[0]._persist_disabled is True
     assert instances[0]._session_db is None
     assert instances[0]._session_json_enabled is False
@@ -296,6 +298,7 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
 
     assert result["final_response"] == "cancelled"
     assert constructed[0]["skip_memory"] is True
+    assert constructed[0]["strict_memory_isolation"] is True
     assert observed == {
         "business_token": "",
         "execution_policy": "silent_automation",

@@ -6057,11 +6057,22 @@ def _run_video_edit_runtime_command_if_allowed(
             )
             if trusted_env.get(key)
         }
+        trusted_context = {
+            key: trusted_env[key]
+            for key in (
+                "HERMES_TURN_ID",
+                "HERMES_SESSION_KEY",
+                "HERMES_GATEWAY_SESSION_KEY",
+                "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+            )
+            if trusted_env.get(key)
+        }
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
         payload = {
             "script": parsed.argv[1],
             "argv": parsed.argv[1:],
             "env": trusted_env,
+            "context": trusted_context,
             "secrets": trusted_secrets,
             "cwd": run_cwd,
             "source_bundle": _trusted_video_edit_source_bundle(

@@ -610,6 +610,12 @@ def _extract_business_execution_token(raw: Any) -> str:
     return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
 
 
+def _extract_execution_scope_digest(raw: Any) -> str:
+    """Accept only local-server's canonical execution-scope receipt."""
+    digest = str(raw or "").strip()
+    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
+
+
 _BUSINESS_EXECUTION_AUTHORIZATION_PATH = (
     "/api/v1/ai-proxy/business/authorization/check"
 )
@@ -2124,9 +2130,23 @@ _idem_cache = _IdempotencyCache()
 def _make_request_fingerprint(
     body: Dict[str, Any],
     keys: List[str],
+    *,
+    business_execution_token: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
-    return hashlib.sha256(repr(subset).encode("utf-8")).hexdigest()
+    body_fingerprint = hashlib.sha256(repr(subset).encode("utf-8")).hexdigest()
+    token = _extract_business_execution_token(business_execution_token)
+    if not token:
+        return body_fingerprint
+    token_digest = hashlib.sha256(
+        b"zettlab-business-execution-token-v1\0" + token.encode("ascii")
+    ).hexdigest()
+    return hashlib.sha256(
+        b"zettlab-request-idempotency-v2\0"
+        + body_fingerprint.encode("ascii")
+        + b"\0"
+        + token_digest.encode("ascii")
+    ).hexdigest()
 
 
 def _make_silent_automation_fingerprint(
@@ -5626,6 +5646,9 @@ class APIServerAdapter(BasePlatformAdapter):
         business_execution_token = _extract_business_execution_token(
             request.headers.get("X-Zettlab-Business-Execution-Token", "")
         )
+        requested_execution_scope_digest = _extract_execution_scope_digest(
+            request.headers.get("X-Zettlab-Execution-Scope-Digest", "")
+        )
         requested_execution_policy = _extract_requested_execution_policy(body)
         requested_silent_automation = (
             requested_execution_policy == "silent_automation"
@@ -5759,17 +5782,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if requested_silent_automation:
             execution_scope = _extract_execution_scope(body)
-            execution_authorization = (
-                await _authorize_business_execution(
-                    business_execution_token=business_execution_token,
-                    turn_id=turn_id,
-                    session_id=session_id,
-                    session_key=gateway_session_key or "",
-                    scope=execution_scope,
+            if requested_execution_scope_digest:
+                execution_authorization = (
+                    await _authorize_business_execution(
+                        business_execution_token=business_execution_token,
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        session_key=gateway_session_key or "",
+                        scope=execution_scope,
+                    )
+                    or {}
                 )
-                or {}
-            )
-            if not execution_authorization:
+            if (
+                not execution_authorization
+                or execution_authorization.get("scope_digest")
+                != requested_execution_scope_digest
+            ):
                 # A silent request is an internal capability boundary. Never
                 # downgrade an invalid receipt to an ordinary turn: that would
                 # expose the caller's history/memory and interactive tools.
@@ -6092,6 +6120,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "stream",
                         "metadata",
                     ],
+                    business_execution_token=trusted_business_execution_token,
                 )
             )
             try:

@@ -33,6 +33,7 @@ def _reset_runtime_anchor(monkeypatch):
             "HERMES_TURN_ID": "turn-1",
             "HERMES_SESSION_KEY": "session-1",
             "HERMES_GATEWAY_SESSION_KEY": "stable-session-1",
+            "ZETTLAB_EXECUTION_SCOPE_DIGEST": "d" * 64,
         },
     )
     monkeypatch.setattr(
@@ -71,6 +72,10 @@ def _write_trusted_script(tmp_path, name="workflow_state.py"):
         from _zettlab_video_runtime_context import get as runtime_value
 
         print("execution=" + runtime_value("ZETTLAB_BUSINESS_EXECUTION_TOKEN"))
+        print("runtime-turn=" + runtime_value("HERMES_TURN_ID"))
+        print("runtime-session=" + runtime_value("HERMES_SESSION_KEY"))
+        print("runtime-gateway=" + runtime_value("HERMES_GATEWAY_SESSION_KEY"))
+        print("runtime-scope=" + runtime_value("ZETTLAB_EXECUTION_SCOPE_DIGEST"))
         print("agent=" + os.environ.get("ZET_AGENT_ID", ""))
         print("turn=" + os.environ.get("HERMES_TURN_ID", ""))
         print("gateway=" + os.environ.get("HERMES_GATEWAY_SESSION_KEY", ""))
@@ -189,6 +194,10 @@ def test_trusted_video_runner_receives_only_current_scoped_capability(monkeypatc
     assert result["video_edit_runtime_direct"] is True
     assert result["exit_code"] == 0
     assert "execution=[REDACTED]" in result["output"]
+    assert "runtime-turn=turn-1" in result["output"]
+    assert "runtime-session=session-1" in result["output"]
+    assert "runtime-gateway=stable-session-1" in result["output"]
+    assert f"runtime-scope={'d' * 64}" in result["output"]
     assert "agent=agent-1" in result["output"]
     assert "turn=turn-1" in result["output"]
     assert "gateway=stable-session-1" in result["output"]
@@ -393,6 +402,12 @@ def test_trusted_video_runner_keeps_capability_out_of_wrapper_process_env(monkey
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
     assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
     assert captured["secrets"]["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] == "capability-secret"
+    assert captured["context"] == {
+        "HERMES_TURN_ID": "turn-1",
+        "HERMES_SESSION_KEY": "session-1",
+        "HERMES_GATEWAY_SESSION_KEY": "stable-session-1",
+        "ZETTLAB_EXECUTION_SCOPE_DIGEST": "d" * 64,
+    }
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["secrets"]
     assert "ZETTLAB_CONNECTORS_URL" not in captured["secrets"]
     assert "pythonpath" not in captured

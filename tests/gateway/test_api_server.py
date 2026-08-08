@@ -1488,7 +1488,7 @@ class TestToolsetsEndpoint:
 
 class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
-    async def test_ordinary_idempotency_ignores_business_execution_token(
+    async def test_ordinary_idempotency_isolated_by_business_execution_token(
         self, adapter, monkeypatch, caplog
     ):
         cache = _IdempotencyCache()
@@ -1549,17 +1549,28 @@ class TestChatCompletionsEndpoint:
                 )
                 other_token_body = await other_token.json()
 
-        assert [first.status, same_scope.status, other_token.status] == [
+                missing_token = await cli.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={"Idempotency-Key": "same-key"},
+                )
+                missing_token_body = await missing_token.json()
+
+        assert [first.status, same_scope.status, other_token.status, missing_token.status] == [
+            200,
             200,
             200,
             200,
         ]
         assert first_body["choices"][0]["message"]["content"] == "run-1"
         assert same_scope_body["choices"][0]["message"]["content"] == "run-1"
-        assert other_token_body["choices"][0]["message"]["content"] == "run-1"
-        assert calls == [token_a]
+        assert other_token_body["choices"][0]["message"]["content"] == "run-2"
+        assert missing_token_body["choices"][0]["message"]["content"] == "run-3"
+        assert calls == [token_a, token_b, ""]
         cache_state = repr((cache._store, cache._inflight))
-        response_state = repr((first_body, same_scope_body, other_token_body))
+        response_state = repr(
+            (first_body, same_scope_body, other_token_body, missing_token_body)
+        )
         assert token_a not in cache_state
         assert token_b not in cache_state
         assert token_a not in response_state
@@ -1718,6 +1729,7 @@ class TestChatCompletionsEndpoint:
             "X-Hermes-Session-Key": session_id,
             "X-Hermes-Session-Id": session_id,
             "X-Zettlab-Business-Execution-Token": token,
+            "X-Zettlab-Execution-Scope-Digest": "d" * 64,
         }
 
         app = _create_app(auth_adapter)
@@ -1770,6 +1782,85 @@ class TestChatCompletionsEndpoint:
         assert mock_run.await_args.kwargs["trusted_skill_slug"] == skill_slug
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("scope_digest_header", "authorization_digest", "authorize_count"),
+        [
+            ("", "d" * 64, 0),
+            ("D" * 64, "d" * 64, 0),
+            ("c" * 64, "d" * 64, 1),
+        ],
+    )
+    async def test_silent_execution_rejects_untrusted_scope_digest_header(
+        self,
+        auth_adapter,
+        monkeypatch,
+        scope_digest_header,
+        authorization_digest,
+        authorize_count,
+    ):
+        monkeypatch.setattr(api_server_module, "_idem_cache", _IdempotencyCache())
+        turn_id = "pvm-digest-" + "a" * 20
+        session_id = "proactive-" + turn_id
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "run the manifest"}],
+            "stream": False,
+            "metadata": {
+                "execution_policy": "silent_automation",
+                "turn_id": turn_id,
+                "execution_scope": {
+                    "operation": "weekly_memory_video",
+                    "task_id": turn_id,
+                },
+            },
+        }
+        authorization = {
+            "agent_id": "memory-agent",
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "session_key": session_id,
+            "scope_digest": authorization_digest,
+            "authorization_mode": "automatic",
+        }
+        headers = {
+            "Authorization": "Bearer sk-secret",
+            "Idempotency-Key": "silent-digest-boundary",
+            "X-Hermes-Session-Key": session_id,
+            "X-Hermes-Session-Id": session_id,
+            "X-Zettlab-Business-Execution-Token": "a" * 64,
+        }
+        if scope_digest_header:
+            headers["X-Zettlab-Execution-Scope-Digest"] = scope_digest_header
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                api_server_module,
+                "_authorize_business_execution",
+                new_callable=AsyncMock,
+                return_value=authorization,
+            ) as authorize, patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as run_agent:
+                run_agent.return_value = (
+                    {"final_response": "unexpected", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                data = await response.json()
+
+        assert response.status == 403
+        assert data["error"]["code"] == "invalid_silent_automation_authorization"
+        assert authorize.await_count == authorize_count
+        run_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_invalid_silent_authorization_fails_before_context_or_agent_work(
         self,
         auth_adapter,
@@ -1797,6 +1888,7 @@ class TestChatCompletionsEndpoint:
             "X-Hermes-Session-Key": session_id,
             "X-Hermes-Session-Id": session_id,
             "X-Zettlab-Business-Execution-Token": token,
+            "X-Zettlab-Execution-Scope-Digest": "1" * 64,
         }
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -1958,6 +2050,7 @@ class TestChatCompletionsEndpoint:
                         "X-Hermes-Session-Key": session_id,
                         "X-Hermes-Session-Id": session_id,
                         "X-Zettlab-Business-Execution-Token": token,
+                        "X-Zettlab-Execution-Scope-Digest": "1" * 64,
                     },
                 )
 
@@ -2023,6 +2116,7 @@ class TestChatCompletionsEndpoint:
                         "X-Hermes-Session-Key": session_id,
                         "X-Hermes-Session-Id": session_id,
                         "X-Zettlab-Business-Execution-Token": token,
+                        "X-Zettlab-Execution-Scope-Digest": "2" * 64,
                     },
                 )
                 data = await response.json()
@@ -2101,6 +2195,7 @@ class TestChatCompletionsEndpoint:
                         "X-Hermes-Session-Key": session_id,
                         "X-Hermes-Session-Id": session_id,
                         "X-Zettlab-Business-Execution-Token": token,
+                        "X-Zettlab-Execution-Scope-Digest": "2" * 64,
                     },
                 )
 
@@ -2143,6 +2238,7 @@ class TestChatCompletionsEndpoint:
             "X-Hermes-Session-Key": session_id,
             "X-Hermes-Session-Id": session_id,
             "X-Zettlab-Business-Execution-Token": token,
+            "X-Zettlab-Execution-Scope-Digest": "3" * 64,
         }
         ordinary_body = {
             **body,
@@ -2286,6 +2382,7 @@ class TestChatCompletionsEndpoint:
                         headers={
                             **headers,
                             "X-Zettlab-Business-Execution-Token": token,
+                            "X-Zettlab-Execution-Scope-Digest": authorization_by_token[token]["scope_digest"],
                         },
                     )
                     responses.append((response, await response.json()))
