@@ -5565,7 +5565,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # into local-server's HMAC proof. Text-only is intentional: a digest
         # that ignored image bytes would be replayable.
         skill_slug = _extract_skill_slug(body)
-        task_digest = _business_execution_task_digest(user_message)
+        proof_task_message = _trusted_skill_task_message(user_message, skill_slug)
+        task_digest = _business_execution_task_digest(proof_task_message)
         execution_policy = _extract_execution_policy(
             body,
             business_execution_token,
@@ -5576,6 +5577,14 @@ class APIServerAdapter(BasePlatformAdapter):
             skill_slug=skill_slug,
             task_digest=task_digest,
         )
+        if execution_policy == "silent_automation" and stream:
+            return web.json_response(
+                _openai_error(
+                    "silent_automation requires stream=false so retries remain idempotent",
+                    param="stream",
+                ),
+                status=400,
+            )
 
         metadata = body.get("metadata")
         requested_execution_policy = ""
@@ -5606,8 +5615,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
 
-        # Explicit skill invocation (zet_agent hook; base no-op): triggered
-        # ONLY by metadata.skill_slug — never by sniffing the message text.
+        # Explicit skill selection is triggered ONLY by metadata.skill_slug —
+        # never by sniffing the message text. Ordinary turns may pre-expand the
+        # selected Skill through the zet_agent hook. Verified silent turns keep
+        # the trusted task/slug but skip pre-expansion entirely: their first
+        # model action must load the startup-snapshotted bytes through skill_view.
         # The expansion runs LATE on purpose; the placement is load-bearing:
         #   - AFTER session_id is final, so skill templates resolve
         #     ${HERMES_SESSION_ID} against the real session (session_id is
@@ -5625,8 +5637,11 @@ class APIServerAdapter(BasePlatformAdapter):
             and body.get("tool_choice") != "none"
             and (not requested_silent_automation or execution_policy == "silent_automation")
         )
+        skill_expansion_enabled = bool(
+            skill_selection_enabled and execution_policy != "silent_automation"
+        )
         trusted_user_message = (
-            _trusted_skill_task_message(user_message, skill_slug)
+            proof_task_message
             if skill_selection_enabled
             else user_message
         )
@@ -5637,10 +5652,10 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _expanded_user_message(on_settled=None):
-            if not skill_selection_enabled:
+            if not skill_expansion_enabled:
                 if on_settled is not None:
                     on_settled()
-                return user_message
+                return trusted_user_message
             return await self._expand_inbound_skill_invocation(
                 user_message, trusted_skill_slug, session_id=session_id,
                 on_settled=on_settled,

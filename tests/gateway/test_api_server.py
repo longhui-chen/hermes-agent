@@ -1814,6 +1814,144 @@ class TestChatCompletionsEndpoint:
                 assert mock_run.await_args.kwargs["trusted_skill_slug"] == ""
 
     @pytest.mark.asyncio
+    async def test_trusted_silent_turn_strips_quick_pick_before_proof_and_skips_expansion(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        turn_id = "pvm-" + "c" * 24
+        session_id = "proactive-" + turn_id
+        token = "c" * 64
+        action_token = "profile-action-secret"
+        skill_slug = "video-edit-workflow-mini"
+        task = "run the frozen manifest"
+        displayed_task = f"/{skill_slug} {task}"
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": displayed_task}],
+            "stream": False,
+            "metadata": {
+                "execution_policy": "silent_automation",
+                "turn_id": turn_id,
+                "skill_slug": skill_slug,
+            },
+        }
+        proof = api_server_module._business_execution_proof(
+            action_token,
+            token,
+            "silent_automation",
+            session_id,
+            session_id,
+            turn_id,
+            skill_slug,
+            api_server_module._business_execution_task_digest(task),
+        )
+        monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", action_token)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter,
+                "_expand_inbound_skill_invocation",
+                new_callable=AsyncMock,
+            ) as expand, patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as run_agent:
+                run_agent.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=payload,
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": session_id,
+                        "X-Hermes-Session-Id": session_id,
+                        "X-Zettlab-Business-Execution-Token": token,
+                        "X-Zettlab-Business-Execution-Proof": proof,
+                    },
+                )
+
+        assert response.status == 200
+        expand.assert_not_awaited()
+        assert run_agent.await_args.kwargs["execution_policy"] == "silent_automation"
+        assert run_agent.await_args.kwargs["business_execution_token"] == token
+        assert run_agent.await_args.kwargs["user_message"] == task
+        assert run_agent.await_args.kwargs["trusted_user_message"] == task
+        assert run_agent.await_args.kwargs["trusted_skill_slug"] == skill_slug
+
+    @pytest.mark.asyncio
+    async def test_trusted_silent_stream_fails_before_context_or_agent_work(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        turn_id = "pvm-" + "d" * 24
+        session_id = "proactive-" + turn_id
+        token = "d" * 64
+        action_token = "profile-action-secret"
+        skill_slug = "video-edit-workflow-mini"
+        task = "run the frozen manifest"
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": task}],
+            "stream": True,
+            "metadata": {
+                "execution_policy": "silent_automation",
+                "turn_id": turn_id,
+                "skill_slug": skill_slug,
+            },
+        }
+        proof = api_server_module._business_execution_proof(
+            action_token,
+            token,
+            "silent_automation",
+            session_id,
+            session_id,
+            turn_id,
+            skill_slug,
+            api_server_module._business_execution_task_digest(task),
+        )
+        monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", action_token)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter,
+                "_ensure_session_db_async",
+                new_callable=AsyncMock,
+            ) as ensure_db, patch.object(
+                auth_adapter,
+                "_expand_inbound_skill_invocation",
+                new_callable=AsyncMock,
+            ) as expand, patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=payload,
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": session_id,
+                        "X-Hermes-Session-Id": session_id,
+                        "X-Zettlab-Business-Execution-Token": token,
+                        "X-Zettlab-Business-Execution-Proof": proof,
+                    },
+                )
+                data = await response.json()
+
+        assert response.status == 400
+        assert data["error"]["param"] == "stream"
+        ensure_db.assert_not_awaited()
+        expand.assert_not_awaited()
+        run_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_trusted_silent_turn_never_loads_or_forwards_chat_context(
         self,
         auth_adapter,
