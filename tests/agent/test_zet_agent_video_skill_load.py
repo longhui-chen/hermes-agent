@@ -743,6 +743,7 @@ def test_trusted_video_receipt_preserves_stable_and_lineage_sessions():
         session_id="api-lineage-tip",
         gateway_session_key="proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
         execution_policy="silent_automation",
+        execution_scope_digest="4" * 64,
     )
     token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
     try:
@@ -756,6 +757,7 @@ def test_trusted_video_receipt_preserves_stable_and_lineage_sessions():
         == "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
     )
     assert captured["HERMES_EXECUTION_POLICY"] == "silent_automation"
+    assert captured["ZETTLAB_EXECUTION_SCOPE_DIGEST"] == "4" * 64
 
 
 @pytest.mark.parametrize(

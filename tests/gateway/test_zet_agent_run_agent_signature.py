@@ -166,23 +166,11 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
     monkeypatch.setattr(adapter, "_session_model_override_for", lambda _key: None)
-    bound_session_keys = []
-    monkeypatch.setattr(
-        adapter,
-        "_bind_turn_session_context",
-        lambda session_key, session_id="": bound_session_keys.append(
-            (session_key, session_id)
-        ),
-    )
-
     adapter._create_agent(
         session_id="api-lineage-tip",
-        gateway_session_key="profile-scoped-interaction-key",
+        gateway_session_key="proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
         request_overrides={
             "_zet_execution_policy": "silent_automation",
-            "_zet_stable_gateway_session_key": (
-                "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
-            ),
         },
     )
     adapter._create_agent(
@@ -197,10 +185,11 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
     assert instances[0]._session_json_enabled is False
     assert instances[1]._persist_disabled is False
     assert instances[1]._session_json_enabled is True
-    assert bound_session_keys == [
-        ("proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa", "api-lineage-tip"),
-        ("ordinary-session", "ordinary-session"),
-    ]
+    assert (
+        constructed[0]["gateway_session_key"]
+        == "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    assert constructed[1]["gateway_session_key"] == "ordinary-session"
     assert "_zet_stable_gateway_session_key" not in (
         constructed[0].get("request_overrides") or {}
     )
@@ -445,7 +434,10 @@ async def test_zet_agent_preserves_stable_session_key_across_queue_scoping(
 
     async def fake_run_agent(self, **kwargs):
         del self
+        from tools.approval import get_current_session_key
+
         captured.update(kwargs)
+        captured["approval_session_key"] = get_current_session_key(default="")
         return (
             {"final_response": "ok", "session_id": "api-lineage-tip"},
             {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
@@ -461,9 +453,10 @@ async def test_zet_agent_preserves_stable_session_key_across_queue_scoping(
         gateway_session_key=stable_key,
     )
 
-    assert captured["gateway_session_key"] == adapter._interaction_queue_key(
+    assert captured["gateway_session_key"] == stable_key
+    assert captured["approval_session_key"] == adapter._interaction_queue_key(
         "api-lineage-tip"
     )
-    assert captured["request_overrides"][
-        "_zet_stable_gateway_session_key"
-    ] == stable_key
+    assert "_zet_stable_gateway_session_key" not in (
+        captured.get("request_overrides") or {}
+    )

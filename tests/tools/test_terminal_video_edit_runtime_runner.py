@@ -32,6 +32,7 @@ def _reset_runtime_anchor(monkeypatch):
             "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "capability-secret",
             "HERMES_TURN_ID": "turn-1",
             "HERMES_SESSION_KEY": "session-1",
+            "HERMES_GATEWAY_SESSION_KEY": "stable-session-1",
         },
     )
     monkeypatch.setattr(
@@ -190,6 +191,7 @@ def test_trusted_video_runner_receives_only_current_scoped_capability(monkeypatc
     assert "execution=[REDACTED]" in result["output"]
     assert "agent=agent-1" in result["output"]
     assert "turn=turn-1" in result["output"]
+    assert "gateway=stable-session-1" in result["output"]
     assert "connector-token=" in result["output"]
     assert "connector-url=" in result["output"]
     assert "connector-secret" not in result["output"]

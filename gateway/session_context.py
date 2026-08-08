@@ -136,6 +136,13 @@ _EXECUTION_POLICY: ContextVar = ContextVar(
     "HERMES_EXECUTION_POLICY",
     default=_UNSET,
 )
+# Digest returned by local-server after exact generic scope validation. It is
+# task-local authorization data and is exposed only through a dedicated trusted
+# runner receipt, never through the generic session environment map.
+_EXECUTION_SCOPE_DIGEST: ContextVar = ContextVar(
+    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+    default=_UNSET,
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -298,6 +305,7 @@ def set_turn_vars(
     plan_ack_revision_requested: str = "",
     business_execution_token: str = "",
     execution_policy: str = "",
+    execution_scope_digest: str = "",
 ) -> list:
     """Bind one request's turn identity and plan receipt task-locally."""
     global _session_context_engaged
@@ -310,6 +318,7 @@ def set_turn_vars(
         _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
         _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
         _EXECUTION_POLICY.set(execution_policy),
+        _EXECUTION_SCOPE_DIGEST.set(execution_scope_digest),
     ]
 
 
@@ -324,6 +333,7 @@ def clear_turn_vars(tokens: list) -> None:
             _PLAN_ACK_REVISION_REQUESTED,
             _BUSINESS_EXECUTION_TOKEN,
             _EXECUTION_POLICY,
+            _EXECUTION_SCOPE_DIGEST,
         ),
         tokens,
     ):
@@ -371,6 +381,15 @@ def execution_policy() -> str:
     if value is _UNSET or value is None:
         return ""
     return str(value).strip().lower()
+
+
+def execution_scope_digest() -> str:
+    """Return the local-server-validated generic execution scope digest."""
+    value = _EXECUTION_SCOPE_DIGEST.get()
+    if value is _UNSET or value is None:
+        return ""
+    normalized = str(value).strip().lower()
+    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -582,6 +601,7 @@ def reset_session_vars() -> None:
     _TURN_BINDING.set(_UNSET)
     _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
     _EXECUTION_POLICY.set(_UNSET)
+    _EXECUTION_SCOPE_DIGEST.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.

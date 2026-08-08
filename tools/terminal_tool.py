@@ -6042,12 +6042,9 @@ def _run_video_edit_runtime_command_if_allowed(
         trusted_env = build_video_edit_runtime_env()
         if not _video_edit_runtime_claims_match_receipt(parsed, trusted_env):
             return _video_edit_runtime_shell_guard_result(command)
-        # The proactive helper needs both identities: HERMES_SESSION_KEY is the
-        # current lineage bound to local-server's execution token, while the
-        # stable gateway key proves the hidden proactive run after compaction.
-        # Other helpers do not receive the extra routing value.
-        if script.name != "proactive_video.py":
-            trusted_env.pop("HERMES_GATEWAY_SESSION_KEY", None)
+        # Keep both identities inside the trusted worker: HERMES_SESSION_KEY is
+        # the current lineage, while HERMES_GATEWAY_SESSION_KEY binds helper
+        # authorization to the stable App/profile session across compaction.
         secret_values = [
             trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
             trusted_env.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),

@@ -213,6 +213,7 @@ class _TrustedExecutionReceipt:
     session_id: str
     gateway_session_key: str = ""
     execution_policy: str = ""
+    execution_scope_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -393,16 +394,19 @@ def _capture_trusted_execution_receipt(
         from gateway.session_context import (
             business_execution_token,
             execution_policy,
+            execution_scope_digest,
             get_session_env,
         )
 
         business_token = business_execution_token()
         bound_execution_policy = execution_policy()
+        bound_execution_scope_digest = execution_scope_digest()
         gateway_session_key = get_session_env("HERMES_SESSION_KEY")
         session_id = get_session_env("HERMES_SESSION_ID") or gateway_session_key
     except Exception:
         business_token = ""
         bound_execution_policy = ""
+        bound_execution_scope_digest = ""
         session_id = ""
         gateway_session_key = ""
 
@@ -414,6 +418,9 @@ def _capture_trusted_execution_receipt(
         session_id=str(session_id or "").strip(),
         gateway_session_key=str(gateway_session_key or "").strip(),
         execution_policy=str(bound_execution_policy or "").strip().lower(),
+        execution_scope_digest=str(
+            bound_execution_scope_digest or ""
+        ).strip().lower(),
     )
     present = {
         "agent_id": bool(receipt.agent_id),
@@ -424,8 +431,16 @@ def _capture_trusted_execution_receipt(
     }
     if not all(present.values()):
         logger.warning(
-            "zet_agent: trusted video execution receipt incomplete: %s",
+            "zet_agent: trusted execution receipt incomplete: %s",
             present,
+        )
+        return None
+    if receipt.execution_policy == "silent_automation" and (
+        not receipt.gateway_session_key
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.execution_scope_digest) is None
+    ):
+        logger.warning(
+            "zet_agent: trusted silent execution receipt missing stable scope"
         )
         return None
     return receipt
@@ -452,6 +467,10 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
         # Keep the policy in the frozen receipt so terminal authorization cannot
         # be weakened by a later session-context mutation.
         result["HERMES_EXECUTION_POLICY"] = receipt.execution_policy
+    if receipt.execution_scope_digest:
+        result["ZETTLAB_EXECUTION_SCOPE_DIGEST"] = (
+            receipt.execution_scope_digest
+        )
     return result
 
 

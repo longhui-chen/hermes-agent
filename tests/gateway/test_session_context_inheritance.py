@@ -33,6 +33,8 @@ import pytest
 import gateway.session_context as sc
 from gateway.session_context import (
     _BUSINESS_EXECUTION_TOKEN,
+    _EXECUTION_POLICY,
+    _EXECUTION_SCOPE_DIGEST,
     _SESSION_ASYNC_DELIVERY,
     _TURN_BINDING,
     _UNSET,
@@ -41,6 +43,7 @@ from gateway.session_context import (
     business_execution_token,
     clear_turn_vars,
     current_turn_identity,
+    execution_scope_digest,
     reset_session_vars,
     set_session_vars,
     set_turn_vars,
@@ -110,6 +113,8 @@ def _isolate_session_context():
     saved_async = _SESSION_ASYNC_DELIVERY.get()
     saved_turn_binding = _TURN_BINDING.get()
     saved_business_token = _BUSINESS_EXECUTION_TOKEN.get()
+    saved_execution_policy = _EXECUTION_POLICY.get()
+    saved_execution_scope_digest = _EXECUTION_SCOPE_DIGEST.get()
     saved_reference = sc._CURRENT_TURN_REFERENCE_IMAGE.get()
     saved_engaged = sc._session_context_engaged
     for var in _VAR_MAP.values():
@@ -117,6 +122,8 @@ def _isolate_session_context():
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
     _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
+    _EXECUTION_POLICY.set(_UNSET)
+    _EXECUTION_SCOPE_DIGEST.set(_UNSET)
     sc._CURRENT_TURN_REFERENCE_IMAGE.set("")
     sc._session_context_engaged = True  # a concurrent multi-session host is engaged
     try:
@@ -127,6 +134,8 @@ def _isolate_session_context():
         _SESSION_ASYNC_DELIVERY.set(saved_async)
         _TURN_BINDING.set(saved_turn_binding)
         _BUSINESS_EXECUTION_TOKEN.set(saved_business_token)
+        _EXECUTION_POLICY.set(saved_execution_policy)
+        _EXECUTION_SCOPE_DIGEST.set(saved_execution_scope_digest)
         sc._CURRENT_TURN_REFERENCE_IMAGE.set(saved_reference)
         sc._session_context_engaged = saved_engaged
         for k, v in saved_env.items():
@@ -258,6 +267,15 @@ def test_reset_session_vars_drops_inherited_business_execution_token_flow():
     asyncio.run(run_child())
 
     assert captured == {"token": "", "raw": _UNSET}
+
+
+def test_reset_session_vars_drops_inherited_execution_scope_digest():
+    _EXECUTION_SCOPE_DIGEST.set("a" * 64)
+
+    reset_session_vars()
+
+    assert execution_scope_digest() == ""
+    assert _EXECUTION_SCOPE_DIGEST.get() is _UNSET
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,13 @@
-"""Tests for _normalize_chat_content in the API server adapter."""
+"""Tests for API request normalization and trusted execution boundaries."""
+
+import pytest
 
 from gateway.platforms import api_server
 from gateway.platforms.api_server import (
-    _business_execution_proof,
+    _business_execution_authorization_url,
+    _extract_execution_scope,
     _extract_business_execution_token,
-    _extract_execution_policy,
+    _extract_requested_execution_policy,
     _extract_plan_ack,
     _extract_plan_auto_execute,
     _extract_response_mode,
@@ -25,118 +28,207 @@ class TestExtractBusinessExecutionToken:
 
 
 class TestExtractExecutionPolicy:
-    def test_silent_automation_requires_exact_local_server_proof(self):
-        body = {
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": "pvm-" + "a" * 24,
+    def test_requested_policy_is_only_an_explicit_transport_signal(self):
+        assert _extract_requested_execution_policy({}) == ""
+        assert _extract_requested_execution_policy({"metadata": "silent"}) == ""
+        assert _extract_requested_execution_policy(
+            {"metadata": {"execution_policy": 1}}
+        ) == ""
+        assert _extract_requested_execution_policy(
+            {"metadata": {"executionPolicy": " Silent_Automation "}}
+        ) == "silent_automation"
+
+
+class TestExecutionScope:
+    def test_scope_is_generic_bounded_and_canonicalized(self):
+        assert _extract_execution_scope(
+            {
+                "metadata": {
+                    "execution_scope": {
+                        " operation ": " weekly_memory ",
+                        "task_id": "task-1",
+                    }
+                }
             }
+        ) == {"operation": "weekly_memory", "task_id": "task-1"}
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            {},
+            {"": "value"},
+            {" key": "one", "key ": "two"},
+            {"key": "bad\x00value"},
+            {"key": "bad\nvalue"},
+            {"k" * 129: "value"},
+            {"key": "v" * 1025},
+            {f"key-{index}": "v" for index in range(65)},
+        ],
+    )
+    def test_malformed_or_unbounded_scope_is_rejected(self, scope):
+        assert _extract_execution_scope(
+            {"metadata": {"execution_scope": scope}}
+        ) == {}
+
+
+class TestBusinessAuthorizationURL:
+    @pytest.mark.parametrize(
+        ("append_url", "expected"),
+        [
+            (
+                "http://127.0.0.1:9420/api/v1/internal/chat/append",
+                "http://127.0.0.1:9420/api/v1/ai-proxy/business/authorization/check",
+            ),
+            (
+                "http://[::1]:9420/api/v1/internal/chat/append",
+                "http://[::1]:9420/api/v1/ai-proxy/business/authorization/check",
+            ),
+            (
+                "http://localhost:9420/api/v1/internal/chat/append",
+                "http://localhost:9420/api/v1/ai-proxy/business/authorization/check",
+            ),
+        ],
+    )
+    def test_derives_only_the_fixed_loopback_path(self, append_url, expected):
+        assert _business_execution_authorization_url(append_url) == expected
+
+    @pytest.mark.parametrize(
+        "append_url",
+        [
+            "https://127.0.0.1:9420/api/v1/internal/chat/append",
+            "http://192.168.1.10:9420/api/v1/internal/chat/append",
+            "http://127.0.0.1.attacker.invalid:9420/append",
+            "http://user:pass@127.0.0.1:9420/append",
+            "http://127.0.0.1:99999/append",
+        ],
+    )
+    def test_rejects_non_loopback_or_ambiguous_sources(self, append_url):
+        assert _business_execution_authorization_url(append_url) == ""
+
+
+class TestBusinessAuthorizationRequest:
+    def test_sends_bounded_scope_and_all_identity_headers(self, monkeypatch):
+        captured = {}
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, limit):
+                captured["read_limit"] = limit
+                return b'{"ok":true}'
+
+        def open_request(request, *, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return Response()
+
+        monkeypatch.setattr(api_server, "urlopen_hardened", open_request)
+        response = api_server._business_execution_authorization_request(
+            "http://127.0.0.1:9420/api/v1/ai-proxy/business/authorization/check",
+            action_token="a" * 64,
+            business_execution_token="b" * 64,
+            turn_id="turn-1",
+            session_id="lineage-1",
+            session_key="stable-1",
+            scope={"operation": "weekly_memory", "task_id": "task-1"},
+        )
+
+        request = captured["request"]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        assert response == {"ok": True}
+        assert request.get_method() == "POST"
+        assert request.data == (
+            b'{"scope":{"operation":"weekly_memory","task_id":"task-1"}}'
+        )
+        assert headers["x-zettlab-agent-action-token"] == "a" * 64
+        assert headers["x-zettlab-business-execution-token"] == "b" * 64
+        assert headers["x-hermes-turn-id"] == "turn-1"
+        assert headers["x-hermes-session-id"] == "lineage-1"
+        assert headers["x-hermes-session-key"] == "stable-1"
+        assert headers["content-type"] == "application/json"
+        assert headers["accept"] == "application/json"
+        assert captured["timeout"] == 1.5
+        assert captured["read_limit"] == (16 << 10) + 1
+
+
+class TestBusinessAuthorization:
+    @pytest.mark.asyncio
+    async def test_requires_exact_local_server_receipt(self, monkeypatch):
+        action_token = "a" * 64
+        business_token = "b" * 64
+        turn_id = "turn-1"
+        session_id = "api-lineage-1"
+        session_key = "zettlab:user:agent-1:session-1"
+        scope = {"operation": "weekly_memory", "task_id": "task-1"}
+        secrets = {
+            "ZETTLAB_AGENT_ACTION_TOKEN": action_token,
+            "ZET_AGENT_ID": "agent-1",
         }
-        token = "a" * 64
-        action_token = "profile-action-secret"
-        session_id = "proactive-pvm-" + "a" * 24
-        skill_slug = "video-edit-workflow-mini"
-        task_digest = "d" * 64
-        proof = _business_execution_proof(
-            action_token,
-            token,
-            "silent_automation",
-            session_id,
-            session_id,
-            "pvm-" + "a" * 24,
-            skill_slug,
-            task_digest,
+        monkeypatch.setattr(
+            api_server,
+            "_get_scoped_secret",
+            lambda name, default="": secrets.get(name, default),
         )
-        # This vector is shared with local-server's Go signer test.
-        assert proof == "v1=420358a690e5c7ea0e7342ab9b0c26fd2753e100eef582516bd08f91da813d98"
-
-        assert _extract_execution_policy(
-            body,
-            token,
-            proof,
-            gateway_session_key=session_id,
-            session_id=session_id,
-            turn_id="pvm-" + "a" * 24,
-            skill_slug=skill_slug,
-            task_digest=task_digest,
-            action_token=action_token,
-        ) == "silent_automation"
-        assert _extract_execution_policy(
-            body,
-            token,
-            proof,
-            gateway_session_key=session_id,
-            session_id=session_id,
-            turn_id="pvm-" + "a" * 24,
-            skill_slug=skill_slug,
-            task_digest=task_digest,
-            action_token="wrong-profile-secret",
-        ) == ""
-        assert _extract_execution_policy(
-            body,
-            token,
-            proof,
-            gateway_session_key=session_id,
-            session_id=session_id,
-            turn_id="pvm-" + "a" * 24,
-            skill_slug="another-skill",
-            task_digest=task_digest,
-            action_token=action_token,
-        ) == ""
-        assert _extract_execution_policy(
-            body,
-            token,
-            proof,
-            gateway_session_key=session_id,
-            session_id=session_id,
-            turn_id="pvm-" + "a" * 24,
-            skill_slug=skill_slug,
-            task_digest="e" * 64,
-            action_token=action_token,
-        ) == ""
-        assert _extract_execution_policy(body, token) == ""
-        assert _extract_execution_policy(body, "") == ""
-        assert _extract_execution_policy(body, "not-a-capability") == ""
-
-    def test_unknown_or_malformed_policy_is_ignored(self):
-        token = "a" * 64
-        action_token = "profile-action-secret"
-        session_id = "proactive-pvm-" + "d" * 24
-        turn_id = "pvm-" + "d" * 24
-        skill_slug = "video-edit-workflow-mini"
-        task_digest = "e" * 64
-        proof = _business_execution_proof(
-            action_token,
-            token,
-            "silent_automation",
-            session_id,
-            session_id,
-            turn_id,
-            skill_slug,
-            task_digest,
+        monkeypatch.setattr(
+            api_server,
+            "_business_execution_authorization_url",
+            lambda: "http://127.0.0.1:9420/api/v1/ai-proxy/business/authorization/check",
         )
-        trusted = {
-            "business_execution_proof": proof,
-            "gateway_session_key": session_id,
-            "session_id": session_id,
+        response = {
+            "ok": True,
+            "scope_matched": True,
+            "scope_digest": "c" * 64,
+            "agent_id": "agent-1",
             "turn_id": turn_id,
-            "skill_slug": skill_slug,
-            "task_digest": task_digest,
-            "action_token": action_token,
+            "session_id": session_id,
+            "session_key": session_key,
+            "authorization_mode": "automatic",
         }
+        captured = {}
 
-        assert _extract_execution_policy({}, token, **trusted) == ""
-        assert _extract_execution_policy(
-            {"metadata": "silent_automation"}, token, **trusted
-        ) == ""
-        assert _extract_execution_policy(
-            {"metadata": {"execution_policy": "interactive"}}, token, **trusted
-        ) == ""
-        assert _extract_execution_policy(
-            {"metadata": {"executionPolicy": " silent_automation "}},
-            token,
-            **trusted,
-        ) == "silent_automation"
+        def authorize(url, **kwargs):
+            captured.update({"url": url, **kwargs})
+            return response
+
+        monkeypatch.setattr(
+            api_server,
+            "_business_execution_authorization_request",
+            authorize,
+        )
+        receipt = await api_server._authorize_business_execution(
+            business_execution_token=business_token,
+            turn_id=turn_id,
+            session_id=session_id,
+            session_key=session_key,
+            scope=scope,
+        )
+
+        assert receipt == {
+            "agent_id": "agent-1",
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "session_key": session_key,
+            "scope_digest": "c" * 64,
+            "authorization_mode": "automatic",
+        }
+        assert captured["action_token"] == action_token
+        assert captured["business_execution_token"] == business_token
+        assert captured["scope"] == scope
+
+        response["session_key"] = "another-session"
+        assert await api_server._authorize_business_execution(
+            business_execution_token=business_token,
+            turn_id=turn_id,
+            session_id=session_id,
+            session_key=session_key,
+            scope=scope,
+        ) is None
 
 
 class TestExtractResponseMode:
