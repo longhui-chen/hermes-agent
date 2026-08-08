@@ -111,9 +111,21 @@ class TestStore:
         monkeypatch.setattr("cron.connector_execution.enabled", lambda: True)
 
         with pytest.raises(store.SuggestionConnectorAuthorizationRequired):
-            store.accept_suggestion("linear")
+            store.accept_suggestion(rec["id"])
 
-        assert store.get_suggestion("linear")["status"] == "pending"
+        assert store.get_suggestion(rec["id"])["status"] == "pending"
+
+    def test_accept_linear_suggestion_proceeds_when_leases_disabled(self, store, monkeypatch):
+        """Negative control: the grant guard must not fire when the feature is off."""
+        rec = _add(store, key="linear-off")
+        rec["job_spec"]["skills"] = ["Linear"]
+        store._save_raw([rec])
+        monkeypatch.setattr("cron.connector_execution.enabled", lambda: False)
+
+        with patch("cron.jobs.create_job", lambda **k: {"id": "j"}):
+            assert store.accept_suggestion(rec["id"]) is not None
+
+        assert store.get_suggestion(rec["id"])["status"] == "accepted"
 
     def test_get_by_id_and_index_and_title(self, store):
         rec = _add(store, key="byref", title="Findable")
