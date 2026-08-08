@@ -539,6 +539,39 @@ class TestToolHandler:
             clear_session_vars(session_tokens)
             _servers.pop("memo_srv", None)
 
+    def test_managed_memo_forwards_context_without_migrated_config_flag(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("stored", is_error=False)
+        )
+        server = _make_mock_server("zettlab_memo", session=mock_session)
+        server._config = {}
+        _servers["zettlab_memo"] = server
+        session_tokens = set_session_vars(
+            user_id="account-ota", session_id="session-ota", profile="main"
+        )
+
+        try:
+            handler = _make_tool_handler("zettlab_memo", "memo_write", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"statement": "remember this"}))
+            assert result["result"] == "stored"
+            mock_session.call_tool.assert_called_once_with(
+                "memo_write",
+                arguments={"statement": "remember this"},
+                meta={
+                    "zettlab/profile_id": "main",
+                    "zettlab/session_id": "session-ota",
+                    "zettlab/account_id": "account-ota",
+                },
+            )
+        finally:
+            clear_session_vars(session_tokens)
+            _servers.pop("zettlab_memo", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers

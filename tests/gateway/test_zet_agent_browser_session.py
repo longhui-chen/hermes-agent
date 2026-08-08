@@ -4,7 +4,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.platforms.zet_agent import ZetAgentAdapter, _request_account_id
 from gateway.session_context import (
     get_session_env,
     pop_zettlab_browser_session_token,
@@ -12,6 +12,21 @@ from gateway.session_context import (
     zettlab_browser_session_token,
 )
 from tools import approval, browser_backend_router
+
+
+def test_request_account_id_prefers_explicit_managed_header():
+    request = SimpleNamespace(headers={
+        "X-Zettlab-Account-Id": "account-explicit",
+        "X-Hermes-Session-Key": "zettlab:account-fallback:main:chat-1",
+    })
+    assert _request_account_id(request) == "account-explicit"
+
+
+def test_request_account_id_falls_back_to_stable_zettlab_session_key():
+    request = SimpleNamespace(headers={
+        "X-Hermes-Session-Key": "zettlab:account-fallback:main:chat-1",
+    })
+    assert _request_account_id(request) == "account-fallback"
 
 
 @pytest.mark.asyncio

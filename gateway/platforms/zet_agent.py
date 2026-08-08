@@ -137,6 +137,18 @@ _zettlab_request_account_id: ContextVar[str] = ContextVar(
 def _request_account_id(request: "web.Request") -> str:
     """Return the bounded account identity asserted by managed local-server."""
     value = str(request.headers.get("X-Zettlab-Account-Id", "") or "").strip()
+    if not value:
+        # Compatibility for a partially upgraded device: local-server has
+        # always sent the authenticated stable session key in the form
+        # zettlab:<account>:<agent>:<conversation>.  The explicit account
+        # header remains authoritative; this fallback only keeps personal Memo
+        # writes working while the two packages roll forward independently.
+        session_key = str(
+            request.headers.get("X-Hermes-Session-Key", "") or ""
+        ).strip()
+        parts = session_key.split(":", 3)
+        if len(parts) == 4 and parts[0] == "zettlab" and parts[1] and parts[2]:
+            value = parts[1]
     return value[:256]
 
 

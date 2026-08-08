@@ -5062,9 +5062,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
         call_meta = None
-        if _parse_boolish(
+        # Zettlab Memo is a managed, loopback-only MCP transport whose
+        # personal-memory boundary depends on trusted per-turn identity.  Old
+        # profile config files can survive an OTA without the newer
+        # ``forward_context_meta`` flag, so do not make correctness depend on
+        # that migration having run before the first chat turn.  Other MCP
+        # servers remain opt-in.
+        forward_context_meta = server_name == "zettlab_memo" or _parse_boolish(
             server._config.get("forward_context_meta", False), default=False
-        ):
+        )
+        if forward_context_meta:
             try:
                 from gateway.session_context import get_session_env
 
