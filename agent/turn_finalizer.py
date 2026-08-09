@@ -541,6 +541,7 @@ def finalize_turn(
 
     _response_transformed = False
     _response_transform_suffix = ""
+    _canonical_response_required = False
     _structured_output = False
 
     # Plugin hook: transform_llm_output
@@ -556,6 +557,11 @@ def finalize_turn(
         _structured_output = response_format_requires_structured_output(
             (getattr(agent, "request_overrides", None) or {}).get("response_format")
         )
+
+        def _require_canonical_response() -> None:
+            nonlocal _canonical_response_required
+            _canonical_response_required = True
+
         _transform_results = _invoke_hook(
             "transform_llm_output",
             response_text=final_response or "",
@@ -571,6 +577,7 @@ def finalize_turn(
             completed=completed,
             failed=failed,
             interrupted=interrupted,
+            turn_id=turn_id,
             turn_exit_reason=_turn_exit_reason,
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
@@ -579,6 +586,10 @@ def finalize_turn(
                 getattr(agent, "_supports_followup_turns", True)
             ),
             streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
+            creation_action_receipt_transport=getattr(
+                agent, "_creation_action_receipt_transport", ""
+            ),
+            require_canonical_response=_require_canonical_response,
         )
         for _hook_result in _transform_results:
             if isinstance(_hook_result, str) and _hook_result:
@@ -747,6 +758,7 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_transform_suffix": _response_transform_suffix,
+        "canonical_response_required": _canonical_response_required,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,

@@ -14,6 +14,7 @@ PLUGIN_PATH = (
     / "creation-governor"
     / "__init__.py"
 )
+RECEIPT_TRANSPORT = "canonical_final_v1"
 
 
 def _load_plugin():
@@ -24,6 +25,23 @@ def _load_plugin():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     module._reset_state_for_tests()
+    original_pre_llm_call = getattr(module, "_on_pre_llm_call")
+    original_transform_llm_output = getattr(module, "_transform_llm_output")
+
+    def pre_llm_call(**kwargs):
+        kwargs.setdefault(
+            "creation_action_receipt_transport", RECEIPT_TRANSPORT
+        )
+        return original_pre_llm_call(**kwargs)
+
+    def transform_llm_output(**kwargs):
+        kwargs.setdefault(
+            "creation_action_receipt_transport", RECEIPT_TRANSPORT
+        )
+        return original_transform_llm_output(**kwargs)
+
+    setattr(module, "_on_pre_llm_call", pre_llm_call)
+    setattr(module, "_transform_llm_output", transform_llm_output)
     return module
 
 
@@ -128,6 +146,13 @@ class _Context:
 
 def _decode_envelope(text):
     prefix = "<!--creation-recommendation:start "
+    encoded = text.split(prefix, 1)[1].split("-->", 1)[0].strip()
+    encoded += "=" * (-len(encoded) % 4)
+    return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+
+
+def _decode_action_result(text):
+    prefix = "<!--creation-recommendation-action-result "
     encoded = text.split(prefix, 1)[1].split("-->", 1)[0].strip()
     encoded += "=" * (-len(encoded) % 4)
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
@@ -255,13 +280,85 @@ def test_api_server_never_evaluates_or_transforms_recommendations():
         platform="api_server",
         user_message="Analyze my Google Ads account.",
         conversation_history=[],
+        creation_action_receipt_transport="",
     ) is None
     assert llm.calls == []
     assert plugin._transform_llm_output(
         session_id="openai-client-session",
-        platform="api_server",
-        response_text="Here is the analysis.",
+            platform="api_server",
+            response_text="Here is the analysis.",
+            creation_action_receipt_transport="",
     ) is None
+
+
+def test_api_server_receipt_transport_enables_card_and_exact_turn_receipt():
+    plugin = _load_plugin()
+    plugin.register(_Context(_FakeLlm([_candidate()])))
+    plugin._on_pre_llm_call(
+        session_id="receipt-api-server",
+        platform="api_server",
+        turn_id="source-turn",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    )
+    shown = plugin._transform_llm_output(
+        session_id="receipt-api-server",
+        platform="api_server",
+        turn_id="source-turn",
+        response_text="Here is the analysis.",
+        completed=True,
+        failed=False,
+    )
+    payload = _decode_envelope(shown)
+
+    assert payload["action_receipts"] is True
+    plugin._on_pre_llm_call(
+        session_id="receipt-api-server",
+        platform="api_server",
+        turn_id="action-turn",
+        user_message=_recommendation_response(
+            "create", proposal_id=payload["proposal_id"]
+        ),
+        conversation_history=[],
+    )
+    output = plugin._transform_llm_output(
+        session_id="receipt-api-server",
+        platform="api_server",
+        turn_id="action-turn",
+        response_text="The native flow is ready.",
+        completed=True,
+        failed=False,
+    )
+
+    assert _decode_action_result(output) == {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": payload["proposal_id"],
+        "action": "create",
+        "status": "accepted",
+    }
+
+
+def test_api_server_receipt_transport_covers_optional_tool_in_same_turn():
+    plugin = _load_plugin()
+    plugin.register(_Context(_FakeLlm([_candidate(decision="none")])))
+    plugin._on_pre_llm_call(
+        session_id="receipt-api-server-tool",
+        platform="api_server",
+        turn_id="source-turn",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    )
+
+    result = json.loads(
+        plugin._detect_creation_opportunity(
+            _candidate(),
+            session_id="receipt-api-server-tool",
+            platform="api_server",
+        )
+    )
+
+    assert result["status"] == "proposal_ready"
 
 
 def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
@@ -309,6 +406,7 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
         "confidence": 0.82,
         "evidence_turn_ids": ["evidence-1"],
         "source_turn_id": "turn-1",
+        "action_receipts": True,
     }
     assert (
         plugin._transform_llm_output(
@@ -556,6 +654,7 @@ def test_session_mute_persists_across_plugin_state_reset_and_can_be_undone(
 
     mute_context = plugin._on_pre_llm_call(
         session_id="muted-session",
+        turn_id="mute-turn",
         user_message=_recommendation_response(
             "mute_session", proposal_id=proposal_id
         ),
@@ -594,10 +693,21 @@ def test_session_mute_persists_across_plugin_state_reset_and_can_be_undone(
 
     unmute_context = plugin._on_pre_llm_call(
         session_id="muted-session",
-        user_message=_recommendation_response("unmute_session"),
+        turn_id="unmute-turn",
+        user_message=_recommendation_response(
+            "unmute_session", proposal_id="unmute-correlation"
+        ),
         conversation_history=[],
     )
     assert "re-enabled proactive creation recommendations" in unmute_context["context"]
+    unmute_output = plugin._transform_llm_output(
+        session_id="muted-session",
+        turn_id="unmute-turn",
+        response_text="",
+        completed=False,
+        failed=True,
+    )
+    assert _decode_action_result(unmute_output)["status"] == "accepted"
     assert plugin._is_session_muted(state_key) is False
 
 
@@ -619,17 +729,237 @@ def test_mute_is_rejected_when_its_preference_cannot_be_persisted(monkeypatch):
 
     rejected = plugin._on_pre_llm_call(
         session_id="unpersisted-mute",
+        turn_id="mute-attempt",
         user_message=_recommendation_response("mute_session", proposal_id=proposal_id),
         conversation_history=[],
     )
     assert "invalid or expired" in rejected["context"]
     result = plugin._transform_llm_output(
         session_id="unpersisted-mute",
+        turn_id="mute-attempt",
         response_text="I could not save that preference.",
     )
-    assert result is None
+    assert _decode_action_result(result) == {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": proposal_id,
+        "action": "mute_session",
+        "status": "rejected",
+        "reason_code": "preference_not_persisted",
+    }
     state_key = plugin._session_key({"session_id": "unpersisted-mute"})
     assert plugin._is_session_muted(state_key) is False
+
+
+def test_committed_mute_stays_accepted_when_narration_fails(tmp_path, monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor.db"
+    )
+    plugin.register(_Context(_FakeLlm([_candidate()])))
+    plugin._on_pre_llm_call(
+        session_id="committed-mute",
+        turn_id="source-turn",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    )
+    shown = plugin._transform_llm_output(
+        session_id="committed-mute",
+        turn_id="source-turn",
+        response_text="Here is the analysis.",
+    )
+    proposal_id = _decode_envelope(shown)["proposal_id"]
+
+    plugin._on_pre_llm_call(
+        session_id="committed-mute",
+        turn_id="mute-turn",
+        user_message=_recommendation_response("mute_session", proposal_id=proposal_id),
+        conversation_history=[],
+    )
+    output = plugin._transform_llm_output(
+        session_id="committed-mute",
+        turn_id="mute-turn",
+        response_text="",
+        completed=False,
+        failed=True,
+    )
+
+    assert _decode_action_result(output)["status"] == "accepted"
+    state_key = plugin._session_key({"session_id": "committed-mute"})
+    assert plugin._is_session_muted(state_key) is True
+
+
+def test_committed_mute_retry_after_restart_is_accepted_without_rewriting(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor.db"
+    )
+    plugin.register(_Context(_FakeLlm([_candidate()])))
+    plugin._on_pre_llm_call(
+        session_id="retry-committed-mute",
+        turn_id="source-turn",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    )
+    shown = plugin._transform_llm_output(
+        session_id="retry-committed-mute",
+        turn_id="source-turn",
+        response_text="Here is the analysis.",
+    )
+    proposal_id = _decode_envelope(shown)["proposal_id"]
+    action = _recommendation_response("mute_session", proposal_id=proposal_id)
+
+    plugin._on_pre_llm_call(
+        session_id="retry-committed-mute",
+        turn_id="lost-receipt-turn",
+        user_message=action,
+        conversation_history=[],
+    )
+    plugin._reset_state_for_tests()
+    monkeypatch.setattr(
+        plugin,
+        "_set_session_muted",
+        lambda *_args: pytest.fail("an idempotent retry must not rewrite SQLite"),
+    )
+
+    plugin._on_pre_llm_call(
+        session_id="retry-committed-mute",
+        turn_id="retry-turn",
+        user_message=action,
+        conversation_history=[],
+    )
+    output = plugin._transform_llm_output(
+        session_id="retry-committed-mute",
+        turn_id="retry-turn",
+        response_text="Recommendations are disabled.",
+        completed=True,
+        failed=False,
+    )
+
+    assert _decode_action_result(output) == {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": proposal_id,
+        "action": "mute_session",
+        "status": "accepted",
+    }
+
+
+def test_committed_unmute_retry_after_restart_is_accepted_without_rewriting(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor.db"
+    )
+    state_key = plugin._session_key({"session_id": "retry-committed-unmute"})
+    assert plugin._set_session_muted(state_key, True) is True
+    action = _recommendation_response(
+        "unmute_session", proposal_id="unmute-retry-correlation"
+    )
+    plugin._on_pre_llm_call(
+        session_id="retry-committed-unmute",
+        turn_id="lost-receipt-turn",
+        user_message=action,
+        conversation_history=[],
+    )
+
+    plugin._reset_state_for_tests()
+    monkeypatch.setattr(
+        plugin,
+        "_set_session_muted",
+        lambda *_args: pytest.fail("an idempotent retry must not rewrite SQLite"),
+    )
+    plugin._on_pre_llm_call(
+        session_id="retry-committed-unmute",
+        turn_id="retry-turn",
+        user_message=action,
+        conversation_history=[],
+    )
+    output = plugin._transform_llm_output(
+        session_id="retry-committed-unmute",
+        turn_id="retry-turn",
+        response_text="Recommendations are enabled.",
+        completed=True,
+        failed=False,
+    )
+
+    assert _decode_action_result(output) == {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": "unmute-retry-correlation",
+        "action": "unmute_session",
+        "status": "accepted",
+    }
+
+
+def test_unmute_persistence_failure_is_rejected_and_keeps_session_muted(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor.db"
+    )
+    state_key = plugin._session_key({"session_id": "failed-unmute"})
+    assert plugin._set_session_muted(state_key, True) is True
+    monkeypatch.setattr(plugin, "_set_session_muted", lambda *_args: False)
+
+    plugin._on_pre_llm_call(
+        session_id="failed-unmute",
+        turn_id="unmute-turn",
+        user_message=_recommendation_response(
+            "unmute_session", proposal_id="unmute-correlation"
+        ),
+        conversation_history=[],
+    )
+    output = plugin._transform_llm_output(
+        session_id="failed-unmute",
+        turn_id="unmute-turn",
+        response_text="The preference could not be saved.",
+        completed=True,
+        failed=False,
+    )
+
+    assert _decode_action_result(output)["reason_code"] == "preference_not_persisted"
+    assert plugin._is_session_muted(state_key) is True
+
+
+def test_unmute_requires_nonempty_proposal_id_and_current_muted_state():
+    plugin = _load_plugin()
+
+    missing_id = plugin._on_pre_llm_call(
+        session_id="unmute-guard",
+        turn_id="missing-id-turn",
+        user_message=_recommendation_response("unmute_session"),
+        conversation_history=[],
+    )
+    assert "invalid or expired" in missing_id["context"]
+
+    not_muted = plugin._on_pre_llm_call(
+        session_id="unmute-guard",
+        turn_id="not-muted-turn",
+        user_message=_recommendation_response(
+            "unmute_session", proposal_id="unmute-correlation"
+        ),
+        conversation_history=[],
+    )
+    output = plugin._transform_llm_output(
+        session_id="unmute-guard",
+        turn_id="not-muted-turn",
+        response_text="Nothing changed.",
+        completed=True,
+        failed=False,
+    )
+    assert _decode_action_result(output) == {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": "unmute-correlation",
+        "action": "unmute_session",
+        "status": "rejected",
+        "reason_code": "proposal_not_actionable",
+    }
 
 
 def test_known_unmuted_sessions_are_bounded_and_pruned_with_session_state(

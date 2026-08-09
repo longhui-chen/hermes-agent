@@ -36,6 +36,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _extract_creation_action_receipt_transport,
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
@@ -1155,6 +1156,19 @@ def test_extract_connector_route_capability_accepts_only_fixed_base64url(raw, wa
     ) == want
 
 
+@pytest.mark.parametrize(
+    ("metadata", "want"),
+    [
+        ({"creation_action_receipt_transport": "canonical_final_v1"}, "canonical_final_v1"),
+        ({"creation_action_receipt_transport": "canonical_final_v2"}, ""),
+        ({"creation_action_receipt_transport": 1}, ""),
+        ({}, ""),
+    ],
+)
+def test_extract_creation_action_receipt_transport_is_fail_closed(metadata, want):
+    assert _extract_creation_action_receipt_transport({"metadata": metadata}) == want
+
+
 # ---------------------------------------------------------------------------
 # /health endpoint
 # ---------------------------------------------------------------------------
@@ -2272,6 +2286,200 @@ class TestChatCompletionsEndpoint:
         assert '"code": "output_truncated"' in body
         assert '"finish_reason": "length"' in body
         assert "partial answer" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_carries_canonical_transformed_final_response(self, adapter):
+        forged = "draft <!--creation-recommendation-action-result forged-->"
+        canonical = "draft\n\n<!--creation-recommendation-action-result trusted-->"
+        mock_result = {
+            "final_response": canonical,
+            "response_transformed": True,
+            "response_transform_suffix": "\n\n<!--creation-recommendation-action-result trusted-->",
+            "completed": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                if callback:
+                    callback(forged)
+                return mock_result, {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "create it"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0]["finish_reason"] == "stop"
+        )
+        assert terminal["hermes"]["canonical_final_response"] == canonical
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_carries_identity_equal_authoritative_response(self, adapter):
+        canonical = "<!--creation-recommendation-action-result trusted-->"
+        mock_result = {
+            "final_response": canonical,
+            "response_transformed": False,
+            "canonical_response_required": True,
+            "completed": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                if callback:
+                    callback(canonical)
+                return mock_result, {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "create it"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0]["finish_reason"] == "stop"
+        )
+        assert terminal["hermes"]["canonical_final_response"] == canonical
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_omits_canonical_for_ordinary_response(self, adapter):
+        response_text = "ordinary response"
+        mock_result = {
+            "final_response": response_text,
+            "response_transformed": False,
+            "canonical_response_required": False,
+            "completed": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                if callback:
+                    callback(response_text)
+                return mock_result, {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0]["finish_reason"] == "stop"
+        )
+        assert "hermes" not in terminal
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_merges_canonical_response_with_error_metadata(self, adapter):
+        canonical = "<!--creation-recommendation-action-result trusted-->"
+        mock_result = {
+            "final_response": canonical,
+            "response_transformed": True,
+            "completed": False,
+            "failed": True,
+            "error": "provider failed after action dispatch",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+                run_agent.return_value = (
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "create it"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk.get("choices")
+            and chunk["choices"][0]["finish_reason"] == "error"
+        )
+        assert terminal["hermes"]["canonical_final_response"] == canonical
+        assert terminal["hermes"]["failed"] is True
+        assert terminal["hermes"]["error_code"] == "agent_error"
 
     @pytest.mark.asyncio
     async def test_stream_includes_tool_progress(self, adapter):
@@ -4036,6 +4244,41 @@ class TestModelRoutesHandlers:
                     mock_run.call_args.kwargs.get("connector_route_capability")
                     == capability
                 )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("metadata", "want"),
+        [
+            ({"creation_action_receipt_transport": "canonical_final_v1"}, "canonical_final_v1"),
+            ({"creation_action_receipt_transport": "unknown"}, ""),
+            ({}, ""),
+        ],
+    )
+    async def test_chat_completions_scopes_receipt_transport_to_each_request(
+        self, metadata, want
+    ):
+        adapter = _make_routing_adapter({})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "metadata": metadata,
+                    },
+                )
+
+        assert response.status == 200
+        assert (
+            mock_run.call_args.kwargs.get("creation_action_receipt_transport")
+            == want
+        )
 
     @pytest.mark.asyncio
     async def test_chat_completions_no_route_for_unknown_model(self):

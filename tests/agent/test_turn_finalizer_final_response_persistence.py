@@ -339,6 +339,41 @@ def test_transformed_response_is_persisted_for_existing_final_delivery(monkeypat
     assert result["response_transform_suffix"] == proposal
 
 
+def test_authoritative_identity_transform_requires_canonical_delivery(monkeypatch):
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            kwargs["require_canonical_response"]()
+            return [kwargs["response_text"]]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "创建它"},
+        {"role": "assistant", "content": "trusted receipt"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="trusted receipt",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "trusted receipt"
+    assert result["response_transformed"] is False
+    assert result["canonical_response_required"] is True
+
+
 def test_transformed_response_survives_cold_session_db_readback(monkeypatch, tmp_path):
     proposal = "\n\n要不要为你生成创建方案？"
 
@@ -391,6 +426,7 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     agent._user_id_alt = "canonical-owner-a"
     agent.request_overrides = {"response_format": {"type": "json_object"}}
     agent._supports_followup_turns = False
+    agent._creation_action_receipt_transport = "canonical_final_v1"
     agent.stream_delta_callback = lambda _delta: None
     messages = [
         {"role": "user", "content": "分析一下"},
@@ -417,10 +453,15 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert transform_kwargs["failed"] is True
     assert transform_kwargs["interrupted"] is False
     assert transform_kwargs["turn_exit_reason"] == "error_near_max_iterations(provider error)"
+    assert transform_kwargs["turn_id"] == "turn"
     assert transform_kwargs["sender_id"] == "canonical-owner-a"
     assert transform_kwargs["structured_output"] is True
     assert transform_kwargs["supports_followup_turns"] is False
     assert transform_kwargs["streaming_output"] is True
+    assert (
+        transform_kwargs["creation_action_receipt_transport"]
+        == "canonical_final_v1"
+    )
     assert post_kwargs["assistant_response"] == "任务失败。"
     assert post_kwargs["sender_id"] == "canonical-owner-a"
     assert post_kwargs["failed"] is True

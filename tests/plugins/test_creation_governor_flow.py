@@ -13,6 +13,7 @@ PLUGIN_PATH = (
     / "creation-governor"
     / "__init__.py"
 )
+RECEIPT_TRANSPORT = "canonical_final_v1"
 
 
 class _Llm:
@@ -69,6 +70,7 @@ def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch)
 
 def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
     spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    assert spec is not None
     plugin = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(plugin)
@@ -100,6 +102,7 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
 
 def test_pending_single_file_handoff_does_not_deliver_recommendation_card():
     spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    assert spec is not None
     plugin = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(plugin)
@@ -130,6 +133,7 @@ def test_pending_single_file_handoff_does_not_deliver_recommendation_card():
 
 def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    assert spec is not None
     plugin = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(plugin)
@@ -144,10 +148,12 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
         session_id="flow-muted-session",
         user_message="Look into this business problem.",
         conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
     )
     shown = context.hooks[1][0][1](
         session_id="flow-muted-session",
         response_text="Here is the actual business analysis.",
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
     )
     assert shown
     assert len(context.llm.calls) == 1
@@ -170,34 +176,41 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
     response["proposal_id"] = json.loads(response["proposal_id"])["proposal_id"]
     mute_context = context.hooks[0][0][1](
         session_id="flow-muted-session",
+        turn_id="mute-turn",
         user_message=(
             "[creation_recommendation_response]\n"
             f"{json.dumps(response)}\n"
             "[/creation_recommendation_response]"
         ),
         conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
     )
     assert "disabled proactive creation recommendations" in mute_context["context"]
     mute_output = context.hooks[1][0][1](
         session_id="flow-muted-session",
+        turn_id="mute-turn",
         response_text="Creation suggestions are now off.",
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
     )
-    assert mute_output is None
+    assert "creation-recommendation-action-result" in mute_output
 
     assert context.hooks[0][0][1](
         session_id="flow-muted-session",
         user_message="Now inspect another business question.",
         conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
     ) is None
     assert len(context.llm.calls) == 1
     assert context.hooks[1][0][1](
         session_id="flow-muted-session",
         response_text="This answer remains untouched.",
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
     ) is None
 
 
 def test_invalid_card_action_flow_is_denied_without_entering_creation():
     spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    assert spec is not None
     plugin = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(plugin)

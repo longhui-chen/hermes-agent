@@ -1105,6 +1105,9 @@ def build_turn_context(
                 getattr(agent, "_supports_followup_turns", True)
             ),
             streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
+            creation_action_receipt_transport=getattr(
+                agent, "_creation_action_receipt_transport", ""
+            ),
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

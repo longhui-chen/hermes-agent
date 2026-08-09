@@ -1456,6 +1456,7 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     agent._memory_write_origin = "background_review"
     agent.request_overrides = {"response_format": {"type": "json_schema"}}
     agent._supports_followup_turns = False
+    agent._creation_action_receipt_transport = "canonical_final_v1"
     agent.stream_delta_callback = lambda _delta: None
     captured = {}
 
@@ -1476,6 +1477,9 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     assert captured["structured_output"] is True
     assert captured["supports_followup_turns"] is False
     assert captured["streaming_output"] is True
+    assert (
+        captured["creation_action_receipt_transport"] == "canonical_final_v1"
+    )
 
 
 def test_persist_user_message_becomes_original():

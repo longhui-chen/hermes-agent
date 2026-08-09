@@ -560,6 +560,16 @@ def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
     return capability
 
 
+def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("creation_action_receipt_transport")
+    if raw == "canonical_final_v1":
+        return "canonical_final_v1"
+    return ""
+
+
 def _extract_skill_slug(body: Dict[str, Any]) -> str:
     """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
     invocation signal (ZET fork).
@@ -5309,6 +5319,9 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
         connector_route_capability = _extract_connector_route_capability(body)
+        creation_action_receipt_transport = (
+            _extract_creation_action_receipt_transport(body)
+        )
         business_execution_token = _extract_business_execution_token(
             request.headers.get("X-Zettlab-Business-Execution-Token", "")
         )
@@ -5613,6 +5626,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
+                creation_action_receipt_transport=creation_action_receipt_transport,
                 business_execution_token=business_execution_token,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
@@ -5669,6 +5683,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
+                    creation_action_receipt_transport=creation_action_receipt_transport,
                     business_execution_token=business_execution_token,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
@@ -5997,6 +6012,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            hermes_terminal: Dict[str, Any] = {}
+            if result_dict.get("response_transformed") or result_dict.get(
+                "canonical_response_required"
+            ):
+                hermes_terminal["canonical_final_response"] = str(
+                    result_dict.get("final_response") or ""
+                )
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
                 _wire_code = _hermes_error_code(result_dict, finish_reason)
@@ -6005,13 +6027,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": err_msg,
                         "type": _wire_code,
                     }
-                finish_chunk["hermes"] = {
+                hermes_terminal.update({
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": _wire_code,
-                }
+                })
+            if hermes_terminal:
+                finish_chunk["hermes"] = hermes_terminal
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -7985,6 +8009,7 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
+        creation_action_receipt_transport: str = "",
         business_execution_token: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
@@ -8078,6 +8103,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent._zet_agent_response_mode = response_mode or ""
                     agent._zet_agent_plan_ack = dict(plan_ack or {})
                     agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
+                    agent._creation_action_receipt_transport = (
+                        creation_action_receipt_transport
+                    )
                     if trusted_user_message is not None:
                         agent._zet_agent_trusted_user_message = trusted_user_message
                     agent._zet_agent_trusted_skill_slug = trusted_skill_slug
