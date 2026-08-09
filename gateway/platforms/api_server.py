@@ -584,9 +584,9 @@ def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
     )
     if not isinstance(last_user_content, str):
         return False
-    match = re.fullmatch(
-        r"\s*\[creation_recommendation_response\]\s*(\{.*?\})\s*"
-        r"\[/creation_recommendation_response\]\s*",
+    match = re.search(
+        r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+        r"\[/creation_recommendation_response\]\s*$",
         last_user_content,
         re.DOTALL,
     )

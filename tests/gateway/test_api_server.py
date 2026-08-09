@@ -1535,6 +1535,30 @@ class TestChatCompletionsEndpoint:
         )
 
     @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_admits_web_action_instructions_before_protocol_block(
+        self, adapter
+    ):
+        body = self._canonical_action_body()
+        body["messages"][0]["content"] = (
+            "The user selected Ignore on this recommendation card. "
+            "Do not create anything.\n\n"
+            + body["messages"][0]["content"]
+        )
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("metadata", "content"),
         [
