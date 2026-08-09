@@ -4,7 +4,7 @@ set -euo pipefail
 APP_ROOT=$(dirname "$(readlink -f "$0")")
 HERMES_SRC="$APP_ROOT/lib/hermes-agent"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
-DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/zettos-main-data/com.zettlab.claw}"
+DATA_DIR="/volume1/system/zettos-main-data/com.zettlab.claw"
 HERMES_HOME="$DATA_DIR/hermes_home"
 SECRET_DIR="$DATA_DIR/secrets"
 LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"

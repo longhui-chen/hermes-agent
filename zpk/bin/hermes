@@ -22,7 +22,8 @@ if [ ! -f "$HERMES_LAUNCHER" ]; then
     exit 127
 fi
 
-export HERMES_HOME="${HERMES_HOME:-${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/zettos-main-data/com.zettlab.claw}/hermes_home}"
+DATA_DIR="/volume1/system/zettos-main-data/com.zettlab.claw"
+export HERMES_HOME="${HERMES_HOME:-$DATA_DIR/hermes_home}"
 export HERMES_BUNDLED_SKILLS="${HERMES_BUNDLED_SKILLS:-$HERMES_SRC/skills}"
 export HERMES_BUNDLED_PLUGINS="${HERMES_BUNDLED_PLUGINS:-$HERMES_SRC/plugins}"
 export HERMES_BUNDLED_LOCALES="${HERMES_BUNDLED_LOCALES:-$HERMES_SRC/locales}"

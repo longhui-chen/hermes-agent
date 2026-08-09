@@ -13,6 +13,17 @@ import pytest
 
 
 _ENV_FILE_SIZE_LIMIT = 64 * 1024
+_DEVICE_DATA_DIR_ASSIGNMENT = (
+    'DATA_DIR="/volume1/system/zettos-main-data/com.zettlab.claw"'
+)
+
+
+def _use_fixture_data_dir(source: str, data_dir: Path) -> str:
+    assert _DEVICE_DATA_DIR_ASSIGNMENT in source
+    return source.replace(
+        _DEVICE_DATA_DIR_ASSIGNMENT,
+        f"DATA_DIR={shlex.quote(str(data_dir))}",
+    )
 
 
 def _readlink_f_available(tmp_path: Path) -> bool:
@@ -80,15 +91,7 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
     prepare_source = (repo_root / "zpk" / "prepare-claw-service.sh").read_text(
         encoding="utf-8"
     )
-    data_assignment = (
-        'DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-'
-        '/volume1/system/zettos-main-data/com.zettlab.claw}"'
-    )
-    assert data_assignment in prepare_source
-    prepare_source = prepare_source.replace(
-        data_assignment,
-        f"DATA_DIR={shlex.quote(str(data_dir))}",
-    )
+    prepare_source = _use_fixture_data_dir(prepare_source, data_dir)
     protected_root = protected_presets_root or tmp_path
     for assignment in (
         'SUBVOLUME_ZETTLAB_PRESETS_ROOT="/volume1/subvol/agents/zettlab-presets"',
@@ -988,6 +991,7 @@ def test_r2_runtime_scripts_use_only_direct_system_data_path():
     ]
     text = "\n".join(path.read_text(encoding="utf-8") for path in runtime_files)
     assert "/volume1/system/zettos-main-data/com.zettlab.claw" in text
+    assert "ZETTLAB_CLAW_DATA_DIR" not in text
     assert "RequiresMountsFor=/volume1" in text
     assert "/volume1/subvol/apps" not in text
     assert "__APP_BASE__/data" not in text
@@ -1171,7 +1175,13 @@ def test_start_claw_service_loads_reconciled_env_without_overriding_explicit(
     app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
     repo_root = Path(__file__).resolve().parents[2]
     start_script = app_root / "start-claw-service.sh"
-    shutil.copy2(repo_root / "zpk" / "start-claw-service.sh", start_script)
+    start_source = (repo_root / "zpk" / "start-claw-service.sh").read_text(
+        encoding="utf-8"
+    )
+    start_script.write_text(
+        _use_fixture_data_dir(start_source, hermes_home.parent),
+        encoding="utf-8",
+    )
     start_script.chmod(0o755)
 
     hermes_home.mkdir(parents=True)
@@ -1267,7 +1277,6 @@ Path({str(gateway_log)!r}).write_text(
     if with_explicit_override:
         overrides["HERMES_MANAGED_DIR"] = str(explicit_managed)
         overrides["HERMES_NEMO_RELAY_CORE_ENABLED"] = "true"
-    overrides["ZETTLAB_CLAW_DATA_DIR"] = str(hermes_home.parent)
     subprocess.run(
         [str(start_script)],
         check=True,
@@ -1473,9 +1482,9 @@ def test_zpk_agent_service_names_are_device_facing():
     assert meta["service_name"] == "zettlab-claw"
     assert "restart" not in meta
     assert "systemctl restart zettlab-claw.service" not in install
-    assert (
-        'DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/'
-        'zettos-main-data/com.zettlab.claw}"' in install
+    assert _DEVICE_DATA_DIR_ASSIGNMENT in install
+    assert "ZETTLAB_CLAW_DATA_DIR" not in "\n".join(
+        (install, start_wrapper, hermes_wrapper)
     )
     assert install.index('"$APP_ROOT/prepare-claw-service.sh"') < install.index(
         '"$APP_ROOT/bin/hermes" --version'

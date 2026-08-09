@@ -7,7 +7,7 @@ HERMES_SRC="$APP_ROOT/lib/hermes-agent"
 HERMES_BIN="$HERMES_SRC/venv/bin/hermes"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 HERMES_LINK="/usr/local/bin/hermes"
-DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/zettos-main-data/com.zettlab.claw}"
+DATA_DIR="/volume1/system/zettos-main-data/com.zettlab.claw"
 
 source "$APP_ROOT/zpk-systemd.sh"
 

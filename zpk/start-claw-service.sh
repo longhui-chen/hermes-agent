@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_ROOT=$(dirname "$(readlink -f "$0")")
-DATA_DIR="${ZETTLAB_CLAW_DATA_DIR:-/volume1/system/zettos-main-data/com.zettlab.claw}"
+DATA_DIR="/volume1/system/zettos-main-data/com.zettlab.claw"
 ENV_FILE="$DATA_DIR/secrets/zettlab-claw.env"
 
 load_reconciled_env() {
