@@ -471,6 +471,43 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert agent.streamed_deltas == []
 
 
+def test_creation_governor_transform_hook_keeps_scope_after_session_rotation(monkeypatch):
+    transform_kwargs = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            transform_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    agent._creation_governor_conversation_session_id = "stable-app-conversation"
+    agent.session_id = "rotated-transcript-session"
+    messages = [
+        {"role": "user", "content": "继续"},
+        {"role": "assistant", "content": "已继续。"},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="已继续。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="继续",
+        original_user_message="继续",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert transform_kwargs["conversation_session_id"] == "stable-app-conversation"
+    assert transform_kwargs["session_id"] == "rotated-transcript-session"
+
+
 def test_transformed_persistence_exception_is_reported_without_losing_response(monkeypatch):
     post_kwargs = {}
 

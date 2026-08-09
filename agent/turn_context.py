@@ -359,6 +359,10 @@ def build_turn_context(
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
+    agent._creation_governor_conversation_session_id = (
+        getattr(agent, "_gateway_session_key", None) or agent.session_id
+    )
+
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
     # belong to the canonical child, including observability metadata.
@@ -1084,6 +1088,9 @@ def build_turn_context(
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
+            conversation_session_id=(
+                agent._creation_governor_conversation_session_id
+            ),
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,

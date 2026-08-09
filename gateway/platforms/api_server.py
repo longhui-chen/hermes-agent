@@ -570,6 +570,48 @@ def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
     return ""
 
 
+def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    last_user_content = next(
+        (
+            message.get("content")
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        None,
+    )
+    if not isinstance(last_user_content, str):
+        return False
+    match = re.fullmatch(
+        r"\s*\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+        r"\[/creation_recommendation_response\]\s*",
+        last_user_content,
+        re.DOTALL,
+    )
+    if match is None:
+        return False
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("version") == 1
+        and payload.get("type") == "creation_recommendation_response"
+        and payload.get("action")
+        in {"create", "dismiss", "mute_session", "unmute_session"}
+        and payload.get("creation_type") in {"agent", "skill", "task"}
+        and isinstance(payload.get("proposal_id"), str)
+        and payload["proposal_id"].strip()
+        and isinstance(payload.get("title"), str)
+        and payload["title"].strip()
+        and isinstance(payload.get("dedup_key"), str)
+        and payload["dedup_key"].strip()
+    )
+
+
 def _extract_skill_slug(body: Dict[str, Any]) -> str:
     """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
     invocation signal (ZET fork).
@@ -2656,6 +2698,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            (
+                "POST",
+                "/v1/chat/completions/canonical-final-v1",
+                self._handle_canonical_final_chat_completions,
+            ),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -3435,6 +3482,10 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
         router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
         router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+        router.add_post(
+            "/p/{profile}/v1/chat/completions/canonical-final-v1",
+            self._profile_handler(self._handle_canonical_final_chat_completions),
+        )
 
         router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
         router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
@@ -5292,6 +5343,38 @@ class APIServerAdapter(BasePlatformAdapter):
             on_settled()
         return user_message
 
+    async def _handle_canonical_final_chat_completions(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                _openai_error("Invalid JSON in request body"), status=400
+            )
+        if not isinstance(body, dict) or (
+            _extract_creation_action_receipt_transport(body)
+            != "canonical_final_v1"
+        ) or not _extract_turn_id(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires exact receipt metadata and turn id"
+                ),
+                status=400,
+            )
+        if not _is_canonical_final_creation_action(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires a valid creation recommendation action"
+                ),
+                status=400,
+            )
+        request["canonical_final_creation_action_admitted"] = True
+        return await self._handle_chat_completions(request)
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -5322,6 +5405,10 @@ class APIServerAdapter(BasePlatformAdapter):
         creation_action_receipt_transport = (
             _extract_creation_action_receipt_transport(body)
         )
+        if _is_canonical_final_creation_action(body) and not request.get(
+            "canonical_final_creation_action_admitted", False
+        ):
+            creation_action_receipt_transport = ""
         business_execution_token = _extract_business_execution_token(
             request.headers.get("X-Zettlab-Business-Execution-Token", "")
         )

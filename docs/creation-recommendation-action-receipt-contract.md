@@ -45,6 +45,29 @@ the canonical assistant text and uses it for `turn.end.final_text`. This
 terminal replacement is required because a streamed model draft cannot retract
 a model-authored fake result marker.
 
+## Conversation identity
+
+Proposal ownership, preference state, and pending receipt state use one stable
+conversation scope:
+
+```text
+conversation_session_id = gateway_session_key or agent.session_id
+```
+
+For Local Server traffic, `gateway_session_key` is the non-empty App session
+scope supplied by `X-Hermes-Session-Key`. `agent.session_id` is only the
+fallback for transports that do not provide a stable gateway key. A session id
+created by out-of-place conversation compression is a transcript-lineage id;
+it must not replace the stable App scope for proposal, preference, or receipt
+ownership.
+
+The API captures `conversation_session_id` once at turn admission and supplies
+that same value to creation-governor's pre-hook and transform-hook. A rotation
+of `agent.session_id` between those hooks does not change the owning scope.
+Hermes uses this stable scope for proposal state, dismiss/dedup state, durable
+preference rows, and pending receipt lookup. The outer `turn_id` continues to
+identify the exact action attempt within that scope.
+
 ## Recommendation capability
 
 Local Server declares that it can replace the streamed draft with Hermes'
@@ -109,6 +132,27 @@ rejects an absent or unknown transport before proposal, preference, or native
 creation side effects. Capability on the recommendation turn is not inherited
 by a later action turn.
 
+A receipt-capable action is admitted only through this versioned endpoint:
+
+```text
+POST /v1/chat/completions/canonical-final-v1
+```
+
+The endpoint is exclusive to the canonical-final receipt protocol. Before
+constructing or invoking an Agent, it requires both a structurally valid
+receipt-capable action wrapper and the exact metadata value
+`creation_action_receipt_transport: canonical_final_v1`. Missing, malformed,
+non-string, or unknown capability values, and non-action payloads, receive a
+controlled 4xx response before model execution or any creation-governor side
+effect.
+
+Ordinary chat turns and legacy recommendation actions continue to use
+`POST /v1/chat/completions`. Metadata alone does not upgrade an action sent to
+the legacy endpoint. Local Server must not retry or fall back to the legacy
+endpoint after a 404, another admission error, or an uncertain transport result
+from the versioned endpoint. An old Hermes has no versioned route and therefore
+returns 404 at routing time, before the structured wrapper can reach a model.
+
 ## Action receipt
 
 Hermes appends one trusted hidden result marker to the assistant message for
@@ -142,7 +186,7 @@ The initial reason codes are:
 | Code | Meaning | Retry policy |
 | --- | --- | --- |
 | `proposal_not_actionable` | Expired, stale, replayed, wrong-owner, consumed, or field-mismatched proposal | Terminal; do not offer retry |
-| `preference_not_persisted` | `mute_session` or `unmute_session` did not commit its durable preference | Retry while the card is actionable |
+| `preference_not_persisted` | Durable preference state could not be read reliably or the requested value could not be committed | Retry while the card is actionable |
 
 Unknown or absent reason codes degrade to a generic rejected result. The Web
 must not depend on human-readable assistant text to classify a receipt.
@@ -215,6 +259,22 @@ does not qualify for this reconciliation. The retry still requires a non-empty
 outer `turn_id` and `proposal_id`, and the receipt echoes the retry's exact
 `proposal_id + action` under that exact turn.
 
+Durable preference lookup has four states, not a boolean fallback:
+
+| State | Meaning | Reconciliation behavior |
+| --- | --- | --- |
+| `muted` | An explicit durable row contains the muted target | A mute retry is accepted without another write |
+| `unmuted` | An explicit durable row contains the unmuted target | An unmute retry is accepted without another write |
+| `absent` | No durable preference row exists for the stable conversation scope | Not proof of either prior target; continue normal current-proposal validation |
+| `read_error` | SQLite was unavailable, locked, corrupt, or otherwise could not answer authoritatively | Do not mutate or consume the proposal; reject with `preference_not_persisted` so the same action can be retried |
+
+An explicit opposite row is also not a reconciliation match and continues
+through normal current-proposal validation. A storage read error must never be
+collapsed into `absent`, an unmuted default, or terminal
+`proposal_not_actionable`. Recommendation display checks encountering
+`read_error` fail closed by suppressing a new recommendation until preference
+state can be read.
+
 ## Authority and precedence
 
 A valid receipt is the domain result for the card action and is more specific
@@ -247,8 +307,18 @@ corruption and must fail closed.
 - A valid new Web action has a non-empty outer `turn_id`.
 - A receipt-capable recommendation and every action against it independently
   declare `creation_action_receipt_transport: canonical_final_v1`.
+- A receipt-capable action is sent only to
+  `/v1/chat/completions/canonical-final-v1`; the normal endpoint never admits
+  that action into the receipt protocol.
+- The versioned endpoint validates the exact capability and action shape before
+  Agent construction, model execution, or governor mutation. Admission failure
+  has no legacy-endpoint fallback.
 - Missing or unknown transport capability never enables receipt production;
   a downgrade between card delivery and action fails before action mutation.
+- `conversation_session_id` is captured once as
+  `gateway_session_key or agent.session_id`. The pre-hook and transform-hook
+  receive the same captured value even if transcript compression rotates
+  `agent.session_id` during the turn.
 - Capability is isolated to one API request and supplied identically to the
   governor pre-hook and transform-hook. It never leaks to the next turn or to
   the model/provider request.
@@ -272,6 +342,9 @@ corruption and must fail closed.
   from an in-flight streamed draft.
 - A pending receipt is cleared after the owning turn ends and never leaks to a
   later turn.
+- Preference reconciliation distinguishes explicit `muted`, explicit
+  `unmuted`, `absent`, and `read_error`; only an exact explicit target proves an
+  accepted no-op retry, while `read_error` stays retryable and non-mutating.
 - Invalid, stale, replayed, wrong-owner, or mismatched requests do not mutate a
   current valid proposal.
 - Accepted create closes the proposal and is never reopened by a generic turn
@@ -304,27 +377,65 @@ corruption and must fail closed.
 
 ## Deployment order
 
-The request capability is the executable Local-first version fence. A document
-or deployment intention alone is not a fence: an old Local Server ignores the
-Hermes terminal extension and can pass a model-authored result marker through
-as ordinary assistant text. Persisting canonical provenance in Web or history
-would not repair that old hop.
+The versioned admission endpoint and exact metadata are the executable
+Hermes-side version fence. Metadata alone is insufficient: an old Hermes can
+ignore unknown metadata on the legacy endpoint and pass a structured action to
+the model. The new endpoint makes rollback fail at HTTP routing before model
+execution, while the exact metadata prevents accidental use of that endpoint
+by an incapable or malformed request.
 
 Rollout order is:
 
 1. Deploy Web compatibility for both legacy and receipt-capable cards.
-2. Deploy Local Server canonical replacement and untrusted-marker removal.
-3. Make upgraded Local Server send
-   `creation_action_receipt_transport: canonical_final_v1` on both
-   recommendation and action turns.
-4. Deploy Hermes receipt production. Hermes emits `action_receipts: true` and
-   performs receipt-capable actions only for requests carrying the exact
-   capability; missing and future/unknown values fail closed.
+2. Deploy Local Server canonical replacement, untrusted-marker removal,
+   versioned action routing, and a no-fallback rule. Keep receipt opt-in
+   disabled until Hermes is ready.
+3. Deploy Hermes with the versioned endpoint, stable conversation scope, and
+   four-state preference reconciliation.
+4. Enable upgraded Local Server to send the exact metadata on recommendation
+   turns and to route receipt-capable actions, with the same exact metadata, to
+   the versioned endpoint.
 
-This negotiation safely supports a mixed Local fleet: old instances never opt
-in, and a device that rolls back after displaying a capable card cannot mutate
-through the receipt path. It is not replaced by carrying provenance to Web. No
-broad Web/history provenance schema is required for this v1 contract. History
-that was already accepted through an unsafe pre-fence deployment, if any, must
-be quarantined or migrated separately; enabling the fence cannot retroactively
-establish its provenance.
+Mixed-version and rollback behavior is normative:
+
+| Local Server | Hermes | Ordinary/legacy traffic | Receipt-capable action |
+| --- | --- | --- | --- |
+| old | old | Legacy endpoint and behavior | No receipt-capable protocol |
+| old | new | Legacy endpoint; missing capability keeps new governor suppressed | Must not be enabled for this Local version |
+| new | old | Legacy endpoint remains available | Versioned endpoint is absent: 404 before model; no fallback and no side effect |
+| new | new | Legacy endpoint remains available | Versioned endpoint plus exact metadata admits the action and returns canonical final v1 |
+
+Rolling Hermes back after a capable card was displayed is safe: the click
+receives 404 from the absent versioned route before model execution. Rolling
+Local Server back is not made safe by a Hermes check because an old Local does
+not know to select the protected route. Deployment must therefore prevent
+Local rollback below the canonical-final minimum while receipt-capable cards
+remain actionable, or Web must verify the current Local transport capability
+at click time and make such cards unavailable. It must never send their wrapper
+through an old Local.
+
+No broad Web/history provenance schema is required for this v1 contract.
+History that was already accepted through an unsafe pre-fence deployment, if
+any, must be quarantined or migrated separately; enabling the fence cannot
+retroactively establish its provenance.
+
+## Contract test oracle
+
+- If `agent.session_id` rotates after pre-hook admission, transform-hook still
+  consumes the pending receipt under the captured `conversation_session_id`;
+  proposal and preference ownership remain continuous across the rotation.
+- The exact durable target (`muted` or `unmuted`) accepts a same-scope retry
+  without a write. An absent or opposite row does not reconcile. A read error
+  returns `preference_not_persisted`, performs no write, preserves the current
+  proposal, and remains retryable.
+- The versioned endpoint with an exact capability and valid action may reach
+  creation-governor. Missing/unknown capability, malformed or ordinary content,
+  and requests to an old Hermes fail before Agent/model invocation and before
+  any proposal, preference, or creation side effect.
+- Local Server routes only validated receipt-capable actions to the versioned
+  endpoint. A 404, controlled 4xx, timeout, or connection loss causes no POST to
+  the legacy endpoint. Ordinary and legacy traffic continues on the legacy
+  endpoint.
+- In a new-Local/old-Hermes rollback test, a capable click yields 404 and zero
+  model/governor calls. In a Local rollback test, Web refuses the action unless
+  the minimum Local transport version is still proven at click time.

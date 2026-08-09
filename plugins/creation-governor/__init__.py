@@ -245,7 +245,12 @@ def _latch_dismissal(session_id: str, dedup_key: str, now: float) -> None:
 
 
 def _raw_session_key(kwargs: dict[str, Any]) -> str:
-    return _text(kwargs.get("session_id") or kwargs.get("task_id"), 160)
+    return _text(
+        kwargs.get("conversation_session_id")
+        or kwargs.get("session_id")
+        or kwargs.get("task_id"),
+        160,
+    )
 
 
 def _scoped_session_key(raw_session_id: str, owner_id: str) -> str:
@@ -335,22 +340,12 @@ def _set_session_muted(session_id: str, muted: bool) -> bool:
     return True
 
 
-def _is_session_muted(session_id: str) -> bool:
-    now = time.monotonic()
-    with _state_lock:
-        _prune_known_unmuted_sessions(now)
-        _prune_muted_sessions(now)
-        if session_id in _muted_sessions:
-            _remember_muted_session(session_id, now)
-            return True
-        if session_id in _known_unmuted_sessions:
-            _remember_unmuted_session(session_id, now)
-            return False
+def _read_persisted_session_preference(
+    session_id: str,
+) -> Literal["muted", "unmuted", "absent", "read_error"]:
     path = _preferences_db_path()
     if not path.exists():
-        with _state_lock:
-            _remember_unmuted_session(session_id, now)
-        return False
+        return "absent"
     try:
         with sqlite3.connect(path, timeout=2.0) as connection:
             row = connection.execute(
@@ -366,8 +361,27 @@ def _is_session_muted(session_id: str) -> bool:
             "creation recommendation session preference read failed",
             exc_info=True,
         )
-        return False
-    muted = bool(row and row[0])
+        return "read_error"
+    if row is None:
+        return "absent"
+    return "muted" if bool(row[0]) else "unmuted"
+
+
+def _is_session_muted(session_id: str) -> bool:
+    now = time.monotonic()
+    with _state_lock:
+        _prune_known_unmuted_sessions(now)
+        _prune_muted_sessions(now)
+        if session_id in _muted_sessions:
+            _remember_muted_session(session_id, now)
+            return True
+        if session_id in _known_unmuted_sessions:
+            _remember_unmuted_session(session_id, now)
+            return False
+    preference = _read_persisted_session_preference(session_id)
+    if preference == "read_error":
+        return True
+    muted = preference == "muted"
     with _state_lock:
         if muted:
             _remember_muted_session(session_id, now)
@@ -375,29 +389,6 @@ def _is_session_muted(session_id: str) -> bool:
         else:
             _remember_unmuted_session(session_id, now)
     return muted
-
-
-def _persisted_session_preference_matches(session_id: str, muted: bool) -> bool:
-    path = _preferences_db_path()
-    if not path.exists():
-        return False
-    try:
-        with sqlite3.connect(path, timeout=2.0) as connection:
-            row = connection.execute(
-                """
-                SELECT recommendations_muted
-                FROM creation_session_preferences
-                WHERE session_id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-    except (OSError, sqlite3.Error):
-        logger.warning(
-            "creation recommendation session preference reconciliation failed",
-            exc_info=True,
-        )
-        return False
-    return row is not None and bool(row[0]) is muted
 
 
 def _remember_unmuted_session(session_id: str, now: float) -> None:
@@ -1034,9 +1025,22 @@ def _handle_previous_proposal_action(
                 and structured["title"] == proposal.get("suggested_name")
                 and structured["dedup_key"] == proposal.get("dedup_key")
             )
+        preference: Literal["muted", "unmuted", "absent", "read_error"] = "absent"
         if action in {"mute_session", "unmute_session"}:
             target_muted = action == "mute_session"
-            if _persisted_session_preference_matches(session_id, target_muted):
+            preference = _read_persisted_session_preference(session_id)
+            if preference == "read_error":
+                return _ActionHandlingOutcome(
+                    "",
+                    _ActionReceipt(
+                        structured["proposal_id"],
+                        action,
+                        "rejected",
+                        "preference_not_persisted",
+                    ),
+                )
+            target_preference = "muted" if target_muted else "unmuted"
+            if preference == target_preference:
                 return _ActionHandlingOutcome(
                     (
                         "[Creation governor internal action: The requested conversation "
@@ -1086,7 +1090,7 @@ def _handle_previous_proposal_action(
                 _ActionReceipt(structured["proposal_id"], action, "accepted"),
             )
         if action == "unmute_session":
-            if not _is_session_muted(session_id):
+            if preference != "muted":
                 return _ActionHandlingOutcome(
                     "",
                     _ActionReceipt(

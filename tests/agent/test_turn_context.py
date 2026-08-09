@@ -1482,6 +1482,24 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     )
 
 
+def test_creation_governor_pre_hook_uses_stable_gateway_conversation_scope(monkeypatch):
+    agent = _FakeAgent()
+    agent._gateway_session_key = "stable-app-conversation"
+    captured = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "pre_llm_call":
+            captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+
+    _build(agent)
+
+    assert captured["conversation_session_id"] == "stable-app-conversation"
+    assert captured["session_id"] == "sess-1"
+
+
 def test_persist_user_message_becomes_original():
     agent = _FakeAgent()
     ctx = _build(agent, user_message="api-prefixed", persist_user_message="clean")

@@ -137,6 +137,82 @@ def test_receipt_transport_capability_does_not_leak_to_the_next_turn():
     assert plugin._invocation_scope.get() is None
 
 
+def test_preference_read_error_rejects_retry_without_write_or_proposal_consumption(
+    monkeypatch,
+):
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "preference-read-error")
+    state_key = plugin._session_key(
+        {"session_id": "preference-read-error", "sender_id": "owner-a"}
+    )
+    monkeypatch.setattr(plugin.Path, "exists", lambda _path: True)
+    monkeypatch.setattr(
+        plugin.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            plugin.sqlite3.OperationalError("database is locked")
+        ),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_set_session_muted",
+        lambda *_args: pytest.fail("read_error must not write preference state"),
+    )
+
+    plugin._on_pre_llm_call(
+        session_id="preference-read-error",
+        sender_id="owner-a",
+        turn_id="mute-attempt",
+        user_message=_action(payload, action="mute_session"),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+    output = plugin._transform_llm_output(
+        session_id="preference-read-error",
+        sender_id="owner-a",
+        turn_id="mute-attempt",
+        response_text="请稍后重试。",
+        completed=True,
+        failed=False,
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+    assert _decode_action_result(output) == {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": payload["proposal_id"],
+        "action": "mute_session",
+        "status": "rejected",
+        "reason_code": "preference_not_persisted",
+    }
+    state = plugin._session_states[state_key]
+    assert state["proposal_stage"] == "proposal_shown"
+    assert state["last_proposal"]["proposal_id"] == payload["proposal_id"]
+
+
+def test_preference_read_error_suppresses_new_recommendations(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_read_persisted_session_preference",
+        lambda _session_id: "read_error",
+    )
+    llm = _FakeLlm([])
+    setattr(plugin, "_plugin_llm", llm)
+
+    result = plugin._on_pre_llm_call(
+        session_id="preference-read-error-display",
+        sender_id="owner-a",
+        turn_id="display-turn",
+        user_message="分析近期广告效果",
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+    assert result is None
+    assert llm.calls == []
+
+
 @pytest.mark.parametrize("receipt_transport", ["", "canonical_final_v2"])
 def test_capable_card_action_fails_closed_after_transport_downgrade(
     receipt_transport: str, monkeypatch

@@ -772,6 +772,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post(
+        "/v1/chat/completions/canonical-final-v1",
+        adapter._handle_canonical_final_chat_completions,
+    )
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -1478,6 +1482,135 @@ class TestToolsetsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @staticmethod
+    def _canonical_action_body(*, metadata=None, content=None):
+        action = {
+            "version": 1,
+            "type": "creation_recommendation_response",
+            "proposal_id": "proposal-1",
+            "action": "create",
+            "creation_type": "agent",
+            "title": "Advertising analyst",
+            "dedup_key": "agent:advertising-analyst",
+            "evidence_turn_ids": ["turn-1"],
+        }
+        wrapped = (
+            "[creation_recommendation_response]\n"
+            f"{json.dumps(action)}\n"
+            "[/creation_recommendation_response]"
+        )
+        return {
+            "model": "hermes-agent",
+            "metadata": metadata
+            if metadata is not None
+            else {
+                "creation_action_receipt_transport": "canonical_final_v1",
+                "turn_id": "turn-action-1",
+            },
+            "messages": [{"role": "user", "content": content or wrapped}],
+            "stream": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_admits_exact_action_before_agent_run(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1",
+                    json=self._canonical_action_body(),
+                )
+
+        assert response.status == 200
+        assert run_agent.call_count == 1
+        assert (
+            run_agent.call_args.kwargs["creation_action_receipt_transport"]
+            == "canonical_final_v1"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("metadata", "content"),
+        [
+            ({}, None),
+            ({"creation_action_receipt_transport": "canonical_final_v2"}, None),
+            ({"creation_action_receipt_transport": "canonical_final_v1"}, None),
+            (
+                {"creation_action_receipt_transport": "canonical_final_v1"},
+                "ordinary chat",
+            ),
+            (
+                {"creation_action_receipt_transport": "canonical_final_v1"},
+                "[creation_recommendation_response]\n{}\n"
+                "[/creation_recommendation_response]",
+            ),
+        ],
+        ids=[
+            "missing-capability",
+            "unknown-capability",
+            "missing-turn-id",
+            "ordinary",
+            "malformed",
+        ],
+    )
+    async def test_canonical_final_endpoint_rejects_non_protocol_requests_before_agent(
+        self, adapter, metadata, content
+    ):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1",
+                    json=self._canonical_action_body(metadata=metadata, content=content),
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_chat_stays_on_legacy_endpoint(self, adapter):
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "ordinary", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "ordinary chat"}],
+                    },
+                )
+
+        assert response.status == 200
+        assert run_agent.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_endpoint_does_not_upgrade_structured_action(self, adapter):
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "legacy", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=self._canonical_action_body(),
+                )
+
+        assert response.status == 200
+        assert run_agent.call_count == 1
+        assert run_agent.call_args.kwargs["creation_action_receipt_transport"] == ""
+
     @pytest.mark.asyncio
     async def test_idempotency_is_scoped_by_business_execution_token(
         self, adapter, monkeypatch, caplog

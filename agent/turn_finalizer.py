@@ -566,6 +566,13 @@ def finalize_turn(
             "transform_llm_output",
             response_text=final_response or "",
             session_id=agent.session_id or "",
+            conversation_session_id=getattr(
+                agent,
+                "_creation_governor_conversation_session_id",
+                None,
+            )
+            or agent.session_id
+            or "",
             model=agent.model,
             api_mode=getattr(agent, "api_mode", None) or "",
             platform=getattr(agent, "platform", None) or "",
