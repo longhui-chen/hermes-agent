@@ -78,7 +78,8 @@ _SELF_QUERY_RE = re.compile(
 )
 _FAST_ROUTE_UNAVAILABLE_RE = re.compile(
     r"(?:404|not found|not in public manifest|unknown (?:model|route)|"
-    r"model .+ does not exist|invalid model)",
+    r"model .+ does not exist|invalid model|model_not_found|"
+    r"no available channel for model)",
     re.IGNORECASE,
 )
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")

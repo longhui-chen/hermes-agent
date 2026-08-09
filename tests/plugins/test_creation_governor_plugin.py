@@ -104,7 +104,10 @@ class _FailingFastRouteLlm:
     def complete(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
         if kwargs.get("auxiliary_task"):
-            raise RuntimeError("404 route is not in public manifest")
+            raise RuntimeError(
+                "503 model_not_found: No available channel for model "
+                "zettlab-creation-fast"
+            )
         return SimpleNamespace(
             text=json.dumps(self.fallback_result),
             provider="custom",
