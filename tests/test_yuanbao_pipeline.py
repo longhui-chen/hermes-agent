@@ -571,9 +571,28 @@ class TestExtractContentMiddleware:
         await ExtractContentMiddleware()(ctx, next_fn)
 
         assert "Hello!" in ctx.raw_text
+        assert ctx.user_authored_message == "Hello!"
         assert len(ctx.media_refs) == 1
         assert ctx.media_refs[0]["kind"] == "image"
         next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_image_only_has_no_authored_caption(self):
+        adapter = make_adapter()
+        ctx = make_ctx(
+            adapter=adapter,
+            msg_body=[
+                {"msg_type": "TIMImageElem", "msg_content": {
+                    "image_info_array": [{"url": "https://img.example.com/1.jpg"}]
+                }},
+            ],
+        )
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        assert ctx.user_authored_message == ""
+        assert next_fn.await_count == 1
 
 
 class TestPlaceholderFilterMiddleware:
@@ -1345,4 +1364,3 @@ class TestPatchAnchorsMiddleware:
             text, ["/cache/odd.bin"], ["application/octet-stream"],
         )
         assert out == text
-
