@@ -1722,7 +1722,10 @@ class TestChatCompletionsEndpoint:
             "authorization_mode": "automatic",
         }
         payload = {
-            "model": "hermes-agent",
+            "model": "caller-selected-model",
+            "provider": "caller-selected-provider",
+            "model_options": {"temperature": 0.9},
+            "tool_choice": "none",
             "messages": [{"role": "user", "content": task}],
             "stream": False,
             "metadata": {
@@ -1799,6 +1802,9 @@ class TestChatCompletionsEndpoint:
         assert mock_run.await_args.kwargs["execution_scope_digest"] == "d" * 64
         assert mock_run.await_args.kwargs["business_execution_token"] == token
         assert mock_run.await_args.kwargs["trusted_skill_slug"] == skill_slug
+        assert "provider" not in mock_run.await_args.kwargs
+        assert "model_options" not in mock_run.await_args.kwargs
+        assert mock_run.await_args.kwargs["request_overrides"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1821,7 +1827,10 @@ class TestChatCompletionsEndpoint:
         turn_id = "pvm-digest-" + "a" * 20
         session_id = "proactive-" + turn_id
         payload = {
-            "model": "hermes-agent",
+            "model": "caller-selected-model",
+            "provider": "caller-selected-provider",
+            "model_options": {"temperature": 0.9},
+            "tool_choice": "none",
             "messages": [{"role": "user", "content": "run the manifest"}],
             "stream": False,
             "metadata": {
@@ -1942,6 +1951,62 @@ class TestChatCompletionsEndpoint:
         assert ensure_db.await_count == 0
         assert expand.await_count == 0
         assert run_agent.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_retryable_silent_authorization_failure_returns_503(
+        self,
+        auth_adapter,
+    ):
+        turn_id = "pvm-unavailable-" + "a" * 16
+        session_id = "proactive-" + turn_id
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "run the manifest"}],
+            "stream": False,
+            "metadata": {
+                "execution_policy": "silent_automation",
+                "turn_id": turn_id,
+                "skill_slug": "video-edit-workflow-mini",
+                "execution_scope": {
+                    "operation": "weekly_memory_video",
+                    "task_id": turn_id,
+                },
+            },
+        }
+        headers = {
+            "Authorization": "Bearer sk-secret",
+            "Idempotency-Key": "unavailable-proof-test",
+            "X-Hermes-Session-Key": session_id,
+            "X-Hermes-Session-Id": session_id,
+            "X-Zettlab-Business-Execution-Token": "e" * 64,
+            "X-Zettlab-Execution-Scope-Digest": "1" * 64,
+        }
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                api_server_module,
+                "_authorize_business_execution",
+                new_callable=AsyncMock,
+                side_effect=api_server_module._BusinessExecutionAuthorizationError(
+                    "transport_unavailable",
+                    retryable=True,
+                ),
+            ), patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                data = await response.json()
+
+        assert response.status == 503
+        assert response.headers["Retry-After"] == "1"
+        assert data["error"]["code"] == "silent_automation_authorization_unavailable"
+        run_agent.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("idempotency_header", [None, "   "])

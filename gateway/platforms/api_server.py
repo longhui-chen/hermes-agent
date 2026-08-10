@@ -922,6 +922,8 @@ async def _authorize_business_execution(
                     "[api_server] silent execution authorization failed: %s",
                     str(exc),
                 )
+                if exc.retryable:
+                    raise
                 return None
             await asyncio.sleep(0.05)
 
@@ -5843,18 +5845,33 @@ class APIServerAdapter(BasePlatformAdapter):
         if requested_silent_automation:
             execution_scope = _extract_execution_scope(body)
             if requested_execution_scope_digest:
-                execution_authorization = (
-                    await _authorize_business_execution(
-                        business_execution_token=business_execution_token,
-                        turn_id=turn_id,
-                        session_id=session_id,
-                        session_key=gateway_session_key or "",
-                        scope=execution_scope,
-                        trusted_task_message=trusted_task_message,
-                        skill_slug=skill_slug,
+                try:
+                    execution_authorization = (
+                        await _authorize_business_execution(
+                            business_execution_token=business_execution_token,
+                            turn_id=turn_id,
+                            session_id=session_id,
+                            session_key=gateway_session_key or "",
+                            scope=execution_scope,
+                            trusted_task_message=trusted_task_message,
+                            skill_slug=skill_slug,
+                        )
+                        or {}
                     )
-                    or {}
-                )
+                except _BusinessExecutionAuthorizationError as exc:
+                    logger.warning(
+                        "[api_server] silent execution authorization unavailable: %s",
+                        str(exc),
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            "silent_automation authorization service unavailable",
+                            param="metadata.execution_policy",
+                            code="silent_automation_authorization_unavailable",
+                        ),
+                        status=503,
+                        headers={"Retry-After": "1"},
+                    )
             if (
                 not execution_authorization
                 or execution_authorization.get("scope_digest")
@@ -5912,7 +5929,6 @@ class APIServerAdapter(BasePlatformAdapter):
         #     message passes through unexpanded instead.
         skill_selection_enabled = bool(
             skill_slug
-            and body.get("tool_choice") != "none"
             and (not requested_silent_automation or execution_policy == "silent_automation")
         )
         skill_expansion_enabled = bool(
@@ -5940,10 +5956,17 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", self._model_name)
+        # Silent receipts authorize the server-side workflow and its configured
+        # route. Request-level model/provider/options must not become an
+        # unbound exfiltration or cost-control switch.
+        model_name = (
+            self._model_name
+            if execution_policy == "silent_automation"
+            else body.get("model", self._model_name)
+        )
         created = int(time.time())
         request_overrides: Dict[str, Any] = {}
-        if body.get("tool_choice") == "none":
+        if execution_policy != "silent_automation" and body.get("tool_choice") == "none":
             request_overrides["tool_choice"] = "none"
         response_format = body.get("response_format")
         if response_format is not None:
@@ -5962,10 +5985,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
         route = self._resolve_route(model_name)
-        agent_overrides = _request_agent_overrides(
-            body,
-            virtual_model=self._model_name,
-            allow_bare_model=self._direct_model_requests,
+        agent_overrides = (
+            {}
+            if execution_policy == "silent_automation"
+            else _request_agent_overrides(
+                body,
+                virtual_model=self._model_name,
+                allow_bare_model=self._direct_model_requests,
+            )
         )
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
