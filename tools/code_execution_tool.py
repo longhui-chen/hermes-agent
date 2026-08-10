@@ -34,9 +34,11 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -54,6 +56,14 @@ from tools.thread_context import propagate_context_to_thread
 # ``_use_tcp_rpc`` in ``_execute_local`` below.  That makes execute_code
 # available on every platform Hermes itself runs on.
 logger = logging.getLogger(__name__)
+
+_MANAGED_EXECUTE_CODE_PREAMBLE = """\
+import ctypes as _hermes_ctypes
+_hermes_libc = _hermes_ctypes.CDLL(None, use_errno=True)
+if _hermes_libc.prctl(4, 0, 0, 0, 0) != 0:
+    raise OSError(_hermes_ctypes.get_errno(), "failed to disable process dumpability")
+del _hermes_ctypes, _hermes_libc
+"""
 
 SANDBOX_AVAILABLE = True
 
@@ -135,7 +145,10 @@ def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
 # match a safe prefix, the operational HERMES_ allowlist, or (on Windows) an
-# OS-essential name.
+# OS-essential name.  Delegate-task child context is also an exact-name
+# operational marker: without it, a sandbox script that spawns/imports Hermes
+# code can lose the DB-layer Kanban mutation guard while still inheriting
+# HERMES_HOME.
 #
 # NB: the broad "HERMES_" prefix was deliberately removed (#27303) — it leaked
 # HERMES_*-named config that lacks a secret substring (e.g. HERMES_BASE_URL,
@@ -173,6 +186,7 @@ _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_PROFILE",
     "HERMES_CONFIG",
     "HERMES_ENV",
+    "HERMES_DELEGATED_CHILD_CONTEXT",
     "HERMES_HOME_FALLBACK",
 })
 
@@ -212,7 +226,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     """Produce the scrubbed child-process env for execute_code.
 
     Rules (order matters):
-      1. Passthrough vars (skill- or config-declared) always pass.
+      1. Passthrough vars (skill- or config-declared) pass through the active
+         profile secret scope; an absent scoped value is omitted and an
+         unscoped multiplex read fails closed.
       2. Secret-substring names (KEY/TOKEN/DSN/WEBHOOK/etc.) are blocked.
       3. Names matching a safe prefix pass.
       4. Operational HERMES_* vars (_HERMES_CHILD_ALLOWED) pass by exact name.
@@ -223,12 +239,22 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     Extracted into a helper so tests can exercise the logic without
     spawning a subprocess.
     """
+    resolve_passthrough_value = None
     if is_passthrough is None:
         try:
-            from tools.env_passthrough import is_env_passthrough as _ep
+            from tools.env_passthrough import (
+                is_env_passthrough as _ep,
+                resolve_passthrough_value,
+            )
         except Exception:
             _ep = lambda _: False  # noqa: E731
+            resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
         is_passthrough = _ep
+    else:
+        try:
+            from tools.env_passthrough import resolve_passthrough_value
+        except Exception:
+            resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
     if is_windows is None:
         is_windows = _IS_WINDOWS
 
@@ -249,7 +275,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
         if k in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
             continue
         if is_passthrough(k):
-            scrubbed[k] = v
+            resolved = resolve_passthrough_value(k, v)
+            if resolved is not None:
+                scrubbed[k] = resolved
             continue
         if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
             continue
@@ -275,6 +303,22 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             len(_dropped_hermes),
             ", ".join(sorted(_dropped_hermes)),
         )
+
+    # delegate_task children are marked with a ContextVar, not os.environ, while
+    # the execute_code sandbox crosses a process boundary. Bridge that context
+    # into the child env and strip dispatcher-owned Kanban variables after the
+    # normal secret/passthrough scrub so an explicit passthrough cannot re-grant
+    # a delegated child the parent's board mutation capability.
+    try:
+        from agent.delegation_context import (
+            is_delegated_child_process_context,
+            scrub_kanban_env,
+        )
+
+        if is_delegated_child_process_context():
+            scrubbed = scrub_kanban_env(scrubbed)
+    except Exception:
+        pass
     return scrubbed
 
 
@@ -302,7 +346,41 @@ def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     if not SANDBOX_AVAILABLE:
         return False
+
+    try:
+        from tools.terminal_tool import (
+            _check_vercel_sandbox_requirements,
+            _get_env_config,
+        )
+
+        config = _get_env_config()
+    except Exception:
+        logger.debug("Could not resolve terminal config for execute_code availability", exc_info=True)
+        return False
+
+    if config.get("env_type") == "vercel_sandbox":
+        return _check_vercel_sandbox_requirements(config)
+
     return True
+
+
+def _managed_execute_code_argv(
+    python: str,
+    script_path: str,
+    *,
+    env: Dict[str, str],
+    execution_scope: str | None = None,
+    workspace: str | None = None,
+) -> List[str]:
+    """Apply the managed local-process capability boundary to execute_code."""
+    from tools.environments.local import _managed_execute_code_sandbox_argv
+
+    return _managed_execute_code_sandbox_argv(
+        [python, script_path],
+        env=env,
+        execution_scope=execution_scope,
+        workspace=workspace,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +404,7 @@ _TOOL_STUBS = {
     ),
     "read_file": (
         "read_file",
-        "path: str, offset: int = 1, limit: int = 500",
+        "path: str, offset: int = 1, limit: int = 2000",
         '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""',
         '{"path": path, "offset": offset, "limit": limit}',
     ),
@@ -355,6 +433,61 @@ _TOOL_STUBS = {
         '{"command": command, "timeout": timeout, "workdir": workdir}',
     ),
 }
+
+
+def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]:
+    """Map well-known sandbox script failures to one actionable recovery hint.
+
+    Production mining (state.db): the top execute_code failure classes are
+    hermes_tools import misuse (importing tools that aren't in the sandbox,
+    23x in one window), calling the built-in helpers via import, treating
+    tool results as strings instead of dicts, and importing third-party
+    packages that don't exist in the sandbox interpreter. Bounded scan,
+    first match wins, never raises.
+    """
+    if not stderr_text:
+        return None
+    window = stderr_text[:4000]
+    try:
+        m = re.search(
+            r"cannot import name '(\w+)' from 'hermes_tools'", window
+        )
+        if m:
+            missing = m.group(1)
+            available = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or SANDBOX_ALLOWED_TOOLS))
+            builtin = {"json_parse", "shell_quote", "retry"}
+            if missing in builtin:
+                return (
+                    f"{missing} is a BUILT-IN helper in the sandbox — no import "
+                    f"needed. Remove it from the import line and call {missing}(...) directly."
+                )
+            return (
+                f"'{missing}' is not available inside the execute_code sandbox. "
+                f"Importable tools here: {', '.join(available)}. For anything "
+                "else, use the normal tool call instead of execute_code."
+            )
+        m = re.search(r"NameError: name '(json_parse|shell_quote|retry)' is not defined", window)
+        if m:
+            return (
+                f"{m.group(1)} is built into the generated sandbox module — "
+                "call it directly at module scope without importing it."
+            )
+        m = re.search(r"ModuleNotFoundError: No module named '([\w.]+)'", window)
+        if m:
+            return (
+                f"'{m.group(1)}' is not installed in the sandbox interpreter. "
+                "Use Python stdlib inside execute_code, or run the code via "
+                "terminal() with the project venv's python instead."
+            )
+        if re.search(r"TypeError: string indices must be integers|AttributeError: 'str' object has no attribute 'get'", window):
+            return (
+                "Tool functions in the sandbox return DICTS (already parsed) — "
+                "do not json.loads() them or index them like strings. "
+                "Example: read_file(path)['content']."
+            )
+    except Exception:
+        return None
+    return None
 
 
 def generate_hermes_tools_module(enabled_tools: List[str],
@@ -575,6 +708,27 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+def _validate_rpc_peer(
+    conn: socket.socket,
+    expected_peer: tuple[int, int] | None,
+) -> None:
+    """Fail closed unless the UDS client has the expected child PID and UID."""
+
+    if expected_peer is None:
+        return
+    peer_option = getattr(socket, "SO_PEERCRED", None)
+    if peer_option is None:
+        raise PermissionError("RPC peer credentials are unavailable")
+    raw_peer = conn.getsockopt(
+        socket.SOL_SOCKET,
+        peer_option,
+        struct.calcsize("3i"),
+    )
+    peer_pid, peer_uid, _peer_gid = struct.unpack("3i", raw_peer)
+    if (peer_pid, peer_uid) != expected_peer:
+        raise PermissionError("RPC peer identity mismatch")
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -584,6 +738,7 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    expected_peer: tuple[int, int] | None = None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -602,6 +757,7 @@ def _rpc_server_loop(
                 continue
         if conn is None:
             return
+        _validate_rpc_peer(conn, expected_peer)
         conn.settimeout(300)
 
         buf = b""
@@ -635,7 +791,7 @@ def _rpc_server_loop(
                     # sandbox-script-supplied JSON.
                     str(request.get("token") or "").encode(), rpc_token.encode()
                 ):
-                    resp = json.dumps({"error": "Unauthorized RPC request"})
+                    resp = tool_error("Unauthorized RPC request")
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -645,23 +801,19 @@ def _rpc_server_loop(
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
+                    resp = tool_error(
+                        f"Tool '{tool_name}' is not available in execute_code. "
+                        f"Available: {available}"
+                    )
                     conn.sendall((resp + "\n").encode())
                     continue
 
                 # Enforce tool call limit
                 if tool_call_counter[0] >= max_tool_calls:
-                    resp = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
+                    resp = tool_error(
+                        f"Tool call limit reached ({max_tool_calls}). "
+                        "No more tool calls allowed in this execution."
+                    )
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -770,12 +922,13 @@ def _get_or_create_env(task_id: str):
         cwd = overrides.get("cwd") or config["cwd"]
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona"}:
+        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
                 "container_persistent": config.get("container_persistent", True),
+                "vercel_runtime": config.get("vercel_runtime", ""),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_network": config.get("docker_network", True),
@@ -937,20 +1090,16 @@ def _rpc_poll_loop(
                 # Enforce allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
+                    tool_result = tool_error(
+                        f"Tool '{tool_name}' is not available in execute_code. "
+                        f"Available: {available}"
+                    )
                 # Enforce tool call limit
                 elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
+                    tool_result = tool_error(
+                        f"Tool call limit reached ({max_tool_calls}). "
+                        "No more tool calls allowed in this execution."
+                    )
                 else:
                     # Strip forbidden terminal parameters
                     if tool_name == "terminal" and isinstance(tool_args, dict):
@@ -1222,10 +1371,10 @@ def execute_code(
         JSON string with execution results.
     """
     if not SANDBOX_AVAILABLE:
-        return json.dumps({
-            "error": "execute_code sandbox is unavailable in this environment. "
-                     "Use normal tool calls (terminal, read_file, write_file, ...) instead."
-        })
+        return tool_error(
+            "execute_code sandbox is unavailable in this environment. "
+            "Use normal tool calls (terminal, read_file, write_file, ...) instead."
+        )
 
     if not code or not code.strip():
         return tool_error("No code provided.")
@@ -1311,6 +1460,10 @@ def execute_code(
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
+    rpc_thread = None
+    managed_gateway = os.environ.get("HERMES_MANAGED_GATEWAY") == "1"
+    managed_execute_scope: str | None = None
+    managed_execute_uid: int | None = None
 
     try:
         # Write the auto-generated hermes_tools module.
@@ -1329,6 +1482,8 @@ def execute_code(
 
         # Write the user's script
         with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as f:
+            if managed_gateway:
+                f.write(_MANAGED_EXECUTE_CODE_PREAMBLE)
             f.write(code)
 
         # --- Start RPC server ---
@@ -1352,19 +1507,6 @@ def execute_code(
             os.chmod(sock_path, 0o600)
         server_sock.listen(1)
 
-        # Wrapped so the thread inherits the turn's approval context + callbacks
-        # (see tools.thread_context) — else gateway sandbox tool calls silently
-        # auto-approve dangerous commands (#33057, #30882).
-        rpc_thread = threading.Thread(
-            target=propagate_context_to_thread(_rpc_server_loop),
-            args=(
-                server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
-            ),
-            daemon=True,
-        )
-        rpc_thread.start()
-
         # --- Spawn child process ---
         # Build a minimal environment for the child. We intentionally exclude
         # API keys and tokens to prevent credential exfiltration from LLM-
@@ -1377,6 +1519,9 @@ def execute_code(
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
         _inject_execute_code_session_context_env(child_env)
+        from tools.environments.local import _inject_context_hermes_home
+
+        _inject_context_hermes_home(child_env)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1427,13 +1572,45 @@ def execute_code(
         #   - project: user's venv python + session's working directory, so
         #              project deps like pandas and user files resolve.
         # Env scrubbing and tool whitelist apply identically in both modes.
-        _mode = _get_execution_mode()
+        _mode = "strict" if managed_gateway else _get_execution_mode()
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
+        _child_script_path = _script_path
+        if managed_gateway:
+            from tools.environments.local import (
+                _prepare_managed_execute_code_workspace,
+            )
+
+            if sock_path is None:
+                raise OSError("managed execute_code requires a Unix RPC socket")
+            managed_execute_scope = secrets.token_hex(16)
+            managed_execute_uid = _prepare_managed_execute_code_workspace(
+                tmpdir,
+                [
+                    os.path.join(tmpdir, "hermes_tools.py"),
+                    _script_path,
+                    sock_path,
+                ],
+                env=child_env,
+                execution_scope=managed_execute_scope,
+            )
+            child_env["HOME"] = tmpdir
+            child_env["TMPDIR"] = tmpdir
+            child_env["TMP"] = tmpdir
+            child_env["TEMP"] = tmpdir
+            child_env["HERMES_RPC_SOCKET"] = sock_path
+            _child_cwd = tmpdir
+            _child_script_path = _script_path
 
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            _managed_execute_code_argv(
+                _child_python,
+                _child_script_path,
+                env=child_env,
+                execution_scope=managed_execute_scope,
+                workspace=tmpdir if managed_gateway else None,
+            ),
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
@@ -1442,6 +1619,25 @@ def execute_code(
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
+
+        # Start accepting only after Popen returns, so the managed path can bind
+        # the one allowed UDS client to the exact root service child PID.
+        expected_peer = None
+        if managed_gateway:
+            if managed_execute_uid is None:
+                raise OSError("managed execute_code identity is unavailable")
+            service_uid = getattr(os, "geteuid", lambda: -1)()
+            expected_peer = (proc.pid, service_uid)
+        rpc_thread = threading.Thread(
+            target=propagate_context_to_thread(_rpc_server_loop),
+            args=(
+                server_sock, task_id, tool_call_log,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                rpc_token, expected_peer,
+            ),
+            daemon=True,
+        )
+        rpc_thread.start()
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout
@@ -1551,6 +1747,23 @@ def execute_code(
                 pass
             poll_interval = min(0.2, poll_interval * 1.5)
 
+        # A script can start a detached/background descendant which survives
+        # the top-level process group. Retire the invocation cgroup on every
+        # normal exit before readers, RPC state, or the workspace are released.
+        # Failure raises into the error result and keeps the resource ID.
+        if managed_execute_uid is not None and managed_execute_scope is not None:
+            from tools.environments.local import (
+                retire_managed_execute_code_identity,
+            )
+
+            retire_managed_execute_code_identity(
+                managed_execute_uid,
+                child_env,
+                managed_execute_scope,
+            )
+            managed_execute_uid = None
+            managed_execute_scope = None
+
         # Wait for readers to finish draining
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
@@ -1570,7 +1783,8 @@ def execute_code(
         stop_event.set()
         server_sock.close()  # break accept() so thread exits promptly
         server_sock = None  # prevent double close in finally
-        rpc_thread.join(timeout=3)
+        if rpc_thread is not None:
+            rpc_thread.join(timeout=3)
 
         # Strip ANSI escape sequences so the model never sees terminal
         # formatting — prevents it from copying escapes into file writes.
@@ -1621,6 +1835,12 @@ def execute_code(
             # Include stderr in output so the LLM sees the traceback
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
+            # Known-failure-class recovery hint (import misuse, missing
+            # module, dict-vs-string result handling) so the model fixes
+            # the script on the next attempt instead of re-diagnosing.
+            hint = _sandbox_failure_hint(stderr_text, enabled_tools=sandbox_tools)
+            if hint:
+                result["hint"] = hint
 
         return json.dumps(result, ensure_ascii=False)
 
@@ -1657,6 +1877,22 @@ def execute_code(
                 os.unlink(sock_path)
         except OSError:
             pass  # already cleaned up or never created
+        if managed_execute_uid is not None and managed_execute_scope is not None:
+            try:
+                from tools.environments.local import (
+                    retire_managed_execute_code_identity,
+                )
+
+                retire_managed_execute_code_identity(
+                    managed_execute_uid,
+                    child_env,
+                    managed_execute_scope,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to retire managed execute_code identity",
+                    exc_info=True,
+                )
 
 
 def _kill_process_group(proc, escalate: bool = False):
@@ -1773,6 +2009,8 @@ def _is_usable_python(python_path: str) -> bool:
     Cached so we don't fork a subprocess on every execute_code call.
     """
     try:
+        from agent.delegation_context import delegated_child_subprocess_env
+
         result = subprocess.run(
             [python_path, "-c",
              "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"],
@@ -1780,6 +2018,7 @@ def _is_usable_python(python_path: str) -> bool:
             capture_output=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
             stdin=subprocess.DEVNULL,
+            env=delegated_child_subprocess_env(),
         )
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
@@ -1892,7 +2131,7 @@ _TOOL_DOC_LINES = [
      "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
      "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
     ("read_file",
-     "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
+     "  read_file(path: str, offset: int = 1, limit: int = 2000) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
     ("write_file",
      "  write_file(path: str, content: str) -> dict\n"
@@ -1957,25 +2196,22 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         )
 
     description = (
-        "Run a Python script that can call Hermes tools programmatically. "
-        "Use this when you need 3+ tool calls with processing logic between them, "
-        "need to filter/reduce large tool outputs before they enter your context, "
-        "need conditional branching (if X then Y else Z), or need to loop "
-        "(fetch N pages, process N files, retry on failure).\n\n"
-        "Use normal tool calls instead when: single tool call with no processing, "
-        "you need to see the full result and apply complex reasoning, "
-        "or the task requires interactive user input.\n\n"
+        "Run a Python script that calls Hermes tools programmatically. "
+        "Use when you need 3+ tool calls with logic between them: "
+        "filtering/reducing large outputs before they enter context, "
+        "conditional branching, or loops (N pages/files, retry on failure). "
+        "Use normal tool calls for single calls, results you must reason "
+        "over in full, or anything needing user interaction.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
-        "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
-        "datetime, collections, etc.) for processing between tool calls.\n\n"
-        "Also available (no import needed — built into hermes_tools):\n"
-        "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
-        "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
-        "  retry(fn, max_attempts=3, delay=2) — retry with exponential backoff for transient failures"
+        "Print your final result to stdout; stdlib (json, re, csv, datetime, ...) "
+        "is available for processing.\n\n"
+        "Built-in helpers (no import): json_parse(text) — tolerant json.loads for "
+        "terminal() output; shell_quote(s) — shlex.quote for dynamic shell args; "
+        "retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures."
     )
 
     return {

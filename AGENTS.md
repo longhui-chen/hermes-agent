@@ -190,9 +190,10 @@ framework or parallel implementation.
   proof at the nearest real boundary. Mock external providers at the boundary;
   unit tests must not use live networks or credentials.
 - Use `scripts/run_tests.sh`, not raw `pytest`, for authoritative Python test
-  runs. It supplies the hermetic credential, HOME, timezone, locale, xdist, and
-  subprocess-isolation setup used by CI. Target a file or node for fast feedback;
-  run the required broader scope before submission.
+  runs. It supplies the hermetic credential, HOME, timezone, locale, and
+  per-file subprocess isolation via `scripts/run_tests_parallel.py`. Target a
+  file and use `-k` for a single test; the runner is file-granular. Run the
+  required broader scope before submission.
 - Keep `HERMES_HOME` inside a temporary directory in tests. Profile tests that
   exercise HOME-anchored roots must also replace `Path.home()`.
 - Test contracts and relationships, not snapshots of expected-to-change data.

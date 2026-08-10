@@ -17,6 +17,7 @@ Covers the zet_agent side of ``delegate_task(background=true)``:
 
 import asyncio
 import json
+import os
 import urllib.error
 import urllib.request
 
@@ -252,6 +253,37 @@ async def test_deliver_posts_structured_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_deliver_unwraps_scoped_key_before_local_server_wire(
+    monkeypatch, tmp_path
+):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
+    adapter = _adapter(monkeypatch)
+    public_session_id = "zettlab:u1:agentA:1"
+    profile_home = tmp_path / "profiles" / "agent-a"
+    profile_home.mkdir(parents=True)
+    event = _delegation_process_event()
+    event["session_key"] = f"{profile_home}|{public_session_id}"
+    event["parent_session_id"] = public_session_id
+    payloads = []
+
+    def _fake_urlopen(req, timeout=None):
+        payloads.append(json.loads(req.data.decode("utf-8")))
+        return _FakeHTTPResponse(200)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        await adapter._deliver_delegation_completion(event, "done")
+    finally:
+        reset_hermes_home_override(token)
+
+    assert payloads[0]["session_key"] == public_session_id
+    assert payloads[0]["session_id"] == public_session_id
+
+
+@pytest.mark.asyncio
 async def test_deliver_raises_on_http_error_status(monkeypatch):
     monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
     adapter = _adapter(monkeypatch)
@@ -419,6 +451,56 @@ def test_resolver_claims_own_session(monkeypatch):
     assert src.chat_type == "dm"
 
 
+def test_resolver_unwraps_own_profile_scoped_session(monkeypatch, tmp_path):
+    """Background delegation stores the approval-isolated scoped key, but
+    SessionDB and local-server both address the public App session id."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    adapter = _adapter(monkeypatch)
+    public_session_id = "zettlab:u1:agentA:1"
+    profile_home = tmp_path / "profiles" / "agent-a"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        adapter, "_ensure_session_db", lambda: _FakeSessionDB({public_session_id})
+    )
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        src = adapter.resolve_process_event_source(
+            f"{profile_home}|{public_session_id}"
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert src is not None
+    assert src.chat_id == public_session_id
+
+
+def test_resolver_rejects_foreign_profile_scoped_session(monkeypatch, tmp_path):
+    """A scoped key is an ownership capability, not just a string to split."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    adapter = _adapter(monkeypatch)
+    public_session_id = "zettlab:u1:agentA:1"
+    active_home = tmp_path / "profiles" / "agent-a"
+    foreign_home = tmp_path / "profiles" / "agent-b"
+    active_home.mkdir(parents=True)
+    foreign_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        adapter, "_ensure_session_db", lambda: _FakeSessionDB({public_session_id})
+    )
+
+    token = set_hermes_home_override(str(active_home))
+    try:
+        src = adapter.resolve_process_event_source(
+            f"{foreign_home}|{public_session_id}"
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert src is None
+
+
 def test_resolver_fail_closed(monkeypatch):
     adapter = _adapter(monkeypatch)
     # 不认识的会话 / 空 key 不认领；DB 探测异常改抛 transient（见下组测试）
@@ -567,6 +649,97 @@ def test_turn_rebind_keeps_async_delivery_off_without_env(monkeypatch):
         assert async_delivery_supported() is False
     finally:
         clear_session_vars(tokens)
+
+
+def test_turn_rebind_keeps_public_chat_id_separate_from_profile_scoped_key(
+    monkeypatch,
+):
+    from gateway.session_context import clear_session_vars, get_session_env
+    from tools.cronjob_tools import _origin_from_env
+
+    monkeypatch.delenv(_ADVANCE_ENV, raising=False)
+    adapter = _adapter(monkeypatch)
+    public_session_id = "zettlab:userA:main:session-1"
+    scoped_key = f"/profiles/main|{public_session_id}"
+    tokens = _with_api_server_binding()
+    try:
+        adapter._bind_turn_session_context(
+            public_session_id,
+            session_key=scoped_key,
+        )
+        assert get_session_env("HERMES_SESSION_CHAT_ID") == public_session_id
+        assert get_session_env("HERMES_SESSION_KEY") == scoped_key
+        assert get_session_env("HERMES_EXEC_ASK") == "1"
+        assert _origin_from_env()["chat_id"] == public_session_id
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_inherited_api_run_binding_stays_zet_agent(monkeypatch):
+    from gateway.session_context import (
+        async_delivery_supported,
+        clear_session_vars,
+        get_session_env,
+    )
+
+    monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
+    adapter = _adapter(monkeypatch)
+    tokens = adapter._bind_api_server_session(
+        chat_id="public-session",
+        session_key="/profiles/coder|public-session",
+        session_id="public-session",
+    )
+    try:
+        assert get_session_env("HERMES_SESSION_PLATFORM") == "zet_agent"
+        assert get_session_env("HERMES_EXEC_ASK") == "1"
+        assert async_delivery_supported() is True
+    finally:
+        clear_session_vars(tokens)
+
+
+@pytest.mark.asyncio
+async def test_inherited_api_bindings_are_concurrency_local(monkeypatch):
+    from gateway.session_context import clear_session_vars, get_session_env
+
+    monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "process-sentinel")
+    monkeypatch.setenv("HERMES_EXEC_ASK", "process-sentinel")
+    adapter = _adapter(monkeypatch)
+    both_bound = asyncio.Event()
+    release = asyncio.Event()
+    bound = 0
+    lock = asyncio.Lock()
+
+    async def _one(session_id):
+        nonlocal bound
+        tokens = adapter._bind_api_server_session(
+            chat_id=session_id,
+            session_key=f"/profiles/main|{session_id}",
+            session_id=session_id,
+        )
+        try:
+            async with lock:
+                bound += 1
+                if bound == 2:
+                    both_bound.set()
+            await both_bound.wait()
+            await release.wait()
+            return (
+                get_session_env("HERMES_SESSION_KEY"),
+                get_session_env("HERMES_EXEC_ASK"),
+            )
+        finally:
+            clear_session_vars(tokens)
+
+    first = asyncio.create_task(_one("session-a"))
+    second = asyncio.create_task(_one("session-b"))
+    await both_bound.wait()
+    assert os.environ["HERMES_SESSION_KEY"] == "process-sentinel"
+    assert os.environ["HERMES_EXEC_ASK"] == "process-sentinel"
+    release.set()
+
+    assert await first == ("/profiles/main|session-a", "1")
+    assert await second == ("/profiles/main|session-b", "1")
 
 
 @pytest.mark.asyncio

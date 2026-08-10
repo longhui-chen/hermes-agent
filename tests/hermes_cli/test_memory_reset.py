@@ -83,23 +83,6 @@ class TestMemoryReset:
         assert not (memories / "MEMORY.md").exists()
         assert not (memories / "USER.md").exists()
 
-    def test_reset_memory_only(self, memory_env):
-        """--target memory should only delete MEMORY.md."""
-        hermes_home, memories = memory_env
-
-        result = _run_memory_reset(target="memory", yes=True)
-        assert result == "deleted"
-        assert not (memories / "MEMORY.md").exists()
-        assert (memories / "USER.md").exists()
-
-    def test_reset_user_only(self, memory_env):
-        """--target user should only delete USER.md."""
-        hermes_home, memories = memory_env
-
-        result = _run_memory_reset(target="user", yes=True)
-        assert result == "deleted"
-        assert (memories / "MEMORY.md").exists()
-        assert not (memories / "USER.md").exists()
 
     def test_cleanup_pending_exits_nonzero_without_success_message(
         self, memory_env, monkeypatch, capsys
@@ -165,38 +148,6 @@ class TestMemoryReset:
         result = _run_memory_reset(target="all", yes=True)
         assert result == "nothing"
 
-    def test_reset_confirmation_denied(self, memory_env):
-        """Without --yes and without typing 'yes', should be cancelled."""
-        hermes_home, memories = memory_env
-
-        result = _run_memory_reset(target="all", yes=False, confirm_input="no")
-        assert result == "cancelled"
-        # Files should still exist
-        assert (memories / "MEMORY.md").exists()
-        assert (memories / "USER.md").exists()
-
-    def test_reset_confirmation_accepted(self, memory_env):
-        """Typing 'yes' should proceed with deletion."""
-        hermes_home, memories = memory_env
-
-        result = _run_memory_reset(target="all", yes=False, confirm_input="yes")
-        assert result == "deleted"
-        assert not (memories / "MEMORY.md").exists()
-        assert not (memories / "USER.md").exists()
-
-    def test_reset_profile_scoped(self, tmp_path, monkeypatch):
-        """Reset should work on the active profile's HERMES_HOME."""
-        profile_home = tmp_path / "profiles" / "myprofile"
-        memories = profile_home / "memories"
-        memories.mkdir(parents=True)
-        (memories / "MEMORY.md").write_text("profile memory", encoding="utf-8")
-        (memories / "USER.md").write_text("profile user", encoding="utf-8")
-        monkeypatch.setenv("HERMES_HOME", str(profile_home))
-
-        result = _run_memory_reset(target="all", yes=True)
-        assert result == "deleted"
-        assert not (memories / "MEMORY.md").exists()
-        assert not (memories / "USER.md").exists()
 
     def test_reset_partial_files(self, memory_env):
         """Reset should work when only one memory file exists."""

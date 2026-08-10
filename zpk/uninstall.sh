@@ -7,6 +7,7 @@ APP_ID="com.zettlab.claw"
 KEEP_DATA=false
 HERMES_LINK="/usr/local/bin/hermes"
 EXPECTED_DATA_TARGET="/zettos/main/data/$APP_ID"
+DATA_DIR="/volume1/system/zettos-main-data/$APP_ID"
 
 for arg in "$@"; do
     if [ "$arg" = "--keep-data" ]; then
@@ -15,6 +16,15 @@ for arg in "$@"; do
 done
 
 echo "Uninstalling zettlab-claw (keep data: $KEEP_DATA) ..."
+
+if [ -L "$DATA_DIR" ]; then
+    echo "refuse to access symlinked R2 data directory: $DATA_DIR" >&2
+    exit 1
+fi
+if [ -e "$DATA_DIR" ] && [ "$(readlink -f "$DATA_DIR" 2>/dev/null || true)" != "$DATA_DIR" ]; then
+    echo "refuse to access R2 data through symlinked path components: $DATA_DIR" >&2
+    exit 1
+fi
 
 if command -v systemctl >/dev/null 2>&1; then
     for service in zettlab-claw.service hermes-agent-mux.service; do
@@ -26,7 +36,7 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload 2>/dev/null || true
 fi
 
-rm -f "$APP_BASE/data/secrets/hermes-agent-mux.env"
+rm -f "$DATA_DIR/secrets/hermes-agent-mux.env" "$APP_BASE/data/secrets/hermes-agent-mux.env"
 
 echo "  stopping hermes processes under $APP_BASE"
 PIDS=""
@@ -66,7 +76,10 @@ if [ -L "$HERMES_LINK" ]; then
 fi
 
 if [ "$KEEP_DATA" = "false" ]; then
-    echo "  removing runtime data"
+    echo "  removing R2 runtime data"
+    rm -rf "$DATA_DIR"
+
+    echo "  removing legacy runtime data"
     if [ -L "$APP_BASE/data" ]; then
         DATA_TARGET=$(readlink -f "$APP_BASE/data" 2>/dev/null || true)
         case "$DATA_TARGET" in

@@ -371,7 +371,10 @@ def test_channel_proposal_followup_context_points_to_card(monkeypatch):
     assert followup is not None
     context = followup["context"]
     assert "Connect button" in context
-    assert "native creation flow" not in context
+    # 连接类走卡片，不该混入任何原生创建流程话术（main 已把各品类具名化）。
+    assert "native cronjob flow" not in context
+    assert "native skill_manage" not in context
+    assert "agent-creator" not in context
 
 
 def test_creation_type_followup_context_keeps_native_flow(monkeypatch):
@@ -398,7 +401,10 @@ def test_creation_type_followup_context_keeps_native_flow(monkeypatch):
         conversation_history=[],
     )
     assert followup is not None
-    assert "native creation flow" in followup["context"]
+    # main 的 _native_creation_route 已把各品类的话术具名化（task → 原生 cronjob 流程），
+    # 不再是泛化的 "native creation flow"；这里钉的是「非连接类仍走原生创建流程」这条
+    # 语义，而不是那句具体措辞。
+    assert "native cronjob flow" in followup["context"]
 
 
 def test_availability_context_grounds_main_model_every_turn(monkeypatch):

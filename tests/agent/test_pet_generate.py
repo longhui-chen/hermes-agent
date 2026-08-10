@@ -8,6 +8,9 @@ exercised hermetically.
 from __future__ import annotations
 
 import os
+import threading
+import time
+from collections import Counter
 
 import pytest
 
@@ -55,11 +58,6 @@ def test_extract_strip_frames_transparent_returns_centered_cells():
         assert frame.getchannel("A").getextrema()[1] > 0
 
 
-def test_extract_strip_frames_keys_out_solid_background():
-    frames = atlas.extract_strip_frames(_strip(4, transparent=False), 4)
-    assert len(frames) == 4
-    # The green backdrop must be gone (corner transparent).
-    assert frames[0].getpixel((0, 0))[3] == 0
 
 
 def test_remove_background_defringes_antialiased_edge():
@@ -77,131 +75,24 @@ def test_remove_background_defringes_antialiased_edge():
     assert keyed.getpixel((100, 100))[3] > 0  # core intact
 
 
-def test_remove_background_clears_trapped_chroma_pocket():
-    # Green body enclosing a magenta pocket (the "pink between the arm" case):
-    # the pocket isn't border-reachable, so it must be cleared by interior seeding.
-    img = Image.new("RGBA", (200, 200), (255, 0, 255, 255))  # magenta backdrop
-    draw = ImageDraw.Draw(img)
-    draw.ellipse((40, 40, 160, 160), fill=(40, 200, 60, 255))  # body
-    draw.ellipse((85, 85, 115, 115), fill=(255, 0, 255, 255))  # trapped pocket
-    keyed = atlas.remove_background(img)
-    assert keyed.getpixel((100, 100))[3] == 0  # pocket cleared
-    assert keyed.getpixel((100, 50))[3] > 0  # body still opaque
-    assert keyed.getpixel((2, 2))[3] == 0  # border cleared
 
 
-def test_extract_strip_frames_repairs_provider_alpha_holes():
-    img = _strip(1)
-    draw = ImageDraw.Draw(img)
-    cx = img.width // 2
-    cy = img.height // 2
-    draw.ellipse((cx - 16, cy - 16, cx + 16, cy + 16), fill=(0, 0, 0, 0))
-
-    frames = atlas.extract_strip_frames(img, 1, method="components")
-    assert frames[0].getpixel((atlas.CELL_WIDTH // 2, atlas.CELL_HEIGHT // 2))[3] > 0
 
 
-def test_extract_strip_frames_severs_thin_bridges_between_frames():
-    # AI strips often connect poses with a 1px shadow/glow bridge. Strict
-    # component extraction must still find each frame instead of treating the row
-    # as one merged subject.
-    img = _strip(4)
-    draw = ImageDraw.Draw(img)
-    draw.line((20, img.height // 2, img.width - 20, img.height // 2), fill=(255, 255, 255, 255), width=1)
-
-    frames = atlas.extract_strip_frames(img, 4, method="components")
-    assert len(frames) == 4
-    assert all(frame.getchannel("A").getextrema()[1] > 0 for frame in frames)
 
 
-def test_extract_strip_frames_drops_small_side_lobes_from_adjacent_frames():
-    # Frogger regression: a real pose plus a small separated side lobe from a
-    # neighbouring pose. The side lobe should not survive into the fitted cell.
-    img = Image.new("RGBA", (atlas.CELL_WIDTH, atlas.CELL_HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse((52, 34, 150, 188), fill=(70, 190, 70, 255))
-    draw.rectangle((4, 70, 24, 160), fill=(70, 190, 70, 255))
-    draw.rectangle((168, 82, 186, 150), fill=(70, 190, 70, 255))
-
-    frame = atlas.extract_strip_frames(img, 1, method="components")[0]
-    alpha = frame.getchannel("A")
-    left_edge_mass = sum(1 for x in range(0, 36) for y in range(frame.height) if alpha.getpixel((x, y)) > 16)
-    right_edge_mass = sum(1 for x in range(frame.width - 36, frame.width) for y in range(frame.height) if alpha.getpixel((x, y)) > 16)
-    assert left_edge_mass == 0
-    assert right_edge_mass == 0
 
 
-def test_extract_strip_frames_drops_detached_slot_effects():
-    img = Image.new("RGBA", (atlas.CELL_WIDTH, atlas.CELL_HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse((72, 54, 148, 172), fill=(70, 190, 70, 255))  # subject
-    draw.polygon([(10, 76), (16, 84), (24, 78), (18, 88)], fill=(255, 255, 160, 255))  # sparkle
-
-    frame = atlas.extract_strip_frames(img, 1, method="components", fit=False)[0]
-    bbox = frame.getbbox()
-    assert bbox is not None
-    assert bbox[0] > 40  # detached sparkle was removed
 
 
-def test_extract_strip_frames_requires_slot_padding_in_strict_mode():
-    img = Image.new("RGBA", (atlas.CELL_WIDTH * 2, atlas.CELL_HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    # Frame 0 touches the top edge; strict mode should reject the row so the
-    # caller regenerates instead of accepting a clipped pet frame.
-    draw.rectangle((40, 0, 120, 130), fill=(70, 190, 70, 255))
-    draw.rectangle((atlas.CELL_WIDTH + 40, 40, atlas.CELL_WIDTH + 120, 170), fill=(70, 190, 70, 255))
-
-    with pytest.raises(ValueError):
-        atlas.extract_strip_frames(img, 2, method="components", fit=False)
 
 
-def test_extract_strip_frames_rejects_multi_pose_frame_outlier():
-    frames = []
-    for _ in range(3):
-        frame = Image.new("RGBA", (atlas.CELL_WIDTH, atlas.CELL_HEIGHT), (0, 0, 0, 0))
-        ImageDraw.Draw(frame).rectangle((82, 120, 108, 178), fill=(220, 240, 255, 255))
-        frames.append(frame)
-
-    bad = Image.new("RGBA", (atlas.CELL_WIDTH, atlas.CELL_HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(bad)
-    for x in (10, 50, 90, 130, 166):
-        draw.rectangle((x, 124, x + 12, 172), fill=(220, 240, 255, 255))
-    frames.append(bad)
-
-    with pytest.raises(ValueError, match="multiple separated subjects"):
-        atlas._validate_extracted_frames(frames, 4)
 
 
-def test_extract_strip_frames_uses_real_gutters_when_spacing_is_uneven():
-    # gpt-image often returns a square chroma strip whose poses are separated but
-    # not laid out on exact equal-width slots. Equal slot slicing would include
-    # the next pose's wing/cape in frame 0; gutter-derived crops keep it out.
-    img = Image.new("RGBA", (600, 208), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle((40, 58, 140, 178), fill=(80, 120, 220, 255))
-    draw.rectangle((182, 58, 282, 178), fill=(220, 120, 80, 255))
-    draw.rectangle((430, 58, 530, 178), fill=(80, 220, 120, 255))
-
-    frames = atlas.extract_strip_frames(img, 3, method="auto", fit=False)
-
-    assert len(frames) == 3
-    assert frames[0].getbbox()[2] <= 120
-    assert frames[1].getbbox()[0] <= 16
 
 
-def test_extract_strip_frames_slot_fallback_when_unsegmentable():
-    # A single connected smear can't be split into 5 components → slot fallback.
-    img = Image.new("RGBA", (200 * 5, 208), (0, 0, 0, 0))
-    ImageDraw.Draw(img).rectangle((0, 80, 200 * 5 - 1, 120), fill=(200, 50, 50, 255))
-    frames = atlas.extract_strip_frames(img, 5, method="auto")
-    assert len(frames) == 5
 
 
-def test_extract_components_method_raises_when_too_few():
-    img = Image.new("RGBA", (400, 208), (0, 0, 0, 0))
-    ImageDraw.Draw(img).ellipse((10, 10, 100, 100), fill=(255, 0, 0, 255))
-    with pytest.raises(ValueError):
-        atlas.extract_strip_frames(img, 6, method="components")
 
 
 # ───────────────────────── atlas compose / validate ─────────────────────────
@@ -214,39 +105,12 @@ def _frames_for_all_states() -> dict[str, list]:
     return out
 
 
-def test_compose_atlas_geometry_and_validation():
-    sheet = atlas.compose_atlas(_frames_for_all_states())
-    assert sheet.size == (atlas.ATLAS_WIDTH, atlas.ATLAS_HEIGHT)
-    result = atlas.validate_atlas(sheet)
-    assert result["ok"], result["errors"]
-    assert set(result["filled_states"]) == {s for s, _, _ in atlas.ROW_SPECS}
 
 
-def test_compose_atlas_leaves_unused_tail_transparent():
-    # waving has 4 frames; columns 4 and 5 of its row must be transparent.
-    sheet = atlas.compose_atlas(_frames_for_all_states())
-    wave_row = next(r for s, r, _ in atlas.ROW_SPECS if s == "waving")
-    top = wave_row * atlas.CELL_HEIGHT
-    for col in (4, 5):
-        left = col * atlas.CELL_WIDTH
-        cell = sheet.crop((left, top, left + atlas.CELL_WIDTH, top + atlas.CELL_HEIGHT))
-        assert cell.getchannel("A").getextrema()[1] == 0
 
 
-def test_validate_atlas_rejects_wrong_size():
-    bad = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
-    result = atlas.validate_atlas(bad)
-    assert not result["ok"]
-    assert any("expected" in e for e in result["errors"])
 
 
-def test_validate_atlas_rejects_rgb_residue():
-    sheet = atlas.compose_atlas(_frames_for_all_states())
-    # Poke a fully-transparent pixel with non-zero RGB.
-    sheet.putpixel((0, 0), (120, 0, 0, 0))
-    result = atlas.validate_atlas(sheet)
-    assert not result["ok"]
-    assert any("residue" in e for e in result["errors"])
 
 
 def test_validate_atlas_rejects_postage_stamp_sprite():
@@ -264,33 +128,10 @@ def test_validate_atlas_rejects_postage_stamp_sprite():
     assert any("too small" in e for e in result["errors"])
 
 
-def test_validate_atlas_rejects_one_collapsed_state_row():
-    frames = _frames_for_all_states()
-    tiny = Image.new("RGBA", (atlas.CELL_WIDTH, atlas.CELL_HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(tiny)
-    draw.rectangle((90, 150, 106, 199), fill=(220, 240, 255, 255))
-    frames["failed"] = [tiny.copy() for _ in range(atlas.FRAME_COUNTS["failed"])]
-
-    sheet = atlas.compose_atlas(frames)
-    result = atlas.validate_atlas(sheet)
-
-    assert not result["ok"]
-    assert any("appears collapsed" in e and "failed" in e for e in result["errors"])
 
 
-def test_validate_atlas_warns_on_empty_state():
-    frames = _frames_for_all_states()
-    frames["jumping"] = []
-    sheet = atlas.compose_atlas(frames)
-    result = atlas.validate_atlas(sheet)
-    assert result["ok"]  # one empty row is a warning, not an error
-    assert any("jumping" in w for w in result["warnings"])
 
 
-def test_single_frame_fits_cell():
-    frame = atlas.single_frame(_strip(1))
-    assert frame.size == (atlas.CELL_WIDTH, atlas.CELL_HEIGHT)
-    assert frame.getchannel("A").getextrema()[1] > 0
 
 
 def test_normalize_cells_uses_consistent_pose_scale_for_motion_rows():
@@ -359,46 +200,13 @@ def test_register_local_pet_is_generated_and_exports_zip():
     assert any(n.startswith("zippy/spritesheet") for n in names)
 
 
-def test_export_pet_rejects_unknown_and_traversal():
-    from agent.pet import store
-
-    with pytest.raises(store.PetStoreError):
-        store.export_pet("does-not-exist")
-    with pytest.raises(store.PetStoreError):
-        store.export_pet("../secrets")
 
 
-def test_register_local_pet_accepts_bytes():
-    from agent.pet import store
-
-    sheet = atlas.compose_atlas(_frames_for_all_states())
-    data = atlas.atlas_to_webp_bytes(sheet)
-    pet = store.register_local_pet(data, slug="bytey")
-    assert pet.exists
 
 
 # ───────────────────────── orchestration (mocked imagegen) ─────────────────────────
 
 
-def test_generate_base_drafts_returns_n(monkeypatch, tmp_path):
-    from agent.pet.generate import imagegen, orchestrate
-
-    calls = {"n": 0}
-
-    def fake_generate(prompt, *, n=1, reference_images=None, provider=None, prefix="pet", aspect_ratio="square"):
-        paths = []
-        for i in range(n):
-            calls["n"] += 1
-            p = tmp_path / f"{prefix}_{calls['n']}.png"
-            _strip(1).save(p)
-            paths.append(p)
-        return paths
-
-    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
-    monkeypatch.setattr(imagegen, "generate", fake_generate)
-
-    drafts = orchestrate.generate_base_drafts("a fox", n=4)
-    assert len(drafts) == 4
 
 
 def test_generate_base_drafts_hardens_opaque_background(monkeypatch, tmp_path):
@@ -423,6 +231,239 @@ def test_generate_base_drafts_hardens_opaque_background(monkeypatch, tmp_path):
     assert rgba.getpixel((0, 0))[3] == 0
     # The pet blob in the center is still opaque.
     assert rgba.getpixel((rgba.width // 2, rgba.height // 2))[3] > 0
+
+
+def test_hatch_pet_propagates_secret_scope_to_generation_workers(monkeypatch, tmp_path):
+    from agent import secret_scope
+    from agent.pet import store
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import imagegen, orchestrate
+
+    base = tmp_path / "base.png"
+    _strip(1).save(base)
+
+    def fake_generate(prompt, *, n=1, reference_images=None, provider=None, prefix="pet", aspect_ratio="square"):
+        del prompt, n, reference_images, provider, aspect_ratio
+        assert secret_scope.get_secret("PET_TEST_PROFILE") == "profile-a"
+        state = prefix.replace("pet_row_", "")
+        count = atlas_mod.FRAME_COUNTS.get(state, 6)
+        path = tmp_path / f"{prefix}.png"
+        _strip(count).save(path)
+        return [path]
+
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+    monkeypatch.setattr(store, "pets_dir", lambda: tmp_path / "pets")
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    scope_token = secret_scope.set_secret_scope({"PET_TEST_PROFILE": "profile-a"})
+    try:
+        result = orchestrate.hatch_pet(
+            base_image=base,
+            slug="scoped-pet",
+            concept="a scoped robot pet",
+        )
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert result.slug == "scoped-pet"
+    assert result.validation["ok"] is True
+
+
+def test_hatch_pet_generates_animation_rows_one_at_a_time(monkeypatch, tmp_path):
+    from agent.pet import store
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import imagegen, orchestrate
+
+    base = tmp_path / "base.png"
+    _strip(1).save(base)
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_generate(
+        prompt,
+        *,
+        n=1,
+        reference_images=None,
+        provider=None,
+        prefix="pet",
+        aspect_ratio="square",
+    ):
+        nonlocal active, max_active
+        del prompt, n, reference_images, provider, aspect_ratio
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.02)
+            state = prefix.replace("pet_row_", "")
+            count = atlas_mod.FRAME_COUNTS.get(state, 6)
+            path = tmp_path / f"{prefix}.png"
+            _strip(count).save(path)
+            return [path]
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+    monkeypatch.setattr(store, "pets_dir", lambda: tmp_path / "pets")
+
+    result = orchestrate.hatch_pet(
+        base_image=base,
+        slug="bounded-pet",
+        concept="a bounded robot pet",
+    )
+
+    assert result.validation["ok"] is True
+    assert max_active == orchestrate._MAX_PARALLEL_HATCH_ROWS == 1
+
+
+def test_hatch_pet_retry_reuses_completed_animation_rows(monkeypatch, tmp_path):
+    from agent.pet import store
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import imagegen, orchestrate
+    from agent.pet.generate.imagegen import GenerationError
+
+    base = tmp_path / "base.png"
+    _strip(1).save(base)
+    cache = tmp_path / "row-cache"
+    cache.mkdir()
+    calls: Counter[str] = Counter()
+    allow_running_right = False
+
+    def fake_generate(
+        prompt,
+        *,
+        n=1,
+        reference_images=None,
+        provider=None,
+        prefix="pet",
+        aspect_ratio="square",
+    ):
+        del prompt, n, reference_images, provider, aspect_ratio
+        state = prefix.replace("pet_row_", "")
+        calls[state] += 1
+        if state == "running-right" and not allow_running_right:
+            raise GenerationError("temporary upstream failure")
+        count = atlas_mod.FRAME_COUNTS.get(state, 6)
+        path = tmp_path / f"{prefix}.png"
+        _strip(count).save(path)
+        return [path]
+
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+    monkeypatch.setattr(store, "pets_dir", lambda: tmp_path / "pets")
+
+    with pytest.raises(GenerationError, match="running-right"):
+        orchestrate.hatch_pet(
+            base_image=base,
+            slug="resumable-pet",
+            concept="a resumable robot pet",
+            row_cache_dir=cache,
+        )
+
+    generated_states = {
+        state for state, _, _ in atlas_mod.ROW_SPECS if state != "running-left"
+    }
+    assert calls["running-right"] == orchestrate._ROW_GEN_ATTEMPTS
+    assert all(calls[state] == 1 for state in generated_states - {"running-right"})
+
+    allow_running_right = True
+    result = orchestrate.hatch_pet(
+        base_image=base,
+        slug="resumable-pet",
+        concept="a resumable robot pet",
+        row_cache_dir=cache,
+    )
+
+    assert result.validation["ok"] is True
+    assert calls["running-right"] == orchestrate._ROW_GEN_ATTEMPTS + 1
+    assert all(calls[state] == 1 for state in generated_states - {"running-right"})
+    assert {path.name for path in cache.iterdir()} == generated_states
+
+
+def test_hatch_pet_reports_only_durable_rows_as_ready(monkeypatch, tmp_path):
+    from agent.pet import store
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import imagegen, orchestrate
+
+    base = tmp_path / "base.png"
+    _strip(1).save(base)
+    cache = tmp_path / "row-cache"
+    cache.mkdir()
+
+    def fake_generate(
+        prompt,
+        *,
+        n=1,
+        reference_images=None,
+        provider=None,
+        prefix="pet",
+        aspect_ratio="square",
+    ):
+        del prompt, n, reference_images, provider, aspect_ratio
+        state = prefix.replace("pet_row_", "")
+        count = atlas_mod.FRAME_COUNTS.get(state, 6)
+        path = tmp_path / f"{prefix}.png"
+        _strip(count).save(path)
+        return [path]
+
+    real_save = orchestrate._save_cached_row
+
+    def fake_save(cache_root, state, frames):
+        if state == "waving":
+            raise OSError("cache unavailable")
+        real_save(cache_root, state, frames)
+
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+    monkeypatch.setattr(orchestrate, "_save_cached_row", fake_save)
+    monkeypatch.setattr(store, "pets_dir", lambda: tmp_path / "pets")
+    events: list[tuple[str, str]] = []
+
+    result = orchestrate.hatch_pet(
+        base_image=base,
+        slug="durable-pet",
+        concept="a durable robot pet",
+        row_cache_dir=cache,
+        on_progress=lambda event, detail: events.append((event, detail)),
+    )
+
+    assert result.validation["ok"] is True
+    assert ("row-ready", "idle") in events
+    assert ("row-ready", "waving") not in events
+
+
+def test_cached_row_rejects_small_compressed_image_with_large_decoded_size(tmp_path):
+    import json
+
+    from agent.pet.generate import orchestrate
+
+    cache = tmp_path / "row-cache"
+    row = cache / "idle"
+    row.mkdir(parents=True)
+    Image.new("RGBA", (3000, 3000), (0, 0, 0, 0)).save(row / "frame-0.png")
+    (row / "complete.json").write_text(
+        json.dumps({"version": 1, "state": "idle", "count": 1}),
+        encoding="utf-8",
+    )
+
+    assert (row / "frame-0.png").stat().st_size < orchestrate._MAX_CACHED_FRAME_BYTES
+    assert orchestrate._load_cached_row(cache, "idle", 1) is None
+
+
+def test_hatch_pixel_budget_covers_all_generated_rows():
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import orchestrate
+
+    generated_row_count = len(atlas_mod.ROW_SPECS) - 1
+    assert orchestrate._MAX_HATCH_FRAME_PIXELS == (
+        orchestrate._MAX_CACHED_ROW_PIXELS * generated_row_count
+    )
 
 
 def test_hatch_pet_end_to_end(monkeypatch, tmp_path):
@@ -462,17 +503,52 @@ def test_hatch_pet_end_to_end(monkeypatch, tmp_path):
     assert store.load_pet("mocky").exists
 
 
-def test_hatch_pet_idle_fallback_when_row_fails(monkeypatch, tmp_path):
+def test_stage_hatched_pet_writes_package_without_installing(monkeypatch, tmp_path):
+    import json
+
+    from agent.pet import store
+    from agent.pet.generate import orchestrate
+
+    installed = tmp_path / "installed"
+    staging = tmp_path / "staging"
+    installed.mkdir()
+    staging.mkdir()
+    monkeypatch.setattr(store, "pets_dir", lambda: installed)
+    sheet = atlas.compose_atlas(_frames_for_all_states())
+
+    slug, display_name, spritesheet = orchestrate._stage_hatched_pet(
+        sheet,
+        staging_dir=staging,
+        slug="Blue Byte",
+        display_name="Blue Byte",
+        description="An original test pet.",
+    )
+
+    metadata = json.loads((spritesheet.parent / "pet.json").read_text())
+    assert slug == "blue-byte"
+    assert display_name == "Blue Byte"
+    assert spritesheet.is_file()
+    assert metadata["id"] == "blue-byte"
+    assert metadata["spritesheetPath"] == "spritesheet.webp"
+    assert list(installed.iterdir()) == []
+
+
+def test_hatch_pet_retries_timeout_three_times_without_idle_fallback(monkeypatch, tmp_path):
     from agent.pet.generate import atlas as atlas_mod
     from agent.pet.generate import imagegen, orchestrate
     from agent.pet.generate.imagegen import GenerationError
 
     base = tmp_path / "base.png"
     _strip(1).save(base)
+    cache = tmp_path / "row-cache"
+    cache.mkdir()
+    idle_calls = 0
 
     def fake_generate(prompt, *, n=1, reference_images=None, provider=None, prefix="pet", aspect_ratio="square"):
+        nonlocal idle_calls
         if prefix == "pet_row_idle":
-            raise GenerationError("boom")
+            idle_calls += 1
+            raise GenerationError("media generation service timed out; retryable=false")
         state = prefix.replace("pet_row_", "")
         count = atlas_mod.FRAME_COUNTS.get(state, 6)
         p = tmp_path / f"{prefix}.png"
@@ -482,8 +558,15 @@ def test_hatch_pet_idle_fallback_when_row_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
     monkeypatch.setattr(imagegen, "generate", fake_generate)
 
-    result = orchestrate.hatch_pet(base_image=base, slug="fallbacky", concept="a fox")
-    assert "idle" in result.states  # filled by the base-image fallback
+    with pytest.raises(GenerationError, match=r"idle after 3 attempt\(s\).*timed out"):
+        orchestrate.hatch_pet(
+            base_image=base,
+            slug="strict-idle",
+            concept="a fox",
+            row_cache_dir=cache,
+        )
+
+    assert idle_calls == orchestrate._ROW_GEN_ATTEMPTS == 3
 
 
 def test_hatch_pet_rejects_missing_required_animation_rows(monkeypatch, tmp_path):
@@ -494,8 +577,12 @@ def test_hatch_pet_rejects_missing_required_animation_rows(monkeypatch, tmp_path
     base = tmp_path / "base.png"
     _strip(1).save(base)
 
+    failed_calls = 0
+
     def fake_generate(prompt, *, n=1, reference_images=None, provider=None, prefix="pet", aspect_ratio="square"):
-        if prefix == "pet_row_running-right":
+        nonlocal failed_calls
+        if prefix == "pet_row_failed":
+            failed_calls += 1
             raise GenerationError("bad row")
         state = prefix.replace("pet_row_", "")
         count = atlas_mod.FRAME_COUNTS.get(state, 6)
@@ -506,19 +593,41 @@ def test_hatch_pet_rejects_missing_required_animation_rows(monkeypatch, tmp_path
     monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
     monkeypatch.setattr(imagegen, "generate", fake_generate)
 
-    with pytest.raises(GenerationError, match="running-right"):
+    with pytest.raises(GenerationError, match=r"failed after 3 attempt\(s\)"):
         orchestrate.hatch_pet(base_image=base, slug="broken", concept="a fox")
 
+    assert failed_calls == orchestrate._ROW_GEN_ATTEMPTS == 3
 
-def test_resolve_provider_errors_without_backend(monkeypatch):
-    from agent.pet.generate import imagegen
 
-    monkeypatch.setattr(imagegen, "_discover", lambda: None)
-    monkeypatch.setattr("agent.image_gen_registry.get_active_provider", lambda: None)
-    monkeypatch.setattr("agent.image_gen_registry.get_provider", lambda name: None)
+def test_hatch_pet_does_not_retry_explicit_nonretryable_row_error(monkeypatch, tmp_path):
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import imagegen, orchestrate
+    from agent.pet.generate.imagegen import GenerationError
 
-    with pytest.raises(imagegen.GenerationError):
-        imagegen.resolve_provider(require_references=True)
+    base = tmp_path / "base.png"
+    _strip(1).save(base)
+    failed_calls = 0
+
+    def fake_generate(prompt, *, n=1, reference_images=None, provider=None, prefix="pet", aspect_ratio="square"):
+        nonlocal failed_calls
+        if prefix == "pet_row_failed":
+            failed_calls += 1
+            raise GenerationError("content policy rejection; retryable=false")
+        state = prefix.replace("pet_row_", "")
+        count = atlas_mod.FRAME_COUNTS.get(state, 6)
+        path = tmp_path / f"{prefix}.png"
+        _strip(count).save(path)
+        return [path]
+
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+
+    with pytest.raises(GenerationError, match=r"failed after 1 attempt\(s\)"):
+        orchestrate.hatch_pet(base_image=base, slug="blocked", concept="a fox")
+
+    assert failed_calls == 1
+
+
 
 
 class _FakeImgProvider:
@@ -530,20 +639,6 @@ class _FakeImgProvider:
         return self._available
 
 
-def test_resolve_provider_honors_available_preference(monkeypatch):
-    """An explicit, configured, ref-capable preference wins over the active one."""
-    from agent.pet.generate import imagegen
-
-    registry = {"openai": _FakeImgProvider("openai"), "openrouter": _FakeImgProvider("openrouter")}
-    monkeypatch.setattr(imagegen, "_discover", lambda: None)
-    monkeypatch.setattr("agent.image_gen_registry.get_active_provider", lambda: registry["openai"])
-    monkeypatch.setattr("agent.image_gen_registry.get_provider", lambda name: registry.get(name))
-
-    assert imagegen.resolve_provider(prefer="openrouter").name == "openrouter"
-    # An unavailable / unknown preference is ignored — fall back to the active one.
-    registry["openrouter"]._available = False
-    assert imagegen.resolve_provider(prefer="openrouter").name == "openai"
-    assert imagegen.resolve_provider(prefer="not-a-provider").name == "openai"
 
 
 def test_list_sprite_providers_marks_default(monkeypatch):

@@ -61,15 +61,50 @@ import sys
 import tempfile
 import threading
 import time
-import requests
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
-from agent.auxiliary_client import call_llm
 from agent.redact import redact_cdp_url
-from hermes_constants import agent_browser_runnable, get_hermes_home
+from hermes_constants import (
+    agent_browser_runnable,
+    get_hermes_home,
+    get_hermes_home_override,
+)
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
+
+
+def __getattr__(name: str):
+    """Lazy module attributes (PEP 562) — import diet for cold start.
+
+    ``requests`` (~40 ms) and ``agent.auxiliary_client.call_llm`` (~65 ms)
+    are only needed on specific code paths, so they load on first use. The
+    module-level names are preserved for the test-patch surface
+    (``patch("tools.browser_tool.requests.get")`` /
+    ``patch("tools.browser_tool.call_llm")``): first attribute access imports
+    the real object and binds it into module globals.
+    """
+    if name == "requests":
+        import requests as _requests
+
+        globals()["requests"] = _requests
+        return _requests
+    if name == "call_llm":
+        from agent.auxiliary_client import call_llm as _call_llm
+
+        globals()["call_llm"] = _call_llm
+        return _call_llm
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _lazy_call_llm(*args, **kwargs):
+    """Invoke ``call_llm`` through module globals so test patches of
+    ``tools.browser_tool.call_llm`` are honored, importing lazily otherwise."""
+    fn = globals().get("call_llm")
+    if fn is None:
+        fn = __getattr__("call_llm")
+    return fn(*args, **kwargs)
 
 # Browser-specific tool keys passed through to the agent-browser subprocess
 # AFTER credential stripping.  agent-browser is a Node process loading npm
@@ -148,7 +183,108 @@ try:
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
 
+try:
+    from tools.browser_backend_router import (
+        is_desktop_host_online as _is_desktop_host_online,
+        is_managed_browser_configured as _is_managed_browser_configured,
+        route_browser_action as _route_browser_action,
+    )
+except ImportError:
+    _is_desktop_host_online = lambda: False  # noqa: E731
+    _is_managed_browser_configured = lambda: False  # noqa: E731
+    _route_browser_action = lambda _action, _params=None: None  # noqa: E731
+
 logger = logging.getLogger(__name__)
+
+
+def _managed_route_result(route: Any) -> Optional[str]:
+    """Return a terminal tool result, or None when normal dispatch continues."""
+    if route is None:
+        return None
+    if route.backend == "camofox":
+        if _is_camofox_mode():
+            return None
+        return json.dumps({
+            "success": False,
+            "code": "camofox_backend_unavailable",
+            "error": "local-server selected Camofox, but this profile has no Camofox runtime.",
+        }, ensure_ascii=False)
+    return route.result or json.dumps({
+        "success": False,
+        "code": "invalid_browser_router_response",
+        "error": "Managed browser router returned no action result.",
+    }, ensure_ascii=False)
+
+
+def _managed_desktop_payload(route: Any) -> Optional[Dict[str, Any]]:
+    """Decode a desktop result while preserving router errors as tool output."""
+    if route is None or route.backend != "desktop":
+        return None
+    try:
+        payload = json.loads(route.result or "")
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+    return {
+        "success": False,
+        "code": "invalid_browser_router_response",
+        "error": "Managed browser router returned an invalid desktop result.",
+    }
+
+
+def _is_browser_internal_blank_url(url: str) -> bool:
+    """Return True for browser-internal blank pages (about:blank / about:srcdoc).
+
+    A managed page legitimately reports these URLs in non-network states: a
+    fresh tab, the post-close safety blanking, or an ``srcdoc`` iframe.  They
+    carry no network target, so the SSRF boundary does not apply to them.
+    Only the exact browser-internal blank pages qualify — URLs with a real
+    network scheme are never exempted here.
+    """
+    value = (url or "").strip().lower()
+    if not value.startswith("about:"):
+        return False
+    rest = value[len("about:"):]
+    # ``about:blank?query`` / ``about:blank#fragment`` still render blank.
+    for separator in ("#", "?"):
+        index = rest.find(separator)
+        if index != -1:
+            rest = rest[:index]
+    return rest in ("blank", "srcdoc")
+
+
+def _managed_page_safety_error(url: str) -> Optional[str]:
+    """Apply the browser's post-navigation network boundary to PC pages.
+
+    Mirrors the gating used by the local/cloud navigation paths: the cloud
+    metadata floor is unconditional, while the private/internal check is
+    skipped for local backends and when ``browser.allow_private_urls`` is set —
+    otherwise the user's own LAN pages (e.g. the device web UI) would be
+    blocked and force-closed on the managed desktop browser.
+    """
+    if not url:
+        return None
+    if _is_browser_internal_blank_url(url):
+        # Legitimate initial/reset state, not a network target.
+        return None
+    if _is_always_blocked_url(url):
+        return "Blocked: page URL targets a cloud metadata endpoint"
+    if (
+        not _is_local_backend()
+        and not _allow_private_urls()
+        and not _is_safe_url(url)
+    ):
+        return "Blocked: page URL targets a private or internal address"
+    return None
+
+
+def _close_unsafe_managed_page() -> None:
+    """Best-effort blanking after a desktop page crosses the network boundary."""
+    try:
+        _route_browser_action("close")
+    except Exception as exc:
+        logger.debug("Managed browser safety close failed: %s", exc)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
 # Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
@@ -429,6 +565,8 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         version_url = discovery_url.rstrip("/") + "/json/version"
 
     try:
+        import requests  # lazy — shared module object, test patches still apply
+
         response = requests.get(version_url, timeout=10)
         response.raise_for_status()
         payload = response.json()
@@ -457,6 +595,45 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+def _get_cdp_override_raw() -> str:
+    """Return the *configured* CDP override without any network I/O.
+
+    Precedence is:
+    1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
+    2. ``browser.cdp_url`` in config.yaml (persistent config)
+
+    This is the availability-check variant: callers that only need to know
+    *whether* a CDP override is configured (tool ``check_fn`` gates,
+    ``_is_local_mode`` / ``_is_local_backend`` routing decisions,
+    ``hermes doctor``) MUST use this instead of :func:`_get_cdp_override`.
+
+    Rationale: ``_get_cdp_override`` resolves the endpoint over HTTP
+    (``/json/version`` discovery, 10s timeout). Tool-schema assembly runs at
+    every CLI/Desktop startup and probes several browser-family check_fns;
+    when a *stale* ``browser.cdp_url`` points at a dead endpoint (the debug
+    Chrome it referenced is long gone), each check blocked on a failing
+    socket connect and startup stalled for 10+ seconds before the banner —
+    with no error, just mystery slowness. Same principle as the existing
+    "do not execute ``agent-browser --version`` here" rule in
+    ``check_browser_requirements``: no side effects during schema build.
+    """
+    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if env_override:
+        return env_override
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
+    except Exception as e:
+        logger.debug("Could not read browser.cdp_url from config: %s", e)
+
+    return ""
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
@@ -467,22 +644,16 @@ def _get_cdp_override() -> str:
     When either is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
+
+    NOTE: resolution may perform an HTTP ``/json/version`` discovery request.
+    Only call this on paths that are about to *connect* (session creation,
+    supervisor attach). Pure is-it-configured gates must use
+    :func:`_get_cdp_override_raw`.
     """
-    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if env_override:
-        return _resolve_cdp_override(env_override)
-
-    try:
-        from hermes_cli.config import read_raw_config
-
-        cfg = read_raw_config()
-        browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
-    except Exception as e:
-        logger.debug("Could not read browser.cdp_url from config: %s", e)
-
-    return ""
+    raw = _get_cdp_override_raw()
+    if not raw:
+        return ""
+    return _resolve_cdp_override(raw)
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -789,7 +960,7 @@ def _termux_browser_install_error() -> str:
 
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
     return _get_cloud_provider() is None
 
@@ -821,7 +992,7 @@ def _is_local_backend() -> bool:
     # config (both via _get_cdp_override(), and both now suppress camofox in
     # browser_camofox.py). _is_local_mode() already treats any CDP override as
     # non-local; keep the two helpers in agreement.
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
     if _is_camofox_mode():
         return True
@@ -1313,7 +1484,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return task_id
     if _is_camofox_mode():
         return task_id
@@ -1386,26 +1557,39 @@ def _last_session_key(task_id: str) -> str:
 def _allow_private_urls() -> bool:
     """Return whether the browser is allowed to navigate to private/internal addresses.
 
-    Reads ``config["browser"]["allow_private_urls"]`` once and caches the result
-    for the process lifetime.  Defaults to ``False`` (SSRF protection active).
+    Reads ``config["browser"]["allow_private_urls"]``. Single-profile calls
+    cache the result for the process lifetime; multiplexed profile turns resolve
+    their context-local config on each call. Defaults to ``False`` (SSRF
+    protection active).
     """
     global _cached_allow_private_urls, _allow_private_urls_resolved
+
+    # The profile multiplexer scopes config with a ContextVar while sharing
+    # this module. Never reuse another profile's private-network opt-out.
+    if get_hermes_home_override() is not None:
+        return _resolve_allow_private_urls()
+
     if _allow_private_urls_resolved:
         return _cached_allow_private_urls
 
     _allow_private_urls_resolved = True
-    _cached_allow_private_urls = False  # safe default
+    _cached_allow_private_urls = _resolve_allow_private_urls()
+    return _cached_allow_private_urls
+
+
+def _resolve_allow_private_urls() -> bool:
+    """Read the browser private-URL toggle from the active config scope."""
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            _cached_allow_private_urls = is_truthy_value(
+            return is_truthy_value(
                 browser_cfg.get("allow_private_urls"), default=False
             )
     except Exception as e:
         logger.debug("Could not read allow_private_urls from config: %s", e)
-    return _cached_allow_private_urls
+    return False
 
 
 def _socket_safe_tmpdir() -> str:
@@ -1484,6 +1668,42 @@ _cleanup_running = False
 # Protects _session_last_activity AND _active_sessions for thread safety
 # (subagents run concurrently via ThreadPoolExecutor)
 _cleanup_lock = threading.Lock()
+
+
+def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
+    """Return a provider-authoritative session expiry as epoch seconds.
+
+    Cloud providers may omit ``expires_at``. Unknown or malformed values are
+    therefore treated as having no known expiry, preserving the existing
+    lifecycle for local browsers and providers without an expiry contract.
+    """
+    value = session_info.get("expires_at")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    normalized = value.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        logger.warning("Ignoring invalid cloud browser session expiry timestamp")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _session_has_expired(
+    session_info: Dict[str, Any], *, now: Optional[float] = None
+) -> bool:
+    """Return whether a cached browser session crossed its provider deadline."""
+    expires_at = _session_expiry_timestamp(session_info)
+    if expires_at is None:
+        return False
+    return (time.time() if now is None else now) >= expires_at
 
 
 def _emergency_cleanup_all_sessions():
@@ -2069,8 +2289,29 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     with _cleanup_lock:
         # Check if we already have a session for this task
-        if task_id in _active_sessions:
-            return _active_sessions[task_id]
+        existing_session = _active_sessions.get(task_id)
+
+    if existing_session is not None:
+        if not _session_has_expired(existing_session):
+            return existing_session
+
+        logger.info(
+            "Replacing expired cloud browser session for task %s",
+            task_id,
+        )
+        _cleanup_single_browser_session(task_id)
+        # Cleanup removes the activity entry. The replacement session must be
+        # tracked by the inactivity reaper just like an initial session.
+        _update_session_activity(task_id)
+
+        # Guard against a concurrent replacement: another thread may have
+        # already cleaned up the expired session and created a fresh one
+        # while we were waiting.  If so, return the live replacement instead
+        # of falling through to create yet another session.
+        with _cleanup_lock:
+            replacement = _active_sessions.get(task_id)
+        if replacement is not None and replacement is not existing_session:
+            return replacement
 
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
@@ -2720,7 +2961,7 @@ def _extract_relevant_content(
         model = _get_extraction_model()
         if model:
             call_kwargs["model"] = model
-        response = call_llm(**call_kwargs)
+        response = _lazy_call_llm(**call_kwargs)
         extracted = (response.choices[0].message.content or "").strip()
         if not extracted:
             # _truncate_snapshot stores its own pointer (dedupes to the same
@@ -2894,6 +3135,23 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
         })
 
+    managed_route = _route_browser_action("navigate", {"url": url})
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        final_url = str(managed_payload.get("url") or "").strip()
+        safety_error = (
+            _managed_page_safety_error(final_url)
+            if managed_payload.get("success") is True
+            else None
+        )
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     # Camofox backend — delegate after safety checks pass
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_navigate
@@ -3044,6 +3302,31 @@ def browser_snapshot(
     Returns:
         JSON string with page snapshot
     """
+    managed_route = _route_browser_action("snapshot", {"full": bool(full)})
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        current_url = str(managed_payload.get("url") or "").strip()
+        safety_error = (
+            _managed_page_safety_error(current_url)
+            if managed_payload.get("success") is True
+            else None
+        )
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        snapshot_text = managed_payload.get("snapshot", "")
+        if isinstance(snapshot_text, str) and len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+            snapshot_text = (
+                _extract_relevant_content(snapshot_text, user_task)
+                if user_task
+                else _truncate_snapshot(snapshot_text)
+            )
+            managed_payload["snapshot"] = snapshot_text
+        return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
@@ -3139,6 +3422,11 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with click result
     """
+    managed_route = _route_browser_action("click", {"ref": ref})
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
@@ -3180,6 +3468,11 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with type result
     """
+    managed_route = _route_browser_action("type", {"ref": ref, "text": text})
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
@@ -3244,6 +3537,11 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
             "error": f"Invalid direction '{direction}'. Use 'up' or 'down'."
         }, ensure_ascii=False)
 
+    managed_route = _route_browser_action("scroll", {"direction": direction})
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     # Single scroll with pixel amount instead of 5x subprocess calls.
     # agent-browser supports: agent-browser scroll down 500
     # ~500px is roughly half a viewport of travel.
@@ -3290,6 +3588,11 @@ def browser_back(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result
     """
+    managed_route = _route_browser_action("back")
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
@@ -3342,6 +3645,11 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with key press result
     """
+    managed_route = _route_browser_action("press", {"key": key})
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
@@ -3403,9 +3711,50 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         policy_error = _enforce_browser_eval_policy(expression)
         if policy_error:
             return json.dumps({"success": False, "error": policy_error}, ensure_ascii=False)
+        # Managed routing is asked WITHOUT the expression: arbitrary page JS is
+        # never proxied to the desktop browser host (the host runs the user's
+        # logged-in browser), so the expression must not leave this process on
+        # the routing request either.  The probe only resolves which backend
+        # owns the session; Camofox delegation and unmanaged sessions continue
+        # into the local eval path, which enforces the private-URL pre-scan,
+        # post-eval URL recheck, and output redaction.
+        managed_route = _route_browser_action("console", {"clear": False})
+        if managed_route is not None and managed_route.backend == "desktop":
+            return json.dumps({
+                "success": False,
+                "code": "browser_eval_not_supported_on_managed_desktop",
+                "error": (
+                    "JavaScript evaluation is not supported on the managed "
+                    "desktop browser. Use browser_snapshot or browser_console "
+                    "(without expression) to inspect the page instead."
+                ),
+            }, ensure_ascii=False)
+        managed_result = _managed_route_result(managed_route)
+        if managed_result is not None:
+            return managed_result
         return _browser_eval(expression, task_id)
 
     # --- Console output mode (original behaviour) ---
+    managed_route = _route_browser_action("console", {"clear": bool(clear)})
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        # Same defenses as the local console path: refuse output from a page
+        # whose URL crossed the network boundary, and redact secrets from
+        # console messages / exception text before they reach the model.
+        current_url = str(managed_payload.get("url") or "").strip()
+        safety_error = (
+            _managed_page_safety_error(current_url)
+            if managed_payload.get("success") is True
+            else None
+        )
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_console
         return camofox_console(clear, task_id)
@@ -3872,32 +4221,18 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         _end_session_call,
         _ensure_tab,
         _browser_identity_key,
-        _handback_privacy_filter_enabled,
         _held_owner_lock,
-        _last_response_started_handback,
         _mutating_tab_call,
         _tool_error_from_exception,
     )
-
-    def _blocked_after_handback() -> str:
-        return json.dumps({
-            "success": False,
-            "error": (
-                "Browser evaluation is blocked after human control until the "
-                "Agent navigates to a new page or closes the session."
-            ),
-        }, ensure_ascii=False)
 
     try:
         tab_info = _ensure_tab(task_id or "default")
         user_id = tab_info["user_id"]
         guard_active = _eval_ssrf_guard_active(task_id or "default")
-        # The private-page probes, arbitrary JS, handback checks, and landing
-        # probe must all describe one identity-serialized page transition.
+        # The private-page probes, arbitrary JS, and landing probe must all
+        # describe one identity-serialized page transition.
         with _held_owner_lock(_browser_identity_key(tab_info)):
-            filtered_at_request = _handback_privacy_filter_enabled(tab_info)
-            if filtered_at_request:
-                return _blocked_after_handback()
             if guard_active:
                 blocked_url = _camofox_current_page_private_url(tab_info)
                 if blocked_url:
@@ -3908,22 +4243,15 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                             f"({blocked_url}). Refusing to evaluate JavaScript on this page."
                         ),
                     }, ensure_ascii=False)
-                if _last_response_started_handback() or _handback_privacy_filter_enabled(tab_info):
-                    return _blocked_after_handback()
 
             # Arbitrary JS can change the document as readily as a click, so it
-            # inherits the stale-epoch check from the shared mutation helper.
+            # goes through the shared mutation helper that serializes on the
+            # tab identity.
             resp = _mutating_tab_call(
                 tab_info,
                 "/evaluate",
                 {"expression": expression, "userId": user_id},
             )
-            if (
-                filtered_at_request
-                or _last_response_started_handback()
-                or _handback_privacy_filter_enabled(tab_info)
-            ):
-                return _blocked_after_handback()
 
             if guard_active:
                 blocked_url = _camofox_current_page_private_url(tab_info)
@@ -3936,8 +4264,6 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                             "JavaScript navigation via browser_console."
                         ),
                     }, ensure_ascii=False)
-                if _last_response_started_handback() or _handback_privacy_filter_enabled(tab_info):
-                    return _blocked_after_handback()
 
         # Camofox returns the result in a JSON envelope
         raw_result = resp.get("result") if isinstance(resp, dict) else resp
@@ -3965,7 +4291,7 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         return _tool_error_from_exception(e, session=locals().get("tab_info"))
     finally:
         # _ensure_tab hands back a referenced cache entry and ownership with
-        # it. Every path here — success, the two handback refusals, the
+        # it. Every path here — success, the private-page refusals, the
         # unsupported-eval degradation and any error — has to give it back, or
         # the entry is skipped by the idle sweep and by eviction forever.
         _end_session_call(locals().get("tab_info"))
@@ -4030,6 +4356,11 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with list of images (src and alt)
     """
+    managed_route = _route_browser_action("get_images")
+    managed_result = _managed_route_result(managed_route)
+    if managed_result is not None:
+        return managed_result
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
@@ -4117,13 +4448,55 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         A JSON string with vision analysis results and screenshot_path, or a
         multimodal tool-result envelope carrying the screenshot and metadata.
     """
-    if _is_camofox_mode():
-        from tools.browser_camofox import camofox_vision
-        return camofox_vision(question, annotate, task_id)
-
     import base64
+    import binascii
     import uuid as uuid_mod
     from hermes_constants import get_hermes_dir
+
+    managed_screenshot_bytes: Optional[bytes] = None
+    managed_route = _route_browser_action("screenshot", {
+        "annotate": bool(annotate),
+    })
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        if managed_payload.get("success") is not True:
+            return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
+        current_url = str(managed_payload.get("url") or "").strip()
+        safety_error = _managed_page_safety_error(current_url)
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        encoded = managed_payload.get("data")
+        mime_type = str(managed_payload.get("mime_type") or "").lower()
+        if not isinstance(encoded, str) or mime_type != "image/png":
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed browser returned an invalid PNG screenshot.",
+            }, ensure_ascii=False)
+        try:
+            managed_screenshot_bytes = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed browser returned invalid screenshot data.",
+            }, ensure_ascii=False)
+        if not managed_screenshot_bytes:
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed browser returned an empty screenshot.",
+            }, ensure_ascii=False)
+    if managed_payload is None:
+        managed_result = _managed_route_result(managed_route)
+        if managed_result is not None:
+            return managed_result
+
+        if _is_camofox_mode():
+            from tools.browser_camofox import camofox_vision
+            return camofox_vision(question, annotate, task_id)
+
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     effective_task_id = _last_session_key(task_id or "default")
@@ -4133,7 +4506,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     # private/internal address, the screenshot would expose private page content
     # to the vision model.  Re-check the current URL before capturing anything.
     if (
-        not _is_local_backend()
+        managed_screenshot_bytes is None
+        and not _is_local_backend()
         and not _is_local_sidecar_key(effective_task_id)
         and not _allow_private_urls()
     ):
@@ -4167,7 +4541,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     engine = _get_browser_engine()
     _lp_prerouted = False
     _lp_fallback_warning = None
-    if engine == "lightpanda" and _should_inject_engine(engine):
+    if (
+        managed_screenshot_bytes is None
+        and engine == "lightpanda"
+        and _should_inject_engine(engine)
+    ):
         logger.debug("browser_vision: pre-routing screenshot to Chrome (engine=lightpanda)")
         screenshot_args = []
         if annotate:
@@ -4201,7 +4579,13 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Prune old screenshots (older than 24 hours) to prevent unbounded disk growth
         _cleanup_old_screenshots(screenshots_dir, max_age_hours=24)
 
-        if _lp_prerouted and screenshot_path.exists():
+        if managed_screenshot_bytes is not None:
+            screenshot_path.write_bytes(managed_screenshot_bytes)
+            result = {
+                "success": True,
+                "data": {"path": str(screenshot_path)},
+            }
+        elif _lp_prerouted and screenshot_path.exists():
             result = {
                 "success": True,
                 "data": {
@@ -4350,7 +4734,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             call_kwargs["model"] = vision_model
         # Try full-size screenshot; on size-related rejection, downscale and retry.
         try:
-            response = call_llm(**call_kwargs)
+            response = _lazy_call_llm(**call_kwargs)
         except Exception as _api_err:
             from tools.vision_tools import (
                 _is_image_size_error, _resize_image_for_vision, _RESIZE_TARGET_BYTES,
@@ -4366,7 +4750,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 data_url = _resize_image_for_vision(
                     screenshot_path, mime_type="image/png")
                 call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
-                response = call_llm(**call_kwargs)
+                response = _lazy_call_llm(**call_kwargs)
             else:
                 raise
 
@@ -4497,6 +4881,15 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     # before the backend tears down the underlying CDP endpoint.
     _stop_cdp_supervisor(task_id)
 
+    managed_backend = None
+    try:
+        managed_route = _route_browser_action("close")
+        if managed_route is not None:
+            managed_backend = managed_route.backend
+    except Exception as e:
+        managed_backend = "error"
+        logger.debug("Managed browser cleanup for task %s: %s", task_id, e)
+
     # Also clean up Camofox session if running in Camofox mode.
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.
@@ -4510,7 +4903,9 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         # The idle reaper and shutdown paths run without the request's profile
         # and secret scope, so _is_camofox_mode() fails closed there. A tracked
         # session is scope-independent evidence that teardown is still owed.
-        if _is_camofox_mode() or has_camofox_session(task_id):
+        if managed_backend in {None, "camofox"} and (
+            _is_camofox_mode() or has_camofox_session(task_id)
+        ):
             if not camofox_soft_cleanup(task_id):
                 camofox_close(task_id)
     except Exception as e:
@@ -4531,12 +4926,23 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
 
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        # An expired cloud CDP URL cannot accept an agent-browser close command.
+        # Avoid feeding it back through _get_session_info(), which would try to
+        # renew the session recursively while cleanup is still in progress.
+        if _session_has_expired(session_info):
+            logger.debug(
+                "Skipping agent-browser close for expired session %s",
+                task_id,
+            )
+        else:
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug(
+                    "agent-browser close command completed for task %s",
+                    task_id,
+                )
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
         # Now remove from tracking under lock
         with _cleanup_lock:
@@ -4761,7 +5167,7 @@ def _maybe_autoinstall_chromium() -> bool:
         proc = subprocess.run(
             install_cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=600,
             env=_build_browser_env(),
         )
@@ -4808,13 +5214,24 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
+    # The managed browser router is provided by local-server and needs no
+    # browser binary inside Hermes. But local-server injects the router
+    # endpoint whenever it runs, so configuration alone proves nothing about a
+    # usable backend. Desktop only counts as available while a PC Browser Host
+    # is actually connected (``host_status`` probe); otherwise fall through to
+    # the Camofox/local checks below.
+    if _is_managed_browser_configured() and _is_desktop_host_online():
+        return True
+
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():
         return True
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    # Raw (no-I/O) check: this runs during tool-schema assembly at startup,
+    # where a stale endpoint must not cost a blocking HTTP probe.
+    if _get_cdp_override_raw():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.

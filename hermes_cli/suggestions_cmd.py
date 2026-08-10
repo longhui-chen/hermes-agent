@@ -97,7 +97,10 @@ def handle_suggestions_command(
     if sub in ("accept", "add", "schedule"):
         if not rest:
             return "Usage: /suggestions accept <number|id>"
-        job = store.accept_suggestion(rest, origin=origin)
+        try:
+            job = store.accept_suggestion(rest, origin=origin)
+        except store.SuggestionConnectorAuthorizationRequired as exc:
+            return str(exc)
         if job is None:
             return f"No pending suggestion matches '{rest}'. Run /suggestions to list them."
         sched = job.get("schedule_display") or (job.get("job_spec", {}) or {}).get("schedule", "")

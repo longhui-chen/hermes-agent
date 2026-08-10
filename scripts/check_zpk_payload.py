@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import importlib.util
 import os
 import re
 import subprocess
@@ -28,6 +29,15 @@ CORE_IMPORTS = [
     "tools.environments.local",
     "tools.process_registry",
 ]
+
+PROJECT_RUNTIME_MODULES = {
+    "gateway.run": Path("gateway/run.py"),
+    "tools.code_execution_tool": Path("tools/code_execution_tool.py"),
+    "tools.environments.local": Path("tools/environments/local.py"),
+    "tools.process_registry": Path("tools/process_registry.py"),
+    "tools.terminal_tool": Path("tools/terminal_tool.py"),
+    "tools.trusted_direct_runner": Path("tools/trusted_direct_runner.py"),
+}
 
 # Only packages with a stable import module and expected eager runtime use
 # should be listed here.  Lazy/provider/native/dev-only deps are skipped below.
@@ -218,6 +228,31 @@ def _check_imports(modules: list[str]) -> None:
         raise RuntimeError(f"import smoke test failed:\n{details}")
 
 
+def _check_project_source_parity() -> None:
+    """Reject a cached project wheel that differs from this checkout."""
+
+    failures = []
+    for module, relative_source in PROJECT_RUNTIME_MODULES.items():
+        source = PROJECT_ROOT / relative_source
+        spec = importlib.util.find_spec(module)
+        origin = Path(spec.origin).resolve() if spec and spec.origin else None
+        if origin is None or not origin.is_file():
+            failures.append(f"{module}: installed module is missing")
+            continue
+        if not source.is_file():
+            failures.append(f"{module}: checkout source is missing")
+            continue
+        if origin.read_bytes() != source.read_bytes():
+            failures.append(
+                f"{module}: installed module does not match {relative_source}"
+            )
+    if failures:
+        details = "\n".join(f"  - {failure}" for failure in failures)
+        raise RuntimeError(
+            "project wheel/source parity check failed:\n" + details
+        )
+
+
 def _modules_for_package(package: str) -> list[str]:
     mapped = PACKAGE_IMPORTS.get(package)
     if mapped:
@@ -284,6 +319,12 @@ def main() -> int:
 
     _check_imports(CORE_IMPORTS)
     print(f"core imports ok: {', '.join(CORE_IMPORTS)}")
+
+    _check_project_source_parity()
+    print(
+        "project wheel/source parity ok: "
+        + ", ".join(PROJECT_RUNTIME_MODULES)
+    )
 
     _check_seed_policy()
 

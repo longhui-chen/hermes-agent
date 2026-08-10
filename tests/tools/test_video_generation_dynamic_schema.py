@@ -54,6 +54,9 @@ class _BothModalitiesProvider(VideoGenProvider):
             "supports_audio": True,
             "supports_negative_prompt": True,
             "max_reference_images": 0,
+            "image_input_description": (
+                "Use an absolute local image path; remote URLs are unsupported."
+            ),
         }
 
     def generate(self, prompt, **kwargs):
@@ -112,7 +115,8 @@ class TestDynamicSchemaBuilder:
         saved = plugins_module._ensure_plugins_discovered
         plugins_module._ensure_plugins_discovered = lambda *a, **k: None
         try:
-            desc = _build_dynamic_video_schema()["description"]
+            schema = _build_dynamic_video_schema()
+            desc = schema["description"]
         finally:
             plugins_module._ensure_plugins_discovered = saved
 
@@ -120,6 +124,13 @@ class TestDynamicSchemaBuilder:
         assert "text-to-video" in desc and "image-to-video" in desc
         assert "routes automatically" in desc
         assert "operations supported" not in desc
+        assert (
+            schema["parameters"]["properties"]["image_url"]["description"]
+            == "Use an absolute local image path; remote URLs are unsupported."
+        )
+        assert "omit reference_image_urls" in (
+            schema["parameters"]["properties"]["reference_image_urls"]["description"]
+        )
 
     def test_image_only_model_warns_about_required_image_url(self, cfg_home):
         from tools.video_generation_tool import _build_dynamic_video_schema

@@ -14,7 +14,7 @@ def _make_runner() -> GatewayRunner:
     runner.adapters = {}
     runner._model = "openai/gpt-4.1-mini"
     runner._base_url = None
-    runner._decide_image_input_mode = lambda **_: "native"
+    runner._decide_image_input_mode = lambda *_args, **_kwargs: "native"
     return runner
 
 

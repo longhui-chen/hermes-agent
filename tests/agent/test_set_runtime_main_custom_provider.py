@@ -83,6 +83,7 @@ class TestSetRuntimeMainCustomProvider:
         finally:
             mod.clear_runtime_main()
 
+
     def test_explicit_main_runtime_takes_precedence(self):
         """When main_runtime dict has values, turn-scoped values are not used."""
         import agent.auxiliary_client as mod

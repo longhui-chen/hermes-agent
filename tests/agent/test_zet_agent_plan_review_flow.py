@@ -66,6 +66,17 @@ def _empty_response() -> SimpleNamespace:
     )
 
 
+def _text_response(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content, tool_calls=None),
+            finish_reason="stop",
+        )],
+        usage=None,
+        model="test-model",
+    )
+
+
 def _plan_tool_response(*, content: str, reasoning: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(
@@ -76,7 +87,11 @@ def _plan_tool_response(*, content: str, reasoning: str) -> SimpleNamespace:
                     type="function",
                     function=SimpleNamespace(
                         name="present_plan",
-                        arguments='{"title":"减脂计划","groups":[]}',
+                        arguments=(
+                            '{"title":"减脂计划","groups":['
+                            '{"icon":"🏃","label":"训练","items":["每周跑步三次"]}'
+                            "]}"
+                        ),
                     ),
                 )],
                 reasoning_content=reasoning,
@@ -429,6 +444,32 @@ def test_plan_tool_flow_drops_sibling_content_and_visible_reasoning_before_histo
     )
 
 
+def test_present_plan_without_sse_callback_continues_to_text_response_flow():
+    agent = _plan_agent(("present_plan",))
+    agent._zet_agent_response_mode = ""
+    agent.plan_emit_callback = None
+    response = _plan_tool_response(content="", reasoning="")
+
+    with (
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            side_effect=[
+                response,
+                _text_response("📋 减脂计划\n- 每周跑步三次"),
+            ],
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("先给我一个减脂计划")
+
+    assert result["failed"] is False
+    assert "📋 减脂计划" in result["final_response"]
+    assert "每周跑步三次" in result["final_response"]
+
+
 def test_plan_mode_requires_interactive_callbacks():
     missing = SimpleNamespace(
         _zet_agent_plan_mode_active=True,
@@ -494,6 +535,74 @@ def test_parallel_present_plan_calls_keep_only_the_first_call():
 
     assert _enforce_single_plan_interaction_tool_call(agent, assistant)
     assert assistant.tool_calls == [first]
+
+
+def test_manual_present_plan_outside_plan_mode_drops_parallel_side_effect_unit():
+    terminal = SimpleNamespace(
+        function=SimpleNamespace(name="terminal"),
+        id="terminal",
+    )
+    present_plan = SimpleNamespace(
+        function=SimpleNamespace(name="present_plan"),
+        id="present-plan",
+    )
+    assistant = SimpleNamespace(tool_calls=[terminal, present_plan])
+    agent = SimpleNamespace(
+        platform="zet_agent",
+        _zet_agent_plan_mode_active=False,
+        _zet_agent_plan_auto_execute=False,
+    )
+
+    assert _enforce_single_plan_interaction_tool_call(agent, assistant)
+    assert assistant.tool_calls == [present_plan]
+
+
+def test_manual_present_plan_outside_plan_mode_drops_parallel_side_effect_flow():
+    agent = _plan_agent(("present_plan", "terminal"))
+    agent._zet_agent_response_mode = ""
+    response = _plan_tool_response(
+        content="先展示计划",
+        reasoning="展示后等待确认",
+    )
+    response.choices[0].message.tool_calls.append(
+        SimpleNamespace(
+            id="call-terminal",
+            type="function",
+            function=SimpleNamespace(
+                name="terminal",
+                arguments='{"command":"touch /tmp/x"}',
+            ),
+        )
+    )
+    executed = []
+
+    def execute_plan(assistant_message, messages, *_args):
+        executed.append([call.function.name for call in assistant_message.tool_calls])
+        agent._zet_agent_plan_presented = True
+        messages.append(
+            {
+                "role": "tool",
+                "name": "present_plan",
+                "tool_call_id": "call-plan",
+                "content": '{"success":true}',
+            }
+        )
+
+    with (
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            side_effect=[response, _text_response("计划已展示，继续执行。")],
+        ),
+        patch.object(agent, "_execute_tool_calls", side_effect=execute_plan),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("先展示计划卡片")
+
+    assert executed == [["present_plan"]]
+    assert result["api_calls"] == 2
 
 
 class _CapturingQ:

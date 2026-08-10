@@ -13,3 +13,11 @@ after installing the package.
 
 Do not add package-local restart metadata unless `zettlab-ota` intentionally
 adopts `package.meta` as a supported restart source of truth.
+
+## Persistent storage contract
+
+The device package stores all Claw runtime state directly under
+`/volume1/system/zettos-main-data/com.zettlab.claw`. The service unit requires
+`/volume1` before startup. Runtime scripts must not follow or create an
+`__APP_BASE__/data` link, and must not use the historical
+`/volume1/subvol/apps/com.zettlab.claw/data` layout.

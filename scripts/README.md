@@ -3,7 +3,15 @@
 ## `check_zpk_payload.py`
 
 Smoke-tests the `hermes-agent` ZPK build environment after `make zpk-venv`
-installs `ZPK_INSTALL_SPEC` (default: `.[all]`).
+installs the fixed `ZPK_INSTALL_SPEC`
+(`.[all,langfuse,anthropic,zpk-runtime]`).
+
+The Makefile creates the venv with the overridable `UV` executable. It first
+runs a locked, wheel-only dependency sync with `--no-install-project --no-build`,
+then builds Hermes non-editably with the locked `setuptools` already in the venv
+and `--no-build-isolation`. The `zpk-runtime` extra keeps both the device-side
+`pip` fallback and build backend behind `uv.lock` artifact hashes; the build
+never falls back to an unlocked install.
 
 The script is called by `Makefile` during `make zpk-pack`. It verifies the
 packaging contract only:

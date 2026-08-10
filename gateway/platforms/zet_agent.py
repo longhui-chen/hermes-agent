@@ -74,14 +74,17 @@ After the first successful exchange, reuse Hermes' native
 """
 
 import asyncio
+import hashlib
 import inspect
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
-import uuid
+import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
@@ -92,15 +95,28 @@ try:
 except ImportError:
     web = None  # type: ignore[assignment]
 
+from gateway.sensitive_process_boundary import (
+    gateway_sensitive_process_boundary_ready,
+    initialize_gateway_sensitive_process_boundary,
+)
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.api_server import (
     AIOHTTP_AVAILABLE,
     APIServerAdapter,
     DEFAULT_HOST,
     MAX_REQUEST_BYTES,
+    _REQUEST_OPTION_MISSING,
+    _ProviderAuthResolutionError,
+    _api_request_profile,
+    _apply_runtime_agent_overrides,
     _chat_finish_reason_from_result,
+    _clean_request_string,
     _coerce_port,
     _openai_error,
+    _request_reasoning_config,
+    _request_service_tier,
+    _resolve_request_runtime_agent_kwargs,
+    _strip_skill_display_token,
 )
 from gateway.platforms.base import SendResult
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
@@ -173,6 +189,21 @@ ZET_AGENT_DEFAULT_PORT = 7900
 # approval flow uses hermes' built-in timeout (``approval.gateway_timeout``,
 # default 300s) so we don't duplicate it here.
 CLARIFY_RESPONSE_TIMEOUT = 300.0
+INTERACTION_PREPARE_TTL = 300.0
+INTERACTION_RECEIPT_TTL = 4 * 60 * 60.0
+INTERACTION_RECEIPT_CAP = 4096
+INTERACTION_CLARIFY_RESPONSE_MAX_BYTES = 16 * 1024
+INTERACTION_PREPARED_RAW_BUDGET = 4 * 1024 * 1024
+INTERACTION_RECOVERY_FENCE_TTL = 15.0
+INTERACTION_DURABLE_SESSION_CAP = 4096
+# Keep an exact capability tombstone for at least as long as a finalized
+# receipt. Reclaim is additionally gated by live source/receipt/task evidence.
+INTERACTION_DURABLE_SESSION_TTL = INTERACTION_RECEIPT_TTL
+INTERACTION_PUBLISHED_TURN_CAP = 4096
+INTERACTION_ROUTE_ALIAS_CAP = 4096
+INTERACTION_PENDING_MIRROR_CAP = 256
+INTERACTION_PENDING_MIRROR_BYTE_BUDGET = 256 * 1024
+INTERACTION_PENDING_MIRROR_TTL = 10 * 60.0
 
 # Expired runtime-import staging may contain complete source transcripts.
 # Sweep periodically even when no later import request arrives; each database
@@ -243,7 +274,7 @@ _ZET_ADDENDUM_HEAD = """\
 _ZET_PLAN_FIRST_AUTO = """\
 ## 计划先行（Plan-First）
 
-面对复杂多步任务（涉及 3 个以上阶段、不可逆操作或大量数据变更）时：
+默认模式下，只有任务包含不可逆操作、大范围数据变更、对外发布/发送，或其它确实需要用户在执行前预审的高风险步骤时：
 1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
 2. 计划卡片只是给用户看的只读预览，展示后**不要停下、不要等用户确认、不要问用户是否执行**，直接在同一轮继续把计划执行下去。
 3. 执行阶段用 `todo` 工具逐步记录和更新进度，每完成一步立即把对应 todo 标记为 completed。
@@ -271,6 +302,48 @@ _ZET_PLAN_FIRST_MANUAL = """\
 
 简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
 
+# workdir 契约：设备上终端的相对路径没人供给锚点时会兜底到 scope 外的目录，
+# 而契约不进 prompt 模型只能靠撞墙学习，所以在平台层显式声明。
+_ZET_WORKDIR_SECTION = """\
+## 工作目录与路径
+
+- 读写用户文件：一律用绝对路径（如 `/volume1/subvol/data/...`），不要依赖相对路径。
+- 相对路径没有稳定含义：文件工具在你还没跑过终端命令时把它解析到你自己的产出目录，一旦终端 `cd` 过或带 `workdir` 跑过命令，就改成跟着那个目录走。所以要落临时产物，写绝对路径，别靠相对路径。
+- 终端命令的锚点也不与文件工具共用：命令里的脚本、输入、输出参数都写绝对路径。刚用 write_file 写出的文件，交给命令时也要给绝对路径。"""
+
+# 只有终端工具真的能解析 `agent_output` 时才教这个姿势。别名尚未落地的运行时
+# 会把它当普通路径原样 `cd`，命令直接失败——教一个用不了的姿势比不教更糟。
+_ZET_WORKDIR_ALIAS_LINE = (
+    "- 跑脚本、落临时产物：终端调用传 `workdir='agent_output'`，"
+    "那是你自己的可写产出目录——只有传了它，命令里的相对路径才和文件工具落在同一处。"
+)
+
+
+def _agent_output_alias_available() -> bool:
+    """Report whether ``workdir='agent_output'`` will actually work right now.
+
+    Both halves have to hold: the terminal tool must know the alias *and* the
+    platform must have provisioned the directory it resolves to. A device whose
+    agent runtime is newer than its local-server has the first without the
+    second, and teaching the alias there produces a command that fails on every
+    use. Staying quiet costs nothing — the model falls back to absolute paths,
+    which work either way.
+    """
+
+    try:
+        from tools.runtime_workdir import agent_output_dir
+
+        return bool(agent_output_dir())
+    except Exception:
+        return False
+
+
+def _zet_workdir_section() -> str:
+    if not _agent_output_alias_available():
+        return _ZET_WORKDIR_SECTION
+    # 别名行放最后：它是上一条「终端参数写绝对路径」的例外，紧跟着读才不歧义。
+    return f"{_ZET_WORKDIR_SECTION}\n{_ZET_WORKDIR_ALIAS_LINE}"
+
 _ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言
 
@@ -290,7 +363,9 @@ def _zettlab_workflow_addendum(auto_execute: bool) -> str:
     PLAN_SCHEMA so no side effect runs before the user confirms.
     """
     plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
-    return "\n\n".join((_ZET_ADDENDUM_HEAD, plan_first, _ZET_ADDENDUM_TAIL)) + "\n"
+    return "\n\n".join(
+        (_ZET_ADDENDUM_HEAD, plan_first, _zet_workdir_section(), _ZET_ADDENDUM_TAIL)
+    ) + "\n"
 
 
 _DELEGATION_ADVANCE_ENV = "ZET_DELEGATION_ADVANCE_URL"
@@ -323,19 +398,42 @@ class _ClarifyEntry:
 
     The agent thread enters ``wait()`` on ``event``; the HTTP respond
     handler resolves the matching entry, stores the response, and calls
-    ``event.set()`` to unblock the agent. ``clarify_id`` is generated at
-    creation and is the stable identity sent both over the live stream and
-    through the reconnect ``/pending`` projection. Older callers may omit it
-    when responding, in which case the historical FIFO behavior is retained.
+    ``event.set()`` to unblock the agent. ``interaction_id`` is the durable
+    delivery identity; ``clarify_id`` is its compatibility alias for existing
+    live-stream, reconnect, and exact-response clients. Callers that omit both
+    identities retain the historical FIFO behavior.
     """
 
-    __slots__ = ("clarify_id", "event", "payload", "response")
+    __slots__ = (
+        "clarify_id",
+        "event",
+        "response",
+        "interaction_id",
+        "turn_id",
+        "interaction_generation",
+        "payload",
+        "prepared_delivery_id",
+        "prepared_until",
+        "deferred_wake_at",
+    )
 
-    def __init__(self, clarify_id: str, payload: Dict[str, Any]) -> None:
-        self.clarify_id = clarify_id
+    def __init__(
+        self,
+        interaction_id: str,
+        turn_id: str,
+        payload: Dict[str, Any],
+        interaction_generation: int = 0,
+    ) -> None:
+        self.clarify_id = interaction_id
         self.event = threading.Event()
-        self.payload = payload
         self.response: Optional[str] = None
+        self.interaction_id = interaction_id
+        self.turn_id = turn_id
+        self.interaction_generation = interaction_generation
+        self.payload = payload
+        self.prepared_delivery_id: Optional[str] = None
+        self.prepared_until = 0.0
+        self.deferred_wake_at = 0.0
 
 
 class ZetAgentAdapter(APIServerAdapter):
@@ -385,13 +483,39 @@ class ZetAgentAdapter(APIServerAdapter):
         self._clarify_state_lock = threading.Lock()
         self._clarify_queues: Dict[str, List[_ClarifyEntry]] = {}
 
-        # Mirror of the most recently pushed (and not yet resolved) prompt
-        # payload per scoped session. Used by GET /v1/sessions/{sid}/pending
-        # so a reconnecting client (chat.resume path) can re-render the modal
+        # FIFO mirror of pushed (and not yet resolved) prompt payloads per
+        # profile-scoped session. Used by GET /v1/sessions/{sid}/pending so a
+        # reconnecting client (chat.resume path) can re-render the modal
         # for any interaction the agent thread is still blocked on.
         self._pending_lock = threading.Lock()
-        self._pending_clarify: Dict[str, Dict[str, Any]] = {}
-        self._pending_approval: Dict[str, Dict[str, Any]] = {}
+        self._pending_clarify: Dict[str, List[Dict[str, Any]]] = {}
+        self._pending_approval: Dict[str, List[Dict[str, Any]]] = {}
+        self._pending_mirror_meta: "OrderedDict[tuple[str, str, str], tuple[int, float]]" = OrderedDict()
+        self._pending_mirror_bytes = 0
+
+        # Compaction rotates the public session tip while callbacks created
+        # earlier in the same turn keep their original route. Canonical aliases
+        # preserve one profile-scoped interaction route across that lineage.
+        self._interaction_route_lock = threading.Lock()
+        self._interaction_route_aliases: "OrderedDict[str, str]" = OrderedDict()
+
+        # Process-local two-phase delivery receipts. Prepared receipts live
+        # for five minutes; finalized receipts live for four hours. The cap
+        # is a hard memory bound for the 2 GB device runtime.
+        self._delivery_lock = threading.Lock()
+        self._interaction_deliveries: "OrderedDict[tuple[str, str], Dict[str, Any]]" = OrderedDict()
+        self._prepared_raw_bytes = 0
+        self._published_interaction_generations: "OrderedDict[tuple[str, str], int]" = OrderedDict()
+        self._committed_interaction_generations: Dict[tuple[str, str], int] = {}
+        self._provisional_interaction_generations: Dict[
+            tuple[str, str], set[int]
+        ] = {}
+        # Bounded exact capability negotiation memory. Keys and pending-source
+        # identities are SHA-256 digests so tombstones never retain raw user or
+        # session strings. Values contain only monotonic activity plus a bounded
+        # set of hashed live-source identities.
+        self._durable_session_digests: "OrderedDict[bytes, Dict[str, Any]]" = OrderedDict()
+        self._durable_source_pin_count = 0
 
         # Active chat-completions turns keyed by X-Hermes-Session-Id, so
         # POST /v1/sessions/{sid}/interrupt can find the running agent +
@@ -401,11 +525,17 @@ class ZetAgentAdapter(APIServerAdapter):
         self._session_run_lock = threading.Lock()
         self._active_session_agents: Dict[str, Any] = {}
         self._active_session_tasks: Dict[str, Any] = {}
+        self._active_session_turn_ids: Dict[str, str] = {}
 
         # Sessions with registered approval callbacks. Kept separately from
         # title generation so titles remain fully owned by Hermes SessionDB.
         self._session_lock = threading.Lock()
         self._approval_session_ids: set[str] = set()
+
+        # The file itself is profile-local. Keep the in-memory mirror keyed by
+        # canonical HERMES_HOME as well so serving coder after main cannot
+        # write main's session metadata into coder's file.
+        self._seen_models_by_home: Dict[str, "OrderedDict[str, str]"] = {}
 
         # Portable imports mutate profile-owned state outside the chat-run
         # path. Track them explicitly so a successful profile unload cannot
@@ -416,6 +546,49 @@ class ZetAgentAdapter(APIServerAdapter):
             str, Dict[int, tuple[Optional[tuple[int, int]], bool]]
         ] = {}
         self._runtime_import_barrier_generation = 0
+
+    def _expected_api_key(self) -> str:
+        """Use the device listener key for every ZetAgent profile mirror.
+
+        local-server is the intended caller of this device-internal surface and
+        authenticates all ``/p/<profile>`` requests with one ``ZET_AGENT_KEY``.
+        Generic API-server gateways keep their profile-scoped key isolation in
+        :class:`APIServerAdapter`; only this managed-device adapter preserves
+        the shared listener-key contract.
+        """
+        return self._api_key
+
+    def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
+        """Atomically enter a profile unless unload already owns its barrier."""
+        key = self._profile_home_key(profile_home)
+        if not key:
+            return ""
+        with self._runtime_import_operation_lock:
+            if self._runtime_import_barriers_locked(key):
+                return ""
+            self._active_chat_runs_by_home[key] = (
+                self._active_chat_runs_by_home.get(key, 0) + 1
+            )
+        return key
+
+    def _end_profile_chat_run(self, profile_home_key: str) -> None:
+        if not profile_home_key:
+            return
+        with self._runtime_import_operation_lock:
+            remaining = (
+                self._active_chat_runs_by_home.get(profile_home_key, 0) - 1
+            )
+            if remaining > 0:
+                self._active_chat_runs_by_home[profile_home_key] = remaining
+            else:
+                self._active_chat_runs_by_home.pop(profile_home_key, None)
+
+    def _active_profile_chat_runs(self, profile_home: Optional[Any] = None) -> int:
+        key = self._profile_home_key(profile_home)
+        if not key:
+            return 0
+        with self._runtime_import_operation_lock:
+            return int(self._active_chat_runs_by_home.get(key, 0) or 0)
 
     @staticmethod
     def _profile_directory_identity(key: str) -> Optional[tuple[int, int]]:
@@ -471,19 +644,20 @@ class ZetAgentAdapter(APIServerAdapter):
 
     def _block_runtime_import_profile(
         self, profile_home: Optional[Any]
-    ) -> tuple[int, Optional[int]]:
+    ) -> tuple[int, int, Optional[int]]:
         key = self._profile_home_key(profile_home)
         with self._runtime_import_operation_lock:
-            active = int(self._runtime_import_operations.get(key, 0) or 0)
-            if active:
-                return active, None
+            active_imports = int(self._runtime_import_operations.get(key, 0) or 0)
+            active_api_runs = int(self._active_chat_runs_by_home.get(key, 0) or 0)
+            if active_imports or active_api_runs:
+                return active_imports, active_api_runs, None
             self._runtime_import_barriers_locked(key)
             self._runtime_import_barrier_generation += 1
             owner = self._runtime_import_barrier_generation
             self._runtime_import_unload_barriers.setdefault(key, {})[owner] = (
                 self._profile_directory_identity(key), False
             )
-            return 0, owner
+            return 0, 0, owner
 
     def _complete_runtime_import_profile_unload(
         self, profile_home: Optional[Any], owner: Optional[int]
@@ -565,13 +739,44 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return bool(_delegation_advance_url())
 
-    def _bind_turn_session_context(self, session_id: str) -> None:
+    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
+        """Bind local-server's browser scope capability for this API request.
+
+        The base handler creates the agent task while this context is active,
+        so ContextVar propagation carries the token into synchronous tool
+        workers without exposing it through process-global environment state.
+        """
+        from gateway.session_context import (
+            pop_zettlab_browser_session_token,
+            push_zettlab_browser_session_token,
+        )
+
+        token = push_zettlab_browser_session_token(
+            request.headers.get("X-Zettlab-Browser-Session-Token", "")
+        )
+        try:
+            return await super()._handle_chat_completions(request)
+        finally:
+            pop_zettlab_browser_session_token(token)
+
+    def _bind_turn_session_context(
+        self,
+        session_id: str,
+        *,
+        session_key: Optional[str] = None,
+    ) -> None:
         """Rebind session contextvars for this turn's agent build.
 
         ZettClaw — 让 cronjob tool 自动设 origin: 把当前 chat session_id 注入
         contextvars，cronjob_tools._origin_from_env 会读到 platform/chat_id
         自动填到 cron job.origin。否则 cron 触发时 OriginStrategy 找不到 chat
         → 走 NewSession 兜底创 phantom session, APP 看不到推送。
+
+        ``session_id`` is the public App chat id persisted into cron origins;
+        ``session_key`` may be the profile-scoped internal multiplex key used
+        by approval/clarify routing.  Keeping them separate prevents an
+        internal ``<profile_home>|<session_id>`` key from leaking into a job
+        that SessionDB can only resolve by its public id.
 
         tokens 不显式 reset — contextvars 是 task-local，task 结束自动清；
         同 task 内多次 _create_agent 后 set 会覆盖前值，符合预期。
@@ -595,11 +800,63 @@ class ZetAgentAdapter(APIServerAdapter):
                 thread_id="",
                 user_id="",
                 user_name="",
-                session_key=session_id,
+                session_key=session_key or session_id,
                 async_delivery=self.supports_async_delivery,
+                exec_ask="1",
             )
         except Exception as _e:
             logger.warning("[zet_agent] set_session_vars failed (cron origin won't auto-populate): %s", _e)
+
+    def _bind_api_server_session(
+        self,
+        *,
+        chat_id: str,
+        session_key: str,
+        session_id: str,
+    ) -> list:
+        """Bind inherited API routes as Zet, without touching the parent.
+
+        In particular ``/v1/runs`` owns a worker lifecycle that never calls
+        Zet's ``_run_agent`` wrapper. A subclass chokepoint keeps approvals,
+        cron origin and async-delivery correct there while ordinary
+        APIServerAdapter requests remain ``api_server`` and non-delivering.
+        """
+        from gateway.session_context import set_session_vars
+
+        return set_session_vars(
+            platform="zet_agent",
+            chat_id=chat_id,
+            session_key=session_key,
+            session_id=session_id,
+            async_delivery=self.supports_async_delivery,
+            cron_session="",
+            exec_ask="1",
+        )
+
+    @staticmethod
+    def _public_session_id_for_current_profile(session_key: str) -> Optional[str]:
+        """Return the public App id represented by an opaque Zet session key.
+
+        Bare ids are already public. Multiplex keys have the exact
+        ``<current HERMES_HOME>|<public id>`` shape; a foreign-home prefix is
+        rejected rather than stripped so one profile cannot claim another's
+        completion.
+        """
+        key = str(session_key or "").strip()
+        if not key:
+            return None
+        if "|" not in key:
+            return key
+        try:
+            from hermes_constants import get_hermes_home
+
+            prefix = f"{get_hermes_home()}|"
+        except Exception:
+            return None
+        if not key.startswith(prefix):
+            return None
+        public_id = key[len(prefix):].strip()
+        return public_id or None
 
     def resolve_process_event_source(self, session_key: str):
         """Claim synthetic process events whose session_key is a zet_agent
@@ -613,7 +870,7 @@ class ZetAgentAdapter(APIServerAdapter):
         gateway actually persisted are claimed, so foreign platforms' keys
         stay unresolvable.
         """
-        key = (session_key or "").strip()
+        key = self._public_session_id_for_current_profile(session_key)
         if not key:
             return None
         try:
@@ -692,7 +949,12 @@ class ZetAgentAdapter(APIServerAdapter):
         payload = {
             "schema": 1,
             "kind": "delegation",
-            "session_key": str(evt.get("session_key") or ""),
+            "session_key": (
+                self._public_session_id_for_current_profile(
+                    str(evt.get("session_key") or "")
+                )
+                or str(evt.get("parent_session_id") or "")
+            ),
             "session_id": str(evt.get("parent_session_id") or ""),
             "delegation_id": str(evt.get("delegation_id") or ""),
             "status": evt.get("status"),
@@ -866,9 +1128,40 @@ class ZetAgentAdapter(APIServerAdapter):
                     exc_info=True,
                 )
 
-        if not skill_slug or not isinstance(user_message, str):
+        if not skill_slug:
             _settled()
             return user_message
+        multimodal_parts = user_message if isinstance(user_message, list) else None
+        if multimodal_parts is not None:
+            source_text = "\n".join(
+                str(part.get("text") or "")
+                for part in multimodal_parts
+                if isinstance(part, dict) and part.get("type") == "text"
+                and str(part.get("text") or "")
+            )
+        elif isinstance(user_message, str):
+            source_text = user_message
+        else:
+            _settled()
+            return user_message
+
+        def _restore_multimodal(expanded: Any) -> Any:
+            if multimodal_parts is None or not isinstance(expanded, str):
+                return expanded
+            if expanded == source_text:
+                return user_message
+            restored: list[Any] = []
+            inserted = False
+            for part in multimodal_parts:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    if not inserted:
+                        restored.append({"type": "text", "text": expanded})
+                        inserted = True
+                    continue
+                restored.append(part)
+            if not inserted:
+                restored.insert(0, {"type": "text", "text": expanded})
+            return restored
         import asyncio
 
         sema = self._skill_invoke_semaphore
@@ -878,9 +1171,12 @@ class ZetAgentAdapter(APIServerAdapter):
             sema = asyncio.Semaphore(self._SKILL_INVOKE_MAX_CONCURRENCY)
             self._skill_invoke_semaphore = sema
         try:
-            await asyncio.wait_for(
-                sema.acquire(), timeout=self._SKILL_INVOKE_ACQUIRE_TIMEOUT
-            )
+            # ``wait_for`` wraps ``acquire`` in a second task and can swallow
+            # an external cancellation when that inner task completes in the
+            # same event-loop turn (Python 3.11 cancellation race). Keeping
+            # the timeout on this task preserves disconnect cancellation.
+            async with asyncio.timeout(self._SKILL_INVOKE_ACQUIRE_TIMEOUT):
+                await sema.acquire()
         except asyncio.TimeoutError:
             logger.warning(
                 "[zet_agent] skill expansion saturated; passing message through",
@@ -934,19 +1230,19 @@ class ZetAgentAdapter(APIServerAdapter):
                 if state["released"]:
                     # Queued-cancel already refunded the permit; stay out of
                     # the skills layer (the caller is gone anyway).
-                    return user_message
+                    return source_text
                 state["started"] = True
             try:
                 return ctx.run(
                     self._expand_inbound_skill_invocation_blocking,
-                    user_message, skill_slug, session_id,
+                    source_text, skill_slug, session_id,
                 )
             finally:
                 _release_from_worker()
 
         fut = loop.run_in_executor(None, _worker)
         try:
-            return await fut
+            return _restore_multimodal(await fut)
         except asyncio.CancelledError:
             with state_lock:
                 refund = not state["started"] and not state["released"]
@@ -1072,12 +1368,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # The token may sit anywhere (the pick appends at the cursor) and
         # may repeat (re-selects); strip standalone occurrences only, so
         # a genuine mention like "path/to/x" is never touched.
-        task_text = re.sub(
-            r"(?<!\S)" + re.escape(token) + r"(?!\S)", "", user_message
-        )
-        task_text = "\n".join(
-            line for line in (l.rstrip() for l in task_text.splitlines()) if line
-        ).strip()
+        task_text = _strip_skill_display_token(user_message, skill_slug)
 
         try:
             # task_id = the resolved chat session, so ${HERMES_SESSION_ID}
@@ -1114,6 +1405,7 @@ class ZetAgentAdapter(APIServerAdapter):
         stream_q: Any,
         agent_ref: Any,
         gateway_session_key: Optional[str],
+        turn_id: Optional[str] = None,
     ) -> None:
         """Run Hermes' native title worker before the request stream closes."""
         if not isinstance(result, tuple) or not result or not isinstance(result[0], dict):
@@ -1161,14 +1453,38 @@ class ZetAgentAdapter(APIServerAdapter):
 
         from agent.title_generator import maybe_auto_title
 
+        # The title costs one credit, and it belongs to the turn that triggered
+        # it (the first exchange) — not to a card of its own. The worker runs on
+        # a bare thread whose ContextVars do NOT inherit the turn binding, so
+        # capture the key and the title HERE and re-bind them inside the worker.
+        # The title snapshot reads the turn's own binding (pushed in _run_agent
+        # from trusted_user_message) rather than re-deriving from user_message,
+        # which for skill turns is the expanded boilerplate — one source of
+        # truth with the turn's main/tool/auxiliary calls.
+        from gateway.session_context import (
+            billing_usage_id_for,
+            zettlab_turn_title,
+        )
+
+        title_usage_id = billing_usage_id_for(effective_session_id, turn_id)
+        turn_title = zettlab_turn_title()
+
         def _run_title_worker() -> None:
-            from gateway.session_context import clear_session_vars
+            from gateway.session_context import (
+                clear_session_vars,
+                pop_billing_usage_id,
+                pop_zettlab_turn_title,
+                push_billing_usage_id,
+                push_zettlab_turn_title,
+            )
 
             tokens = self._bind_api_server_session(
                 chat_id=effective_session_id,
                 session_key=gateway_session_key or effective_session_id,
                 session_id=effective_session_id,
             )
+            usage_token = push_billing_usage_id(title_usage_id)
+            title_token = push_zettlab_turn_title(turn_title)
             try:
                 maybe_auto_title(
                     session_db,
@@ -1186,6 +1502,8 @@ class ZetAgentAdapter(APIServerAdapter):
                     background=False,
                 )
             finally:
+                pop_zettlab_turn_title(title_token)
+                pop_billing_usage_id(usage_token)
                 clear_session_vars(tokens)
 
         if stream_q is None:
@@ -1223,7 +1541,13 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] steer_dropped push failed", exc_info=True)
 
-    def _make_status_cb(self, stream_q: Any, previous: Any = None):
+    def _make_status_cb(
+        self,
+        stream_q: Any,
+        previous: Any = None,
+        *,
+        interaction_queue_key: str = "",
+    ):
         """Forward structured AIAgent status events onto the SSE extension lane."""
         # AIAgent instances are currently created per turn. If a future change
         # reuses them, unwrap our prior wrapper instead of chaining closures that
@@ -1250,6 +1574,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 old_sid = str(payload.get("old_session_id") or "")
                 new_sid = str(payload.get("new_session_id") or "")
                 if old_sid and new_sid and old_sid != new_sid:
+                    self._register_interaction_route_alias(
+                        old_sid,
+                        new_sid,
+                        old_route_key=interaction_queue_key,
+                    )
                     try:
                         self._goals().note_compaction_rotation(old_sid, new_sid)
                     except Exception:
@@ -1270,7 +1599,196 @@ class ZetAgentAdapter(APIServerAdapter):
     # Approval — register notify callback, resolve via HTTP respond
     # ------------------------------------------------------------------
 
-    def _make_approval_cb(self, stream_q: Any, session_id: str):
+    _APPROVAL_PROJECTION_MAX_PER_SESSION = 16
+    _APPROVAL_PROJECTION_MAX_GLOBAL = 256
+    _APPROVAL_PROJECTION_MAX_BYTES = 512 * 1024
+    _APPROVAL_PROJECTION_COMMAND_CHARS = 4096
+    _APPROVAL_PROJECTION_DESCRIPTION_CHARS = 1024
+
+    @staticmethod
+    def _bounded_approval_projection_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        digest = hashlib.sha256(
+            text.encode("utf-8", errors="replace")
+        ).hexdigest()
+        half = max(limit // 2, 1)
+        return (
+            f"{text[:half]}\n...[truncated sha256={digest}]...\n"
+            f"{text[-half:]}"
+        )
+
+    def _bounded_approval_projection_payload(
+        self, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        bounded = dict(payload)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8", errors="replace")
+        ).hexdigest()
+        bounded["command"] = self._bounded_approval_projection_text(
+            payload.get("command", ""),
+            self._APPROVAL_PROJECTION_COMMAND_CHARS,
+        )
+        bounded["description"] = self._bounded_approval_projection_text(
+            payload.get("description", ""),
+            self._APPROVAL_PROJECTION_DESCRIPTION_CHARS,
+        )
+        bounded["pattern_key"] = self._bounded_approval_projection_text(
+            payload.get("pattern_key", ""), 512
+        )
+        bounded["pattern_keys"] = [
+            self._bounded_approval_projection_text(value, 512)
+            for value in list(payload.get("pattern_keys", []) or [])[:32]
+            if value
+        ]
+        bounded["payload_fingerprint"] = fingerprint
+        return bounded
+
+    @staticmethod
+    def _approval_projection_size(payload: Dict[str, Any]) -> int:
+        return len(
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8", errors="replace")
+        )
+
+    def _clear_approval_projections(self, scoped_session_key: str) -> int:
+        with self._pending_lock:
+            raw_queue = self._pending_approval.pop(scoped_session_key, [])
+            getattr(self, "_approval_stream_queues", {}).pop(
+                scoped_session_key, None
+            )
+        if isinstance(raw_queue, dict):
+            return 1
+        return len(raw_queue or [])
+
+    def _approval_projection_head(
+        self, scoped_session_key: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(scoped_session_key)
+            if isinstance(raw_queue, dict):
+                return raw_queue
+            if raw_queue:
+                return raw_queue[0]
+        return None
+
+    def _cache_approval_projection(
+        self,
+        stream_q: Any,
+        scoped_session_key: str,
+        session_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        payload = self._bounded_approval_projection_payload(payload)
+        payload_size = self._approval_projection_size(payload)
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(scoped_session_key)
+            if isinstance(raw_queue, dict):
+                queue = [raw_queue]
+            else:
+                queue = list(raw_queue or [])
+            if len(queue) >= self._APPROVAL_PROJECTION_MAX_PER_SESSION:
+                raise RuntimeError("approval projection session limit reached")
+            all_payloads = []
+            for existing in self._pending_approval.values():
+                if isinstance(existing, dict):
+                    all_payloads.append(existing)
+                else:
+                    all_payloads.extend(existing or [])
+            if len(all_payloads) >= self._APPROVAL_PROJECTION_MAX_GLOBAL:
+                raise RuntimeError("approval projection global limit reached")
+            total_bytes = sum(
+                self._approval_projection_size(item) for item in all_payloads
+            )
+            if total_bytes + payload_size > self._APPROVAL_PROJECTION_MAX_BYTES:
+                raise RuntimeError("approval projection byte limit reached")
+            should_emit = not queue
+            queue.append(payload)
+            self._pending_approval[scoped_session_key] = queue
+            stream_queues = getattr(self, "_approval_stream_queues", None)
+            if stream_queues is None:
+                stream_queues = {}
+                self._approval_stream_queues = stream_queues
+            stream_queues[scoped_session_key] = stream_q
+        if should_emit:
+            try:
+                stream_q.put(("__tool_progress__", payload))
+            except Exception:
+                self._remove_approval_projection(
+                    scoped_session_key, str(payload.get("approval_id") or "")
+                )
+                raise
+            try:
+                self._goals().on_interaction_pending(session_id)
+            except Exception:
+                logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
+
+    def _remove_approval_projection(
+        self,
+        scoped_session_key: str,
+        approval_id: Optional[str],
+    ) -> bool:
+        next_payload = None
+        stream_q = None
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(scoped_session_key)
+            if isinstance(raw_queue, dict):
+                queue = [raw_queue]
+            else:
+                queue = list(raw_queue or [])
+            if not queue:
+                return False
+            target_index = 0
+            if approval_id is not None:
+                target_index = next(
+                    (
+                        index
+                        for index, item in enumerate(queue)
+                        if item.get("approval_id") == approval_id
+                    ),
+                    -1,
+                )
+                if target_index < 0:
+                    return True
+            removed_head = target_index == 0
+            queue.pop(target_index)
+            if queue:
+                self._pending_approval[scoped_session_key] = queue
+                if removed_head:
+                    next_payload = queue[0]
+                    stream_q = getattr(
+                        self, "_approval_stream_queues", {}
+                    ).get(scoped_session_key)
+            else:
+                self._pending_approval.pop(scoped_session_key, None)
+                getattr(self, "_approval_stream_queues", {}).pop(
+                    scoped_session_key, None
+                )
+        if next_payload is not None and stream_q is not None:
+            try:
+                stream_q.put(("__tool_progress__", next_payload))
+            except Exception:
+                logger.debug("[zet_agent] approval projection push failed", exc_info=True)
+        return bool(queue)
+
+    def _make_approval_cb(
+        self,
+        stream_q: Any,
+        session_id: str,
+        queue_key: Optional[str] = None,
+        owner_agent: Any = None,
+        bound_turn_id: str = "",
+    ):
         """Return a callable suitable for ``register_gateway_notify``.
 
         The hermes approval module calls our ``cb(approval_data)`` from
@@ -1280,9 +1798,9 @@ class ZetAgentAdapter(APIServerAdapter):
         loop) emits it, then return immediately — the agent's wait()
         is what actually blocks the run.
 
-        Plan-E rev4 payload: ``{command, description, pattern_key,
-        pattern_keys, expires_at_ms}`` — no request_id (per-session
-        FIFO; oldest pending wins). expires_at_ms is stamped here from
+        Payload includes both ``approval_id`` for exact legacy-card matching
+        and ``interaction_id`` for durable two-phase delivery. The deadline is
+        stamped here from
         the same approval config the wait loop in tools/approval.py
         reads, so the App's countdown matches the agent's actual deadline.
 
@@ -1290,6 +1808,33 @@ class ZetAgentAdapter(APIServerAdapter):
         reconnecting client can fetch it via the GET /pending endpoint
         and re-render the modal after a ws drop.
         """
+        internal_key = queue_key or self._interaction_queue_key(session_id)
+        captured_turn_id = str(
+            bound_turn_id
+            or getattr(owner_agent, "_zettlab_active_turn_id", "")
+            or ""
+        ).strip()
+        owner_required = owner_agent is not None
+        owner_ref = None
+        owner_token = ""
+        if owner_required:
+            try:
+                owner_ref = weakref.ref(owner_agent)
+            except TypeError:
+                # Compatibility for non-weakrefable test/integration owners.
+                # The callback captures only this random immutable token; the
+                # current scoped owner must still present the same token.
+                owner_token = str(
+                    getattr(owner_agent, "_zettlab_approval_owner_token", "")
+                    or ""
+                )
+                if not owner_token:
+                    owner_token = secrets.token_hex(16)
+                    try:
+                        owner_agent._zettlab_approval_owner_token = owner_token
+                    except Exception:
+                        owner_token = ""
+
         def _notify(approval_data: Dict[str, Any]) -> None:
             # Stamp the deadline using the same config the wait loop in
             # tools/approval.py reads. The notify callback fires
@@ -1297,35 +1842,158 @@ class ZetAgentAdapter(APIServerAdapter):
             # read returns the same value to both sites — clients see
             # the wall-clock time the agent will actually give up at.
             expires_at_ms = int((time.time() + _approval_timeout_seconds()) * 1000)
+            interaction_id = str(approval_data.get("interaction_id", "") or "")
+            if not interaction_id:
+                interaction_id = secrets.token_hex(16)
+                approval_data["interaction_id"] = interaction_id
+            live_owner = None
+            if owner_required:
+                if owner_ref is not None:
+                    live_owner = owner_ref()
+                    if live_owner is None:
+                        raise RuntimeError("approval callback owner was collected")
+                elif not owner_token:
+                    raise RuntimeError("approval callback owner cannot be verified")
+            from gateway.session_context import get_session_env
+            caller_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
+            if (
+                owner_required
+                and captured_turn_id
+                and caller_turn_id != captured_turn_id
+            ):
+                raise RuntimeError("approval callback turn owner mismatch")
+            turn_id = captured_turn_id or caller_turn_id
+            if turn_id:
+                approval_data["turn_id"] = turn_id
+                owner_bound = self._remember_active_turn_id(
+                    session_id,
+                    turn_id,
+                    owner_agent=live_owner,
+                    owner_token=owner_token,
+                )
+                if owner_required and not owner_bound:
+                    raise RuntimeError("approval callback active owner mismatch")
+                if not self._pin_durable_session_source(
+                    internal_key, "approval", interaction_id
+                ):
+                    raise RuntimeError(
+                        "durable approval source capacity exhausted"
+                    )
+                self._wait_for_recovery_fence(internal_key, turn_id)
+            interaction_generation = int(
+                approval_data.get("interaction_generation", 0) or 0
+            )
+            if interaction_generation <= 0:
+                # Compatibility path for legacy integrations that invoke the
+                # registered callback directly instead of enqueueing through
+                # tools.approval. Such callers have no durable generation, so
+                # keep the latest-main bounded FIFO projection semantics and
+                # never advertise the two-phase delivery capability.
+                legacy_payload = {
+                    "type": "hermes.approval",
+                    "approval_id": approval_data.get("approval_id", ""),
+                    "command": approval_data.get("command", ""),
+                    "description": approval_data.get("description", ""),
+                    "pattern_key": approval_data.get("pattern_key", ""),
+                    "pattern_keys": list(
+                        approval_data.get("pattern_keys", []) or []
+                    ),
+                    "expires_at_ms": expires_at_ms,
+                }
+                self._cache_approval_projection(
+                    stream_q,
+                    internal_key,
+                    session_id,
+                    legacy_payload,
+                )
+                approval_id = str(legacy_payload.get("approval_id") or "")
+
+                def _cleanup_legacy_projection() -> None:
+                    self._remove_approval_projection(
+                        internal_key,
+                        approval_id,
+                    )
+
+                return _cleanup_legacy_projection
             payload = {
                 "type": "hermes.approval",
+                "approval_id": approval_data.get("approval_id", ""),
+                "interaction_id": interaction_id,
+                "interaction_generation": interaction_generation,
+                "interaction_delivery_version": 1,
                 "command": approval_data.get("command", ""),
                 "description": approval_data.get("description", ""),
                 "pattern_key": approval_data.get("pattern_key", ""),
                 "pattern_keys": list(approval_data.get("pattern_keys", []) or []),
                 "expires_at_ms": expires_at_ms,
             }
-            with self._pending_lock:
-                self._pending_approval[session_id] = payload
-            try:
-                stream_q.put(("__tool_progress__", payload))
-            except Exception:
-                logger.debug("[zet_agent] approval notify push failed", exc_info=True)
+            if turn_id:
+                payload["turn_id"] = turn_id
+            if not self._store_pending_interaction(
+                "approval", internal_key, payload
+            ):
+                raise RuntimeError("approval reconnect mirror capacity exhausted")
+            if turn_id:
+                reserved, push_error = self._publish_interaction_event(
+                    stream_q,
+                    payload,
+                    internal_key,
+                    turn_id,
+                    interaction_generation,
+                )
+                if not reserved:
+                    self._remove_pending_interaction(
+                        "approval", internal_key, interaction_id
+                    )
+                    raise RuntimeError(
+                        "interaction generation capacity exhausted"
+                    )
+                if push_error is not None:
+                    self._remove_pending_interaction(
+                        "approval", internal_key, interaction_id
+                    )
+                    raise RuntimeError("approval notify push failed") from push_error
+            else:
+                try:
+                    stream_q.put(("__tool_progress__", payload))
+                except Exception as exc:
+                    self._remove_pending_interaction(
+                        "approval", internal_key, interaction_id
+                    )
+                    raise RuntimeError("approval notify push failed") from exc
             # Goal projection: a blocked approval means the loop is waiting
             # on the user — surface it on the App's goal banner (HR#3: goal
             # rounds never auto-approve). No-op for non-goal sessions.
             try:
-                self._goals().on_interaction_pending(session_id)
+                self._goals().on_interaction_pending(
+                    session_id, verify_live_source=True
+                )
             except Exception:
                 logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
+        def _source_dropped(_session_key: str, interaction_id: str) -> None:
+            self._remove_pending_interaction(
+                "approval", internal_key, interaction_id
+            )
+            self._release_durable_session_source(
+                internal_key, "approval", interaction_id
+            )
+
+        setattr(_notify, "_gateway_interaction_dropped", _source_dropped)
         return _notify
 
     # ------------------------------------------------------------------
     # Clarify — stable instance IDs with legacy FIFO fallback on respond
     # ------------------------------------------------------------------
 
-    def _make_clarify_cb(self, stream_q: Any, session_id: str):
+    def _make_clarify_cb(
+        self,
+        stream_q: Any,
+        session_id: str,
+        queue_key: Optional[str] = None,
+        owner_agent: Any = None,
+        bound_turn_id: str = "",
+    ):
         """Return a sync ``(question, choices) -> str`` callback.
 
         Appends an entry to the session's FIFO queue and pushes a
@@ -1334,60 +2002,142 @@ class ZetAgentAdapter(APIServerAdapter):
         pops the entry and signals it. Timeout returns "" so a stale
         clarify never hangs the turn forever.
 
-        A new opaque ``clarify_id`` is attached before either the SSE event
-        or reconnect projection is published. The response endpoint uses this
-        identity when the client provides it; legacy clients that do not yet
-        send the field retain the historical FIFO response behavior.
+        The wire payload includes one opaque identity as both ``clarify_id``
+        and ``interaction_id``. Legacy responders may answer an exact
+        ``clarify_id`` or omit it for FIFO; two-phase responders must match the
+        oldest durable ``interaction_id``.
         """
-        # Capture profile identity while the callback is attached. The agent
-        # invokes it later from its worker thread, where the request's profile
-        # contextvar need not be active any more.
-        scoped_session_key = self._active_turn_key(session_id)
+        internal_key = queue_key or self._interaction_queue_key(session_id)
+        captured_turn_id = str(
+            bound_turn_id
+            or getattr(owner_agent, "_zettlab_active_turn_id", "")
+            or ""
+        ).strip()
 
         def _ask(question: str, choices: Optional[List[str]]) -> str:
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
             # clock time we will actually give up at.
             expires_at_ms = int((time.time() + CLARIFY_RESPONSE_TIMEOUT) * 1000)
-            clarify_id = uuid.uuid4().hex
-            payload = {
-                "type": "hermes.clarify",
-                "clarify_id": clarify_id,
-                "question": question,
-                "choices_offered": list(choices or []),
-                "expires_at_ms": expires_at_ms,
-            }
-            entry = _ClarifyEntry(clarify_id, payload)
-            with self._clarify_state_lock:
-                queue = self._clarify_queues.setdefault(scoped_session_key, [])
-                queue.append(entry)
-                # /pending is the projection of the entry legacy clients
-                # would answer next.  Keep that projection on FIFO's head
-                # even if a future producer can enqueue concurrently.
-                is_pending_head = len(queue) == 1
-            with self._pending_lock:
-                if is_pending_head:
-                    self._pending_clarify[scoped_session_key] = payload
-            try:
-                stream_q.put(("__tool_progress__", payload))
-            except Exception:
-                logger.debug("[zet_agent] clarify push failed", exc_info=True)
-                self._discard_clarify_entry(scoped_session_key, entry)
+            from gateway.session_context import get_session_env
+            caller_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
+            if (
+                owner_agent is not None
+                and captured_turn_id
+                and caller_turn_id != captured_turn_id
+            ):
+                logger.warning(
+                    "[zet_agent] clarify callback rejected stale turn owner"
+                )
                 return ""
+            turn_id = captured_turn_id or caller_turn_id
+            if turn_id:
+                owner_bound = self._remember_active_turn_id(
+                    session_id, turn_id, owner_agent=owner_agent
+                )
+                if owner_agent is not None and not owner_bound:
+                    logger.warning(
+                        "[zet_agent] clarify callback rejected inactive owner"
+                    )
+                    return ""
+                self._wait_for_recovery_fence(internal_key, turn_id)
+            from tools.approval import reserve_gateway_interaction_generation
+
+            with reserve_gateway_interaction_generation() as interaction_generation:
+                interaction_id = secrets.token_hex(16)
+                payload = {
+                    "type": "hermes.clarify",
+                    "clarify_id": interaction_id,
+                    "interaction_id": interaction_id,
+                    "interaction_generation": interaction_generation,
+                    "interaction_delivery_version": 1,
+                    "question": question,
+                    "choices_offered": list(choices or []),
+                    "expires_at_ms": expires_at_ms,
+                }
+                if turn_id:
+                    payload["turn_id"] = turn_id
+                entry = _ClarifyEntry(
+                    interaction_id,
+                    turn_id,
+                    payload,
+                    interaction_generation,
+                )
+                with self._clarify_state_lock:
+                    self._clarify_queues.setdefault(internal_key, []).append(entry)
+            if not self._pin_durable_session_source(
+                internal_key, "clarify", interaction_id
+            ):
+                logger.warning(
+                    "[zet_agent] durable clarify source capacity exhausted"
+                )
+                self._discard_clarify_entry(internal_key, entry)
+                return ""
+            if not self._store_pending_interaction(
+                "clarify", internal_key, payload
+            ):
+                self._discard_clarify_entry(internal_key, entry)
+                return ""
+            if turn_id:
+                reserved, push_error = self._publish_interaction_event(
+                    stream_q,
+                    payload,
+                    internal_key,
+                    turn_id,
+                    interaction_generation,
+                )
+                if not reserved:
+                    self._discard_clarify_entry(internal_key, entry)
+                    return ""
+                if push_error is not None:
+                    logger.debug(
+                        "[zet_agent] clarify push failed",
+                        exc_info=(
+                            type(push_error),
+                            push_error,
+                            push_error.__traceback__,
+                        ),
+                    )
+                    self._discard_clarify_entry(internal_key, entry)
+                    return ""
+            else:
+                try:
+                    stream_q.put(("__tool_progress__", payload))
+                except Exception:
+                    logger.debug("[zet_agent] clarify push failed", exc_info=True)
+                    self._discard_clarify_entry(internal_key, entry)
+                    return ""
             # Goal projection: clarify blocks the turn on user input — mirror
             # the approval hook (waiting banner; no GoalManager mutation).
             try:
-                self._goals().on_interaction_pending(session_id)
+                self._goals().on_interaction_pending(
+                    session_id, verify_live_source=True
+                )
             except Exception:
                 logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
-            resolved = entry.event.wait(timeout=CLARIFY_RESPONSE_TIMEOUT)
+            wait_deadline = time.monotonic() + CLARIFY_RESPONSE_TIMEOUT
+            resolved = False
+            while True:
+                remaining = wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if entry.event.wait(timeout=min(1.0, remaining)):
+                    resolved = True
+                    break
+                if entry.deferred_wake_at and time.monotonic() >= entry.deferred_wake_at:
+                    # Fail-safe for a local-server crash after finalize. Keep
+                    # the persisted goal waiting flag fail-closed; only release
+                    # the in-process agent waiter so it cannot hang forever.
+                    entry.event.set()
+                    resolved = True
+                    break
             if not resolved:
                 logger.warning(
                     "[zet_agent] clarify timeout after %ss session=%s",
                     CLARIFY_RESPONSE_TIMEOUT, session_id,
                 )
-                self._discard_clarify_entry(scoped_session_key, entry)
+                self._discard_clarify_entry(internal_key, entry)
                 return ""
             return entry.response or ""
 
@@ -1644,36 +2394,69 @@ class ZetAgentAdapter(APIServerAdapter):
                 "groups": groups,
                 "auto_execute": bool(getattr(agent, "_zet_agent_plan_auto_execute", False)),
             }
-            try:
-                stream_q.put(("__tool_progress__", payload))
-            except Exception:
-                logger.debug("[zet_agent] plan emit push failed", exc_info=True)
+            stream_q.put(("__tool_progress__", payload))
 
         return _emit
 
-    def _discard_clarify_entry(self, scoped_session_key: str, entry: _ClarifyEntry) -> None:
+    def _discard_clarify_entry(self, queue_key: str, entry: _ClarifyEntry) -> None:
         """Remove an unresolved entry (push failure or timeout). The
         respond handler removes via popleft on success; this path
         handles error rollback so the queue doesn't accumulate."""
-        next_payload: Optional[Dict[str, Any]] = None
         with self._clarify_state_lock:
-            queue = self._clarify_queues.get(scoped_session_key)
+            queue = self._clarify_queues.get(queue_key)
             if queue and entry in queue:
                 queue.remove(entry)
             if queue is not None and not queue:
-                self._clarify_queues.pop(scoped_session_key, None)
-            elif queue:
-                # The pending projection always represents the entry at the
-                # front of the legacy FIFO. This also keeps reconnect correct
-                # should a future producer create more than one entry.
-                next_payload = queue[0].payload
-        with self._pending_lock:
-            current = self._pending_clarify.get(scoped_session_key)
-            if current and current.get("clarify_id") == entry.clarify_id:
-                if next_payload is None:
-                    self._pending_clarify.pop(scoped_session_key, None)
-                else:
-                    self._pending_clarify[scoped_session_key] = next_payload
+                self._clarify_queues.pop(queue_key, None)
+        self._remove_pending_interaction(
+            "clarify", queue_key, entry.interaction_id
+        )
+        self._release_durable_session_source(
+            queue_key, "clarify", entry.interaction_id
+        )
+
+    def _remember_active_turn_id(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        owner_agent: Any = None,
+        owner_token: str = "",
+    ) -> bool:
+        """Bind the registered live task to the turn that emitted a prompt."""
+        lock = getattr(self, "_session_run_lock", None)
+        turn_ids = getattr(self, "_active_session_turn_ids", None)
+        if lock is None or turn_ids is None:
+            return False
+        key = self._active_turn_key(session_id)
+        with lock:
+            current_owner = None
+            if owner_agent is not None or owner_token:
+                current_ref = self._active_session_agents.get(key)
+                current_owner = current_ref[0] if current_ref else None
+                if current_owner is None:
+                    return False
+                if owner_agent is not None and current_owner is not owner_agent:
+                    return False
+                if owner_token and str(
+                    getattr(
+                        current_owner,
+                        "_zettlab_approval_owner_token",
+                        "",
+                    )
+                    or ""
+                ) != owner_token:
+                    return False
+            current_turn_id = str(turn_ids.get(key, "") or "")
+            if current_turn_id and current_turn_id != turn_id:
+                return False
+            turn_ids[key] = turn_id
+            if current_owner is not None:
+                try:
+                    current_owner._zettlab_active_turn_id = turn_id
+                except Exception:
+                    pass
+            return True
 
     def _register_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Stash the in-flight chat-completions turn so the session
@@ -1693,8 +2476,23 @@ class ZetAgentAdapter(APIServerAdapter):
         with self._session_run_lock:
             self._active_session_agents[key] = agent_ref
             self._active_session_tasks[key] = agent_task
+            # Task replacement starts a fresh binding generation. Until that
+            # task's own callback proves its turn id, all older receipts are
+            # terminal rather than inheriting the previous task's id.
+            self._active_session_turn_ids.pop(key, None)
+            try:
+                registered_agent = agent_ref[0]
+                registered_turn_id = str(
+                    getattr(registered_agent, "_zettlab_active_turn_id", "")
+                    or ""
+                )
+            except Exception:
+                registered_turn_id = ""
+            if registered_turn_id:
+                self._active_session_turn_ids[key] = registered_turn_id
 
-    def _active_turn_key(self, session_id: str) -> str:
+    @staticmethod
+    def _raw_active_turn_key(session_id: str) -> str:
         """Scoped registry key: {hermes_home}|{session_id} — same shape as
         the goal driver's _scope_key so both sides resolve identically."""
         try:
@@ -1703,6 +2501,46 @@ class ZetAgentAdapter(APIServerAdapter):
             return f"{get_hermes_home()}|{session_id}"
         except Exception:
             return session_id
+
+    def _canonical_interaction_route(self, scoped_key: str) -> str:
+        lock = getattr(self, "_interaction_route_lock", None)
+        aliases = getattr(self, "_interaction_route_aliases", None)
+        if lock is None or aliases is None:
+            return scoped_key
+        with lock:
+            canonical = aliases.get(scoped_key, scoped_key)
+            if scoped_key in aliases:
+                aliases.move_to_end(scoped_key)
+            return canonical
+
+    def _register_interaction_route_alias(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        old_route_key: str = "",
+    ) -> None:
+        """Bind a compacted public tip to the turn's stable scoped route."""
+        raw_old = self._raw_active_turn_key(old_session_id)
+        raw_new = self._raw_active_turn_key(new_session_id)
+        old_key = old_route_key or raw_old
+        canonical = self._canonical_interaction_route(old_key)
+        with self._interaction_route_lock:
+            self._interaction_route_aliases[raw_old] = canonical
+            self._interaction_route_aliases[raw_new] = canonical
+            self._interaction_route_aliases.move_to_end(raw_old)
+            self._interaction_route_aliases.move_to_end(raw_new)
+            while len(self._interaction_route_aliases) > INTERACTION_ROUTE_ALIAS_CAP:
+                self._interaction_route_aliases.popitem(last=False)
+
+    def _active_turn_key(self, session_id: str) -> str:
+        return self._canonical_interaction_route(
+            self._raw_active_turn_key(session_id)
+        )
+
+    def _interaction_queue_key(self, session_id: str) -> str:
+        """Internal profile-scoped key; never expose this value on the wire."""
+        return self._active_turn_key(session_id)
 
     def _clear_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Drop the registration ONLY if it still points at the turn we
@@ -1724,15 +2562,91 @@ class ZetAgentAdapter(APIServerAdapter):
                         break
             if self._active_session_tasks.get(key) is agent_task:
                 self._active_session_tasks.pop(key, None)
+                self._active_session_turn_ids.pop(key, None)
             else:
                 for k, v in list(self._active_session_tasks.items()):
                     if v is agent_task:
                         self._active_session_tasks.pop(k, None)
+                        self._active_session_turn_ids.pop(k, None)
                         break
 
     # ------------------------------------------------------------------
     # Agent factory override
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _session_model_state_key(session_id: str) -> str:
+        profile = str(_api_request_profile.get() or "main").strip() or "main"
+        if profile == "default":
+            profile = "main"
+        return f"agent:{profile}:zet_agent:dm:{session_id}"
+
+    def _session_model_override_for(
+        self, session_key: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve local-server's public id into profile-owned runner state.
+
+        The JSON control plane is already profile-local. Its in-memory mirror
+        must encode the same owner; a bare public id would collide across
+        profiles and cannot be cleared by ``unload_profile_runtime``.
+        """
+        raw_key = str(session_key or "").strip()
+        if not raw_key:
+            return None
+        public_id = self._public_session_id_for_current_profile(raw_key)
+        profile = str(_api_request_profile.get() or "main").strip() or "main"
+        if profile == "default":
+            profile = "main"
+        state_prefix = f"agent:{profile}:zet_agent:dm:"
+        if raw_key.startswith(state_prefix):
+            state_key = raw_key
+            public_id = raw_key[len(state_prefix):]
+        elif public_id:
+            state_key = self._session_model_state_key(public_id)
+        else:
+            return None
+
+        gw = getattr(self, "gateway_runner", None)
+        overrides = getattr(gw, "_session_model_overrides", None) if gw is not None else None
+        if overrides is None:
+            return None
+        try:
+            candidate = overrides.get(state_key)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, dict):
+            return dict(candidate)
+
+        # Rehydrate from the active profile's local-server-owned file. Do not
+        # consult a process-global bare-id cache: that was the cross-profile
+        # leak this scoped key replaces.
+        try:
+            from gateway.session_model_overrides import load_session_model_overrides
+
+            candidate = load_session_model_overrides().get(public_id or "")
+        except Exception:
+            candidate = None
+        if not isinstance(candidate, dict):
+            return None
+        overrides[state_key] = dict(candidate)
+        return dict(candidate)
+
+    def _last_resolved_model_cache_key(self, session_key: str) -> Any:
+        """Keep transient model recovery inside the active profile home."""
+        raw_key = str(session_key or "")
+        if not raw_key:
+            return ""
+        return (self._seen_models_home_key(), raw_key)
+
+    def _last_resolved_model_fallback_key(self) -> Any:
+        return (self._seen_models_home_key(), None)
+
+    def _is_last_resolved_model_fallback_key(self, cache_key: Any) -> bool:
+        return (
+            isinstance(cache_key, tuple)
+            and len(cache_key) == 2
+            and cache_key[1] is None
+        )
 
     def _create_agent(
         self,
@@ -1743,7 +2657,12 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        requested_model: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
+        session_model: Optional[str] = None,
+        confirmed_runtime_lock: bool = False,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Build the agent for the zet_agent platform, then attach extra callbacks.
@@ -1781,11 +2700,10 @@ class ZetAgentAdapter(APIServerAdapter):
             + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
         )
 
-        # cron origin + async-delivery capability（见 helper docstring）。
-        self._bind_turn_session_context(session_id)
-
         from run_agent import AIAgent
         from gateway.run import (
+            _checkpoint_agent_kwargs,
+            _current_max_iterations,
             _resolve_runtime_agent_kwargs,
             _resolve_gateway_model,
             _load_gateway_config,
@@ -1794,7 +2712,10 @@ class ZetAgentAdapter(APIServerAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         platform_key = Platform.ZET_AGENT.value
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except RuntimeError as exc:
+            raise _ProviderAuthResolutionError(str(exc)) from exc
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
@@ -1805,114 +2726,264 @@ class ZetAgentAdapter(APIServerAdapter):
         if runtime_model:
             model = runtime_model
 
+        request_reasoning_config = _request_reasoning_config(model_options)
+        if request_reasoning_config is not None:
+            reasoning_config = request_reasoning_config
+        request_service_tier = _request_service_tier(model_options)
+
+        request_model = _clean_request_string(requested_model)
+        request_provider = _clean_request_string(requested_provider)
+        route_model = (
+            _clean_request_string(route.get("model"))
+            if isinstance(route, dict)
+            else None
+        )
+        route_provider = (
+            _clean_request_string(route.get("provider"))
+            if isinstance(route, dict)
+            else None
+        )
+        route_api_key = (
+            _clean_request_string(route.get("api_key"))
+            if isinstance(route, dict)
+            else None
+        )
+        route_base_url = (
+            _clean_request_string(route.get("base_url"))
+            if isinstance(route, dict)
+            else None
+        )
+
+        def _resolve_provider_runtime(
+            provider: Optional[str],
+            *,
+            target_model: Optional[str],
+            required: bool,
+        ) -> Optional[Dict[str, Any]]:
+            provider_name = _clean_request_string(provider)
+            if not provider_name:
+                return None
+            try:
+                return _resolve_request_runtime_agent_kwargs(
+                    provider_name,
+                    target_model=target_model or None,
+                )
+            except Exception as exc:
+                try:
+                    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+
+                    return _resolve_runtime_agent_kwargs_for_provider(provider_name)
+                except Exception:
+                    pass
+                if required:
+                    raise _ProviderAuthResolutionError(str(exc)) from exc
+                logger.debug(
+                    "zet_agent provider-runtime refresh failed for provider=%s model=%s",
+                    provider_name,
+                    target_model or "",
+                    exc_info=True,
+                )
+                return None
+
         # ZET-576: apply session-level model override if present.
         # _resolve_gateway_model reads config.yaml (agent default), but
         # session overrides live in gateway_runner._session_model_overrides
         # which this adapter's _create_agent bypasses. Check it here.
         gw = getattr(self, "gateway_runner", None)
-        override_key = gateway_session_key or session_id
+        override_key = session_id or gateway_session_key
         runtime_auxiliary_task_configs = None
         runtime_supports_vision = None
-        override = None
-        if gw is not None and override_key:
-            candidate = getattr(gw, "_session_model_overrides", {}).get(override_key)
-            if isinstance(candidate, dict):
-                override = dict(candidate)
-        if override is None:
-            override = self._session_model_override_for(override_key)
+        session_override = None
+        if not confirmed_runtime_lock and gw is not None and override_key:
+            session_override = self._session_model_override_for(override_key)
 
-        # Per-client route sits between the global runtime and an explicit
-        # session /model override, matching the base API adapter precedence.
-        if route and not override:
-            if route.get("provider"):
-                try:
-                    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+        from hermes_cli.model_switch import resolve_effective_model
 
-                    provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        route["provider"]
-                    )
-                    provider_kwargs.pop("model", None)
-                    runtime_kwargs.update(provider_kwargs)
-                except Exception:
-                    for key in (
-                        "api_key",
-                        "base_url",
-                        "api_mode",
-                        "command",
-                        "args",
-                        "credential_pool",
-                    ):
-                        runtime_kwargs.pop(key, None)
-                    runtime_kwargs["provider"] = route["provider"]
-            if route.get("model"):
-                model = route["model"]
-            if route.get("api_key"):
-                runtime_kwargs["api_key"] = route["api_key"]
-            if route.get("base_url"):
-                runtime_kwargs["base_url"] = route["base_url"]
-            logger.debug(
-                "zet_agent model route applied: model=%s provider=%s",
-                model,
-                runtime_kwargs.get("provider"),
+        session_row_model = _clean_request_string(session_model)
+        if session_override:
+            override_model = resolve_effective_model(session_override, None, model)
+            session_provider = _clean_request_string(
+                session_override.get("provider")
             )
-        elif route and override:
-            logger.debug(
-                "zet_agent model route skipped: session /model override wins for %s",
-                override_key,
+            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            provider_runtime = _resolve_provider_runtime(
+                session_provider or current_provider,
+                target_model=override_model,
+                required=False,
             )
-
-        if override:
-            model = override.get("model", model)
-            for k in ("provider", "api_key", "base_url", "api_mode"):
-                v = override.get(k)
-                if v is not None:
-                    runtime_kwargs[k] = v
-            context_length = override.get("context_length")
+            if provider_runtime:
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            _apply_runtime_agent_overrides(runtime_kwargs, session_override)
+            model = override_model
+            context_length = session_override.get("context_length")
             if context_length is not None:
                 runtime_kwargs["config_context_length"] = context_length
-            auxiliary = override.get("auxiliary")
+            auxiliary = session_override.get("auxiliary")
             if isinstance(auxiliary, dict):
                 runtime_auxiliary_task_configs = auxiliary
-            supports_vision = override.get("supports_vision")
+            supports_vision = session_override.get("supports_vision")
             if isinstance(supports_vision, bool):
                 runtime_supports_vision = supports_vision
             logger.info(
                 "session-model-override applied: session=%s model=%s",
                 override_key, model,
             )
+            if route or request_model or request_provider:
+                logger.debug(
+                    "zet_agent request selection skipped: session /model override wins for %s",
+                    override_key or "",
+                )
+        elif session_row_model and not confirmed_runtime_lock:
+            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            provider_runtime = _resolve_provider_runtime(
+                current_provider,
+                target_model=session_row_model,
+                required=False,
+            )
+            if provider_runtime:
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            model = resolve_effective_model(None, session_row_model, model)
+            if request_model or request_provider:
+                logger.debug(
+                    "zet_agent request selection skipped: session-persisted model wins for %s",
+                    override_key or "",
+                )
+        else:
+            effective_model = (
+                (route_model or model)
+                if route is not None
+                else (request_model or model)
+            )
+            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            effective_provider = request_provider or route_provider or current_provider
+            provider_runtime = None
+            if effective_provider and (
+                bool(request_provider or route_provider) or effective_model != model
+            ):
+                provider_runtime = _resolve_provider_runtime(
+                    effective_provider,
+                    target_model=effective_model,
+                    required=bool(request_provider) or confirmed_runtime_lock,
+                )
+            if provider_runtime:
+                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            elif effective_provider and effective_provider != current_provider:
+                for key in (
+                    "api_key",
+                    "base_url",
+                    "api_mode",
+                    "command",
+                    "args",
+                    "credential_pool",
+                ):
+                    runtime_kwargs.pop(key, None)
+                runtime_kwargs["provider"] = effective_provider
+            model = effective_model
+            if route_api_key:
+                runtime_kwargs["api_key"] = route_api_key
+            if route_base_url:
+                runtime_kwargs["base_url"] = route_base_url
+            if route:
+                logger.debug(
+                    "zet_agent request selection applied: model=%s provider=%s route_provider=%s request_provider=%s",
+                    model,
+                    runtime_kwargs.get("provider"),
+                    route_provider or "",
+                    request_provider or "",
+                )
+
+        if not model and runtime_kwargs.get("provider"):
+            try:
+                from hermes_cli.models import get_default_model_for_provider
+
+                model = get_default_model_for_provider(runtime_kwargs["provider"])
+                if model:
+                    logger.info(
+                        "No model configured — defaulting to %s for provider %s",
+                        model,
+                        runtime_kwargs["provider"],
+                    )
+            except Exception:
+                pass
+
+        resolved_key = gateway_session_key or ""
+        if not model:
+            recovered = self._last_resolved_model_for(resolved_key)
+            if recovered:
+                logger.warning(
+                    "Empty model resolved for session=%s — recovering last-known-good model %s",
+                    resolved_key,
+                    recovered,
+                )
+                model = recovered
+        else:
+            self._remember_last_resolved_model(resolved_key, model)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
-        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-        fallback_model = GatewayRunner._load_fallback_model()
-
-        agent = AIAgent(
-            model=model,
-            **runtime_kwargs,
-            max_iterations=max_iterations,
-            quiet_mode=True,
-            verbose_logging=False,
-            ephemeral_system_prompt=ephemeral_system_prompt or None,
-            enabled_toolsets=enabled_toolsets,
-            session_id=session_id,
-            platform=platform_key,
-            stream_delta_callback=stream_delta_callback,
-            tool_progress_callback=tool_progress_callback,
-            tool_start_callback=tool_start_callback,
-            tool_complete_callback=tool_complete_callback,
-            session_db=self._ensure_session_db(),
-            fallback_model=fallback_model,
-            reasoning_config=reasoning_config,
-            gateway_session_key=gateway_session_key,
-            request_overrides=agent_request_overrides or None,
+        max_iterations = _current_max_iterations()
+        fallback_model = (
+            None if confirmed_runtime_lock else GatewayRunner._load_fallback_model()
         )
+
+        agent_kwargs = {
+            "model": model,
+            **runtime_kwargs,
+            **_checkpoint_agent_kwargs(user_config),
+            "max_iterations": max_iterations,
+            "quiet_mode": True,
+            "verbose_logging": False,
+            "ephemeral_system_prompt": ephemeral_system_prompt or None,
+            "enabled_toolsets": enabled_toolsets,
+            "session_id": session_id,
+            "platform": platform_key,
+            "stream_delta_callback": stream_delta_callback,
+            "tool_progress_callback": tool_progress_callback,
+            "tool_start_callback": tool_start_callback,
+            "tool_complete_callback": tool_complete_callback,
+            "session_db": self._ensure_session_db(),
+            "fallback_model": fallback_model,
+            "reasoning_config": reasoning_config,
+            "gateway_session_key": gateway_session_key,
+            "request_overrides": agent_request_overrides or None,
+        }
+        if request_service_tier is not _REQUEST_OPTION_MISSING:
+            agent_kwargs["service_tier"] = request_service_tier
+
+        agent = AIAgent(**agent_kwargs)
         if disable_tools:
             agent.tools = []
             agent.valid_tool_names = set()
             agent._skip_mcp_refresh = True
+        agent._hermes_api_runtime = {
+            "provider": runtime_kwargs.get("provider")
+            or getattr(agent, "provider", "")
+            or "",
+            "model": getattr(agent, "model", None) or model,
+            "route_source": (
+                "session_model_lock"
+                if confirmed_runtime_lock
+                else "session_model_override"
+                if session_override
+                else "raw_request"
+                if route or request_model or request_provider
+                else "global"
+            ),
+        }
         agent.runtime_auxiliary_task_configs = runtime_auxiliary_task_configs
         agent.runtime_supports_vision = runtime_supports_vision
+        from gateway.session_context import get_session_env
+
+        extension_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
+        if extension_turn_id:
+            try:
+                agent._zettlab_active_turn_id = extension_turn_id
+            except Exception:
+                logger.debug(
+                    "[zet_agent] failed to bind agent turn identity",
+                    exc_info=True,
+                )
 
         stream_q = self._sniff_stream_q(
             tool_start_callback,
@@ -1928,6 +2999,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
                 self._sniff_warned = True
             return agent
+
+        interaction_queue_key = (
+            self._interaction_queue_key(session_id)
+            if session_id
+            else (gateway_session_key or "")
+        )
 
         # 1. Reasoning: late-bind on the agent (AIAgent reads
         # ``self.reasoning_callback`` at runtime).
@@ -1953,6 +3030,7 @@ class ZetAgentAdapter(APIServerAdapter):
             agent.status_callback = self._make_status_cb(
                 stream_q,
                 getattr(agent, "status_callback", None),
+                interaction_queue_key=interaction_queue_key,
             )
         except Exception:
             logger.warning("[zet_agent] failed to attach status_callback", exc_info=True)
@@ -1962,7 +3040,13 @@ class ZetAgentAdapter(APIServerAdapter):
         # it is just a closure allocation.
         if session_id:
             try:
-                agent.clarify_callback = self._make_clarify_cb(stream_q, session_id)
+                agent.clarify_callback = self._make_clarify_cb(
+                    stream_q,
+                    session_id,
+                    interaction_queue_key,
+                    agent,
+                    bound_turn_id=extension_turn_id,
+                )
             except Exception:
                 logger.warning("[zet_agent] failed to attach clarify_callback", exc_info=True)
 
@@ -2008,9 +3092,30 @@ class ZetAgentAdapter(APIServerAdapter):
         if session_id:
             try:
                 from tools.approval import register_gateway_notify
-                register_gateway_notify(session_id, self._make_approval_cb(stream_q, session_id))
+                register_gateway_notify(
+                    interaction_queue_key,
+                    self._make_approval_cb(
+                        stream_q,
+                        session_id,
+                        interaction_queue_key,
+                        agent,
+                        bound_turn_id=extension_turn_id,
+                    ),
+                )
                 with self._session_lock:
-                    self._approval_session_ids.add(session_id)
+                    self._approval_session_ids.add(interaction_queue_key)
+                with self._pending_lock:
+                    approval_keys = getattr(
+                        self,
+                        "_approval_session_keys",
+                        None,
+                    )
+                    if approval_keys is None:
+                        approval_keys = {}
+                        self._approval_session_keys = approval_keys
+                    approval_keys[self._active_turn_key(session_id)] = (
+                        interaction_queue_key
+                    )
             except Exception:
                 logger.warning("[zet_agent] failed to register approval notify", exc_info=True)
 
@@ -2031,29 +3136,72 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_complete_callback=None,
         agent_ref=None,
         gateway_session_key: Optional[str] = None,
+        requested_model: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
+        session_model: Optional[str] = None,
+        requested_runtime: Optional[Dict[str, Any]] = None,
+        route_source: str = "global",
+        confirmed_runtime_lock: bool = False,
         response_mode: Optional[str] = None,
         plan_ack: Optional[Dict[str, Any]] = None,
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
+        business_execution_token: Optional[str] = None,
+        current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
+        trusted_user_message: Any = None,
+        trusted_skill_slug: str = "",
     ):
-        """Wrap base ``_run_agent`` to bind the session-scoped env
-        vars hermes' approval/clarify gate reads at runtime.
+        """Wrap base ``_run_agent`` to bind the App and interaction scopes.
 
-        ``HERMES_SESSION_KEY`` keys the per-session approval queue so
-        that the notify callback we registered in ``_create_agent``
-        is found when the agent calls ``check_all_command_guards``.
-        ``HERMES_EXEC_ASK`` flips the approval gate from "skip" to
-        "block-and-prompt" outside CLI/gateway sessions.
+        ``gateway_session_key`` is the stable external App session key used by
+        managed tools such as the desktop-browser router. Approval/clarify uses
+        a separate profile-scoped interaction key, bound through approval's
+        dedicated ContextVar, so identical lineage session IDs in two profiles
+        cannot share an interaction queue. ``HERMES_EXEC_ASK`` flips the
+        approval gate from "skip" to "block-and-prompt" outside CLI/gateway
+        sessions.
 
-        Both vars are saved and restored around the call so concurrent
-        chat.completions requests do not leak each other's session key.
-        Process-global env is not strictly safe under concurrency, but
-        webui uses the same pattern (api/streaming.py) and the
-        contention window is short enough in practice.
+        The App/turn flags are bound through gateway.session_context by the
+        subclass ``_bind_api_server_session`` chokepoint. The interaction key
+        below is bound through approval's dedicated ContextVar. Neither scope
+        is mirrored into process-global ``os.environ`` because HTTP turns overlap.
         """
+        # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
+        # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
+        # 轮 _current_turn_id 做精确收尾——否则空 turn_id 收不了尾，写入轮的
+        # pin 只能等服务端 TTL（Codex review P1）。
+        if agent_ref is None:
+            agent_ref = [None]
+
+        if (
+            business_execution_token
+            and not gateway_sensitive_process_boundary_ready()
+        ):
+            raise PermissionError(
+                "gateway process memory boundary is unavailable"
+            )
+
+        ack_status = str((plan_ack or {}).get("status", "") or "").strip().lower()
+        ack_turn_id = str((plan_ack or {}).get("turn_id", "") or "").strip()
+        ack_revision_requested = ""
+        if ack_status not in {"confirmed", "cancelled"}:
+            ack_status = ""
+            ack_turn_id = ""
+        else:
+            ack_revision_requested = (
+                "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
+            )
+        scoped_business_execution_token = str(business_execution_token or "")
+        if ack_status == "cancelled" or (ack_status and not ack_turn_id):
+            # Legacy receipts remain visible to released clients, but cannot
+            # carry the newer turn-bound side-effect capability. Cancellation
+            # similarly preserves the receipt while revoking execution.
+            scoped_business_execution_token = ""
+
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
 
@@ -2141,11 +3289,55 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] model-identity note hook failed", exc_info=True)
 
-        old_session_key = os.environ.get("HERMES_SESSION_KEY")
-        old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
-        if session_id:
-            os.environ["HERMES_SESSION_KEY"] = session_id
-        os.environ.setdefault("HERMES_EXEC_ASK", "1")
+        from gateway.session_context import (
+            clear_turn_vars,
+            pop_zettlab_turn_title,
+            push_zettlab_turn_title,
+            set_turn_vars,
+            summarize_turn_title,
+        )
+
+        turn_context_tokens = set_turn_vars(
+            turn_id=str(turn_id or ""),
+            plan_ack_status=ack_status,
+            plan_ack_turn_id=ack_turn_id,
+            plan_ack_revision_requested=ack_revision_requested,
+            business_execution_token=scoped_business_execution_token,
+        )
+        # This turn's ledger card title (X-Task-Title). Bound here, before the
+        # base adapter's copy_context() hands the request to its executor, so
+        # every model call of the turn stamps the same title. Synthetic
+        # [ZETTLAB:...] turns are protocol traffic, not something a user typed —
+        # they carry no title, exactly like the auto-title path skips them.
+        # Prefer the user-authored task text: for skill invocations
+        # ``user_message`` is the expanded activation boilerplate, and
+        # ``trusted_user_message`` is what the user actually asked. Bind only
+        # when this turn got a per-turn ledger key — without a turn_id the card
+        # stays session-scoped, and a per-turn title would just retitle that one
+        # card to whichever turn ran last.
+        # A skill invoked with no user instruction leaves trusted_user_message
+        # an empty str — that yields an empty title (header omitted), which is
+        # still better than the expanded boilerplate. Only a non-str (callers
+        # that don't thread the field) falls back to the raw message.
+        title_source = (
+            self._title_user_message(trusted_user_message)
+            if isinstance(trusted_user_message, str)
+            else title_user_message
+        )
+        turn_title_token = push_zettlab_turn_title(
+            ""
+            if not str(turn_id or "").strip() or title_source.startswith("[ZETTLAB:")
+            else summarize_turn_title(title_source)
+        )
+        interaction_queue_key = (
+            self._interaction_queue_key(session_id) if session_id else gateway_session_key
+        )
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        approval_session_token = set_current_session_key(interaction_queue_key or "")
 
         try:
             result = await super()._run_agent(
@@ -2159,13 +3351,24 @@ class ZetAgentAdapter(APIServerAdapter):
                 tool_complete_callback=tool_complete_callback,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                requested_model=requested_model,
+                requested_provider=requested_provider,
+                model_options=model_options,
                 route=route,
+                session_model=session_model,
+                requested_runtime=requested_runtime,
+                route_source=route_source,
+                confirmed_runtime_lock=confirmed_runtime_lock,
                 response_mode=response_mode,
                 plan_ack=plan_ack,
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
+                business_execution_token=scoped_business_execution_token,
+                current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
+                trusted_user_message=trusted_user_message,
+                trusted_skill_slug=trusted_skill_slug,
             )
             # Early-return steer salvage: many conversation_loop retry/error
             # paths return without running finalize_turn, so the closing
@@ -2305,6 +3508,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         stream_q=stream_q,
                         agent_ref=agent_ref,
                         gateway_session_key=gateway_session_key,
+                        turn_id=turn_id,
                     )
                 except Exception:
                     logger.debug("[zet_agent] native auto-title hook failed", exc_info=True)
@@ -2319,14 +3523,46 @@ class ZetAgentAdapter(APIServerAdapter):
                         "[zet_agent] failed to reset attachment emitter",
                         exc_info=True,
                     )
-            if old_session_key is None:
-                os.environ.pop("HERMES_SESSION_KEY", None)
-            else:
-                os.environ["HERMES_SESSION_KEY"] = old_session_key
-            if old_exec_ask is None:
-                os.environ.pop("HERMES_EXEC_ASK", None)
-            else:
-                os.environ["HERMES_EXEC_ASK"] = old_exec_ask
+            # Zettlab file-change protection: release this turn's protection
+            # snapshot pin.  This lives in `finally` because several
+            # run_conversation error/early-return paths never reach
+            # finalize_turn; reporting is idempotent and a no-op when the turn
+            # never took a protection snapshot.  A missed report is not fatal
+            # either — the pin carries a TTL and a periodic reconciler.
+            try:
+                import asyncio as _asyncio
+                import sys as _sys
+
+                from tools.zettlab_snapshot_guard import finish_turn
+
+                _exc_type = _sys.exc_info()[0]
+                # 断流取消：base writer 先 interrupt() 再 cancel()，但
+                # run_conversation 跑在 executor 线程里，取消这个 asyncio
+                # wrapper 不会立刻停住它——此刻解 pin，恢复点的保护窗口会早于
+                # 前台 terminal / execute_code 的真实写入结束（Codex review
+                # P1）。取消路径一律**不收尾**，把 pin 留给服务端 TTL +
+                # reconcile 自愈：晚一点解 pin 是安全方向，早解不是。
+                if _exc_type is not None and issubclass(_exc_type, _asyncio.CancelledError):
+                    logger.debug(
+                        "[zet_agent] turn cancelled; leaving the protection pin to the server TTL"
+                    )
+                else:
+                    # guard 按 agent 运行时的 _current_turn_id 键控轮状态（与工具
+                    # dispatch 传下去的是同一个值）；并发轮时必须指名收自己的轮。
+                    guard_turn = ""
+                    if agent_ref and agent_ref[0] is not None:
+                        guard_turn = str(getattr(agent_ref[0], "_current_turn_id", "") or "")
+                    finish_turn(
+                        "failed" if _exc_type is not None else "completed",
+                        turn_id=guard_turn,
+                    )
+            except Exception:
+                logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
+            try:
+                reset_current_session_key(approval_session_token)
+            finally:
+                clear_turn_vars(turn_context_tokens)
+                pop_zettlab_turn_title(turn_title_token)
 
     def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
         """Return the model this session will actually use this turn: the
@@ -2334,13 +3570,9 @@ class ZetAgentAdapter(APIServerAdapter):
         default. Mirrors the model resolution in ``_create_agent`` so the
         open-time identity check compares against what the agent really runs.
         """
-        gw = getattr(self, "gateway_runner", None)
         key = gateway_session_key or session_id
-        if gw is not None and key:
-            try:
-                override = getattr(gw, "_session_model_overrides", {}).get(key)
-            except Exception:
-                override = None
+        if key:
+            override = self._session_model_override_for(key)
             if override and override.get("model"):
                 return override["model"]
         try:
@@ -2361,24 +3593,65 @@ class ZetAgentAdapter(APIServerAdapter):
                     self._seen_models_lock = lk
         return lk
 
+    @staticmethod
+    def _seen_models_home_key() -> str:
+        from hermes_constants import get_hermes_home
+
+        return os.path.abspath(os.fspath(get_hermes_home()))
+
     def _ensure_seen_models(self) -> "OrderedDict[str, str]":
-        """Lazily load (once) the per-session last-seen model map. Call under _seen_lock()."""
-        if not getattr(self, "_seen_loaded", False):
-            try:
-                from gateway.session_seen_models import load_seen_models
-                self._seen_models = OrderedDict(load_seen_models())
-            except Exception:
-                self._seen_models = OrderedDict()
-                logger.debug("[zet_agent] load_seen_models failed", exc_info=True)
-            self._seen_loaded = True
-        return self._seen_models
+        """Load the active profile's last-seen model map. Call under lock."""
+        home_key = self._seen_models_home_key()
+        caches = getattr(self, "_seen_models_by_home", None)
+        if caches is None:
+            caches = {}
+            self._seen_models_by_home = caches
+        seen = caches.get(home_key)
+        if seen is None:
+            # Compatibility for embedders/tests that seeded the former
+            # single-profile attributes before the first lookup.
+            if getattr(self, "_seen_loaded", False) and hasattr(self, "_seen_models"):
+                seen = OrderedDict(getattr(self, "_seen_models", {}))
+                self._seen_loaded = False
+            else:
+                try:
+                    from gateway.session_seen_models import load_seen_models, seen_path
+
+                    seen = OrderedDict(load_seen_models(seen_path(Path(home_key))))
+                except Exception:
+                    seen = OrderedDict()
+                    logger.debug("[zet_agent] load_seen_models failed", exc_info=True)
+            caches[home_key] = seen
+        self._seen_models = seen
+        return seen
 
     def _save_seen_models(self) -> None:
         try:
-            from gateway.session_seen_models import save_seen_models
-            save_seen_models(getattr(self, "_seen_models", {}))
+            from gateway.session_seen_models import save_seen_models, seen_path
+
+            home_key = self._seen_models_home_key()
+            seen = self._ensure_seen_models()
+            save_seen_models(seen, seen_path(Path(home_key)))
         except Exception:
             logger.debug("[zet_agent] save_seen_models failed", exc_info=True)
+
+    def _drop_profile_local_model_caches(self, profile_home: str) -> None:
+        """Release adapter-owned model metadata for one unloaded profile."""
+        if not profile_home:
+            return
+        home_key = os.path.abspath(os.path.expanduser(profile_home))
+        with self._seen_lock():
+            getattr(self, "_seen_models_by_home", {}).pop(home_key, None)
+        prefix = f"{home_key}|"
+        cache = getattr(self, "_last_resolved_model", None)
+        if cache is not None:
+            for key in list(cache.keys()):
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 2
+                    and key[0] == home_key
+                ) or str(key).startswith(prefix):
+                    cache.pop(key, None)
 
     @staticmethod
     def _extract_first_user_message(agent: Any) -> str:
@@ -2427,6 +3700,9 @@ class ZetAgentAdapter(APIServerAdapter):
         register helper always has a list to stash.
         """
         active_ref = agent_ref if agent_ref is not None else [None]
+        scoped_session_key = (
+            self._active_turn_key(session_id) if session_id else ""
+        )
         self._register_active_session_turn(session_id, active_ref, agent_task)
         try:
             return await super()._write_sse_chat_completion(
@@ -2442,39 +3718,1058 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         finally:
             self._clear_active_session_turn(session_id, active_ref, agent_task)
+            if scoped_session_key:
+                self._clear_approval_projections(scoped_session_key)
 
     # ------------------------------------------------------------------
     # HTTP respond handlers — wake blocked agent threads
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _interaction_payload_digest(kind: str, value: str) -> str:
+        """Digest the semantic response, stable across Python and Go."""
+        return hashlib.sha256(f"{kind}\0{value}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _durable_session_digest(queue_key: str) -> bytes:
+        return hashlib.sha256(queue_key.encode("utf-8")).digest()
+
+    @staticmethod
+    def _durable_source_digest(kind: str, interaction_id: str) -> bytes:
+        return hashlib.sha256(
+            f"{kind}\0{interaction_id}".encode("utf-8")
+        ).digest()
+
+    def _durable_pending_source_digests(
+        self, queue_key: str
+    ) -> set[bytes]:
+        lock = getattr(self, "_pending_lock", None)
+        if lock is None:
+            return set()
+        with lock:
+            return {
+                self._durable_source_digest(kind, interaction_id)
+                for kind, pending_by_session in (
+                    ("approval", self._pending_approval),
+                    ("clarify", self._pending_clarify),
+                )
+                for payload in pending_by_session.get(queue_key, [])
+                if (
+                    interaction_id := str(
+                        payload.get("interaction_id", "") or ""
+                    )
+                )
+            }
+
+    def _durable_evidence_digests_locked(self) -> set[bytes]:
+        """Return exact session digests that still forbid reclamation.
+
+        All raw scope keys stay in their existing bounded runtime structures;
+        the durable tombstone table sees only their digests.
+        """
+        protected = {
+            self._durable_session_digest(scope_key)
+            for receipt in self._interaction_deliveries.values()
+            if (scope_key := str(receipt.get("scope_key", "") or ""))
+        }
+
+        session_lock = getattr(self, "_session_run_lock", None)
+        active_tasks = getattr(self, "_active_session_tasks", {})
+        if session_lock is not None:
+            with session_lock:
+                task_items = list(active_tasks.items())
+            for scope_key, task in task_items:
+                try:
+                    task_live = task is not None and not bool(task.done())
+                except Exception:
+                    task_live = task is not None
+                if task_live:
+                    protected.add(self._durable_session_digest(scope_key))
+
+        clarify_lock = getattr(self, "_clarify_state_lock", None)
+        clarify_queues = getattr(self, "_clarify_queues", {})
+        if clarify_lock is not None:
+            with clarify_lock:
+                clarify_keys = [
+                    key for key, entries in clarify_queues.items() if entries
+                ]
+            protected.update(
+                self._durable_session_digest(key) for key in clarify_keys
+            )
+
+        pending_lock = getattr(self, "_pending_lock", None)
+        if pending_lock is not None:
+            with pending_lock:
+                pending_keys = {
+                    key
+                    for pending_by_session in (
+                        self._pending_approval,
+                        self._pending_clarify,
+                    )
+                    for key, payloads in pending_by_session.items()
+                    if payloads
+                }
+            protected.update(
+                self._durable_session_digest(key) for key in pending_keys
+            )
+        return protected
+
+    def _prune_durable_sessions_locked(
+        self, now: Optional[float] = None
+    ) -> None:
+        current = time.monotonic() if now is None else now
+        protected = self._durable_evidence_digests_locked()
+        ttl = max(0.0, float(INTERACTION_DURABLE_SESSION_TTL))
+        for digest, state in list(self._durable_session_digests.items()):
+            if state.get("sources") or digest in protected:
+                continue
+            last_active_value = state.get("last_active")
+            last_active = (
+                current
+                if last_active_value is None
+                else float(last_active_value)
+            )
+            if last_active + ttl > current:
+                continue
+            self._durable_session_digests.pop(digest, None)
+
+    def _mark_durable_session_locked(self, queue_key: str) -> bool:
+        now = time.monotonic()
+        self._prune_durable_sessions_locked(now)
+        digest = self._durable_session_digest(queue_key)
+        state = self._durable_session_digests.get(digest)
+        if state is not None:
+            state["last_active"] = now
+            self._durable_session_digests.move_to_end(digest)
+            return True
+        if len(self._durable_session_digests) >= INTERACTION_DURABLE_SESSION_CAP:
+            return False
+        sources = self._durable_pending_source_digests(queue_key)
+        source_count = int(getattr(self, "_durable_source_pin_count", 0) or 0)
+        if source_count + len(sources) > INTERACTION_PENDING_MIRROR_CAP:
+            return False
+        self._durable_session_digests[digest] = {
+            "last_active": now,
+            "sources": sources,
+        }
+        self._durable_source_pin_count = source_count + len(sources)
+        return True
+
+    def _unmark_durable_session_locked(self, queue_key: str) -> None:
+        state = self._durable_session_digests.pop(
+            self._durable_session_digest(queue_key), None
+        )
+        if state is not None:
+            self._durable_source_pin_count = max(
+                0,
+                int(getattr(self, "_durable_source_pin_count", 0) or 0)
+                - len(state.get("sources", ())),
+            )
+
+    def _is_durable_session_locked(self, queue_key: str) -> bool:
+        self._prune_durable_sessions_locked()
+        return self._durable_session_digest(queue_key) in (
+            self._durable_session_digests
+        )
+
+    def _pin_durable_session_source(
+        self, queue_key: str, kind: str, interaction_id: str
+    ) -> bool:
+        with self._delivery_lock:
+            return self._pin_durable_session_source_locked(
+                queue_key, kind, interaction_id
+            )
+
+    def _pin_durable_session_source_locked(
+        self, queue_key: str, kind: str, interaction_id: str
+    ) -> bool:
+        digest = self._durable_session_digest(queue_key)
+        state = self._durable_session_digests.get(digest)
+        if state is None:
+            return True
+        source = self._durable_source_digest(kind, interaction_id)
+        sources = state.setdefault("sources", set())
+        if source in sources:
+            return True
+        source_count = int(
+            getattr(self, "_durable_source_pin_count", 0) or 0
+        )
+        if source_count >= INTERACTION_PENDING_MIRROR_CAP:
+            return False
+        sources.add(source)
+        state["last_active"] = time.monotonic()
+        self._durable_source_pin_count = source_count + 1
+        self._durable_session_digests.move_to_end(digest)
+        return True
+
+    def _release_durable_session_source(
+        self, queue_key: str, kind: str, interaction_id: str
+    ) -> None:
+        with self._delivery_lock:
+            self._release_durable_session_source_locked(
+                queue_key, kind, interaction_id
+            )
+
+    def _release_durable_session_source_locked(
+        self, queue_key: str, kind: str, interaction_id: str
+    ) -> None:
+        digest = self._durable_session_digest(queue_key)
+        state = self._durable_session_digests.get(digest)
+        if state is None:
+            return
+        source = self._durable_source_digest(kind, interaction_id)
+        sources = state.setdefault("sources", set())
+        if source not in sources:
+            return
+        sources.discard(source)
+        self._durable_source_pin_count = max(
+            0,
+            int(getattr(self, "_durable_source_pin_count", 0) or 0) - 1,
+        )
+        state["last_active"] = time.monotonic()
+        self._durable_session_digests.move_to_end(digest)
+
+    @staticmethod
+    def _install_recovery_fence_locked(
+        receipt: Dict[str, Any],
+        state_revision: int,
+        wake_event: Optional[threading.Event] = None,
+    ) -> None:
+        """Install one idempotent bounded fence for an active revision."""
+        if receipt.get("_fence_id") is not None:
+            return
+        receipt["_fence_id"] = secrets.token_hex(16)
+        receipt["_fence_event"] = wake_event or threading.Event()
+        receipt["_fence_revision"] = state_revision
+        receipt["_fence_expires_at"] = (
+            time.monotonic() + INTERACTION_RECOVERY_FENCE_TTL
+        )
+        receipt["_fence_expires_at_ms"] = int(
+            (time.time() + INTERACTION_RECOVERY_FENCE_TTL) * 1000
+        )
+
+    @staticmethod
+    def _take_recovery_fence_locked(receipt: Dict[str, Any]):
+        event = receipt.pop("_fence_event", None)
+        receipt.pop("_fence_id", None)
+        receipt.pop("_fence_expires_at", None)
+        receipt.pop("_fence_expires_at_ms", None)
+        receipt.pop("_fence_revision", None)
+        return event
+
+    @classmethod
+    def _clear_recovery_fence_locked(cls, receipt: Dict[str, Any]) -> None:
+        event = cls._take_recovery_fence_locked(receipt)
+        if event is not None:
+            event.set()
+
+    def _expire_recovery_fences_locked(self, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else now
+        for receipt in self._interaction_deliveries.values():
+            expires_at = float(receipt.get("_fence_expires_at", 0.0) or 0.0)
+            if expires_at and expires_at <= current:
+                self._clear_recovery_fence_locked(receipt)
+
+    def _wait_for_recovery_fence(self, queue_key: str, turn_id: str) -> None:
+        """Hold creation of the next prompt while recovery commits locally."""
+        while True:
+            with self._delivery_lock:
+                now = time.monotonic()
+                self._expire_recovery_fences_locked(now)
+                fence_event = None
+                wait_seconds = 0.0
+                for receipt in self._interaction_deliveries.values():
+                    if (
+                        receipt.get("scope_key") == queue_key
+                        and receipt.get("turn_id") == turn_id
+                        and receipt.get("_fence_event") is not None
+                    ):
+                        fence_event = receipt["_fence_event"]
+                        wait_seconds = max(
+                            0.0,
+                            float(receipt.get("_fence_expires_at", now)) - now,
+                        )
+                        break
+            if fence_event is None:
+                return
+            fence_event.wait(timeout=wait_seconds or 0.001)
+
+    def _mark_older_deliveries_superseded(
+        self,
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> bool:
+        """Record a published generation and transfer older Goal ownership."""
+        with self._delivery_lock:
+            return self._commit_interaction_publication_locked(
+                queue_key, turn_id, interaction_generation
+            )
+
+    def _commit_interaction_publication_locked(
+        self,
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> bool:
+        self._expire_recovery_fences_locked()
+        watermark_key = queue_key, turn_id
+        if not self._ensure_published_turn_capacity_locked(watermark_key):
+            return False
+        provisional = self._provisional_interaction_generations.get(
+            watermark_key
+        )
+        if provisional is not None:
+            provisional.discard(interaction_generation)
+            if not provisional:
+                self._provisional_interaction_generations.pop(
+                    watermark_key, None
+                )
+        self._committed_interaction_generations[watermark_key] = max(
+            self._committed_interaction_generations.get(watermark_key, 0),
+            interaction_generation,
+        )
+        self._recompute_published_generation_locked(watermark_key)
+        for receipt in self._interaction_deliveries.values():
+            if (
+                receipt.get("scope_key") == queue_key
+                and receipt.get("turn_id") == turn_id
+                and receipt.get("finalized")
+                and int(receipt.get("interaction_generation", 0) or 0)
+                < interaction_generation
+            ):
+                receipt["_superseded"] = True
+                # A standalone TTL remains fail-closed. Once a real newer
+                # source prompt is published, that prompt owns the Goal
+                # protection and the stale receipt must not pin it forever.
+                receipt.pop("_goal_resolve_deferred", None)
+                self._refresh_delivery_state_locked(receipt)
+        return True
+
+    def _drop_published_turn_locked(
+        self, watermark_key: tuple[str, str]
+    ) -> None:
+        self._published_interaction_generations.pop(watermark_key, None)
+        self._committed_interaction_generations.pop(watermark_key, None)
+        self._provisional_interaction_generations.pop(watermark_key, None)
+
+    def _evict_terminal_published_turn_locked(
+        self, watermark_key: tuple[str, str]
+    ) -> bool:
+        if self._has_later_pending_for_turn(
+            watermark_key[0], watermark_key[1], -1
+        ):
+            return False
+        matching = [
+            (receipt_key, receipt)
+            for receipt_key, receipt in self._interaction_deliveries.items()
+            if receipt.get("scope_key") == watermark_key[0]
+            and receipt.get("turn_id") == watermark_key[1]
+        ]
+        if any(
+            not receipt.get("finalized")
+            or self._refresh_delivery_state_locked(receipt) != "terminal"
+            for _, receipt in matching
+        ):
+            return False
+        for receipt_key, receipt in matching:
+            self._clear_recovery_fence_locked(receipt)
+            self._release_prepared_raw_locked(receipt)
+            self._interaction_deliveries.pop(receipt_key, None)
+        self._drop_published_turn_locked(watermark_key)
+        return True
+
+    def _ensure_published_turn_capacity_locked(
+        self, watermark_key: tuple[str, str]
+    ) -> bool:
+        self._prune_interaction_deliveries_locked()
+        if watermark_key in self._published_interaction_generations:
+            return True
+        while (
+            len(self._published_interaction_generations)
+            >= INTERACTION_PUBLISHED_TURN_CAP
+        ):
+            evicted = False
+            for key in list(self._published_interaction_generations):
+                if self._provisional_interaction_generations.get(key):
+                    continue
+                if self._evict_terminal_published_turn_locked(key):
+                    evicted = True
+                    break
+            if not evicted:
+                return False
+        self._published_interaction_generations[watermark_key] = 0
+        self._committed_interaction_generations.setdefault(watermark_key, 0)
+        return True
+
+    def _recompute_published_generation_locked(
+        self, watermark_key: tuple[str, str]
+    ) -> int:
+        committed = int(
+            self._committed_interaction_generations.get(watermark_key, 0)
+            or 0
+        )
+        provisional = self._provisional_interaction_generations.get(
+            watermark_key, set()
+        )
+        effective = max([committed, *provisional])
+        self._published_interaction_generations[watermark_key] = effective
+        self._published_interaction_generations.move_to_end(watermark_key)
+        return effective
+
+    def _begin_interaction_publication(
+        self,
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> bool:
+        """Make a generation effective before its SSE event is observable."""
+        with self._delivery_lock:
+            return self._begin_interaction_publication_locked(
+                queue_key, turn_id, interaction_generation
+            )
+
+    def _begin_interaction_publication_locked(
+        self,
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> bool:
+        watermark_key = queue_key, turn_id
+        if not self._ensure_published_turn_capacity_locked(watermark_key):
+            return False
+        self._provisional_interaction_generations.setdefault(
+            watermark_key, set()
+        ).add(interaction_generation)
+        self._recompute_published_generation_locked(watermark_key)
+        return True
+
+    def _rollback_interaction_publication(
+        self,
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> None:
+        """Remove one failed provisional without clobbering concurrent newer work."""
+        with self._delivery_lock:
+            self._rollback_interaction_publication_locked(
+                queue_key, turn_id, interaction_generation
+            )
+
+    def _rollback_interaction_publication_locked(
+        self,
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> None:
+        key = queue_key, turn_id
+        provisional = self._provisional_interaction_generations.get(key)
+        if provisional is not None:
+            provisional.discard(interaction_generation)
+            if not provisional:
+                self._provisional_interaction_generations.pop(key, None)
+        effective = self._recompute_published_generation_locked(key)
+        if effective == 0 and not any(
+            receipt.get("scope_key") == queue_key
+            and receipt.get("turn_id") == turn_id
+            for receipt in self._interaction_deliveries.values()
+        ):
+            self._drop_published_turn_locked(key)
+
+    def _publish_interaction_event(
+        self,
+        stream_q: Any,
+        payload: Dict[str, Any],
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> tuple[bool, Optional[Exception]]:
+        """Publish one prompt as an atomic delivery-state transition.
+
+        Production uses an unbounded ``queue.Queue``, so ``put`` is a short,
+        non-blocking handoff. Keeping the delivery lock across reserve, push,
+        and commit prevents a finalizer from observing a provisional prompt
+        that can still roll back after a failed push.
+        """
+        with self._delivery_lock:
+            if not self._begin_interaction_publication_locked(
+                queue_key, turn_id, interaction_generation
+            ):
+                return False, None
+            try:
+                stream_q.put(("__tool_progress__", payload))
+            except Exception as exc:
+                self._rollback_interaction_publication_locked(
+                    queue_key, turn_id, interaction_generation
+                )
+                return True, exc
+            committed = self._commit_interaction_publication_locked(
+                queue_key, turn_id, interaction_generation
+            )
+            if not committed:  # the successful reservation owns this slot
+                self._rollback_interaction_publication_locked(
+                    queue_key, turn_id, interaction_generation
+                )
+                return False, None
+            return True, None
+
+    def _prune_interaction_deliveries_locked(self) -> None:
+        now = time.monotonic()
+        self._expire_recovery_fences_locked(now)
+        for key, receipt in list(self._interaction_deliveries.items()):
+            expires_at = (
+                receipt["expires_at"]
+                if receipt.get("finalized")
+                else receipt["prepare_expires_at"]
+            )
+            if expires_at <= now:
+                self._clear_recovery_fence_locked(receipt)
+                self._release_prepared_raw_locked(receipt)
+                self._interaction_deliveries.pop(key, None)
+        self._prune_durable_sessions_locked(now)
+
+    def _release_prepared_raw_locked(self, receipt: Dict[str, Any]) -> str:
+        """Remove private raw response data and release its byte budget."""
+        raw_response = str(receipt.pop("_raw_response", "") or "")
+        raw_bytes = int(receipt.pop("_raw_bytes", 0) or 0)
+        self._prepared_raw_bytes = max(0, self._prepared_raw_bytes - raw_bytes)
+        return raw_response
+
+    def _delivery_key(self, session_id: str, delivery_id: str) -> tuple[str, str]:
+        return self._active_turn_key(session_id), delivery_id
+
+    def _delivery_binding_matches(
+        self,
+        receipt: Dict[str, Any],
+        *,
+        session_id: str,
+        kind: str,
+        interaction_id: str,
+        payload_digest: Optional[str] = None,
+    ) -> bool:
+        return (
+            receipt.get("scope_key") == self._interaction_queue_key(session_id)
+            and receipt.get("kind") == kind
+            and receipt.get("interaction_id") == interaction_id
+            and (
+                payload_digest is None
+                or receipt.get("payload_digest") == payload_digest
+            )
+        )
+
+    def _store_prepared_delivery_locked(self, receipt: Dict[str, Any]) -> bool:
+        """Store without exceeding the hard cap; never evict a live lease."""
+        raw_bytes = int(receipt.get("_raw_bytes", 0) or 0)
+        if self._prepared_raw_bytes + raw_bytes > INTERACTION_PREPARED_RAW_BUDGET:
+            return False
+        while len(self._interaction_deliveries) >= INTERACTION_RECEIPT_CAP:
+            terminal_key = next(
+                (
+                    key
+                    for key, existing in self._interaction_deliveries.items()
+                    if existing.get("finalized")
+                    and self._refresh_delivery_state_locked(existing) == "terminal"
+                ),
+                None,
+            )
+            if terminal_key is None:
+                return False
+            terminal_receipt = self._interaction_deliveries.pop(terminal_key, None)
+            if terminal_receipt is not None:
+                self._release_prepared_raw_locked(terminal_receipt)
+        key = receipt["scope_key"], receipt["delivery_id"]
+        receipt.setdefault("interaction_generation", 0)
+        receipt.setdefault("state_revision", 1)
+        receipt.setdefault("_state", "prepared")
+        receipt.setdefault("_superseded", False)
+        self._interaction_deliveries[key] = receipt
+        self._prepared_raw_bytes += raw_bytes
+        return True
+
+    @staticmethod
+    def _pending_mirror_size(payload: Dict[str, Any]) -> int:
+        try:
+            return len(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+        except Exception:
+            return INTERACTION_PENDING_MIRROR_BYTE_BUDGET + 1
+
+    def _pending_source_contains(
+        self, kind: str, queue_key: str, interaction_id: str
+    ) -> bool:
+        if kind == "approval":
+            try:
+                from tools.approval import list_gateway_approvals
+
+                return any(
+                    str(item.get("interaction_id", "")) == interaction_id
+                    for item in list_gateway_approvals(queue_key)
+                )
+            except Exception:
+                return False
+        with self._clarify_state_lock:
+            return any(
+                entry.interaction_id == interaction_id
+                for entry in self._clarify_queues.get(queue_key, [])
+            )
+
+    def _remove_pending_mirror_locked(
+        self, meta_key: tuple[str, str, str]
+    ) -> None:
+        kind, queue_key, interaction_id = meta_key
+        meta = self._pending_mirror_meta.pop(meta_key, None)
+        if meta is not None:
+            self._pending_mirror_bytes = max(
+                0, self._pending_mirror_bytes - int(meta[0])
+            )
+        pending_by_session = (
+            self._pending_approval
+            if kind == "approval"
+            else self._pending_clarify
+        )
+        pending = pending_by_session.get(queue_key, [])
+        pending[:] = [
+            payload
+            for payload in pending
+            if str(payload.get("interaction_id", "")) != interaction_id
+        ]
+        if not pending:
+            pending_by_session.pop(queue_key, None)
+
+    def _prune_pending_mirrors(self, *, include_stale_lru: bool = False) -> None:
+        now = time.monotonic()
+        with self._pending_lock:
+            snapshot = list(self._pending_mirror_meta.items())
+        removable = []
+        for meta_key, (_, expires_at) in snapshot:
+            if not include_stale_lru and expires_at > now:
+                continue
+            if not self._pending_source_contains(*meta_key):
+                removable.append(meta_key)
+        if not removable:
+            return
+        with self._pending_lock:
+            for meta_key in removable:
+                self._remove_pending_mirror_locked(meta_key)
+
+    def _store_pending_interaction(
+        self,
+        kind: str,
+        queue_key: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Store one reconnect mirror without evicting a live source card."""
+        interaction_id = str(payload.get("interaction_id", "") or "")
+        if not interaction_id:
+            return False
+        size = self._pending_mirror_size(payload)
+        if size > INTERACTION_PENDING_MIRROR_BYTE_BUDGET:
+            return False
+        self._prune_pending_mirrors()
+        meta_key = kind, queue_key, interaction_id
+
+        def _has_capacity() -> bool:
+            existing = self._pending_mirror_meta.get(meta_key)
+            existing_size = int(existing[0]) if existing else 0
+            return (
+                len(self._pending_mirror_meta) - (1 if existing else 0) + 1
+                <= INTERACTION_PENDING_MIRROR_CAP
+                and self._pending_mirror_bytes - existing_size + size
+                <= INTERACTION_PENDING_MIRROR_BYTE_BUDGET
+            )
+
+        with self._pending_lock:
+            has_capacity = _has_capacity()
+        if not has_capacity:
+            self._prune_pending_mirrors(include_stale_lru=True)
+        with self._pending_lock:
+            if not _has_capacity():
+                return False
+            self._remove_pending_mirror_locked(meta_key)
+            pending_by_session = (
+                self._pending_approval
+                if kind == "approval"
+                else self._pending_clarify
+            )
+            pending_by_session.setdefault(queue_key, []).append(payload)
+            self._pending_mirror_meta[meta_key] = (
+                size,
+                time.monotonic() + INTERACTION_PENDING_MIRROR_TTL,
+            )
+            self._pending_mirror_meta.move_to_end(meta_key)
+            self._pending_mirror_bytes += size
+            return True
+
+    def _remove_pending_interaction(
+        self,
+        kind: str,
+        queue_key: str,
+        interaction_id: str,
+    ) -> None:
+        with self._pending_lock:
+            self._remove_pending_mirror_locked(
+                (kind, queue_key, interaction_id)
+            )
+
+    def _clear_pending_queue(self, queue_key: str) -> None:
+        with self._pending_lock:
+            for meta_key in list(self._pending_mirror_meta):
+                if meta_key[1] == queue_key:
+                    self._remove_pending_mirror_locked(meta_key)
+            self._pending_clarify.pop(queue_key, None)
+            self._pending_approval.pop(queue_key, None)
+
+    def _has_later_pending_for_turn(
+        self,
+        queue_key: str,
+        turn_id: str,
+        interaction_generation: int,
+    ) -> bool:
+        """Cross-check adapter mirrors against the live source FIFOs.
+
+        The approval source entry is enqueued before its notify callback. A
+        recovery fence deliberately blocks that callback, so source-only
+        entries are not visible yet. Conversely, a timeout can remove the
+        source while leaving a stale mirror. Requiring both sides closes both
+        races without an unbounded tombstone map.
+        """
+        if not turn_id:
+            return False
+        try:
+            from tools.approval import list_gateway_approvals
+
+            approval_source = {
+                str(item.get("interaction_id", "")): int(
+                    item.get("interaction_generation", 0) or 0
+                )
+                for item in list_gateway_approvals(queue_key)
+            }
+        except Exception:
+            approval_source = {}
+        with self._clarify_state_lock:
+            clarify_source = {
+                entry.interaction_id: int(entry.interaction_generation or 0)
+                for entry in self._clarify_queues.get(queue_key, [])
+            }
+        with self._pending_lock:
+            for payload in list(self._pending_approval.get(queue_key, [])):
+                interaction_id = str(payload.get("interaction_id", ""))
+                if interaction_id not in approval_source:
+                    self._remove_pending_mirror_locked(
+                        ("approval", queue_key, interaction_id)
+                    )
+            for payload in list(self._pending_clarify.get(queue_key, [])):
+                interaction_id = str(payload.get("interaction_id", ""))
+                if interaction_id not in clarify_source:
+                    self._remove_pending_mirror_locked(
+                        ("clarify", queue_key, interaction_id)
+                    )
+            approval_mirror = self._pending_approval.get(queue_key, [])
+            clarify_mirror = self._pending_clarify.get(queue_key, [])
+            payloads = (
+                [(payload, approval_source) for payload in approval_mirror]
+                + [(payload, clarify_source) for payload in clarify_mirror]
+            )
+        for payload, source in payloads:
+            interaction_id = str(payload.get("interaction_id", ""))
+            generation = int(payload.get("interaction_generation", 0) or 0)
+            if (
+                payload.get("turn_id") == turn_id
+                and generation > interaction_generation
+                and source.get(interaction_id) == generation
+            ):
+                return True
+        return False
+
+    def _compute_delivery_state_locked(self, receipt: Dict[str, Any]) -> str:
+        if not receipt.get("finalized"):
+            return "prepared"
+        turn_id = str(receipt.get("turn_id", ""))
+        key = str(receipt.get("scope_key", ""))
+        with self._session_run_lock:
+            task = self._active_session_tasks.get(key)
+            current_turn_id = self._active_session_turn_ids.get(key) or ""
+        try:
+            task_live = task is not None and not bool(task.done())
+        except Exception:
+            task_live = False
+        if not task_live or current_turn_id != turn_id:
+            return "terminal"
+        generation = int(receipt.get("interaction_generation", 0) or 0)
+        max_published = int(
+            self._published_interaction_generations.get((key, turn_id), 0)
+            or 0
+        )
+        if max_published > generation:
+            if self._has_later_pending_for_turn(key, turn_id, generation):
+                receipt["_superseded"] = True
+                return "pending"
+            receipt["_superseded"] = True
+            return "terminal"
+        if self._has_later_pending_for_turn(key, turn_id, generation):
+            receipt["_superseded"] = True
+            return "pending"
+        if receipt.get("_superseded"):
+            return "terminal"
+        return "active"
+
+    def _refresh_delivery_state_locked(self, receipt: Dict[str, Any]) -> str:
+        previous = str(receipt.get("_state", "prepared"))
+        current = self._compute_delivery_state_locked(receipt)
+        # Once a newer interaction was observed, an old receipt can only move
+        # from pending to terminal; it must never dynamically become active.
+        if previous == "terminal":
+            current = "terminal"
+        elif previous == "pending" and current == "active":
+            current = "terminal"
+        if current != previous:
+            receipt["_state"] = current
+            receipt["state_revision"] = int(receipt.get("state_revision", 1)) + 1
+        else:
+            receipt.setdefault("_state", current)
+            receipt.setdefault("state_revision", 1)
+        if current != "active" and receipt.get("_fence_event") is not None:
+            self._clear_recovery_fence_locked(receipt)
+        return current
+
+    def _public_delivery_receipt(
+        self,
+        receipt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        state = self._refresh_delivery_state_locked(receipt)
+        payload = {
+            "resolved": 1 if receipt.get("finalized") else 0,
+            "delivery_id": receipt["delivery_id"],
+            "interaction_id": receipt["interaction_id"],
+            "session_id": receipt["session_id"],
+            "kind": receipt["kind"],
+            "turn_id": receipt["turn_id"],
+            "interaction_generation": int(
+                receipt.get("interaction_generation", 0) or 0
+            ),
+            "state_revision": int(receipt.get("state_revision", 1) or 1),
+            "payload_digest": receipt["payload_digest"],
+            "state": state,
+            "prepared_at_ms": receipt["prepared_at_ms"],
+        }
+        if receipt.get("accepted_at_ms") is not None:
+            payload["accepted_at_ms"] = receipt["accepted_at_ms"]
+        if receipt.get("_fence_id") is not None:
+            payload["fence_id"] = receipt["_fence_id"]
+            payload["fence_expires_at_ms"] = receipt["_fence_expires_at_ms"]
+        return payload
+
+    @staticmethod
+    def _delivery_protocol_fields(body: Dict[str, Any]):
+        delivery_id = str(body.get("delivery_id", "") or "").strip()
+        interaction_id = str(body.get("interaction_id", "") or "").strip()
+        phase = str(body.get("phase", "") or "").strip().lower()
+        if not delivery_id and not interaction_id and not phase:
+            return None, None
+        if (
+            not delivery_id
+            or not interaction_id
+            or phase not in {"prepare", "finalize"}
+            or len(delivery_id) > 128
+            or len(interaction_id) > 128
+        ):
+            return None, web.json_response(
+                _openai_error(
+                    "delivery_id, interaction_id and phase=prepare|finalize are required"
+                ),
+                status=400,
+            )
+        return (delivery_id, interaction_id, phase), None
+
+    @staticmethod
+    def _delivery_conflict(message: str, code: str = "interaction_delivery_conflict"):
+        return web.json_response(_openai_error(message, code=code), status=409)
+
+    async def _handle_interaction_delivery(self, request: "web.Request") -> "web.Response":
+        """Return a bounded process-local delivery receipt for recovery."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info.get("session_id", "")
+        delivery_id = request.match_info.get("delivery_id", "")
+        with self._delivery_lock:
+            self._prune_interaction_deliveries_locked()
+            receipt = self._interaction_deliveries.get(
+                self._delivery_key(session_id, delivery_id)
+            )
+            if (
+                receipt is None
+                or receipt.get("scope_key")
+                != self._interaction_queue_key(session_id)
+            ):
+                return web.json_response(
+                    _openai_error(
+                        f"No interaction delivery {delivery_id} for session {session_id}",
+                        code="interaction_delivery_not_found",
+                    ),
+                    status=404,
+                )
+            self._interaction_deliveries.move_to_end(
+                self._delivery_key(session_id, delivery_id)
+            )
+            payload = self._public_delivery_receipt(receipt)
+        return web.json_response(payload)
+
+    async def _handle_recovery_fence(self, request: "web.Request") -> "web.Response":
+        """Claim or release a short CAS fence around local recovery commit."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info.get("session_id", "")
+        delivery_id = request.match_info.get("delivery_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Invalid JSON body"), status=400)
+        action = str(body.get("action", "") or "").strip().lower()
+        expected_revision = body.get("expected_state_revision")
+        if (
+            action not in {"claim", "ack"}
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            return web.json_response(
+                _openai_error(
+                    "action=claim|ack and positive expected_state_revision are required"
+                ),
+                status=400,
+            )
+        fence_id = str(body.get("fence_id", "") or "").strip()
+        if action == "ack" and (not fence_id or len(fence_id) > 128):
+            return web.json_response(
+                _openai_error("fence_id is required during ack"), status=400
+            )
+
+        key = self._delivery_key(session_id, delivery_id)
+        wake_event = None
+        resolve_deferred_goal = False
+        response = None
+        with self._delivery_lock:
+            self._prune_interaction_deliveries_locked()
+            receipt = self._interaction_deliveries.get(key)
+            if (
+                receipt is None
+                or receipt.get("scope_key")
+                != self._interaction_queue_key(session_id)
+            ):
+                return web.json_response(
+                    _openai_error(
+                        f"No interaction delivery {delivery_id} for session {session_id}",
+                        code="interaction_delivery_not_found",
+                    ),
+                    status=404,
+                )
+            state = self._refresh_delivery_state_locked(receipt)
+            revision = int(receipt.get("state_revision", 1) or 1)
+
+            if action == "claim":
+                if state != "active" or revision != expected_revision:
+                    return self._delivery_conflict(
+                        "interaction delivery is no longer the expected active revision",
+                        code="interaction_recovery_stale",
+                    )
+                if receipt.get("_fence_id") is None:
+                    self._install_recovery_fence_locked(receipt, revision)
+                elif int(receipt.get("_fence_revision", 0) or 0) != revision:
+                    return self._delivery_conflict(
+                        "interaction recovery fence revision changed",
+                        code="interaction_recovery_stale",
+                    )
+                self._interaction_deliveries.move_to_end(key)
+                return web.json_response(self._public_delivery_receipt(receipt))
+
+            if (
+                receipt.get("_fence_id") != fence_id
+                or int(receipt.get("_fence_revision", 0) or 0) != expected_revision
+                or revision != expected_revision
+                or state != "active"
+            ):
+                return self._delivery_conflict(
+                    "interaction recovery fence is missing, expired, or stale",
+                    code="interaction_recovery_stale",
+                )
+            self._interaction_deliveries.move_to_end(key)
+            payload = self._public_delivery_receipt(receipt)
+            payload["released"] = True
+            # Freeze/serialize the active acknowledgement before waking the
+            # delayed callback. The callback may publish the next pending
+            # generation as soon as it wakes, but it cannot rewrite this
+            # already-built response.
+            response = web.json_response(payload)
+            wake_event = self._take_recovery_fence_locked(receipt)
+            resolve_deferred_goal = bool(
+                receipt.pop("_goal_resolve_deferred", False)
+            )
+        if wake_event is not None:
+            wake_event.set()
+        if resolve_deferred_goal:
+            try:
+                await asyncio.to_thread(
+                    self._goals().on_interaction_resolved, session_id
+                )
+            except Exception:
+                logger.debug("[zet_agent] goal resolved projection failed", exc_info=True)
+        assert response is not None
+        return response
+
     async def _handle_approval_respond(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/approval/respond — resolve the
         oldest pending gateway approval for the session.
 
-        Body: ``{"choice": "once"|"session"|"always"|"deny"}``.
-        Plan-E rev4: no approval_id — oldest pending wins. Returns
-        ``resolved`` count (0 means nothing was pending; APP can show
-        a "request expired" hint).
+        Legacy bodies use ``choice`` and may bind the exact live card with an
+        opaque ``approval_id``. The durable protocol additionally sends
+        ``delivery_id``, ``interaction_id`` and ``phase=prepare|finalize``;
+        prepare leases without waking the agent.
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         session_id = request.match_info.get("session_id", "")
+        queue_key = self._interaction_queue_key(session_id)
+        self._prune_pending_mirrors()
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
-        choice = (body.get("choice") or "").strip()
-        if choice not in {"once", "session", "always", "deny"}:
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Invalid JSON body"), status=400)
+        choice_present = "choice" in body
+        choice = str(body.get("choice") or "").strip()
+        approval_id = body.get("approval_id")
+        if approval_id is not None and (
+            not isinstance(approval_id, str)
+            or not 24 <= len(approval_id) <= 128
+            or any(
+                char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                for char in approval_id
+            )
+        ):
             return web.json_response(
-                _openai_error('choice must be one of "once","session","always","deny"'),
+                _openai_error("approval_id must be an opaque URL-safe token"),
                 status=400,
             )
 
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import (
+                approval_session_key_for_id,
+                resolve_gateway_approval,
+            )
         except Exception as exc:
             logger.exception("[zet_agent] tools.approval import failed")
             return web.json_response(
@@ -2482,16 +4777,296 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
 
-        resolved = resolve_gateway_approval(session_id, choice)
+        protocol, protocol_err = self._delivery_protocol_fields(body)
+        if protocol_err is not None:
+            return protocol_err
+        if protocol is None or choice_present:
+            if choice not in {"once", "session", "always", "deny"}:
+                return web.json_response(
+                    _openai_error(
+                        'choice must be one of "once","session","always","deny"'
+                    ),
+                    status=400,
+                )
+        if protocol is not None:
+            delivery_id, interaction_id, phase = protocol
+            if phase == "prepare" and not choice_present:
+                return web.json_response(
+                    _openai_error("choice is required during prepare"),
+                    status=400,
+                )
+            if len(session_id) > 1024:
+                return web.json_response(
+                    _openai_error("session_id exceeds 1024 characters"),
+                    status=400,
+                )
+            payload_digest = (
+                self._interaction_payload_digest("approval", choice)
+                if choice_present
+                else None
+            )
+            key = self._delivery_key(session_id, delivery_id)
+            deferred_wake_event = None
+            resolve_goal_now = False
+            response = None
+            with self._delivery_lock:
+                self._prune_interaction_deliveries_locked()
+                receipt = self._interaction_deliveries.get(key)
+                if receipt is not None and not self._delivery_binding_matches(
+                    receipt,
+                    session_id=session_id,
+                    kind="approval",
+                    interaction_id=interaction_id,
+                    payload_digest=payload_digest,
+                ):
+                    return self._delivery_conflict(
+                        f"delivery_id {delivery_id} is bound to a different interaction"
+                    )
+                if receipt is not None and (phase == "prepare" or receipt.get("finalized")):
+                    return web.json_response(self._public_delivery_receipt(receipt))
+                if receipt is None and phase == "finalize":
+                    return self._delivery_conflict(
+                        f"delivery_id {delivery_id} has not been prepared",
+                        code="interaction_delivery_not_prepared",
+                    )
+
+                if phase == "prepare":
+                    from tools.approval import prepare_gateway_approval
+
+                    status, approval_data = prepare_gateway_approval(
+                        queue_key, interaction_id, delivery_id
+                    )
+                    if status == "missing":
+                        return web.json_response(
+                            _openai_error(
+                                f"No approval pending for session {session_id}",
+                                code="approval_not_pending",
+                            ),
+                            status=404,
+                        )
+                    if status != "prepared":
+                        return self._delivery_conflict(
+                            f"approval prepare failed: {status}"
+                        )
+                    turn_id = str((approval_data or {}).get("turn_id", "") or "")
+                    if not turn_id or len(turn_id) > 256:
+                        from tools.approval import release_gateway_approval_prepare
+
+                        release_gateway_approval_prepare(
+                            queue_key, interaction_id, delivery_id
+                        )
+                        return self._delivery_conflict(
+                            "approval turn_id is missing or exceeds 256 characters",
+                            code="interaction_turn_missing",
+                        )
+                    now = time.monotonic()
+                    interaction_generation = int(
+                        (approval_data or {}).get("interaction_generation", 0) or 0
+                    )
+                    if interaction_generation <= 0:
+                        from tools.approval import release_gateway_approval_prepare
+
+                        release_gateway_approval_prepare(
+                            queue_key, interaction_id, delivery_id
+                        )
+                        return self._delivery_conflict(
+                            "approval source generation is missing",
+                            code="interaction_generation_missing",
+                        )
+                    receipt = {
+                        "delivery_id": delivery_id,
+                        "scope_key": queue_key,
+                        "interaction_id": interaction_id,
+                        "interaction_generation": interaction_generation,
+                        "session_id": session_id,
+                        "kind": "approval",
+                        "turn_id": turn_id,
+                        "payload_digest": payload_digest,
+                        "_raw_response": choice,
+                        "_raw_bytes": len(choice.encode("utf-8")),
+                        "prepared_at_ms": int(time.time() * 1000),
+                        "accepted_at_ms": None,
+                        "finalized": False,
+                        "prepare_expires_at": now + INTERACTION_PREPARE_TTL,
+                        "expires_at": now + INTERACTION_RECEIPT_TTL,
+                    }
+                    was_durable_session = self._is_durable_session_locked(queue_key)
+                    if not self._mark_durable_session_locked(queue_key):
+                        from tools.approval import release_gateway_approval_prepare
+
+                        release_gateway_approval_prepare(
+                            queue_key, interaction_id, delivery_id
+                        )
+                        return web.json_response(
+                            _openai_error(
+                                "durable interaction session capacity exhausted",
+                                code="interaction_delivery_capacity",
+                                err_type="server_error",
+                            ),
+                            status=503,
+                        )
+                    if not self._store_prepared_delivery_locked(receipt):
+                        if not was_durable_session:
+                            self._unmark_durable_session_locked(queue_key)
+                        from tools.approval import release_gateway_approval_prepare
+
+                        release_gateway_approval_prepare(
+                            queue_key, interaction_id, delivery_id
+                        )
+                        return web.json_response(
+                            _openai_error(
+                                "interaction delivery receipt capacity exhausted",
+                                code="interaction_delivery_capacity",
+                                err_type="server_error",
+                            ),
+                            status=503,
+                        )
+                    return web.json_response(self._public_delivery_receipt(receipt))
+
+                from tools.approval import finalize_gateway_approval_deferred
+
+                if receipt is None:  # narrowed above; defensive for type checkers
+                    return self._delivery_conflict(
+                        f"delivery_id {delivery_id} has not been prepared",
+                        code="interaction_delivery_not_prepared",
+                    )
+                finalized_choice = (
+                    choice
+                    if choice_present
+                    else str(receipt.get("_raw_response", "") or "")
+                )
+                if finalized_choice not in {"once", "session", "always", "deny"}:
+                    return self._delivery_conflict(
+                        "prepared approval response is unavailable",
+                        code="interaction_delivery_stale",
+                    )
+                (
+                    status,
+                    finalized_approval_data,
+                    approval_wake_event,
+                ) = finalize_gateway_approval_deferred(
+                    queue_key,
+                    interaction_id,
+                    delivery_id,
+                    finalized_choice,
+                    wake_after_seconds=INTERACTION_RECOVERY_FENCE_TTL,
+                )
+                if status != "resolved":
+                    return self._delivery_conflict(
+                        f"approval finalize failed: {status}",
+                        code="interaction_delivery_stale",
+                    )
+                self._remove_pending_interaction("approval", queue_key, interaction_id)
+                self._release_durable_session_source_locked(
+                    queue_key, "approval", interaction_id
+                )
+                self._release_prepared_raw_locked(receipt)
+                receipt["finalized"] = True
+                receipt["accepted_at_ms"] = int(time.time() * 1000)
+                receipt["expires_at"] = time.monotonic() + INTERACTION_RECEIPT_TTL
+                self._interaction_deliveries.move_to_end(key)
+                state = self._refresh_delivery_state_locked(receipt)
+                if state == "active" and approval_wake_event is not None:
+                    self._install_recovery_fence_locked(
+                        receipt,
+                        int(receipt.get("state_revision", 1) or 1),
+                        approval_wake_event,
+                    )
+                    receipt["_goal_resolve_deferred"] = True
+                    if finalized_approval_data is not None:
+                        finalized_approval_data["_gateway_deferred_wake_at"] = receipt[
+                            "_fence_expires_at"
+                        ]
+                else:
+                    deferred_wake_event = approval_wake_event
+                    resolve_goal_now = True
+                response_payload = self._public_delivery_receipt(receipt)
+                response = web.json_response(response_payload)
+            if deferred_wake_event is not None:
+                deferred_wake_event.set()
+            if resolve_goal_now:
+                try:
+                    await asyncio.to_thread(
+                        self._goals().on_interaction_resolved, session_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "[zet_agent] goal resolved projection failed", exc_info=True
+                    )
+            assert response is not None
+            return response
+
+        with self._delivery_lock:
+            if self._is_durable_session_locked(queue_key):
+                return self._delivery_conflict(
+                    "legacy approval delivery is disabled for this session",
+                    code="durable_interaction_required",
+                )
+        approval_queue_key = queue_key
+        if approval_id is not None:
+            resolved_queue_key = approval_session_key_for_id(approval_id)
+            if resolved_queue_key is None:
+                return web.json_response({"resolved": 0})
+            approval_queue_key = resolved_queue_key
+        else:
+            with self._pending_lock:
+                mapped_queue_key = getattr(
+                    self,
+                    "_approval_session_keys",
+                    {},
+                ).get(self._active_turn_key(session_id))
+            if mapped_queue_key:
+                approval_queue_key = mapped_queue_key
+        try:
+            from tools.approval import list_gateway_approvals
+
+            queued_approvals = list_gateway_approvals(approval_queue_key)
+            target_approval = next(
+                (
+                    item
+                    for item in queued_approvals
+                    if approval_id is not None
+                    and item.get("approval_id") == approval_id
+                ),
+                queued_approvals[0] if queued_approvals else None,
+            )
+            legacy_interaction_id = str(
+                (target_approval or {}).get("interaction_id", "")
+            )
+        except Exception:
+            legacy_interaction_id = ""
+        resolved = resolve_gateway_approval(
+            approval_queue_key,
+            choice,
+            approval_id=approval_id,
+        )
+        if resolved:
+            if legacy_interaction_id:
+                self._remove_pending_interaction(
+                    "approval", approval_queue_key, legacy_interaction_id
+                )
+            else:
+                with self._pending_lock:
+                    pending = self._pending_approval.get(approval_queue_key, [])
+                    if pending:
+                        interaction_id = str(
+                            pending[0].get("interaction_id", "") or ""
+                        )
+                        self._remove_pending_mirror_locked(
+                            ("approval", approval_queue_key, interaction_id)
+                        )
         with self._pending_lock:
-            self._pending_approval.pop(session_id, None)
+            has_pending_projection = bool(
+                self._pending_approval.get(approval_queue_key)
+                or self._pending_clarify.get(approval_queue_key)
+            )
         # Goal projection: the loop is no longer blocked on the user — flip
         # the App banner back from "waiting". No-op for non-goal sessions.
         # 仅在真的解析了 approval（resolved > 0）时才清等待标记（codex P1）：
         # gateway 重启后内存 queue 已丢、App 对旧卡片的 POST 返回 resolved=0，
         # 此时清掉 sidecar 上的 interaction_pending 会让 reconcile/自动 resume
         # 把本该等确认的 goal 继续自驱（用户点的可能还是 deny）。
-        if resolved:
+        if resolved and not has_pending_projection:
             try:
                 await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
             except Exception:
@@ -2502,42 +5077,283 @@ class ZetAgentAdapter(APIServerAdapter):
         """POST /v1/sessions/{session_id}/clarify/respond — answer one
         pending clarify prompt.
 
-        Body: ``{"response": "...", "clarify_id": "..."}``. A supplied
-        id must match a live entry and is never allowed to consume another
-        prompt. Omitting it preserves the legacy oldest-pending FIFO behavior.
-        404 makes stale or mismatched retries explicit rather than silently
-        applying an answer to a different card.
+        Legacy bodies resolve a supplied ``clarify_id`` exactly, or use FIFO
+        when no id is supplied. The durable protocol additionally sends
+        ``delivery_id``, ``interaction_id`` and ``phase=prepare|finalize``.
+        Stale or mismatched identities never consume a different prompt.
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         session_id = request.match_info.get("session_id", "")
-        scoped_session_key = self._active_turn_key(session_id)
+        queue_key = self._interaction_queue_key(session_id)
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Invalid JSON body"), status=400)
+        response_present = "response" in body
         response_text = str(body.get("response", "") or "")
         clarify_id = str(body.get("clarify_id", "") or "").strip()
 
-        next_payload: Optional[Dict[str, Any]] = None
+        protocol, protocol_err = self._delivery_protocol_fields(body)
+        if protocol_err is not None:
+            return protocol_err
+        if protocol is not None:
+            delivery_id, interaction_id, phase = protocol
+            if clarify_id and clarify_id != interaction_id:
+                return self._delivery_conflict(
+                    "clarify_id does not match interaction_id"
+                )
+            if phase == "prepare" and not response_present:
+                return web.json_response(
+                    _openai_error("response is required during prepare"),
+                    status=400,
+                )
+            response_bytes = len(response_text.encode("utf-8"))
+            if (
+                response_present
+                and response_bytes > INTERACTION_CLARIFY_RESPONSE_MAX_BYTES
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "clarify response exceeds 16 KiB",
+                        code="clarify_response_too_large",
+                    ),
+                    status=413,
+                )
+            if len(session_id) > 1024:
+                return web.json_response(
+                    _openai_error("session_id exceeds 1024 characters"),
+                    status=400,
+                )
+            payload_digest = (
+                self._interaction_payload_digest("clarify", response_text)
+                if response_present
+                else None
+            )
+            key = self._delivery_key(session_id, delivery_id)
+            deferred_wake_event = None
+            resolve_goal_now = False
+            response = None
+            with self._delivery_lock:
+                self._prune_interaction_deliveries_locked()
+                receipt = self._interaction_deliveries.get(key)
+                if receipt is not None and not self._delivery_binding_matches(
+                    receipt,
+                    session_id=session_id,
+                    kind="clarify",
+                    interaction_id=interaction_id,
+                    payload_digest=payload_digest,
+                ):
+                    return self._delivery_conflict(
+                        f"delivery_id {delivery_id} is bound to a different interaction"
+                    )
+                if receipt is not None and (phase == "prepare" or receipt.get("finalized")):
+                    return web.json_response(self._public_delivery_receipt(receipt))
+                if receipt is None and phase == "finalize":
+                    return self._delivery_conflict(
+                        f"delivery_id {delivery_id} has not been prepared",
+                        code="interaction_delivery_not_prepared",
+                    )
+
+                if phase == "prepare":
+                    with self._clarify_state_lock:
+                        queue = self._clarify_queues.get(queue_key)
+                        entry = queue[0] if queue else None
+                        if entry is None:
+                            return web.json_response(
+                                _openai_error(
+                                    f"No clarify pending for session {session_id}",
+                                    code="clarify_not_pending",
+                                ),
+                                status=404,
+                            )
+                        if entry.interaction_id != interaction_id:
+                            return self._delivery_conflict(
+                                "clarify interaction is not the oldest pending entry"
+                            )
+                        now = time.monotonic()
+                        if entry.prepared_until <= now:
+                            entry.prepared_delivery_id = None
+                        if (
+                            entry.prepared_delivery_id is not None
+                            and entry.prepared_delivery_id != delivery_id
+                        ):
+                            return self._delivery_conflict(
+                                "clarify interaction is prepared by another delivery"
+                            )
+                        entry.prepared_delivery_id = delivery_id
+                        entry.prepared_until = now + INTERACTION_PREPARE_TTL
+                        turn_id = entry.turn_id
+                    if not turn_id or len(turn_id) > 256:
+                        with self._clarify_state_lock:
+                            if entry.prepared_delivery_id == delivery_id:
+                                entry.prepared_delivery_id = None
+                                entry.prepared_until = 0.0
+                        return self._delivery_conflict(
+                            "clarify turn_id is missing or exceeds 256 characters",
+                            code="interaction_turn_missing",
+                        )
+                    receipt = {
+                        "delivery_id": delivery_id,
+                        "scope_key": queue_key,
+                        "interaction_id": interaction_id,
+                        "interaction_generation": entry.interaction_generation,
+                        "session_id": session_id,
+                        "kind": "clarify",
+                        "turn_id": turn_id,
+                        "payload_digest": payload_digest,
+                        "_raw_response": response_text,
+                        "_raw_bytes": response_bytes,
+                        "prepared_at_ms": int(time.time() * 1000),
+                        "accepted_at_ms": None,
+                        "finalized": False,
+                        "prepare_expires_at": now + INTERACTION_PREPARE_TTL,
+                        "expires_at": now + INTERACTION_RECEIPT_TTL,
+                    }
+                    if entry.interaction_generation <= 0:
+                        with self._clarify_state_lock:
+                            if entry.prepared_delivery_id == delivery_id:
+                                entry.prepared_delivery_id = None
+                                entry.prepared_until = 0.0
+                        return self._delivery_conflict(
+                            "clarify source generation is missing",
+                            code="interaction_generation_missing",
+                        )
+                    was_durable_session = self._is_durable_session_locked(queue_key)
+                    if not self._mark_durable_session_locked(queue_key):
+                        with self._clarify_state_lock:
+                            if entry.prepared_delivery_id == delivery_id:
+                                entry.prepared_delivery_id = None
+                                entry.prepared_until = 0.0
+                        return web.json_response(
+                            _openai_error(
+                                "durable interaction session capacity exhausted",
+                                code="interaction_delivery_capacity",
+                                err_type="server_error",
+                            ),
+                            status=503,
+                        )
+                    if not self._store_prepared_delivery_locked(receipt):
+                        if not was_durable_session:
+                            self._unmark_durable_session_locked(queue_key)
+                        with self._clarify_state_lock:
+                            if entry.prepared_delivery_id == delivery_id:
+                                entry.prepared_delivery_id = None
+                                entry.prepared_until = 0.0
+                        return web.json_response(
+                            _openai_error(
+                                "interaction delivery receipt capacity exhausted",
+                                code="interaction_delivery_capacity",
+                                err_type="server_error",
+                            ),
+                            status=503,
+                        )
+                    return web.json_response(self._public_delivery_receipt(receipt))
+
+                if receipt is None:  # narrowed above; defensive for type checkers
+                    return self._delivery_conflict(
+                        f"delivery_id {delivery_id} has not been prepared",
+                        code="interaction_delivery_not_prepared",
+                    )
+                finalized_response = (
+                    response_text
+                    if response_present
+                    else str(receipt.get("_raw_response", "") or "")
+                )
+                with self._clarify_state_lock:
+                    queue = self._clarify_queues.get(queue_key)
+                    entry = queue[0] if queue else None
+                    now = time.monotonic()
+                    if (
+                        entry is None
+                        or entry.interaction_id != interaction_id
+                        or entry.prepared_until <= now
+                        or entry.prepared_delivery_id != delivery_id
+                    ):
+                        return self._delivery_conflict(
+                            "clarify finalize no longer owns the pending interaction",
+                            code="interaction_delivery_stale",
+                        )
+                    entry.deferred_wake_at = (
+                        time.monotonic() + INTERACTION_RECOVERY_FENCE_TTL
+                    )
+                    assert queue is not None
+                    queue.pop(0)
+                    if not queue:
+                        self._clarify_queues.pop(queue_key, None)
+                entry.response = finalized_response
+                self._remove_pending_interaction("clarify", queue_key, interaction_id)
+                self._release_durable_session_source_locked(
+                    queue_key, "clarify", interaction_id
+                )
+                self._release_prepared_raw_locked(receipt)
+                receipt["finalized"] = True
+                receipt["accepted_at_ms"] = int(time.time() * 1000)
+                receipt["expires_at"] = time.monotonic() + INTERACTION_RECEIPT_TTL
+                self._interaction_deliveries.move_to_end(key)
+                state = self._refresh_delivery_state_locked(receipt)
+                if state == "active":
+                    self._install_recovery_fence_locked(
+                        receipt,
+                        int(receipt.get("state_revision", 1) or 1),
+                        entry.event,
+                    )
+                    receipt["_goal_resolve_deferred"] = True
+                    entry.deferred_wake_at = receipt["_fence_expires_at"]
+                else:
+                    deferred_wake_event = entry.event
+                    resolve_goal_now = True
+                response_payload = self._public_delivery_receipt(receipt)
+                response = web.json_response(response_payload)
+            if deferred_wake_event is not None:
+                deferred_wake_event.set()
+            if resolve_goal_now:
+                try:
+                    await asyncio.to_thread(
+                        self._goals().on_interaction_resolved, session_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "[zet_agent] goal resolved projection failed", exc_info=True
+                    )
+            assert response is not None
+            return response
+
+        with self._delivery_lock:
+            if self._is_durable_session_locked(queue_key):
+                return self._delivery_conflict(
+                    "legacy clarify delivery is disabled for this session",
+                    code="durable_interaction_required",
+                )
         with self._clarify_state_lock:
-            queue = self._clarify_queues.get(scoped_session_key)
+            queue = self._clarify_queues.get(queue_key)
             entry: Optional[_ClarifyEntry] = None
             if queue:
                 if clarify_id:
-                    for i, candidate in enumerate(queue):
+                    for index, candidate in enumerate(queue):
                         if candidate.clarify_id == clarify_id:
-                            entry = queue.pop(i)
+                            entry = candidate
                             break
                 else:
-                    entry = queue.pop(0)
+                    index = 0
+                    entry = queue[0]
+                if (
+                    entry is not None
+                    and entry.prepared_delivery_id is not None
+                    and entry.prepared_until > time.monotonic()
+                ):
+                    return self._delivery_conflict(
+                        "clarify interaction is locked by a prepared delivery"
+                    )
+                if entry is not None:
+                    queue.pop(index)
             if queue is not None and not queue:
-                self._clarify_queues.pop(scoped_session_key, None)
-            elif queue:
-                next_payload = queue[0].payload
+                self._clarify_queues.pop(queue_key, None)
         if entry is None:
             return web.json_response(
                 _openai_error(
@@ -2549,13 +5365,10 @@ class ZetAgentAdapter(APIServerAdapter):
 
         entry.response = response_text
         entry.event.set()
-        with self._pending_lock:
-            current = self._pending_clarify.get(scoped_session_key)
-            if current and current.get("clarify_id") == entry.clarify_id:
-                if next_payload is None:
-                    self._pending_clarify.pop(scoped_session_key, None)
-                else:
-                    self._pending_clarify[scoped_session_key] = next_payload
+        self._remove_pending_interaction("clarify", queue_key, entry.interaction_id)
+        self._release_durable_session_source(
+            queue_key, "clarify", entry.interaction_id
+        )
         # Goal projection: mirror the approval respond hook.
         try:
             await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
@@ -2580,10 +5393,53 @@ class ZetAgentAdapter(APIServerAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info.get("session_id", "")
-        scoped_session_key = self._active_turn_key(session_id)
+        queue_key = self._interaction_queue_key(session_id)
+        self._prune_pending_mirrors()
+        try:
+            from tools.approval import peek_gateway_approval
+
+            approval_data = peek_gateway_approval(queue_key)
+            approval_interaction_id = str(
+                (approval_data or {}).get("interaction_id", "")
+            )
+        except Exception:
+            approval_interaction_id = ""
+        with self._clarify_state_lock:
+            clarify_queue_entries = self._clarify_queues.get(queue_key, [])
+            clarify_interaction_id = (
+                clarify_queue_entries[0].interaction_id
+                if clarify_queue_entries
+                else ""
+            )
         with self._pending_lock:
-            ap = self._pending_approval.get(session_id)
-            cl = self._pending_clarify.get(scoped_session_key)
+            approval_queue = self._pending_approval.get(queue_key, [])
+            clarify_queue = self._pending_clarify.get(queue_key, [])
+            ap = next(
+                (
+                    payload
+                    for payload in approval_queue
+                    if payload.get("interaction_id") == approval_interaction_id
+                ),
+                None,
+            )
+            cl = next(
+                (
+                    payload
+                    for payload in clarify_queue
+                    if payload.get("interaction_id") == clarify_interaction_id
+                ),
+                None,
+            )
+            for kind, payload in (("approval", ap), ("clarify", cl)):
+                if payload is None:
+                    continue
+                meta_key = (
+                    kind,
+                    queue_key,
+                    str(payload.get("interaction_id", "") or ""),
+                )
+                if meta_key in self._pending_mirror_meta:
+                    self._pending_mirror_meta.move_to_end(meta_key)
         return web.json_response({
             "approval": ap,
             "clarify": cl,
@@ -3205,11 +6061,17 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 if generation is None:
                     continue
-                session_db = await _to_thread_with_completion_barrier(
-                    self._open_profile_session_db,
-                    Path(profile_home),
-                    create=False,
-                )
+                try:
+                    session_db = await _to_thread_with_completion_barrier(
+                        self._open_profile_session_db,
+                        Path(profile_home),
+                        create=False,
+                    )
+                except FileNotFoundError:
+                    # Discovery lists every served profile home; ones that have
+                    # never opened a session simply have no state.db yet. That
+                    # is not a cleanup failure — skip without warning.
+                    continue
                 if self._profile_directory_identity(key) != generation:
                     logger.warning(
                         "[zet_agent] runtime import profile changed while DB opened; skipping cleanup"
@@ -3373,25 +6235,52 @@ class ZetAgentAdapter(APIServerAdapter):
         already-failed turn, and a secondary failure here would mask
         the original interrupt status returned to the caller.
         """
+        queue_key = scoped_session_key or self._interaction_queue_key(session_id)
         # Clarify queue: drain pending entries and signal their events
         # with empty response so the ask_user callback unblocks.
-        if scoped_session_key is None:
-            scoped_session_key = self._active_turn_key(session_id)
         with self._clarify_state_lock:
-            clarify_queue = list(self._clarify_queues.pop(scoped_session_key, []) or [])
+            clarify_queue = list(self._clarify_queues.pop(queue_key, []) or [])
         for entry in clarify_queue:
             try:
                 entry.response = ""
                 entry.event.set()
             except Exception:
                 pass
+            self._remove_pending_interaction(
+                "clarify", queue_key, entry.interaction_id
+            )
+            self._release_durable_session_source(
+                queue_key, "clarify", entry.interaction_id
+            )
 
-        # Approval gate: tell hermes the pending approval was denied
-        # so its run loop bails. tools.approval.resolve_gateway_approval
-        # is the same path /v1/sessions/{sid}/approval/respond uses.
+        # Approval gate: atomically revoke queued requests and one-shot replay
+        # grants. A stale approval card must never authorize work after the
+        # interrupted run has ended.
         try:
-            from tools.approval import resolve_gateway_approval
-            resolve_gateway_approval(session_id, "deny")
+            with self._pending_lock:
+                getattr(self, "_approval_session_keys", {}).pop(
+                    self._active_turn_key(session_id),
+                    None,
+                )
+            from tools.approval import (
+                cancel_gateway_approvals,
+                cancel_session_approvals,
+                list_gateway_approvals,
+            )
+
+            approval_ids = [
+                str(item.get("interaction_id", "") or "")
+                for item in list_gateway_approvals(queue_key)
+            ]
+            cancel_session_approvals(queue_key)
+            cancel_gateway_approvals(queue_key, "deny")
+            for interaction_id in approval_ids:
+                self._remove_pending_interaction(
+                    "approval", queue_key, interaction_id
+                )
+                self._release_durable_session_source(
+                    queue_key, "approval", interaction_id
+                )
         except Exception:
             logger.debug("[zet_agent] session interrupt: approval cleanup failed", exc_info=True)
 
@@ -3408,9 +6297,7 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] session interrupt: terminal cleanup failed", exc_info=True)
 
-        with self._pending_lock:
-            self._pending_clarify.pop(scoped_session_key, None)
-            self._pending_approval.pop(session_id, None)
+        self._clear_pending_queue(queue_key)
 
     # ------------------------------------------------------------------
     # Diagnostic wrapper around base /v1/chat/completions
@@ -3427,6 +6314,19 @@ class ZetAgentAdapter(APIServerAdapter):
         downstream ``await request.json()`` inside the base handler reuses
         them — we only pay one read.
         """
+        raw_business_token = request.headers.get(
+            "X-Zettlab-Business-Execution-Token",
+            "",
+        )
+        if raw_business_token and not gateway_sensitive_process_boundary_ready():
+            return web.json_response(
+                _openai_error(
+                    "ZetAgent process memory boundary is unavailable",
+                    code="process_boundary_unavailable",
+                ),
+                status=503,
+            )
+
         try:
             raw = await request.read()
         except Exception as e:
@@ -3608,11 +6508,11 @@ class ZetAgentAdapter(APIServerAdapter):
         if gw is not None:
             overrides = getattr(gw, "_session_model_overrides", None)
             if overrides is not None:
-                overrides[session_id] = override
+                overrides[self._session_model_state_key(session_id)] = override
             evict = getattr(gw, "_evict_cached_agent", None)
             if callable(evict):
                 try:
-                    evict(session_id)
+                    evict(self._interaction_queue_key(session_id))
                 except Exception as exc:
                     logger.warning(
                         "session-model-switch: evict_cached_agent failed for %s: %s",
@@ -3667,8 +6567,9 @@ class ZetAgentAdapter(APIServerAdapter):
         gw = getattr(self, "gateway_runner", None)
         if gw is not None:
             overrides = getattr(gw, "_session_model_overrides", None)
-            if overrides is not None and session_id in overrides:
-                overrides.pop(session_id, None)
+            state_key = self._session_model_state_key(session_id)
+            if overrides is not None and state_key in overrides:
+                overrides.pop(state_key, None)
                 cleared = True
             # Only evict when we actually removed an override: an un-overridden
             # session's cached agent is already built on the default model, so
@@ -3677,7 +6578,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 evict = getattr(gw, "_evict_cached_agent", None)
                 if callable(evict):
                     try:
-                        evict(session_id)
+                        evict(self._interaction_queue_key(session_id))
                     except Exception as exc:
                         logger.warning(
                             "session-model-clear: evict_cached_agent failed for %s: %s",
@@ -4094,9 +6995,21 @@ class ZetAgentAdapter(APIServerAdapter):
                 },
                 status=409,
             )
-        active_imports, unload_barrier_owner = self._block_runtime_import_profile(
-            profile_home
-        )
+        (
+            active_imports,
+            active_api_runs,
+            unload_barrier_owner,
+        ) = self._block_runtime_import_profile(profile_home)
+        if active_api_runs:
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": active_api_runs,
+                    "active_api_runs": active_api_runs,
+                },
+                status=409,
+            )
         if active_imports:
             return web.json_response(
                 {
@@ -4104,6 +7017,59 @@ class ZetAgentAdapter(APIServerAdapter):
                     "error": "profile has active imports",
                     "active_sessions": active_imports,
                     "active_imports": active_imports,
+                },
+                status=409,
+            )
+
+        # Invalidate goal work before runtime/DB teardown. A barrier Timer may
+        # already have detached itself from the timer table and be waiting on
+        # its session lock; cancellation alone cannot stop that callback from
+        # reporting a continuation after this endpoint succeeds (codex P1).
+        # The drain runs off-loop and its completion barrier makes request
+        # cancellation wait until the worker has really exited.
+        drv = getattr(self, "_zet_goal_driver", None)
+        if profile_home and drv is not None:
+            try:
+                await _to_thread_with_completion_barrier(
+                    drv.invalidate_barrier_callbacks_for_home,
+                    profile_home,
+                )
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                logger.warning(
+                    "[zet_agent] profile-unload: goal callbacks did not drain",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: goal callbacks could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
+
+        # A callback that began just before invalidation can finish one last
+        # report while unload waits for it. Re-check the active-run gate before
+        # evicting runtime state so that continuation cannot race past the
+        # first check above.
+        active_api_runs = self._active_profile_chat_runs(profile_home)
+        if active_api_runs:
+            self._unblock_runtime_import_profile(
+                profile_home, unload_barrier_owner
+            )
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": active_api_runs,
+                    "active_api_runs": active_api_runs,
                 },
                 status=409,
             )
@@ -4154,6 +7120,71 @@ class ZetAgentAdapter(APIServerAdapter):
                 },
                 status=409,
             )
+
+        killed_profile_processes = 0
+        terminal_cleanup = {
+            "killed_uid_processes": 0,
+            "terminal_home_removed": False,
+            "terminal_cgroup_removed": False,
+            "identity_retired": False,
+        }
+        if profile_home:
+            try:
+                from tools.environments.local import (
+                    retire_managed_terminal_profile,
+                )
+                from tools.terminal_tool import cleanup_managed_profile_environments
+                from tools.process_registry import process_registry
+                from tools.approval import purge_profile_approval_state
+
+                killed_profile_processes = await _to_thread_with_completion_barrier(
+                    lambda: process_registry.kill_all(
+                        profile_owner=profile_home
+                    )
+                )
+                cleaned_terminal_environments = await _to_thread_with_completion_barrier(
+                    cleanup_managed_profile_environments,
+                    profile_home,
+                )
+                terminal_cleanup = await _to_thread_with_completion_barrier(
+                    retire_managed_terminal_profile,
+                    profile_home,
+                )
+                terminal_cleanup["terminal_environments_removed"] = (
+                    cleaned_terminal_environments
+                )
+                if process_registry.has_active_for_profile(profile_home):
+                    raise OSError("profile process registry is still active")
+                purged_process_state = await _to_thread_with_completion_barrier(
+                    process_registry.purge_profile_state,
+                    profile_home,
+                )
+                terminal_cleanup["purged_process_state"] = purged_process_state
+                purged_approval_state = await _to_thread_with_completion_barrier(
+                    purge_profile_approval_state,
+                    profile_home,
+                )
+                terminal_cleanup["purged_approval_state"] = purged_approval_state
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                logger.warning(
+                    "[zet_agent] profile-unload: process identity cleanup failed",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: managed processes could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
 
         closed_session_db = False
         if profile_home:
@@ -4210,17 +7241,10 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
                     raise
                 closed_session_db = True
-            # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
-            # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
-            # scope 读 goal 并重新自驱一个用户刚删掉的 agent。同时按 home
-            # 翻代，让还在跑的 post-turn judge 任务在 report 前的复核中失效
-            # （active-run 计数在 turn 结束时已归零，拦不住这些后置任务）。
-            # getattr：teardown 期间绝不懒创建 driver。
-            drv = getattr(self, "_zet_goal_driver", None)
+            # Goal callbacks/timers were invalidated and drained before
+            # runtime teardown. Only the cached goal DB remains to close.
             if drv is not None:
                 try:
-                    drv.cancel_barrier_timers_for_home(profile_home)
-                    drv.bump_lock_generations_for_home(profile_home)
                     # goal sidecar 走 hermes_cli.goals._DB_CACHE（按 home 缓存
                     # SessionDB），上面只关了 adapter 自己的 _session_dbs ——
                     # 不关它的话 profile 删除/重建后 goal 读写仍打在旧 inode
@@ -4232,12 +7256,16 @@ class ZetAgentAdapter(APIServerAdapter):
                         exc_info=True,
                     )
 
+            self._drop_profile_local_model_caches(profile_home)
+
         self._complete_runtime_import_profile_unload(
             profile_home, unload_barrier_owner
         )
         return web.json_response({
             "unloaded": True,
             "closed_session_db": closed_session_db,
+            "killed_profile_processes": killed_profile_processes,
+            **terminal_cleanup,
             "evicted_sessions": int(runtime_unload.get("evicted_sessions", 0) or 0),
             "disconnected_adapters": int(runtime_unload.get("disconnected_adapters", 0) or 0),
         })
@@ -4245,6 +7273,21 @@ class ZetAgentAdapter(APIServerAdapter):
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
     # ------------------------------------------------------------------
+
+    def _register_base_http_routes(self, router: "web.UrlDispatcher") -> None:
+        """Register the canonical API-server table and its profile mirrors.
+
+        Zet used to copy a point-in-time subset of ``connect()``. The inherited
+        capability document then advertised newer session/model endpoints that
+        the listener did not have. Keeping the route table as the owner makes
+        upstream additions reach Zet automatically; only chat completions swaps
+        in the fork's diagnostic wrapper.
+        """
+        for method, path, handler in self._http_route_table():
+            if path == "/v1/chat/completions":
+                handler = self._diagnostic_chat_completions
+            router.add_route(method, path, handler)
+            router.add_route(method, f"/p/{{profile}}{path}", handler)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp server, registering our extra routes
@@ -4280,6 +7323,13 @@ class ZetAgentAdapter(APIServerAdapter):
         and copy the base body — which we do here, with the four
         extra ``add_post`` calls inlined.
         """
+        if not initialize_gateway_sensitive_process_boundary():
+            logger.warning(
+                "[zet_agent] gateway process memory boundary is unavailable; "
+                "ordinary chat remains enabled but business-token requests "
+                "will be rejected"
+            )
+
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
@@ -4297,7 +7347,16 @@ class ZetAgentAdapter(APIServerAdapter):
         import socket as _socket
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [
+                mw
+                for mw in (
+                    self._make_profile_prefix_middleware(),
+                    cors_middleware,
+                    body_limit_middleware,
+                    security_headers_middleware,
+                )
+                if mw is not None
+            ]
             # client_max_size=MAX_REQUEST_BYTES mirrors APIServerAdapter.connect
             # in api_server.py — without it aiohttp falls back to its 1 MiB
             # default and rejects multimodal payloads (image_url with inlined
@@ -4305,43 +7364,13 @@ class ZetAgentAdapter(APIServerAdapter):
             # as a misleading 400 "Invalid JSON in request body".
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
-            # Base routes — kept identical to APIServerAdapter.connect
-            # so health/models/responses/runs/jobs all work under the
-            # zet_agent platform too.
-            self._app.router.add_get("/health", self._handle_health)
-            self._app.router.add_get("/health/detailed", self._handle_health_detailed)
-            self._app.router.add_get("/v1/health", self._handle_health)
-            self._app.router.add_get("/v1/models", self._handle_models)
-            if hasattr(self, "_handle_capabilities"):
-                self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
-            self._app.router.add_post("/v1/chat/completions", self._diagnostic_chat_completions)
-            self._app.router.add_post("/v1/responses", self._handle_responses)
-            self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
-            self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
-            # Cron jobs management
-            self._app.router.add_get("/api/jobs", self._handle_list_jobs)
-            self._app.router.add_get("/api/jobs/occurrences", self._handle_list_job_occurrences)
-            self._app.router.add_post("/api/jobs", self._handle_create_job)
-            self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
-            self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
-            self._app.router.add_delete("/api/jobs/{job_id}", self._handle_delete_job)
-            self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
-            self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
-            self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._register_base_http_routes(self._app.router)
             self._app.router.add_post(
                 "/api/sessions/import", self._handle_session_import,
             )
             self._app.router.add_post(
                 "/api/memory/import", self._handle_memory_import,
             )
-            self._register_unprefixed_cron_control_routes(self._app.router)
-            # Structured event streaming
-            self._app.router.add_post("/v1/runs", self._handle_runs)
-            if hasattr(self, "_handle_get_run"):
-                self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
-            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
-            self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
-
             # ZET-372 — interaction respond endpoints.
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/approval/respond",
@@ -4358,6 +7387,14 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_get(
                 "/v1/sessions/{session_id}/pending",
                 self._handle_pending,
+            )
+            self._app.router.add_get(
+                "/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}",
+                self._handle_interaction_delivery,
+            )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}/recovery-fence",
+                self._handle_recovery_fence,
             )
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/interrupt",
@@ -4445,10 +7482,6 @@ class ZetAgentAdapter(APIServerAdapter):
                 "/p/{profile}/v1/subagents/{subagent_id}/interrupt",
                 self._profile_handler(self._handle_subagent_interrupt),
             )
-            self._register_profile_api_routes(
-                self._app.router,
-                chat_handler=self._diagnostic_chat_completions,
-            )
             self._app.router.add_post(
                 "/p/{profile}/v1/skills/reload",
                 self._profile_handler(self._handle_skills_reload),
@@ -4484,6 +7517,14 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_get(
                 "/p/{profile}/v1/sessions/{session_id}/pending",
                 self._profile_handler(self._handle_pending),
+            )
+            self._app.router.add_get(
+                "/p/{profile}/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}",
+                self._profile_handler(self._handle_interaction_delivery),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}/recovery-fence",
+                self._profile_handler(self._handle_recovery_fence),
             )
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/approval/respond",
@@ -4627,6 +7668,13 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             pass
 
+        # Teardown/disconnect is a hard run boundary. Projection callbacks are
+        # idempotent, so clearing here safely races timeout cleanup and keeps a
+        # dead adapter from retaining command cards or stream queue objects.
+        with self._pending_lock:
+            self._pending_approval.clear()
+            getattr(self, "_approval_stream_queues", {}).clear()
+
         # Wake any clarify waiters with empty responses so the agent
         # threads don't sit on threading.Event forever.
         with self._clarify_state_lock:
@@ -4636,6 +7684,13 @@ class ZetAgentAdapter(APIServerAdapter):
             self._clarify_queues.clear()
         for entry in entries:
             entry.event.set()
+        with self._pending_lock:
+            self._pending_clarify.clear()
+            self._pending_approval.clear()
+            self._pending_mirror_meta.clear()
+            self._pending_mirror_bytes = 0
+        with self._interaction_route_lock:
+            self._interaction_route_aliases.clear()
 
         await super().disconnect()
 

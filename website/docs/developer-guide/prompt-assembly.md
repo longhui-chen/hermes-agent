@@ -47,7 +47,7 @@ Here is a simplified view of what the final system prompt looks like when all la
 
 ```
 # Layer 1: Agent Identity (from ~/.hermes/SOUL.md)
-You are Zettlab Memo, an intelligent AI assistant running on a Zettlab AI-Native Personal Computer.
+You are Zettlab Memo, an intelligent AI assistant running on a Zettlab Agent Computer (AC).
 You are helpful, knowledgeable, direct, and proactive.
 You assist your owner with tasks via your tools.
 ...
@@ -165,7 +165,7 @@ def load_soul_md() -> Optional[str]:
         return None
     content = soul_path.read_text(encoding="utf-8").strip()
     content = _scan_context_content(content, "SOUL.md")  # Security scan
-    content = _truncate_content(content, "SOUL.md")       # Cap defaults to 20k chars, configurable
+    content = _truncate_content(content, "SOUL.md")       # Cap scales with model context window (20k floor); config override wins
     return content
 ```
 
@@ -174,12 +174,13 @@ When `load_soul_md()` returns content, it replaces the hardcoded `DEFAULT_AGENT_
 If `SOUL.md` doesn't exist, the system falls back to:
 
 ```
-You are Zettlab Memo, an intelligent AI assistant running on a Zettlab AI-Native Personal Computer.
-You are helpful, knowledgeable, direct, and proactive.
-You assist your owner with tasks via your tools.
-Be targeted and efficient — act instead of only describing what you plan to do.
-For long-running tasks, keep the owner posted on your progress as you go,
-so they always know what you have done and what is coming next.
+# Agent SOUL
+
+This profile has not been given a specialized persona yet. Treat this file
+as an open identity slot: follow the user's current request, the shared
+Zettlab agent base prompt, and any future edits to this SOUL.md. Do not
+assume any named specialist identity unless this file, a template package,
+or the current user explicitly defines that identity.
 ```
 
 ## How context files are injected
@@ -231,7 +232,7 @@ def build_context_files_prompt(cwd=None, skip_soul=False):
 
 All context files are:
 - **Security scanned** — checked for prompt injection patterns (invisible unicode, "ignore previous instructions", credential exfiltration attempts)
-- **Truncated** — capped at `context_file_max_chars` characters (default 20,000) using 70/20 head/tail ratio with a truncation marker
+- **Truncated** — capped at `context_file_max_chars` characters using a 70/20 head/tail split with a truncation marker. The cap scales with the model's context window (20,000-char floor, 500K ceiling); an explicit `context_file_max_chars` in `config.yaml` always wins.
 - **YAML frontmatter stripped** — `.hermes.md` frontmatter is removed (reserved for future config overrides)
 
 ## API-call-time-only layers

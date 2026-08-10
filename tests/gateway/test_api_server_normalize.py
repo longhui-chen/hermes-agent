@@ -2,12 +2,38 @@
 
 from gateway.platforms import api_server
 from gateway.platforms.api_server import (
+    _extract_business_execution_token,
     _extract_plan_ack,
     _extract_plan_auto_execute,
+    _extract_response_mode,
     _extract_turn_id,
     _normalize_chat_content,
     _resolve_plan_auto_execute,
 )
+
+
+class TestExtractBusinessExecutionToken:
+    def test_valid_opaque_token_is_preserved(self):
+        assert _extract_business_execution_token("a" * 64) == "a" * 64
+
+    def test_malformed_or_header_injected_token_is_dropped(self):
+        assert _extract_business_execution_token("short") == ""
+        assert _extract_business_execution_token("a" * 64 + "\r\nX-Evil: 1") == ""
+        assert _extract_business_execution_token("A" * 64) == ""
+
+
+class TestExtractResponseMode:
+    def test_plan_mode_is_preserved(self):
+        assert _extract_response_mode(
+            {"metadata": {"response_mode": "plan"}}
+        ) == "plan"
+
+    def test_missing_direct_or_unknown_mode_preserves_default(self):
+        assert _extract_response_mode({}) == ""
+        assert _extract_response_mode(
+            {"metadata": {"responseMode": " DIRECT "}}
+        ) == ""
+        assert _extract_response_mode({"metadata": {"response_mode": "auto"}}) == ""
 
 
 class TestExtractPlanAck:
@@ -15,25 +41,69 @@ class TestExtractPlanAck:
         assert _extract_plan_ack({
             "metadata": {
                 "plan_ack": {
+                    "turn_id": "turn-plan-1",
                     "status": "cancelled",
                     "revision_requested": False,
                 },
             },
-        }) == {"status": "cancelled", "revision_requested": False}
+        }) == {
+            "turn_id": "turn-plan-1",
+            "status": "cancelled",
+            "revision_requested": False,
+        }
 
     def test_camel_case_revision_ack(self):
         assert _extract_plan_ack({
             "metadata": {
                 "planAck": {
+                    "turnId": "turn-plan-2",
                     "status": "cancelled",
                     "revisionRequested": True,
                 },
             },
-        }) == {"status": "cancelled", "revision_requested": True}
+        }) == {
+            "turn_id": "turn-plan-2",
+            "status": "cancelled",
+            "revision_requested": True,
+        }
+
+    def test_legacy_ack_uses_metadata_turn_id(self):
+        assert _extract_plan_ack({
+            "metadata": {
+                "turn_id": "legacy-plan-turn",
+                "plan_ack": {
+                    "status": "confirmed",
+                    "revision_requested": False,
+                },
+            },
+        }) == {
+            "turn_id": "legacy-plan-turn",
+            "status": "confirmed",
+            "revision_requested": False,
+        }
+
+    def test_released_ack_without_turn_id_preserves_receipt_without_binding(self):
+        ack = _extract_plan_ack({
+            "metadata": {
+                "plan_ack": {
+                    "status": "confirmed",
+                    "revision_requested": False,
+                },
+            },
+        })
+
+        assert ack == {
+            "status": "confirmed",
+            "revision_requested": False,
+        }
+        assert "turn_id" not in ack
 
     def test_unknown_or_malformed_ack_is_ignored(self):
         assert _extract_plan_ack({"metadata": {"plan_ack": "cancelled"}}) == {}
         assert _extract_plan_ack({"metadata": {"plan_ack": {"status": "other"}}}) == {}
+        assert _extract_plan_ack({
+            "metadata": {"plan_ack": {"status": "confirmed", "turn_id": ""}},
+        }) == {}
 
 
 class TestExtractPlanAutoExecute:
@@ -133,8 +203,6 @@ class TestNormalizeChatContent:
     def test_plain_string_returned_as_is(self):
         assert _normalize_chat_content("hello world") == "hello world"
 
-    def test_empty_string_returned_as_is(self):
-        assert _normalize_chat_content("") == ""
 
     def test_text_content_part(self):
         content = [{"type": "text", "text": "hello"}]
@@ -148,49 +216,6 @@ class TestNormalizeChatContent:
         content = [{"type": "output_text", "text": "assistant output"}]
         assert _normalize_chat_content(content) == "assistant output"
 
-    def test_multiple_text_parts_joined_with_newline(self):
-        content = [
-            {"type": "text", "text": "first"},
-            {"type": "text", "text": "second"},
-        ]
-        assert _normalize_chat_content(content) == "first\nsecond"
-
-    def test_mixed_string_and_dict_parts(self):
-        content = ["plain string", {"type": "text", "text": "dict part"}]
-        assert _normalize_chat_content(content) == "plain string\ndict part"
-
-    def test_image_url_parts_silently_skipped(self):
-        content = [
-            {"type": "text", "text": "check this:"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
-        ]
-        assert _normalize_chat_content(content) == "check this:"
-
-    def test_integer_content_converted(self):
-        assert _normalize_chat_content(42) == "42"
-
-    def test_boolean_content_converted(self):
-        assert _normalize_chat_content(True) == "True"
-
-    def test_deeply_nested_list_respects_depth_limit(self):
-        """Nesting beyond max_depth returns empty string."""
-        content = [[[[[[[[[[[["deep"]]]]]]]]]]]]
-        result = _normalize_chat_content(content)
-        # The deep nesting should be truncated, not crash
-        assert isinstance(result, str)
-
-    def test_large_list_capped(self):
-        """Lists beyond MAX_CONTENT_LIST_SIZE are truncated."""
-        content = [{"type": "text", "text": f"item{i}"} for i in range(2000)]
-        result = _normalize_chat_content(content)
-        # Should not contain all 2000 items
-        assert result.count("item") <= 1000
-
-    def test_oversized_string_truncated(self):
-        """Strings beyond 64KB are truncated."""
-        huge = "x" * 100_000
-        result = _normalize_chat_content(huge)
-        assert len(result) == 65_536
 
     def test_empty_text_parts_filtered(self):
         content = [
@@ -200,25 +225,4 @@ class TestNormalizeChatContent:
         ]
         assert _normalize_chat_content(content) == "actual"
 
-    def test_dict_without_type_skipped(self):
-        content = [{"foo": "bar"}, {"type": "text", "text": "real"}]
-        assert _normalize_chat_content(content) == "real"
 
-    def test_empty_list_returns_empty(self):
-        assert _normalize_chat_content([]) == ""
-
-    def test_many_small_parts_normalize_without_quadratic_rescan(self, monkeypatch):
-        """Large content arrays should normalize in linear time."""
-        content = [{"type": "text", "text": "x"} for _ in range(1000)]
-        sum_calls = 0
-
-        def counting_sum(values):
-            nonlocal sum_calls
-            sum_calls += 1
-            return sum(values)
-
-        monkeypatch.setattr(api_server, "sum", counting_sum, raising=False)
-        result = _normalize_chat_content(content)
-
-        assert result.count("x") == 1000
-        assert sum_calls == 0

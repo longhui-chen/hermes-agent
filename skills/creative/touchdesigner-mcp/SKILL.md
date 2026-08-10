@@ -1,6 +1,6 @@
 ---
 name: touchdesigner-mcp
-description: "Control a running TouchDesigner instance via twozero MCP — create operators, set parameters, wire connections, execute Python, build real-time visuals. 36 native tools."
+description: Control TouchDesigner via twozero MCP.
 version: 1.1.0
 author: kshitijk4poor
 license: MIT
@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [TouchDesigner, MCP, twozero, creative-coding, real-time-visuals, generative-art, audio-reactive, VJ, installation, GLSL]
-    related_skills: [native-mcp, ascii-video, manim-video, hermes-video]
+    related_skills: [ascii-video, manim-video]
 
 ---
 
@@ -37,7 +37,7 @@ Hub health check: `GET http://localhost:40404/mcp` returns JSON with instance PI
 Run the setup script to handle everything:
 
 ```bash
-bash "${HERMES_HOME:-$HOME/.hermes}/skills/creative/touchdesigner-mcp/scripts/setup.sh"
+bash "${HERMES_SKILL_DIR}/scripts/setup.sh"
 ```
 
 The script will:

@@ -9,6 +9,7 @@ which has provider-specific conditionals for max_tokens defaults,
 reasoning configuration, temperature handling, and extra_body assembly.
 """
 
+import json
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -17,6 +18,56 @@ from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.response_format import response_format_requires_structured_output
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
+    """Return the stable system/developer prefix used for cache routing.
+
+    Chat Completions carries instructions in its message list rather than a
+    separate ``instructions`` field.  Only a leading system/developer message
+    is static by contract; later messages are conversation state and must not
+    split a warm prefix bucket on every turn.
+    """
+    if not messages or not isinstance(messages[0], dict):
+        return ""
+    first = messages[0]
+    if first.get("role") not in {"system", "developer"}:
+        return ""
+    content = first.get("content")
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(content or "")
+
+
+def _add_prompt_cache_key(
+    api_kwargs: dict[str, Any],
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    supports_prompt_cache_key: bool,
+) -> None:
+    """Add a content-addressed key only for an explicitly capable endpoint."""
+    if not supports_prompt_cache_key:
+        return
+
+    # An explicit caller body field is authoritative too.  Do not add a
+    # duplicate top-level field whose SDK merge precedence could overwrite it.
+    extra_body = api_kwargs.get("extra_body")
+    if "prompt_cache_key" in api_kwargs or (
+        isinstance(extra_body, dict) and "prompt_cache_key" in extra_body
+    ):
+        return
+
+    # Reuse the Responses transport's single authoritative hash algorithm so
+    # equivalent static prefixes route to the same cache bucket across modes.
+    from agent.transports.codex import _content_cache_key
+
+    cache_key = _content_cache_key(_static_prompt_instructions(messages), tools)
+    if cache_key:
+        api_kwargs["prompt_cache_key"] = cache_key
 
 
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
@@ -49,27 +100,36 @@ def _is_gemini_transport_without_response_format(provider_name: str, base_url: A
 def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str, Any]) -> None:
     """Forward the conversation/cron session as stable Zettlab headers.
 
-    X-Task-Id drives credit-ledger task grouping (mini-api 08-ai.md -> ai-api
-    scene_params -> ai-cloud ledger.task_id), so a multi-step task's per-turn
-    consumption aggregates into one task card. X-Zettlab-Conversation-ID gives
-    ai-gateway an explicit sticky/canary routing key using the same stable
-    session-derived value. The local-server ai-proxy relays these headers to the
-    IAM gateway.
+    X-Task-Id drives credit-ledger grouping (mini-api 08-ai.md -> ai-api
+    scene_params -> ai-cloud ledger.task_id), at the granularity of one unit of
+    usage: a chat turn, or a single cron run (see billing_usage_id_for).
 
-    The session -> task_id mapping (interactive vs cron, see billing_task_id_for)
-    also gates non-NAS sessions to '' so the billing headers never leak to a
-    third-party provider. Applied to BOTH the legacy and profile build paths —
-    the NAS ai-proxy agent runs with provider=custom, which takes the legacy path.
+    🔴 X-Zettlab-Conversation-ID is NOT the same value: it is ai-gateway's
+    sticky/canary routing key and prompt-cache affinity hash, so it stays at
+    conversation granularity (billing_conversation_id_for). Collapsing the two
+    back together would give every turn a fresh cache bucket.
+
+    The local-server ai-proxy relays these headers to the IAM gateway. The
+    session mapping also gates non-NAS sessions to '' so the billing headers
+    never leak to a third-party provider. Applied to BOTH the legacy and profile
+    build paths — the NAS ai-proxy agent runs with provider=custom, which takes
+    the legacy path.
     """
     # Best-effort: credit attribution must never break the main request path.
     # Wrapped in try/except like auxiliary_client._apply_user_default_headers so a
     # billing import/lookup error can't bubble up and abort build_kwargs.
     try:
-        from gateway.session_context import billing_task_id_for, billing_task_title_encoded
+        from gateway.session_context import (
+            billing_conversation_id_for,
+            billing_task_title_encoded,
+            billing_usage_id_for,
+        )
 
-        task_id = billing_task_id_for(params.get("session_id"))
+        session_id = params.get("session_id")
+        task_id = billing_usage_id_for(session_id)
         if not task_id:
             return
+        conversation_id = billing_conversation_id_for(session_id)
         existing = api_kwargs.get("extra_headers")
         headers: Dict[str, str] = {}
         if isinstance(existing, dict):
@@ -77,11 +137,12 @@ def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str,
                 str(k): str(v) for k, v in existing.items() if k and v is not None
             })
         headers.setdefault("X-Task-Id", task_id)
-        headers.setdefault("X-Zettlab-Conversation-ID", task_id)
+        if conversation_id:
+            headers.setdefault("X-Zettlab-Conversation-ID", conversation_id)
         headers.setdefault("X-Scene-Type", "agent")
-        # Cron runs also stamp the job name as X-Task-Title so the ledger's cron
-        # task card shows the real name (and survives the job being deleted).
-        # Empty for interactive sessions, which carry no title here.
+        # Cron runs stamp the job name as X-Task-Title so the ledger's cron card
+        # shows the real name (and survives the job being deleted); interactive
+        # turns stamp this turn's user-message summary.
         task_title = billing_task_title_encoded()
         if task_title:
             headers.setdefault("X-Task-Title", task_title)
@@ -168,6 +229,24 @@ def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
     if "generativelanguage.googleapis.com" not in normalized:
         return False
     return normalized.endswith("/openai")
+
+
+def _is_openai_api_base_url(base_url: Any) -> bool:
+    """True only for api.openai.com itself (exact host).
+
+    OpenAI documents ``prompt_cache_key`` as a first-class body field and
+    GPT-5.6+ docs recommend it for reliable cache routing, so the flag is
+    implied for the real endpoint. Deliberately NOT a substring match:
+    Azure OpenAI and strict OpenAI-compat endpoints may reject unknown
+    fields and must stay opt-in via ``supports_prompt_cache_key``.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(str(base_url or "").strip()).hostname or "").lower()
+    except Exception:
+        return False
+    return host == "api.openai.com"
 
 
 def _model_consumes_thought_signature(model: Any) -> bool:
@@ -385,6 +464,8 @@ class ChatCompletionsTransport(ProviderTransport):
             # Claude on OpenRouter/Nous max output
             anthropic_max_output: int | None
             extra_body_additions: dict | None
+            supports_prompt_cache_key: bool — explicit endpoint capability for
+                the top-level Chat Completions request field; defaults off.
         """
         # Codex sanitization: drop reasoning_items / call_id / response_item_id.
         # Pass model so the Gemini thought_signature (extra_content) is kept for
@@ -436,7 +517,6 @@ class ChatCompletionsTransport(ProviderTransport):
         ephemeral = params.get("ephemeral_max_output_tokens")
         max_tokens = params.get("max_tokens")
         anthropic_max_out = params.get("anthropic_max_output")
-        is_nvidia_nim = params.get("is_nvidia_nim", False)
         is_kimi = params.get("is_kimi", False)
         is_tokenhub = params.get("is_tokenhub", False)
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
@@ -494,7 +574,6 @@ class ChatCompletionsTransport(ProviderTransport):
         extra_body: dict[str, Any] = {}
 
         is_openrouter = params.get("is_openrouter", False)
-        is_nous = params.get("is_nous", False)
         is_github_models = params.get("is_github_models", False)
         provider_name = str(params.get("provider_name") or "").strip().lower()
         base_url = params.get("base_url")
@@ -577,6 +656,14 @@ class ChatCompletionsTransport(ProviderTransport):
                 api_kwargs[k] = v
 
         _apply_zettlab_billing_headers(api_kwargs, params)
+
+        _add_prompt_cache_key(
+            api_kwargs,
+            messages=sanitized,
+            tools=api_kwargs.get("tools"),
+            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
+            or _is_openai_api_base_url(params.get("base_url")),
+        )
 
         return api_kwargs
 
@@ -729,6 +816,12 @@ class ChatCompletionsTransport(ProviderTransport):
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
 
+        _add_prompt_cache_key(
+            api_kwargs,
+            messages=sanitized,
+            tools=api_kwargs.get("tools"),
+            supports_prompt_cache_key=bool(profile.supports_prompt_cache_key),
+        )
         _apply_zettlab_billing_headers(api_kwargs, params)
 
         return api_kwargs

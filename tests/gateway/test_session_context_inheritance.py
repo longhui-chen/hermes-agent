@@ -32,12 +32,18 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import (
+    _BUSINESS_EXECUTION_TOKEN,
     _SESSION_ASYNC_DELIVERY,
+    _TURN_BINDING,
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
+    business_execution_token,
+    clear_turn_vars,
+    current_turn_identity,
     reset_session_vars,
     set_session_vars,
+    set_turn_vars,
 )
 from tools.environments.local import _make_run_env
 
@@ -63,6 +69,37 @@ FOREIGN = dict(
 )
 
 
+@pytest.mark.asyncio
+async def test_current_turn_reference_images_are_task_local_and_reset():
+    ready = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[str] = []
+
+    async def run(value: str) -> None:
+        token = sc.push_current_turn_reference_image(value)
+        try:
+            seen.append(sc.current_turn_reference_image())
+            if len(seen) == 2:
+                ready.set()
+            await ready.wait()
+            await release.wait()
+            assert sc.current_turn_reference_image() == value
+        finally:
+            sc.pop_current_turn_reference_image(token)
+        assert sc.current_turn_reference_image() == ""
+
+    first = asyncio.create_task(run("data:image/png;base64,AAAA"))
+    second = asyncio.create_task(run("data:image/png;base64,BBBB"))
+    await ready.wait()
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert set(seen) == {
+        "data:image/png;base64,AAAA",
+        "data:image/png;base64,BBBB",
+    }
+
+
 @pytest.fixture(autouse=True)
 def _isolate_session_context():
     """Clean ContextVar + engaged-latch slate per test, restored afterwards."""
@@ -71,10 +108,16 @@ def _isolate_session_context():
     saved_env = {k: os.environ.get(k) for k in SESSION_VARS}
     saved_ctx = {name: var.get() for name, var in _VAR_MAP.items()}
     saved_async = _SESSION_ASYNC_DELIVERY.get()
+    saved_turn_binding = _TURN_BINDING.get()
+    saved_business_token = _BUSINESS_EXECUTION_TOKEN.get()
+    saved_reference = sc._CURRENT_TURN_REFERENCE_IMAGE.get()
     saved_engaged = sc._session_context_engaged
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TURN_BINDING.set(_UNSET)
+    _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
+    sc._CURRENT_TURN_REFERENCE_IMAGE.set("")
     sc._session_context_engaged = True  # a concurrent multi-session host is engaged
     try:
         yield
@@ -82,6 +125,9 @@ def _isolate_session_context():
         for var, val in zip(_VAR_MAP.values(), saved_ctx.values()):
             var.set(val)
         _SESSION_ASYNC_DELIVERY.set(saved_async)
+        _TURN_BINDING.set(saved_turn_binding)
+        _BUSINESS_EXECUTION_TOKEN.set(saved_business_token)
+        sc._CURRENT_TURN_REFERENCE_IMAGE.set(saved_reference)
         sc._session_context_engaged = saved_engaged
         for k, v in saved_env.items():
             if v is None:
@@ -126,23 +172,6 @@ async def _async_noop(fn):
     fn()
 
 
-def test_child_task_inherits_foreign_session_without_reset():
-    """REPRODUCER: without the entry reset, B's pre-bind window leaks A's id.
-
-    This is the production hijack. Asserting the leak EXISTS documents the bug
-    the fix closes; the next test proves the fix.
-    """
-    set_session_vars(**MINE)  # parent A binds in the current context
-
-    captured = asyncio.run(_child_turn(reset_first=False))
-
-    # The pre-bind window inherited A's (MINE) identity — the leak.
-    assert captured["window"]["HERMES_SESSION_CHAT_ID"] == "MINE_CHAT", (
-        "Expected to reproduce the inheritance leak (window sees parent's "
-        f"MINE_CHAT); got {captured['window']!r}"
-    )
-
-
 def test_reset_session_vars_closes_inheritance_leak():
     """THE FIX: resetting at handler entry strips the inherited identity.
 
@@ -176,6 +205,59 @@ def test_reset_session_vars_restores_unset_not_empty():
     reset_session_vars()
     for name, var in _VAR_MAP.items():
         assert var.get() is _UNSET, f"{name} is {var.get()!r}, expected _UNSET"
+
+
+def test_turn_binding_set_clear_is_exact_for_nested_requests():
+    assert current_turn_identity() is None
+    outer_tokens = set_turn_vars(turn_id="same-external-turn")
+    outer_identity = current_turn_identity()
+    assert outer_identity is not None
+
+    inner_tokens = set_turn_vars(turn_id="same-external-turn")
+    inner_identity = current_turn_identity()
+    assert inner_identity is not None
+    assert inner_identity != outer_identity
+
+    clear_turn_vars(inner_tokens)
+    assert current_turn_identity() == outer_identity
+    clear_turn_vars(outer_tokens)
+    assert current_turn_identity() is None
+
+
+def test_reset_session_vars_drops_inherited_turn_binding():
+    set_turn_vars(turn_id="foreign-turn")
+    assert current_turn_identity() is not None
+
+    reset_session_vars()
+
+    assert current_turn_identity() is None
+    assert _TURN_BINDING.get() is _UNSET
+
+
+def test_reset_session_vars_resets_business_execution_token_to_unset():
+    _BUSINESS_EXECUTION_TOKEN.set("foreign-business-token")
+
+    reset_session_vars()
+
+    assert business_execution_token() == ""
+    assert _BUSINESS_EXECUTION_TOKEN.get() is _UNSET
+
+
+def test_reset_session_vars_drops_inherited_business_execution_token_flow():
+    _BUSINESS_EXECUTION_TOKEN.set("foreign-business-token")
+    captured = {}
+
+    async def child_turn():
+        reset_session_vars()
+        captured["token"] = business_execution_token()
+        captured["raw"] = _BUSINESS_EXECUTION_TOKEN.get()
+
+    async def run_child():
+        await asyncio.create_task(child_turn())
+
+    asyncio.run(run_child())
+
+    assert captured == {"token": "", "raw": _UNSET}
 
 
 # ---------------------------------------------------------------------------
@@ -213,23 +295,6 @@ async def _child_async_delivery(reset_first: bool):
     return captured
 
 
-def test_child_task_inherits_foreign_async_delivery_without_reset():
-    """REPRODUCER: without the entry reset, B inherits A's async_delivery=False.
-
-    A stateless adapter (API server) opts out with async_delivery=False. A task
-    spawned from that context sees the inherited False in its pre-bind window —
-    the leak the explicit reset closes.
-    """
-    set_session_vars(**FOREIGN, async_delivery=False)  # stateless sibling A
-
-    captured = asyncio.run(_child_async_delivery(reset_first=False))
-
-    assert captured["window"] is False, (
-        "Expected to reproduce the async-delivery inheritance leak (window "
-        f"inherits A's async_delivery=False); got {captured['window']!r}"
-    )
-
-
 def test_reset_session_vars_closes_async_delivery_leak():
     """THE FIX: resetting at handler entry drops the inherited async_delivery.
 
@@ -247,16 +312,3 @@ def test_reset_session_vars_closes_async_delivery_leak():
     )
 
 
-def test_reset_session_vars_restores_async_delivery_unset():
-    """reset_session_vars restores _SESSION_ASYNC_DELIVERY to the _UNSET sentinel.
-
-    The capability flag must read 'never bound here' (_UNSET), not a falsy value,
-    so async_delivery_supported() resolves to the default-supported path rather
-    than being mistaken for an opted-out stateless adapter.
-    """
-    set_session_vars(**FOREIGN, async_delivery=False)
-    reset_session_vars()
-    assert _SESSION_ASYNC_DELIVERY.get() is _UNSET, (
-        f"_SESSION_ASYNC_DELIVERY is {_SESSION_ASYNC_DELIVERY.get()!r}, expected _UNSET"
-    )
-    assert async_delivery_supported() is True

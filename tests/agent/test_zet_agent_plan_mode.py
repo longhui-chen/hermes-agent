@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from agent.conversation_loop import (
     _apply_forced_present_plan_tool_choice,
+    _apply_zet_agent_plan_tool_visibility,
     _is_thinking_tool_choice_rejection,
     _is_unsupported_thinking_parameter_error,
     _should_end_after_present_plan,
@@ -265,7 +266,7 @@ def test_present_plan_does_not_end_turn_when_auto_execute_enabled():
     )
 
 
-def test_present_plan_tool_result_does_not_end_regular_tool_turns():
+def test_present_plan_does_not_end_regular_tool_turns():
     assert not _should_end_after_present_plan(
         _agent(
             _zet_agent_plan_mode_active=False,
@@ -374,3 +375,50 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         assert "## 工作风格" in text
         assert "## 计划先行（Plan-First）" in text
         assert "## 用户画像语言" in text
+        # 工作目录契约是设备上唯一能让模型避开 scope 外锚点的说明；丢了它
+        # 模型只能靠撞墙学习，所以这里钉住它的存在。
+        assert "## 工作目录与路径" in text
+        assert "绝对路径" in text
+        # 相对路径两头都不能承诺：文件工具只在没跑过终端命令时锚到产出目录，
+        # 一旦 cd 过就跟着终端走；终端命令参数则从来不锚到 ZET_AGENT_OUTPUT_DIR。
+        # 把任何一头说成无条件的，模型都会把产物写到收不回来的地方。
+        assert "相对路径没有稳定含义" in text
+        assert "终端命令的锚点也不与文件工具共用" in text
+
+
+def test_workflow_addendum_workdir_alias_line_follows_capability(monkeypatch):
+    """`agent_output` 只在终端工具真能解析它时才教——别名没落地的运行时会把它
+    当普通路径原样 cd，教了反而让命令失败。"""
+    from gateway.platforms import zet_agent
+
+    monkeypatch.setattr(zet_agent, "_agent_output_alias_available", lambda: False)
+    assert "agent_output" not in zet_agent._zettlab_workflow_addendum(True)
+
+    monkeypatch.setattr(zet_agent, "_agent_output_alias_available", lambda: True)
+    with_alias = zet_agent._zettlab_workflow_addendum(True)
+    assert "workdir='agent_output'" in with_alias
+    assert "## 工作目录与路径" in with_alias
+
+
+def test_trusted_video_execution_never_hides_present_plan(monkeypatch):
+    agent = _agent()
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"terminal", "todo"}),
+    )
+    api_kwargs = {
+        "tools": [
+            {"type": "function", "function": {"name": "present_plan"}},
+            {"type": "function", "function": {"name": "terminal"}},
+            {"type": "function", "function": {"name": "write_file"}},
+        ]
+    }
+
+    assert _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
+    assert [
+        tool["function"]["name"] for tool in api_kwargs["tools"]
+    ] == ["present_plan", "terminal"]

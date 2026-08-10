@@ -22,6 +22,7 @@ Usage::
 import json
 import os
 import re
+import stat
 import shlex
 import shutil
 import stat
@@ -372,6 +373,34 @@ def get_profile_dir(name: str) -> Path:
     return _get_profiles_root() / canon
 
 
+def _prepare_private_profiles_root() -> Path:
+    """Create the shared profile parent as an owner-only traversal barrier."""
+    profiles_root = _get_profiles_root()
+    profiles_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = os.lstat(profiles_root)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise OSError(f"Profile root is not a directory: {profiles_root}")
+    os.chmod(profiles_root, 0o700, follow_symlinks=False)
+    return profiles_root
+
+
+def _secure_profile_root(profile_dir: Path) -> None:
+    """Keep a profile and its direct secret file private at creation time."""
+    info = os.lstat(profile_dir)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise OSError(f"Profile path is not a directory: {profile_dir}")
+    os.chmod(profile_dir, 0o700, follow_symlinks=False)
+
+    env_path = profile_dir / ".env"
+    try:
+        env_info = os.lstat(env_path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(env_info.st_mode) or stat.S_ISLNK(env_info.st_mode):
+        raise OSError(f"Profile .env is not a regular file: {env_path}")
+    os.chmod(env_path, 0o600, follow_symlinks=False)
+
+
 def profile_exists(name: str) -> bool:
     """Check whether a profile directory exists."""
     canon = normalize_profile_name(name)
@@ -406,7 +435,7 @@ def check_alias_collision(name: str) -> Optional[str]:
     try:
         result = subprocess.run(
             ["where" if is_windows else "which", canon],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         if result.returncode == 0:
             existing_path = result.stdout.strip().splitlines()[0]
@@ -414,7 +443,7 @@ def check_alias_collision(name: str) -> Optional[str]:
             expected = wrapper_dir / (f"{canon}.bat" if is_windows else canon)
             if existing_path == str(expected):
                 try:
-                    content = expected.read_text()
+                    content = expected.read_text(encoding="utf-8")
                     if "hermes -p" in content:
                         return None  # it's our wrapper, safe to overwrite
                 except Exception:
@@ -458,7 +487,7 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
     if is_windows:
         wrapper_path = wrapper_dir / f"{canon}.bat"
         try:
-            wrapper_path.write_text(f"@echo off\r\nhermes -p {profile} %*\r\n")
+            wrapper_path.write_text(f"@echo off\r\nhermes -p {profile} %*\r\n", encoding="utf-8")
             return wrapper_path
         except OSError as e:
             print(f"⚠ Could not create wrapper at {wrapper_path}: {e}")
@@ -467,7 +496,7 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
         wrapper_path = wrapper_dir / canon
         try:
             hermes_exe = shutil.which("hermes") or "hermes"
-            wrapper_path.write_text(f'#!/bin/sh\nexec {shlex.quote(hermes_exe)} -p {profile} "$@"\n')
+            wrapper_path.write_text(f'#!/bin/sh\nexec {shlex.quote(hermes_exe)} -p {profile} "$@"\n', encoding="utf-8")
             wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
             return wrapper_path
         except OSError as e:
@@ -496,7 +525,7 @@ def remove_wrapper_script(name: str) -> bool:
         if wrapper_path.exists():
             try:
                 # Verify it's our wrapper before removing
-                content = wrapper_path.read_text()
+                content = wrapper_path.read_text(encoding="utf-8")
                 if "hermes -p" in content:
                     wrapper_path.unlink()
                     return True
@@ -683,9 +712,10 @@ def _read_config_model(profile_dir: Path) -> tuple:
     if not config_path.exists():
         return None, None
     try:
-        import yaml
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        # Multi-profile display read: load_config() targets the ACTIVE
+        # profile's home, so read THIS profile's file via the raw primitive.
+        from hermes_cli.config import read_user_config_raw
+        cfg = read_user_config_raw(config_path)
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str):
             return model_cfg, None
@@ -1036,7 +1066,8 @@ def create_profile(
             "Cannot create a profile named 'default' — it is the built-in profile (~/.hermes)."
         )
 
-    profile_dir = get_profile_dir(canon)
+    profiles_root = _prepare_private_profiles_root()
+    profile_dir = profiles_root / canon
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
@@ -1064,14 +1095,18 @@ def create_profile(
             symlinks=True,
             ignore=_clone_all_copytree_ignore(source_dir),
         )
+        _secure_profile_root(profile_dir)
         # Strip runtime files
         for stale in _CLONE_ALL_STRIP:
             (profile_dir / stale).unlink(missing_ok=True)
     else:
         # Bootstrap directory structure
-        profile_dir.mkdir(parents=True, exist_ok=True)
+        profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _secure_profile_root(profile_dir)
         for subdir in _PROFILE_DIRS:
-            (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+            (profile_dir / subdir).mkdir(
+                mode=0o700, parents=True, exist_ok=True
+            )
 
         # Clone config files from source
         if source_dir is not None:
@@ -1124,6 +1159,7 @@ def create_profile(
             os.chmod(str(env_path), 0o600)
         except OSError:
             pass  # best-effort — save_env_value creates the file on demand
+    _secure_profile_root(profile_dir)
 
     # Seed a default SOUL.md so the user has a file to customize immediately.
     # Skipped when the profile already has one (from --clone / --clone-all).
@@ -1206,7 +1242,7 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
              "r = sync_skills(quiet=True); print(json.dumps(r))"],
             env={**os.environ, "HERMES_HOME": str(profile_dir)},
             cwd=str(project_root),
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout.strip())
@@ -1755,7 +1791,7 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         return
 
     try:
-        raw = pid_file.read_text().strip()
+        raw = pid_file.read_text(encoding="utf-8").strip()
         data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
         pid = int(data["pid"])
         # Route through terminate_pid so Windows uses the appropriate
@@ -1796,7 +1832,7 @@ def get_active_profile() -> str:
     """
     path = _get_active_profile_path()
     try:
-        name = path.read_text().strip()
+        name = path.read_text(encoding="utf-8").strip()
         if not name:
             return "default"
         return name
@@ -1825,7 +1861,7 @@ def set_active_profile(name: str) -> None:
     else:
         # Atomic write
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(canon + "\n")
+        tmp.write_text(canon + "\n", encoding="utf-8")
         tmp.replace(path)
 
 
@@ -2060,8 +2096,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
-    profiles_root = _get_profiles_root()
-    profiles_root.mkdir(parents=True, exist_ok=True)
+    profiles_root = _prepare_private_profiles_root()
 
     with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
         staging_root = Path(tmpdir)
@@ -2078,7 +2113,16 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
             final_source = staging_root / canon
             extracted.rename(final_source)
 
+        _secure_profile_root(final_source)
         shutil.move(str(final_source), str(profile_dir))
+
+    env_path = profile_dir / ".env"
+    if not env_path.exists():
+        env_path.write_text(
+            "# Per-profile secrets for this imported Hermes profile.\n",
+            encoding="utf-8",
+        )
+    _secure_profile_root(profile_dir)
 
     return profile_dir
 

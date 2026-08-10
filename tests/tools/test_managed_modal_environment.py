@@ -145,6 +145,43 @@ def test_managed_modal_execute_polls_until_completed(monkeypatch):
     assert any(call[0] == "POST" and call[1].endswith("/execs") for call in calls)
 
 
+def test_managed_modal_execute_injects_task_local_context(monkeypatch):
+    _install_fake_tools_package()
+    managed_modal = _load_tool_module("tools.environments.managed_modal", "environments/managed_modal.py")
+
+    exec_payloads = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        if method == "POST" and url.endswith("/v1/sandboxes"):
+            return _FakeResponse(200, {"id": "sandbox-1"})
+        if method == "POST" and url.endswith("/execs"):
+            exec_payloads.append(json)
+            return _FakeResponse(200, {
+                "execId": json["execId"],
+                "status": "completed",
+                "output": "ok",
+                "returncode": 0,
+            })
+        if method == "POST" and url.endswith("/terminate"):
+            return _FakeResponse(200, {"status": "terminated"})
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+    monkeypatch.setattr(managed_modal.requests, "request", fake_request)
+
+    env = managed_modal.ManagedModalEnvironment(image="python:3.11")
+    env._unset_snapshot_ephemeral_env_script = lambda: ["unset HERMES_TURN_ID"]
+    env._snapshot_ephemeral_env_exports = lambda: ["export HERMES_TURN_ID=turn-current"]
+    result = env.execute("echo hello")
+    env.cleanup()
+
+    assert result == {"output": "ok", "returncode": 0}
+    assert exec_payloads[0]["command"] == (
+        "unset HERMES_TURN_ID\n"
+        "export HERMES_TURN_ID=turn-current\n"
+        "echo hello"
+    )
+
+
 def test_managed_modal_create_sends_a_stable_idempotency_key(monkeypatch):
     _install_fake_tools_package()
     managed_modal = _load_tool_module("tools.environments.managed_modal", "environments/managed_modal.py")

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import posixpath
+import stat
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -164,7 +165,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -269,6 +270,44 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
+def _managed_gateway_output_dir() -> str | None:
+    """受管网关下平台供给的 agent output 目录，作为相对路径的兜底锚点。
+
+    multiplex 网关形态没有终端 live cwd、注册的 session cwd 和 ``$TERMINAL_CWD``
+    可供锚定，原兜底会落到 root 守护进程的 HOME（scope 外）：相对路径写入必被
+    守卫 403 拦截，读取则报出误导性的 ``/root/...`` 路径。锚到 agent 自己的可写
+    地盘在安全上成立——文件工具的目标始终是显式路径，藏不住任何写入，用户文件
+    必然走绝对路径、保护照常；它也不像终端 cwd 那样兼任 project-context 加载根。
+
+    tools/runtime_workdir.py 合入后本 helper 自然收敛到那份共享实现；在此之前
+    保留一份语义一致的内联实现（profile scope 优先，须为已存在的绝对目录）。
+    任何异常都视为不可用、沿用原兜底，绝不让文件工具因此抛错（HR2）。
+    """
+    if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+        return None
+    try:
+        try:
+            from tools.runtime_workdir import agent_output_dir
+        except ImportError:
+            pass
+        else:
+            value = agent_output_dir()
+            return str(value) if value else None
+        # 受管网关是 multiplex 单进程：进程级 os.environ 里的
+        # ZET_AGENT_OUTPUT_DIR 可能是**另一个 profile** 留下的，拿它当锚点会让
+        # 相对读写落到别人的产出目录（HR3）。所以 scope 取不到就当不可用，
+        # 沿用原兜底，绝不回落进程环境。
+        from agent.secret_scope import get_secret
+
+        value = get_secret("ZET_AGENT_OUTPUT_DIR", "")
+        value = str(value or "").strip()
+        if value and os.path.isabs(value) and os.path.isdir(value):
+            return value
+        return None
+    except Exception:
+        return None
+
+
 def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root for divergence checks.
 
@@ -318,7 +357,9 @@ def _resolve_base_dir(
       3. A sentinel-free, absolute ``$TERMINAL_CWD`` (the worktree path set by
          ``cli.py``/``main.py`` for ``-w`` sessions). Used even before any
          terminal command has populated the live cwd registry.
-      4. The process cwd.
+      4. Managed multiplex gateway only (host paths): the platform-provisioned
+         agent output directory — see :func:`_managed_gateway_output_dir`.
+      5. The process cwd.
 
     The returned base is ALWAYS absolute. This is the core invariant that
     prevents the worktree-cwd divergence bug: a relative or sentinel
@@ -333,6 +374,11 @@ def _resolve_base_dir(
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
+    if not root and not container_paths:
+        # 受管网关下前三层锚点均无人供给，落到进程 cwd 会指向 root 守护进程的
+        # HOME（scope 外），故先锚到平台 output 目录；容器路径语义在沙箱内，
+        # host 目录对其无意义，保持原兜底不动。
+        root = _managed_gateway_output_dir()
     if root:
         base_text = _expand_tilde(root)
     else:
@@ -359,6 +405,36 @@ def _resolve_base_dir(
         # cwd once, here, so the result no longer depends on cwd at resolve().
         base = Path(os.getcwd()) / base
     return base.resolve()
+
+
+def _ops_uses_resolved_paths(task_id: str = "default") -> bool:
+    """Whether the ops layer should be handed this layer's resolved paths.
+
+    Passing the resolved path is what keeps the scope check, the dedup
+    bookkeeping and the actual I/O describing one file — but only while the
+    filesystem this process resolved against is the one the ops layer acts on.
+    Local is that case, and it is also the only backend the snapshot guard
+    protects, so it is the whole reason the alignment matters.
+
+    Every other backend executes elsewhere. An ssh session's ``notes.md`` must
+    stay relative so the remote shell anchors it against the remote cwd; a
+    container backend's must stay relative because the base this layer picks is
+    a host notion — :func:`_authoritative_workspace_root` falls through to a
+    raw ``$TERMINAL_CWD`` that is never mapped into the namespace, while
+    ``terminal_tool`` normalizes the container's own cwd to ``/workspace`` or
+    ``/root``. Handing either one a host absolute path names a different file
+    or none at all, so they keep the pre-existing raw-path behaviour.
+    """
+
+    return _terminal_env_type_for_task(task_id) == "local"
+
+
+def _ops_path(path: str, resolved: object, task_id: str = "default") -> str:
+    """Pick the path to hand the ops layer for an already-checked *path*."""
+
+    if not resolved or not _ops_uses_resolved_paths(task_id):
+        return path
+    return str(resolved)
 
 
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
@@ -526,7 +602,13 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
     try:
         resolved = _resolve_path_for_task(path, task_id)
     except (OSError, ValueError, RuntimeError):
+        sibling_error = _managed_sibling_profile_error(path, task_id)
+        if sibling_error:
+            return sibling_error
         return get_read_block_error(path)
+    sibling_error = _managed_sibling_profile_error(str(resolved), task_id)
+    if sibling_error:
+        return sibling_error
     return get_read_block_error(str(resolved))
 
 
@@ -568,29 +650,251 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
+    "/private/etc/",
+    # macOS: /private/var mirrors /var. Block the sensitive subtrees, NOT the
+    # whole thing — a blanket "/private/var/" refused every legitimate temp-file
+    # write, because $TMPDIR, /tmp, and /var/folders all realpath() into
+    # /private/var/folders/... on macOS (and _resolve_path_for_task resolves
+    # symlinks), and /private/var/tmp is a normal temp dir.
+    "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
-_hermes_config_resolved: str | None = None
-_hermes_config_resolved_loaded = False
+# Managed Claw secrets are consumed by a privileged, long-running gateway.
+# File tools run in-process and therefore must never be able to rewrite the
+# service EnvironmentFile/key or a multiplex profile's credential file.  Keep
+# the canonical R2 state root together with historical roots as
+# defense-in-depth. Historical entries remain denied paths, not supported
+# storage layouts.
+_MANAGED_CLAW_SECRET_ROOTS = (
+    "/volume1/system/zettos-main-data/com.zettlab.claw/secrets",
+    "/zettos/main/apps/com.zettlab.claw/data/secrets",
+    "/zettos/main/data/com.zettlab.claw/secrets",
+    "/volume1/subvol/apps/com.zettlab.claw/data/secrets",
+)
+_MANAGED_CLAW_HERMES_ROOTS = (
+    "/volume1/system/zettos-main-data/com.zettlab.claw/hermes_home",
+    "/zettos/main/apps/com.zettlab.claw/data/hermes_home",
+    "/zettos/main/data/com.zettlab.claw/hermes_home",
+    "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
+)
+_MANAGED_TERMINAL_HOME_ROOTS = (
+    "/run/zettlab-claw/terminal-homes",
+)
+
+
+def _path_within(candidate: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((candidate, root)) == root
+    except (OSError, ValueError):
+        return False
+
+
+def _managed_sibling_profile_error(
+    filepath: str,
+    task_id: str = "default",
+    managed_hermes_roots: tuple[str, ...] | None = None,
+) -> str | None:
+    """Deny managed file-tool access to every profile except the active one."""
+
+    if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        active_home = os.path.normpath(
+            os.path.realpath(str(get_hermes_home().expanduser()))
+        )
+    except Exception:
+        active_home = ""
+
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError, RuntimeError):
+        expanded = _expand_tilde(filepath)
+        resolved = (
+            os.path.normpath(os.path.realpath(expanded))
+            if os.path.isabs(expanded)
+            else ""
+        )
+    candidates = {
+        candidate
+        for candidate in (
+            resolved,
+            os.path.normpath(os.path.realpath(resolved)) if resolved else "",
+        )
+        if candidate and os.path.isabs(candidate)
+    }
+
+    profile_roots: set[str] = set()
+    configured_roots = managed_hermes_roots or _MANAGED_CLAW_HERMES_ROOTS
+    for configured_root in configured_roots:
+        for root in (
+            os.path.normpath(configured_root),
+            os.path.normpath(os.path.realpath(configured_root)),
+        ):
+            if os.path.isabs(root):
+                profile_roots.add(os.path.join(root, "profiles"))
+
+    allowed_home = ""
+    if active_home and os.path.isabs(active_home):
+        for profiles_root in profile_roots:
+            if (
+                os.path.dirname(active_home) == profiles_root
+                and os.path.basename(active_home) not in {"", ".", ".."}
+            ):
+                allowed_home = active_home
+                break
+
+    for candidate in candidates:
+        for profiles_root in profile_roots:
+            if not _path_within(candidate, profiles_root):
+                continue
+            if allowed_home and _path_within(candidate, allowed_home):
+                continue
+            return (
+                f"Refusing access to managed sibling profile path: {filepath}\n"
+                "Agent file tools are confined to the active profile."
+            )
+
+    # 同一条约束的另一半：agent 产出树。受管终端把每个 agent 的 output 归自己的
+    # UID、0700，所以 shell 天然进不去别人的产出；但文件工具跑在 root 网关进程里
+    # 没有这层保护，而相对路径此刻正锚在自己的 output 上——`../../agent-b/output/x`
+    # 就直接读到隔壁 agent 的产物（HR3）。绝对路径不受影响：它们不用这个锚点，
+    # 照常走 scope gate。
+    own_output = _managed_gateway_output_dir()
+    if own_output:
+        own_output = os.path.normpath(os.path.realpath(own_output))
+        agents_root = os.path.dirname(os.path.dirname(own_output))
+        own_agent_dir = os.path.dirname(own_output)
+        if os.path.isabs(agents_root) and os.path.basename(own_output) == "output":
+            for candidate in candidates:
+                if not _path_within(candidate, agents_root):
+                    continue
+                if _path_within(candidate, own_agent_dir):
+                    continue
+                return (
+                    f"Refusing access to another agent's data directory: {filepath}\n"
+                    "Relative paths are anchored to this agent's own output "
+                    "directory; pass an absolute path for files elsewhere."
+                )
+    return None
+
+
+def local_host_read_context_for_task(
+    task_id: str = "default",
+) -> tuple[str, tuple[str, ...]]:
+    """Snapshot non-I/O context required by a direct local host read."""
+    backend = _terminal_env_type_for_task(task_id)
+    if backend != "local":
+        raise ValueError(
+            f"Direct local image paths are unavailable with the {backend or 'non-local'} "
+            "terminal backend; provide the image as a base64 data URI instead."
+        )
+    return backend, tuple(_MANAGED_CLAW_HERMES_ROOTS)
+
+
+def _reject_windows_reparse_components(filepath: Path) -> None:
+    """Reject Windows symlink/junction components before canonical resolution."""
+    if sys.platform != "win32":
+        return
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    parts = filepath.parts
+    if not parts:
+        raise ValueError("Local image input path is invalid")
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current /= part
+        try:
+            component_stat = os.stat(current, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(f"Unable to inspect local image input: {exc}") from exc
+        if getattr(component_stat, "st_file_attributes", 0) & reparse_flag:
+            raise ValueError(
+                "Windows reparse paths are not supported for local image input"
+            )
+
+
+def resolve_host_read_path_for_task(
+    filepath: str,
+    task_id: str = "default",
+    *,
+    terminal_backend: str | None = None,
+    managed_hermes_roots: tuple[str, ...] | None = None,
+) -> tuple[Path, tuple[int, int]]:
+    """Resolve and authorize a model-supplied path for direct host reading.
+
+    Provider integrations use this when they need bytes rather than the
+    paginated ``read_file`` response. Direct host reads are valid only for the
+    local terminal backend; remote and sandboxed backends must use their own
+    file transport. The returned path is the strict canonical target and the
+    identity tuple must be checked again by the process that opens the file.
+    """
+    if terminal_backend is None:
+        backend, default_managed_roots = local_host_read_context_for_task(task_id)
+        if managed_hermes_roots is None:
+            managed_hermes_roots = default_managed_roots
+    else:
+        backend = terminal_backend
+    if backend != "local":
+        raise ValueError("Direct host reads require a verified local terminal backend")
+    from tools.environments.local import _msys_to_windows_path
+
+    lexical = Path(_expand_tilde(_msys_to_windows_path(filepath)))
+    if not lexical.is_absolute():
+        raise ValueError("Direct host reads require an absolute path")
+    _reject_windows_reparse_components(lexical)
+    if sys.platform != "win32" and lexical.is_symlink():
+        raise ValueError("Local image input must not be a symbolic link")
+    try:
+        canonical = lexical.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Unable to resolve local image input: {exc}") from exc
+
+    sibling_error = _managed_sibling_profile_error(
+        str(canonical),
+        task_id,
+        managed_hermes_roots,
+    )
+    if sibling_error:
+        raise ValueError(sibling_error)
+    blocked = get_read_block_error(str(canonical))
+    if blocked:
+        raise ValueError(blocked)
+    try:
+        authorized_stat = os.stat(canonical, follow_symlinks=False)
+        canonical_after = lexical.resolve(strict=True)
+        final_stat = os.stat(canonical_after, follow_symlinks=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Unable to authorize local image input: {exc}") from exc
+    if canonical_after != canonical or (
+        final_stat.st_dev,
+        final_stat.st_ino,
+    ) != (
+        authorized_stat.st_dev,
+        authorized_stat.st_ino,
+    ):
+        raise ValueError("Local image input changed while authorizing")
+    return canonical_after, (final_stat.st_dev, final_stat.st_ino)
 
 
 def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
-    global _hermes_config_resolved, _hermes_config_resolved_loaded
-    if _hermes_config_resolved_loaded:
-        return _hermes_config_resolved
-    _hermes_config_resolved_loaded = True
+    """Return the active profile's resolved Hermes config path.
+
+    A multiplex gateway changes ``get_hermes_home()`` through a ContextVar on
+    every profile dispatch.  A process-global single-value cache would pin the
+    first profile's config path and let later profiles rewrite their own
+    security settings.  Resolution is cheap and must remain request-scoped.
+    """
     try:
         from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
+
+        return str(get_config_path().resolve())
     except Exception:
         try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+            return str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
         except Exception:
-            _hermes_config_resolved = None
-    return _hermes_config_resolved
+            return None
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
@@ -609,6 +913,118 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
+    candidates = (resolved, normalized)
+    managed_secret_roots = list(_MANAGED_CLAW_SECRET_ROOTS)
+    managed_hermes_roots = list(_MANAGED_CLAW_HERMES_ROOTS)
+    configured_home = os.environ.get("HERMES_HOME", "").strip()
+    if configured_home and "\x00" not in configured_home:
+        try:
+            managed_hermes_roots.append(
+                str(Path(_expand_tilde(configured_home)).resolve())
+            )
+        except (OSError, ValueError):
+            pass
+    if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        try:
+            from hermes_constants import get_hermes_home
+
+            managed_hermes_roots.append(
+                str(get_hermes_home().expanduser().resolve())
+            )
+        except (OSError, ValueError):
+            pass
+
+    if any(
+        _path_within(candidate, root)
+        for candidate in candidates
+        for root in managed_secret_roots
+    ) or any(
+        os.path.basename(candidate) == ".env" and _path_within(candidate, root)
+        for candidate in candidates
+        for root in managed_hermes_roots
+    ):
+        return (
+            f"Refusing to write to managed secret path: {filepath}\n"
+            "Agent file tools cannot modify service or profile credentials."
+        )
+    # The managed gateway adds HERMES_LAZY_INSTALL_TARGET to sys.path during
+    # bootstrap.  A model-controlled .pth file or importable module below that
+    # root would execute in the privileged gateway process on a later import or
+    # restart.  The terminal subprocess runs under a separate unprivileged UID,
+    # but write_file/patch execute in-process, so enforce this as a hard file-tool
+    # boundary rather than relying on filesystem ownership alone.
+    if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        if any(
+            _path_within(candidate, root)
+            for candidate in candidates
+            for root in _MANAGED_TERMINAL_HOME_ROOTS
+        ):
+            return (
+                f"Refusing to write to managed terminal home path: {filepath}\n"
+                "Agent file tools cannot modify terminal runtime identities."
+            )
+
+        # User/project plugins and profile event hooks execute inside the
+        # privileged gateway. File tools also run in-process, so they may not
+        # rewrite either code root, including a sibling multiplex profile that
+        # could be activated later.
+        plugin_roots = list(managed_hermes_roots)
+        project_plugins_enabled = os.environ.get(
+            "HERMES_ENABLE_PROJECT_PLUGINS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        project_plugin_root = (
+            str((Path.cwd() / ".hermes" / "plugins").resolve())
+            if project_plugins_enabled
+            else ""
+        )
+        for candidate in candidates:
+            for root in plugin_roots:
+                try:
+                    relative_parts = Path(candidate).relative_to(root).parts
+                except (OSError, ValueError):
+                    continue
+                blocked_kind = next(
+                    (kind for kind in ("plugins", "hooks") if kind in relative_parts),
+                    "",
+                )
+                if not blocked_kind and relative_parts:
+                    if relative_parts[0] == "agent-hooks":
+                        blocked_kind = "agent-hooks"
+                    elif relative_parts[0] == "scripts":
+                        blocked_kind = "scripts"
+                if blocked_kind:
+                    code_kind = {
+                        "plugins": "plugin",
+                        "hooks": "hook",
+                        "agent-hooks": "shell hook",
+                        "scripts": "script",
+                    }[blocked_kind]
+                    return (
+                        f"Refusing to write to managed {code_kind} code path: {filepath}\n"
+                        "Agent file tools cannot modify code loaded by the gateway."
+                    )
+            if project_plugin_root and _path_within(candidate, project_plugin_root):
+                return (
+                    f"Refusing to write to managed plugin code path: {filepath}\n"
+                    "Agent file tools cannot modify code loaded by the gateway."
+                )
+
+        lazy_target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
+        if lazy_target and "\x00" not in lazy_target:
+            try:
+                lazy_root = str(Path(_expand_tilde(lazy_target)).resolve())
+                if os.path.commonpath((resolved, lazy_root)) == lazy_root:
+                    return (
+                        f"Refusing to write to managed runtime import path: {filepath}\n"
+                        "Agent file tools cannot modify executable Python import roots."
+                    )
+            except (OSError, ValueError):
+                # A malformed configured root is a deployment issue.  Do not
+                # broaden the deny to unrelated paths when it cannot be parsed.
+                pass
+    sibling_error = _managed_sibling_profile_error(filepath, task_id)
+    if sibling_error:
+        return sibling_error
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -793,6 +1209,8 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
 _READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
 _DEDUP_CAP = 1000             # dict; skip-identical-reread guard
 _READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
+_NOT_FOUND_CAP = 500          # dict; per-task negative-result cache for missing paths
+_NOT_FOUND_TTL_SECONDS = 60.0 # short TTL — a path that didn't exist may be created soon
 _READ_DEDUP_STATUS_MESSAGE = (
     "File unchanged since last read. The content from "
     "the earlier read_file result in this conversation is "
@@ -849,6 +1267,79 @@ def _cap_read_tracker_data(task_data: dict) -> None:
                 ts.pop(next(iter(ts)))
             except (StopIteration, KeyError):
                 break
+
+    nf = task_data.get("not_found")
+    if nf is not None and len(nf) > _NOT_FOUND_CAP:
+        excess = len(nf) - _NOT_FOUND_CAP
+        for _ in range(excess):
+            try:
+                nf.pop(next(iter(nf)))
+            except (StopIteration, KeyError):
+                break
+
+
+def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | None:
+    """Return cached not-found JSON for *(op, resolved_str)* if still fresh.
+
+    Skips the expensive subprocess + suggestion walk when the model retries
+    the same missing path. Observed in agent.log: a single typo'd path was
+    retried 13 times — each retry forked a shell to walk the parent directory
+    and score similar names.
+
+    *op* is "read" or "search" — kept separate because the two callers return
+    different error JSON shapes ("File not found:" vs "Path not found:").
+
+    Eviction: TTL or write_file/patch on the path (see invalidate_for_path).
+    """
+    import os as _os
+    import time
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        if not task_data:
+            return None
+        nf = task_data.get("not_found")
+        if not nf:
+            return None
+        entry = nf.get((op, resolved_str))
+        if entry is None:
+            return None
+        ts, cached_json = entry
+        if time.monotonic() - ts > _NOT_FOUND_TTL_SECONDS:
+            nf.pop((op, resolved_str), None)
+            return None
+    # Existence guard: the path may have been created since we cached the
+    # miss — by a terminal command, another agent, or any external process
+    # (write_file/patch invalidate explicitly, but they're not the only
+    # writers). The agent pattern "check file → create it → read it" is
+    # common; serving a stale miss for up to the TTL breaks it. One stat is
+    # ~free next to the subprocess walk we're skipping.
+    #
+    # The stat runs OUTSIDE _read_tracker_lock (matching the dedup mtime
+    # check below in read_file_tool): the lock is global across all tasks,
+    # and a hung stat on a dead network mount must not stall every other
+    # task's read/search bookkeeping.
+    if _os.path.exists(resolved_str):
+        with _read_tracker_lock:
+            task_data = _read_tracker.get(task_id)
+            nf = task_data.get("not_found") if task_data else None
+            if nf:
+                nf.pop((op, resolved_str), None)
+        return None
+    return cached_json
+
+
+def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str) -> None:
+    """Cache a not-found error so the next *op* call for *resolved_str* skips I/O."""
+    import time
+    with _read_tracker_lock:
+        task_data = _read_tracker.setdefault(task_id, {
+            "last_key": None, "consecutive": 0,
+            "read_history": set(), "dedup": {},
+            "dedup_hits": {}, "read_timestamps": {},
+        })
+        nf = task_data.setdefault("not_found", {})
+        nf[(op, resolved_str)] = (time.monotonic(), error_json)
+        _cap_read_tracker_data(task_data)
 
 
 def _is_internal_file_status_text(content: str) -> bool:
@@ -1042,12 +1533,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
+            if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
@@ -1106,7 +1598,7 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -1116,14 +1608,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # blocking on input).  Pure path check — no I/O.
         device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
-            return json.dumps({
-                "error": (
-                    f"Cannot read '{path}': this is a device file that would "
-                    "block or produce infinite output."
-                ),
-            })
+            return tool_error(
+                f"Cannot read '{path}': this is a device file that would "
+                "block or produce infinite output."
+            )
 
         _resolved = _resolve_path_for_task(path, task_id)
+
+        sibling_error = _managed_sibling_profile_error(str(_resolved), task_id)
+        if sibling_error:
+            return json.dumps({"error": sibling_error}, ensure_ascii=False)
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -1188,12 +1682,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
-            return json.dumps({
-                "error": (
-                    f"Cannot read binary file '{path}' ({_ext}). "
-                    "Use vision_analyze for images, or terminal to inspect binary files."
-                ),
-            })
+            return tool_error(
+                f"Cannot read binary file '{path}' ({_ext}). "
+                "Use vision_analyze for images, or terminal to inspect binary files."
+            )
 
         # ── Hermes internal path guard ────────────────────────────────
         # Prevent prompt injection via catalog or hub metadata files,
@@ -1204,7 +1696,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # the Python process cwd, which can differ.
         block_error = get_read_block_error(str(_resolved))
         if block_error:
-            return json.dumps({"error": block_error})
+            return tool_error(block_error)
+
+        # ── Negative-result cache ─────────────────────────────────────
+        # If we already discovered this path doesn't exist (within TTL),
+        # return the cached error without spawning the subprocess +
+        # similar-files walk. Cleared by write_file/patch on the same path.
+        resolved_str_for_neg = str(_resolved)
+        cached_not_found = _check_not_found_cache("read", resolved_str_for_neg, task_id)
+        if cached_not_found is not None:
+            return cached_not_found
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -1242,19 +1743,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                         _cap_read_tracker_data(task_data)
 
                     if hits >= 2:
-                        return json.dumps({
-                            "error": (
-                                f"BLOCKED: You have called read_file on this "
-                                f"exact region {hits + 1} times and the file "
-                                "has NOT changed. STOP calling read_file for "
-                                "this path — the content from your earlier "
-                                "read_file result in this conversation is "
-                                "still current. Proceed with your task using "
-                                "the information you already have."
-                            ),
-                            "path": path,
-                            "already_read": hits + 1,
-                        }, ensure_ascii=False)
+                        return tool_error(
+                            f"BLOCKED: You have called read_file on this "
+                            f"exact region {hits + 1} times and the file "
+                            "has NOT changed. STOP calling read_file for "
+                            "this path — the content from your earlier "
+                            "read_file result in this conversation is "
+                            "still current. Proceed with your task using "
+                            "the information you already have.",
+                            path=path,
+                            already_read=hits + 1,
+                        )
 
                     return json.dumps({
                         "status": "unchanged",
@@ -1267,9 +1766,29 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
+        # Read the path we just validated, not the raw argument: the ops layer
+        # anchors a relative path against the terminal cwd, which is not the
+        # base this function resolved against. Letting the two differ means the
+        # block check, dedup and staleness bookkeeping all describe a different
+        # file than the one actually read. ``_ops_path`` keeps a remote
+        # backend's relative paths relative — see its docstring.
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        result = file_ops.read_file(_ops_path(path, _resolved, task_id), offset, limit)
         result_dict = result.to_dict()
+
+        # ── Populate negative-result cache on not-found ───────────────
+        # _suggest_similar_files returns ReadResult(error="File not found: ..").
+        # Cache the JSON we'd return so a retry skips the parent-dir walk.
+        # Deliberately NO early return: on upstream, error results flow
+        # through the tracking block below (consecutive-loop detection,
+        # dedup bookkeeping via the resolved path) and the normal exit —
+        # short-circuiting here changes that behavior (and broke a real
+        # test interaction). Serving from the cache (above) is the
+        # optimization; recording must stay side-effect-identical.
+        _err = result_dict.get("error") or ""
+        if isinstance(_err, str) and _err.startswith("File not found:"):
+            _not_found_json = json.dumps(result_dict, ensure_ascii=False)
+            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -1380,15 +1899,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         if count >= 4:
             # Hard block: stop returning content to break the loop
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have read this exact file region {count} times in a row. "
-                    "The content has NOT changed. You already have this information. "
-                    "STOP re-reading and proceed with your task."
-                ),
-                "path": path,
-                "already_read": count,
-            }, ensure_ascii=False)
+            return tool_error(
+                f"BLOCKED: You have read this exact file region {count} times in a row. "
+                "The content has NOT changed. You already have this information. "
+                "STOP re-reading and proceed with your task.",
+                path=path,
+                already_read=count,
+            )
         elif count >= 3:
             result_dict["_warning"] = (
                 f"You have read this exact file region {count} times consecutively. "
@@ -1448,6 +1965,15 @@ def notify_other_tool_call(task_id: str = "default"):
             # progress, so clear per-key dedup hit counters too.
             if "dedup_hits" in task_data:
                 task_data["dedup_hits"].clear()
+            # Any other tool (terminal, delegate, ...) may have created a
+            # previously-missing path — a cached miss is no longer
+            # trustworthy. The serve-side existence guard in
+            # _check_not_found_cache already covers this, but clearing
+            # here keeps the cache honest and covers exotic cases the
+            # stat can't (e.g. permission flips).
+            nf = task_data.get("not_found")
+            if nf:
+                nf.clear()
 
 
 def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
@@ -1464,7 +1990,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     internally.
     """
     try:
-        resolved = str(_resolve_path(filepath))
+        resolved = str(_resolve_path(filepath, task_id))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -1472,12 +1998,18 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
         if task_data is None:
             return
         dedup = task_data.get("dedup")
-        if not dedup:
-            return
-        # Collect keys to remove (can't mutate dict during iteration).
-        stale_keys = [k for k in dedup if k[0] == resolved]
-        for k in stale_keys:
-            del dedup[k]
+        if dedup:
+            # Collect keys to remove (can't mutate dict during iteration).
+            stale_keys = [k for k in dedup if k[0] == resolved]
+            for k in stale_keys:
+                del dedup[k]
+        # Also evict from the negative-result cache: a write_file that
+        # creates the path means subsequent reads (or searches under it)
+        # must hit disk.
+        nf = task_data.get("not_found")
+        if nf:
+            nf.pop(("read", resolved), None)
+            nf.pop(("search", resolved), None)
 
 
 def _update_read_timestamp(filepath: str, task_id: str) -> None:
@@ -1652,6 +2184,42 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
+_V4A_FILE_HEADER = r'^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+)$'
+_V4A_MOVE_HEADER = r'^(\*\*\*\s*Move\s+File:\s*)(.+?)(\s*->\s*)(.+)$'
+
+
+def _rewrite_v4a_header_paths(patch: str, resolved: dict[str, str]) -> str:
+    """Replace V4A header paths with the absolute paths already resolved here.
+
+    Header paths are what the shell layer acts on, and it anchors a relative one
+    against its own cwd — a different base than this layer used for locking and
+    the scope pre-check. Rewriting keeps one answer for "which file". Headers
+    whose path did not resolve are left untouched so the existing error path
+    still reports them.
+    """
+
+    if not resolved:
+        return patch
+    import re as _re
+
+    def _swap(raw: str) -> str:
+        return resolved.get(raw.strip()) or raw
+
+    def _file_header(match: "re.Match[str]") -> str:
+        return match.group(1) + _swap(match.group(2))
+
+    def _move_header(match: "re.Match[str]") -> str:
+        return (
+            match.group(1)
+            + _swap(match.group(2))
+            + match.group(3)
+            + _swap(match.group(4))
+        )
+
+    patch = _re.sub(_V4A_MOVE_HEADER, _move_header, patch, flags=_re.MULTILINE)
+    return _re.sub(_V4A_FILE_HEADER, _file_header, patch, flags=_re.MULTILINE)
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -1775,7 +2343,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                # Same reason as ``replace`` above: the headers carry the paths
+                # the shell layer will act on, and it resolves a relative one
+                # against its own cwd. Rewrite them to the paths this layer
+                # already resolved, locked and scope-checked, so both layers
+                # agree on which files the patch touches.
+                result = file_ops.patch_v4a(
+                    _rewrite_v4a_header_paths(
+                        patch,
+                        _path_to_resolved
+                        if _ops_uses_resolved_paths(task_id)
+                        else {},
+                    )
+                )
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -1878,27 +2458,51 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             count = task_data["consecutive"]
 
         if count >= 4:
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have run this exact search {count} times in a row. "
-                    "The results have NOT changed. You already have this information. "
-                    "STOP re-searching and proceed with your task."
-                ),
-                "pattern": pattern,
-                "already_searched": count,
-            }, ensure_ascii=False)
+            return tool_error(
+                f"BLOCKED: You have run this exact search {count} times in a row. "
+                "The results have NOT changed. You already have this information. "
+                "STOP re-searching and proceed with your task.",
+                pattern=pattern,
+                already_searched=count,
+            )
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
+        sibling_error = _managed_sibling_profile_error(
+            str(resolved_path) if resolved_path else path,
+            task_id,
+        )
+        if sibling_error:
+            return json.dumps({"error": sibling_error}, ensure_ascii=False)
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
+            return tool_error(block_error)
 
+        # ── Negative-result cache ─────────────────────────────────────
+        # Search returns "Path not found: <path>" when the search root
+        # doesn't exist. The error path also lists the parent directory
+        # (file_operations.py:1402) — expensive to repeat. Cache so the
+        # next call to a known-missing root skips both shells.
+        try:
+            resolved_search_path = str(_resolve_path_for_task(path, task_id))
+        except (OSError, ValueError):
+            resolved_search_path = path
+        cached_search_nf = _check_not_found_cache("search", resolved_search_path, task_id)
+        if cached_search_nf is not None:
+            return cached_search_nf
+
+        # Search the path the block check just cleared. A relative path handed
+        # to the ops layer anchors against the terminal cwd instead, so the
+        # scope decision above would describe a different tree than the one
+        # actually walked. ``_ops_path`` keeps a remote backend's relative
+        # paths relative — see its docstring.
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern,
+            path=_ops_path(path, resolved_path, task_id),
+            target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
@@ -1913,6 +2517,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 f"{omitted} result(s) omitted because they target credential, "
                 "token, cache, or secret-bearing environment files."
             )
+
+        # Populate negative cache when search root was missing. No early
+        # return — same rationale as the read path: error results keep
+        # flowing through the consecutive-search bookkeeping below.
+        _search_err = result_dict.get("error") or ""
+        if isinstance(_search_err, str) and _search_err.startswith("Path not found:"):
+            _search_nf_json = json.dumps(result_dict, ensure_ascii=False)
+            _record_not_found("search", resolved_search_path, task_id, _search_nf_json)
 
         if count >= 3:
             result_dict["_warning"] = (
@@ -1952,7 +2564,7 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
         },
         "required": ["path"]
     }
@@ -1960,7 +2572,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
     "parameters": {
         "type": "object",
         "properties": {

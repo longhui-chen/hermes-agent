@@ -884,8 +884,11 @@ def test_runtime_import_barrier_allows_only_a_recreated_profile_generation(tmp_p
     profile_home.mkdir(parents=True)
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
 
-    active, owner = adapter._block_runtime_import_profile(profile_home)
-    assert active == 0
+    active_imports, active_api_runs, owner = adapter._block_runtime_import_profile(
+        profile_home
+    )
+    assert active_imports == 0
+    assert active_api_runs == 0
     adapter._complete_runtime_import_profile_unload(profile_home, owner)
     assert adapter._begin_runtime_import_operation(profile_home) is None
     profile_home.rmdir()
@@ -908,6 +911,24 @@ async def test_unload_then_sweep_does_not_recreate_deleted_profile(
     adapter._session_db = db
     adapter._session_dbs = {key: db}
     monkeypatch.setattr(adapter, "_multiplex_profile_homes", lambda: {})
+    from tools.process_registry import process_registry
+
+    purged_profiles = []
+    purged_approval_profiles = []
+    monkeypatch.setattr(
+        process_registry,
+        "purge_profile_state",
+        lambda owner: purged_profiles.append(owner) or {
+            "running_records": 0,
+            "finished_records": 0,
+            "pending_watchers": 0,
+            "completion_events": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.approval.purge_profile_approval_state",
+        lambda owner: purged_approval_profiles.append(owner) or {},
+    )
 
     class _Request(dict):
         def __init__(self):
@@ -923,6 +944,8 @@ async def test_unload_then_sweep_does_not_recreate_deleted_profile(
     response = await adapter._handle_profile_unload(_Request())
     assert response.status == 200
     assert adapter._session_db is None
+    assert purged_profiles == [str(profile_home.resolve())]
+    assert purged_approval_profiles == [str(profile_home.resolve())]
     shutil.rmtree(profile_home)
 
     assert await adapter._cleanup_stale_runtime_imports_once() == 0
@@ -1835,6 +1858,7 @@ def test_open_profile_session_db_accepts_stale_regular_sidecar(tmp_path):
         db.close()
 
 
+@pytest.mark.requires_writable_schema
 def test_malformed_profile_state_db_self_heals_on_open(tmp_path):
     """A corrupted state.db must self-heal through the sidecar-anchored open,
     not leave the profile's sessions/chat/import permanently unavailable."""
@@ -1871,3 +1895,37 @@ def test_malformed_profile_state_db_self_heals_on_open(tmp_path):
         if healed is not None:
             healed.close()
     assert list(profile_home.glob("state.db.malformed-backup-*"))  # backed up first
+
+
+@pytest.mark.asyncio
+async def test_cleanup_discovery_silently_skips_profile_without_state_db(
+    tmp_path, monkeypatch, caplog
+):
+    """A served profile that never opened a session has no state.db yet.
+
+    The discovery pass opens with create=False; the resulting
+    FileNotFoundError is an expected no-op, not a cleanup failure, so it
+    must not emit the per-profile failure warning.
+    """
+    import logging
+
+    empty_home = tmp_path / "profiles" / "fresh"
+    empty_home.mkdir(parents=True)
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._session_db = None
+    adapter._session_dbs = {}
+    adapter._ensure_session_db = lambda: None
+    monkeypatch.setattr(
+        adapter, "_multiplex_profile_homes", lambda: {"fresh": empty_home}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert await adapter._cleanup_stale_runtime_imports_once() == 0
+
+    assert not any(
+        "runtime import staging cleanup failed" in record.getMessage()
+        for record in caplog.records
+    )

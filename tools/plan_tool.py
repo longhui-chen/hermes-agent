@@ -28,6 +28,10 @@ from typing import List, Optional, Dict, Any, Callable
 _MAX_GROUPS = 20
 _MAX_ITEMS_PER_GROUP = 50
 _MAX_ITEM_LEN = 500
+PLAN_PRESENTED_RESULT = (
+    "Plan presented to user. "
+    "Stop and wait for the user's confirmation before executing."
+)
 
 
 def _format_plan_text(title: str, groups: List[Dict[str, Any]]) -> str:
@@ -81,6 +85,8 @@ def present_plan(
             for i in (g.get("items") or [])
             if str(i).strip()
         ][:_MAX_ITEMS_PER_GROUP]
+        if not items:
+            continue
         label = str(g.get("label", "")).strip() or "Steps"
         icon = str(g.get("icon", "")).strip() or ""
         # count 一律以裁剪后的 items 实际条数为准（schema 里 count 可选；传了也忽略，
@@ -92,12 +98,21 @@ def present_plan(
             "items": items,
         })
 
+    if not cleaned_groups:
+        return json.dumps(
+            {"error": "at least one non-empty plan group is required"},
+            ensure_ascii=False,
+        )
+
     if callback is not None:
         # zet_agent：推 hermes.plan SSE → App 渲染结构化计划卡。
         try:
             callback(title, cleaned_groups)
         except Exception:
-            pass
+            return json.dumps(
+                {"error": "failed to present plan"},
+                ensure_ascii=False,
+            )
         if auto_execute:
             # App plan 模式且开启自动执行：计划卡只读展示，agent 在同一 turn 直接
             # 继续执行，不再等用户点确认（manual 老路径见下方 return，完整保留）。
@@ -107,10 +122,7 @@ def present_plan(
                 "this same turn. Do NOT ask the user to confirm or say you are "
                 "waiting — just proceed, and track progress with the `todo` tool."
             )
-        return (
-            "Plan presented to user. "
-            "Stop and wait for the user's confirmation before executing."
-        )
+        return PLAN_PRESENTED_RESULT
 
     # 无 callback（CLI / messaging / api_server，无确认卡）：返回格式化计划文本，
     # 让 agent 能把计划完整呈现给用户，再停下等确认——否则计划内容丢失且 agent 空等。
@@ -171,6 +183,7 @@ PLAN_SCHEMA = {
             },
             "groups": {
                 "type": "array",
+                "minItems": 1,
                 "description": "Ordered list of step groups forming the plan.",
                 "items": {
                     "type": "object",
@@ -189,6 +202,7 @@ PLAN_SCHEMA = {
                         },
                         "items": {
                             "type": "array",
+                            "minItems": 1,
                             "items": {"type": "string"},
                             "description": "Concrete steps in this group (1-5 items).",
                         },

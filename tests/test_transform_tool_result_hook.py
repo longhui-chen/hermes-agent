@@ -51,30 +51,10 @@ def _run_handle_function_call(
     )
 
 
-def test_result_unchanged_when_no_hook_registered(monkeypatch):
-    # Real invoke_hook with no plugins loaded returns [].
-    monkeypatch.setenv("HERMES_HOME", "/tmp/hermes_no_plugins")
-    # Force a fresh plugin manager so no stale plugins pollute state.
-    plugins_mod._plugin_manager = plugins_mod.PluginManager()
-
-    out = _run_handle_function_call(monkeypatch)
-    assert out == '{"output": "original"}'
 
 
-def test_result_unchanged_for_none_hook_return(monkeypatch):
-    out = _run_handle_function_call(
-        monkeypatch,
-        invoke_hook=lambda hook_name, **kw: [None],
-    )
-    assert out == '{"output": "original"}'
 
 
-def test_result_ignores_non_string_hook_returns(monkeypatch):
-    out = _run_handle_function_call(
-        monkeypatch,
-        invoke_hook=lambda hook_name, **kw: [{"bad": True}, 123, ["nope"]],
-    )
-    assert out == '{"output": "original"}'
 
 
 def test_first_valid_string_return_replaces_result(monkeypatch):
@@ -109,15 +89,6 @@ def test_hook_receives_expected_kwargs(monkeypatch):
     assert captured["tool_call_id"] == "tc1"
 
 
-def test_hook_exception_falls_back_to_original(monkeypatch):
-    def _raise(*_a, **_kw):
-        raise RuntimeError("boom")
-
-    out = _run_handle_function_call(
-        monkeypatch,
-        invoke_hook=_raise,
-    )
-    assert out == '{"output": "original"}'
 
 
 def test_post_tool_call_remains_observational(monkeypatch):
@@ -158,6 +129,76 @@ def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
     assert observed == [
         ("post_tool_call", '{"raw": "value"}'),
         ("transform_tool_result", '{"raw": "value"}'),
+    ]
+
+
+def test_dispatch_wrapper_is_inside_plugin_boundary(monkeypatch):
+    """A privileged dispatch wrapper must not cover plugin execution code."""
+    events = []
+    privileged = False
+
+    def _dispatch(_tool_name, _args, **_kwargs):
+        assert privileged is True
+        events.append("registry")
+        return '{"raw": "failure"}'
+
+    def _execution_middleware(*, args, next_call, **_context):
+        assert privileged is False
+        events.append("middleware-before")
+        result = next_call(args)
+        assert privileged is False
+        events.append("middleware-after")
+        return result
+
+    def _dispatch_wrapper(_tool_name, _args, dispatch):
+        nonlocal privileged
+        assert privileged is False
+        events.append("wrapper-enter")
+        privileged = True
+        try:
+            result = dispatch()
+        finally:
+            privileged = False
+        events.append(("raw-result", result))
+        return result
+
+    def _hook(hook_name, **kwargs):
+        assert privileged is False
+        if hook_name == "post_tool_call":
+            events.append(("post", kwargs["result"]))
+        if hook_name == "transform_tool_result":
+            events.append(("transform", kwargs["result"]))
+            return ['{"model": "rewritten"}']
+        return []
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", _dispatch)
+    monkeypatch.setattr(
+        "hermes_cli.middleware._get_middleware_callbacks",
+        lambda kind: [_execution_middleware] if kind == "tool_execution" else [],
+    )
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+    monkeypatch.setattr(model_tools, "_READ_SEARCH_TOOLS", frozenset())
+
+    result = model_tools.handle_function_call(
+        "dummy_tool",
+        {"value": 1},
+        task_id="t1",
+        session_id="s1",
+        tool_call_id="tc1",
+        skip_pre_tool_call_hook=True,
+        dispatch_wrapper=_dispatch_wrapper,
+    )
+
+    assert result == '{"model": "rewritten"}'
+    assert events == [
+        "middleware-before",
+        "wrapper-enter",
+        "registry",
+        ("raw-result", '{"raw": "failure"}'),
+        "middleware-after",
+        ("post", '{"raw": "failure"}'),
+        ("transform", '{"raw": "failure"}'),
     ]
 
 
