@@ -267,6 +267,46 @@ def _get_default_output_dir() -> str:
     return str(get_hermes_dir("cache/audio", "audio_cache"))
 
 DEFAULT_OUTPUT_DIR = _get_default_output_dir()
+_SAFE_SESSION_OUTPUT_BUCKET_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _default_output_dir_for_session(*, platform: str, session_id: str) -> Path:
+    """Resolve the per-call default without leaking another profile's root.
+
+    Managed Zettlab turns expose a profile-scoped semantic Agent output root.
+    TTS audio is a user-visible artifact there, not an internal Hermes cache
+    entry. Other platforms retain the historical cache behavior because their
+    delivery adapters consume the returned ``MEDIA:`` path directly.
+    """
+
+    if (
+        str(platform or "").strip().lower() != "zet_agent"
+        or os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+    ):
+        return Path(DEFAULT_OUTPUT_DIR)
+
+    try:
+        from tools.runtime_workdir import agent_output_dir
+
+        output_root = agent_output_dir()
+    except Exception:
+        output_root = None
+    if not output_root:
+        logger.warning(
+            "Managed Zettlab Agent output is unavailable; using the TTS cache"
+        )
+        return Path(DEFAULT_OUTPUT_DIR)
+
+    root = Path(output_root)
+    bucket = str(session_id or "").strip().rsplit(":", 1)[-1]
+    if not bucket:
+        return root
+    if not _SAFE_SESSION_OUTPUT_BUCKET_RE.fullmatch(bucket):
+        logger.warning(
+            "Unsafe Zettlab session output bucket ignored; using flat Agent output"
+        )
+        return root
+    return root / bucket
 
 # ---------------------------------------------------------------------------
 # Per-provider input-character limits (from official provider docs).
@@ -2878,11 +2918,14 @@ def text_to_speech_tool(
 
     On messaging platforms, the returned MEDIA:<path> tag is intercepted
     by the send pipeline and delivered as a native voice message.
-    In CLI mode, the file is saved to ~/voice-memos/.
+    In managed Zettlab mode, the file is saved to the current Agent session's
+    product output directory. Other platforms keep the Hermes audio cache.
 
     Args:
         text: The text to convert to speech.
-        output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
+        output_path: Optional custom save path. Managed Zettlab sessions default
+            to the current Agent output bucket; other platforms use the Hermes
+            audio cache.
         speed: Optional playback speed multiplier (0.25-4.0). Overrides config.yaml.
         instructions: Optional voice-design guidance (tone, emotion, pacing,
             accent, whispering). Forwarded to the OpenAI backend
@@ -2949,6 +2992,7 @@ def text_to_speech_tool(
     # always outputs MP3 and needs ffmpeg for conversion.
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
+    session_id = get_session_env("HERMES_SESSION_ID", "")
     want_opus = platform in OPUS_VOICE_PLATFORMS
 
     # Determine output path
@@ -2991,7 +3035,10 @@ def text_to_speech_tool(
             }, ensure_ascii=False)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
+        out_dir = _default_output_dir_for_session(
+            platform=platform,
+            session_id=session_id,
+        )
         out_dir.mkdir(parents=True, exist_ok=True)
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
@@ -4033,7 +4080,12 @@ TTS_SCHEMA = {
             },
             "output_path": {
                 "type": "string",
-                "description": f"Optional custom file path to save the audio. Defaults to {display_hermes_home()}/audio_cache/<timestamp>.mp3"
+                "description": (
+                    "Optional custom file path to save the audio. Managed "
+                    "Zettlab sessions default to the current Agent's product "
+                    "output bucket; other platforms default to "
+                    f"{display_hermes_home()}/audio_cache/<timestamp>.mp3"
+                )
             },
             "speed": {
                 "type": "number",
