@@ -655,6 +655,21 @@ def build_turn_context(
         else:
             with persist_lock:
                 agent._ensure_db_session()
+        if (
+            getattr(agent, "_system_prompt_persist_pending", False)
+            and getattr(agent, "_session_db", None) is not None
+        ):
+            updated = agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+            if updated is not False:
+                agent._system_prompt_persist_pending = False
+            else:
+                logger.warning(
+                    "System prompt still could not be persisted after session "
+                    "row creation (session=%s)",
+                    agent.session_id or "none",
+                )
     except Exception:
         logger.warning(
             "Turn-start session row creation failed for session=%s",

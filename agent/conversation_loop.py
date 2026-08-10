@@ -98,6 +98,17 @@ from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
+
+def _onboarding_fast_retry_delay(agent, status_code, is_rate_limited):
+    """Return the onboarding-only 502 retry delay, else ``None``."""
+    if (
+        getattr(agent, "_onboarding_fast_retry", False)
+        and status_code == 502
+        and not is_rate_limited
+    ):
+        return 0.25
+    return None
+
 logger = logging.getLogger(__name__)
 
 # Stable prefix of the local interrupt status string emitted when a turn is
@@ -1392,8 +1403,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            updated = agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+            agent._system_prompt_persist_pending = updated is False
         except Exception as exc:
+            agent._system_prompt_persist_pending = True
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
                 "%s. Subsequent turns will rebuild the system prompt and "
@@ -6684,6 +6699,15 @@ def run_conversation(
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                onboarding_retry_delay = _onboarding_fast_retry_delay(
+                    agent, status_code, is_rate_limited
+                )
+                if onboarding_retry_delay is not None:
+                    # Onboarding gets exactly one fast retry (the agent factory
+                    # caps max_retries at two).  Normal Agent traffic keeps the
+                    # existing adaptive backoff unchanged.
+                    wait_time = onboarding_retry_delay
+                    _backoff_policy = "onboarding_fast_502"
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,

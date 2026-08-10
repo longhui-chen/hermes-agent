@@ -134,6 +134,36 @@ _zettlab_request_account_id: ContextVar[str] = ContextVar(
 )
 
 
+def _onboarding_deepseek_fast_path(
+    *,
+    profile: str,
+    model: str,
+    reasoning_config: Optional[Dict[str, Any]],
+    request_overrides: Optional[Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], Dict[str, Any], bool]:
+    """Apply the wire-level DeepSeek fast path only to system onboarding.
+
+    The device routes the catalog's ``deepseek-v4-flash`` model through the
+    local ``custom`` OpenAI-compatible proxy.  Provider-profile dispatch is
+    therefore based on ``custom`` rather than ``deepseek`` and cannot add the
+    DeepSeek-specific ``extra_body.thinking`` field for us.  Put the supported
+    field on the final request overrides so this is effective on the wire,
+    while leaving every normal Agent request untouched.
+    """
+    normalized_profile = str(profile or "main").strip().lower()
+    normalized_model = str(model or "").strip().lower()
+    overrides = dict(request_overrides or {})
+    if normalized_profile != "onboarding" or not normalized_model.startswith(
+        "deepseek-v4-"
+    ):
+        return reasoning_config, overrides, False
+
+    extra_body = dict(overrides.get("extra_body") or {})
+    extra_body["thinking"] = {"type": "disabled"}
+    overrides["extra_body"] = extra_body
+    return {"enabled": False}, overrides, True
+
+
 def _request_account_id(request: "web.Request") -> str:
     """Return the bounded account identity asserted by managed local-server."""
     value = str(request.headers.get("X-Zettlab-Account-Id", "") or "").strip()
@@ -2818,6 +2848,16 @@ class ZetAgentAdapter(APIServerAdapter):
         else:
             self._remember_last_resolved_model(resolved_key, model)
 
+        active_profile = str(_api_request_profile.get() or "main").strip() or "main"
+        reasoning_config, agent_request_overrides, onboarding_fast_path = (
+            _onboarding_deepseek_fast_path(
+                profile=active_profile,
+                model=model or "",
+                reasoning_config=reasoning_config,
+                request_overrides=agent_request_overrides,
+            )
+        )
+
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
@@ -2852,6 +2892,13 @@ class ZetAgentAdapter(APIServerAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if onboarding_fast_path:
+            # One initial attempt plus one quick retry.  The retry loop reads
+            # this marker to replace its multi-second generic 502 backoff.
+            agent._api_max_retries = min(
+                max(int(getattr(agent, "_api_max_retries", 2) or 2), 1), 2
+            )
+            agent._onboarding_fast_retry = True
         if disable_tools:
             agent.tools = []
             agent.valid_tool_names = set()

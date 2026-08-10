@@ -18,7 +18,43 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.platforms.zet_agent import (
+    ZetAgentAdapter,
+    _onboarding_deepseek_fast_path,
+)
+
+
+def test_onboarding_deepseek_fast_path_sets_supported_wire_field():
+    reasoning, overrides, enabled = _onboarding_deepseek_fast_path(
+        profile="onboarding",
+        model="deepseek-v4-flash",
+        reasoning_config={"enabled": True, "effort": "high"},
+        request_overrides={"extra_body": {"existing": 1}},
+    )
+
+    assert enabled is True
+    assert reasoning == {"enabled": False}
+    assert overrides == {
+        "extra_body": {
+            "existing": 1,
+            "thinking": {"type": "disabled"},
+        }
+    }
+
+
+def test_onboarding_fast_path_does_not_touch_normal_agent():
+    original_reasoning = {"enabled": True, "effort": "high"}
+    original_overrides = {"extra_body": {"existing": 1}}
+    reasoning, overrides, enabled = _onboarding_deepseek_fast_path(
+        profile="main",
+        model="deepseek-v4-flash",
+        reasoning_config=original_reasoning,
+        request_overrides=original_overrides,
+    )
+
+    assert enabled is False
+    assert reasoning is original_reasoning
+    assert overrides == original_overrides
 
 
 def _keyword_params(func):
