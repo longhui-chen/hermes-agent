@@ -580,35 +580,29 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
 
 # Identifies a Zettlab moderation-GATEWAY verdict (mainland-China green-cip), as
 # opposed to a general provider content-policy refusal. A gateway block is a
-# compliance decision: it must never fail over to a second model, because every
-# cloud model sits behind the same gateway (identical verdict, one more billed
-# scan) and a user-configured custom model does not sit behind it at all — so
-# failover would answer the very content the gateway just rejected. General
-# provider refusals (OpenAI usage policy, Codex cyber, Anthropic safety, MiniMax
-# new_sensitive) must stay failover-eligible, so they are deliberately excluded.
+# compliance decision that must never fail over: every cloud model sits behind
+# the same gateway (identical verdict) and a user-configured custom model does
+# not, so failover would answer the very content the gateway just rejected.
+# General provider refusals (OpenAI usage policy, Codex cyber, Anthropic safety,
+# MiniMax new_sensitive) must stay failover-eligible, so they are excluded.
 #
-# ``moderation_input_blocked`` is the gateway's own error code and is
-# unambiguous. On the paths where the gateway returns a generic ``code="400"``
-# it still pairs its ``content_policy_violation`` type with its localized
-# ``内容不合规`` message, so BOTH are required there: ``content_policy_violation``
-# alone is a generic token a real provider could also emit, and treating it as a
-# gateway verdict would wrongly suppress that provider's legitimate failover
-# (PR #299 review).
+# Keyed ONLY on the gateway's own error code ``moderation_input_blocked``, which
+# is unambiguous and verifiable. A generic ``content_policy_violation`` type or a
+# localized ``内容不合规`` message is deliberately NOT used: a user-configured
+# custom Chinese-language endpoint emits the same tokens, so attributing them to
+# the gateway would wrongly suppress that provider's legitimate failover. A
+# gateway path that ever surfaces WITHOUT this code must be bound to a verifiable
+# gateway origin (routing / a caller-provided source), never to the refusal text
+# (PR #299 review; AGENTS.md HR2/HR3 — do not act on unverifiable attribution).
 _MODERATION_GATEWAY_CODE = "moderation_input_blocked"
-_MODERATION_GATEWAY_GENERIC_TYPE = "content_policy_violation"
-_MODERATION_GATEWAY_MESSAGE = "内容不合规"
 
 
 def _is_moderation_gateway_block(policy_haystack: str) -> bool:
-    """True only for a Zettlab moderation-gateway verdict (not a general provider
-    content-policy refusal). ``policy_haystack`` is the same lowered
+    """True only for a Zettlab moderation-gateway verdict, keyed on the gateway's
+    own error code — never on a generic type or localized refusal message that a
+    custom provider could also emit. ``policy_haystack`` is the same lowered
     message+code+type string used for content-policy pattern matching."""
-    if _MODERATION_GATEWAY_CODE in policy_haystack:
-        return True
-    return (
-        _MODERATION_GATEWAY_GENERIC_TYPE in policy_haystack
-        and _MODERATION_GATEWAY_MESSAGE in policy_haystack
-    )
+    return _MODERATION_GATEWAY_CODE in policy_haystack
 
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
