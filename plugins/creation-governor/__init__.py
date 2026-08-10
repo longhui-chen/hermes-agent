@@ -727,6 +727,17 @@ def _connection_inventory(session_id: str, now: float) -> dict[str, Any]:
             return cached
     inventory = _fetch_connection_inventory()
     inventory["_at"] = now
+    # 库存是 channel/connector 推荐的硬闸输入：池为空即禁止推荐。此前它不落日志，
+    # 出不出卡只能靠猜——池空到底是"云端真没有"还是"链路把数据丢了"分不清
+    # （2026-08-10 排查教训）。
+    logger.info(
+        "connection inventory: fetched=%s channels_recommendable=%d "
+        "connectors_connected=%d connectors_recommendable=%d",
+        inventory.get("fetched"),
+        len(inventory.get("channels_recommendable") or []),
+        len(inventory.get("connectors_connected") or []),
+        len(inventory.get("connectors_recommendable") or []),
+    )
     with _state_lock:
         _state_locked(session_id, now)["connection_inventory"] = inventory
     return inventory
