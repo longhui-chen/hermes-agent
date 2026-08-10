@@ -3133,6 +3133,7 @@ class ZetAgentAdapter(APIServerAdapter):
         business_execution_token: Optional[str] = None,
         execution_policy: Optional[str] = None,
         execution_scope_digest: Optional[str] = None,
+        execution_request_digest: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
@@ -3191,6 +3192,9 @@ class ZetAgentAdapter(APIServerAdapter):
         scoped_execution_scope_digest = str(
             execution_scope_digest or ""
         ).strip().lower()
+        scoped_execution_request_digest = str(
+            execution_request_digest or ""
+        ).strip().lower()
 
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
@@ -3243,6 +3247,7 @@ class ZetAgentAdapter(APIServerAdapter):
             business_execution_token=scoped_business_execution_token,
             execution_policy=scoped_execution_policy,
             execution_scope_digest=scoped_execution_scope_digest,
+            execution_request_digest=scoped_execution_request_digest,
         )
         # This turn's ledger card title (X-Task-Title). Bound here, before the
         # base adapter's copy_context() hands the request to its executor, so
@@ -3307,6 +3312,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 business_execution_token=scoped_business_execution_token,
                 execution_policy=scoped_execution_policy,
                 execution_scope_digest=scoped_execution_scope_digest,
+                execution_request_digest=scoped_execution_request_digest,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,

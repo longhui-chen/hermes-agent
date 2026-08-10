@@ -143,6 +143,10 @@ _EXECUTION_SCOPE_DIGEST: ContextVar = ContextVar(
     "ZETTLAB_EXECUTION_SCOPE_DIGEST",
     default=_UNSET,
 )
+_EXECUTION_REQUEST_DIGEST: ContextVar = ContextVar(
+    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
+    default=_UNSET,
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -306,6 +310,7 @@ def set_turn_vars(
     business_execution_token: str = "",
     execution_policy: str = "",
     execution_scope_digest: str = "",
+    execution_request_digest: str = "",
 ) -> list:
     """Bind one request's turn identity and plan receipt task-locally."""
     global _session_context_engaged
@@ -319,6 +324,7 @@ def set_turn_vars(
         _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
         _EXECUTION_POLICY.set(execution_policy),
         _EXECUTION_SCOPE_DIGEST.set(execution_scope_digest),
+        _EXECUTION_REQUEST_DIGEST.set(execution_request_digest),
     ]
 
 
@@ -334,6 +340,7 @@ def clear_turn_vars(tokens: list) -> None:
             _BUSINESS_EXECUTION_TOKEN,
             _EXECUTION_POLICY,
             _EXECUTION_SCOPE_DIGEST,
+            _EXECUTION_REQUEST_DIGEST,
         ),
         tokens,
     ):
@@ -386,6 +393,15 @@ def execution_policy() -> str:
 def execution_scope_digest() -> str:
     """Return the local-server-validated generic execution scope digest."""
     value = _EXECUTION_SCOPE_DIGEST.get()
+    if value is _UNSET or value is None:
+        return ""
+    normalized = str(value).strip().lower()
+    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
+
+
+def execution_request_digest() -> str:
+    """Return the local-server-validated request digest for silent turns."""
+    value = _EXECUTION_REQUEST_DIGEST.get()
     if value is _UNSET or value is None:
         return ""
     normalized = str(value).strip().lower()

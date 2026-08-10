@@ -6064,6 +6064,7 @@ def _run_video_edit_runtime_command_if_allowed(
                 "HERMES_SESSION_KEY",
                 "HERMES_GATEWAY_SESSION_KEY",
                 "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+                "ZETTLAB_EXECUTION_REQUEST_DIGEST",
             )
             if trusted_env.get(key)
         }

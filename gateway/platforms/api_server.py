@@ -5717,6 +5717,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         execution_policy = ""
         execution_scope_digest = ""
+        execution_request_digest = ""
         execution_authorization: Dict[str, Any] = {}
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -5891,6 +5892,9 @@ class APIServerAdapter(BasePlatformAdapter):
             execution_policy = "silent_automation"
             execution_scope_digest = str(
                 execution_authorization["scope_digest"]
+            )
+            execution_request_digest = str(
+                execution_authorization["request_digest"]
             )
 
         trusted_business_execution_token = business_execution_token
@@ -6126,6 +6130,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 business_execution_token=trusted_business_execution_token,
                 execution_policy=execution_policy,
                 execution_scope_digest=execution_scope_digest,
+                execution_request_digest=execution_request_digest,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
                 trusted_user_message=trusted_user_message,
@@ -6184,6 +6189,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     business_execution_token=trusted_business_execution_token,
                     execution_policy=execution_policy,
                     execution_scope_digest=execution_scope_digest,
+                    execution_request_digest=execution_request_digest,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
@@ -8503,6 +8509,7 @@ class APIServerAdapter(BasePlatformAdapter):
         business_execution_token: Optional[str] = None,
         execution_policy: Optional[str] = None,
         execution_scope_digest: Optional[str] = None,
+        execution_request_digest: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,

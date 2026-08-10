@@ -1805,6 +1805,7 @@ VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # inherit either a live ContextVar or a stale process-global fallback.
     "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
     "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -2014,12 +2015,18 @@ def build_camera_runtime_env() -> dict[str, str]:
     ).strip()
     if scope_digest:
         env["ZETTLAB_EXECUTION_SCOPE_DIGEST"] = scope_digest
+    request_digest = str(
+        frozen_receipt.get("ZETTLAB_EXECUTION_REQUEST_DIGEST", "") or ""
+    ).strip()
+    if request_digest:
+        env["ZETTLAB_EXECUTION_REQUEST_DIGEST"] = request_digest
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
         "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "ZETTLAB_EXECUTION_SCOPE_DIGEST": 64,
+        "ZETTLAB_EXECUTION_REQUEST_DIGEST": 64,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
     }

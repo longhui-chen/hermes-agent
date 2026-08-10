@@ -214,6 +214,7 @@ class _TrustedExecutionReceipt:
     gateway_session_key: str = ""
     execution_policy: str = ""
     execution_scope_digest: str = ""
+    execution_request_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -395,18 +396,21 @@ def _capture_trusted_execution_receipt(
             business_execution_token,
             execution_policy,
             execution_scope_digest,
+            execution_request_digest,
             get_session_env,
         )
 
         business_token = business_execution_token()
         bound_execution_policy = execution_policy()
         bound_execution_scope_digest = execution_scope_digest()
+        bound_execution_request_digest = execution_request_digest()
         gateway_session_key = get_session_env("HERMES_SESSION_KEY")
         session_id = get_session_env("HERMES_SESSION_ID") or gateway_session_key
     except Exception:
         business_token = ""
         bound_execution_policy = ""
         bound_execution_scope_digest = ""
+        bound_execution_request_digest = ""
         session_id = ""
         gateway_session_key = ""
 
@@ -420,6 +424,9 @@ def _capture_trusted_execution_receipt(
         execution_policy=str(bound_execution_policy or "").strip().lower(),
         execution_scope_digest=str(
             bound_execution_scope_digest or ""
+        ).strip().lower(),
+        execution_request_digest=str(
+            bound_execution_request_digest or ""
         ).strip().lower(),
     )
     present = {
@@ -438,6 +445,7 @@ def _capture_trusted_execution_receipt(
     if receipt.execution_policy == "silent_automation" and (
         not receipt.gateway_session_key
         or re.fullmatch(r"[0-9a-f]{64}", receipt.execution_scope_digest) is None
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.execution_request_digest) is None
     ):
         logger.warning(
             "zet_agent: trusted silent execution receipt missing stable scope"
@@ -470,6 +478,10 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
     if receipt.execution_scope_digest:
         result["ZETTLAB_EXECUTION_SCOPE_DIGEST"] = (
             receipt.execution_scope_digest
+        )
+    if receipt.execution_request_digest:
+        result["ZETTLAB_EXECUTION_REQUEST_DIGEST"] = (
+            receipt.execution_request_digest
         )
     return result
 
