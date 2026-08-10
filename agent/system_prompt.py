@@ -47,6 +47,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
     default_agent_identity,
+    workspace_device_ops_guidance,
     zettlab_agent_kernel_guidance,
     zettlab_turn_rules_guidance,
 )
@@ -240,6 +241,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    # Workspace/device work belongs to the trusted agent-creator CLI, but the
+    # rule is only actionable when skill_view exists to load that skill.
+    if "skill_view" in agent.valid_tool_names:
+        tool_guidance.append(workspace_device_ops_guidance())
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
