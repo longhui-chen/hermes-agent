@@ -586,23 +586,30 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
 # General provider refusals (OpenAI usage policy, Codex cyber, Anthropic safety,
 # MiniMax new_sensitive) must stay failover-eligible, so they are excluded.
 #
-# Keyed ONLY on the gateway's own error code ``moderation_input_blocked``, which
-# is unambiguous and verifiable. A generic ``content_policy_violation`` type or a
-# localized ``内容不合规`` message is deliberately NOT used: a user-configured
-# custom Chinese-language endpoint emits the same tokens, so attributing them to
-# the gateway would wrongly suppress that provider's legitimate failover. A
-# gateway path that ever surfaces WITHOUT this code must be bound to a verifiable
-# gateway origin (routing / a caller-provided source), never to the refusal text
+# Attribution is by VERIFIABLE signals only, never by refusal text:
+#   1. ``via_moderation_gateway`` — the caller confirms the request went through
+#      the local ai-proxy → moderation gateway route (see
+#      _is_zettlab_ai_proxy_route in conversation_loop). This covers every
+#      gateway shape, including the generic ``code="400"`` path that omits the
+#      gateway's own code.
+#   2. ``moderation_input_blocked`` — the gateway's own unambiguous error code,
+#      a robust secondary for call sites that do not thread the route flag.
+# A generic ``content_policy_violation`` type or a localized ``内容不合规``
+# message is deliberately NOT used: a user-configured custom Chinese-language
+# endpoint emits the same tokens, so attributing them to the gateway would
+# wrongly suppress that provider's legitimate failover
 # (PR #299 review; AGENTS.md HR2/HR3 — do not act on unverifiable attribution).
 _MODERATION_GATEWAY_CODE = "moderation_input_blocked"
 
 
-def _is_moderation_gateway_block(policy_haystack: str) -> bool:
-    """True only for a Zettlab moderation-gateway verdict, keyed on the gateway's
-    own error code — never on a generic type or localized refusal message that a
-    custom provider could also emit. ``policy_haystack`` is the same lowered
-    message+code+type string used for content-policy pattern matching."""
-    return _MODERATION_GATEWAY_CODE in policy_haystack
+def _is_moderation_gateway_block(policy_haystack: str, via_moderation_gateway: bool) -> bool:
+    """True only for a Zettlab moderation-gateway verdict. Keyed on a verifiable
+    origin (``via_moderation_gateway`` — request routed through the ai-proxy)
+    OR the gateway's own unambiguous ``moderation_input_blocked`` code; never on
+    a generic type or localized refusal message a custom provider could emit.
+    ``policy_haystack`` is the same lowered message+code+type string used for
+    content-policy pattern matching."""
+    return via_moderation_gateway or _MODERATION_GATEWAY_CODE in policy_haystack
 
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
@@ -755,8 +762,14 @@ def classify_api_error(
     approx_tokens: int = 0,
     context_length: int = 200000,
     num_messages: int = 0,
+    via_moderation_gateway: bool = False,
 ) -> ClassifiedError:
     """Classify an API error into a structured recovery recommendation.
+
+    ``via_moderation_gateway`` is a verifiable origin flag the caller sets when
+    the request was routed through the local ai-proxy → Zettlab moderation
+    gateway; it makes a content-policy block a non-failover compliance verdict
+    regardless of the error's code/type shape. See _is_moderation_gateway_block.
 
     Priority-ordered pipeline:
       1. Special-case provider-specific patterns (thinking sigs, tier gates)
@@ -874,7 +887,9 @@ def classify_api_error(
         # routing the rejected prompt to a fallback model. A general provider
         # refusal stays failover-eligible unless a deployment opts out via
         # content_policy_fallback_disabled(). See _is_moderation_gateway_block.
-        _gateway_moderation = _is_moderation_gateway_block(_policy_haystack)
+        _gateway_moderation = _is_moderation_gateway_block(
+            _policy_haystack, via_moderation_gateway
+        )
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,

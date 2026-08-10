@@ -89,6 +89,39 @@ def test_gateway_moderation_never_fails_over_regardless_of_switch(monkeypatch):
         assert classified.should_fallback is False
 
 
+def test_ai_proxy_route_makes_generic_code_block_no_fallback(monkeypatch):
+    """接线校验（live path）：generic code="400" 形状不含网关码，但只要请求走的是
+    ai-proxy 路由（可验证来源 _is_zettlab_ai_proxy_route），就判为网关终审、不
+    fallback；同一形状换成自配 endpoint（非 ai-proxy）则默认仍可 fallback。
+    """
+    from agent.conversation_loop import _is_zettlab_ai_proxy_route
+
+    class _Agent:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+    gateway_agent = _Agent("http://127.0.0.1:19090/api/v1/ai-proxy/v1")
+    custom_agent = _Agent("https://my-llm.example.com/v1")
+    assert _is_zettlab_ai_proxy_route(gateway_agent) is True
+    assert _is_zettlab_ai_proxy_route(custom_agent) is False
+
+    body = {"error": {"code": "400", "type": "content_policy_violation", "message": "内容不合规"}}
+    monkeypatch.setattr(ec, "content_policy_fallback_disabled", lambda: False)
+
+    via_gw = classify_api_error(
+        _StubError("request failed", body, 400),
+        via_moderation_gateway=_is_zettlab_ai_proxy_route(gateway_agent),
+    )
+    assert via_gw.reason == FailoverReason.content_policy_blocked
+    assert via_gw.should_fallback is False  # 网关路由 → 不 fallback（即便无网关码）
+
+    via_custom = classify_api_error(
+        _StubError("request failed", body, 400),
+        via_moderation_gateway=_is_zettlab_ai_proxy_route(custom_agent),
+    )
+    assert via_custom.should_fallback is True  # 非网关路由 → 默认仍可 fallback
+
+
 # ── 被拒的一轮不得留在会话历史里 ────────────────────────────────────
 
 from agent.conversation_loop import (  # noqa: E402
