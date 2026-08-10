@@ -100,17 +100,20 @@ class ClassifiedError:
 
 
 def content_policy_fallback_disabled() -> bool:
-    """True when a content-policy block must end the turn instead of failing over.
+    """True when a GENERAL provider content-policy refusal must end the turn
+    instead of failing over to a second model.
 
-    Default is off, preserving the general-purpose behaviour where a second
-    model may legitimately answer what the first refused.
+    Default is off, preserving general-purpose behaviour: a refusal from one
+    provider (OpenAI usage policy, Codex cyber, Anthropic safety) may be
+    legitimately answered by a different model, so failover is allowed.
 
-    A compliance deployment must turn this on. When an upstream moderation
-    gateway is what refused the prompt, failing over is wrong twice: every
-    cloud model sits behind the same gateway so the verdict is identical (the
-    retry only buys a second billed moderation call), and a user-configured
-    custom model does *not* sit behind it — so the fallback would answer
-    exactly the content the gateway just rejected.
+    Scope: this switch does NOT govern a Zettlab moderation-GATEWAY block
+    (code=moderation_input_blocked / type=content_policy_violation). A gateway
+    verdict is a compliance decision that never fails over — unconditionally,
+    handled at the classification site via ``_MODERATION_GATEWAY_PATTERNS`` — so
+    a CN/compliance deployment needs no env flag for it. Set
+    ``HERMES_CONTENT_POLICY_NO_FALLBACK=1`` only to additionally stop failover
+    on general provider refusals too.
     """
     return os.getenv("HERMES_CONTENT_POLICY_NO_FALLBACK", "").strip().lower() in {
         "1",
@@ -575,6 +578,21 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     "new_sensitive",
 ]
 
+# Subset of the above that identifies a Zettlab moderation-GATEWAY verdict, as
+# opposed to a general provider content-policy refusal. A gateway block is a
+# compliance decision (mainland-China green-cip scan): it must never fail over
+# to a second model, because every cloud model sits behind the same gateway
+# (identical verdict, one more billed scan) and a user-configured custom model
+# does not sit behind it at all — so failover would answer the very content the
+# gateway just rejected. General provider refusals (OpenAI usage policy, Codex
+# cyber, Anthropic safety, MiniMax new_sensitive) are NOT in here: a different
+# model may legitimately answer them, so they stay failover-eligible unless a
+# deployment opts out globally via content_policy_fallback_disabled().
+_MODERATION_GATEWAY_PATTERNS = (
+    "moderation_input_blocked",
+    "content_policy_violation",
+)
+
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
     "invalid api key",
@@ -839,10 +857,23 @@ def classify_api_error(
     # even though the compliance gateway already refused it.
     _policy_haystack = f"{error_msg} {(error_code or '').lower()} {_error_type_of(body)}"
     if any(p in _policy_haystack for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
+        # A moderation-GATEWAY verdict never fails over (compliance), and this
+        # holds unconditionally — it is not gated on the env switch, so an OTA
+        # that never sets the flag still fails toward compliance instead of
+        # routing the rejected prompt to a fallback model. A general provider
+        # refusal stays failover-eligible unless a deployment opts out via
+        # content_policy_fallback_disabled(). See _MODERATION_GATEWAY_PATTERNS.
+        _gateway_moderation = any(
+            p in _policy_haystack for p in _MODERATION_GATEWAY_PATTERNS
+        )
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,
-            should_fallback=not content_policy_fallback_disabled(),
+            should_fallback=(
+                False
+                if _gateway_moderation
+                else not content_policy_fallback_disabled()
+            ),
         )
 
     # Anthropic thinking block recovery (400).  Two distinct failure modes,

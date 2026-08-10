@@ -48,26 +48,45 @@ def test_moderation_code_alone_still_recognised():
     assert classified.reason == FailoverReason.content_policy_blocked
 
 
-def test_no_fallback_flag_is_honoured(monkeypatch):
-    """开关打开时，分类结果必须明确说「不要 fallback」。"""
+def test_general_provider_refusal_no_fallback_flag_is_honoured(monkeypatch):
+    """开关打开时，连一般供应商的安全拒绝也必须「不要 fallback」。"""
     monkeypatch.setattr(ec, "content_policy_fallback_disabled", lambda: True)
-    classified = _classify({
-        "error": {"code": "moderation_input_blocked", "message": "内容不合规"}
-    })
+    classified = _classify(
+        {"error": {"message": "flagged for possible cybersecurity risk"}},
+        message="This content was flagged for possible cybersecurity risk.",
+    )
     assert classified.reason == FailoverReason.content_policy_blocked
     assert classified.should_fallback is False
 
 
-def test_fallback_still_allowed_when_switch_is_off(monkeypatch):
-    """反向钉住：海外设备没开这个开关时，供应商安全过滤仍然可以换模型重试。
+def test_general_provider_refusal_still_fails_over_when_switch_is_off(monkeypatch):
+    """反向钉住：海外设备没开这个开关时，一般供应商安全过滤仍可换模型重试。
 
-    没有这条，上面那条可以靠「永远不 fallback」通过。
+    注意这里用的是一般供应商拒绝，不是审核网关 —— 网关那条见下一个用例。
     """
     monkeypatch.setattr(ec, "content_policy_fallback_disabled", lambda: False)
-    classified = _classify({
-        "error": {"code": "moderation_input_blocked", "message": "内容不合规"}
-    })
+    classified = _classify(
+        {"error": {"message": "flagged for possible cybersecurity risk"}},
+        message="This content was flagged for possible cybersecurity risk.",
+    )
+    assert classified.reason == FailoverReason.content_policy_blocked
     assert classified.should_fallback is True
+
+
+def test_gateway_moderation_never_fails_over_regardless_of_switch(monkeypatch):
+    """审核网关拦截是合规终审：无论开关开没开，都绝不 fallback。
+
+    这一条独立于 content_policy_fallback_disabled() —— 打包/OTA 时忘了设那个
+    环境变量，也不能把已被网关拒绝的请求路由到用户自配的备用模型（正是 #257
+    要堵的洞）。
+    """
+    for flag in (True, False):
+        monkeypatch.setattr(ec, "content_policy_fallback_disabled", lambda flag=flag: flag)
+        classified = _classify({
+            "error": {"code": "moderation_input_blocked", "message": "内容不合规"}
+        })
+        assert classified.reason == FailoverReason.content_policy_blocked
+        assert classified.should_fallback is False
 
 
 # ── 被拒的一轮不得留在会话历史里 ────────────────────────────────────

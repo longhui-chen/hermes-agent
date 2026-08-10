@@ -523,22 +523,34 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="anthropic", model="claude-x")
         assert normalized_provider_error_code(result) == "content_blocked"
 
-    def test_content_policy_failover_opt_out(self, monkeypatch):
-        # Compliance deployments must not fail over to a second model: every
-        # cloud model sits behind the same gateway (identical verdict, one more
-        # billed moderation call), and a user-configured custom model does not
-        # sit behind it at all.
-        e = MockAPIError(
+    def test_content_policy_failover_split_by_source(self, monkeypatch):
+        # A moderation-GATEWAY verdict never fails over, unconditionally — not
+        # gated on the env switch — so an OTA that never sets the flag still
+        # fails toward compliance. A GENERAL provider refusal stays
+        # failover-eligible by default and only stops when a deployment opts out.
+        gateway = MockAPIError(
             "内容不合规",
             status_code=400,
             body={"error": {"code": "moderation_input_blocked", "message": "内容不合规"}},
         )
+        general = Exception(
+            "This content was flagged for possible cybersecurity risk."
+        )
 
+        # Gateway block: no failover regardless of the env switch value.
+        for val in (None, "0", "1"):
+            if val is None:
+                monkeypatch.delenv("HERMES_CONTENT_POLICY_NO_FALLBACK", raising=False)
+            else:
+                monkeypatch.setenv("HERMES_CONTENT_POLICY_NO_FALLBACK", val)
+            assert classify_api_error(gateway, provider="zettlab").should_fallback is False
+
+        # General provider refusal: failover-eligible by default…
         monkeypatch.delenv("HERMES_CONTENT_POLICY_NO_FALLBACK", raising=False)
-        assert classify_api_error(e, provider="zettlab").should_fallback is True
-
+        assert classify_api_error(general, provider="openai-codex").should_fallback is True
+        # …and only suppressed when a deployment opts out globally.
         monkeypatch.setenv("HERMES_CONTENT_POLICY_NO_FALLBACK", "1")
-        assert classify_api_error(e, provider="zettlab").should_fallback is False
+        assert classify_api_error(general, provider="openai-codex").should_fallback is False
 
     def test_404_model_not_found_still_works(self):
         # Regression guard: the new policy-block check must not swallow
