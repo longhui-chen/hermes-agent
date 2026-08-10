@@ -3030,6 +3030,25 @@ class ZetAgentAdapter(APIServerAdapter):
             agent.ephemeral_system_prompt = ephemeral_system_prompt or None
             agent.reasoning_config = reasoning_config
             agent.request_overrides = dict(agent_request_overrides or {})
+            # APIServerAdapter historically creates one AIAgent per request,
+            # so these counters are request-local despite their legacy
+            # ``session_*`` names. Preserve the existing SSE usage contract
+            # when reusing only the expensive runtime/client shell.
+            for counter_name in (
+                "session_prompt_tokens",
+                "session_completion_tokens",
+                "session_total_tokens",
+                "session_api_calls",
+                "session_input_tokens",
+                "session_output_tokens",
+                "session_cache_read_tokens",
+                "session_cache_write_tokens",
+                "session_reasoning_tokens",
+            ):
+                setattr(agent, counter_name, 0)
+            agent.session_estimated_cost_usd = 0.0
+            agent.session_cost_status = "unknown"
+            agent.session_cost_source = "none"
         if onboarding_fast_path:
             # One initial attempt plus one quick retry.  The retry loop reads
             # this marker to replace its multi-second generic 502 backoff.
