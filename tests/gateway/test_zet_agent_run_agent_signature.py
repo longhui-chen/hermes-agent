@@ -20,6 +20,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.zet_agent import (
     ZetAgentAdapter,
+    _api_request_profile,
     _onboarding_deepseek_fast_path,
 )
 
@@ -192,6 +193,59 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
     assert captured["profile_name"] == "main"
+
+
+def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.model = kwargs.get("model")
+            self.provider = kwargs.get("provider")
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {"provider": "custom", "api_key": "test-key"},
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "lite")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._checkpoint_agent_kwargs", lambda _cfg: {})
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        lambda: {"enabled": True},
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model", lambda: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools", lambda *_: {"terminal", "memory"}
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+    profile_token = _api_request_profile.set("onboarding")
+    try:
+        agent = adapter._create_agent(
+            ephemeral_system_prompt="v14 onboarding policy",
+            session_id="onboarding-session",
+            gateway_session_key="zettlab:user:onboarding:session",
+        )
+    finally:
+        _api_request_profile.reset(profile_token)
+
+    assert captured["enabled_toolsets"] == []
+    assert captured["skip_tool_loading"] is True
+    assert captured["skip_context_files"] is True
+    assert captured["skip_memory"] is True
+    assert captured["ephemeral_system_prompt"] == "v14 onboarding policy"
+    assert captured["reasoning_config"] == {"enabled": False}
+    assert agent._tools_disabled_for_request is True
+    assert agent.compression_enabled is False
 
 
 @pytest.mark.asyncio

@@ -859,6 +859,33 @@ def _append_api_system_instruction(
     api_kwargs["messages"] = patched
 
 
+def _compact_lightweight_api_messages(
+    agent: Any, api_messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep only the stable system policy and current structured user turn.
+
+    The onboarding service includes the complete GuideContextSnapshot in each
+    current user message. Durable SessionDB persistence still retains the full
+    UI transcript; this changes only the provider-bound copy.
+    """
+    if not getattr(agent, "_onboarding_lightweight", False):
+        return api_messages
+
+    system = next(
+        (msg for msg in api_messages if msg.get("role") == "system"), None
+    )
+    current_user = next(
+        (msg for msg in reversed(api_messages) if msg.get("role") == "user"),
+        None,
+    )
+    compacted: List[Dict[str, Any]] = []
+    if system is not None:
+        compacted.append(system)
+    if current_user is not None:
+        compacted.append(current_user)
+    return compacted or api_messages
+
+
 def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
     """Inject the Plan decision protocol into the API-only system message.
 
@@ -2675,6 +2702,8 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        api_messages = _compact_lightweight_api_messages(agent, api_messages)
+
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -3327,6 +3356,19 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
+                    _started = getattr(agent, "_onboarding_upstream_started_mono", None)
+                    if (
+                        getattr(agent, "_onboarding_lightweight", False)
+                        and isinstance(_started, (int, float))
+                        and not getattr(agent, "_onboarding_ttft_logged", False)
+                    ):
+                        agent._onboarding_ttft_logged = True
+                        logger.info(
+                            "onboarding lightweight upstream first delta: "
+                            "session=%s ttft_ms=%d",
+                            agent.session_id or "none",
+                            int((time.monotonic() - _started) * 1000),
+                        )
 
                 _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
@@ -3364,6 +3406,23 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    if getattr(agent, "_onboarding_lightweight", False):
+                        _upstream_started = time.monotonic()
+                        agent._onboarding_upstream_started_mono = _upstream_started
+                        agent._onboarding_ttft_logged = False
+                        _received = getattr(agent, "_onboarding_received_mono", None)
+                        logger.info(
+                            "onboarding lightweight upstream request: "
+                            "session=%s preflight_ms=%d messages=%d tools=%d "
+                            "approx_tokens=%d",
+                            agent.session_id or "none",
+                            int((_upstream_started - _received) * 1000)
+                            if isinstance(_received, (int, float))
+                            else -1,
+                            len(next_api_kwargs.get("messages") or []),
+                            len(next_api_kwargs.get("tools") or []),
+                            approx_tokens,
+                        )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
