@@ -110,7 +110,7 @@ def content_policy_fallback_disabled() -> bool:
     Scope: this switch does NOT govern a Zettlab moderation-GATEWAY block
     (code=moderation_input_blocked / type=content_policy_violation). A gateway
     verdict is a compliance decision that never fails over — unconditionally,
-    handled at the classification site via ``_MODERATION_GATEWAY_PATTERNS`` — so
+    handled at the classification site via ``_is_moderation_gateway_block`` — so
     a CN/compliance deployment needs no env flag for it. Set
     ``HERMES_CONTENT_POLICY_NO_FALLBACK=1`` only to additionally stop failover
     on general provider refusals too.
@@ -578,20 +578,37 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     "new_sensitive",
 ]
 
-# Subset of the above that identifies a Zettlab moderation-GATEWAY verdict, as
+# Identifies a Zettlab moderation-GATEWAY verdict (mainland-China green-cip), as
 # opposed to a general provider content-policy refusal. A gateway block is a
-# compliance decision (mainland-China green-cip scan): it must never fail over
-# to a second model, because every cloud model sits behind the same gateway
-# (identical verdict, one more billed scan) and a user-configured custom model
-# does not sit behind it at all — so failover would answer the very content the
-# gateway just rejected. General provider refusals (OpenAI usage policy, Codex
-# cyber, Anthropic safety, MiniMax new_sensitive) are NOT in here: a different
-# model may legitimately answer them, so they stay failover-eligible unless a
-# deployment opts out globally via content_policy_fallback_disabled().
-_MODERATION_GATEWAY_PATTERNS = (
-    "moderation_input_blocked",
-    "content_policy_violation",
-)
+# compliance decision: it must never fail over to a second model, because every
+# cloud model sits behind the same gateway (identical verdict, one more billed
+# scan) and a user-configured custom model does not sit behind it at all — so
+# failover would answer the very content the gateway just rejected. General
+# provider refusals (OpenAI usage policy, Codex cyber, Anthropic safety, MiniMax
+# new_sensitive) must stay failover-eligible, so they are deliberately excluded.
+#
+# ``moderation_input_blocked`` is the gateway's own error code and is
+# unambiguous. On the paths where the gateway returns a generic ``code="400"``
+# it still pairs its ``content_policy_violation`` type with its localized
+# ``内容不合规`` message, so BOTH are required there: ``content_policy_violation``
+# alone is a generic token a real provider could also emit, and treating it as a
+# gateway verdict would wrongly suppress that provider's legitimate failover
+# (PR #299 review).
+_MODERATION_GATEWAY_CODE = "moderation_input_blocked"
+_MODERATION_GATEWAY_GENERIC_TYPE = "content_policy_violation"
+_MODERATION_GATEWAY_MESSAGE = "内容不合规"
+
+
+def _is_moderation_gateway_block(policy_haystack: str) -> bool:
+    """True only for a Zettlab moderation-gateway verdict (not a general provider
+    content-policy refusal). ``policy_haystack`` is the same lowered
+    message+code+type string used for content-policy pattern matching."""
+    if _MODERATION_GATEWAY_CODE in policy_haystack:
+        return True
+    return (
+        _MODERATION_GATEWAY_GENERIC_TYPE in policy_haystack
+        and _MODERATION_GATEWAY_MESSAGE in policy_haystack
+    )
 
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
@@ -862,10 +879,8 @@ def classify_api_error(
         # that never sets the flag still fails toward compliance instead of
         # routing the rejected prompt to a fallback model. A general provider
         # refusal stays failover-eligible unless a deployment opts out via
-        # content_policy_fallback_disabled(). See _MODERATION_GATEWAY_PATTERNS.
-        _gateway_moderation = any(
-            p in _policy_haystack for p in _MODERATION_GATEWAY_PATTERNS
-        )
+        # content_policy_fallback_disabled(). See _is_moderation_gateway_block.
+        _gateway_moderation = _is_moderation_gateway_block(_policy_haystack)
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,
