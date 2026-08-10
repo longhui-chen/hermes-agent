@@ -586,30 +586,35 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
 # General provider refusals (OpenAI usage policy, Codex cyber, Anthropic safety,
 # MiniMax new_sensitive) must stay failover-eligible, so they are excluded.
 #
-# Attribution is by VERIFIABLE signals only, never by refusal text:
-#   1. ``via_moderation_gateway`` — the caller confirms the request went through
-#      the local ai-proxy → moderation gateway route (see
-#      _is_zettlab_ai_proxy_route in conversation_loop). This covers every
-#      gateway shape, including the generic ``code="400"`` path that omits the
-#      gateway's own code.
-#   2. ``moderation_input_blocked`` — the gateway's own unambiguous error code,
-#      a robust secondary for call sites that do not thread the route flag.
-# A generic ``content_policy_violation`` type or a localized ``内容不合规``
-# message is deliberately NOT used: a user-configured custom Chinese-language
-# endpoint emits the same tokens, so attributing them to the gateway would
-# wrongly suppress that provider's legitimate failover
-# (PR #299 review; AGENTS.md HR2/HR3 — do not act on unverifiable attribution).
+# A gateway verdict is recognized ONLY by the gateway's own error shapes — never
+# by the ai-proxy route alone, and never by refusal text a custom provider could
+# emit:
+#   1. ``moderation_input_blocked`` — the gateway's own unambiguous error code
+#      (any route; a robust secondary for call sites that don't thread the flag).
+#   2. ``via_moderation_gateway`` AND ``content_policy_violation`` — on the
+#      verified ai-proxy route the gateway's generic ``code="400"`` shape carries
+#      this as its error ``type``. The route flag is REQUIRED so a custom
+#      endpoint that merely reuses the token is not matched; the type is required
+#      so that an UPSTREAM model's own safety refusal passed through the proxy
+#      (``content_filter`` / "flagged by our safety system" / ``new_sensitive``,
+#      all in _CONTENT_POLICY_BLOCKED_PATTERNS) stays failover-eligible instead
+#      of being mistaken for a compliance verdict.
+# A localized ``内容不合规`` message is deliberately NOT a signal on its own.
+# (PR #299 review; AGENTS.md HR2/HR3 — do not act on unverifiable attribution.)
 _MODERATION_GATEWAY_CODE = "moderation_input_blocked"
+_MODERATION_GATEWAY_GENERIC_TYPE = "content_policy_violation"
 
 
 def _is_moderation_gateway_block(policy_haystack: str, via_moderation_gateway: bool) -> bool:
-    """True only for a Zettlab moderation-gateway verdict. Keyed on a verifiable
-    origin (``via_moderation_gateway`` — request routed through the ai-proxy)
-    OR the gateway's own unambiguous ``moderation_input_blocked`` code; never on
-    a generic type or localized refusal message a custom provider could emit.
-    ``policy_haystack`` is the same lowered message+code+type string used for
-    content-policy pattern matching."""
-    return via_moderation_gateway or _MODERATION_GATEWAY_CODE in policy_haystack
+    """True only for a Zettlab moderation-gateway verdict — its unambiguous
+    ``moderation_input_blocked`` code, or (on the verified ai-proxy route) its
+    ``content_policy_violation`` generic-code type. Never the route alone (an
+    upstream model refusal also traverses the proxy) and never a localized
+    message a custom provider could emit. ``policy_haystack`` is the same lowered
+    message+code+type string used for content-policy pattern matching."""
+    if _MODERATION_GATEWAY_CODE in policy_haystack:
+        return True
+    return via_moderation_gateway and _MODERATION_GATEWAY_GENERIC_TYPE in policy_haystack
 
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
