@@ -550,6 +550,17 @@ class ZetAgentAdapter(APIServerAdapter):
         # One-shot warn flag for closure-sniff failures.
         self._sniff_warned: bool = False
 
+        # Onboarding reconnects its SSE/WS transport between turns, but the
+        # server-side session is stable. Reuse a bounded set of lightweight
+        # AIAgents so OpenAI client/session initialization does not add ~1.5s
+        # to every hot turn. Values are (agent, last_used_monotonic).
+        self._onboarding_agent_cache_lock = threading.Lock()
+        self._onboarding_agent_cache: "OrderedDict[tuple, tuple[Any, float]]" = (
+            OrderedDict()
+        )
+        self._onboarding_agent_cache_cap = 8
+        self._onboarding_agent_cache_ttl_seconds = 15 * 60
+
         # Pending clarify prompts: {profile-home}|{session_id} ->
         # list[_ClarifyEntry] (FIFO). A bare session id is not a gateway
         # identity in multiplex mode: /p/main and /p/coder may legitimately
@@ -638,6 +649,42 @@ class ZetAgentAdapter(APIServerAdapter):
         the shared listener-key contract.
         """
         return self._api_key
+
+    def _cached_onboarding_agent(self, key: tuple) -> Optional[Any]:
+        now = time.monotonic()
+        expired = []
+        with self._onboarding_agent_cache_lock:
+            for cache_key, (_, last_used) in list(self._onboarding_agent_cache.items()):
+                if now - last_used > self._onboarding_agent_cache_ttl_seconds:
+                    expired.append(self._onboarding_agent_cache.pop(cache_key)[0])
+            entry = self._onboarding_agent_cache.pop(key, None)
+            if entry is not None:
+                agent, _ = entry
+                self._onboarding_agent_cache[key] = (agent, now)
+            else:
+                agent = None
+        for stale in expired:
+            try:
+                stale.close()
+            except Exception:
+                logger.debug("onboarding cache eviction close failed", exc_info=True)
+        return agent
+
+    def _cache_onboarding_agent(self, key: tuple, agent: Any) -> None:
+        evicted = []
+        with self._onboarding_agent_cache_lock:
+            replaced = self._onboarding_agent_cache.pop(key, None)
+            if replaced is not None and replaced[0] is not agent:
+                evicted.append(replaced[0])
+            self._onboarding_agent_cache[key] = (agent, time.monotonic())
+            while len(self._onboarding_agent_cache) > self._onboarding_agent_cache_cap:
+                _, (stale, _) = self._onboarding_agent_cache.popitem(last=False)
+                evicted.append(stale)
+        for stale in evicted:
+            try:
+                stale.close()
+            except Exception:
+                logger.debug("onboarding cache eviction close failed", exc_info=True)
 
     def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
         """Atomically enter a profile unless unload already owns its barrier."""
@@ -2955,7 +3002,34 @@ class ZetAgentAdapter(APIServerAdapter):
             )
 
         agent_init_started_mono = time.monotonic()
-        agent = AIAgent(**agent_kwargs)
+        onboarding_cache_key = None
+        agent = None
+        if onboarding_fast_path:
+            onboarding_cache_key = (
+                active_profile.lower(),
+                str(gateway_session_key or session_id or ""),
+                str(model or ""),
+                str(runtime_kwargs.get("provider") or ""),
+                str(runtime_kwargs.get("base_url") or ""),
+                str(_zettlab_request_account_id.get() or ""),
+            )
+            agent = self._cached_onboarding_agent(onboarding_cache_key)
+        reused_onboarding_agent = agent is not None
+        if agent is None:
+            agent = AIAgent(**agent_kwargs)
+            if onboarding_cache_key is not None:
+                self._cache_onboarding_agent(onboarding_cache_key, agent)
+        else:
+            # Request-scoped callbacks close over this response's stream queue.
+            # Replace them on every reuse so a reconnect never writes into the
+            # previous SSE response or retains its queue longer than one turn.
+            agent.stream_delta_callback = stream_delta_callback
+            agent.tool_progress_callback = tool_progress_callback
+            agent.tool_start_callback = tool_start_callback
+            agent.tool_complete_callback = tool_complete_callback
+            agent.ephemeral_system_prompt = ephemeral_system_prompt or None
+            agent.reasoning_config = reasoning_config
+            agent.request_overrides = dict(agent_request_overrides or {})
         if onboarding_fast_path:
             # One initial attempt plus one quick retry.  The retry loop reads
             # this marker to replace its multi-second generic 502 backoff.
@@ -2972,9 +3046,10 @@ class ZetAgentAdapter(APIServerAdapter):
             agent._system_prompt_persist_pending = True
             agent._onboarding_received_mono = onboarding_received_mono
             logger.info(
-                "onboarding lightweight agent ready: session=%s init_ms=%d",
+                "onboarding lightweight agent ready: session=%s init_ms=%d reused=%s",
                 session_id or "none",
                 int((time.monotonic() - agent_init_started_mono) * 1000),
+                reused_onboarding_agent,
             )
         if disable_tools:
             agent.tools = []
@@ -3465,6 +3540,22 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
             except Exception:
                 logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
+            try:
+                cached_agent = agent_ref[0] if agent_ref else None
+                if getattr(cached_agent, "_onboarding_lightweight", False):
+                    for callback_name in (
+                        "stream_delta_callback",
+                        "tool_progress_callback",
+                        "tool_start_callback",
+                        "tool_complete_callback",
+                        "reasoning_callback",
+                        "clarify_callback",
+                    ):
+                        setattr(cached_agent, callback_name, None)
+            except Exception:
+                logger.debug(
+                    "[zet_agent] onboarding callback cleanup failed", exc_info=True
+                )
             try:
                 reset_current_session_key(approval_session_token)
             finally:

@@ -197,9 +197,12 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
 
 def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
     captured = {}
+    constructions = 0
 
     class FakeAgent:
         def __init__(self, **kwargs):
+            nonlocal constructions
+            constructions += 1
             captured.update(kwargs)
             self.model = kwargs.get("model")
             self.provider = kwargs.get("provider")
@@ -238,6 +241,12 @@ def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
             session_id="onboarding-session",
             gateway_session_key="zettlab:user:onboarding:session",
         )
+        reused = adapter._create_agent(
+            ephemeral_system_prompt="v14 onboarding policy",
+            session_id="onboarding-session",
+            gateway_session_key="zettlab:user:onboarding:session",
+            stream_delta_callback=lambda _text: None,
+        )
     finally:
         _api_request_profile.reset(profile_token)
 
@@ -250,6 +259,9 @@ def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
     assert agent._tools_disabled_for_request is True
     assert agent.compression_enabled is False
     assert "authoritative v14 policy" in agent._cached_system_prompt
+    assert reused is agent
+    assert constructions == 1
+    assert reused.stream_delta_callback is not None
 
 
 @pytest.mark.asyncio
