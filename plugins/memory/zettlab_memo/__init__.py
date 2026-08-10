@@ -37,7 +37,10 @@ class ZettlabMemoProvider(MemoryProvider):
         self._profile_id = str(kwargs.get("agent_identity") or "main")
         self._account_id = str(kwargs.get("user_id") or "")
         hermes_home = Path(str(kwargs.get("hermes_home") or os.environ.get("HERMES_HOME") or ""))
-        self._endpoint, self._token = self._load_transport(hermes_home)
+        self._endpoint, self._token = self._load_transport(
+            hermes_home,
+            profile_id=self._profile_id,
+        )
         if not self._endpoint or not self._token:
             logger.warning("Zettlab Memo provider transport is not configured")
 
@@ -140,26 +143,46 @@ class ZettlabMemoProvider(MemoryProvider):
             return {}
 
     @staticmethod
-    def _load_transport(hermes_home: Path) -> tuple[str, str]:
+    def _load_transport(
+        hermes_home: Path,
+        *,
+        profile_id: str = "",
+    ) -> tuple[str, str]:
         override = os.environ.get("ZETTLAB_MEMO_PROVIDER_URL", "").rstrip("/")
         token_override = os.environ.get("ZETTLAB_MEMO_ACTION_TOKEN", "")
         if override and token_override:
             return override, token_override
-        config_path = hermes_home / "config.yaml"
-        if not config_path.is_file():
-            return "", ""
-        try:
-            import yaml
+        config_paths = []
+        clean_profile_id = profile_id.strip()
+        if clean_profile_id and clean_profile_id != "main":
+            config_paths.append(
+                hermes_home / "profiles" / clean_profile_id / "config.yaml"
+            )
+        config_paths.append(hermes_home / "config.yaml")
 
-            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            entry = (config.get("mcp_servers") or {}).get("zettlab_memo") or {}
-            mcp_url = str(entry.get("url") or "")
-            token = str((entry.get("headers") or {}).get("X-Zettlab-Agent-Action-Token") or "")
-            suffix = "/api/v1/internal/mcp/zettlab-memo"
-            if mcp_url.endswith(suffix):
-                return mcp_url[: -len(suffix)] + "/api/v1/internal/memory-provider/zettlab-memo", token
-        except Exception as exc:
-            logger.debug("Could not read Zettlab Memo provider config: %s", exc)
+        for config_path in config_paths:
+            if not config_path.is_file():
+                continue
+            try:
+                import yaml
+
+                config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                entry = (config.get("mcp_servers") or {}).get("zettlab_memo") or {}
+                mcp_url = str(entry.get("url") or "")
+                token = str((entry.get("headers") or {}).get("X-Zettlab-Agent-Action-Token") or "")
+                suffix = "/api/v1/internal/mcp/zettlab-memo"
+                if mcp_url.endswith(suffix) and token:
+                    return (
+                        mcp_url[: -len(suffix)]
+                        + "/api/v1/internal/memory-provider/zettlab-memo",
+                        token,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Could not read Zettlab Memo provider config %s: %s",
+                    config_path,
+                    exc,
+                )
         return "", ""
 
 

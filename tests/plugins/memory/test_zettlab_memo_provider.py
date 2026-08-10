@@ -42,3 +42,32 @@ def test_provider_prefetch_and_native_write(monkeypatch, tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_provider_prefers_profile_scoped_transport(monkeypatch, tmp_path):
+    monkeypatch.delenv("ZETTLAB_MEMO_PROVIDER_URL", raising=False)
+    monkeypatch.delenv("ZETTLAB_MEMO_ACTION_TOKEN", raising=False)
+    root_config = tmp_path / "config.yaml"
+    profile_config = tmp_path / "profiles" / "onboarding" / "config.yaml"
+    profile_config.parent.mkdir(parents=True)
+    root_config.write_text(
+        """mcp_servers:\n  zettlab_memo:\n    url: http://127.0.0.1:19090/api/v1/internal/mcp/zettlab-memo\n    headers:\n      X-Zettlab-Agent-Action-Token: stale-root-token\n""",
+        encoding="utf-8",
+    )
+    profile_config.write_text(
+        """mcp_servers:\n  zettlab_memo:\n    url: http://127.0.0.1:19090/api/v1/internal/mcp/zettlab-memo\n    headers:\n      X-Zettlab-Agent-Action-Token: onboarding-token\n""",
+        encoding="utf-8",
+    )
+
+    provider = ZettlabMemoProvider()
+    provider.initialize(
+        "session-1",
+        hermes_home=str(tmp_path),
+        agent_identity="onboarding",
+        user_id="user-1",
+    )
+
+    assert provider._token == "onboarding-token"
+    assert provider._endpoint.endswith(
+        "/api/v1/internal/memory-provider/zettlab-memo"
+    )
