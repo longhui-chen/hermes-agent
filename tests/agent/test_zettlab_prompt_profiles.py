@@ -329,5 +329,39 @@ def test_common_base_owns_agent_creation_routing(monkeypatch, lang, required):
         assert text in stable
 
 
+@pytest.mark.parametrize(
+    ("lang", "required"),
+    [
+        (
+            "en",
+            (
+                "<workspace_and_device_ops>",
+                "agent-creator skill's CLI",
+                "never raw shell",
+                "skill_view(name='agent-creator')",
+            ),
+        ),
+        (
+            "zh",
+            (
+                "<workspace_and_device_ops>",
+                "agent-creator skill 的 CLI",
+                "不用原生 shell",
+                "skill_view(name='agent-creator')",
+            ),
+        ),
+    ],
+)
+def test_common_base_routes_workspace_and_device_ops_to_cli(monkeypatch, lang, required):
+    """Workspace/device work must reach the trusted CLI without the model
+    having to rediscover the skill from the index on its own."""
+    monkeypatch.setenv("HERMES_AGENT_LANG", lang)
+
+    stable = _stable_prompt()
+
+    for text in required:
+        assert text in stable
+
+
 def test_runtime_default_is_the_neutral_base():
     assert DEFAULT_SOUL_MD == base_soul_md("en")
