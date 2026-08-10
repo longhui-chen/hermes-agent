@@ -65,8 +65,8 @@ class ToolCallGuardrailConfig:
     """Thresholds for per-turn tool-call loop detection.
 
     Warnings are enabled by default and never prevent tool execution. Hard stops
-    are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
-    the user enables circuit-breaker behavior in config.yaml.
+    remain configurable for ordinary tools; trusted runtime operations can still
+    declare a non-retryable failure and terminate their turn immediately.
     """
 
     warnings_enabled: bool = True
@@ -270,6 +270,34 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return False, ""
 
 
+def _trusted_runtime_terminal_failure(tool_name: str, result: str | None) -> bool:
+    """Recognize a trusted runner's non-retryable input/state exit.
+
+    ``terminal_tool`` adds ``video_edit_runtime_direct`` only after the command
+    passed the signed video-runtime boundary. The trusted helper itself marks a
+    non-retryable workflow input/state response with ``terminal_failure``; exit
+    codes alone are intentionally not treated as control flow because some
+    trusted helpers use exit code 2 for recoverable input guidance.
+    """
+    if tool_name != "terminal" or not result:
+        return False
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if (
+        not isinstance(payload, dict)
+        or payload.get("video_edit_runtime_direct") is not True
+        or not isinstance(payload.get("output"), str)
+    ):
+        return False
+    try:
+        helper_payload = json.loads(payload["output"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(helper_payload, dict) and helper_payload.get("terminal_failure") is True
+
+
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
@@ -359,6 +387,21 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+
+        if failed and _trusted_runtime_terminal_failure(tool_name, result):
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="trusted_runtime_terminal_failure",
+                message=(
+                    "The trusted workflow runner rejected its input or state. "
+                    "Stop retrying this tool and report the blocker to the user."
+                ),
+                tool_name=tool_name,
+                count=1,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
@@ -534,14 +577,14 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
     """Action-oriented guidance for recovering from repeated tool failures."""
     common = (
         f"{tool_name} has failed {count} times this turn. This looks like a loop. "
-        "Do not switch to text-only replies; keep using tools, but diagnose before retrying. "
-        "First inspect the latest error/output and verify your assumptions. "
+        "Respect the active workflow and the latest tool result. If either marks "
+        "the failure as terminal or fail-closed, stop using tools and report the blocker "
+        "concisely. Otherwise verify your assumptions before one targeted recovery attempt. "
     )
     if tool_name == "terminal":
         return common + (
-            "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
-            "in the same tool, then try an absolute path, a simpler command, a different "
-            "working directory, or a different tool such as read_file/write_file/patch."
+            "Use only diagnostics permitted by the active workflow; do not replace a "
+            "trusted helper's terminal failure with generic filesystem discovery."
         )
     return common + (
         "Try different arguments, a narrower query/path, an absolute path when relevant, "

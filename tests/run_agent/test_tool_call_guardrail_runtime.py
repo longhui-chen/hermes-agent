@@ -178,7 +178,7 @@ def test_guardrail_guidance_does_not_corrupt_browser_snapshot_completion_callbac
         assert "idempotent_no_progress_warning" in messages[-1]["content"]
 
 
-def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
+def test_same_tool_failure_warning_respects_terminal_workflow_failures():
     agent = _make_agent("terminal")
     guardrails = getattr(agent, "_tool_guardrails")
     guardrails.after_call(
@@ -202,11 +202,41 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
 
     content = messages[0]["content"]
     assert "same_tool_failure_warning" in content
-    assert "Do not switch to text-only replies" in content
-    assert "keep using tools" in content
-    assert "pwd && ls -la" in content
-    assert "absolute path" in content
-    assert "different tool" in content
+    assert "terminal or fail-closed" in content
+    assert "stop using tools" in content
+    assert "report the blocker" in content
+    assert "keep using tools" not in content
+    assert "pwd && ls -la" not in content
+
+
+def test_trusted_video_runtime_non_retryable_exit_halts_default_turn():
+    agent = _make_agent("terminal", max_iterations=4)
+    response = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call("terminal", '{"command":"resume-state"}', "c-terminal")],
+    )
+    agent.client.chat.completions.create.return_value = response
+    trusted_failure = json.dumps(
+        {
+            "video_edit_runtime_direct": True,
+            "exit_code": 2,
+            "output": '{"ok":false,"error":"workflow_state_not_found","terminal_failure":true}',
+        }
+    )
+
+    with (
+        patch("run_agent.handle_function_call", return_value=trusted_failure) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("继续上一次剪辑")
+
+    dispatch.assert_called_once()
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "trusted_runtime_terminal_failure"
+    assert "stopped retrying" in result["final_response"]
 
 
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
@@ -398,7 +428,7 @@ def test_default_run_conversation_warns_without_guardrail_halt():
 
 
 
-def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
+def test_configured_guardrail_halt_emits_final_response_through_stream_delta_callback():
     """Regression for #30770: when the guardrail halts the loop, the
     synthesized halt message must be pushed through ``stream_delta_callback``
     so SSE/TUI clients see why the agent stopped instead of a silent stream
