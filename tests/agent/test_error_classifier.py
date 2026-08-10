@@ -552,6 +552,14 @@ class TestClassifyApiError:
         upstream_safety = Exception(
             "prompt was flagged by our safety system"
         )
+        # content_policy_violation as the error.CODE (or in text), NOT the
+        # structured error.type — must not count as the gateway even on the
+        # ai-proxy route (the token is matched on the parsed type, not a substring).
+        cpv_in_code = MockAPIError(
+            "blocked",
+            status_code=400,
+            body={"error": {"code": "content_policy_violation", "message": "blocked"}},
+        )
 
         def _setenv(val):
             if val is None:
@@ -579,6 +587,9 @@ class TestClassifyApiError:
         assert classify_api_error(cyber, provider="openai-codex").should_fallback is True
         assert classify_api_error(
             upstream_safety, provider="zettlab", via_moderation_gateway=True
+        ).should_fallback is True
+        assert classify_api_error(
+            cpv_in_code, provider="zettlab", via_moderation_gateway=True
         ).should_fallback is True
         # …and all are suppressed only when a deployment opts out globally.
         _setenv("1")

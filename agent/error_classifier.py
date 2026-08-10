@@ -591,30 +591,36 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
 # emit:
 #   1. ``moderation_input_blocked`` — the gateway's own unambiguous error code
 #      (any route; a robust secondary for call sites that don't thread the flag).
-#   2. ``via_moderation_gateway`` AND ``content_policy_violation`` — on the
-#      verified ai-proxy route the gateway's generic ``code="400"`` shape carries
-#      this as its error ``type``. The route flag is REQUIRED so a custom
-#      endpoint that merely reuses the token is not matched; the type is required
-#      so that an UPSTREAM model's own safety refusal passed through the proxy
-#      (``content_filter`` / "flagged by our safety system" / ``new_sensitive``,
-#      all in _CONTENT_POLICY_BLOCKED_PATTERNS) stays failover-eligible instead
-#      of being mistaken for a compliance verdict.
+#   2. ``via_moderation_gateway`` AND the STRUCTURED ``error.type`` equalling
+#      ``content_policy_violation`` — on the verified ai-proxy route the gateway's
+#      generic ``code="400"`` shape carries this as its error ``type``. Matched on
+#      the parsed ``error.type`` field via an exact compare, NOT as a substring of
+#      the flattened haystack: the token appearing in some provider's ``error.code``
+#      or message text must not count. The route flag is also REQUIRED so a custom
+#      endpoint that merely reuses the token is not matched, and so an UPSTREAM
+#      model's own safety refusal passed through the proxy (``content_filter`` /
+#      "flagged by our safety system" / ``new_sensitive``, all in
+#      _CONTENT_POLICY_BLOCKED_PATTERNS) stays failover-eligible.
 # A localized ``内容不合规`` message is deliberately NOT a signal on its own.
 # (PR #299 review; AGENTS.md HR2/HR3 — do not act on unverifiable attribution.)
 _MODERATION_GATEWAY_CODE = "moderation_input_blocked"
 _MODERATION_GATEWAY_GENERIC_TYPE = "content_policy_violation"
 
 
-def _is_moderation_gateway_block(policy_haystack: str, via_moderation_gateway: bool) -> bool:
+def _is_moderation_gateway_block(
+    policy_haystack: str, error_type: str, via_moderation_gateway: bool
+) -> bool:
     """True only for a Zettlab moderation-gateway verdict — its unambiguous
     ``moderation_input_blocked`` code, or (on the verified ai-proxy route) its
-    ``content_policy_violation`` generic-code type. Never the route alone (an
-    upstream model refusal also traverses the proxy) and never a localized
-    message a custom provider could emit. ``policy_haystack`` is the same lowered
-    message+code+type string used for content-policy pattern matching."""
+    generic-code shape identified by the STRUCTURED ``error.type`` equalling
+    ``content_policy_violation``. Never the route alone (an upstream model refusal
+    also traverses the proxy), never a localized message, and never the generic
+    type appearing merely as a code/message substring. ``policy_haystack`` is the
+    lowered message+code+type string used for content-policy pattern matching;
+    ``error_type`` is the parsed ``error.type`` (see _error_type_of)."""
     if _MODERATION_GATEWAY_CODE in policy_haystack:
         return True
-    return via_moderation_gateway and _MODERATION_GATEWAY_GENERIC_TYPE in policy_haystack
+    return via_moderation_gateway and error_type == _MODERATION_GATEWAY_GENERIC_TYPE
 
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
@@ -893,7 +899,7 @@ def classify_api_error(
         # refusal stays failover-eligible unless a deployment opts out via
         # content_policy_fallback_disabled(). See _is_moderation_gateway_block.
         _gateway_moderation = _is_moderation_gateway_block(
-            _policy_haystack, via_moderation_gateway
+            _policy_haystack, _error_type_of(body), via_moderation_gateway
         )
         return _result(
             FailoverReason.content_policy_blocked,
