@@ -1716,15 +1716,43 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
 
 def _inject_context_hermes_home(env: dict) -> None:
-    """Bridge the context-local Hermes home override into subprocess env."""
+    """把 context-local 的 Hermes home 覆盖桥接进子进程环境。
+
+    ⚠️ 这里**曾经**是一个 ``except Exception: pass``。它把三件性质完全不同的事
+    压成了同一个"静默通过",其中最毒的一件是:连 ``from hermes_constants import``
+    的 ImportError 也一起吞掉 ⇒ 打包/部署一出问题,这个 pin **永久静默失效、全路径、
+    全时间**,而日志上一切正常。那不是降级,那是"保护装置整个不存在,却没人知道"。
+
+    ⇒ 三个分支必须分开处置,⛔ 不许再合并成一个 catch:
+
+    ① **没有 pin**(override 为空)⇒ 静默 no-op、**不记日志**。
+       这是绝大多数正常路径(单 profile),记日志只会刷屏,把真信号淹掉。
+
+    ② **机制本身不可用**(ImportError / 符号缺失)⇒ **响亮地失败**。
+       这是部署错误,不是运行时条件。悄悄跑下去 = 带着一个并不存在的安全边界在服务。
+
+    ③ **有 pin,但取用时抛异常** ⇒ **fail closed**,让异常上抛、子进程不要起。
+       "明知该指向 A 却指向了 B 的凭据库"比"这次操作失败"严重得多:各 profile 绑的是
+       **不同的真人身份**,指错=一个 agent 拿别人的身份去操作。
+       ⭐ 爆炸半径很窄:只有 pin 存在(多 profile 会话)才可能触发,单 profile 走 ①。
+    """
     try:
         from hermes_constants import get_hermes_home_override
+    except ImportError:
+        # ② 机制不可用:先留下能定位的日志,再上抛 —— ⛔ 不许静默继续。
+        logger.error(
+            "profile pin unavailable: cannot import get_hermes_home_override; "
+            "a child process may be pointed at another profile's credential store",
+            exc_info=True,
+        )
+        raise
 
-        value = get_hermes_home_override()
-        if value:
-            env["HERMES_HOME"] = value
-    except Exception:
-        pass
+    # ③ 取 pin 若抛异常,**不接住** —— fail closed 好过指向别人的凭据库。
+    value = get_hermes_home_override()
+    if not value:
+        # ① 无 pin:静默返回。
+        return
+    env["HERMES_HOME"] = value
 
 
 def _inject_session_context_env(env: dict) -> None:
