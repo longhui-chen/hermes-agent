@@ -93,7 +93,15 @@ def list_my_connectors_tool(args, **kw):
     # local-server envelope is {code, data:{connectors:[{provider, state, ...}]}}
     data = parsed.get("data") if isinstance(parsed, dict) else None
     if isinstance(data, dict) and "connectors" in data:
-        return json.dumps({"connectors": data["connectors"]}, ensure_ascii=False)
+        out = {"connectors": data["connectors"]}
+        # available_providers = 目录里这个用户「还能连」的连接器。connectors 只列
+        # 已连接的，用户一个都没连时它是空数组——此前模型据此回答「连接器列表是
+        # 空的」，而实际上有几十个可连（2026-08-10 真机现场）。可选字段，老版本
+        # local-server 不返回时保持原样。
+        available = data.get("available_providers")
+        if isinstance(available, list) and available:
+            out["available_providers"] = available
+        return json.dumps(out, ensure_ascii=False)
     return json.dumps({"error": f"unexpected response from local-server: {body[:200]}"}, ensure_ascii=False)
 
 

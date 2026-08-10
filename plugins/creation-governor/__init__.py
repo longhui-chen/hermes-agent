@@ -699,6 +699,15 @@ def _fetch_connection_inventory() -> dict[str, Any]:
                         recommendable.append(provider)
                     else:
                         connected.append(provider)
+                # 从未连接过的 provider 不会出现在 connectors 里（那份只列已建立
+                # 的连接），但它们恰恰是最该被推荐去连的。缺了这一路，用户一个
+                # 连接器都没连时可推荐池恒为空，connector 推荐被硬闸拒死。
+                available = parsed.get("available_providers")
+                if isinstance(available, list):
+                    for item in available:
+                        provider = _text(item, 80).lower()
+                        if provider and provider not in connected:
+                            recommendable.append(provider)
                 inventory["connectors_connected"] = sorted(set(connected))
                 inventory["connectors_recommendable"] = sorted(set(recommendable))
                 inventory["fetched"] = True
