@@ -193,6 +193,13 @@ sets `HERMES_REAL_HOME` so scripts can still locate the actual user home when
 they need it. Container backends keep using `{HERMES_HOME}/home` in `auto` mode
 because that directory lives on the persistent Hermes data volume.
 
+Platform-managed gateways may enforce a separate, non-root terminal `HOME`
+even when `home_mode: profile` is configured. Integrated CLIs that need a
+profile credential store are then executed through a process-authenticated
+command broker: the terminal submits a bounded argv, while the platform chooses
+the executable, credential `HOME`, and working directory. Arbitrary shell
+commands cannot read or copy the underlying OAuth files.
+
 Scripts that need to distinguish profile state from the real user home should
 prefer `HERMES_HOME` for Hermes data and `HERMES_REAL_HOME` for the account home:
 

@@ -1283,6 +1283,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
+            completion_function_result = function_result
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -1327,9 +1328,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     error_message=function_result,
                     middleware_trace=list(middleware_trace),
                 )
+            completion_function_result = function_result
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            completion_function_result = function_result
             name = function_name
             args = function_args
             progress_function_name = function_name
@@ -1451,7 +1454,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 agent.tool_complete_callback(
-                    tc.id, name, display_args, display_function_result,
+                    tc.id, name, display_args, completion_function_result,
                 )
             except Exception as cb_err:
                 logging.debug("Tool complete callback error: %s", cb_err)
@@ -2044,6 +2047,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        completion_function_result = function_result
         if not _execution_blocked and not _is_error_result:
             apply_trusted_skill_execution(
                 agent,
@@ -2165,7 +2169,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call.id,
                     function_name,
                     display_args,
-                    display_function_result,
+                    completion_function_result,
                 )
             except Exception as cb_err:
                 logging.debug("Tool complete callback error: %s", cb_err)

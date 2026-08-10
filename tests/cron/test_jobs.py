@@ -2153,6 +2153,51 @@ class TestAdvanceNextRuns:
         assert advance_next_run(one_ids[0]) is False
         assert advance_next_run("missing-id") is False
 
+    def test_batch_honours_each_jobs_own_timezone(self, tmp_cron_dir, monkeypatch):
+        """Each job advances in its own pinned tz, not the hermes instance zone."""
+        pytest.importorskip("croniter")
+        from cron.jobs import advance_next_runs
+
+        # hermes instance zone = UTC, like a factory-default board.
+        now = datetime(2026, 8, 8, 3, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        shanghai = create_job(prompt="sh", schedule="0 9 * * *", timezone="Asia/Shanghai")
+        tokyo = create_job(prompt="tk", schedule="0 9 * * *", timezone="Asia/Tokyo")
+        jobs = load_jobs()
+        for j in jobs:
+            j["next_run_at"] = "2026-08-01T00:00:00+00:00"  # stale → both must advance
+        save_jobs(jobs)
+        assert advance_next_runs([shanghai["id"], tokyo["id"]]) == 2
+
+        # 09:00 wall clock in each job's OWN zone, not 09:00 UTC.
+        sh_next = datetime.fromisoformat(get_job(shanghai["id"])["next_run_at"])
+        tk_next = datetime.fromisoformat(get_job(tokyo["id"])["next_run_at"])
+        assert sh_next.astimezone(ZoneInfo("Asia/Shanghai")).hour == 9
+        assert tk_next.astimezone(ZoneInfo("Asia/Tokyo")).hour == 9
+        # Distinct zones must land on distinct instants within one batch.
+        assert sh_next != tk_next
+
+    def test_batch_leaves_untimezoned_jobs_on_instance_zone(self, tmp_cron_dir, monkeypatch):
+        """Jobs with no pinned tz keep follow-live semantics (no behaviour change)."""
+        pytest.importorskip("croniter")
+        from cron.jobs import advance_next_runs, compute_next_run
+
+        now = datetime(2026, 8, 8, 3, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="no tz", schedule="0 9 * * *")
+        jobs = load_jobs()
+        for j in jobs:
+            j["timezone"] = None
+            j["next_run_at"] = "2026-08-01T00:00:00+00:00"  # stale → must advance
+        save_jobs(jobs)
+
+        assert advance_next_runs([job["id"]]) == 1
+        assert get_job(job["id"])["next_run_at"] == compute_next_run(
+            job["schedule"], now.isoformat()
+        )
+
 
 # =========================================================================
 # Completed one-shot retention sweep

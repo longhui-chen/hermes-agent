@@ -2,12 +2,13 @@
 Description=Zettlab Claw Gateway
 Wants=network.target
 After=network.target
+RequiresMountsFor=/volume1
 
 [Service]
 Type=simple
-EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env
-Environment=HERMES_HOME=__APP_BASE__/data/hermes_home
-Environment=HERMES_LAZY_INSTALL_TARGET=__APP_BASE__/data/lazy-packages
+EnvironmentFile=-/volume1/system/zettos-main-data/com.zettlab.claw/secrets/zettlab-claw.env
+Environment=HERMES_HOME=/volume1/system/zettos-main-data/com.zettlab.claw/hermes_home
+Environment=HERMES_LAZY_INSTALL_TARGET=/volume1/system/zettos-main-data/com.zettlab.claw/lazy-packages
 Environment=HERMES_DISABLE_LAZY_INSTALLS=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=HERMES_BUNDLED_SKILLS=__APP_BASE__/current/lib/hermes-agent/skills

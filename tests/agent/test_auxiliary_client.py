@@ -4484,9 +4484,9 @@ def test_apply_zettlab_session_headers_skips_non_zettlab_session():
         set_current_session_id("")
 
 
-def test_apply_zettlab_session_headers_collapses_cron_session():
-    """A cron run's aux calls aggregate into one per-job task card: the
-    cron_<job>_<date>_<time> session collapses to a stable cron_<job> task_id."""
+def test_apply_zettlab_session_headers_bills_cron_per_run():
+    """A cron run's aux calls land on that run's own ledger card (task id keeps
+    the per-run timestamp) while routing stays on the stable per-job id."""
     from agent.auxiliary_client import _apply_zettlab_session_headers
     from gateway.session_context import set_current_session_id
 
@@ -4494,10 +4494,51 @@ def test_apply_zettlab_session_headers_collapses_cron_session():
     try:
         headers = _apply_zettlab_session_headers(None)
         assert headers is not None
-        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Task-Id") == "cron_4b2628798006_20260624_104233"
         assert headers.get("X-Zettlab-Conversation-ID") == "cron_4b2628798006"
         assert headers.get("X-Scene-Type") == "agent"
     finally:
+        set_current_session_id("")
+
+
+def test_apply_zettlab_session_headers_separates_turn_and_conversation_keys():
+    """🔴 F5 red line: auxiliary calls bill to the turn but keep routing and
+    prompt-cache affinity on the conversation."""
+    from agent.auxiliary_client import _apply_zettlab_session_headers
+    from gateway.session_context import set_current_session_id, set_zettlab_turn_id
+
+    set_current_session_id("zettlab:u1:agent-a:abc")
+    set_zettlab_turn_id("turn-3")
+    try:
+        headers = _apply_zettlab_session_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc:tturn-3"
+        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc"
+        assert headers["X-Task-Id"] != headers["X-Zettlab-Conversation-ID"]
+    finally:
+        set_zettlab_turn_id("")
+        set_current_session_id("")
+
+
+def test_apply_zettlab_session_headers_uses_a_captured_usage_id():
+    """Background workers (title generation) bill to the turn they were spawned
+    from, which their thread's ContextVars no longer carry."""
+    from agent.auxiliary_client import _apply_zettlab_session_headers
+    from gateway.session_context import (
+        pop_billing_usage_id,
+        push_billing_usage_id,
+        set_current_session_id,
+    )
+
+    set_current_session_id("zettlab:u1:agent-a:abc")
+    token = push_billing_usage_id("zettlab:u1:agent-a:abc:tfirst-turn")
+    try:
+        headers = _apply_zettlab_session_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc:tfirst-turn"
+        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc"
+    finally:
+        pop_billing_usage_id(token)
         set_current_session_id("")
 
 
@@ -4514,7 +4555,7 @@ def test_apply_user_default_headers_stamps_cron_job_title():
     try:
         headers = _apply_zettlab_session_headers(None)
         assert headers is not None
-        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Task-Id") == "cron_4b2628798006_20260624_104233"
         assert unquote(headers.get("X-Task-Title", "")) == "站立提醒"
     finally:
         set_current_session_id("")
