@@ -2868,6 +2868,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
         agent_kwargs = {
             "model": model,
+            "profile_name": active_profile,
             **runtime_kwargs,
             **_checkpoint_agent_kwargs(user_config),
             "max_iterations": max_iterations,

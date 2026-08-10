@@ -172,6 +172,7 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
+    assert captured["profile_name"] == "main"
 
 
 @pytest.mark.asyncio
