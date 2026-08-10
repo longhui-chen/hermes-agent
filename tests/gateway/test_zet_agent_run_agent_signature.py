@@ -223,6 +223,9 @@ def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.tools_config._get_platform_tools", lambda *_: {"terminal", "memory"}
     )
+    monkeypatch.setattr(
+        "agent.prompt_builder.load_soul_md", lambda *_: "authoritative v14 policy"
+    )
 
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
@@ -246,6 +249,7 @@ def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
     assert captured["reasoning_config"] == {"enabled": False}
     assert agent._tools_disabled_for_request is True
     assert agent.compression_enabled is False
+    assert "authoritative v14 policy" in agent._cached_system_prompt
 
 
 @pytest.mark.asyncio
