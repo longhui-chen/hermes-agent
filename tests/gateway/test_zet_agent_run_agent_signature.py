@@ -38,6 +38,25 @@ def test_onboarding_deepseek_fast_path_sets_supported_wire_field():
         "extra_body": {
             "existing": 1,
             "thinking": {"type": "disabled"},
+            "reasoning_effort": "none",
+        }
+    }
+
+
+def test_onboarding_fast_path_applies_to_catalog_alias_model():
+    reasoning, overrides, enabled = _onboarding_deepseek_fast_path(
+        profile="onboarding",
+        model="lite",
+        reasoning_config={"enabled": True},
+        request_overrides={},
+    )
+
+    assert enabled is True
+    assert reasoning == {"enabled": False}
+    assert overrides == {
+        "extra_body": {
+            "thinking": {"type": "disabled"},
+            "reasoning_effort": "none",
         }
     }
 

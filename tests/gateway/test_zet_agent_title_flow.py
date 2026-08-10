@@ -116,6 +116,62 @@ async def test_native_title_skips_zettlab_synthetic_turns(monkeypatch):
     title_call.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_onboarding_uses_deterministic_title_without_llm(monkeypatch):
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    stream_q = queue.Queue()
+
+    class _DB:
+        def get_session_title(self, _session_id):
+            return None
+
+        def set_auto_title_if_empty(self, _session_id, title):
+            assert title == "初始设置"
+            return True
+
+    agent = SimpleNamespace(
+        _session_db=_DB(),
+        _profile_name="onboarding",
+        model="lite",
+        provider="custom",
+        base_url="http://model.invalid/v1",
+        api_key="test-key",
+        api_mode="openai_chat",
+    )
+    result = (
+        {
+            "final_response": "你好。",
+            "messages": [
+                {"role": "user", "content": "Frank"},
+                {"role": "assistant", "content": "你好。"},
+            ],
+            "session_id": "zettlab:u1:onboarding:s1",
+            "completed": True,
+        },
+        {},
+    )
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", AsyncMock(return_value=result))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("onboarding must not call the LLM title worker")
+
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", forbidden)
+
+    got = await adapter._run_agent(
+        user_message="Frank",
+        conversation_history=[],
+        session_id="zettlab:u1:onboarding:s1",
+        stream_delta_callback=lambda delta: stream_q.put(delta),
+        agent_ref=[agent],
+    )
+
+    assert got == result
+    assert stream_q.get_nowait() == (
+        "__tool_progress__",
+        {"type": "conversation.title", "title": "初始设置"},
+    )
+
+
 def test_title_input_strips_agent_creator_routing_directive():
     routed = (
         "[Zettlab internal routing directive]\n"

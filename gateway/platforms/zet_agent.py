@@ -143,23 +143,20 @@ def _onboarding_deepseek_fast_path(
 ) -> tuple[Optional[Dict[str, Any]], Dict[str, Any], bool]:
     """Apply the wire-level DeepSeek fast path only to system onboarding.
 
-    The device routes the catalog's ``deepseek-v4-flash`` model through the
-    local ``custom`` OpenAI-compatible proxy.  Provider-profile dispatch is
-    therefore based on ``custom`` rather than ``deepseek`` and cannot add the
-    DeepSeek-specific ``extra_body.thinking`` field for us.  Put the supported
-    field on the final request overrides so this is effective on the wire,
-    while leaving every normal Agent request untouched.
+    The device may expose ``deepseek-v4-flash`` through a catalog alias such
+    as ``lite`` on the local ``custom`` OpenAI-compatible proxy.  Model-name
+    matching is therefore not reliable.  Onboarding never needs reasoning,
+    so put both supported disable signals on its final request overrides while
+    leaving every normal Agent request untouched.
     """
     normalized_profile = str(profile or "main").strip().lower()
-    normalized_model = str(model or "").strip().lower()
     overrides = dict(request_overrides or {})
-    if normalized_profile != "onboarding" or not normalized_model.startswith(
-        "deepseek-v4-"
-    ):
+    if normalized_profile != "onboarding":
         return reasoning_config, overrides, False
 
     extra_body = dict(overrides.get("extra_body") or {})
     extra_body["thinking"] = {"type": "disabled"}
+    extra_body["reasoning_effort"] = "none"
     overrides["extra_body"] = extra_body
     return {"enabled": False}, overrides, True
 
@@ -1509,6 +1506,26 @@ class ZetAgentAdapter(APIServerAdapter):
             }
 
         from agent.title_generator import maybe_auto_title
+
+        if (
+            str(getattr(agent, "_profile_name", "") or "").strip().lower()
+            == "onboarding"
+        ):
+            from agent.title_generator import _persist_session_title
+
+            try:
+                persisted = _persist_session_title(
+                    session_db, effective_session_id, "初始设置"
+                )
+            except Exception:
+                logger.debug(
+                    "[zet_agent] deterministic onboarding title persist failed",
+                    exc_info=True,
+                )
+                persisted = None
+            if persisted:
+                self._push_title(stream_q, persisted)
+            return
 
         def _run_title_worker() -> None:
             from gateway.session_context import clear_session_vars
