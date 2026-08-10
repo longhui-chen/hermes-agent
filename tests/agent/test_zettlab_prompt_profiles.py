@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import _build_onboarding_prompt_parts, build_system_prompt_parts
 from hermes_cli.config import ensure_hermes_home
 from hermes_cli.default_soul import (
     DEFAULT_SOUL_MD,
@@ -43,6 +43,37 @@ def _stable_prompt(soul_text: str = "") -> str:
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(_make_agent())["stable"]
+
+
+def test_onboarding_profile_uses_bounded_prompt():
+    soul = "[zettlab-onboarding-guide-v15]\n只进行简短初次见面引导。"
+    parts = _build_onboarding_prompt_parts(soul, "current onboarding step")
+
+    combined = "\n".join(parts.values())
+    assert soul in parts["stable"]
+    assert "current onboarding step" == parts["context"]
+    assert "conversation_protocol" not in combined
+    assert "zettlab_onboarding_turn_contract" in parts["volatile"]
+    assert len(combined) < 6000
+
+
+def test_onboarding_profile_routes_around_general_prompt_builder():
+    soul = "[zettlab-onboarding-guide-v15]\n只进行简短初次见面引导。"
+    fake_runtime = SimpleNamespace(load_soul_md=lambda _context_length: soul)
+    with (
+        patch("agent.system_prompt._ra", return_value=fake_runtime),
+        patch("agent.system_prompt._active_profile_name_for_prompt", return_value="onboarding"),
+    ):
+        parts = build_system_prompt_parts(
+            _make_agent(valid_tool_names=["terminal", "memory"]),
+            system_message="step=userName",
+        )
+
+    combined = "\n".join(parts.values())
+    assert soul in combined
+    assert "step=userName" in combined
+    assert "conversation_protocol" not in combined
+    assert len(combined) < 6000
 
 
 @pytest.mark.parametrize("profile", ["main", "memo", "default", "root", "writer"])
