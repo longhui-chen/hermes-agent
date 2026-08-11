@@ -18,6 +18,7 @@ import pytest
 from tests.tools._profile_scope import mux_profile_scope, request_fingerprint
 from tools.apphost_tool import (
     APP_HOST_SCHEMA,
+    _CALL_HTTP_METHODS,
     _check_app_host,
     _local_error,
     app_host_tool,
@@ -187,6 +188,18 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}, "POST",
      "/app1/lifecycle", {"action": "restart"}),
     ("logs", {"slug": "app1", "tail": 50}, "GET", "/app1/logs?tail=50", None),
+    # call rides POST /{slug}/call with method/path/body in the request body:
+    # the app path is payload, never URL — the server builds the target URL
+    # from the slug (the agent has no host/port to give).
+    ("call", {"slug": "app1", "path": "/api/refresh", "http_method": "POST",
+              "body": {"source": "cron"}},
+     "POST", "/app1/call",
+     {"method": "POST", "path": "/api/refresh", "body": {"source": "cron"}}),
+    # GET with a query string and no body: the body key must be absent, not
+    # null — the server treats "present" as "forward a JSON body".
+    ("call", {"slug": "app1", "path": "/api/items?limit=10",
+              "http_method": "GET"},
+     "POST", "/app1/call", {"method": "GET", "path": "/api/items?limit=10"}),
 ])
 def test_action_routing_flow(monkeypatch, action, args, method, path, body):
     seen = {}
@@ -232,6 +245,7 @@ _ALL_HTTP_ACTION_ARGS = [
     ("delete", {"slug": "app1"}),
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}),
     ("logs", {"slug": "app1"}),
+    ("call", {"slug": "app1", "path": "/api/health", "http_method": "GET"}),
 ]
 
 
@@ -503,6 +517,94 @@ def test_schema_does_not_adjudicate_between_publish_and_legacy():
     )
 
 
+# --- call against a server that predates the route ---------------------------
+# Same OTA-skew story as rollback/publish, with one difference: call has no
+# fallback channel, and the bodiless 404 shape is identical to what a naive
+# reading takes as "the app is missing" — the mapping is what keeps an old
+# device from sending the model off probing other slugs and paths.
+
+_CALL_ARGS = {"action": "call", "slug": "app1", "path": "/api/refresh",
+              "http_method": "POST"}
+
+
+def test_call_404_without_body_is_unsupported_not_retryable(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(404, b"404 page not found")):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == 404
+    assert out["error"]["code"] == "unsupported"
+    # The message must break the "404 means the app is missing" reading and
+    # close the door on retries — there is no fallback channel to name.
+    message = out["error"]["message"]
+    assert "call" in message
+    assert "不代表应用不存在" in message
+    # Telling the model to upgrade the device is a dead end (same rule as the
+    # publish branch).
+    assert "升级" not in message
+
+
+def test_call_404_with_json_body_stays_verbatim(monkeypatch):
+    """A parsable 404 is the server speaking — on this route it covers both
+    "unknown app" and "not the owner" (deliberately the same shape, so
+    existence never leaks). The unsupported mapping must never swallow it."""
+    upstream = {"code": "not_found", "message": 'unknown app "app1"',
+                "retryable": False}
+    body = json.dumps(upstream).encode("utf-8")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(404, body)):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == 404
+    assert out["error"] == upstream
+
+
+def test_call_unsupported_mapping_is_narrow(monkeypatch):
+    # Only (call, 404, no parsable body) maps to unsupported; a bodiless
+    # non-404 stays transport_error rather than a capability verdict.
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(502, b"<html></html>")):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == 502
+    assert out["error"]["code"] == "transport_error"
+
+
+# --- call: two-layer status & retryable pass-through --------------------------
+
+def test_call_app_level_error_is_tool_success(monkeypatch):
+    """Two-layer status: data.status is the APP's answer. An app-side 500
+    arrives as ok:true — the forwarding chain worked, the app answered — and
+    must never be conflated with a tool failure the model would retry."""
+    payload = {"status": 500, "content_type": "application/json",
+               "body": {"error": "refresh source unavailable"}}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, payload)):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is True
+    assert out["data"] == payload
+
+
+@pytest.mark.parametrize("upstream,status", [
+    # Transient states: the server names them retryable and pairs them with
+    # Retry-After: 5.
+    ({"code": "app_waking", "message": "还在启动", "retryable": True}, 503),
+    ({"code": "app_updating", "message": "正在更新", "retryable": True}, 503),
+    # The user pressed stop: retryable false is load-bearing — a retry loop
+    # here would make the stop button decorative.
+    ({"code": "app_stopped", "message": "应用已停止", "retryable": False}, 503),
+    ({"code": "app_unreachable", "message": "连接失败", "retryable": False}, 502),
+    ({"code": "app_response_too_large", "message": "响应过大", "retryable": False}, 502),
+])
+def test_call_forwarding_errors_pass_retryable_verbatim(monkeypatch, upstream, status):
+    """The {code, message, retryable} error body must arrive untouched: the
+    model's retry decision reads these fields, and flattening them into prose
+    (or dropping retryable) severs that contract."""
+    body = json.dumps(upstream).encode("utf-8")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(status, body)):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == status
+    assert out["error"] == upstream  # verbatim, key for key
+
+
 def test_connection_error_does_not_leak_url_or_token(monkeypatch):
     scope = _scope()
 
@@ -633,6 +735,10 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     ("acquire_slot", {}, 120.0),
     ("probe", {}, 30.0),
     ("delete", {"slug": "a1"}, 30.0),
+    # Deliberately the default tier: the server's wake+respond budget (~25s)
+    # must expire first so failures arrive as structured error codes, not as
+    # a client-side status=null transport_error.
+    ("call", {"slug": "a1", "path": "/api/x", "http_method": "GET"}, 30.0),
 ])
 def test_timeout_is_tiered_per_action(monkeypatch, action, args, expected_timeout):
     seen = {}
@@ -692,6 +798,12 @@ def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
     ("rollback", {"slug": "app1", "to_version": "   "}),  # whitespace is not a target
     ("lifecycle", {"slug": "app1"}),         # lifecycle_action missing
     ("lifecycle", {"slug": "app1", "lifecycle_action": "explode"}),
+    ("call", {"path": "/api/x", "http_method": "GET"}),   # slug missing
+    ("call", {"slug": "app1", "http_method": "GET"}),     # path missing
+    ("call", {"slug": "app1", "path": "/api/x"}),         # http_method missing
+    ("call", {"slug": "app1", "path": "/api/x", "http_method": "FETCH"}),
+    # HEAD/OPTIONS are real methods but not app domain verbs — not offered.
+    ("call", {"slug": "app1", "path": "/api/x", "http_method": "HEAD"}),
 ])
 def test_missing_required_params_rejected_without_http(monkeypatch, action, args):
     seen = {}
@@ -722,6 +834,7 @@ _SERVER_INTERNAL_ROUTES = {
     ("DELETE", "/{name}"),
     ("POST", "/{name}/lifecycle"),
     ("GET", "/{name}/logs"),
+    ("POST", "/{name}/call"),
 }
 
 
@@ -927,6 +1040,41 @@ def test_malformed_publish_source_rejected_without_http(monkeypatch, bad_source)
     assert "req" not in seen
 
 
+@pytest.mark.parametrize("bad_path", [
+    "api/refresh",                        # not rooted at the app
+    "//evil.example/steal",               # host-relative URL form
+    "http://127.0.0.1:9/x",               # full URL
+    "/redirect?to=https://x",             # embedded absolute URL anywhere
+    "/api/../internal",                   # traversal segment
+    "/api/refresh\nX-Injected: 1",
+    "/api/refresh\x00",
+    "/api/\x1bcontrol",
+    "/" + "a" * 2000,
+])
+def test_malformed_call_path_rejected_without_http(monkeypatch, bad_path):
+    """String-level precheck: a path that is really a URL, a traversal, or
+    carries control characters never rides a credentialed request (the server
+    stays the authoritative gate)."""
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({**_CALL_ARGS, "path": bad_path}))
+    assert out["ok"] is False and out["status"] == 0
+    assert out["error"]["code"] == "invalid_request"
+    assert "req" not in seen
+
+
+def test_call_http_method_is_case_normalized(monkeypatch):
+    # "post" is unambiguous — normalize instead of burning a model turn on a
+    # case correction. The wire form is canonical uppercase.
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({**_CALL_ARGS, "http_method": "post"}))
+    assert out["ok"] is True
+    assert json.loads(seen["req"].data.decode("utf-8"))["method"] == "POST"
+
+
 # --- response-size caps ------------------------------------------------------
 
 def test_error_body_read_is_capped(monkeypatch):
@@ -1052,7 +1200,7 @@ def test_schema_declares_every_action_it_handles():
     declared = set(APP_HOST_SCHEMA["parameters"]["properties"]["action"]["enum"])
     for action in (
         "publish", "rollback", "reload", "install", "list", "delete",
-        "lifecycle", "logs",
+        "lifecycle", "logs", "call",
     ):
         assert action in declared, f"{action} is handled but not offered to the model"
 
@@ -1071,6 +1219,25 @@ def test_undo_is_described_where_the_model_reads_it():
     text = APP_HOST_SCHEMA["description"]
     assert "rollback" in text
     assert "prev_version_id" in text, "the model has to be told where to get to_version"
+
+
+def test_call_is_described_where_the_model_reads_it():
+    """The description is the only place the model learns call's retry
+    discipline — the error codes come from the server, but which ones to obey
+    without retrying has to be said up front."""
+    text = APP_HOST_SCHEMA["description"]
+    # Transient vs terminal must both be named…
+    assert "app_updating" in text and "app_waking" in text
+    # …and app_stopped must be tied to a no-retry instruction (the user
+    # pressed stop; a retry loop would make that button decorative).
+    assert "app_stopped" in text
+    assert "never retry" in text
+    # The two-layer status contract: an app-side error is not a tool failure.
+    assert "data.status" in text
+    props = APP_HOST_SCHEMA["parameters"]["properties"]
+    for param in ("path", "http_method", "body"):
+        assert param in props, f"call's {param} is handled but not declared"
+    assert list(_CALL_HTTP_METHODS) == props["http_method"]["enum"]
 
 
 # --- creation provenance (session key) ---------------------------------------

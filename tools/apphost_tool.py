@@ -51,6 +51,7 @@ _MAX_TEXT_PAYLOAD_CHARS = 64 * 1024
 _DEFAULT_LOG_TAIL = 200
 _MAX_STAGING_DIR_CHARS = 1024
 _MAX_SOURCE_SUBDIR_CHARS = 1024
+_MAX_APP_PATH_CHARS = 1024
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # Credentialed loopback transport (no env proxies, no redirects) — shared
@@ -67,12 +68,13 @@ def _urlopen(req, timeout):
 
 _LIFECYCLE_ACTIONS = ("start", "stop", "restart")
 _PUBLISH_MODES = ("install", "reload")
+_CALL_HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 # NOTE: no "recover" — the internal (agent) face deliberately does not expose
 # it (an action token authenticates one agent, not the device); recovery from
 # the recycle bin lives on the JWT member face, i.e. the client app's list.
 _HTTP_ACTIONS = (
     "probe", "list", "acquire_slot", "release_slot", "publish", "install",
-    "reload", "rollback", "delete", "lifecycle", "logs",
+    "reload", "rollback", "delete", "lifecycle", "logs", "call",
 )
 _ACTIONS = _HTTP_ACTIONS + ("build_env",)
 
@@ -104,7 +106,26 @@ APP_HOST_SCHEMA = {
         "delete (soft-delete into the "
         "recycle bin; recovery is done from the client app's list, there is "
         "no recover action here), lifecycle (start/stop/restart), logs "
-        "(recent log tail), build_env (local check of the shared Go vendor "
+        "(recent log tail), call (invoke an HTTP endpoint of an app the "
+        "current agent owns — the way to write data into it: give the app's "
+        "slug plus its own API path such as /api/refresh, with http_method "
+        "and an optional JSON body; never a full URL, host or port — the "
+        "host resolves the target from the slug, and only the owning agent "
+        "can reach the app. The result's data.status / data.body are the "
+        "APP's answer: an app-side 4xx/5xx there still means the call went "
+        "through — read the app's error and fix the request, do not treat it "
+        "as a tool failure or blindly retry. Only a failed forwarding chain "
+        "returns ok:false, and its error code decides retries — the error "
+        "body also carries a retryable flag: app_updating / app_waking are "
+        "transient, wait ~5s and retry; app_stopped means the user stopped "
+        "the app on purpose — never retry and never try to start or restart "
+        "it; app_broken / app_start_failed / app_unreachable / not_found do "
+        "not heal by retrying — check logs or report instead; code "
+        "\"unsupported\" with HTTP status 404 means this device's "
+        "local-server predates the call route: the device cannot forward "
+        "calls at all, which is NOT the same as the app missing — stop, do "
+        "not keep probing other paths or slugs), build_env (local check of "
+        "the shared Go vendor "
         "dir to copy into the build workspace; makes no HTTP request)."
     ),
     "parameters": {
@@ -119,7 +140,31 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Application slug. Required for install, reload, "
-                    "rollback, delete, lifecycle, and logs."
+                    "rollback, delete, lifecycle, logs, and call."
+                ),
+            },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Required for call: the app's own API path, starting "
+                    "with '/', e.g. \"/api/refresh\" (a query string is "
+                    "fine). Only the path within the app — never a full URL, "
+                    "host or port; the host resolves the target from the "
+                    "slug."
+                ),
+            },
+            "http_method": {
+                "type": "string",
+                "enum": list(_CALL_HTTP_METHODS),
+                "description": (
+                    "Required for call: the HTTP method of the app request."
+                ),
+            },
+            "body": {
+                "type": "object",
+                "description": (
+                    "For call: JSON request body forwarded to the app as-is. "
+                    "Meaningful only with a non-GET http_method."
                 ),
             },
             "mode": {
@@ -325,6 +370,42 @@ def _require_source_subdir(args):
     return source_subdir
 
 
+def _require_app_path(args):
+    """String-level precheck of the model-supplied in-app path for call.
+
+    The server is the authoritative gate (it builds the target URL from the
+    slug itself and validates the path again). This layer rejects the
+    obviously-malformed forms locally so they never ride a credentialed
+    request: full URLs, host-relative ``//`` forms, traversal segments,
+    control characters, absurd length.
+    """
+    path = str(args.get("path", "") or "").strip()
+    if not path:
+        raise _BadRequest("call 需要提供 path 参数（应用自身的 API 路径，如 /api/refresh）")
+    if len(path) > _MAX_APP_PATH_CHARS:
+        raise _BadRequest("path 过长")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
+        raise _BadRequest("path 含非法字符")
+    if "://" in path:
+        raise _BadRequest("path 必须是应用内的相对路径，不能是完整 URL")
+    if not path.startswith("/"):
+        raise _BadRequest("path 必须以 / 开头")
+    if path.startswith("//"):
+        raise _BadRequest("path 不能以 // 开头")
+    if ".." in path.split("/"):
+        raise _BadRequest("path 不允许包含上级目录段")
+    return path
+
+
+def _require_http_method(args):
+    method = str(args.get("http_method", "") or "").strip().upper()
+    if method not in _CALL_HTTP_METHODS:
+        raise _BadRequest(
+            "call 需要 http_method 参数（GET/POST/PUT/PATCH/DELETE）"
+        )
+    return method
+
+
 def _session_key():
     """Stable chat-session identity for creation provenance, or "".
 
@@ -431,6 +512,19 @@ def _build_request(action, args):
         except (TypeError, ValueError):
             raise _BadRequest("tail 必须是整数")
         return "GET", f"/{slug}/logs?tail={tail}", None, timeout
+    if action == "call":
+        # Default tier on purpose: the server's own budget is wake 10s +
+        # app response 15s ≈ 25s, deliberately BELOW this 30s — the server
+        # must time out first so the failure arrives as a structured error
+        # code (app_waking / app_unreachable), not as a client-side
+        # status=null transport_error.
+        slug = _require_slug(args)
+        path = _require_app_path(args)
+        method = _require_http_method(args)
+        body = {"method": method, "path": path}
+        if args.get("body") is not None:
+            body["body"] = args["body"]
+        return "POST", f"/{slug}/call", body, timeout
     raise _BadRequest(f"未知动作：{action}")
 
 
@@ -518,7 +612,7 @@ def app_host_tool(args, **_kw):
             # string (slug_conflict / storage_full / ...), never the HTTP
             # status. Do not flatten into prose.
             return _fail(upstream, status=exc.code)
-        if action in ("rollback", "publish") and exc.code == 404:
+        if action in ("rollback", "publish", "call") and exc.code == 404:
             # Hermes and local-server ship as separate OTA packages, so this
             # tool can meet a server that predates POST /{slug}/rollback. Its
             # router answers an unregistered path with a bodiless 404, while
@@ -528,7 +622,17 @@ def app_host_tool(args, **_kw):
             # not exist. Reporting it as transport_error would invite retries
             # of a request that can never work; "unsupported" is terminal and
             # the message names the fallback that always exists.
-            if action == "publish":
+            if action == "call":
+                # No fallback exists for call — unlike publish/rollback there
+                # is no older channel that reaches an app's endpoints. The
+                # message must break the "404 means the app is missing"
+                # reading, or the model wanders off probing other slugs.
+                message = (
+                    "设备端 App Host 尚不支持 call（local-server 版本较旧）。"
+                    "这不代表应用不存在——是这台设备没有转发通道，"
+                    "换路径、换 slug 或重试都不会成功，请如实汇报此能力缺失"
+                )
+            elif action == "publish":
                 message = (
                     "设备端 App Host 尚不支持 publish（local-server 版本较旧）。"
                     "改用老设备发布通道：把本次 source_subdir 指向的那个目录"
