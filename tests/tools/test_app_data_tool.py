@@ -538,6 +538,9 @@ def test_read_invoke_uses_declared_route_and_profile_token(monkeypatch):
                 "requestHeaders",
                 "method",
                 "filePath",
+                "callback_urls",
+                "endpoint_uris",
+                "file_paths",
                 "password",
                 "prompt",
                 "provider",
@@ -545,6 +548,7 @@ def test_read_invoke_uses_declared_route_and_profile_token(monkeypatch):
                 "secret",
                 "secret_key",
                 "skills",
+                "source_urls",
             )
         ),
         (
@@ -572,9 +576,13 @@ def test_read_invoke_uses_declared_route_and_profile_token(monkeypatch):
                 "apikey",
                 "bearer",
                 "credential",
+                "callback_urls",
+                "endpoint_uris",
+                "file_paths",
                 "password",
                 "secret",
                 "secret_key",
+                "source_urls",
             )
         ),
         (

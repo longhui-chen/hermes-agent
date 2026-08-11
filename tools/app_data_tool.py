@@ -284,7 +284,7 @@ def _is_forbidden_key(key: str) -> bool:
         return True
     if any(marker in canonical for marker in _FORBIDDEN_KEY_MARKERS):
         return True
-    return canonical.endswith(("url", "uri", "path"))
+    return canonical.endswith(("url", "urls", "uri", "uris", "path", "paths"))
 
 
 def _validate_document(name: str, raw: object) -> dict[str, object] | None:

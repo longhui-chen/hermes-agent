@@ -680,6 +680,10 @@ def test_read_invoke_does_not_retry_outside_local_server(monkeypatch, tmp_path):
         "model",
         "file_path",
         "callback_url",
+        "callback_urls",
+        "endpoint_uris",
+        "file_paths",
+        "source_urls",
     ],
 )
 def test_sensitive_payload_never_reaches_transport(

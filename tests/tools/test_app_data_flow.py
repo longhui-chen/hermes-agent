@@ -210,6 +210,17 @@ def test_ordinary_zet_chat_cache_hit_keeps_core_connector_and_app_tools(
             "tool_call",
         }.issubset(first_names)
         assert len(model_tools._tool_defs_cache) == 1
+
+        # This validator is outside ordinary Chat tool dispatch. Keep a real
+        # neighboring tool assertion so a guard change cannot remove or break
+        # the normal Chat surface.
+        todo_entry = registry.get_entry("todo")
+        assert todo_entry is not None
+        todo_handler = Mock(return_value='{"ok":true,"tool":"todo"}')
+        monkeypatch.setattr(todo_entry, "handler", todo_handler)
+        dispatched = json.loads(registry.dispatch("todo", {}))
+        assert dispatched == {"ok": True, "tool": "todo"}
+        todo_handler.assert_called_once_with({})
     finally:
         registry_module.invalidate_check_fn_cache()
         model_tools._clear_tool_defs_cache()
@@ -467,9 +478,13 @@ def test_sensitive_aliases_never_reach_real_loopback_transport(monkeypatch):
         "apikey",
         "bearer",
         "credential",
+        "callback_urls",
+        "endpoint_uris",
+        "file_paths",
         "password",
         "secret",
         "secret_key",
+        "source_urls",
     )
     with _app_data_server() as (base_url, calls), mux_profile_scope(
         monkeypatch,

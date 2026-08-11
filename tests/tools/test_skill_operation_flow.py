@@ -205,6 +205,47 @@ def test_profile_local_skill_operation_real_transport_flow(monkeypatch, tmp_path
     assert all("flow-skill-agent" not in json.dumps(body) for *_prefix, body in calls if body)
 
 
+def test_plural_location_fields_are_rejected_before_real_transport(
+    monkeypatch, tmp_path
+):
+    profile = _write_profile(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    fields = ("callback_urls", "endpoint_uris", "file_paths", "source_urls")
+
+    with _server() as (base_url, calls), _cron_scope(), mux_profile_scope(
+        monkeypatch,
+        {
+            "ZET_APP_DATA_BASE_URL": base_url,
+            "ZETTLAB_AGENT_ACTION_TOKEN": "flow-skill-token",
+            "ZET_AGENT_ID": "flow-skill-agent",
+        },
+        poison_environ=True,
+    ):
+        for field in fields:
+            payload = json.loads(
+                skill_operation_tool(
+                    {
+                        "action": "invoke",
+                        "operation": "maintenance.inspect",
+                        "payload": {"nested": {field: "must-not-leak"}},
+                    }
+                )
+            )
+            query = json.loads(
+                skill_operation_tool(
+                    {
+                        "action": "invoke",
+                        "operation": "maintenance.inspect",
+                        "query": {field: "must-not-leak"},
+                    }
+                )
+            )
+            assert payload["error"]["code"] == "invalid_request"
+            assert query["error"]["code"] == "invalid_request"
+
+    assert calls == []
+
+
 def test_real_transport_is_not_called_after_same_run_manifest_change(
     monkeypatch, tmp_path
 ):
