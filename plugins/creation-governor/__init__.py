@@ -93,8 +93,10 @@ _emitted_connection_proposals: OrderedDict[str, tuple[str, str]] = OrderedDict()
 _state_lock = threading.Lock()
 _plugin_llm: Any = None
 _plugin_ctx: Any = None
+# (raw_session_id, scoped_session_id, suppression_reason, owner_id,
+#  receipt_transport, turn_id)
 _invocation_scope: ContextVar[
-    tuple[str, str, str | None, str, str] | None
+    tuple[str, str, str | None, str, str, str] | None
 ] = ContextVar(
     "creation_governor_invocation_scope",
     default=None,
@@ -293,6 +295,26 @@ def _scoped_session_key(raw_session_id: str, owner_id: str) -> str:
     return f"{profile}|{_text(owner_id, 160)}|{raw_session_id}"
 
 
+def _is_current_invocation(kwargs: dict[str, Any]) -> bool:
+    """Whether this hook/tool call belongs to the turn that set the scope.
+
+    钩子（pre_llm_call / transform_llm_output）拿得到稳定的
+    conversation_session_id，直接按它认；工具链拿不到——
+    ``model_tools`` 只把 transcript 级 ``session_id`` 递进
+    ``registry.dispatch``，稳定 scope 传不进来。turn_id 两侧都在且比 session
+    更细，用它作为同一次调用的凭据，让工具写候选与钩子读候选落在同一个
+    conversation scope。
+    """
+    invocation = _invocation_scope.get()
+    if invocation is None:
+        return False
+    raw_session_id = _raw_session_key(kwargs)
+    if raw_session_id and invocation[0] == raw_session_id:
+        return True
+    turn_id = _text(kwargs.get("turn_id"), 160)
+    return bool(turn_id and invocation[5] == turn_id)
+
+
 def _session_key(kwargs: dict[str, Any]) -> str:
     raw_session_id = _raw_session_key(kwargs)
     if not raw_session_id:
@@ -306,7 +328,7 @@ def _session_key(kwargs: dict[str, Any]) -> str:
     )
     if (
         invocation is not None
-        and invocation[0] == raw_session_id
+        and _is_current_invocation(kwargs)
         and invocation[1].startswith(profile_prefix)
         and (not explicit_owner or explicit_owner == invocation[3])
     ):
@@ -545,6 +567,16 @@ def _discard_staged_proposal_locked(
     state["last_proposal"] = None
     state["proposal_stage"] = None
     state["candidate_turn"] = -10_000
+
+
+def _delivery_turn_mismatch(proposal: dict[str, Any], turn_id: str) -> bool:
+    """Whether a staged proposal belongs to a different turn than this one.
+
+    两侧都拿到 turn_id 时才判定；老链路（transform 钩子没有 turn_id、或候选
+    来自没有 turn_id 的调用）保持原行为，不因为缺字段就吞掉卡片。
+    """
+    source_turn_id = _text(proposal.get("source_turn_id"), 160)
+    return bool(turn_id and source_turn_id and source_turn_id != turn_id)
 
 
 def _response_delivery_block_reason(response_text: str) -> str:
@@ -1185,7 +1217,7 @@ def _parse_detector_json(value: Any) -> dict[str, Any] | None:
 
 
 def _normalize_candidate(
-    args: dict[str, Any], state: dict[str, Any]
+    args: dict[str, Any], state: dict[str, Any], turn_id: str = ""
 ) -> tuple[dict[str, Any] | None, str]:
     decision = _normalize_creation_type(
         args.get("decision") or args.get("creation_type")
@@ -1270,7 +1302,10 @@ def _normalize_candidate(
         "proposal_text": proposal_text,
         **({"target": target} if target else {}),
         "current_request": _text(state.get("last_user_message"), 1000),
-        "source_turn_id": _text(state.get("last_turn_id"), 160),
+        # 优先用调用方自己的 turn_id：state["last_turn_id"] 是共享的，同一
+        # conversation 并发两轮时慢的那轮会读到后来者的 id，卡片就会挂到
+        # 另一轮的回复下面。
+        "source_turn_id": turn_id or _text(state.get("last_turn_id"), 160),
     }, "candidate"
 
 
@@ -1294,13 +1329,13 @@ def _proposal_payload(candidate: dict[str, Any], *, status: str) -> dict[str, An
 
 
 def _consider_candidate(
-    session_id: str, args: dict[str, Any], now: float
+    session_id: str, args: dict[str, Any], now: float, turn_id: str = ""
 ) -> dict[str, Any]:
     if _is_session_muted(session_id):
         return {"status": "candidate_recorded", "reason": "session_muted"}
     with _state_lock:
         state = _state_locked(session_id, now)
-        candidate, reason = _normalize_candidate(args, state)
+        candidate, reason = _normalize_candidate(args, state, turn_id)
         state["last_candidate"] = dict(candidate) if candidate else None
     if candidate is None:
         return {
@@ -1378,6 +1413,16 @@ def _handle_previous_proposal_action(
                 and structured["title"] == proposal.get("suggested_name")
                 and structured["dedup_key"] == proposal.get("dedup_key")
             )
+            # 校验与消费同处一个临界区：双击、重发或两路并发流会让两个线程都读到
+            # proposal_shown，各自返回 accepted 并各自触发一次原生创建。只有赢下
+            # 这次状态跃迁的请求才继续走到 accepted 回执。
+            if current and action == "create":
+                _discard_staged_proposal_locked(
+                    session_id, state, release_claim=False
+                )
+            elif current and action == "dismiss":
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
         preference: Literal["muted", "unmuted", "absent", "read_error"] = "absent"
         if action in {"mute_session", "unmute_session"}:
             target_muted = action == "mute_session"
@@ -1483,10 +1528,6 @@ def _handle_previous_proposal_action(
             )
         if action == "dismiss":
             _latch_dismissal(session_id, structured["dedup_key"], now)
-            with _state_lock:
-                state = _state_locked(session_id, now)
-                state["last_proposal"] = None
-                state["proposal_stage"] = None
             return _ActionHandlingOutcome(
                 (
                     "[Creation governor internal action: The user dismissed the previous "
@@ -1495,9 +1536,6 @@ def _handle_previous_proposal_action(
                 ),
                 _ActionReceipt(structured["proposal_id"], action, "accepted"),
             )
-        with _state_lock:
-            state = _state_locked(session_id, now)
-            _discard_staged_proposal_locked(session_id, state, release_claim=False)
         return _ActionHandlingOutcome(
             (
                 "[Creation governor internal action: The user accepted the previous recommendation "
@@ -1565,7 +1603,14 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         suppression_reason = "unsupported_runtime"
     receipt_transport = _receipt_transport(kwargs)
     _invocation_scope.set(
-        (raw_session_id, session_id, suppression_reason, owner_id, receipt_transport)
+        (
+            raw_session_id,
+            session_id,
+            suppression_reason,
+            owner_id,
+            receipt_transport,
+            _text(kwargs.get("turn_id"), 160),
+        )
     )
     if not session_id:
         return None
@@ -1645,7 +1690,9 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             connection_context=_connection_inventory_context(inventory),
         )
         if candidate is not None:
-            candidate_result = _consider_candidate(session_id, candidate, now)
+            candidate_result = _consider_candidate(
+                session_id, candidate, now, _text(kwargs.get("turn_id"), 160)
+            )
             logger.info(
                 "creation opportunity checkpoint result status=%s reason=%s "
                 "decision=%s confidence=%s title=%s",
@@ -1991,6 +2038,10 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             not isinstance(proposal, dict)
             or int(state["candidate_turn"]) != current_turn
             or int(state["last_delivery_turn"]) == current_turn
+            # 候选只允许产生它的那一轮消费：state["turn"] 是共享计数器，同一
+            # conversation 并发两轮时它认不出「这张卡是谁的」，会把 A 轮的卡
+            # 挂到 B 轮的回复下面。
+            or _delivery_turn_mismatch(proposal, turn_id)
         ):
             return response_text if stripped_forged_result else None
 
@@ -2060,10 +2111,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
 
 def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
     invocation = _invocation_scope.get()
-    raw_session_id = _raw_session_key(kwargs)
-    current_invocation = bool(
-        invocation is not None and invocation[0] == raw_session_id
-    )
+    current_invocation = _is_current_invocation(kwargs)
     if current_invocation and invocation is not None and invocation[2]:
         return json.dumps({"status": "not_proposed", "reason": invocation[2]})
     if not current_invocation and (
@@ -2075,7 +2123,9 @@ def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
     session_id = _session_key(kwargs)
     if not session_id:
         return json.dumps({"status": "invalid", "error": "missing_session_id"})
-    result = _consider_candidate(session_id, args, time.monotonic())
+    result = _consider_candidate(
+        session_id, args, time.monotonic(), _text(kwargs.get("turn_id"), 160)
+    )
     return json.dumps(result, ensure_ascii=False)
 
 

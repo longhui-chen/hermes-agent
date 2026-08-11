@@ -806,3 +806,137 @@ def test_explicit_creation_and_expired_cards_cannot_enter_recommendation_flow():
     )
     assert expired is not None
     assert "invalid or expired" in expired["context"]
+
+
+class _ReentrantSecondClick:
+    """在「校验刚结束」的那次 _state_lock 释放点上同步插入第二次点击。
+
+    这个释放点就是双击 / 重发 / 并发流真正撞上的位置：校验与消费分处两个
+    临界区时它落在两者之间，插进来的第二次点击会同样看到 proposal_shown
+    并同样成交，于是原生创建流程被拉起两次。
+    """
+
+    def __init__(self, plugin, second_click):
+        self._real = plugin._state_lock
+        self._second_click = second_click
+        self.armed = False
+        self._fired = False
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *exc_info):
+        released = self._real.__exit__(*exc_info)
+        if self.armed and not self._fired:
+            self._fired = True
+            self._second_click()
+        return released
+
+
+def test_a_second_click_landing_mid_validation_cannot_also_be_accepted(monkeypatch):
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "double-click-create")
+    message = _action(payload)
+
+    def _click(turn_id: str) -> None:
+        plugin._on_pre_llm_call(
+            session_id="double-click-create",
+            sender_id="owner-a",
+            turn_id=turn_id,
+            user_message=message,
+            conversation_history=[],
+        )
+
+    seam = _ReentrantSecondClick(plugin, lambda: _click("click-2"))
+    monkeypatch.setattr(plugin, "_state_lock", seam)
+    original_parse = plugin._parse_recommendation_response
+
+    def _parse_and_arm(user_message: str):
+        parsed = original_parse(user_message)
+        if parsed is not None:
+            seam.armed = True
+        return parsed
+
+    monkeypatch.setattr(plugin, "_parse_recommendation_response", _parse_and_arm)
+
+    _click("click-1")
+
+    state_key = plugin._session_key(
+        {"session_id": "double-click-create", "sender_id": "owner-a"}
+    )
+    receipts = plugin._session_states[state_key]["pending_action_results"]
+    assert sorted(receipts) == ["click-1", "click-2"]
+    statuses = [receipt.status for receipt in receipts.values()]
+    assert statuses.count("accepted") == 1
+    assert receipts["click-2"].reason_code == "proposal_not_actionable"
+
+
+def test_tool_discovered_card_survives_a_transcript_scoped_tool_dispatch():
+    """工具链只递 transcript 级 session_id，卡片仍要落在钩子的稳定作用域里。
+
+    ``model_tools`` 的 registry.dispatch 不转发 conversation_session_id，
+    候选一旦写进 transcript 作用域，transform 钩子就再也读不到它，卡片静默消失。
+    """
+    plugin = _load_plugin()
+
+    plugin._on_pre_llm_call(
+        session_id="transcript-1",
+        conversation_session_id="stable-conversation",
+        sender_id="owner-a",
+        turn_id="turn-7",
+        user_message="分析近期广告效果",
+        conversation_history=[],
+    )
+    discovered = plugin._detect_creation_opportunity(
+        _candidate(),
+        session_id="transcript-1",
+        turn_id="turn-7",
+    )
+    assert json.loads(discovered)["status"] == "proposal_ready"
+
+    transformed = plugin._transform_llm_output(
+        session_id="transcript-1",
+        conversation_session_id="stable-conversation",
+        sender_id="owner-a",
+        turn_id="turn-7",
+        response_text="分析完成。",
+        completed=True,
+        failed=False,
+    )
+    assert transformed is not None
+    assert _decode_envelope(transformed)["source_turn_id"] == "turn-7"
+
+
+def test_card_is_only_delivered_by_the_turn_that_produced_it():
+    plugin = _load_plugin()
+
+    plugin._on_pre_llm_call(
+        session_id="turn-bound-card",
+        sender_id="owner-a",
+        turn_id="producing-turn",
+        user_message="分析近期广告效果",
+        conversation_history=[],
+    )
+    assert (
+        json.loads(
+            plugin._detect_creation_opportunity(
+                _candidate(),
+                session_id="turn-bound-card",
+                sender_id="owner-a",
+                turn_id="producing-turn",
+            )
+        )["status"]
+        == "proposal_ready"
+    )
+
+    assert (
+        plugin._transform_llm_output(
+            session_id="turn-bound-card",
+            sender_id="owner-a",
+            turn_id="another-concurrent-turn",
+            response_text="另一轮的回复。",
+            completed=True,
+            failed=False,
+        )
+        is None
+    )
