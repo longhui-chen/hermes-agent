@@ -136,6 +136,7 @@ def _install_fake_openai_module(captured, transcription_response=None):
     class FakeSpeechResponse:
         def stream_to_file(self, output_path):
             captured["stream_to_file"] = output_path
+            Path(output_path).write_bytes(b"fake-audio")
 
     class FakeOpenAI:
         def __init__(self, api_key, base_url, **kwargs):
@@ -220,7 +221,8 @@ def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatc
     assert captured["base_url"] == "https://openai-audio-gateway.nousresearch.com/v1"
     assert captured["speech_kwargs"]["model"] == "gpt-4o-mini-tts"
     assert captured["speech_kwargs"]["extra_headers"] == {"x-idempotency-key": "tts-call-123"}
-    assert captured["stream_to_file"] == str(output_path)
+    assert captured["stream_to_file"].endswith(".part")
+    assert output_path.read_bytes() == b"fake-audio"
     assert captured["close_calls"] == 1
 
 
@@ -228,9 +230,8 @@ def test_zettlab_tts_auto_selects_local_gateway_and_ai_api_model(monkeypatch, tm
     captured = {}
     _install_fake_tools_package()
     _install_fake_openai_module(captured)
-    # A device image may also carry a direct OpenAI key. The board-local path
-    # still owns managed TTS so provider credentials and billing stay cloud-side.
-    monkeypatch.setenv("OPENAI_API_KEY", "direct-key-must-not-win")
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv(
         "ZET_CHAT_APPEND_URL",
         "http://127.0.0.1:9090/api/v1/internal/chat/append",
@@ -252,9 +253,75 @@ def test_zettlab_tts_auto_selects_local_gateway_and_ai_api_model(monkeypatch, tm
     assert captured["api_key"] == "local-action-token"
     assert captured["base_url"] == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
     assert captured["client_kwargs"]["http_client"]._trust_env is False
+    assert captured["client_kwargs"]["http_client"].follow_redirects is False
+    assert captured["client_kwargs"]["max_retries"] == 0
     assert captured["speech_kwargs"]["model"] == "seed-tts-1.1"
     assert captured["speech_kwargs"]["voice"] == "nova"
     assert captured["speech_kwargs"]["speed"] == 3.0
+
+
+def test_zettlab_tts_existing_direct_key_wins_unless_gateway_is_forced(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured)
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    direct_path = tmp_path / "direct.mp3"
+    tts_tool._generate_openai_tts(
+        "direct",
+        str(direct_path),
+        {"openai": {"model": "tts-1-hd"}},
+    )
+    assert captured["api_key"] == "direct-openai-key"
+    assert captured["base_url"] == "https://api.openai.com/v1"
+    assert captured["speech_kwargs"]["model"] == "tts-1-hd"
+
+    managed_path = tmp_path / "managed.mp3"
+    tts_tool._generate_openai_tts(
+        "managed",
+        str(managed_path),
+        {"use_gateway": True, "openai": {"model": "tts-1-hd"}},
+    )
+    assert captured["api_key"] == "local-action-token"
+    assert captured["base_url"] == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+    assert captured["speech_kwargs"]["model"] == "seed-tts-1.1"
+
+
+def test_tts_bounded_file_sink_removes_partial_output(monkeypatch, tmp_path):
+    _install_fake_tools_package()
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    output_path = tmp_path / "oversized.mp3"
+
+    class OversizedResponse:
+        headers = {}
+
+        def iter_bytes(self, chunk_size=None):
+            del chunk_size
+            yield b"1234"
+            yield b"5678"
+
+        def close(self):
+            return None
+
+    with pytest.raises(RuntimeError, match="exceeds 6 bytes"):
+        tts_tool._write_tts_response_to_file(
+            OversizedResponse(),
+            str(output_path),
+            label="test TTS",
+            limit=6,
+        )
+
+    assert not output_path.exists()
+    assert list(tmp_path.glob("*.part")) == []
 
 
 def test_zettlab_tts_explicit_direct_openai_opt_out_wins(monkeypatch, tmp_path):

@@ -11,6 +11,7 @@ import queue
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -105,14 +106,18 @@ def test_elevenlabs_available_reflects_key(monkeypatch):
 
 
 def test_openai_available_reflects_audio_key_resolution(monkeypatch):
-    monkeypatch.setattr(ts, "_openai_config_api_key", lambda: "")
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "voice-key")
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: ("voice-key", "https://api.openai.com/v1"),
+    )
     assert ts.OpenAIStreamer.available() is True
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "")
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: None,
+    )
     assert ts.OpenAIStreamer.available() is False
-    # tts.openai.api_key from config.yaml counts too
-    monkeypatch.setattr(ts, "_openai_config_api_key", lambda: "cfg-key")
-    assert ts.OpenAIStreamer.available() is True
 
 
 def test_openai_streamer_prefers_configured_api_key(monkeypatch):
@@ -139,8 +144,11 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
             self.audio = MagicMock()
             self.audio.speech.with_streaming_response = _StreamingCreate()
 
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "env-key")
-    monkeypatch.setattr(ts, "get_env_value", lambda key, *args: None)
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: ("cfg-key", "http://local-tts.example/v1"),
+    )
     monkeypatch.setattr("openai.OpenAI", _OpenAI)
 
     config = {
@@ -152,6 +160,17 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert streamer is not None
     assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
     assert captured["client"]["api_key"] == "cfg-key"
+    assert captured["client"]["base_url"] == "http://local-tts.example/v1"
+    assert captured["client"]["max_retries"] == 0
+
+
+def test_openai_managed_backend_uses_sync_pipeline(monkeypatch):
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: None,
+    )
+    assert ts.resolve_streaming_provider({"provider": "openai"}) is None
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
@@ -915,3 +934,29 @@ def test_sync_pipeline_cleans_temp_files(monkeypatch):
     assert created, "expected temp files to be created via mkstemp"
     leftovers = [p for p in created if os.path.exists(p)]
     assert not leftovers, f"temp files not cleaned: {leftovers}"
+
+
+def test_sync_pipeline_propagates_profile_context(monkeypatch):
+    from tools import tts_tool
+
+    profile_marker: ContextVar[str] = ContextVar("profile_marker", default="missing")
+    seen = []
+
+    def fake_synth(text, output_path):
+        seen.append((text, profile_marker.get()))
+        with open(output_path, "wb") as output:
+            output.write(b"mp3")
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    token = profile_marker.set("profile-a")
+    try:
+        pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+        pipeline.speak("Profile scoped sentence.")
+        pipeline.close()
+    finally:
+        profile_marker.reset(token)
+
+    assert seen == [("Profile scoped sentence.", "profile-a")]

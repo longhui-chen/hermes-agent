@@ -95,6 +95,25 @@ def test_managed_zettlab_tts_rejects_unsafe_session_bucket(tmp_path, monkeypatch
     assert file_path.is_relative_to(output_root)
 
 
+def test_managed_zettlab_tts_rejects_dot_session_buckets(tmp_path, monkeypatch):
+    output_root = tmp_path / "agent-output"
+    output_root.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    _stub_edge_tts(monkeypatch)
+
+    for bucket in (".", ".."):
+        with _managed_zettlab_session(
+            output_root,
+            f"zettlab:local-dev:main:{bucket}",
+        ):
+            result = json.loads(tts_tool.text_to_speech_tool("hello"))
+
+        file_path = Path(result["file_path"])
+        assert result["success"] is True
+        assert file_path.parent == output_root.resolve()
+        assert file_path.is_relative_to(output_root.resolve())
+
+
 def test_non_zettlab_tts_keeps_existing_cache_default(tmp_path, monkeypatch):
     output_root = tmp_path / "agent-output"
     cache_root = tmp_path / "cache" / "audio"

@@ -51,6 +51,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Any, Iterator, Optional
@@ -261,6 +262,11 @@ GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
 TTS_RESPONSE_BODY_LIMIT_BYTES = 16 * 1024 * 1024
 TTS_RESPONSE_BODY_CHUNK_BYTES = 64 * 1024
+ZETTLAB_TTS_CONNECT_TIMEOUT_SECONDS = 5.0
+ZETTLAB_TTS_READ_TIMEOUT_SECONDS = 120.0
+ZETTLAB_TTS_WRITE_TIMEOUT_SECONDS = 30.0
+ZETTLAB_TTS_POOL_TIMEOUT_SECONDS = 5.0
+ZETTLAB_TTS_TOTAL_TIMEOUT_SECONDS = 120.0
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -297,16 +303,24 @@ def _default_output_dir_for_session(*, platform: str, session_id: str) -> Path:
         )
         return Path(DEFAULT_OUTPUT_DIR)
 
-    root = Path(output_root)
+    root = Path(output_root).resolve()
     bucket = str(session_id or "").strip().rsplit(":", 1)[-1]
     if not bucket:
         return root
-    if not _SAFE_SESSION_OUTPUT_BUCKET_RE.fullmatch(bucket):
+    if bucket in {".", ".."} or not _SAFE_SESSION_OUTPUT_BUCKET_RE.fullmatch(bucket):
         logger.warning(
             "Unsafe Zettlab session output bucket ignored; using flat Agent output"
         )
         return root
-    return root / bucket
+    candidate = (root / bucket).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        logger.warning(
+            "Zettlab session output bucket escaped Agent output; using flat output"
+        )
+        return root
+    return candidate
 
 # ---------------------------------------------------------------------------
 # Per-provider input-character limits (from official provider docs).
@@ -359,6 +373,8 @@ def _config_bool(value: Any, default: bool = False) -> bool:
 
 
 def _response_has_explicit_stream(response: Any) -> bool:
+    if _response_has_explicit_iter_bytes(response):
+        return True
     iter_content = getattr(response, "iter_content", None)
     if not callable(iter_content):
         return False
@@ -366,6 +382,18 @@ def _response_has_explicit_stream(response: Any) -> bool:
     if response_type.__module__.startswith("requests."):
         return True
     return "iter_content" in vars(response_type)
+
+
+def _response_has_explicit_iter_bytes(response: Any) -> bool:
+    iter_bytes = getattr(response, "iter_bytes", None)
+    if not callable(iter_bytes):
+        return False
+    response_type = type(response)
+    return (
+        "iter_bytes" in vars(response)
+        or "iter_bytes" in vars(response_type)
+        or response_type.__module__.startswith(("httpx", "openai"))
+    )
 
 
 def _close_response(response: Any) -> None:
@@ -388,7 +416,10 @@ def _read_tts_response_bytes(
     chunks: list[bytes] = []
     total = 0
     try:
-        if _response_has_explicit_stream(response):
+        iter_bytes = getattr(response, "iter_bytes", None)
+        if _response_has_explicit_iter_bytes(response):
+            iterator = iter_bytes(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
+        elif _response_has_explicit_stream(response):
             iterator = response.iter_content(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
         else:
             content = vars(response).get("content", getattr(type(response), "content", b""))
@@ -439,10 +470,95 @@ def _write_tts_response_to_file(
     *,
     label: str,
     limit: Optional[int] = None,
+    total_timeout: Optional[float] = None,
 ) -> None:
-    audio_bytes = _read_tts_response_bytes(response, label=label, limit=limit)
-    with open(output_path, "wb") as f:
-        f.write(audio_bytes)
+    """Stage a bounded response beside the target, then atomically publish it."""
+    limit = TTS_RESPONSE_BODY_LIMIT_BYTES if limit is None else limit
+    target = Path(output_path)
+    partial_id = str(uuid.uuid4()).replace("-", "")
+    partial = target.with_name(f".{target.name}.{partial_id}.part")
+    started = time.monotonic()
+    total = 0
+
+    headers = getattr(response, "headers", None)
+    content_length = None
+    if headers is not None:
+        try:
+            raw_length = headers.get("content-length") or headers.get("Content-Length")
+            content_length = (
+                int(raw_length)
+                if isinstance(raw_length, (str, int))
+                else None
+            )
+        except (TypeError, ValueError):
+            content_length = None
+    if content_length is not None and content_length > limit:
+        _close_response(response)
+        raise RuntimeError(f"{label} response exceeds {limit} bytes")
+
+    try:
+        iter_bytes = getattr(response, "iter_bytes", None)
+        iter_content = getattr(response, "iter_content", None)
+        if _response_has_explicit_iter_bytes(response):
+            iterator = iter_bytes(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
+        elif _response_has_explicit_stream(response):
+            iterator = iter_content(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
+        else:
+            content = vars(response).get(
+                "content", getattr(type(response), "content", None)
+            )
+            if isinstance(content, str):
+                content = content.encode("utf-8", errors="replace")
+            iterator = (
+                iter((bytes(content),))
+                if isinstance(content, (bytes, bytearray))
+                else None
+            )
+
+        if iterator is None:
+            stream_to_file = getattr(response, "stream_to_file", None)
+            if not callable(stream_to_file):
+                raise RuntimeError(f"{label} response is not streamable")
+            stream_to_file(str(partial))
+            total = partial.stat().st_size
+            if total > limit:
+                raise RuntimeError(f"{label} response exceeds {limit} bytes")
+        else:
+            with partial.open("wb") as output:
+                for chunk in iterator:
+                    if not chunk:
+                        continue
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8", errors="replace")
+                    chunk = bytes(chunk)
+                    total += len(chunk)
+                    if total > limit:
+                        raise RuntimeError(f"{label} response exceeds {limit} bytes")
+                    if (
+                        total_timeout is not None
+                        and time.monotonic() - started > total_timeout
+                    ):
+                        raise TimeoutError(
+                            f"{label} response exceeded {total_timeout:g}s total timeout"
+                        )
+                    output.write(chunk)
+
+        if (
+            total_timeout is not None
+            and time.monotonic() - started > total_timeout
+        ):
+            raise TimeoutError(
+                f"{label} response exceeded {total_timeout:g}s total timeout"
+            )
+        os.replace(partial, target)
+    except Exception:
+        try:
+            partial.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        _close_response(response)
 
 # Final fallback when provider isn't recognised at all.
 FALLBACK_MAX_TEXT_LENGTH = 4000
@@ -514,6 +630,13 @@ def _gateway_is_explicitly_disabled(tts_config: Dict[str, Any]) -> bool:
     value = tts_config.get("use_gateway")
     return value is False or (
         isinstance(value, str) and value.strip().lower() == "false"
+    )
+
+
+def _gateway_is_explicitly_enabled(tts_config: Dict[str, Any]) -> bool:
+    value = tts_config.get("use_gateway")
+    return value is True or (
+        isinstance(value, str) and value.strip().lower() == "true"
     )
 
 
@@ -1666,9 +1789,18 @@ def _generate_openai_tts(
         import httpx
         client_kwargs["http_client"] = httpx.Client(
             trust_env=False,
-            timeout=httpx.Timeout(600.0, connect=5.0),
-            follow_redirects=True,
+            timeout=httpx.Timeout(
+                connect=ZETTLAB_TTS_CONNECT_TIMEOUT_SECONDS,
+                read=ZETTLAB_TTS_READ_TIMEOUT_SECONDS,
+                write=ZETTLAB_TTS_WRITE_TIMEOUT_SECONDS,
+                pool=ZETTLAB_TTS_POOL_TIMEOUT_SECONDS,
+            ),
+            follow_redirects=False,
         )
+        # The speech request is billable and not known to be idempotent at the
+        # provider. local-server alone may retry one explicit
+        # AUTH_TOKEN_INVALID rejection, before ai-api reaches the provider.
+        client_kwargs["max_retries"] = 0
     client = OpenAIClient(api_key=api_key, base_url=base_url, **client_kwargs)
     try:
         create_kwargs: Dict[str, Any] = {
@@ -1686,7 +1818,16 @@ def _generate_openai_tts(
             create_kwargs["extra_body"] = {"lang_code": language}
         response = client.audio.speech.create(**create_kwargs)
 
-        response.stream_to_file(output_path)
+        _write_tts_response_to_file(
+            response,
+            output_path,
+            label="OpenAI TTS",
+            total_timeout=(
+                ZETTLAB_TTS_TOTAL_TIMEOUT_SECONDS
+                if managed_contract_active
+                else None
+            ),
+        )
         return output_path
     finally:
         close = getattr(client, "close", None)
@@ -3378,10 +3519,10 @@ def _resolve_openai_audio_client_config(
 ) -> tuple[str, str, bool]:
     """Return ``(api_key, base_url, is_managed)`` for OpenAI audio.
 
-    The Zettlab board-local gateway takes precedence unless the effective TTS
-    config explicitly opts out. Outside a Zettlab session, preserve upstream's
-    config/env/credential-pool resolution before falling back to the Nous
-    managed audio gateway.
+    On a Zettlab device, an existing direct TTS key keeps its historical
+    priority unless ``tts.use_gateway: true`` explicitly selects the managed
+    path. Outside a Zettlab session, preserve upstream's config/env/credential-
+    pool resolution before falling back to the Nous managed audio gateway.
     """
     if tts_config is None:
         tts_config = _load_tts_config()
@@ -3401,7 +3542,12 @@ def _resolve_openai_audio_client_config(
             "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
         )
 
+    gateway_forced = _gateway_is_explicitly_enabled(tts_config)
     zettlab_gateway = resolve_zettlab_tool_gateway("openai-tts")
+    if zettlab_gateway is not None and not gateway_forced:
+        selected_key = cfg_api_key or direct_api_key
+        if selected_key:
+            return selected_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
     if zettlab_gateway is not None:
         return (
             zettlab_gateway.token,
@@ -3551,7 +3697,14 @@ class _SyncSentencePipeline:
         """Queue one sentence. Blocks only when the lookahead bound is full."""
         if self._stop.is_set():
             return
-        future = self._executor.submit(self._synthesize_to_tmp, cleaned)
+        # ThreadPoolExecutor does not inherit ContextVars. Capture the active
+        # profile secret/session scope for each queued sentence.
+        context = copy_context()
+        future = self._executor.submit(
+            context.run,
+            self._synthesize_to_tmp,
+            cleaned,
+        )
         self._queue.put((cleaned, future))
 
     def close(self) -> None:
@@ -3871,9 +4024,10 @@ def stream_tts_to_speaker(
             _prefetch_sem.acquire()
             chunk_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=_CHUNK_QUEUE_MAX)
             _audio_queue.put(chunk_queue)
+            context = copy_context()
             t = threading.Thread(
-                target=_consume_to_queue,
-                args=(audio_iter, chunk_queue),
+                target=context.run,
+                args=(_consume_to_queue, audio_iter, chunk_queue),
                 daemon=True,
             )
             _prefetch_threads.append(t)
