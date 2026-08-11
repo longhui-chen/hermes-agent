@@ -272,3 +272,38 @@ def test_push_memory_saved_emits_ms_attachment():
     assert att["id"] == "ms-t-42"
     assert att["kind"] == "memory.saved"
     assert att["payload"]["items"][0]["source"] == "memory"
+
+
+def test_push_memory_saved_missing_turn_id_falls_back_to_session_digest():
+    """turn_id 缺失时按 session 生成锚点 id —— 与 memory.citations 同款兜底。
+
+    ⛔ 这条以前没有：`_push_memory_saved` 的兜底分支和 `_push_memory_citations`
+    是同一段逻辑（都用 uuid.uuid5(NAMESPACE_OID, ...)），但只有 citations 那侧有
+    用例。于是 zet_agent.py 漏 `import uuid` 时，citations 那条红了、saved 这条
+    一路绿着 —— 而生产上两侧都坏：NameError 被外层 try 吞掉转成 return False，
+    表现是**角标静默不出**，比抛异常更难查。同族的兜底路径要一起盖住。
+    """
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    class _Q:
+        def __init__(self):
+            self.items = []
+        def qsize(self):
+            return 0
+        def put(self, item):
+            self.items.append(item)
+
+    q = _Q()
+    ok = ZetAgentAdapter._push_memory_saved(q, None, "sess-9", [
+        {"id": "abc", "source": "memory", "excerpt": "产品周会每周五下午 3 点"},
+    ])
+    assert ok, "turn_id 缺失不该让角标静默消失"
+    att = q.items[0][1]["attachment"]
+    assert att["id"].startswith("ms-")
+    assert len(att["id"]) > 3
+    # 锚点必须由 session 决定：同一 session 两次调用给出同一个 id（upsert 语义）。
+    q2 = _Q()
+    ZetAgentAdapter._push_memory_saved(q2, None, "sess-9", [
+        {"id": "abc", "source": "memory", "excerpt": "产品周会每周五下午 3 点"},
+    ])
+    assert q2.items[0][1]["attachment"]["id"] == att["id"]
