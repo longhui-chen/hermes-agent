@@ -3437,7 +3437,28 @@ def run_job(
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     _zet_output_scope_token = None
+    _cron_skill_operation_scope = None
     try:
+        try:
+            _attached_skills = job.get("skills")
+            if not isinstance(_attached_skills, list):
+                _legacy_skill = str(job.get("skill") or "").strip()
+                _attached_skills = [_legacy_skill] if _legacy_skill else []
+            from tools.skill_operation_tool import (
+                bind_cron_skill_operation_scope,
+            )
+
+            _cron_skill_operation_scope = bind_cron_skill_operation_scope(
+                _attached_skills,
+                job_id=str(job_id),
+            )
+        except Exception:
+            # Tool discovery/import is optional for ordinary scheduled jobs.
+            logger.warning(
+                "Job '%s': unable to initialize optional Skill operation scope",
+                job_id,
+                exc_info=True,
+            )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
@@ -4127,6 +4148,17 @@ def run_job(
             _terminal_cwd_lock.release_write()
         else:
             _terminal_cwd_lock.release_read()
+        # The optional Skill bridge cleans up independently. Its failure must
+        # not replace an ordinary Cron result or skip the remaining cleanup.
+        if _cron_skill_operation_scope is not None:
+            try:
+                _cron_skill_operation_scope.close()
+            except Exception:
+                logger.warning(
+                    "Job '%s': optional Skill operation scope cleanup failed",
+                    job_id,
+                    exc_info=True,
+                )
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
