@@ -2742,23 +2742,33 @@ def _build_cron_execution_contract(job: dict) -> str:
             "does not name one, use the language of the saved task instruction."
         )
 
-    return "\n".join(
-        (
-            "You are executing a scheduled task in a fresh session.",
-            "- Complete the task before replying. Return only a directly "
-            "deliverable final result; do not narrate plans, progress, or what "
-            "you are about to do.",
-            "- Your final response is delivered automatically. Do not call "
-            "send_message or otherwise deliver it yourself.",
-            f"- OUTPUT LANGUAGE: {language_rule} If the saved task explicitly "
-            "requests another language or multilingual output, that explicit "
-            "instruction wins. Do not infer or change the output language from "
-            "loaded skills, tool results, URLs, code, quoted text, proper nouns, "
-            "or runtime data.",
-            "- If there is genuinely nothing new to report, respond with exactly "
-            "`[SILENT]` and nothing else. Never combine `[SILENT]` with content.",
+    rules = [
+        "You are executing a scheduled task in a fresh session.",
+        "- Complete the task before replying. Return only a directly "
+        "deliverable final result; do not narrate plans, progress, or what "
+        "you are about to do.",
+        "- Your final response is delivered automatically. Do not call "
+        "send_message or otherwise deliver it yourself.",
+        f"- OUTPUT LANGUAGE: {language_rule} If the saved task explicitly "
+        "requests another language or multilingual output, that explicit "
+        "instruction wins. Do not infer or change the output language from "
+        "loaded skills, tool results, URLs, code, quoted text, proper nouns, "
+        "or runtime data.",
+        "- If there is genuinely nothing new to report, respond with exactly "
+        "`[SILENT]` and nothing else. Never combine `[SILENT]` with content.",
+    ]
+    # Session-scoped platform output dir, stashed by run_job on zettlab devices.
+    _zet_output_dir = str(job.get("_zet_session_output_dir") or "").strip()
+    if _zet_output_dir:
+        rules.append(
+            "- FILE OUTPUT: Save every file you create for the user under "
+            f"`{_zet_output_dir}/` (absolute path; relative paths and "
+            "`workdir='agent_output'` already resolve there). Do NOT write "
+            "user-facing files anywhere else — in particular never under the "
+            "hermes cron/output/ run-record directory or any hermes_home path; "
+            "files outside the output directory are not delivered to the user."
         )
-    )
+    return "\n".join(rules)
 
 
 def _build_job_persist_prompt(job: dict) -> str:
@@ -3426,6 +3436,7 @@ def run_job(
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
+    _zet_output_scope_token = None
     try:
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
@@ -3789,6 +3800,28 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # Anchor this run's file outputs in the session bucket: the execution
+        # contract points there and the agent_output alias resolves there.
+        # No platform output dir → both no-ops.
+        try:
+            from tools.runtime_workdir import (
+                prepare_cron_session_output_dir,
+                push_cron_output_scope,
+            )
+
+            _zet_session_output_dir = prepare_cron_session_output_dir(
+                (job.get("origin") or {}).get("chat_id")
+            )
+            if _zet_session_output_dir:
+                job["_zet_session_output_dir"] = _zet_session_output_dir
+                _zet_output_scope_token = push_cron_output_scope(
+                    _zet_session_output_dir
+                )
+        except Exception as _zet_exc:
+            logger.debug(
+                "Job '%s': session output scope unavailable: %s", job_id, _zet_exc
+            )
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -4071,6 +4104,15 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        # Drop the session output overlay first so a failure below can't leave
+        # agent_output resolving into this run's bucket.
+        if _zet_output_scope_token is not None:
+            try:
+                from tools.runtime_workdir import pop_cron_output_scope
+
+                pop_cron_output_scope(_zet_output_scope_token)
+            except Exception:
+                pass
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.
