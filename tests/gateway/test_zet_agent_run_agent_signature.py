@@ -157,9 +157,10 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
         "gateway.run.GatewayRunner._load_reasoning_config",
         staticmethod(lambda: {}),
     )
+    foreign_fallback = {"provider": "foreign-provider", "model": "foreign/model"}
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_fallback_model",
-        staticmethod(lambda: None),
+        staticmethod(lambda: foreign_fallback),
     )
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
@@ -171,7 +172,14 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
         gateway_session_key="proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
         request_overrides={
             "_zet_execution_policy": "silent_automation",
+            "tool_choice": "none",
+            "response_format": {"type": "json_object"},
         },
+        requested_model="caller/model",
+        requested_provider="caller-provider",
+        model_options={"reasoning_effort": "high"},
+        route={"model": "route/model", "provider": "route-provider"},
+        session_model="session/model",
     )
     adapter._create_agent(
         session_id="ordinary-session",
@@ -183,6 +191,10 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
     assert constructed[0]["strict_memory_isolation"] is True
     assert constructed[1]["strict_memory_isolation"] is False
     assert constructed[0]["skip_context_files"] is True
+    assert constructed[0]["fallback_model"] is None
+    assert constructed[0]["model"] == "gpt-test"
+    assert constructed[0]["provider"] == "openai"
+    assert constructed[0]["request_overrides"] is None
     assert constructed[1]["skip_context_files"] is False
     assert instances[0]._persist_disabled is True
     assert instances[0]._session_db is None

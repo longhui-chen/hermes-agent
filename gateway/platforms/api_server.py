@@ -5843,27 +5843,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        if requested_silent_automation:
-            execution_scope = _extract_execution_scope(body)
-            if requested_execution_scope_digest:
-                try:
-                    execution_authorization = (
-                        await _authorize_business_execution(
-                            business_execution_token=business_execution_token,
-                            turn_id=turn_id,
-                            session_id=session_id,
-                            session_key=gateway_session_key or "",
-                            scope=execution_scope,
-                            trusted_task_message=trusted_task_message,
-                            skill_slug=skill_slug,
-                        )
-                        or {}
+        execution_scope = _extract_execution_scope(body)
+        if (
+            business_execution_token
+            and requested_execution_scope_digest
+            and execution_scope
+        ):
+            try:
+                execution_authorization = (
+                    await _authorize_business_execution(
+                        business_execution_token=business_execution_token,
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        session_key=gateway_session_key or "",
+                        scope=execution_scope,
+                        trusted_task_message=trusted_task_message,
+                        skill_slug=skill_slug,
                     )
-                except _BusinessExecutionAuthorizationError as exc:
-                    logger.warning(
-                        "[api_server] silent execution authorization unavailable: %s",
-                        str(exc),
-                    )
+                    or {}
+                )
+            except _BusinessExecutionAuthorizationError as exc:
+                logger.warning(
+                    "[api_server] %s execution authorization unavailable: %s",
+                    "silent" if requested_silent_automation else "interactive",
+                    str(exc),
+                )
+                if requested_silent_automation:
                     return web.json_response(
                         _openai_error(
                             "silent_automation authorization service unavailable",
@@ -5873,6 +5878,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=503,
                         headers={"Retry-After": "1"},
                     )
+
+        if requested_silent_automation:
             if (
                 not execution_authorization
                 or execution_authorization.get("scope_digest")
@@ -5896,6 +5903,28 @@ class APIServerAdapter(BasePlatformAdapter):
             execution_request_digest = str(
                 execution_authorization["request_digest"]
             )
+        elif (
+            execution_authorization
+            and execution_authorization.get("scope_digest")
+            == requested_execution_scope_digest
+        ):
+            # Interactive chat remains available when the local authorization
+            # service is temporarily unavailable, but trusted side-effect
+            # helpers receive a receipt only after exact scope/request proof.
+            execution_scope_digest = str(
+                execution_authorization["scope_digest"]
+            )
+            execution_request_digest = str(
+                execution_authorization["request_digest"]
+            )
+
+        if execution_policy == "silent_automation":
+            # Silent receipts authorize one server-owned workflow. UI/API
+            # controls are not part of that receipt and must not widen the
+            # workflow after authorization.
+            response_mode = ""
+            plan_ack = {}
+            plan_auto_execute = False
 
         trusted_business_execution_token = business_execution_token
 
@@ -5933,6 +5962,10 @@ class APIServerAdapter(BasePlatformAdapter):
         #     message passes through unexpanded instead.
         skill_selection_enabled = bool(
             skill_slug
+            and (
+                body.get("tool_choice") != "none"
+                or requested_silent_automation
+            )
             and (not requested_silent_automation or execution_policy == "silent_automation")
         )
         skill_expansion_enabled = bool(
@@ -5973,7 +6006,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if execution_policy != "silent_automation" and body.get("tool_choice") == "none":
             request_overrides["tool_choice"] = "none"
         response_format = body.get("response_format")
-        if response_format is not None:
+        if execution_policy != "silent_automation" and response_format is not None:
             response_format_error = _validate_chat_response_format(response_format)
             if response_format_error:
                 return web.json_response(
@@ -5988,7 +6021,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Per-client model routing: if the requested model matches a
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
-        route = self._resolve_route(model_name)
+        route = (
+            None
+            if execution_policy == "silent_automation"
+            else self._resolve_route(model_name)
+        )
         agent_overrides = (
             {}
             if execution_policy == "silent_automation"

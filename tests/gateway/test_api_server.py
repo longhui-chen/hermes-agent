@@ -1583,6 +1583,78 @@ class TestChatCompletionsEndpoint:
         assert token_b not in caplog.text
 
     @pytest.mark.asyncio
+    async def test_interactive_business_receipt_requires_exact_authorization(
+        self, adapter
+    ):
+        adapter._api_key = "sk-secret"
+        turn_id = "turn-interactive-video"
+        session_id = "api-interactive-video"
+        session_key = "zettlab:owner:agent-video:session-1"
+        task = "把这些视频剪成旅行 vlog"
+        token = "a" * 64
+        scope_digest = "b" * 64
+        request_digest = api_server_module._business_execution_request_digest(
+            task,
+            "",
+        )
+        authorization = {
+            "agent_id": "agent-video",
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "session_key": session_key,
+            "scope_digest": scope_digest,
+            "request_digest": request_digest,
+            "authorization_mode": "automatic",
+        }
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": task}],
+            "stream": False,
+            "metadata": {
+                "turn_id": turn_id,
+                "execution_scope": {
+                    "operation": "interactive_video_edit",
+                    "task_id": turn_id,
+                },
+            },
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                api_server_module,
+                "_authorize_business_execution",
+                new_callable=AsyncMock,
+                return_value=authorization,
+            ) as authorize, patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as run_agent:
+                run_agent.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=payload,
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": session_key,
+                        "X-Hermes-Session-Id": session_id,
+                        "X-Zettlab-Business-Execution-Token": token,
+                        "X-Zettlab-Execution-Scope-Digest": scope_digest,
+                    },
+                )
+
+        assert response.status == 200
+        authorize.assert_awaited_once()
+        assert run_agent.await_args.kwargs["execution_policy"] == ""
+        assert run_agent.await_args.kwargs["execution_scope_digest"] == scope_digest
+        assert run_agent.await_args.kwargs["execution_request_digest"] == request_digest
+        assert run_agent.await_args.kwargs["business_execution_token"] == token
+
+    @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -1726,10 +1798,12 @@ class TestChatCompletionsEndpoint:
             "provider": "caller-selected-provider",
             "model_options": {"temperature": 0.9},
             "tool_choice": "none",
+            "response_format": {"type": "json_object"},
             "messages": [{"role": "user", "content": task}],
             "stream": False,
             "metadata": {
                 "execution_policy": "silent_automation",
+                "response_mode": "plan",
                 "turn_id": turn_id,
                 "skill_slug": skill_slug,
                 "execution_scope": scope,
@@ -1799,6 +1873,10 @@ class TestChatCompletionsEndpoint:
         }
         assert mock_run.await_count == 1
         assert mock_run.await_args.kwargs["execution_policy"] == "silent_automation"
+        assert mock_run.await_args.kwargs["route"] is None
+        assert mock_run.await_args.kwargs["response_mode"] == ""
+        assert mock_run.await_args.kwargs["plan_ack"] == {}
+        assert mock_run.await_args.kwargs["plan_auto_execute"] is False
         assert mock_run.await_args.kwargs["execution_scope_digest"] == "d" * 64
         assert mock_run.await_args.kwargs["business_execution_token"] == token
         assert mock_run.await_args.kwargs["trusted_skill_slug"] == skill_slug

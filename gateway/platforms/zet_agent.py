@@ -2653,7 +2653,22 @@ class ZetAgentAdapter(APIServerAdapter):
         execution_policy = str(
             agent_request_overrides.pop("_zet_execution_policy", "") or ""
         ).strip().lower()
-        disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
+        silent_execution = execution_policy == "silent_automation"
+        disable_tools = (
+            not silent_execution
+            and agent_request_overrides.pop("tool_choice", None) == "none"
+        )
+        if silent_execution:
+            # The silent capability is bound to the configured runtime. Do not
+            # let direct callers smuggle model/provider/session/format choices
+            # through this adapter after the gateway has verified the receipt.
+            agent_request_overrides.pop("tool_choice", None)
+            agent_request_overrides.pop("response_format", None)
+            requested_model = None
+            requested_provider = None
+            model_options = None
+            route = None
+            session_model = None
 
         # 在 ephemeral_system_prompt 头部接 zettlab 工作风格 addendum。
         # 上游传进来的 ephemeral 通常是 SOUL.md / IDENTITY.md 的拼接（per-agent
@@ -2762,7 +2777,7 @@ class ZetAgentAdapter(APIServerAdapter):
         runtime_auxiliary_task_configs = None
         runtime_supports_vision = None
         session_override = None
-        if not confirmed_runtime_lock and gw is not None and override_key:
+        if not confirmed_runtime_lock and not silent_execution and gw is not None and override_key:
             session_override = self._session_model_override_for(override_key)
 
         from hermes_cli.model_switch import resolve_effective_model
@@ -2801,7 +2816,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     "zet_agent request selection skipped: session /model override wins for %s",
                     override_key or "",
                 )
-        elif session_row_model and not confirmed_runtime_lock:
+        elif session_row_model and not confirmed_runtime_lock and not silent_execution:
             current_provider = _clean_request_string(runtime_kwargs.get("provider"))
             provider_runtime = _resolve_provider_runtime(
                 current_provider,
@@ -2892,7 +2907,9 @@ class ZetAgentAdapter(APIServerAdapter):
 
         max_iterations = _current_max_iterations()
         fallback_model = (
-            None if confirmed_runtime_lock else GatewayRunner._load_fallback_model()
+            None
+            if silent_execution or confirmed_runtime_lock
+            else GatewayRunner._load_fallback_model()
         )
 
         agent_kwargs = {
@@ -3195,6 +3212,12 @@ class ZetAgentAdapter(APIServerAdapter):
         scoped_execution_request_digest = str(
             execution_request_digest or ""
         ).strip().lower()
+        if scoped_execution_policy == "silent_automation":
+            # Silent execution is a receipt-bound workflow, never a caller
+            # supplied interaction mode or plan acknowledgement.
+            response_mode = None
+            plan_ack = None
+            plan_auto_execute = False
 
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
