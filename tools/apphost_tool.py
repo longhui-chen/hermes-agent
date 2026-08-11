@@ -88,8 +88,11 @@ APP_HOST_SCHEMA = {
         "calling again), publish (formal install/update from the current "
         "agent's output workspace: securely copy a generated app, then install "
         "or reload it; the app name comes from metadata.json; on devices whose "
-        "local-server predates this route it fails with code \"unsupported\" — "
-        "the calling skill then falls back to install/reload), install "
+        "local-server predates this route it fails with code \"unsupported\" "
+        "AND HTTP status 404 or 409 — only that pair means the route is "
+        "missing, and only then does the calling skill fall back to "
+        "install/reload; an \"unsupported\" carrying any other status is a "
+        "different problem and falling back cannot help it), install "
         "(register an app from a directory staged directly under App Host's "
         ".staging root; the fallback creation path on devices without publish "
         "support), reload "
@@ -528,8 +531,11 @@ def app_host_tool(args, **_kw):
             if action == "publish":
                 message = (
                     "设备端 App Host 尚不支持 publish（local-server 版本较旧）。"
-                    "改用老设备发布通道：把工作区完整拷贝到 App Host 的 .staging 下"
-                    "作为其直接子目录，再调 install（新建）或 reload（修改）"
+                    "改用老设备发布通道：把本次 source_subdir 指向的那个目录"
+                    "（metadata.json 就在它下面那一层）整个拷到 App Host 的 "
+                    ".staging 下作为其直接子目录——拷完 metadata.json 必须正好在 "
+                    ".staging/<新目录>/ 里，不能再套一层——再调 install（新建）"
+                    "或 reload（修改）"
                 )
             else:
                 message = (

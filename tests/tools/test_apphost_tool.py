@@ -418,6 +418,11 @@ def test_publish_404_without_body_points_at_legacy_route(monkeypatch):
     message = out["error"]["message"]
     assert ".staging" in message
     assert "install" in message and "reload" in message
+    # source_subdir can be nested (runs/run-1/app1). Copying "the workspace"
+    # would land the output root in .staging and bury metadata.json a few
+    # levels down, where install/reload — which treat the direct child AS the
+    # app root — cannot find it. The message has to name what to copy.
+    assert "source_subdir" in message and "metadata.json" in message
     # Telling the model to upgrade the device is a dead end: the whole point of
     # this branch is that the device is not going to be upgraded.
     assert "升级" not in message
@@ -488,6 +493,13 @@ def test_schema_does_not_adjudicate_between_publish_and_legacy():
     subdir = APP_HOST_SCHEMA["parameters"]["properties"]["source_subdir"]["description"]
     assert ".staging" not in subdir, (
         "a blanket .staging ban here reads as global and blocks the fallback"
+    )
+    # Naming `unsupported` without its status pair invites the inverse reading
+    # ("unsupported ⇒ old device"), which sends a fixable 422 schema_version
+    # error down a channel that rejects it again.
+    description = APP_HOST_SCHEMA["description"]
+    assert "404" in description and "409" in description, (
+        "the description mentions unsupported; it must also bound the statuses"
     )
 
 
