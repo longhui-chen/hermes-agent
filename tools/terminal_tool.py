@@ -4675,6 +4675,26 @@ _AGENT_CREATOR_PAYLOAD_KEYS = frozenset({
     "user_entries",
     "memory_entries",
 })
+# create-app-agent (POST /api/v1/skill/app-agents) carries the app binding and
+# the schedule on top of the ordinary creation fields. Kept as a SEPARATE
+# allowlist on purpose: widening _AGENT_CREATOR_PAYLOAD_KEYS instead would let
+# the ordinary create channel smuggle an app binding or a cron job.
+_AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS = _AGENT_CREATOR_PAYLOAD_KEYS | frozenset({
+    "app_slug",
+    "cron_job",
+})
+# Which allowlist applies is keyed by the subcommand token that IS argv[1] of
+# the pinned, digest-verified script — the claim and the execution are the
+# same string, so a caller cannot claim one subcommand to unlock the other's
+# keys. The approval fingerprint covers this token too, binding the human
+# decision to the exact subcommand.
+_AGENT_CREATOR_CREATE_SUBCOMMANDS = {
+    "create": (_AGENT_CREATOR_PAYLOAD_KEYS, "agent.create"),
+    "create-app-agent": (
+        _AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS,
+        "agent.create_app_agent",
+    ),
+}
 _AGENTCOMPUTER_CLI_VALUE_FLAGS = {
     ("file", "list"): frozenset({"--path", "--offset", "--limit"}),
     ("file", "stat"): frozenset({"--path"}),
@@ -4794,9 +4814,10 @@ def _agent_creator_shell_guard_result(command: str) -> Optional[str]:
         "agent_creator_command_blocked",
         (
             "Agent Creator must run as one direct Python invocation of the "
-            "canonical presets script. Only preflight or create --payload "
-            "with a bounded JSON object is allowed; wrappers, non-canonical "
-            "paths, extra arguments, and shell operators are rejected."
+            "canonical presets script. Only preflight or "
+            "create/create-app-agent --payload with a bounded JSON object is "
+            "allowed; wrappers, non-canonical paths, extra arguments, and "
+            "shell operators are rejected."
         ),
     )
 
@@ -5297,7 +5318,13 @@ def _split_agent_creator_heredoc(
     return match.group("command").strip(), payload
 
 
-def _validate_agent_creator_payload(payload: str) -> str:
+def _validate_agent_creator_payload(
+    payload: str,
+    *,
+    allowed_keys: frozenset = _AGENT_CREATOR_PAYLOAD_KEYS,
+) -> str:
+    # The default is the NARROW ordinary-create allowlist: a call site that
+    # forgets to pass keys can only end up stricter, never wider.
     if len(payload.encode("utf-8")) > _AGENT_CREATOR_MAX_PAYLOAD_BYTES:
         raise ValueError("payload too large")
 
@@ -5311,7 +5338,7 @@ def _validate_agent_creator_payload(payload: str) -> str:
     if not isinstance(value, dict):
         raise ValueError("payload must be one JSON object")
     if any(
-        not isinstance(key, str) or key not in _AGENT_CREATOR_PAYLOAD_KEYS
+        not isinstance(key, str) or key not in allowed_keys
         for key in value
     ):
         raise ValueError("payload contains unsupported fields")
@@ -5409,22 +5436,31 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
     if args in (["preflight"], ["list"]):
         if heredoc_payload is not None:
             return None
-    elif len(args) == 3 and args[:2] == ["create", "--payload"]:
+    elif (
+        len(args) == 3
+        and args[1] == "--payload"
+        and args[0] in _AGENT_CREATOR_CREATE_SUBCOMMANDS
+    ):
+        allowed_keys, create_operation = _AGENT_CREATOR_CREATE_SUBCOMMANDS[args[0]]
         if args[2] == "-":
             if heredoc_payload is None:
                 return None
             try:
-                stdin_text = _validate_agent_creator_payload(heredoc_payload) + "\n"
+                stdin_text = _validate_agent_creator_payload(
+                    heredoc_payload, allowed_keys=allowed_keys
+                ) + "\n"
             except ValueError:
                 return None
         else:
             if heredoc_payload is not None:
                 return None
             try:
-                args[2] = _validate_agent_creator_payload(args[2])
+                args[2] = _validate_agent_creator_payload(
+                    args[2], allowed_keys=allowed_keys
+                )
             except ValueError:
                 return None
-        approval_operation = "agent.create"
+        approval_operation = create_operation
     elif args and args[0] == "cli":
         cli_args = args[1:]
         try:
