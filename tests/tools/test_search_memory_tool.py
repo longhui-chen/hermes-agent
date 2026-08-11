@@ -242,3 +242,42 @@ def test_registered_in_memory_toolset_with_memory_gate():
     assert "search_memory" not in toolsets.resolve_toolset(
         "memory", include_registry=False
     )
+
+
+class _HangingSearchProvider:
+    """provider.search() 卡住不返回——模拟打网络/问守护进程时的挂起。"""
+
+    name = "hanging-recall"
+
+    def __init__(self, release):
+        self._release = release
+        self.calls = []
+
+    def search(self, query, top_k):
+        self.calls.append((query, top_k))
+        # 一直等到测试放行；超时路径必须在此之前就把本轮放掉。
+        self._release.wait(timeout=30)
+        return [{"excerpt": "too late"}]
+
+
+def test_provider_search_timeout_degrades_to_curated(tmp_path, monkeypatch):
+    """卡住的 provider 不许把整轮钉死（需求 3.2：召回失败不得阻塞回答）。
+
+    ⛔ 这条不是 `except Exception` 能覆盖的——同步调用「卡住」不抛异常，
+    没有超时闸的话工具会一直不返回，turn 停在 running 直到上游超时。
+    """
+    import threading
+    import tools.search_memory_tool as mod
+
+    monkeypatch.setattr(mod, "_PROVIDER_SEARCH_TIMEOUT_S", 0.2)
+    _write_memory_files(tmp_path, monkeypatch, memory_entries=["zettlab 的周会在周五下午"])
+    release = threading.Event()
+    provider = _HangingSearchProvider(release)
+    try:
+        parsed = _call("zettlab", memory_manager=_FakeManager(provider))
+        # 落回内置策展记忆：拿到结果、且不标 provider。
+        assert provider.calls == [("zettlab", 5)]
+        assert "provider" not in parsed
+        assert parsed["items"], "超时后应降级到策展记忆，而不是空手而归"
+    finally:
+        release.set()

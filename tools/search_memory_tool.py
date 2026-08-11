@@ -25,12 +25,21 @@ import hashlib
 import json
 import logging
 import re
+import threading
 
 logger = logging.getLogger(__name__)
 
 _EXCERPT_MAX_CHARS = 200
 _DEFAULT_TOP_K = 5
 _MAX_TOP_K = 25
+# 🔴 provider.search() 是**别人实现的**扩展点，可能打网络、可能问守护进程。
+# 直接在 agent 线程上同步调它 ⇒ 它一卡，search_memory 工具和复用它的 turn 收尾
+# 归因就把整轮钉死在 running；上面那句 `except Exception` 的降级**永远不会触发**，
+# 因为「卡住」不是异常。需求 3.2 明写「召回失败不得阻塞回答」，超时同理。
+# ⇒ 与 memory_manager._prefetch_provider 同款：有界 worker + join 超时，逾时按
+#   「这个 provider 没结果」处理、落回内置策展记忆。⚠️ 线程是 daemon，卡死的调用
+#   不会拖住进程退出。
+_PROVIDER_SEARCH_TIMEOUT_S = 8.0
 
 # ASCII words/numbers as whole tokens; CJK ideographs (U+3400-U+4DBF,
 # U+4E00-U+9FFF) as single-char tokens — curated memory is Chinese-heavy and
@@ -211,6 +220,37 @@ def _find_provider_search(memory_manager):
     return None
 
 
+def _call_provider_search_bounded(provider_name, search_fn, query, top_k):
+    """跑 provider.search()，带超时。
+
+    返回 ``(raw, failure)``：``failure is None`` 才代表拿到了可用结果；否则
+    ``failure`` 是一句可记日志的原因（异常或超时），调用方据此降级。
+    ⛔ 不要把超时并进 ``except``——超时不是异常，同步调用卡住时那条路根本不走。
+    """
+    box = {}
+
+    def _run():
+        try:
+            box["value"] = search_fn(query, top_k)
+        except Exception as exc:  # noqa: BLE001 - 交给调用方统一降级
+            box["error"] = exc
+
+    thread = threading.Thread(
+        target=_run,
+        daemon=True,
+        name=f"memory-search-{provider_name}",
+    )
+    thread.start()
+    thread.join(_PROVIDER_SEARCH_TIMEOUT_S)
+    if thread.is_alive():
+        # ⚠️ 线程留着继续跑（daemon，进程退出即死）；本轮按「没结果」处理，
+        # 不等它，也不试图杀它——Python 没有安全的线程中断。
+        return None, f"timed out after {_PROVIDER_SEARCH_TIMEOUT_S:.1f}s"
+    if "error" in box:
+        return None, box["error"]
+    return box.get("value"), None
+
+
 def search_memory_tool(args, **kw):
     # Tool handlers must return a STRING (json-encoded) — same contract as
     # memory/list_my_channels. NEVER raise: recall failure must not block the
@@ -230,20 +270,19 @@ def search_memory_tool(args, **kw):
         found = _find_provider_search(kw.get("memory_manager"))
         if found is not None:
             provider_name, search_fn = found
-            try:
-                raw = search_fn(query, top_k)
+            raw, failure = _call_provider_search_bounded(provider_name, search_fn, query, top_k)
+            if failure is None:
                 items = _normalize_provider_items(raw, provider_name, top_k)
                 return json.dumps(
                     {"items": items, "provider": provider_name},
                     ensure_ascii=False,
                 )
-            except Exception as exc:
-                # Degradation path: a failing provider must not block recall —
-                # fall back to the built-in curated memory.
-                logger.warning(
-                    "memory provider '%s' search failed, falling back to curated memory: %s",
-                    provider_name, exc,
-                )
+            # Degradation path: a failing OR hanging provider must not block
+            # recall — fall back to the built-in curated memory.
+            logger.warning(
+                "memory provider '%s' search unusable (%s), falling back to curated memory",
+                provider_name, failure,
+            )
 
         # Layer 2: built-in curated memory (MEMORY.md + USER.md).
         return json.dumps({"items": _search_curated(query, top_k)}, ensure_ascii=False)
