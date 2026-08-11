@@ -21,6 +21,7 @@ from tools.app_data_tool import (
     _OPERATION_RE,
     _READ_TIMEOUT,
     _SLUG_RE,
+    _base_url,
     _check_app_data,
     _is_cron_session,
     _is_trusted_zet_agent_session,
@@ -37,7 +38,7 @@ _CAPABILITY_DIGEST = "a" * 64
 
 def _scope(**overrides):
     values = {
-        "ZET_APPHOST_BASE_URL": _BASE_URL,
+        "ZET_APP_DATA_BASE_URL": _BASE_URL,
         "ZETTLAB_AGENT_ACTION_TOKEN": "profile-operation-token",
         "ZET_AGENT_ID": "profile-agent",
     }
@@ -118,16 +119,106 @@ def test_availability_requires_profile_identity_token_and_exact_loopback_base(mo
 
     with mux_profile_scope(
         monkeypatch,
-        _scope(ZET_APPHOST_BASE_URL="http://example.com/api/v1/internal/apps"),
+        _scope(ZET_APP_DATA_BASE_URL="http://example.com/api/v1/internal/apps"),
     ):
         assert _check_app_data() is False
     with mux_profile_scope(
         monkeypatch,
-        _scope(ZET_APPHOST_BASE_URL="http://127.0.0.1:18080/api/v1/internal/chat"),
+        _scope(ZET_APP_DATA_BASE_URL="http://127.0.0.1:18080/api/v1/internal/chat"),
     ):
         assert _check_app_data() is False
     assert getattr(_check_app_data, "_profile_scope_sensitive") is True
     assert getattr(_check_app_data, "_session_scope_sensitive") is True
+
+
+def test_base_url_prefers_dedicated_app_data_url(monkeypatch):
+    with mux_profile_scope(
+        monkeypatch,
+        _scope(
+            ZET_APP_DATA_BASE_URL=_BASE_URL,
+            ZET_APPHOST_BASE_URL=(
+                "http://127.0.0.1:19090/api/v1/internal/apphost"
+            ),
+        ),
+    ):
+        assert _base_url() == _BASE_URL
+
+
+@pytest.mark.parametrize(
+    ("legacy_url", "expected"),
+    [
+        (_BASE_URL, _BASE_URL),
+        (
+            "http://127.0.0.1:18080/api/v1/internal/apphost",
+            _BASE_URL,
+        ),
+        (
+            "http://[::1]:18080/api/v1/internal/apphost/",
+            "http://[::1]:18080/api/v1/internal/apps",
+        ),
+    ],
+)
+def test_base_url_uses_safe_legacy_apphost_compatibility(
+    monkeypatch, legacy_url, expected
+):
+    with mux_profile_scope(
+        monkeypatch,
+        _scope(ZET_APP_DATA_BASE_URL="", ZET_APPHOST_BASE_URL=legacy_url),
+    ):
+        assert _base_url() == expected
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://example.com/api/v1/internal/apps",
+        "https://127.0.0.1:18080/api/v1/internal/apps",
+        "http://user@127.0.0.1:18080/api/v1/internal/apps",
+        "http://127.0.0.1:bad/api/v1/internal/apps",
+        "http://127.0.0.1:18080/api/v1/internal/apphost",
+        "http://127.0.0.1:18080/api/v1/internal/apps/extra",
+        "http://127.0.0.1:18080/api/v1/internal/apps?target=other",
+        "http://127.0.0.1:18080/api/v1/internal/apps#other",
+    ],
+)
+def test_explicit_invalid_app_data_url_fails_closed_without_legacy_fallback(
+    monkeypatch, bad_url
+):
+    with mux_profile_scope(
+        monkeypatch,
+        _scope(
+            ZET_APP_DATA_BASE_URL=bad_url,
+            ZET_APPHOST_BASE_URL=_BASE_URL,
+        ),
+    ), patch("tools.app_data_tool._urlopen") as urlopen:
+        assert _base_url() is None
+        assert _check_app_data() is False
+        output = json.loads(
+            app_data_tool({"action": "capabilities", "slug": _SLUG})
+        )
+
+    assert output["error"]["code"] == "unsupported"
+    assert output["status"] == 0
+    urlopen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://example.com/api/v1/internal/apphost",
+        "http://127.0.0.1:18080/api/v1/internal/chat",
+        "http://127.0.0.1:18080/api/v1/internal/apphost?target=other",
+        "http://127.0.0.1:18080/api/v1/internal/apphost#other",
+    ],
+)
+def test_legacy_apphost_derivation_rejects_untrusted_or_ambiguous_urls(
+    monkeypatch, bad_url
+):
+    with mux_profile_scope(
+        monkeypatch,
+        _scope(ZET_APP_DATA_BASE_URL="", ZET_APPHOST_BASE_URL=bad_url),
+    ):
+        assert _base_url() is None
 
 
 @pytest.mark.parametrize("platform", ["", "api_server", "telegram", "cli"])

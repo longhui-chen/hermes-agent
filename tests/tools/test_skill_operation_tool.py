@@ -45,7 +45,7 @@ def test_explicit_unavailable_snapshot_fails_closed():
 
 def _scope():
     return {
-        "ZET_APPHOST_BASE_URL": _BASE_URL,
+        "ZET_APP_DATA_BASE_URL": _BASE_URL,
         "ZETTLAB_AGENT_ACTION_TOKEN": "skill-operation-token",
         "ZET_AGENT_ID": "skill-operation-agent",
     }

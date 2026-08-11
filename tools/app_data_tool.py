@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from agent.secret_scope import get_secret
 from tools.loopback_transport import (
@@ -34,7 +34,8 @@ from tools.registry import registry
 logger = logging.getLogger(__name__)
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
-_BASE_URL_SECRET = "ZET_APPHOST_BASE_URL"
+_BASE_URL_SECRET = "ZET_APP_DATA_BASE_URL"
+_LEGACY_BASE_URL_SECRET = "ZET_APPHOST_BASE_URL"
 _ACTION_TOKEN_SECRET = "ZETTLAB_AGENT_ACTION_TOKEN"
 _AGENT_ID_SECRET = "ZET_AGENT_ID"
 _CAPABILITY_TIMEOUT = 8.0
@@ -111,19 +112,44 @@ def _urlopen(request: urllib.request.Request, timeout: float):
     return _NO_PROXY_OPENER.open(request, timeout=timeout)
 
 
-def _base_url() -> str | None:
-    raw = _secret(_BASE_URL_SECRET)
-    if not raw:
-        return None
+def _validated_base_url(raw: str, *, derive_legacy_sibling: bool) -> str | None:
     try:
         parts = urlsplit(raw)
+        _ = parts.port
     except ValueError:
         return None
-    if parts.path.rstrip("/") != "/api/v1/internal/apps":
+    if parts.username is not None or parts.password is not None:
+        return None
+    if parts.query or parts.fragment:
         return None
     if not parts.netloc or not _is_trusted_loopback_http(parts):
         return None
-    return raw.rstrip("/")
+    path = parts.path[:-1] if parts.path.endswith("/") else parts.path
+    if path == "/api/v1/internal/apps":
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    if derive_legacy_sibling and path == "/api/v1/internal/apphost":
+        return urlunsplit(
+            (parts.scheme, parts.netloc, "/api/v1/internal/apps", "", "")
+        )
+    return None
+
+
+def _base_url() -> str | None:
+    """Resolve the owner-scoped App Data endpoint without repointing App Host.
+
+    New local-server versions inject a dedicated URL.  Older versions only
+    expose ``ZET_APPHOST_BASE_URL``; for those, accept the real ``/apps`` route
+    or derive its fixed sibling from the historical ``/apphost`` value.  An
+    explicitly configured but invalid App Data URL fails closed instead of
+    silently falling back to another secret.
+    """
+    raw = _secret(_BASE_URL_SECRET)
+    if raw:
+        return _validated_base_url(raw, derive_legacy_sibling=False)
+    legacy = _secret(_LEGACY_BASE_URL_SECRET)
+    if not legacy:
+        return None
+    return _validated_base_url(legacy, derive_legacy_sibling=True)
 
 
 def _is_cron_session() -> bool:

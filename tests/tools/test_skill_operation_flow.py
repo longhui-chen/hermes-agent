@@ -149,7 +149,7 @@ def test_profile_local_skill_operation_real_transport_flow(monkeypatch, tmp_path
     with _server() as (base_url, calls), _cron_scope(), mux_profile_scope(
         monkeypatch,
         {
-            "ZET_APPHOST_BASE_URL": base_url,
+            "ZET_APP_DATA_BASE_URL": base_url,
             "ZETTLAB_AGENT_ACTION_TOKEN": "flow-skill-token",
             "ZET_AGENT_ID": "flow-skill-agent",
         },
@@ -221,7 +221,7 @@ def test_real_transport_is_not_called_after_same_run_manifest_change(
     with _server() as (base_url, calls), _cron_scope(), mux_profile_scope(
         monkeypatch,
         {
-            "ZET_APPHOST_BASE_URL": base_url,
+            "ZET_APP_DATA_BASE_URL": base_url,
             "ZETTLAB_AGENT_ACTION_TOKEN": "flow-skill-token",
             "ZET_AGENT_ID": "flow-skill-agent",
         },
@@ -284,7 +284,7 @@ def test_default_cron_toolset_exposes_only_bound_skill_operation(monkeypatch, tm
     with _cron_scope(), mux_profile_scope(
         monkeypatch,
         {
-            "ZET_APPHOST_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apps",
+            "ZET_APP_DATA_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apps",
             "ZETTLAB_AGENT_ACTION_TOKEN": "flow-skill-token",
             "ZET_AGENT_ID": "flow-skill-agent",
         },
@@ -306,7 +306,7 @@ def test_default_cron_toolset_exposes_only_bound_skill_operation(monkeypatch, tm
     with _cron_scope(""), mux_profile_scope(
         monkeypatch,
         {
-            "ZET_APPHOST_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apps",
+            "ZET_APP_DATA_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apps",
             "ZETTLAB_AGENT_ACTION_TOKEN": "flow-skill-token",
             "ZET_AGENT_ID": "flow-skill-agent",
         },
@@ -327,7 +327,7 @@ def test_single_profile_schema_cache_tracks_job_skills_and_manifest(monkeypatch,
     profile = _write_profile(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv(
-        "ZET_APPHOST_BASE_URL", "http://127.0.0.1:18080/api/v1/internal/apps"
+        "ZET_APP_DATA_BASE_URL", "http://127.0.0.1:18080/api/v1/internal/apps"
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "flow-skill-token")
     monkeypatch.setenv("ZET_AGENT_ID", "flow-skill-agent")

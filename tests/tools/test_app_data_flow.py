@@ -90,7 +90,8 @@ def _app_data_server():
 
 def _scope(base_url):
     return {
-        "ZET_APPHOST_BASE_URL": base_url,
+        "ZET_APP_DATA_BASE_URL": base_url,
+        "ZET_APPHOST_BASE_URL": base_url.removesuffix("/apps") + "/apphost",
         "ZETTLAB_AGENT_ACTION_TOKEN": "flow-operation-token",
         "ZET_AGENT_ID": "flow-agent",
     }
@@ -159,8 +160,11 @@ def test_ordinary_zet_chat_cache_hit_keeps_core_connector_and_app_tools(
 
     discover_builtin_tools()
     for key, value in {
-        "ZET_APPHOST_BASE_URL": (
+        "ZET_APP_DATA_BASE_URL": (
             "http://127.0.0.1:19090/api/v1/internal/apps"
+        ),
+        "ZET_APPHOST_BASE_URL": (
+            "http://127.0.0.1:19090/api/v1/internal/apphost"
         ),
         "ZETTLAB_AGENT_ACTION_TOKEN": "flow-operation-token",
         "ZET_AGENT_ID": "flow-agent",
@@ -247,7 +251,7 @@ def test_app_data_schema_cache_isolated_by_platform_and_cron_scope(
     try:
         with patch("agent.secret_scope.is_multiplex_active", return_value=False), patch(
             "tools.app_data_tool._base_url",
-            return_value=secrets["ZET_APPHOST_BASE_URL"],
+            return_value=secrets["ZET_APP_DATA_BASE_URL"],
         ), patch("tools.app_data_tool._secret", side_effect=secret):
             with _runtime_scope("zet_agent"):
                 assert "app_data" in names()
@@ -431,6 +435,29 @@ def test_declared_operations_flow_through_real_loopback_transport(monkeypatch):
     assert calls[2][1].endswith(f"/operations/{_READ_OPERATION}")
     assert calls[4][1].endswith(f"/operations/{_MUTATION_OPERATION}")
     assert all("flow-agent" not in json.dumps(body) for *_prefix, body in calls if body)
+
+
+def test_legacy_apphost_base_derives_real_app_data_route(monkeypatch):
+    with _app_data_server() as (base_url, calls), mux_profile_scope(
+        monkeypatch,
+        {
+            "ZET_APPHOST_BASE_URL": (
+                base_url.removesuffix("/apps") + "/apphost"
+            ),
+            "ZETTLAB_AGENT_ACTION_TOKEN": "legacy-operation-token",
+            "ZET_AGENT_ID": "legacy-agent",
+        },
+        poison_environ=True,
+    ):
+        result = json.loads(
+            app_data_tool({"action": "capabilities", "slug": _SLUG})
+        )
+
+    assert result["ok"] is True
+    assert [method for method, *_rest in calls] == ["GET"]
+    assert calls[0][1] == (
+        f"/api/v1/internal/apps/{_SLUG}/capabilities"
+    )
 
 
 def test_sensitive_aliases_never_reach_real_loopback_transport(monkeypatch):

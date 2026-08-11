@@ -64,7 +64,7 @@ def _patch_run_job_runtime(monkeypatch, profile: Path) -> None:
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("HERMES_MODEL", "test-model")
     monkeypatch.setenv(
-        "ZET_APPHOST_BASE_URL", "http://127.0.0.1:19090/api/v1/internal/apps"
+        "ZET_APP_DATA_BASE_URL", "http://127.0.0.1:19090/api/v1/internal/apps"
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "test-action-token")
     monkeypatch.setenv("ZET_AGENT_ID", "scope-agent")
