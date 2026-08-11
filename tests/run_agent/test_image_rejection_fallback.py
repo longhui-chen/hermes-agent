@@ -512,6 +512,32 @@ class TestImageFallbackConversationFlow:
             second_requests[0]["messages"]
         )
 
+    def test_cached_agent_model_switch_does_not_inherit_image_rejection(self):
+        agent = _make_agent()
+        _script_provider(
+            agent,
+            _ProviderError(400, "image_url is not supported"),
+            _response("safe fallback"),
+        )
+        first = _run(agent, _image_turn(None))
+
+        agent.model = "vision-capable-model"
+        agent.base_url = "https://vision.example/v1"
+        agent.client.chat.completions.create.reset_mock()
+        requests = _script_provider(agent, _response("understood"))
+        result = _run(
+            agent,
+            _image_turn("Describe this image."),
+            conversation_history=first["messages"],
+        )
+
+        assert result["final_response"] == "understood"
+        assert len(requests) == 1
+        assert _has_image(requests[0]["messages"]) is True
+        assert _IMAGE_UNDERSTANDING_UNAVAILABLE_INSTRUCTION not in _system_text(
+            requests[0]["messages"]
+        )
+
     def test_image_only_rejection_blocks_hallucinated_write_and_false_claim(self):
         agent = _make_agent()
         requests = _script_provider(

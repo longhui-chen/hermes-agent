@@ -981,6 +981,14 @@ def _prepare_image_fallback_attempt(
     return payload["messages"], [] if require_text else tools_for_api
 
 
+def _vision_capability_key(agent: Any) -> tuple[str, str, str]:
+    """Identify the provider/model/endpoint for a vision rejection."""
+    return tuple(
+        str(getattr(agent, field, "") or "").strip().lower()
+        for field in ("provider", "model", "base_url")
+    )
+
+
 def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
     """Inject the Plan decision protocol into the API-only system message.
 
@@ -2435,7 +2443,8 @@ def run_conversation(
     # downgraded before sending another request that is known to fail.
     _image_fallback_active = bool(
         _current_turn_has_user_image
-        and getattr(agent, "_vision_unsupported", False)
+        and getattr(agent, "_vision_unsupported_capability", None)
+        == _vision_capability_key(agent)
     )
     _image_fallback_requires_text = bool(
         _image_fallback_active and not _current_turn_has_independent_text
@@ -5067,6 +5076,7 @@ def run_conversation(
                 ):
                     agent._vision_supported = False
                     agent._vision_unsupported = True
+                    agent._vision_unsupported_capability = _vision_capability_key(agent)
                     if _current_turn_has_user_image:
                         # Keep the canonical user message intact. Hermes does
                         # not own the trusted Local/Server screenshot sideband,
