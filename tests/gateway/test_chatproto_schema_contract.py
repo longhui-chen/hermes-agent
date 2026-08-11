@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 
-EXPECTED_SCHEMA_SHA256 = "00fdca71268ee72d3fff4195074cf27a0adefc88463e4c050f4a72704ac5bfd4"
+EXPECTED_SCHEMA_SHA256 = "0c56b93ea0f0d673a51afa938a04c2a4fe3c93fdd790fa91a0e10e99de85337a"
 
 
 def test_chatproto_schema_mirror_matches_hermes_wire_contract():

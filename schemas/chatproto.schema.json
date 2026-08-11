@@ -50,7 +50,7 @@
         },
         "resolution": { "$ref": "#/$defs/ChatAttachmentResolution" },
         "expires_at": { "type": "integer", "minimum": 1, "description": "Unix epoch milliseconds" },
-        "dedup_key": { "type": "string" },
+        "dedup_key": { "type": "string", "maxLength": 1024 },
         "fallback_text": { "type": "string", "maxLength": 4096 }
       },
       "allOf": [
