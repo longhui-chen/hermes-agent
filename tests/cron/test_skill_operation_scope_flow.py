@@ -60,6 +60,43 @@ def _write_runtime_skill(
     )
 
 
+def _patch_run_job_runtime(monkeypatch, profile: Path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_MODEL", "test-model")
+    monkeypatch.setenv(
+        "ZET_APPHOST_BASE_URL", "http://127.0.0.1:19090/api/v1/internal/apps"
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "test-action-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "scope-agent")
+    monkeypatch.setattr(cron_scheduler, "_get_hermes_home", lambda: profile)
+    monkeypatch.setattr(
+        cron_scheduler, "_refresh_cron_dotenv_for_legacy_process", lambda: None
+    )
+    monkeypatch.setattr(cron_scheduler, "get_fallback_chain", lambda _cfg: [])
+    monkeypatch.setattr(cron_scheduler, "_guard_job_credential_exfil", lambda _job: None)
+    monkeypatch.setattr("hermes_state.SessionDB", _DummySessionDB)
+    monkeypatch.setattr(
+        "hermes_constants.resolve_reasoning_config", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "test-key",
+            "base_url": None,
+            "provider": "",
+            "requested_provider": None,
+            "api_mode": None,
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.load_hermes_dotenv", lambda **_kwargs: None
+    )
+    monkeypatch.setattr("hermes_cli.env_loader.reset_secret_source_cache", lambda: None)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: [])
+
+
 def test_run_job_isolates_concurrent_skill_manifests_and_restores_after_failure(
     monkeypatch, tmp_path
 ):
@@ -106,40 +143,7 @@ def test_run_job_isolates_concurrent_skill_manifests_and_restores_after_failure(
         app_slug="beta-app",
     )
 
-    monkeypatch.setenv("HERMES_HOME", str(profile))
-    monkeypatch.setenv("HERMES_MODEL", "test-model")
-    monkeypatch.setenv(
-        "ZET_APPHOST_BASE_URL", "http://127.0.0.1:19090/api/v1/internal/apps"
-    )
-    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "test-action-token")
-    monkeypatch.setenv("ZET_AGENT_ID", "scope-agent")
-    monkeypatch.setattr(cron_scheduler, "_get_hermes_home", lambda: profile)
-    monkeypatch.setattr(
-        cron_scheduler, "_refresh_cron_dotenv_for_legacy_process", lambda: None
-    )
-    monkeypatch.setattr(cron_scheduler, "get_fallback_chain", lambda _cfg: [])
-    monkeypatch.setattr(cron_scheduler, "_guard_job_credential_exfil", lambda _job: None)
-    monkeypatch.setattr("hermes_state.SessionDB", _DummySessionDB)
-    monkeypatch.setattr(
-        "hermes_constants.resolve_reasoning_config", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda **_kwargs: {
-            "api_key": "test-key",
-            "base_url": None,
-            "provider": "",
-            "requested_provider": None,
-            "api_mode": None,
-            "command": None,
-            "args": None,
-        },
-    )
-    monkeypatch.setattr(
-        "hermes_cli.env_loader.load_hermes_dotenv", lambda **_kwargs: None
-    )
-    monkeypatch.setattr("hermes_cli.env_loader.reset_secret_source_cache", lambda: None)
-    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: [])
+    _patch_run_job_runtime(monkeypatch, profile)
 
     barrier = threading.Barrier(2)
     observed: dict[str, dict[str, object]] = {}
@@ -211,4 +215,92 @@ def test_run_job_isolates_concurrent_skill_manifests_and_restores_after_failure(
     assert alpha_result[2] == "alpha complete"
     assert beta_result[0] is False
     assert "intentional beta failure" in (beta_result[3] or "")
+    assert cron_attached_skills() == ()
+
+
+def test_ordinary_cron_survives_manifest_snapshot_binding_failure(
+    monkeypatch, tmp_path
+):
+    """A broken optional bridge must not interrupt an ordinary Cron run."""
+    import model_tools
+    import tools.registry as registry_module
+    import tools.skill_operation_tool as skill_operation_module
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    assert not (profile / "skills").exists()
+    _patch_run_job_runtime(monkeypatch, profile)
+
+    snapshot_attempts = 0
+
+    def fail_snapshot_binding():
+        nonlocal snapshot_attempts
+        snapshot_attempts += 1
+        raise RuntimeError("intentional snapshot binding failure")
+
+    monkeypatch.setattr(
+        skill_operation_module,
+        "push_cron_manifest_snapshot",
+        fail_snapshot_binding,
+    )
+
+    agent_runs = 0
+
+    class _OrdinaryAgent:
+        def __init__(self, *_args, **kwargs):
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, prompt, **_kwargs):
+            nonlocal agent_runs
+            agent_runs += 1
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=self.enabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            tool_names = {
+                item["function"]["name"] for item in definitions
+            }
+            dispatch = json.loads(
+                registry_module.registry.dispatch(
+                    "skill_operation", {"action": "capabilities"}
+                )
+            )
+            assert prompt == "RUN_ORDINARY_CRON"
+            assert cron_attached_skills() == ()
+            assert _check_skill_operation() is False
+            assert "skill_operation" not in tool_names
+            assert dispatch["error"]["code"] == "skill_operation_unavailable"
+            return {
+                "completed": True,
+                "failed": False,
+                "final_response": "ordinary cron complete",
+                "turn_exit_reason": "",
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _OrdinaryAgent)
+    registry_module.invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
+    reset_session_vars()
+    try:
+        result = cron_scheduler.run_job(
+            {
+                "id": "ordinary-cron",
+                "name": "Ordinary cron",
+                "prompt": "RUN_ORDINARY_CRON",
+                "schedule_display": "manual",
+            }
+        )
+    finally:
+        registry_module.invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()
+        reset_session_vars()
+
+    assert snapshot_attempts == 1
+    assert agent_runs == 1
+    assert result[0] is True
+    assert result[2] == "ordinary cron complete"
     assert cron_attached_skills() == ()
