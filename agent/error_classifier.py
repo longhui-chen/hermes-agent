@@ -100,17 +100,20 @@ class ClassifiedError:
 
 
 def content_policy_fallback_disabled() -> bool:
-    """True when a content-policy block must end the turn instead of failing over.
+    """True when a GENERAL provider content-policy refusal must end the turn
+    instead of failing over to a second model.
 
-    Default is off, preserving the general-purpose behaviour where a second
-    model may legitimately answer what the first refused.
+    Default is off, preserving general-purpose behaviour: a refusal from one
+    provider (OpenAI usage policy, Codex cyber, Anthropic safety) may be
+    legitimately answered by a different model, so failover is allowed.
 
-    A compliance deployment must turn this on. When an upstream moderation
-    gateway is what refused the prompt, failing over is wrong twice: every
-    cloud model sits behind the same gateway so the verdict is identical (the
-    retry only buys a second billed moderation call), and a user-configured
-    custom model does *not* sit behind it — so the fallback would answer
-    exactly the content the gateway just rejected.
+    Scope: this switch does NOT govern a Zettlab moderation-GATEWAY block
+    (code=moderation_input_blocked / type=content_policy_violation). A gateway
+    verdict is a compliance decision that never fails over — unconditionally,
+    handled at the classification site via ``_is_moderation_gateway_block`` — so
+    a CN/compliance deployment needs no env flag for it. Set
+    ``HERMES_CONTENT_POLICY_NO_FALLBACK=1`` only to additionally stop failover
+    on general provider refusals too.
     """
     return os.getenv("HERMES_CONTENT_POLICY_NO_FALLBACK", "").strip().lower() in {
         "1",
@@ -575,6 +578,50 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     "new_sensitive",
 ]
 
+# Identifies a Zettlab moderation-GATEWAY verdict (mainland-China green-cip), as
+# opposed to a general provider content-policy refusal. A gateway block is a
+# compliance decision that must never fail over: every cloud model sits behind
+# the same gateway (identical verdict) and a user-configured custom model does
+# not, so failover would answer the very content the gateway just rejected.
+# General provider refusals (OpenAI usage policy, Codex cyber, Anthropic safety,
+# MiniMax new_sensitive) must stay failover-eligible, so they are excluded.
+#
+# A gateway verdict is recognized ONLY by the gateway's own error shapes — never
+# by the ai-proxy route alone, and never by refusal text a custom provider could
+# emit:
+#   1. ``moderation_input_blocked`` — the gateway's own unambiguous error code
+#      (any route; a robust secondary for call sites that don't thread the flag).
+#   2. ``via_moderation_gateway`` AND the STRUCTURED ``error.type`` equalling
+#      ``content_policy_violation`` — on the verified ai-proxy route the gateway's
+#      generic ``code="400"`` shape carries this as its error ``type``. Matched on
+#      the parsed ``error.type`` field via an exact compare, NOT as a substring of
+#      the flattened haystack: the token appearing in some provider's ``error.code``
+#      or message text must not count. The route flag is also REQUIRED so a custom
+#      endpoint that merely reuses the token is not matched, and so an UPSTREAM
+#      model's own safety refusal passed through the proxy (``content_filter`` /
+#      "flagged by our safety system" / ``new_sensitive``, all in
+#      _CONTENT_POLICY_BLOCKED_PATTERNS) stays failover-eligible.
+# A localized ``内容不合规`` message is deliberately NOT a signal on its own.
+# (PR #299 review; AGENTS.md HR2/HR3 — do not act on unverifiable attribution.)
+_MODERATION_GATEWAY_CODE = "moderation_input_blocked"
+_MODERATION_GATEWAY_GENERIC_TYPE = "content_policy_violation"
+
+
+def _is_moderation_gateway_block(
+    policy_haystack: str, error_type: str, via_moderation_gateway: bool
+) -> bool:
+    """True only for a Zettlab moderation-gateway verdict — its unambiguous
+    ``moderation_input_blocked`` code, or (on the verified ai-proxy route) its
+    generic-code shape identified by the STRUCTURED ``error.type`` equalling
+    ``content_policy_violation``. Never the route alone (an upstream model refusal
+    also traverses the proxy), never a localized message, and never the generic
+    type appearing merely as a code/message substring. ``policy_haystack`` is the
+    lowered message+code+type string used for content-policy pattern matching;
+    ``error_type`` is the parsed ``error.type`` (see _error_type_of)."""
+    if _MODERATION_GATEWAY_CODE in policy_haystack:
+        return True
+    return via_moderation_gateway and error_type == _MODERATION_GATEWAY_GENERIC_TYPE
+
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
     "invalid api key",
@@ -726,8 +773,14 @@ def classify_api_error(
     approx_tokens: int = 0,
     context_length: int = 200000,
     num_messages: int = 0,
+    via_moderation_gateway: bool = False,
 ) -> ClassifiedError:
     """Classify an API error into a structured recovery recommendation.
+
+    ``via_moderation_gateway`` is a verifiable origin flag the caller sets when
+    the request was routed through the local ai-proxy → Zettlab moderation
+    gateway; it makes a content-policy block a non-failover compliance verdict
+    regardless of the error's code/type shape. See _is_moderation_gateway_block.
 
     Priority-ordered pipeline:
       1. Special-case provider-specific patterns (thinking sigs, tier gates)
@@ -839,10 +892,23 @@ def classify_api_error(
     # even though the compliance gateway already refused it.
     _policy_haystack = f"{error_msg} {(error_code or '').lower()} {_error_type_of(body)}"
     if any(p in _policy_haystack for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
+        # A moderation-GATEWAY verdict never fails over (compliance), and this
+        # holds unconditionally — it is not gated on the env switch, so an OTA
+        # that never sets the flag still fails toward compliance instead of
+        # routing the rejected prompt to a fallback model. A general provider
+        # refusal stays failover-eligible unless a deployment opts out via
+        # content_policy_fallback_disabled(). See _is_moderation_gateway_block.
+        _gateway_moderation = _is_moderation_gateway_block(
+            _policy_haystack, _error_type_of(body), via_moderation_gateway
+        )
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,
-            should_fallback=not content_policy_fallback_disabled(),
+            should_fallback=(
+                False
+                if _gateway_moderation
+                else not content_policy_fallback_disabled()
+            ),
         )
 
     # Anthropic thinking block recovery (400).  Two distinct failure modes,

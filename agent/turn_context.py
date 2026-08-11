@@ -1213,6 +1213,13 @@ def build_turn_context(
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                if ext_prefetch_cache:
+                    # memory.citations（需求 3 预取路径）：注入即引用，zet_agent 在
+                    # turn 收尾统一发射（与 search_memory 工具命中同通道）。
+                    # 放在 is_trivial_prompt 闸内：没触发预取就没有注入，自然也
+                    # 不该产生引用角标。
+                    from agent.agent_runtime_helpers import collect_prefetch_citations
+                    collect_prefetch_citations(agent, agent._memory_manager.last_prefetch_parts())
         except Exception:
             pass
 

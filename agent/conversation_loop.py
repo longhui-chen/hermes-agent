@@ -4933,6 +4933,11 @@ def run_conversation(
                     approx_tokens=approx_tokens,
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
+                    # Verifiable gateway origin: a content-policy block on the
+                    # ai-proxy route is the Zettlab moderation gateway's verdict
+                    # (compliance, no failover) even on its generic code="400"
+                    # shape — a custom endpoint is on a different base_url.
+                    via_moderation_gateway=_is_zettlab_ai_proxy_route(agent),
                 )
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
