@@ -953,7 +953,15 @@ _APP_AGENT_PAYLOAD = {
 
 
 def test_create_app_agent_payload_passes_over_stdin(monkeypatch, tmp_path):
-    _auto_approve_mutations(monkeypatch)
+    # No approval stub: create-app-agent is approval-exempt by design (the
+    # user already said yes in business terms, and a technical prompt would
+    # expose the hidden agent). The bomb proves no approval is even requested.
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("create-app-agent must not request approval")
+        ),
+    )
     _configure(
         monkeypatch,
         tmp_path,
@@ -995,7 +1003,6 @@ def test_create_app_agent_payload_passes_over_stdin(monkeypatch, tmp_path):
 
 
 def test_create_app_agent_inline_payload_is_canonicalized(monkeypatch, tmp_path):
-    _auto_approve_mutations(monkeypatch)
     _configure(
         monkeypatch,
         tmp_path,
@@ -1122,70 +1129,77 @@ def test_forged_subcommand_names_do_not_unlock_the_wide_allowlist(
     assert "must not run" not in result["output"]
 
 
-def test_create_app_agent_requires_approval_bound_to_subcommand(
+def test_approval_waiver_is_scoped_to_create_app_agent_only(
     monkeypatch,
     tmp_path,
 ):
-    """The one-shot approval fingerprint covers the subcommand token itself:
-    a human decision granted for create-app-agent can never replay as an
-    ordinary create (or vice versa), because the rule_key embeds both the
-    operation name and a hash over argv including the token."""
-    import hashlib
+    """The regression lock for the approval waiver: ordinary create MUST
+    still request one-shot human approval, while create-app-agent must not
+    request any. Anyone widening the waiver to create — or re-adding a
+    prompt to create-app-agent (which would expose the hidden agent) —
+    turns this red."""
+    _configure(
+        monkeypatch,
+        tmp_path,
+        """
+        import json
+        import sys
 
-    _configure(monkeypatch, tmp_path, "print('must not run')\n")
-    captured = {}
+        print(json.dumps({"argv": sys.argv[1:]}, ensure_ascii=False))
+        """,
+    )
+    approval_requests = []
 
-    def require_approval(tool_name, _reason, **kwargs):
-        captured["tool_name"] = tool_name
-        captured.update(kwargs)
+    def record_approval(_tool_name, _reason, **kwargs):
+        approval_requests.append(kwargs.get("rule_key", ""))
         return {
             "approved": False,
             "status": "approval_required",
-            "approval_id": "app-agent-approval-id",
+            "approval_id": "create-approval-id",
         }
 
-    monkeypatch.setattr("tools.approval.request_tool_approval", require_approval)
-    monkeypatch.setattr(
-        "tools.environments.local.build_agent_creator_runtime_env",
-        lambda: (_ for _ in ()).throw(AssertionError("token acquired too early")),
-    )
-    payload = '{ "soul_identity": "y", "name": "x", "app_slug": "a", "cron_job": {} }'
-    command = _canonical_command(
-        f"create-app-agent --payload {shlex.quote(payload)}"
-    )
+    monkeypatch.setattr("tools.approval.request_tool_approval", record_approval)
+    plain_payload = '{"name":"x","soul_identity":"y"}'
+    app_payload = json.dumps(_APP_AGENT_PAYLOAD, ensure_ascii=False)
 
-    result = json.loads(terminal_tool_module.terminal_tool(
-        command,
-        task_id="app-agent-approval",
-    ))
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        plain = json.loads(terminal_tool_module.terminal_tool(
+            _canonical_command(f"create --payload {shlex.quote(plain_payload)}"),
+            task_id="approval-scope-plain-create",
+        ))
+        app_agent = json.loads(
+            terminal_tool_module._run_agent_creator_command_if_allowed(
+                _canonical_command(
+                    f"create-app-agent --payload {shlex.quote(app_payload)}"
+                ),
+                cwd=str(tmp_path),
+                timeout=5,
+            )
+        )
 
-    normalized = '{"app_slug":"a","cron_job":{},"name":"x","soul_identity":"y"}'
-    fingerprint = hashlib.sha256()
-    for value in ("create-app-agent", "--payload", normalized):
-        encoded = value.encode("utf-8")
-        fingerprint.update(len(encoded).to_bytes(8, "big"))
-        fingerprint.update(encoded)
-    fingerprint.update((0).to_bytes(8, "big"))
-    fingerprint_hex = fingerprint.hexdigest()
-
-    assert result["status"] == "pending_approval"
-    assert result["approval_pending"] is True
-    assert captured["one_shot"] is True
-    assert captured["allow_yolo_bypass"] is False
-    assert captured["rule_key"] == (
-        f"agentcomputer:agent.create_app_agent:{fingerprint_hex}"
-    )
-    assert normalized in captured["display_target"]
+    # Ordinary create: exactly one approval request, bound to agent.create,
+    # and the run is held pending.
+    assert plain["status"] == "pending_approval"
+    assert plain["approval_pending"] is True
+    assert len(approval_requests) == 1
+    assert approval_requests[0].startswith("agentcomputer:agent.create:")
+    # create-app-agent: no additional approval request, and the run completed.
+    assert app_agent["exit_code"] == 0
+    assert json.loads(app_agent["output"])["argv"][:2] == [
+        "create-app-agent", "--payload",
+    ]
+    assert len(approval_requests) == 1
 
 
 def test_create_app_agent_capability_mismatch_blocks_before_secret(
     monkeypatch,
     tmp_path,
 ):
-    """The manifest capability gate applies to the new subcommand unchanged:
-    an old preset without the action-token-FD capability blocks the run
-    before any scoped secret is acquired."""
-    _auto_approve_mutations(monkeypatch)
+    """The manifest capability gate applies to the new subcommand unchanged
+    — and with no approval stub in place, this also proves the approval
+    waiver does not waive the trust gates: an old preset without the
+    action-token-FD capability blocks the run before any scoped secret is
+    acquired."""
     script = _configure(monkeypatch, tmp_path, "print('must not run')\n")
     (script.parent.parent / "manifest.yaml").write_text(
         "id: agent-creator\nruntime_capabilities: []\n",
@@ -1218,8 +1232,8 @@ def test_create_app_agent_capability_mismatch_blocks_before_secret(
 def test_create_app_agent_script_digest_mismatch_blocks(monkeypatch, tmp_path):
     """The startup trust snapshot digest still gates the new subcommand: a
     script rewritten after the snapshot must not run, even though its path
-    and inode identity are unchanged."""
-    _auto_approve_mutations(monkeypatch)
+    and inode identity are unchanged. No approval stub — the approval-exempt
+    path still walks every trust gate."""
     script = _configure(monkeypatch, tmp_path, "print('snapshot version')\n")
     terminal_tool_module._capture_connector_runtime_root()
     with open(script, "w", encoding="utf-8") as handle:

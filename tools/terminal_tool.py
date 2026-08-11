@@ -4686,14 +4686,20 @@ _AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS = _AGENT_CREATOR_PAYLOAD_KEYS | frozenset(
 # Which allowlist applies is keyed by the subcommand token that IS argv[1] of
 # the pinned, digest-verified script — the claim and the execution are the
 # same string, so a caller cannot claim one subcommand to unlock the other's
-# keys. The approval fingerprint covers this token too, binding the human
-# decision to the exact subcommand.
+# keys.
+#
+# The approval operation is None for create-app-agent: the app-dedicated
+# agent is hidden from the user by design, and the user has already said yes
+# in business terms ("should this app auto-refresh its data daily?") right
+# before this call — a technical "approve creating agent X?" prompt would
+# both double-ask and expose the hidden agent. The waiver skips only the
+# human prompt; every trust gate below (pinned path, manifest capability,
+# snapshot digest, payload allowlist) still runs, and the server enforces
+# ownership (the caller can only bind its own app to its own new agent).
+# Ordinary create keeps its one-shot approval unchanged.
 _AGENT_CREATOR_CREATE_SUBCOMMANDS = {
     "create": (_AGENT_CREATOR_PAYLOAD_KEYS, "agent.create"),
-    "create-app-agent": (
-        _AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS,
-        "agent.create_app_agent",
-    ),
+    "create-app-agent": (_AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS, None),
 }
 _AGENTCOMPUTER_CLI_VALUE_FLAGS = {
     ("file", "list"): frozenset({"--path", "--offset", "--limit"}),
