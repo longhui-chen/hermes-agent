@@ -85,11 +85,16 @@ APP_HOST_SCHEMA = {
         "storage headroom check), list (installed apps), acquire_slot / "
         "release_slot (build-slot admission before compiling; acquire answers "
         "immediately with a slot token, or queue_ahead while queued — poll by "
-        "calling again), publish (preferred formal install/update: securely "
-        "copy a generated app from the current agent's output workspace, then "
-        "install or reload it; the app name comes from metadata.json), install "
-        "(legacy: register an app already staged by App Host), reload "
-        "(rebuild + restart from a staging dir; idempotent — resending the "
+        "calling again), publish (formal install/update from the current "
+        "agent's output workspace: securely copy a generated app, then install "
+        "or reload it; the app name comes from metadata.json; on devices whose "
+        "local-server predates this route it fails with code \"unsupported\" — "
+        "the calling skill then falls back to install/reload), install "
+        "(register an app from a directory staged directly under App Host's "
+        ".staging root; the fallback creation path on devices without publish "
+        "support), reload "
+        "(rebuild + restart from a staging dir — the fallback update path when "
+        "publish is unsupported; idempotent — resending the "
         "same commit returns current state), rollback (put the previous "
         "version back — one step, no rebuild; requires to_version from the "
         "app's prev_version_id so a retry cannot swap it forward again), "
@@ -97,7 +102,7 @@ APP_HOST_SCHEMA = {
         "recycle bin; recovery is done from the client app's list, there is "
         "no recover action here), lifecycle (start/stop/restart), logs "
         "(recent log tail), build_env (local check of the shared Go vendor "
-        "dir to copy into the staging area; makes no HTTP request)."
+        "dir to copy into the build workspace; makes no HTTP request)."
     ),
     "parameters": {
         "type": "object",
@@ -125,22 +130,24 @@ APP_HOST_SCHEMA = {
             "source_subdir": {
                 "type": "string",
                 "description": (
-                    "Required for publish: portable relative path below the "
-                    "current agent output directory. Never pass an absolute "
-                    "path or an App Host .staging path."
+                    "Required for publish: relative path below the current "
+                    "agent output root (note: that root does NOT include the "
+                    "per-session subdirectory the system prompt appends). "
+                    "Never an absolute path."
                 ),
             },
             "staging_dir": {
                 "type": "string",
                 "description": (
-                    "Absolute path of the staged application source on the "
-                    "device. Required for install and reload."
+                    "Absolute path of a direct child of App Host's .staging "
+                    "root. Required for install and reload (the fallback path "
+                    "when publish is unsupported on this device)."
                 ),
             },
             "note": {
                 "type": "string",
                 "description": (
-                    "For publish(mode=reload) or legacy reload: one line "
+                    "For publish(mode=reload) or reload: one line "
                     "saying what this change did, in the "
                     "user's own words (\u201cFooter \u52a0\u4e86\u4e00\u4e2a\u94fe\u63a5\u201d). It is stored with the "
                     "version and is what the user is shown when deciding "
@@ -521,7 +528,8 @@ def app_host_tool(args, **_kw):
             if action == "publish":
                 message = (
                     "设备端 App Host 尚不支持 publish（local-server 版本较旧）。"
-                    "请先升级设备端服务；不要尝试直接写入 .staging"
+                    "改用老设备发布通道：把工作区完整拷贝到 App Host 的 .staging 下"
+                    "作为其直接子目录，再调 install（新建）或 reload（修改）"
                 )
             else:
                 message = (
