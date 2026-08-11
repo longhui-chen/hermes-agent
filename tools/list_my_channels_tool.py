@@ -18,13 +18,19 @@ _CHANNELS_PATH = "/api/v1/internal/agent/channels"
 LIST_MY_CHANNELS_SCHEMA = {
     "name": "list_my_channels",
     "description": (
-        "List the IM channels (e.g. WeChat, Feishu, Discord) this agent is "
-        "currently connected to. Read-only. Use when the user asks which "
-        "messaging channels are linked / connected. Returns channel kind, name, "
-        "and status — no credentials, no management details. NOTE: a channel "
-        "being connected does NOT mean you can proactively message it; use "
-        "send_channel_message, which may fail (no recent conversation / not a "
-        "verified owner). Do not promise to send before calling it."
+        "List the IM channels this agent is currently connected to, plus "
+        "available_kinds — the channel kinds this device can still connect "
+        "(already filtered by the device's region, e.g. CN devices only get "
+        "feishu/wecom/wechat). Read-only. Use when the user asks which "
+        "messaging channels are linked, or before suggesting any channel. "
+        "IMPORTANT: a kind absent from both installed_channels and "
+        "available_kinds is NOT connectable on this device (region "
+        "restriction) — never suggest or offer to connect it. Returns channel "
+        "kind, name, and status — no credentials, no management details. "
+        "NOTE: a channel being connected does NOT mean you can proactively "
+        "message it; use send_channel_message, which may fail (no recent "
+        "conversation / not a verified owner). Do not promise to send before "
+        "calling it."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
@@ -86,10 +92,16 @@ def list_my_channels_tool(args, **kw):
     except Exception as e:
         return json.dumps({"error": f"failed to fetch channels from local-server: {e}"}, ensure_ascii=False)
 
-    # local-server envelope is {code, data:{installed_channels:[...]}}
+    # local-server envelope is {code, data:{installed_channels:[...], available_kinds:[...]}}
     data = parsed.get("data") if isinstance(parsed, dict) else None
     if isinstance(data, dict) and "installed_channels" in data:
-        return json.dumps({"installed_channels": data["installed_channels"]}, ensure_ascii=False)
+        out: dict = {"installed_channels": data["installed_channels"]}
+        if isinstance(data.get("available_kinds"), list):
+            # 区域感知的可连清单（新版 local-server 才有；老版本无此字段）。
+            # 必须透传：governor 库存判定与主模型口径接地都靠它约束
+            # "只推荐/只谈论本区域真实可连的渠道"。
+            out["available_kinds"] = data["available_kinds"]
+        return json.dumps(out, ensure_ascii=False)
     return json.dumps({"error": f"unexpected response from local-server: {body[:200]}"}, ensure_ascii=False)
 
 
