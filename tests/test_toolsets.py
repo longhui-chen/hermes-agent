@@ -396,6 +396,8 @@ class TestZetAgentDeviceToolReachability:
         it, it is silently unreachable exactly where it is meant to work.
 
         Exemptions, each deliberate and documented:
+        - explicitly non-Zet-Agent session surfaces: ``skill_operation`` is
+          Cron-only and therefore must not be recovered into a zet_agent turn.
         - opt-in toolsets (_DEFAULT_OFF_TOOLSETS): injected via platform
           config when the user enables them (e.g. video_generate) — absent by
           decision, not lost.
@@ -412,16 +414,19 @@ class TestZetAgentDeviceToolReachability:
         known_preexisting_gaps = {
             "list_my_channels", "send_channel_message", "get_personal_calendar",
         }
+        non_zet_agent_session_tools = {"skill_operation"}
         discover_builtin_tools()
         scope_sensitive = {
             entry.name
             for entry in registry._tools.values()
             if getattr(entry.check_fn, "_profile_scope_sensitive", False)
+            and entry.name not in non_zet_agent_session_tools
             and entry.toolset not in _DEFAULT_OFF_TOOLSETS
         }
         # Sanity: the guard must be looking at a non-empty set, otherwise a
         # marker rename would silently turn this test into a no-op.
         assert "app_host" in scope_sensitive
+        assert "app_data" in scope_sensitive
         reachable = self._real_path_tool_names(self._DEVICE_CONFIG, "zet_agent")
         missing = scope_sensitive - reachable - known_preexisting_gaps
         assert not missing, (
