@@ -575,8 +575,11 @@ def _delivery_turn_mismatch(proposal: dict[str, Any], turn_id: str) -> bool:
     两侧都拿到 turn_id 时才判定；老链路（transform 钩子没有 turn_id、或候选
     来自没有 turn_id 的调用）保持原行为，不因为缺字段就吞掉卡片。
     """
+    # 两侧都过 _text：source_turn_id 是收敛空白并截断后存下来的，拿原始
+    # turn_id 直接比会把带空白/超长的 id 一律判成不同轮、把卡片吞掉。
+    current_turn_id = _text(turn_id, 160)
     source_turn_id = _text(proposal.get("source_turn_id"), 160)
-    return bool(turn_id and source_turn_id and source_turn_id != turn_id)
+    return bool(current_turn_id and source_turn_id and source_turn_id != current_turn_id)
 
 
 def _response_delivery_block_reason(response_text: str) -> str:
