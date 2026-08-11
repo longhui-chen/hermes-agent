@@ -530,19 +530,30 @@ class MemoryManager:
         """
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
+            self._last_prefetch_parts = []
             return ""
         parts = []
+        labeled_parts = []
         for provider in self._providers:
             try:
                 result = self._prefetch_provider(provider, clean_query, session_id=session_id)
                 if result and result.strip():
                     parts.append(result)
+                    labeled_parts.append((provider.name, result))
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
+        # memory.citations（需求 3 预取路径）：按 provider 粒度留存本轮注入的
+        # 记忆分块，供 turn_context 登记条目化引用（与 search_memory 工具命中
+        # 共用同一发射通道）。
+        self._last_prefetch_parts = labeled_parts
         return "\n\n".join(parts)
+
+    def last_prefetch_parts(self):
+        """最近一次 prefetch_all 的 (provider_name, text) 分块（引用登记用）。"""
+        return list(getattr(self, "_last_prefetch_parts", []) or [])
 
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
