@@ -117,6 +117,59 @@ def _session_platform_cache_scope() -> str:
         return CHECK_FN_CACHE_BYPASS
 
 
+def _lookup_scoped_tool_defs_cache(
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+    skip_tool_search_assembly: bool,
+):
+    """Return a scoped cache hit, or bypass caching on any bridge fault."""
+    try:
+        try:
+            from hermes_cli.config import get_config_path
+
+            cfg_path = get_config_path()
+            cfg_stat = cfg_path.stat()
+            cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
+        except (FileNotFoundError, OSError, ImportError):
+            cfg_fp = None
+        profile_scope = check_fn_cache_scope()
+        cron_scope = _cron_session_cache_scope()
+        cron_skill_scope = _cron_attached_skill_cache_scope(cron_scope)
+        platform_scope = _session_platform_cache_scope()
+        delegated_scope = _delegated_child_cache_scope()
+        if CHECK_FN_CACHE_BYPASS in {
+            profile_scope,
+            cron_scope,
+            cron_skill_scope,
+            platform_scope,
+            delegated_scope,
+        }:
+            return None, None
+        cache_key = (
+            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+            frozenset(disabled_toolsets) if disabled_toolsets else None,
+            registry._generation,
+            cfg_fp,
+            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(skip_tool_search_assembly),
+            delegated_scope,
+            cron_scope,
+            cron_skill_scope,
+            platform_scope,
+            profile_scope,
+        )
+        return cache_key, _tool_defs_cache.get(cache_key)
+    except Exception:
+        # Scope-aware caching is optional. A broken isolation hook must
+        # degrade to an uncached schema recompute, never a failed Chat or
+        # reuse of a schema whose request scope is unknown.
+        logger.warning(
+            "Tool definition cache scope failed; bypassing schema cache",
+            exc_info=True,
+        )
+        return None, None
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -403,39 +456,11 @@ def get_tool_definitions(
     cache_key = None
     cache_enabled = quiet_mode and _quiet_tool_defs_cache_enabled()
     if cache_enabled:
-        try:
-            from hermes_cli.config import get_config_path
-            cfg_path = get_config_path()
-            cfg_stat = cfg_path.stat()
-            cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
-        except (FileNotFoundError, OSError, ImportError):
-            cfg_fp = None
-        profile_scope = check_fn_cache_scope()
-        cron_scope = _cron_session_cache_scope()
-        cron_skill_scope = _cron_attached_skill_cache_scope(cron_scope)
-        platform_scope = _session_platform_cache_scope()
-        delegated_scope = _delegated_child_cache_scope()
-        if (
-            profile_scope != CHECK_FN_CACHE_BYPASS
-            and cron_scope != CHECK_FN_CACHE_BYPASS
-            and cron_skill_scope != CHECK_FN_CACHE_BYPASS
-            and platform_scope != CHECK_FN_CACHE_BYPASS
-            and delegated_scope != CHECK_FN_CACHE_BYPASS
-        ):
-            cache_key = (
-                frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
-                frozenset(disabled_toolsets) if disabled_toolsets else None,
-                registry._generation,
-                cfg_fp,
-                bool(os.environ.get("HERMES_KANBAN_TASK")),
-                bool(skip_tool_search_assembly),
-                delegated_scope,
-                cron_scope,
-                cron_skill_scope,
-                platform_scope,
-                profile_scope,
-            )
-        cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
+        cache_key, cached = _lookup_scoped_tool_defs_cache(
+            enabled_toolsets,
+            disabled_toolsets,
+            skip_tool_search_assembly,
+        )
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.

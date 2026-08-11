@@ -149,6 +149,60 @@ def test_tool_is_discovered_only_on_generated_app_agent_surface(monkeypatch):
         assert entry.check_fn() is True
 
 
+def test_ordinary_zet_chat_cache_hit_keeps_core_connector_and_app_tools(
+    monkeypatch,
+):
+    """Real assembly keeps neighboring Chat tools when Tool Search is active."""
+    import model_tools
+    import tools.registry as registry_module
+    import tools.tool_search as tool_search_module
+
+    discover_builtin_tools()
+    for key, value in {
+        "ZET_APPHOST_BASE_URL": (
+            "http://127.0.0.1:19090/api/v1/internal/apps"
+        ),
+        "ZETTLAB_AGENT_ACTION_TOKEN": "flow-operation-token",
+        "ZET_AGENT_ID": "flow-agent",
+        "ZET_CHAT_APPEND_URL": (
+            "http://127.0.0.1:19090/api/v1/internal/chat/append"
+        ),
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    config = tool_search_module.ToolSearchConfig.from_raw({"enabled": "on"})
+    monkeypatch.setattr(tool_search_module, "load_config", lambda: config)
+    monkeypatch.setattr(model_tools, "_resolve_active_context_length", lambda: 1)
+
+    registry_module.invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
+    try:
+        with _runtime_scope("zet_agent"):
+            first = model_tools.get_tool_definitions(
+                enabled_toolsets=["hermes-zet-agent", "cronjob"],
+                quiet_mode=True,
+            )
+            second = model_tools.get_tool_definitions(
+                enabled_toolsets=["hermes-zet-agent", "cronjob"],
+                quiet_mode=True,
+            )
+        first_names = {item["function"]["name"] for item in first}
+        second_names = {item["function"]["name"] for item in second}
+        assert first_names == second_names
+        assert {
+            "todo",
+            "list_my_connectors",
+            "app_data",
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+        }.issubset(first_names)
+        assert len(model_tools._tool_defs_cache) == 1
+    finally:
+        registry_module.invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()
+
+
 @pytest.mark.parametrize(
     ("enabled_toolsets", "skip_tool_search_assembly"),
     [

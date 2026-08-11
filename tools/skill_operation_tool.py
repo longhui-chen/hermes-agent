@@ -298,9 +298,127 @@ def push_cron_manifest_snapshot() -> object:
     return _CRON_MANIFEST_SNAPSHOT.set(snapshot)
 
 
+def push_unavailable_cron_manifest_snapshot(reason: str) -> object:
+    """Bind an explicitly unavailable authority for optional-bridge fallback."""
+    message = str(reason or "scheduled-job operation snapshot is unavailable")
+    return _CRON_MANIFEST_SNAPSHOT.set(_ManifestSnapshot("", (), message[:256]))
+
+
+def clear_cron_manifest_snapshot() -> None:
+    """Fail-close the current task after snapshot cleanup cannot restore it."""
+    _CRON_MANIFEST_SNAPSHOT.set(_SNAPSHOT_UNSET)
+
+
 def pop_cron_manifest_snapshot(token: object) -> None:
     """Restore the operation authority that preceded this Cron run."""
     _CRON_MANIFEST_SNAPSHOT.reset(token)
+
+
+class CronSkillOperationScope:
+    """Optional Cron bridge scope whose faults never escape into scheduling."""
+
+    def __init__(self, job_id: str):
+        self._job_id = job_id
+        self._attached_token = None
+        self._snapshot_token = None
+
+    def bind(self, skills: object) -> None:
+        binding_ready = False
+        try:
+            from gateway.session_context import push_cron_attached_skills
+
+            self._attached_token = push_cron_attached_skills(skills)
+            binding_ready = True
+        except Exception:
+            logger.warning(
+                "Job '%s': unable to bind attached Skills; disabling Skill operations",
+                self._job_id,
+                exc_info=True,
+            )
+            try:
+                from gateway.session_context import push_cron_attached_skills
+
+                self._attached_token = push_cron_attached_skills([])
+            except Exception:
+                logger.warning(
+                    "Job '%s': unable to install empty Skill fallback scope",
+                    self._job_id,
+                    exc_info=True,
+                )
+
+        try:
+            if binding_ready:
+                self._snapshot_token = push_cron_manifest_snapshot()
+            else:
+                self._snapshot_token = push_unavailable_cron_manifest_snapshot(
+                    "scheduled-job Skill binding is unavailable"
+                )
+        except Exception:
+            logger.warning(
+                "Job '%s': unable to bind Skill operation snapshot",
+                self._job_id,
+                exc_info=True,
+            )
+            try:
+                self._snapshot_token = push_unavailable_cron_manifest_snapshot(
+                    "scheduled-job operation snapshot binding failed"
+                )
+            except Exception:
+                logger.warning(
+                    "Job '%s': unable to install unavailable operation snapshot",
+                    self._job_id,
+                    exc_info=True,
+                )
+
+    def close(self) -> None:
+        if self._snapshot_token is not None:
+            try:
+                pop_cron_manifest_snapshot(self._snapshot_token)
+            except Exception:
+                logger.warning(
+                    "Job '%s': unable to restore Skill operation snapshot",
+                    self._job_id,
+                    exc_info=True,
+                )
+                try:
+                    clear_cron_manifest_snapshot()
+                except Exception:
+                    logger.warning(
+                        "Job '%s': unable to fail-close operation snapshot cleanup",
+                        self._job_id,
+                        exc_info=True,
+                    )
+
+        if self._attached_token is not None:
+            try:
+                from gateway.session_context import pop_cron_attached_skills
+
+                pop_cron_attached_skills(self._attached_token)
+            except Exception:
+                logger.warning(
+                    "Job '%s': unable to restore attached Skill scope",
+                    self._job_id,
+                    exc_info=True,
+                )
+                try:
+                    from gateway.session_context import push_cron_attached_skills
+
+                    push_cron_attached_skills([])
+                except Exception:
+                    logger.warning(
+                        "Job '%s': unable to fail-close attached Skill cleanup",
+                        self._job_id,
+                        exc_info=True,
+                    )
+
+
+def bind_cron_skill_operation_scope(
+    skills: object, *, job_id: str
+) -> CronSkillOperationScope:
+    """Create a fail-closed optional bridge for one scheduled job."""
+    scope = CronSkillOperationScope(job_id)
+    scope.bind(skills)
+    return scope
 
 
 def _bound_manifest() -> tuple[str, tuple[_DeclaredOperation, ...]]:

@@ -12,9 +12,13 @@ from tests.tools._profile_scope import mux_profile_scope
 from tools.app_data_tool import _CAPABILITY_TIMEOUT, _READ_TIMEOUT
 from tools.skill_operation_tool import (
     SKILL_OPERATION_SCHEMA,
+    _bound_manifest,
     _check_skill_operation,
     _load_manifest,
     _profile_local_skill_files,
+    clear_cron_manifest_snapshot,
+    pop_cron_manifest_snapshot,
+    push_unavailable_cron_manifest_snapshot,
     skill_operation_tool,
 )
 
@@ -27,6 +31,16 @@ _APP_SLUG = "action-dashboard"
 _APP_READ = "maintenance.read"
 _APP_WRITE = "maintenance.apply"
 _DIGEST = "a" * 64
+
+
+def test_explicit_unavailable_snapshot_fails_closed():
+    token = push_unavailable_cron_manifest_snapshot("optional bridge failed")
+    try:
+        with pytest.raises(ValueError, match="optional bridge failed"):
+            _bound_manifest()
+    finally:
+        pop_cron_manifest_snapshot(token)
+        clear_cron_manifest_snapshot()
 
 
 def _scope():

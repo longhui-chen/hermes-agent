@@ -304,3 +304,117 @@ def test_ordinary_cron_survives_manifest_snapshot_binding_failure(
     assert result[0] is True
     assert result[2] == "ordinary cron complete"
     assert cron_attached_skills() == ()
+
+
+def test_ordinary_cron_survives_skill_scope_bind_and_cleanup_failures(
+    monkeypatch, tmp_path
+):
+    """Optional bridge faults fail closed without replacing a Cron result."""
+    import gateway.session_context as session_context_module
+    import model_tools
+    import tools.registry as registry_module
+    import tools.skill_operation_tool as skill_operation_module
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    _patch_run_job_runtime(monkeypatch, profile)
+
+    real_push_attached = session_context_module.push_cron_attached_skills
+    push_attempts = 0
+    attached_cleanup_attempts = 0
+    snapshot_cleanup_attempts = 0
+
+    def flaky_push_attached(skills):
+        nonlocal push_attempts
+        push_attempts += 1
+        if push_attempts == 1:
+            raise RuntimeError("intentional attached Skill bind failure")
+        return real_push_attached(skills)
+
+    def fail_attached_cleanup(_token):
+        nonlocal attached_cleanup_attempts
+        attached_cleanup_attempts += 1
+        raise RuntimeError("intentional attached Skill cleanup failure")
+
+    def fail_snapshot_cleanup(_token):
+        nonlocal snapshot_cleanup_attempts
+        snapshot_cleanup_attempts += 1
+        raise RuntimeError("intentional snapshot cleanup failure")
+
+    monkeypatch.setattr(
+        session_context_module,
+        "push_cron_attached_skills",
+        flaky_push_attached,
+    )
+    monkeypatch.setattr(
+        session_context_module,
+        "pop_cron_attached_skills",
+        fail_attached_cleanup,
+    )
+    monkeypatch.setattr(
+        skill_operation_module,
+        "pop_cron_manifest_snapshot",
+        fail_snapshot_cleanup,
+    )
+
+    class _OrdinaryAgent:
+        def __init__(self, *_args, **kwargs):
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, prompt, **_kwargs):
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=self.enabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            tool_names = {
+                item["function"]["name"] for item in definitions
+            }
+            dispatch = json.loads(
+                registry_module.registry.dispatch(
+                    "skill_operation", {"action": "capabilities"}
+                )
+            )
+            assert prompt == "RUN_ORDINARY_CRON_SCOPE_FAILURE"
+            assert cron_attached_skills() == ()
+            assert _check_skill_operation() is False
+            assert "skill_operation" not in tool_names
+            assert dispatch["error"]["code"] == "skill_operation_unavailable"
+            return {
+                "completed": True,
+                "failed": False,
+                "final_response": "ordinary cron survived scope faults",
+                "turn_exit_reason": "",
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _OrdinaryAgent)
+    registry_module.invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
+    reset_session_vars()
+    try:
+        result = cron_scheduler.run_job(
+            {
+                "id": "ordinary-cron-scope-failure",
+                "name": "Ordinary Cron scope failure",
+                "prompt": "RUN_ORDINARY_CRON_SCOPE_FAILURE",
+                "schedule_display": "manual",
+            }
+        )
+    finally:
+        registry_module.invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()
+        reset_session_vars()
+
+    assert result[0] is True
+    assert result[2] == "ordinary cron survived scope faults"
+    assert push_attempts == 3
+    assert attached_cleanup_attempts == 1
+    assert snapshot_cleanup_attempts == 1
+    assert cron_attached_skills() == ()
+    assert (
+        skill_operation_module._CRON_MANIFEST_SNAPSHOT.get()
+        is skill_operation_module._SNAPSHOT_UNSET
+    )
