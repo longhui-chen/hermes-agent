@@ -78,6 +78,35 @@ def test_prepare_returns_none_without_platform_dir(monkeypatch):
     assert prepare_cron_session_output_dir("zettlab:u:a:Sess") is None
 
 
+def test_prepare_rejects_symlinked_session_bucket(monkeypatch, tmp_path):
+    base = tmp_path / "output"
+    base.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (base / "SessEvil").symlink_to(outside)
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(base))
+
+    # 预埋 symlink 的桶不可信，回落 agent 根，绝不锚进链接目标
+    assert prepare_cron_session_output_dir("zettlab:u:a:SessEvil") == str(base)
+
+
+def test_anchored_session_root(monkeypatch, tmp_path):
+    from gateway.platforms.zet_agent_cron import _anchored_session_root
+
+    base = tmp_path / "output"
+    base.mkdir()
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(base))
+
+    job = {"origin": {"chat_id": "zettlab:u:a:AnchorSess"}}
+    got = _anchored_session_root(job)
+    assert got is not None and str(got) == str((base / "AnchorSess").resolve())
+    # suffix 不可推导 → 回落值等于 agent 根 → 不作为扫描根
+    assert _anchored_session_root({"origin": {"chat_id": "no-colon"}}) is None
+    assert _anchored_session_root(None) is None
+    monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
+    assert _anchored_session_root(job) is None
+
+
 # ── scope 覆盖：run 内生效、run 外还原 ──────────────────────────────────
 
 

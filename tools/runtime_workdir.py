@@ -69,6 +69,16 @@ def prepare_cron_session_output_dir(origin_chat_id: Any) -> Optional[str]:
         os.makedirs(session_dir, exist_ok=True)
     except OSError:
         return base
+    # agent 对 output 可写，预埋同名 symlink 能把整个 run 的锚点引出沙箱；
+    # 桶必须是 base 下的真实目录，否则回落 base。
+    try:
+        if os.path.islink(session_dir):
+            return base
+        real_base = os.path.realpath(base)
+        if not os.path.realpath(session_dir).startswith(real_base + os.sep):
+            return base
+    except OSError:
+        return base
     return session_dir
 
 

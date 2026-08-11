@@ -740,11 +740,15 @@ def build_session_context_prompt(
         _zet_platform_output = _zet_agent_output_dir()
     except Exception:
         _zet_platform_output = None
+    # 只做能力开关，不打印字面路径 —— 根路径一旦出现在创建上下文，模型会把
+    # 它固化进 saved prompt，执行期的 session 桶契约就被压掉了。
     if _zet_platform_output:
         lines.append(
-            f"  (cron/output/ holds run records only. Files created for the "
-            f"user must be saved under {_zet_platform_output}/ — never under "
-            f"cron/output/.)"
+            "  (cron/output/ holds scheduler run records only. Files created "
+            "for the user belong in your agent output directory — when a "
+            "scheduled task runs, its execution contract provides the exact "
+            "absolute path. Do NOT hardcode output paths into saved task "
+            "prompts.)"
         )
 
     # Platform home channels
