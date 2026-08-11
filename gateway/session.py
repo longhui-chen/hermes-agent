@@ -732,6 +732,20 @@ def build_session_context_prompt(
     lines.append(
         f"- `\"local\"` → Save to local files only ({display_hermes_home()}/cron/output/)"
     )
+    # cron/output/ is the run-record dir; without this note it is the only
+    # absolute output path the model ever sees, so user files land in it.
+    try:
+        from tools.runtime_workdir import agent_output_dir as _zet_agent_output_dir
+
+        _zet_platform_output = _zet_agent_output_dir()
+    except Exception:
+        _zet_platform_output = None
+    if _zet_platform_output:
+        lines.append(
+            f"  (cron/output/ holds run records only. Files created for the "
+            f"user must be saved under {_zet_platform_output}/ — never under "
+            f"cron/output/.)"
+        )
 
     # Platform home channels
     for platform, home in context.home_channels.items():

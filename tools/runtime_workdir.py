@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
-from typing import Optional
+from typing import Any, Optional
 
 
 AGENT_OUTPUT_WORKDIR = "agent_output"
 AGENT_OUTPUT_ENV = "ZET_AGENT_OUTPUT_DIR"
 AGENT_OUTPUT_ARG = "_zettlab_agent_output_workdir"
+
+# origin.chat_id is untrusted persisted data; suffixes failing this never join.
+_CRON_SESSION_SUFFIX_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 
 
 class RuntimeWorkdirError(ValueError):
@@ -32,6 +36,74 @@ def agent_output_dir(
         return resolve_runtime_workdir(AGENT_OUTPUT_WORKDIR, environ=environ)
     except RuntimeWorkdirError:
         return None
+
+
+def cron_session_suffix(origin_chat_id: Any) -> Optional[str]:
+    """Session suffix (text after the LAST colon), or ``None``.
+
+    Must match local-server sessionscope.ShortID so both sides bucket the
+    same run under the same directory.
+    """
+    if not isinstance(origin_chat_id, str):
+        return None
+    _, sep, suffix = origin_chat_id.rpartition(":")
+    if not sep:
+        return None
+    return suffix if _CRON_SESSION_SUFFIX_RE.match(suffix) else None
+
+
+def prepare_cron_session_output_dir(origin_chat_id: Any) -> Optional[str]:
+    """Resolve and create ``<ZET_AGENT_OUTPUT_DIR>/<session>`` for one cron run.
+
+    Falls back to the agent output root on underivable suffix or mkdir failure;
+    ``None`` when the platform exposes no output dir (upstream deployments).
+    """
+    base = agent_output_dir()
+    if not base:
+        return None
+    suffix = cron_session_suffix(origin_chat_id)
+    if not suffix:
+        return base
+    session_dir = os.path.join(base, suffix)
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+    except OSError:
+        return base
+    return session_dir
+
+
+def push_cron_output_scope(session_dir: str):
+    """Overlay ``ZET_AGENT_OUTPUT_DIR`` for the current cron run (contextvar
+    copy, never ``os.environ``). Returns a token for
+    :func:`pop_cron_output_scope`; ``None`` when multiplex is on with no scope
+    active — installing one there would hide other profiles' secrets.
+    """
+    from agent.secret_scope import (
+        current_secret_scope,
+        is_multiplex_active,
+        set_secret_scope,
+    )
+
+    prev = current_secret_scope()
+    if prev is not None:
+        overlay = dict(prev)
+    elif not is_multiplex_active():
+        # Scope miss falls through to os.environ when multiplexing is off,
+        # so a single-key scope is a pure overlay here.
+        overlay = {}
+    else:
+        return None
+    overlay[AGENT_OUTPUT_ENV] = session_dir
+    return set_secret_scope(overlay)
+
+
+def pop_cron_output_scope(token) -> None:
+    """Restore the secret scope replaced by :func:`push_cron_output_scope`."""
+    if token is None:
+        return
+    from agent.secret_scope import reset_secret_scope
+
+    reset_secret_scope(token)
 
 
 def resolve_runtime_workdir(
