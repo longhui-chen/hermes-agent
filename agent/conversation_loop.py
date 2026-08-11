@@ -2429,8 +2429,17 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
-    _image_fallback_active = False
-    _image_fallback_requires_text = False
+    # A cached Agent can serve multiple turns, while ``_vision_supported`` is
+    # reset by ``build_turn_context`` for each turn.  Preserve a provider's
+    # definitive 4xx capability rejection separately so later image turns are
+    # downgraded before sending another request that is known to fail.
+    _image_fallback_active = bool(
+        _current_turn_has_user_image
+        and getattr(agent, "_vision_unsupported", False)
+    )
+    _image_fallback_requires_text = bool(
+        _image_fallback_active and not _current_turn_has_independent_text
+    )
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -5057,6 +5066,7 @@ def run_conversation(
                     and _status_ok
                 ):
                     agent._vision_supported = False
+                    agent._vision_unsupported = True
                     if _current_turn_has_user_image:
                         # Keep the canonical user message intact. Hermes does
                         # not own the trusted Local/Server screenshot sideband,

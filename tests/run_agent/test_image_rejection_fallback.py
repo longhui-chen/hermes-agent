@@ -453,6 +453,65 @@ class TestImageFallbackConversationFlow:
         )
         assert _has_image([current_user]) is True
 
+    def test_cached_agent_pure_image_turns_fail_closed_after_known_rejection(self):
+        agent = _make_agent()
+        agent._execute_tool_calls = MagicMock()
+        first_requests = _script_provider(
+            agent,
+            _ProviderError(400, "image_url is not supported"),
+            _response("safe first fallback"),
+        )
+
+        first = _run(agent, _image_turn(None))
+        assert first["final_response"] == _IMAGE_UNDERSTANDING_TEXT_REQUIRED_RESPONSE
+        assert first_requests[1].get("tools", []) == []
+        assert agent._vision_unsupported is True
+
+        agent.client.chat.completions.create.reset_mock()
+        second_requests = _script_provider(
+            agent,
+            _response("provider must not claim image access", tool_calls=[_tool_call()]),
+        )
+        second = _run(
+            agent,
+            _image_turn(None),
+            conversation_history=first["messages"],
+        )
+
+        assert second["final_response"] == _IMAGE_UNDERSTANDING_TEXT_REQUIRED_RESPONSE
+        assert len(second_requests) == 1
+        assert second_requests[0].get("tools", []) == []
+        assert _has_image(second_requests[0]["messages"]) is False
+        agent._execute_tool_calls.assert_not_called()
+
+    def test_cached_agent_mixed_image_turn_keeps_tools_after_known_rejection(self):
+        agent = _make_agent()
+        _script_provider(
+            agent,
+            _ProviderError(400, "does not support image input"),
+            _response("safe first fallback"),
+        )
+        first = _run(agent, _image_turn("Describe the disabled save button."))
+
+        agent.client.chat.completions.create.reset_mock()
+        second_requests = _script_provider(
+            agent,
+            _response("I can work from the text."),
+        )
+        second = _run(
+            agent,
+            _image_turn("Create an issue from the text description."),
+            conversation_history=first["messages"],
+        )
+
+        assert second["final_response"] == "I can work from the text."
+        assert len(second_requests) == 1
+        assert second_requests[0].get("tools")
+        assert _has_image(second_requests[0]["messages"]) is False
+        assert _IMAGE_UNDERSTANDING_UNAVAILABLE_INSTRUCTION in _system_text(
+            second_requests[0]["messages"]
+        )
+
     def test_image_only_rejection_blocks_hallucinated_write_and_false_claim(self):
         agent = _make_agent()
         requests = _script_provider(
