@@ -90,6 +90,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from agent.browser_content_evidence import project_browser_content_evidence
 from agent.browser_state_preview import project_browser_state_preview
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
@@ -1022,6 +1023,26 @@ def _tool_completion_payload(
         browser_state = None
     if browser_state is not None:
         payload["browserState"] = browser_state
+
+    try:
+        browser_content_evidence = project_browser_content_evidence(
+            function_name,
+            decoded,
+            browser_session_id=(
+                ui_hint.get("browser_session_id") if ui_hint is not None else None
+            ),
+        )
+    except Exception:
+        # Evidence is optional presentation data. Projection failure must not
+        # change the model-facing result or the tool lifecycle event.
+        logger.warning(
+            "[api_server] browser content evidence projection failed for tool=%s",
+            function_name,
+            exc_info=True,
+        )
+        browser_content_evidence = None
+    if browser_content_evidence is not None:
+        payload["browserContentEvidence"] = browser_content_evidence
 
     if function_name in {"image_generate", "video_generate"}:
         artifact_output: Dict[str, Any] = {}
