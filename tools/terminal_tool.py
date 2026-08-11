@@ -4679,9 +4679,16 @@ _AGENT_CREATOR_PAYLOAD_KEYS = frozenset({
 # the schedule on top of the ordinary creation fields. Kept as a SEPARATE
 # allowlist on purpose: widening _AGENT_CREATOR_PAYLOAD_KEYS instead would let
 # the ordinary create channel smuggle an app binding or a cron job.
+#
+# "probe" is the capability-gate sentinel: the payload {"probe": true} makes
+# the script ask the server whether this device supports app-dedicated agents
+# at all, creating nothing. It rides the same subcommand, so it has to be in
+# the same allowlist — and it stays OUT of the ordinary-create allowlist, like
+# every other app-agent-only field.
 _AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS = _AGENT_CREATOR_PAYLOAD_KEYS | frozenset({
     "app_slug",
     "cron_job",
+    "probe",
 })
 # Which allowlist applies is keyed by the subcommand token that IS argv[1] of
 # the pinned, digest-verified script — the claim and the execution are the

@@ -1033,7 +1033,59 @@ def test_create_app_agent_inline_payload_is_canonicalized(monkeypatch, tmp_path)
     assert json.loads(argv[2]) == _APP_AGENT_PAYLOAD
 
 
-@pytest.mark.parametrize("app_field", ["app_slug", "cron_job"])
+def test_create_app_agent_capability_probe_reaches_the_script(
+    monkeypatch,
+    tmp_path,
+):
+    """The capability gate runs before anything is created: the skill sends
+    {"probe": true} over the same subcommand and reads the server's answer.
+    Without "probe" in the app-agent allowlist the whole command is blocked,
+    the skill sees only a generic guard error, and the feature silently never
+    starts."""
+    _configure(
+        monkeypatch,
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({
+            "argv": sys.argv[1:],
+            "payload": json.loads(sys.stdin.read()),
+        }, ensure_ascii=False))
+        """,
+    )
+    command = (
+        _canonical_command("create-app-agent --payload -")
+        + " <<'JSON'\n"
+        + json.dumps({"probe": True})
+        + "\nJSON"
+    )
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                command,
+                task_id="app-agent-capability-probe",
+            )
+        )
+
+    assert result["agent_creator_direct"] is True
+    assert result["exit_code"] == 0
+    output = json.loads(result["output"])
+    assert output["argv"] == ["create-app-agent", "--payload", "-"]
+    assert output["payload"] == {"probe": True}
+
+
+# Fields the ordinary create channel must never accept, with a value each.
+_APP_AGENT_ONLY_FIELDS = {
+    "app_slug": _APP_AGENT_PAYLOAD["app_slug"],
+    "cron_job": _APP_AGENT_PAYLOAD["cron_job"],
+    "probe": True,
+}
+
+
+@pytest.mark.parametrize("app_field", sorted(_APP_AGENT_ONLY_FIELDS))
 def test_plain_create_still_rejects_app_agent_fields(
     monkeypatch,
     tmp_path,
@@ -1046,7 +1098,7 @@ def test_plain_create_still_rejects_app_agent_fields(
     payload = json.dumps({
         "name": "x",
         "soul_identity": "y",
-        app_field: _APP_AGENT_PAYLOAD[app_field],
+        app_field: _APP_AGENT_ONLY_FIELDS[app_field],
     }, ensure_ascii=False)
 
     with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
