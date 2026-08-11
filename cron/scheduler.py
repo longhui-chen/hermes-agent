@@ -3314,6 +3314,8 @@ def run_job(
     from gateway.session_context import (
         set_session_vars,
         clear_session_vars,
+        pop_cron_attached_skills,
+        push_cron_attached_skills,
         set_zettlab_connector_route_capability,
         _VAR_MAP,
     )
@@ -3437,12 +3439,38 @@ def run_job(
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     _zet_output_scope_token = None
+    _cron_attached_skills_token = None
+    _cron_manifest_snapshot_token = None
+    _pop_cron_manifest_snapshot = None
     try:
+        _attached_skills = job.get("skills")
+        if not isinstance(_attached_skills, list):
+            _legacy_skill = str(job.get("skill") or "").strip()
+            _attached_skills = [_legacy_skill] if _legacy_skill else []
+        _cron_attached_skills_token = push_cron_attached_skills(
+            _attached_skills
+        )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
         # cron entrypoints and tests.
         _cron_session_token = _cron_session_var.set("1")
+        try:
+            from tools.skill_operation_tool import (
+                pop_cron_manifest_snapshot,
+                push_cron_manifest_snapshot,
+            )
+
+            _pop_cron_manifest_snapshot = pop_cron_manifest_snapshot
+            _cron_manifest_snapshot_token = push_cron_manifest_snapshot()
+        except Exception:
+            # The operation bridge is optional for ordinary Cron jobs. A broken
+            # or absent manifest disables that bridge without aborting scheduling.
+            logger.warning(
+                "Job '%s': unable to bind Skill operation snapshot",
+                job_id,
+                exc_info=True,
+            )
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -4133,6 +4161,13 @@ def run_job(
         clear_session_vars(_ctx_tokens)
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
+        if (
+            _cron_manifest_snapshot_token is not None
+            and _pop_cron_manifest_snapshot is not None
+        ):
+            _pop_cron_manifest_snapshot(_cron_manifest_snapshot_token)
+        if _cron_attached_skills_token is not None:
+            pop_cron_attached_skills(_cron_attached_skills_token)
         set_zettlab_connector_route_capability("")
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")

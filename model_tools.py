@@ -54,6 +54,69 @@ def _is_delegated_child_context() -> bool:
         return False
 
 
+def _delegated_child_cache_scope() -> str:
+    """Return parent/child scope, bypassing schema cache if lookup fails."""
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return "child" if is_delegated_child_context() else "parent"
+    except Exception:
+        return CHECK_FN_CACHE_BYPASS
+
+
+def _cron_session_cache_scope() -> str:
+    """Return the trusted task-local Cron scope for tool-schema caching.
+
+    A failed lookup bypasses the outer cache. Reusing an interactive schema
+    when the session scope is unknown could expose tools that fail closed only
+    at dispatch time.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        from utils import is_truthy_value
+
+        return "cron" if is_truthy_value(
+            get_session_env("HERMES_CRON_SESSION", "")
+        ) else "interactive"
+    except Exception:
+        return CHECK_FN_CACHE_BYPASS
+
+
+def _cron_attached_skill_cache_scope(cron_scope: str) -> object:
+    """Return the scheduled-job Skill and manifest cache boundary.
+
+    ``skill_operation`` availability depends on task-local ``job.skills`` and
+    profile-local manifest content. The handler revalidates both at dispatch;
+    this scope prevents the faster model-schema cache from exposing or hiding
+    the tool based on whichever Cron job initialized it first.
+    """
+    if cron_scope != "cron":
+        return None
+    try:
+        from gateway.session_context import cron_attached_skills
+        from tools.skill_operation_tool import skill_operation_manifest_cache_scope
+
+        return (
+            tuple(cron_attached_skills()),
+            skill_operation_manifest_cache_scope(),
+        )
+    except Exception:
+        return CHECK_FN_CACHE_BYPASS
+
+
+def _session_platform_cache_scope() -> str:
+    """Return a namespaced task-local platform key for schema isolation."""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = str(
+            get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+        ).strip().lower()
+        return f"platform:{platform}"
+    except Exception:
+        return CHECK_FN_CACHE_BYPASS
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -348,7 +411,17 @@ def get_tool_definitions(
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
         profile_scope = check_fn_cache_scope()
-        if profile_scope != CHECK_FN_CACHE_BYPASS:
+        cron_scope = _cron_session_cache_scope()
+        cron_skill_scope = _cron_attached_skill_cache_scope(cron_scope)
+        platform_scope = _session_platform_cache_scope()
+        delegated_scope = _delegated_child_cache_scope()
+        if (
+            profile_scope != CHECK_FN_CACHE_BYPASS
+            and cron_scope != CHECK_FN_CACHE_BYPASS
+            and cron_skill_scope != CHECK_FN_CACHE_BYPASS
+            and platform_scope != CHECK_FN_CACHE_BYPASS
+            and delegated_scope != CHECK_FN_CACHE_BYPASS
+        ):
             cache_key = (
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
@@ -356,7 +429,10 @@ def get_tool_definitions(
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
-                _is_delegated_child_context(),
+                delegated_scope,
+                cron_scope,
+                cron_skill_scope,
+                platform_scope,
                 profile_scope,
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
