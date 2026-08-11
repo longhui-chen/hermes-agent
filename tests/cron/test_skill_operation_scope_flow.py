@@ -45,7 +45,7 @@ def _write_runtime_skill(
     (runtime_root / "app_operations.json").write_text(
         json.dumps(
             {
-                "schema_version": "hermes.skill_app_operations.v1",
+                "schema_version": "zettlab.agent_app_operations.v1",
                 "operations": [
                     {
                         "name": logical_operation,

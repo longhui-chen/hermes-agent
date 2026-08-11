@@ -53,7 +53,7 @@ def _scope():
 
 def _manifest(operations=None):
     return {
-        "schema_version": "hermes.skill_app_operations.v1",
+        "schema_version": "zettlab.agent_app_operations.v1",
         "operations": operations
         or [
             {
@@ -94,6 +94,30 @@ def _write_profile(tmp_path: Path, *, disabled=False, manifest=None) -> Path:
         encoding="utf-8",
     )
     return profile
+
+
+def test_legacy_hermes_manifest_schema_remains_supported(monkeypatch, tmp_path):
+    manifest = _manifest()
+    manifest["schema_version"] = "hermes.skill_app_operations.v1"
+    profile = _write_profile(tmp_path, manifest=manifest)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    operations = _load_manifest(_SKILL)
+
+    assert [operation.name for operation in operations] == [
+        _LOGICAL_READ,
+        _LOGICAL_WRITE,
+    ]
+
+
+def test_unknown_runtime_manifest_schema_fails_closed(monkeypatch, tmp_path):
+    manifest = _manifest()
+    manifest["schema_version"] = "unknown.agent_app_operations.v1"
+    profile = _write_profile(tmp_path, manifest=manifest)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    with pytest.raises(ValueError, match="schema is unsupported"):
+        _load_manifest(_SKILL)
 
 
 def _write_second_runtime_skill(profile: Path) -> None:

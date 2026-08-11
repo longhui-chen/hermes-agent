@@ -34,7 +34,7 @@ def _write_profile(tmp_path: Path) -> Path:
     (runtime / "app_operations.json").write_text(
         json.dumps(
             {
-                "schema_version": "hermes.skill_app_operations.v1",
+                "schema_version": "zettlab.agent_app_operations.v1",
                 "operations": [
                     {
                         "name": "maintenance.inspect",
@@ -230,7 +230,7 @@ def test_real_transport_is_not_called_after_same_run_manifest_change(
         manifest.write_text(
             json.dumps(
                 {
-                    "schema_version": "hermes.skill_app_operations.v1",
+                    "schema_version": "zettlab.agent_app_operations.v1",
                     "operations": [
                         {
                             "name": "maintenance.apply",

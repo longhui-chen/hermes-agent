@@ -178,6 +178,14 @@ def test_ordinary_zet_chat_cache_hit_keeps_core_connector_and_app_tools(
     model_tools._clear_tool_defs_cache()
     try:
         with _runtime_scope("zet_agent"):
+            # Prime lazy plugin/config discovery before asserting the stable
+            # cache key. The first-ever assembly may legitimately invalidate
+            # its own fingerprint while discovery completes.
+            model_tools.get_tool_definitions(
+                enabled_toolsets=["hermes-zet-agent", "cronjob"],
+                quiet_mode=True,
+            )
+            model_tools._clear_tool_defs_cache()
             first = model_tools.get_tool_definitions(
                 enabled_toolsets=["hermes-zet-agent", "cronjob"],
                 quiet_mode=True,

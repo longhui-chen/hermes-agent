@@ -28,7 +28,15 @@ from tools.registry import registry
 logger = logging.getLogger(__name__)
 
 _MANIFEST_RELATIVE_PATH = Path("runtime") / "app_operations.json"
-_SCHEMA_VERSION = "hermes.skill_app_operations.v1"
+_SCHEMA_VERSION = "zettlab.agent_app_operations.v1"
+_SUPPORTED_SCHEMA_VERSIONS = frozenset(
+    {
+        _SCHEMA_VERSION,
+        # Existing marketplace packages remain valid during the runtime-
+        # neutral contract migration.
+        "hermes.skill_app_operations.v1",
+    }
+)
 _MAX_MANIFEST_BYTES = 64 * 1024
 _MAX_SKILL_FRONTMATTER_BYTES = 64 * 1024
 _MAX_SKILL_SCAN_ENTRIES = 1024
@@ -548,7 +556,7 @@ def _load_manifest(skill: str) -> tuple[_DeclaredOperation, ...]:
         raise _ManifestError("runtime manifest is invalid JSON") from exc
     if not isinstance(document, dict) or set(document) != _MANIFEST_KEYS:
         raise _ManifestError("runtime manifest fields are invalid")
-    if document.get("schema_version") != _SCHEMA_VERSION:
+    if document.get("schema_version") not in _SUPPORTED_SCHEMA_VERSIONS:
         raise _ManifestError("runtime manifest schema is unsupported")
     raw_operations = document.get("operations")
     if (
