@@ -160,6 +160,61 @@ def test_injection_carries_group_linkage():
     assert "plan_turn_id: turn-08" in text
 
 
+def test_extras_are_normalized_to_current_plan():
+    # 幻觉/过期 plan_id 或自封 group_index 的计划外新增（codex P1）：强制归到
+    # 当前计划并剥骨架字段，否则双 plan_id 让下一轮 _rearm 解除保护。
+    store = TodoStore()
+    store.seed_from_plan("plan19", _groups(1), plan_turn_id="turn-19")
+    store.write([
+        {"id": "x1", "content": "新任务", "status": "pending",
+         "plan_id": "stale-plan", "group_index": 0, "plan_turn_id": "turn-fake"},
+    ], merge=True)
+    extra = next(i for i in store.read() if i["id"] == "x1")
+    assert extra["plan_id"] == "plan19"
+    assert "group_index" not in extra
+    assert "plan_turn_id" not in extra
+
+
+def test_validate_rejects_oversized_group_index_string():
+    # 几千位数字串会让 int() 抛 ValueError，hydration 每轮重放历史 → 会话
+    # 持续无法恢复（codex P1）。超长/超界一律按无效丢弃且不抛。
+    store = TodoStore()
+    items = store.write([
+        {"id": "a", "content": "x", "status": "pending", "group_index": "9" * 5000},
+        {"id": "b", "content": "y", "status": "pending", "group_index": "99999999"},
+        {"id": "c", "content": "z", "status": "pending", "group_index": "3"},
+    ], merge=False)
+    by_id = {i["id"]: i for i in items}
+    assert "group_index" not in by_id["a"]
+    assert "group_index" not in by_id["b"]
+    assert by_id["c"]["group_index"] == 3
+
+
+def test_turn_end_snapshot_respects_budget(monkeypatch):
+    # 收尾快照预算（codex P1）：store 被长计划外项塞大后，快照超
+    # MAX_TODO_RESULT_CHARS 会被下一轮 hydration 跳过 → 状态回滚。
+    from agent import plan_seeding as ps
+
+    emitted = []
+    agent = _FakeAgent(
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    agent._todo_store.seed_from_plan("plan20", _groups(2))
+    # 用 merge 塞入 60 条 ~4000 字符的长计划外项（~240K 字符）。
+    agent._todo_store.write([
+        {"id": f"big-{i}", "content": "长" * 3900, "status": "in_progress" if i == 0 else "pending"}
+        for i in range(60)
+    ], merge=True)
+    messages = []
+    ps.correct_stale_in_progress_at_turn_end(agent, messages)
+
+    result_json = messages[-1]["content"]
+    assert len(result_json) <= 96_000
+    payload = json.loads(result_json)
+    assert len(payload["todos"]) == 62  # 条目一个不丢，只压内容
+
+
 def test_protection_disarms_after_plan_reaches_terminal_state():
     # 终态计划解除保护（codex P1）：条目全部 completed/cancelled 后，模型为新
     # 任务 merge=false 建清单不能再被旧骨架劫持。

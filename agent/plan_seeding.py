@@ -142,6 +142,17 @@ def _persist_store_snapshot(
     from tools.todo_tool import todo_tool
 
     result_json = todo_tool(store=store)
+    # 快照预算（codex P1）：这对消息不经过 maybe_persist_tool_result / turn
+    # budget，store 被长计划外项塞大后快照可能超 MAX_TODO_RESULT_CHARS ——
+    # 下一轮 hydration 直接跳过，刚看到的取消/校正状态回滚。超限时渐进压缩
+    # store 条目内容（store 与快照保持一致，hydration 结果仍可信）。
+    _SNAPSHOT_BUDGET_CHARS = 96_000
+    for cap in (800, 240, 80):
+        if len(result_json) <= _SNAPSHOT_BUDGET_CHARS:
+            break
+        if not store.compact_contents(cap):
+            break
+        result_json = todo_tool(store=store)
     call_id = f"{call_prefix}_{store.plan_id}_{len(messages)}"
     messages.append({
         "role": "assistant",

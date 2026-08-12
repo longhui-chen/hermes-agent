@@ -181,11 +181,15 @@ class TodoStore:
                 else:
                     # New item -- validate fully and append to end
                     validated = self._validate(t)
-                    # 播种清单的执行期新增 = 该计划的「计划外任务」：盖上
-                    # plan_id（不带 group_index），客户端才能把它与无关的普通
-                    # 条目区分开、归进合一卡的计划外分组（codex P1）。
-                    if self._plan_id and "plan_id" not in validated:
+                    # 播种清单的执行期新增 = 该计划的「计划外任务」：**强制**
+                    # 归到当前 plan_id 并剥掉模型自称的骨架字段（codex P1 两轮
+                    # 收敛）——模型带过期/幻觉 plan_id 会让 store 出现双计划，
+                    # 下一轮 _rearm 因多 ID 解除保护；自封 group_index 则能伪装
+                    # 成骨架成员。骨架身份只能来自播种。
+                    if self._plan_id:
                         validated["plan_id"] = self._plan_id
+                        validated.pop("group_index", None)
+                        validated.pop("plan_turn_id", None)
                     existing[validated["id"]] = validated
                     self._items.append(validated)
             # Rebuild _items preserving order for existing items
@@ -226,9 +230,11 @@ class TodoStore:
             if validated["id"] in self._plan_seeded_ids:
                 incoming_by_id[validated["id"]] = validated
             else:
-                # 计划外任务盖 plan_id（同 merge 分支，codex P1）。
-                if self._plan_id and "plan_id" not in validated:
+                # 计划外任务强制归属当前计划并剥骨架字段（同 merge 分支，codex P1）。
+                if self._plan_id:
                     validated["plan_id"] = self._plan_id
+                    validated.pop("group_index", None)
+                    validated.pop("plan_turn_id", None)
                 extras.append(validated)
 
         rebuilt: List[Dict[str, str]] = []
@@ -266,6 +272,23 @@ class TodoStore:
         else:
             self._plan_id = None
             self._plan_seeded_ids = set()
+
+    def compact_contents(self, max_chars_per_item: int) -> bool:
+        """Truncate every item's content in place（收尾快照预算用）.
+
+        收尾 canonical 快照不走工具结果预算，store 被计划外长文塞大后快照会
+        超 MAX_TODO_RESULT_CHARS——下一轮 hydration 直接跳过这条更新，用户刚
+        看到的取消/校正状态回滚（codex P1）。压缩发生在 store 本体上，快照与
+        store 保持一致、hydration 结果仍然可信。Returns True when changed.
+        """
+        changed = False
+        for item in self._items:
+            content = item.get("content", "")
+            if len(content) > max_chars_per_item:
+                keep = max(1, max_chars_per_item - len(_TRUNCATION_MARKER))
+                item["content"] = content[:keep] + _TRUNCATION_MARKER
+                changed = True
+        return changed
 
     def cancel_plan_items(self) -> bool:
         """Cancel every unfinished item of the seeded plan（取消回执处理）.
@@ -406,10 +429,20 @@ class TodoStore:
         group_index = item.get("group_index")
         if isinstance(group_index, bool):
             group_index = None
-        if isinstance(group_index, int) and group_index >= 0:
+        if isinstance(group_index, int) and 0 <= group_index <= 10_000:
             validated["group_index"] = group_index
-        elif isinstance(group_index, str) and group_index.strip().isdigit():
-            validated["group_index"] = int(group_index.strip())
+        elif isinstance(group_index, str):
+            # 长度上限 + try（codex P1）：几千位数字串 isdigit() 会放行，但
+            # int() 超 Python 整数位数限制抛 ValueError——hydration 每轮都
+            # 重放历史，一条坏结果会让会话持续无法恢复。不可信值一律丢弃。
+            stripped = group_index.strip()
+            if stripped.isdigit() and len(stripped) <= 5:
+                try:
+                    parsed = int(stripped)
+                    if 0 <= parsed <= 10_000:
+                        validated["group_index"] = parsed
+                except ValueError:
+                    pass
 
         plan_id = item.get("plan_id")
         if isinstance(plan_id, str) and plan_id.strip():
