@@ -1775,9 +1775,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
         elif function_name == "present_plan":
-            from tools.plan_tool import present_plan as _present_plan
+            from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 
-            function_result = _present_plan(
+            function_result, _plan_meta = _present_plan_with_meta(
                 title=function_args.get("title", ""),
                 groups=function_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
@@ -1798,6 +1798,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._zet_agent_plan_presented = True
                 if getattr(agent, "plan_emit_callback", None) is None:
                     agent._zet_agent_plan_fallback_response = function_result
+                if _plan_meta is not None:
+                    # 播种延迟到批次收尾（conversation_loop 调 seed_pending_plan_todos）：
+                    # 就地 append 合成消息对会插进本批次其余 tool result 中间，破坏
+                    # assistant↔tool 配对与 messages[-num_tools:] 预算统计。
+                    agent._pending_plan_seed = _plan_meta
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")

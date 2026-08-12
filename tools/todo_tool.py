@@ -51,10 +51,71 @@ class TodoStore:
       - id: unique string identifier (agent-chosen)
       - content: task description
       - status: pending | in_progress | completed | cancelled
+      - group_index (optional): 0-based index of the plan group this item was
+        seeded from (plan-linked lists only; see seed_from_plan)
+      - plan_id (optional): id of the present_plan card this item belongs to
+
+    Plan-seeded lists (seed_from_plan / replayed history carrying plan_id)
+    arm structural protection: a merge=false full rewrite from the model can
+    update seeded items' content/status but cannot destroy the seeded
+    skeleton (ids, group linkage, order) — the skeleton is the contract the
+    App renders the unified plan/todo card from.
     """
 
     def __init__(self):
         self._items: List[Dict[str, str]] = []
+        # Plan-seeding state（结构保护合并的依据）：仅当清单由计划播种（或从
+        # 历史回放出带 plan_id 的条目）时非空。
+        self._plan_id: Optional[str] = None
+        self._plan_seeded_ids: set = set()
+
+    @property
+    def plan_id(self) -> Optional[str]:
+        """plan_id of the seeded plan this list is linked to, if any."""
+        return self._plan_id
+
+    def seed_from_plan(
+        self,
+        plan_id: str,
+        groups: List[Dict[str, Any]],
+    ) -> List[Dict[str, str]]:
+        """Seed the list from a present_plan skeleton (code-guaranteed mapping).
+
+        每个计划子项生成一条 todo：稳定 id ``{plan_id}-{组序号}-{子项序号}``、
+        pending 状态、携带 group_index 与 plan_id。替代「提示词求 agent 自建
+        清单」——层级映射由代码保证（方案 §3，FND-004 详略错位的根治）。
+
+        Cap alignment: plan 上限（20 组 × 50 条 = 1000）大于 MAX_TODO_ITEMS
+        （256）。裁剪按**组边界**对齐——放不下的组整组丢弃，不把一个阶段砍成
+        半截；若第一组单独超限则组内截断（必须播出内容）。
+
+        Returns the seeded list (copy).
+        """
+        items: List[Dict[str, str]] = []
+        for gi, group in enumerate(groups or []):
+            if not isinstance(group, dict):
+                continue
+            group_items = [
+                str(i).strip() for i in (group.get("items") or []) if str(i).strip()
+            ]
+            if not group_items:
+                continue
+            if items and len(items) + len(group_items) > MAX_TODO_ITEMS:
+                break  # 组边界对齐：这一组放不下就整组停止
+            for ii, content in enumerate(group_items):
+                if len(items) >= MAX_TODO_ITEMS:
+                    break  # 首组单独超限：组内截断兜底
+                items.append({
+                    "id": f"{plan_id}-{gi + 1}-{ii + 1}",
+                    "content": self._cap_content(content),
+                    "status": "pending",
+                    "group_index": gi,
+                    "plan_id": plan_id,
+                })
+        self._items = items
+        self._plan_id = plan_id
+        self._plan_seeded_ids = {item["id"] for item in items}
+        return self.read()
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
@@ -66,8 +127,16 @@ class TodoStore:
                    existing items by id and append new ones.
         """
         if not merge:
-            # Replace mode: new list entirely
-            self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
+            if self._plan_id and self._plan_seeded_ids:
+                # 播种保护（方案 §3.4）：schema 鼓励模型 merge=false 整表重写，
+                # 但计划骨架是 App 合一卡的渲染契约——以播种骨架为准，按 id 回
+                # 填模型给的状态/内容；模型新增的条目作为计划外任务追加；骨架外
+                # 的旧条目按 replace 语义被新列表取代。
+                self._items = self._plan_protected_replace(todos)
+            else:
+                # Replace mode: new list entirely
+                self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
+                self._rearm_plan_seeding_from_items()
         else:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
@@ -109,6 +178,76 @@ class TodoStore:
         """Return a copy of the current list."""
         return [item.copy() for item in self._items]
 
+    def _plan_protected_replace(
+        self,
+        todos: List[Dict[str, Any]],
+    ) -> List[Dict[str, str]]:
+        """Structure-protected merge for merge=false rewrites of a seeded list.
+
+        播种骨架（id / group_index / plan_id / 原顺序）不可被模型摧毁：
+        - 命中骨架 id 的条目：回填模型给的 content / status
+        - 骨架条目被整表遗漏：原样保留（遗漏 ≠ 取消，取消要显式 cancelled）
+        - 模型新增条目：验证后追加末尾（计划外任务）
+        """
+        incoming_by_id: Dict[str, Dict[str, str]] = {}
+        extras: List[Dict[str, str]] = []
+        for t in self._dedupe_by_id(todos):
+            validated = self._validate(t)
+            if validated["id"] in self._plan_seeded_ids:
+                incoming_by_id[validated["id"]] = validated
+            else:
+                extras.append(validated)
+
+        rebuilt: List[Dict[str, str]] = []
+        for item in self._items:
+            if item["id"] not in self._plan_seeded_ids:
+                continue  # 骨架外旧条目按 replace 语义由 extras 取代
+            incoming = incoming_by_id.get(item["id"])
+            if incoming is not None:
+                item = {
+                    **item,
+                    "content": incoming["content"],
+                    "status": incoming["status"],
+                }
+            rebuilt.append(item)
+        rebuilt.extend(extras)
+        return rebuilt
+
+    def _rearm_plan_seeding_from_items(self) -> None:
+        """Re-arm plan protection after an unprotected replace (hydration).
+
+        历史回放走 write(merge=False) 整表重建（run_agent._hydrate_todo_store），
+        彼时 store 是全新实例、保护未上膛。回放出的条目若携带唯一 plan_id，
+        据此恢复播种状态，让本 turn 后续的整表重写继续受结构保护。
+        """
+        plan_ids = {
+            item.get("plan_id")
+            for item in self._items
+            if item.get("plan_id")
+        }
+        if len(plan_ids) == 1:
+            self._plan_id = next(iter(plan_ids))
+            self._plan_seeded_ids = {
+                item["id"] for item in self._items if item.get("plan_id") == self._plan_id
+            }
+        else:
+            self._plan_id = None
+            self._plan_seeded_ids = set()
+
+    def demote_stale_in_progress(self) -> bool:
+        """Turn-end host-side correction (Codex #21327 lesson).
+
+        turn 结束后不该有任何条目还在「进行中」——模型忘了收尾时宿主端兜底，
+        把残留的 in_progress 降回 pending（宁可显示未完成，不虚报完成）。
+        Returns True when anything changed (caller should re-emit the list).
+        """
+        changed = False
+        for item in self._items:
+            if item.get("status") == "in_progress":
+                item["status"] = "pending"
+                changed = True
+        return changed
+
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
         return bool(self._items)
@@ -143,7 +282,13 @@ class TodoStore:
         lines = [TODO_INJECTION_HEADER]
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
+            # 计划播种条目带上组归属：长任务（恰恰是最需要计划的场景）压缩一次
+            # 后，注入行是模型唯一的任务记忆——丢掉归属，后续更新就会错组
+            # （v2 审查 F3）。
+            group_suffix = ""
+            if item.get("group_index") is not None:
+                group_suffix = f" [group {item['group_index']}]"
+            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']}){group_suffix}")
 
         return "\n".join(lines)
 
@@ -166,7 +311,9 @@ class TodoStore:
         Validate and normalize a todo item.
 
         Ensures required fields exist and status is valid.
-        Returns a clean dict with only {id, content, status}.
+        Returns a clean dict with {id, content, status} plus the optional
+        plan-linkage fields (group_index, plan_id) when present and valid —
+        剥掉它们会让计划播种的归属信息在任何一次写入后蒸发（v2 审查 F1）。
         """
         if not isinstance(item, dict):
             return {"id": "?", "content": "(invalid item)", "status": "pending"}
@@ -185,7 +332,25 @@ class TodoStore:
         if status not in VALID_STATUSES:
             status = "pending"
 
-        return {"id": item_id, "content": content, "status": status}
+        validated: Dict[str, str] = {"id": item_id, "content": content, "status": status}
+
+        group_index = item.get("group_index")
+        if isinstance(group_index, bool):
+            group_index = None
+        if isinstance(group_index, int) and group_index >= 0:
+            validated["group_index"] = group_index
+        elif isinstance(group_index, str) and group_index.strip().isdigit():
+            validated["group_index"] = int(group_index.strip())
+
+        plan_id = item.get("plan_id")
+        if isinstance(plan_id, str) and plan_id.strip():
+            # id 级长度上限：plan_id 是内部生成的短 hex，历史回放里超长值一律
+            # 视为伪造丢弃。
+            plan_id = plan_id.strip()
+            if len(plan_id) <= 64:
+                validated["plan_id"] = plan_id
+
+        return validated
 
     @staticmethod
     def _dedupe_by_id(todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -302,6 +467,21 @@ TODO_SCHEMA = {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed", "cancelled"],
                             "description": "Current status"
+                        },
+                        "group_index": {
+                            "type": "integer",
+                            "description": (
+                                "Optional. 0-based plan-group index for items "
+                                "belonging to a presented plan. Preserved "
+                                "automatically on seeded items — do not change it."
+                            )
+                        },
+                        "plan_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional. Plan linkage id on seeded items. "
+                                "Preserved automatically — do not change it."
+                            )
                         }
                     },
                     "required": ["id", "content", "status"]

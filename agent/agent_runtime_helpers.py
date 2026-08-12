@@ -3032,14 +3032,26 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
-            return _finish_agent_tool(
-                _todo_tool(
-                    todos=next_args.get("todos"),
-                    merge=next_args.get("merge", False),
-                    store=agent._todo_store,
-                ),
-                next_args,
+            result = _todo_tool(
+                todos=next_args.get("todos"),
+                merge=next_args.get("merge", False),
+                store=agent._todo_store,
             )
+            # Emit hermes.todo onto the SSE stream —— 与顺序路径
+            # （tool_executor 的 todo 分支）对齐。此前并发路径不发事件：
+            # todo 与其它工具并行执行时 App 的清单面板收不到实时更新，
+            # 表现为「store 有、面板没有」。
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    _todo_payload = json.loads(result)
+                    _todo_emit_cb(
+                        _todo_payload.get("todos", []),
+                        _todo_payload.get("summary", {}),
+                    )
+                except Exception:
+                    pass
+            return _finish_agent_tool(result, next_args)
     elif function_name == "session_search":
         def _execute(next_args: dict) -> Any:
             session_db = agent._get_session_db_for_recall()
@@ -3125,9 +3137,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "present_plan":
         def _execute(next_args: dict) -> Any:
-            from tools.plan_tool import present_plan as _present_plan
+            from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 
-            result = _present_plan(
+            result, plan_meta = _present_plan_with_meta(
                 title=next_args.get("title", ""),
                 groups=next_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
@@ -3146,6 +3158,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 agent._zet_agent_plan_presented = True
                 if getattr(agent, "plan_emit_callback", None) is None:
                     agent._zet_agent_plan_fallback_response = result
+                if plan_meta is not None:
+                    # 与顺序路径一致：播种延迟到批次收尾统一执行
+                    # （agent/plan_seeding.seed_pending_plan_todos）。
+                    agent._pending_plan_seed = plan_meta
             return _finish_agent_tool(result, next_args)
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:

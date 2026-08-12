@@ -561,11 +561,13 @@ def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None
 
 
 def _should_end_after_present_plan(agent: Any) -> bool:
-    # Only an explicit manual Plan-mode turn waits for confirmation. Plans
-    # presented during a regular tool turn are status UI, not an execution gate.
+    # 决策点语义（方案 §0）：zet_agent 上任何成功呈现且非 auto 直跑的计划卡
+    # 都结束本 turn、等用户在卡上确认——包括普通模式下模型自发的高风险拦截
+    # 计划（此前只有显式 plan 模式才等，自发计划靠提示词约定「模型自觉停」，
+    # 弱模型一次不自觉就会在用户确认前跑出副作用）。auto 直跑仅剩旧 App
+    # capability opt-in 兼容路径。
     return (
         (getattr(agent, "platform", "") or "") == "zet_agent"
-        and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
         and bool(getattr(agent, "_zet_agent_plan_presented", False))
         and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
@@ -7599,6 +7601,13 @@ def run_conversation(
                     failed = True
                     break
 
+                # 计划播种：present_plan 本批次成功呈现后，用同一份计划骨架
+                # 播种 TodoStore + 合成 todo 调用消息对（跨 turn 存活）。必须
+                # 在批次收尾后、present_plan break 之前——manual 确认卡模式
+                # 随后立即结束 turn，晚一步播种就随 agent 实例蒸发。
+                from agent.plan_seeding import seed_pending_plan_todos
+                seed_pending_plan_todos(agent, messages)
+
                 if _should_end_after_present_plan(agent):
                     _turn_exit_reason = "text_response(plan_presented)"
                     final_response = str(
@@ -8584,8 +8593,13 @@ def run_conversation(
                     continue
 
                 messages.append(final_msg)
-                
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+                # 计划播种清单的宿主端收尾校正：turn 正常结束后不该有条目还挂
+                # 「进行中」，模型忘了收尾时降回 pending 并重推快照（Codex
+                # #21327 教训——状态约束只写提示词必然漂移）。
+                from agent.plan_seeding import correct_stale_in_progress_at_turn_end
+                correct_stale_in_progress_at_turn_end(agent)
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break

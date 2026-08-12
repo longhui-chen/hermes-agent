@@ -9,11 +9,16 @@ plan and then waits for the user's confirmation before proceeding.
 Wire contract (hermes.plan SSE event):
     {
         "type": "hermes.plan",
+        "plan_id": "a1b2c3d4e5f6",
         "title": "...",
         "groups": [
             {"icon": "emoji", "label": "group name", "count": 3, "items": ["step1", "step2", ...]}
         ]
     }
+
+plan_id links the plan card to the todo items seeded from it (each seeded
+item carries the same plan_id + its group_index) so clients can render both
+as one evolving card. Optional field — old clients ignore it.
 
 On the zet_agent platform, plan_emit_callback is injected by
 ZetAgentAdapter._create_agent (same mechanism as clarify_callback / todo_emit_callback).
@@ -22,7 +27,8 @@ returns the plan as a formatted text block so the agent can still describe it.
 """
 
 import json
-from typing import List, Optional, Dict, Any, Callable
+import uuid
+from typing import List, Optional, Dict, Any, Callable, Tuple
 
 # 内存上限（HR-1）：LLM 可能吐超大计划，封顶防止单次 present_plan 撑爆内存 / 上下文。
 _MAX_GROUPS = 20
@@ -30,7 +36,10 @@ _MAX_ITEMS_PER_GROUP = 50
 _MAX_ITEM_LEN = 500
 PLAN_PRESENTED_RESULT = (
     "Plan presented to user. "
-    "Stop and wait for the user's confirmation before executing."
+    "A task list has been seeded from this plan (see the todo result below). "
+    "Stop and wait for the user's confirmation before executing. After the "
+    "user confirms, carry out the plan and update item statuses with the "
+    "`todo` tool using merge=true. Do NOT rebuild the list from scratch."
 )
 
 
@@ -51,6 +60,26 @@ def present_plan(
     callback: Optional[Callable] = None,
     auto_execute: bool = False,
 ) -> str:
+    """Present a structured execution plan to the user (legacy string return).
+
+    Thin wrapper over :func:`present_plan_with_meta` for callers that only
+    need the tool-result string (registry handler, tests).
+    """
+    result, _meta = present_plan_with_meta(
+        title=title,
+        groups=groups,
+        callback=callback,
+        auto_execute=auto_execute,
+    )
+    return result
+
+
+def present_plan_with_meta(
+    title: str,
+    groups: List[Dict[str, Any]],
+    callback: Optional[Callable] = None,
+    auto_execute: bool = False,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
     Present a structured execution plan to the user.
 
@@ -58,20 +87,22 @@ def present_plan(
         title:    Short title describing the overall goal.
         groups:   List of step groups. Each group:
                   {"icon": "emoji", "label": "group name", "count": int, "items": ["step1", ...]}
-        callback: Platform-provided callable(title, groups) -> None.
+        callback: Platform-provided callable(title, groups, plan_id) -> None.
                   Injected by the agent runner on platforms that support
                   the hermes.plan SSE event (zet_agent). When None the
                   plan is returned as formatted text instead.
 
     Returns:
-        A short instruction telling the agent to stop and wait for user
-        confirmation before executing the plan.
+        (result_str, meta): meta 仅在 callback 路径成功 emit 卡片时非 None，
+        形如 {"plan_id", "title", "groups"} —— 供 agent loop 用同一份计划骨架
+        播种 TodoStore（见 agent/plan_seeding.py），保证「计划 ↔ 任务清单」的
+        层级映射由代码保证而非提示词约定。
     """
     if not title or not title.strip():
         return json.dumps(
             {"error": "title is required for present_plan"},
             ensure_ascii=False,
-        )
+        ), None
 
     title = title.strip()
 
@@ -102,30 +133,43 @@ def present_plan(
         return json.dumps(
             {"error": "at least one non-empty plan group is required"},
             ensure_ascii=False,
-        )
+        ), None
 
     if callback is not None:
         # zet_agent：推 hermes.plan SSE → App 渲染结构化计划卡。
+        # plan_id 是「计划 ↔ 任务清单」的锚：App 按它把两者渲染成同一张卡，
+        # 播种的 todo 条目也携带它（跨 turn / 冷启动 / 历史回放归并的唯一键）。
+        plan_id = uuid.uuid4().hex[:12]
         try:
-            callback(title, cleaned_groups)
+            try:
+                callback(title, cleaned_groups, plan_id)
+            except TypeError:
+                # 旧签名 callback(title, groups)：测试替身 / 未升级平台兼容。
+                callback(title, cleaned_groups)
         except Exception:
             return json.dumps(
                 {"error": "failed to present plan"},
                 ensure_ascii=False,
-            )
+            ), None
+        meta = {"plan_id": plan_id, "title": title, "groups": cleaned_groups}
         if auto_execute:
-            # App plan 模式且开启自动执行：计划卡只读展示，agent 在同一 turn 直接
-            # 继续执行，不再等用户点确认（manual 老路径见下方 return，完整保留）。
+            # 旧 App 兼容路径（metadata opt-in 直跑）：计划卡只读展示，agent 在
+            # 同一 turn 直接继续执行。任务清单已由播种机制按计划骨架创建，
+            # agent 只更新状态，不再自行另建清单（详略错位的根源，FND-004）。
             return (
                 "Plan presented to the user's App as a read-only card. "
                 "Auto-execute is enabled: start carrying out the plan now in "
                 "this same turn. Do NOT ask the user to confirm or say you are "
-                "waiting — just proceed, and track progress with the `todo` tool."
-            )
-        return PLAN_PRESENTED_RESULT
+                "waiting — just proceed. A task list has already been created "
+                "from this plan (see the todo result below); update item "
+                "statuses with the `todo` tool using merge=true as you work. "
+                "Do NOT rebuild the list from scratch."
+            ), meta
+        return PLAN_PRESENTED_RESULT, meta
 
     # 无 callback（CLI / messaging / api_server，无确认卡）：返回格式化计划文本，
     # 让 agent 能把计划完整呈现给用户，再停下等确认——否则计划内容丢失且 agent 空等。
+    # 此分支不播种（delegate 子 agent / CLI 维持现状，方案 §4 边界表）。
     plan_text = _format_plan_text(title, cleaned_groups)
     if auto_execute:
         # delegated child（delegate_tool 强制 _zet_agent_plan_auto_execute）等
@@ -136,11 +180,11 @@ def present_plan(
             + "\n\nAuto-execute is enabled and there is no user available to "
             "confirm: start carrying out the plan now in this same turn. Do "
             "NOT wait for a reply — just proceed."
-        )
+        ), None
     return (
         plan_text
         + "\n\nReview the plan above and reply to confirm (e.g. \"go\" / \"confirm\") before I proceed."
-    )
+    ), None
 
 
 def check_plan_requirements() -> bool:
