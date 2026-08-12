@@ -84,6 +84,7 @@ class TodoStore:
         self,
         plan_id: str,
         groups: List[Dict[str, Any]],
+        plan_turn_id: str = "",
     ) -> List[Dict[str, str]]:
         """Seed the list from a present_plan skeleton (code-guaranteed mapping).
 
@@ -125,6 +126,8 @@ class TodoStore:
                     "status": "pending",
                     "group_index": gi,
                     "plan_id": plan_id,
+                    # 计划呈现 turn 的 id（取消回执的匹配目标，见 _validate 注释）。
+                    **({"plan_turn_id": plan_turn_id} if plan_turn_id else {}),
                 })
         self._items = items
         self._plan_id = plan_id
@@ -387,6 +390,14 @@ class TodoStore:
             plan_id = plan_id.strip()
             if len(plan_id) <= 64:
                 validated["plan_id"] = plan_id
+
+        plan_turn_id = item.get("plan_turn_id")
+        if isinstance(plan_turn_id, str) and plan_turn_id.strip():
+            # 计划呈现 turn 的（App/LS 侧）turn id：取消回执按它匹配目标计划，
+            # 防止从旧卡取消误杀当前计划（codex P1）。
+            plan_turn_id = plan_turn_id.strip()
+            if len(plan_turn_id) <= 128:
+                validated["plan_turn_id"] = plan_turn_id
 
         return validated
 

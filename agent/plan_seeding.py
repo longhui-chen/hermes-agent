@@ -81,8 +81,19 @@ def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
     if not plan_id or not groups:
         return
 
+    # 计划呈现 turn 的（App/LS 侧）turn id：随播种条目持久化，取消回执按它
+    # 匹配目标计划（codex P1——同会话先后两份计划时，从旧卡取消不能误杀
+    # 当前计划）。播种运行在呈现请求的上下文内，ContextVar 可直接取。
+    plan_turn_id = ""
     try:
-        seeded = store.seed_from_plan(plan_id, groups)
+        from gateway.session_context import zettlab_turn_id
+
+        plan_turn_id = zettlab_turn_id()
+    except Exception:
+        plan_turn_id = ""
+
+    try:
+        seeded = store.seed_from_plan(plan_id, groups, plan_turn_id=plan_turn_id)
     except Exception:
         logger.exception("plan seeding failed for plan_id=%s", plan_id)
         return
@@ -175,9 +186,24 @@ def apply_plan_ack_cancellation_at_turn_end(
         from gateway.session_context import get_session_env
 
         status = str(get_session_env("HERMES_PLAN_ACK_STATUS") or "").strip().lower()
+        ack_turn_id = str(get_session_env("HERMES_PLAN_ACK_TURN_ID") or "").strip()
     except Exception:
         return
     if status != "cancelled":
+        return
+    # 目标匹配（codex P1）：ack 携带的是计划呈现 turn 的 id，必须与播种时
+    # 记录的 plan_turn_id 一致才取消——同会话先后两份计划时，从旧卡取消
+    # 不能误杀当前计划。旧播种数据没有 plan_turn_id（滚动窗口）或 ack 缺
+    # turn_id 时 fail-safe no-op（保持修复前行为：宁可不取消）。
+    store_turn_id = next(
+        (
+            str(item.get("plan_turn_id") or "").strip()
+            for item in store.read()
+            if item.get("plan_turn_id")
+        ),
+        "",
+    )
+    if not ack_turn_id or not store_turn_id or ack_turn_id != store_turn_id:
         return
     try:
         if not store.cancel_plan_items():

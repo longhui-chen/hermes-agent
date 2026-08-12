@@ -282,21 +282,29 @@ def test_cancel_plan_items_cancels_unfinished_seeded_items():
     assert store.cancel_plan_items() is False
 
 
+def _mock_ack_env(monkeypatch, status: str, turn_id: str) -> None:
+    def _env(name, default=""):
+        if name == "HERMES_PLAN_ACK_STATUS":
+            return status
+        if name == "HERMES_PLAN_ACK_TURN_ID":
+            return turn_id
+        return default
+
+    monkeypatch.setattr("gateway.session_context.get_session_env", _env)
+
+
 def test_plan_ack_cancellation_writes_canonical_pair(monkeypatch):
     # 取消回执落地（codex P1）：cancelled 回执把播种待办整体置 cancelled 并
     # 写 canonical 对，否则下一轮 hydration 恢复出已取消计划的待办。
     from agent import plan_seeding as ps
 
-    monkeypatch.setattr(
-        "gateway.session_context.get_session_env",
-        lambda name, default="": "cancelled" if name == "HERMES_PLAN_ACK_STATUS" else default,
-    )
+    _mock_ack_env(monkeypatch, "cancelled", "turn-plan-14")
     emitted = []
     agent = _FakeAgent(
         _todo_store=TodoStore(),
         todo_emit_callback=lambda todos, summary: emitted.append(todos),
     )
-    agent._todo_store.seed_from_plan("plan14", _groups(2))
+    agent._todo_store.seed_from_plan("plan14", _groups(2), plan_turn_id="turn-plan-14")
     messages = []
     ps.apply_plan_ack_cancellation_at_turn_end(agent, messages)
 
@@ -305,6 +313,26 @@ def test_plan_ack_cancellation_writes_canonical_pair(monkeypatch):
     assert len(emitted) == 1
     from run_agent import AIAgent
     assert AIAgent._tool_response_matches_todo_call(messages, len(messages) - 1)
+
+
+def test_plan_ack_cancellation_noop_on_turn_mismatch(monkeypatch):
+    # 目标匹配（codex P1）：从旧计划卡发来的 cancelled 回执不能误杀当前计划；
+    # 旧播种数据没有 plan_turn_id 时同样 fail-safe no-op。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "cancelled", "turn-plan-OLD")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan16", _groups(1), plan_turn_id="turn-plan-NEW")
+    messages = []
+    ps.apply_plan_ack_cancellation_at_turn_end(agent, messages)
+    assert messages == []
+    assert agent._todo_store.read()[0]["status"] == "pending"
+
+    # legacy：播种无 plan_turn_id → no-op。
+    agent2 = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent2._todo_store.seed_from_plan("plan17", _groups(1))
+    ps.apply_plan_ack_cancellation_at_turn_end(agent2, messages)
+    assert agent2._todo_store.read()[0]["status"] == "pending"
 
 
 def test_plan_ack_cancellation_noop_without_cancelled_status(monkeypatch):

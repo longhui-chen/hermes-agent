@@ -8694,6 +8694,15 @@ def run_conversation(
                 )
                 apply_plan_ack_cancellation_at_turn_end(agent, messages)
                 correct_stale_in_progress_at_turn_end(agent, messages)
+                if getattr(agent, "_incremental_persistence_failed", False):
+                    # 收尾工具对（取消落地/状态校正）落盘失败：与批次内工具
+                    # 结果同规——不能带着「看似成功」的最终回复结束 turn，
+                    # 否则下一轮 hydrate 恢复旧 todo 状态、与用户看到的回复
+                    # 相矛盾（codex P1）。
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
+                    break
 
                 messages.append(final_msg)
 
