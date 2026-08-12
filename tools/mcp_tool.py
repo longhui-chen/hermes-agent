@@ -5076,11 +5076,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # actually this device's loopback before granting it, and fail closed
         # for that reserved name even when the config asks to forward.
         if server_name == "zettlab_memo":
-            forward_context_meta = _is_loopback_mcp_url(server._config.get("url"))
+            # 无 url = stdio / 进程内托管 transport，本来就在本机，不存在把身份发出
+            # 设备的问题（OTA 未迁移的旧 profile 正是这种形态）。只有显式配了 url
+            # 且它不指向 loopback 时才拒绝。
+            memo_url = str(server._config.get("url") or "").strip()
+            forward_context_meta = not memo_url or _is_loopback_mcp_url(memo_url)
             if not forward_context_meta:
                 logger.warning(
-                    "MCP server 'zettlab_memo' is not a loopback transport; "
-                    "refusing to forward Zettlab identity metadata"
+                    "MCP server 'zettlab_memo' is configured with a non-loopback "
+                    "url; refusing to forward Zettlab identity metadata"
                 )
         else:
             forward_context_meta = _parse_boolish(
