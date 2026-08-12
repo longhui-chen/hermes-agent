@@ -34,6 +34,7 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
 import contextvars as _ctxvars
@@ -1034,6 +1035,83 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
         )
 
 
+def _reserved_topic_owner(name: str, content: str) -> Optional[Tuple[str, str]]:
+    """Return (owner_skill_name, topic) when a new skill lands on a reserved topic.
+
+    A skill declares the topics it owns under ``metadata.hermes.reserved_topics``.
+    Only skills that ship with the platform get to reserve anything: a reserved
+    topic in a skill the agent wrote itself would let it fence off ground from
+    the platform, which is backwards.
+
+    Name collision alone does not catch this. A device under observation grew
+    three skills on one topic in a single afternoon — ``public-market-dashboard-apps``,
+    ``public-data-dashboard-apps``, ``external-data-dashboard-apps`` — three
+    distinct names in three distinct categories, every one of them admitted by
+    the name check. Each carried its own end-to-end procedure for the same job,
+    and the one that happened to load decided the outcome.
+    """
+    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+
+    haystack_parts = [name.replace("-", " ").replace("_", " ")]
+    try:
+        frontmatter, _ = _parse_frontmatter(content)
+    except Exception:
+        frontmatter = {}
+    if isinstance(frontmatter, dict):
+        haystack_parts.append(str(frontmatter.get("description") or ""))
+        meta = frontmatter.get("metadata")
+        hermes_meta = meta.get("hermes") if isinstance(meta, dict) else None
+        if isinstance(hermes_meta, dict):
+            tags = hermes_meta.get("tags")
+            if isinstance(tags, list):
+                haystack_parts.extend(str(tag) for tag in tags)
+    haystack = " ".join(haystack_parts).lower()
+
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        # Reservations are only honoured from the read-only preset library.
+        # ``get_all_skills_dirs`` also yields the profile's own writable dir.
+        if not _is_platform_skills_dir(skills_dir):
+            continue
+        for skill_md in skills_dir.rglob("SKILL.md"):
+            if is_excluded_skill_path(skill_md):
+                continue
+            try:
+                owner_fm, _ = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(owner_fm, dict):
+                continue
+            meta = owner_fm.get("metadata")
+            hermes_meta = meta.get("hermes") if isinstance(meta, dict) else None
+            if not isinstance(hermes_meta, dict):
+                continue
+            reserved = hermes_meta.get("reserved_topics")
+            if not isinstance(reserved, list):
+                continue
+            owner_name = str(owner_fm.get("name") or skill_md.parent.name)
+            if owner_name == name:
+                continue
+            for topic in reserved:
+                needle = str(topic).strip().lower()
+                if needle and needle in haystack:
+                    return owner_name, str(topic)
+    return None
+
+
+def _is_platform_skills_dir(skills_dir: Path) -> bool:
+    """True for the read-only preset library shipped with the device."""
+    presets_root = os.environ.get("ZETTLAB_PRESETS_DIR", "").strip()
+    if not presets_root:
+        return False
+    try:
+        skills_dir.resolve().relative_to(Path(presets_root).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
@@ -1064,6 +1142,22 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         return {
             "success": False,
             "error": f"A skill named '{name}' already exists at {existing['path']}."
+        }
+
+    owner = _reserved_topic_owner(name, content)
+    if owner:
+        skill_name, topic = owner
+        return {
+            "success": False,
+            "error": (
+                f"The '{topic}' topic belongs to the '{skill_name}' skill, which owns "
+                f"the platform workflow for it. A second skill on the same topic does "
+                f"not extend that workflow — it competes with it, and whichever one "
+                f"loads first wins, so the same request starts producing different "
+                f"results run to run. Follow '{skill_name}' instead; if it is missing "
+                f"something, say so in the conversation so it can be fixed at the "
+                f"source rather than forked here."
+            ),
         }
 
     # Create the skill directory

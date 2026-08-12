@@ -1277,3 +1277,121 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+PLATFORM_OWNER_SKILL = """\
+---
+name: application-create
+description: Generate and manage device-hosted apps.
+metadata:
+  hermes:
+    tags: [app, generate]
+    reserved_topics:
+      - dashboard
+      - 看板
+---
+
+# Application create
+
+Step 1: build it.
+"""
+
+
+def _rival_skill(name: str, description: str, tags: str = "") -> str:
+    tag_line = f"    tags: [{tags}]\n" if tags else ""
+    return (
+        "---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        "metadata:\n"
+        "  hermes:\n"
+        f"{tag_line}"
+        "---\n"
+        "\n"
+        "# Rival\n"
+        "\n"
+        "Step 1: do it my way.\n"
+    )
+
+
+@contextmanager
+def _platform_and_profile_dirs(tmp_path):
+    """A read-only preset library plus the profile's own writable skills dir.
+
+    Reservations are honoured only from the preset library, so the two have to
+    be distinguishable — that is what ZETTLAB_PRESETS_DIR marks.
+    """
+    presets_root = tmp_path / "presets"
+    platform_dir = presets_root / "skills"
+    profile_dir = tmp_path / "profile-skills"
+    (platform_dir / "application-create").mkdir(parents=True)
+    (platform_dir / "application-create" / "SKILL.md").write_text(
+        PLATFORM_OWNER_SKILL, encoding="utf-8"
+    )
+    profile_dir.mkdir(parents=True)
+    with patch("tools.skill_manager_tool.SKILLS_DIR", profile_dir), \
+         patch("agent.skill_utils.get_all_skills_dirs",
+               return_value=[profile_dir, platform_dir]), \
+         patch.dict("os.environ", {"ZETTLAB_PRESETS_DIR": str(presets_root)}):
+        yield profile_dir
+
+
+class TestReservedTopics:
+    """A skill the agent writes for itself must not fork a platform workflow.
+
+    One device grew three rival skills on a single topic in one afternoon,
+    each with a different name and category, each admitted by the name check.
+    Whichever loaded first decided the outcome, so the same request produced
+    different results run to run.
+    """
+
+    def test_rival_skill_on_reserved_topic_is_blocked(self, tmp_path):
+        with _platform_and_profile_dirs(tmp_path) as profile_dir:
+            result = _create_skill(
+                "external-data-dashboard-apps",
+                _rival_skill(
+                    "external-data-dashboard-apps",
+                    "Use when building dashboards from public external data.",
+                ),
+            )
+        assert result["success"] is False
+        assert "application-create" in result["error"]
+        assert not (profile_dir / "external-data-dashboard-apps").exists()
+
+    def test_reserved_topic_matches_on_tags_and_description(self, tmp_path):
+        # Name alone gives nothing away here — the topic shows up in the tags.
+        with _platform_and_profile_dirs(tmp_path):
+            result = _create_skill(
+                "market-quote-helper",
+                _rival_skill(
+                    "market-quote-helper",
+                    "Helper for quote tables.",
+                    tags="看板, market-data",
+                ),
+            )
+        assert result["success"] is False
+        assert "application-create" in result["error"]
+
+    def test_unrelated_skill_still_allowed(self, tmp_path):
+        with _platform_and_profile_dirs(tmp_path) as profile_dir:
+            result = _create_skill(
+                "himalaya-email",
+                _rival_skill("himalaya-email", "Send email from the terminal."),
+            )
+        assert result["success"] is True
+        assert (profile_dir / "himalaya-email" / "SKILL.md").exists()
+
+    def test_profile_authored_skill_cannot_reserve_a_topic(self, tmp_path):
+        """Otherwise the agent could fence off ground from the platform."""
+        with _platform_and_profile_dirs(tmp_path) as profile_dir:
+            (profile_dir / "squatter").mkdir()
+            (profile_dir / "squatter" / "SKILL.md").write_text(
+                "---\nname: squatter\ndescription: Squats a topic.\n"
+                "metadata:\n  hermes:\n    reserved_topics:\n      - email\n---\n\n# Squatter\n\nStep 1.\n",
+                encoding="utf-8",
+            )
+            result = _create_skill(
+                "himalaya-email",
+                _rival_skill("himalaya-email", "Send email from the terminal."),
+            )
+        assert result["success"] is True
