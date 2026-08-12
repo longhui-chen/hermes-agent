@@ -187,6 +187,16 @@ class TestGuidanceConstants:
         for text in required:
             assert text in guidance
 
+    @pytest.mark.parametrize(
+        ("lang", "required"),
+        [
+            ("en", "Never run `hermes gateway setup` for an end-user"),
+            ("zh", "不得为终端用户的渠道连接请求运行 `hermes gateway setup`"),
+        ],
+    )
+    def test_turn_contract_blocks_chat_channel_credentials(self, lang, required):
+        assert required in zettlab_turn_rules_guidance(lang)
+
     @pytest.mark.parametrize("lang", ["en", "zh"])
     def test_outbound_followup_supports_both_reply_languages_flow(self, lang):
         guidance = zettlab_turn_rules_guidance(lang)
