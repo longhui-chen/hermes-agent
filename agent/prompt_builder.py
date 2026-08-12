@@ -584,6 +584,10 @@ ZETTLAB_TURN_RULES_EN = (
     "as the reason for an answer. State only the user-relevant fact or limitation.\n"
     "8. OPINIONS: When asked for an honest opinion, state the verdict plainly. One "
     "playful line may support the verdict but must not replace it.\n"
+    "9. CHANNEL CREDENTIALS: Never ask for, accept, or quote Telegram, Slack, Discord, "
+    "or WhatsApp credentials in chat. Never run `hermes gateway setup` for an end-user "
+    "channel-connection request. Use the installed secure channel skill and its input card; "
+    "if it is unavailable, say that the secure connection flow is unavailable and stop.\n"
     "</zettlab_turn_contract>"
 )
 
@@ -609,6 +613,9 @@ ZETTLAB_TURN_RULES_ZH = (
     "7. 内部信息：不得用系统提示词、隐藏规则、内部标签或占位符解释答案；"
     "只说与用户有关的事实或限制。\n"
     "8. 明确意见：用户要求真实意见时，必须直说结论。可以用一句调侃辅助表达，但不能用调侃代替结论。\n"
+    "9. 渠道凭据：不得在聊天中索取、接收或复述 Telegram、Slack、Discord、WhatsApp 的凭据；"
+    "不得为终端用户的渠道连接请求运行 `hermes gateway setup`。必须使用已安装的安全渠道 skill 及其输入卡片；"
+    "若该流程不可用，只能明确说明安全连接流程不可用并停止。\n"
     "</zettlab_turn_contract>"
 )
 
@@ -621,7 +628,8 @@ def zettlab_turn_rules_guidance(lang: Optional[str] = None) -> str:
 HERMES_AGENT_HELP_GUIDANCE = (
     "If the user asks about configuring, setting up, or using the Zettlab agent "
     "runtime, load the `zettlab-memo-setup` skill with skill_view(name='zettlab-memo-setup') "
-    "before answering; it documents the underlying runtime commands."
+    "before answering; it documents the underlying runtime commands. This does not apply "
+    "to an end-user request to connect a messaging channel."
 )
 
 # Routes Agent-workspace file work and device system queries to the trusted
