@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import _build_onboarding_prompt_parts, build_system_prompt_parts
 from hermes_cli.config import ensure_hermes_home
 from hermes_cli.default_soul import (
     DEFAULT_SOUL_MD,
@@ -43,6 +43,37 @@ def _stable_prompt(soul_text: str = "", **agent_overrides) -> str:
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(_make_agent(**agent_overrides))["stable"]
+
+
+def test_onboarding_profile_uses_bounded_prompt():
+    soul = "[zettlab-onboarding-guide-v15]\n只进行简短初次见面引导。"
+    parts = _build_onboarding_prompt_parts(soul, "current onboarding step")
+
+    combined = "\n".join(parts.values())
+    assert soul in parts["stable"]
+    assert "current onboarding step" == parts["context"]
+    assert "conversation_protocol" not in combined
+    assert "zettlab_onboarding_turn_contract" in parts["volatile"]
+    assert len(combined) < 6000
+
+
+def test_onboarding_profile_routes_around_general_prompt_builder():
+    soul = "[zettlab-onboarding-guide-v15]\n只进行简短初次见面引导。"
+    fake_runtime = SimpleNamespace(load_soul_md=lambda _context_length: soul)
+    with (
+        patch("agent.system_prompt._ra", return_value=fake_runtime),
+        patch("agent.system_prompt._active_profile_name_for_prompt", return_value="onboarding"),
+    ):
+        parts = build_system_prompt_parts(
+            _make_agent(valid_tool_names=["terminal", "memory"]),
+            system_message="step=userName",
+        )
+
+    combined = "\n".join(parts.values())
+    assert soul in combined
+    assert "step=userName" in combined
+    assert "conversation_protocol" not in combined
+    assert len(combined) < 6000
 
 
 @pytest.mark.parametrize("profile", ["main", "memo", "default", "root", "writer"])
@@ -138,8 +169,12 @@ def test_zettlab_managed_startup_order_materializes_memo_once_flow(
     monkeypatch.setenv("ZET_AGENT_ID", "main")
     monkeypatch.setenv("HERMES_AGENT_LANG", "en")
 
+    # 命名 profile 的 home 必须显式存在：ensure_hermes_home() 不再为
+    # `<...>/profiles/<id>` 自动 mkdir（否则被删掉的 profile 会被空骨架复活，
+    # 见 hermes_cli/config.py 的守卫）。真机上这一步由 local-server 在拉起
+    # hermes 之前完成。两种启动顺序的差别只在于 SOUL.md 此时是否已经写好。
+    profile_home.mkdir(parents=True)
     if startup_order == "local-first":
-        profile_home.mkdir(parents=True)
         soul_path.write_text(memo_soul, encoding="utf-8")
 
     ensure_hermes_home()

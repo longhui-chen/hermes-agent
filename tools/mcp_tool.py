@@ -5061,6 +5061,53 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        call_meta = None
+        # Zettlab Memo is a managed, loopback-only MCP transport whose
+        # personal-memory boundary depends on trusted per-turn identity.  Old
+        # profile config files can survive an OTA without the newer
+        # ``forward_context_meta`` flag, so do not make correctness depend on
+        # that migration having run before the first chat turn.  Other MCP
+        # servers remain opt-in.
+        #
+        # The *name* alone is not a trust anchor: a hand-edited profile or an
+        # OTA leftover can point ``mcp_servers.zettlab_memo.url`` at a remote
+        # host, and the implicit grant would then ship account/session/profile
+        # identity off-device on every memory call.  Verify the transport is
+        # actually this device's loopback before granting it, and fail closed
+        # for that reserved name even when the config asks to forward.
+        if server_name == "zettlab_memo":
+            forward_context_meta = _is_loopback_mcp_url(server._config.get("url"))
+            if not forward_context_meta:
+                logger.warning(
+                    "MCP server 'zettlab_memo' is not a loopback transport; "
+                    "refusing to forward Zettlab identity metadata"
+                )
+        else:
+            forward_context_meta = _parse_boolish(
+                server._config.get("forward_context_meta", False), default=False
+            )
+        if forward_context_meta:
+            try:
+                from gateway.session_context import get_session_env
+
+                forwarded = {
+                    "zettlab/profile_id": get_session_env("HERMES_SESSION_PROFILE", ""),
+                    "zettlab/session_id": get_session_env("HERMES_SESSION_ID", ""),
+                    "zettlab/turn_id": get_session_env("HERMES_TURN_ID", ""),
+                    "zettlab/account_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+                }
+                call_meta = {
+                    key: str(value).strip()[:512]
+                    for key, value in forwarded.items()
+                    if str(value or "").strip()
+                } or None
+            except Exception:
+                logger.debug(
+                    "MCP server '%s': failed to build forwarded context metadata",
+                    server_name,
+                    exc_info=True,
+                )
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -5070,7 +5117,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if call_meta:
+                        result = await server.session.call_tool(
+                            tool_name, arguments=args, meta=call_meta
+                        )
+                    else:
+                        result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -5770,6 +5822,34 @@ def matches_name_filter(tool_name: str, patterns: set[str]) -> bool:
         for p in patterns
         if "*" in p or "?" in p or "[" in p
     )
+
+
+def _is_loopback_mcp_url(raw: Any) -> bool:
+    """True only when an MCP transport URL resolves to this device's loopback.
+
+    Used to decide whether a managed transport may receive trusted Zettlab
+    identity (account / session / profile).  Anything that is not an http(s)
+    URL on a loopback literal is treated as remote, so a hijacked or stale
+    config fails closed instead of leaking personal-memory scope off-device.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _parse_boolish(value: Any, default: bool = True) -> bool:
