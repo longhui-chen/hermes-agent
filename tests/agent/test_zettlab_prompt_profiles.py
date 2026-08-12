@@ -169,8 +169,12 @@ def test_zettlab_managed_startup_order_materializes_memo_once_flow(
     monkeypatch.setenv("ZET_AGENT_ID", "main")
     monkeypatch.setenv("HERMES_AGENT_LANG", "en")
 
+    # 命名 profile 的 home 必须显式存在：ensure_hermes_home() 不再为
+    # `<...>/profiles/<id>` 自动 mkdir（否则被删掉的 profile 会被空骨架复活，
+    # 见 hermes_cli/config.py 的守卫）。真机上这一步由 local-server 在拉起
+    # hermes 之前完成。两种启动顺序的差别只在于 SOUL.md 此时是否已经写好。
+    profile_home.mkdir(parents=True)
     if startup_order == "local-first":
-        profile_home.mkdir(parents=True)
         soul_path.write_text(memo_soul, encoding="utf-8")
 
     ensure_hermes_home()
