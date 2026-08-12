@@ -1303,7 +1303,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
     secret_token = secret_scope_module.set_secret_scope(
         {
             "ZET_AGENT_ID": "main",
-            "ZETTLAB_AGENT_ACTION_TOKEN": "a" * 64,
+            "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token:camera/v2",
         }
     )
     session_tokens = set_session_vars(
@@ -1340,7 +1340,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
             frozen = build_camera_runtime_env()
             assert frozen == {
                 "ZET_AGENT_ID": "main",
-                "ZETTLAB_AGENT_ACTION_TOKEN": "a" * 64,
+                "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token:camera/v2",
                 "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "b" * 64,
                 "HERMES_TURN_ID": "camera-turn",
                 "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
@@ -1404,6 +1404,67 @@ def test_camsnap_skill_cannot_activate_for_unrelated_task_flow(
             function_result=result,
         )
         assert trusted_skill_allowed_tool_names(agent) == frozenset()
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["", "has space", "line\nfeed", "\x7fdelete", "x" * 4097],
+)
+def test_camera_action_token_rejects_empty_control_or_oversized_values(token):
+    assert not response_mode._is_opaque_action_token(token)
+
+
+def test_camera_action_token_accepts_opaque_utf8_value():
+    assert response_mode._is_opaque_action_token("profile-token:相机/v2")
+
+
+def test_silent_attestation_rejects_skill_path_mismatch(
+    monkeypatch,
+):
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    agent._zet_agent_execution_policy = "silent_automation"
+    turn_tokens = set_turn_vars(turn_id="silent-slug-mismatch")
+    try:
+        task = response_mode._skill_direct_task_context(
+            agent,
+            "执行已授权的视频任务",
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+        agent._zet_agent_skill_direct_task = task
+        attestation = "silent-slug-mismatch-attestation"
+        serialized = json.dumps(
+            {
+                "name": "camsnap",
+                "content": "trusted camera skill",
+                response_mode._ATTESTATION_FIELD: attestation,
+            },
+            ensure_ascii=False,
+        )
+        monkeypatch.setattr(
+            response_mode,
+            "_consume_skill_attestation",
+            lambda token, result: (
+                types.SimpleNamespace(
+                    relative_path=response_mode._CAMERA_SKILL_PATH,
+                    turn_identity=task.turn_identity,
+                )
+                if token == attestation and result == serialized
+                else None
+            ),
+        )
+        capture = MagicMock()
+        monkeypatch.setattr(response_mode, "_capture_trusted_execution_receipt", capture)
+
+        assert not response_mode.apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=serialized,
+        )
+        capture.assert_not_called()
+        assert response_mode.trusted_skill_allowed_tool_names(agent) == frozenset()
     finally:
         clear_turn_vars(turn_tokens)
 

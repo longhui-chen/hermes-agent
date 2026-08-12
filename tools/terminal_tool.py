@@ -6140,8 +6140,10 @@ def _run_video_edit_runtime_command_if_allowed(
             returncode,
         )
         if terminal_failure_reason:
+            result["terminal_failure"] = True
+            result["reason"] = terminal_failure_reason
             return TrustedToolResult(
-                visible_result,
+                json.dumps(result, ensure_ascii=False),
                 terminal_failure_reason=terminal_failure_reason,
             )
         return visible_result

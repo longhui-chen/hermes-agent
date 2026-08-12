@@ -57,6 +57,7 @@ _CAMERA_INTENT_RE = re.compile(
 _VIDEO_EDIT_POLICY_VIOLATION_RETRIES = 2
 _VIDEO_EDIT_RESUME_TTL_SECONDS = 3 * 60 * 60
 _VIDEO_EDIT_RESUME_MAX_SESSIONS = 8
+_OPAQUE_ACTION_TOKEN_MAX_BYTES = 4096
 _VIDEO_EDIT_MEMORY_ACTIONS = frozenset(
     {"plan-forget", "plan-hard", "plan-migrate", "plan-reset", "plan-success"}
 )
@@ -202,6 +203,7 @@ class _SkillDirectTaskContext:
     video_edit_explicit: bool = False
     camera_applicable: bool = False
     camera_explicit: bool = False
+    trusted_skill_slug: str = ""
 
 
 @dataclass(frozen=True)
@@ -466,7 +468,7 @@ def _capture_trusted_execution_receipt(
         )
         return None
     if camera_skill and (
-        re.fullmatch(r"[0-9a-f]{64}", receipt.action_token) is None
+        not _is_opaque_action_token(receipt.action_token)
         or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
         is None
     ):
@@ -488,6 +490,29 @@ def _capture_trusted_execution_receipt(
         logger.warning("zet_agent: silent video action is missing")
         return None
     return receipt
+
+
+def _is_opaque_action_token(value: str) -> bool:
+    """Validate a profile action capability without imposing token syntax."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        if len(value.encode("utf-8")) > _OPAQUE_ACTION_TOKEN_MAX_BYTES:
+            return False
+    except UnicodeError:
+        return False
+    return not any(
+        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F
+        for char in value
+    )
+
+
+def _trusted_skill_path_for_slug(skill_slug: str) -> str:
+    """Derive the canonical signed skill path from an explicit slug."""
+    normalized = str(skill_slug or "").strip().lstrip("/").lower()
+    if not normalized or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", normalized) is None:
+        return ""
+    return f"skills/{normalized}/SKILL.md"
 
 
 def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
@@ -530,7 +555,7 @@ def trusted_camera_runtime_receipt() -> Mapping[str, str]:
     if (
         receipt is None
         or receipt.business_execution_action
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.action_token) is None
+        or not _is_opaque_action_token(receipt.action_token)
         or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
         is None
         or not receipt.session_id
@@ -1363,6 +1388,7 @@ def _skill_direct_task_context(
         video_edit_explicit=explicit,
         camera_applicable=camera_transport_selection or bool(_CAMERA_INTENT_RE.search(normalized)),
         camera_explicit=camera_transport_selection,
+        trusted_skill_slug=normalized_skill_slug,
     )
 
 
@@ -2299,6 +2325,17 @@ def apply_trusted_skill_execution(
         logger.warning(
             "zet_agent: trusted skill %s rejected for mismatched turn identity",
             pending.relative_path,
+        )
+        return False
+    if (
+        getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation"
+        and _trusted_skill_path_for_slug(getattr(task, "trusted_skill_slug", ""))
+        != pending.relative_path
+    ):
+        logger.warning(
+            "zet_agent: silent skill %s does not match the trusted slug %r",
+            pending.relative_path,
+            getattr(task, "trusted_skill_slug", ""),
         )
         return False
     execution_receipt = _capture_trusted_execution_receipt(

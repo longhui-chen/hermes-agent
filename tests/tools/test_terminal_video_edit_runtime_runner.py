@@ -122,6 +122,8 @@ def test_trusted_video_runner_marks_raw_checkpoint_identity_failure_in_process(
         "exit_code": 2,
         "error": None,
         "video_edit_runtime_direct": True,
+        "terminal_failure": True,
+        "reason": "workflow_checkpoint_identity_invalid",
     }
 
 

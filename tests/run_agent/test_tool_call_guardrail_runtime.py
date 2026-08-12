@@ -358,6 +358,8 @@ def test_raw_video_terminal_failure_halts_once_and_skips_later_calls(
         "exit_code": 2,
         "error": None,
         "video_edit_runtime_direct": True,
+        "terminal_failure": True,
+        "reason": "workflow_checkpoint_identity_invalid",
     }
     assert sum(name == "skill_view" for name in dispatch_names) == 0
     assert len(model_calls) == 1

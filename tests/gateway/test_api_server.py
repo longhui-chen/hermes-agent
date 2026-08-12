@@ -3612,6 +3612,16 @@ class TestCORS:
         assert "x-zettlab-business-execution-action" not in allowed
         assert "x-zettlab-business-execution-action-version" not in allowed
 
+    def test_cors_headers_allow_camera_business_execution_token_unit(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        headers = adapter._cors_headers_for_origin("http://localhost:3000")
+        assert headers is not None
+        allowed = {
+            value.strip().lower()
+            for value in headers["Access-Control-Allow-Headers"].split(",")
+        }
+        assert "x-zettlab-business-execution-token" in allowed
+
     def test_cors_headers_for_origin_rejects_unknown_origin(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         assert adapter._cors_headers_for_origin("http://evil.example") is None
@@ -3703,6 +3713,31 @@ class TestCORS:
                 ).split(",")
             }
             assert "x-zettlab-agent-action-token" not in allowed
+
+    @pytest.mark.asyncio
+    async def test_cors_camera_business_execution_token_preflight_is_granted(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.options(
+                "/v1/chat/completions",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": (
+                        "Content-Type, X-Zettlab-Business-Execution-Token"
+                    ),
+                },
+            )
+            assert resp.status == 200
+            allowed = {
+                value.strip().lower()
+                for value in resp.headers.get(
+                    "Access-Control-Allow-Headers",
+                    "",
+                ).split(",")
+            }
+            assert "x-zettlab-business-execution-token" in allowed
 
     @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):
