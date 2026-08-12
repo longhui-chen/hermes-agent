@@ -132,8 +132,23 @@ def _install_fake_fal_client(captured):
     return fal_client_module
 
 
-def _install_fake_openai_module(captured, transcription_response=None):
+def _install_fake_openai_module(
+    captured,
+    transcription_response=None,
+    speech_chunks=(b"fake-audio",),
+):
     class FakeSpeechResponse:
+        def __enter__(self):
+            captured["streaming_response_entered"] = True
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_bytes(self, chunk_size=None):
+            captured["iter_bytes_chunk_size"] = chunk_size
+            yield from speech_chunks
+
         def stream_to_file(self, output_path):
             captured["stream_to_file"] = output_path
             Path(output_path).write_bytes(b"fake-audio")
@@ -149,13 +164,23 @@ def _install_fake_openai_module(captured, transcription_response=None):
                 captured["speech_kwargs"] = kwargs
                 return FakeSpeechResponse()
 
+            def create_streaming_speech(**kwargs):
+                captured["speech_kwargs"] = kwargs
+                captured["streaming_create_calls"] = (
+                    captured.get("streaming_create_calls", 0) + 1
+                )
+                return FakeSpeechResponse()
+
             def create_transcription(**kwargs):
                 captured["transcription_kwargs"] = kwargs
                 return transcription_response
 
             self.audio = types.SimpleNamespace(
                 speech=types.SimpleNamespace(
-                    create=create_speech
+                    create=create_speech,
+                    with_streaming_response=types.SimpleNamespace(
+                        create=create_streaming_speech,
+                    ),
                 ),
                 transcriptions=types.SimpleNamespace(
                     create=create_transcription
@@ -221,7 +246,9 @@ def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatc
     assert captured["base_url"] == "https://openai-audio-gateway.nousresearch.com/v1"
     assert captured["speech_kwargs"]["model"] == "gpt-4o-mini-tts"
     assert captured["speech_kwargs"]["extra_headers"] == {"x-idempotency-key": "tts-call-123"}
-    assert captured["stream_to_file"].endswith(".part")
+    assert captured["streaming_create_calls"] == 1
+    assert captured["streaming_response_entered"] is True
+    assert captured["iter_bytes_chunk_size"] == 64 * 1024
     assert output_path.read_bytes() == b"fake-audio"
     assert captured["close_calls"] == 1
 
@@ -255,9 +282,37 @@ def test_zettlab_tts_auto_selects_local_gateway_and_ai_api_model(monkeypatch, tm
     assert captured["client_kwargs"]["http_client"]._trust_env is False
     assert captured["client_kwargs"]["http_client"].follow_redirects is False
     assert captured["client_kwargs"]["max_retries"] == 0
+    assert captured["streaming_create_calls"] == 1
     assert captured["speech_kwargs"]["model"] == "seed-tts-1.1"
     assert captured["speech_kwargs"]["voice"] == "nova"
     assert captured["speech_kwargs"]["speed"] == 3.0
+
+
+def test_zettlab_tts_streaming_limit_removes_partial_output(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(
+        captured,
+        speech_chunks=(b"1234", b"5678"),
+    )
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    monkeypatch.setattr(tts_tool, "TTS_RESPONSE_BODY_LIMIT_BYTES", 6)
+    output_path = tmp_path / "speech.mp3"
+
+    with pytest.raises(RuntimeError, match="exceeds 6 bytes"):
+        tts_tool._generate_openai_tts("hello world", str(output_path), {})
+
+    assert captured["streaming_create_calls"] == 1
+    assert not output_path.exists()
+    assert list(tmp_path.glob("*.part")) == []
 
 
 def test_zettlab_tts_existing_direct_key_wins_unless_gateway_is_forced(
@@ -366,7 +421,10 @@ def test_zettlab_tts_direct_keys_are_isolated_by_profile(monkeypatch, tmp_path):
     secret_scope.set_multiplex_active(True)
     try:
         profile_a = secret_scope.set_secret_scope(
-            {"VOICE_TOOLS_OPENAI_KEY": "profile-a-key"}
+            {
+                "VOICE_TOOLS_OPENAI_KEY": "profile-a-key",
+                "OPENAI_BASE_URL": "https://profile-a.example/v1",
+            }
         )
         try:
             tts_tool._generate_openai_tts(
@@ -375,11 +433,15 @@ def test_zettlab_tts_direct_keys_are_isolated_by_profile(monkeypatch, tmp_path):
                 {"provider": "openai", "use_gateway": False},
             )
             profile_a_key = captured["api_key"]
+            profile_a_base_url = captured["base_url"]
         finally:
             secret_scope.reset_secret_scope(profile_a)
 
         profile_b = secret_scope.set_secret_scope(
-            {"OPENAI_API_KEY": "profile-b-key"}
+            {
+                "OPENAI_API_KEY": "profile-b-key",
+                "OPENAI_BASE_URL": "https://profile-b.example/v1",
+            }
         )
         try:
             tts_tool._generate_openai_tts(
@@ -388,6 +450,7 @@ def test_zettlab_tts_direct_keys_are_isolated_by_profile(monkeypatch, tmp_path):
                 {"provider": "openai", "use_gateway": False},
             )
             profile_b_key = captured["api_key"]
+            profile_b_base_url = captured["base_url"]
         finally:
             secret_scope.reset_secret_scope(profile_b)
     finally:
@@ -395,6 +458,8 @@ def test_zettlab_tts_direct_keys_are_isolated_by_profile(monkeypatch, tmp_path):
 
     assert profile_a_key == "profile-a-key"
     assert profile_b_key == "profile-b-key"
+    assert profile_a_base_url == "https://profile-a.example/v1"
+    assert profile_b_base_url == "https://profile-b.example/v1"
 
 
 def test_zettlab_tts_requirements_accept_gateway_without_direct_key(monkeypatch):
@@ -553,6 +618,7 @@ def test_zettlab_tts_never_sends_action_token_to_custom_endpoint(monkeypatch, tm
     _install_fake_tools_package()
     _install_fake_openai_module(captured)
     monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env-tts.example.test/v1")
     monkeypatch.setenv(
         "ZET_CHAT_APPEND_URL",
         "http://127.0.0.1:9090/api/v1/internal/chat/append",

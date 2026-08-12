@@ -266,7 +266,6 @@ ZETTLAB_TTS_CONNECT_TIMEOUT_SECONDS = 5.0
 ZETTLAB_TTS_READ_TIMEOUT_SECONDS = 120.0
 ZETTLAB_TTS_WRITE_TIMEOUT_SECONDS = 30.0
 ZETTLAB_TTS_POOL_TIMEOUT_SECONDS = 5.0
-ZETTLAB_TTS_TOTAL_TIMEOUT_SECONDS = 120.0
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -298,10 +297,10 @@ def _default_output_dir_for_session(*, platform: str, session_id: str) -> Path:
     except Exception:
         output_root = None
     if not output_root:
-        logger.warning(
-            "Managed Zettlab Agent output is unavailable; using the TTS cache"
+        raise RuntimeError(
+            "Managed Zettlab Agent output is unavailable: "
+            "ZET_AGENT_OUTPUT_DIR must name an existing directory"
         )
-        return Path(DEFAULT_OUTPUT_DIR)
 
     root = Path(output_root).resolve()
     bucket = str(session_id or "").strip().rsplit(":", 1)[-1]
@@ -470,14 +469,12 @@ def _write_tts_response_to_file(
     *,
     label: str,
     limit: Optional[int] = None,
-    total_timeout: Optional[float] = None,
 ) -> None:
     """Stage a bounded response beside the target, then atomically publish it."""
     limit = TTS_RESPONSE_BODY_LIMIT_BYTES if limit is None else limit
     target = Path(output_path)
     partial_id = str(uuid.uuid4()).replace("-", "")
     partial = target.with_name(f".{target.name}.{partial_id}.part")
-    started = time.monotonic()
     total = 0
 
     headers = getattr(response, "headers", None)
@@ -534,22 +531,8 @@ def _write_tts_response_to_file(
                     total += len(chunk)
                     if total > limit:
                         raise RuntimeError(f"{label} response exceeds {limit} bytes")
-                    if (
-                        total_timeout is not None
-                        and time.monotonic() - started > total_timeout
-                    ):
-                        raise TimeoutError(
-                            f"{label} response exceeded {total_timeout:g}s total timeout"
-                        )
                     output.write(chunk)
 
-        if (
-            total_timeout is not None
-            and time.monotonic() - started > total_timeout
-        ):
-            raise TimeoutError(
-                f"{label} response exceeded {total_timeout:g}s total timeout"
-            )
         os.replace(partial, target)
     except Exception:
         try:
@@ -1816,18 +1799,26 @@ def _generate_openai_tts(
             create_kwargs["instructions"] = instructions
         if language:
             create_kwargs["extra_body"] = {"lang_code": language}
-        response = client.audio.speech.create(**create_kwargs)
-
-        _write_tts_response_to_file(
-            response,
-            output_path,
-            label="OpenAI TTS",
-            total_timeout=(
-                ZETTLAB_TTS_TOTAL_TIMEOUT_SECONDS
-                if managed_contract_active
-                else None
-            ),
-        )
+        if managed_contract_active:
+            # ``audio.speech.create`` may eagerly buffer the entire binary
+            # response before our bounded file sink sees it. Managed audio
+            # must use the SDK's streaming response so the 16 MiB limit is
+            # enforced while bytes arrive from local-server.
+            with client.audio.speech.with_streaming_response.create(
+                **create_kwargs
+            ) as response:
+                _write_tts_response_to_file(
+                    response,
+                    output_path,
+                    label="OpenAI TTS",
+                )
+        else:
+            response = client.audio.speech.create(**create_kwargs)
+            _write_tts_response_to_file(
+                response,
+                output_path,
+                label="OpenAI TTS",
+            )
         return output_path
     finally:
         close = getattr(client, "close", None)
@@ -3176,10 +3167,13 @@ def text_to_speech_tool(
             }, ensure_ascii=False)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = _default_output_dir_for_session(
-            platform=platform,
-            session_id=session_id,
-        )
+        try:
+            out_dir = _default_output_dir_for_session(
+                platform=platform,
+                session_id=session_id,
+            )
+        except RuntimeError as exc:
+            return tool_error(f"TTS output unavailable: {exc}", success=False)
         out_dir.mkdir(parents=True, exist_ok=True)
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
@@ -3533,10 +3527,17 @@ def _resolve_openai_audio_client_config(
     cfg_base_url = str(openai_cfg.get("base_url") or "").strip()
     direct_api_key = _resolve_profile_openai_audio_api_key()
 
+    def direct_base_url() -> str:
+        # OPENAI_BASE_URL remains part of the direct OpenAI-compatible TTS
+        # contract. ``get_env_value`` is profile-scoped under multiplexing,
+        # so this cannot borrow another profile's endpoint.
+        env_base_url = str(get_env_value("OPENAI_BASE_URL") or "").strip()
+        return cfg_base_url or env_base_url or DEFAULT_OPENAI_BASE_URL
+
     if _gateway_is_explicitly_disabled(tts_config):
         selected_key = cfg_api_key or direct_api_key
         if selected_key:
-            return selected_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+            return selected_key, direct_base_url(), False
         raise ValueError(
             "Neither tts.openai.api_key in config nor "
             "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
@@ -3547,7 +3548,7 @@ def _resolve_openai_audio_client_config(
     if zettlab_gateway is not None and not gateway_forced:
         selected_key = cfg_api_key or direct_api_key
         if selected_key:
-            return selected_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+            return selected_key, direct_base_url(), False
     if zettlab_gateway is not None:
         return (
             zettlab_gateway.token,
@@ -3556,9 +3557,9 @@ def _resolve_openai_audio_client_config(
         )
 
     if cfg_api_key and not prefers_gateway("tts"):
-        return cfg_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+        return cfg_api_key, direct_base_url(), False
     if direct_api_key and not prefers_gateway("tts"):
-        return direct_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+        return direct_api_key, direct_base_url(), False
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:

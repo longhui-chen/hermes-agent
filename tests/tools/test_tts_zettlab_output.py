@@ -77,6 +77,27 @@ def test_managed_zettlab_tts_resolves_output_root_per_profile(tmp_path, monkeypa
     assert Path(result_b["file_path"]).parent == output_b / "session-b"
 
 
+def test_managed_zettlab_tts_fails_when_agent_output_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    missing_output_root = tmp_path / "missing-agent-output"
+    cache_root = tmp_path / "cache" / "audio"
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(tts_tool, "DEFAULT_OUTPUT_DIR", str(cache_root))
+    _stub_edge_tts(monkeypatch)
+
+    with _managed_zettlab_session(
+        missing_output_root,
+        "zettlab:local-dev:main:session-abc",
+    ):
+        result = json.loads(tts_tool.text_to_speech_tool("hello"))
+
+    assert result["success"] is False
+    assert "ZET_AGENT_OUTPUT_DIR must name an existing directory" in result["error"]
+    assert not cache_root.exists()
+
+
 def test_managed_zettlab_tts_rejects_unsafe_session_bucket(tmp_path, monkeypatch):
     output_root = tmp_path / "agent-output"
     output_root.mkdir()
