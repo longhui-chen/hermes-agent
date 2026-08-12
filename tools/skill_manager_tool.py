@@ -1100,6 +1100,26 @@ def _reserved_topic_owner(name: str, content: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _reserved_topic_guard(name: str, content: str) -> Optional[Dict[str, Any]]:
+    """Reject a user SKILL.md whose post-write content claims platform turf."""
+    owner = _reserved_topic_owner(name, content)
+    if not owner:
+        return None
+    skill_name, topic = owner
+    return {
+        "success": False,
+        "error": (
+            f"The '{topic}' topic belongs to the '{skill_name}' skill, which owns "
+            f"the platform workflow for it. A second skill on the same topic does "
+            f"not extend that workflow — it competes with it, and whichever one "
+            f"loads first wins, so the same request starts producing different "
+            f"results run to run. Follow '{skill_name}' instead; if it is missing "
+            f"something, say so in the conversation so it can be fixed at the "
+            f"source rather than forked here."
+        ),
+    }
+
+
 def _is_platform_skills_dir(skills_dir: Path) -> bool:
     """True for the read-only preset library shipped with the device."""
     presets_root = os.environ.get("ZETTLAB_PRESETS_DIR", "").strip()
@@ -1144,21 +1164,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
 
-    owner = _reserved_topic_owner(name, content)
-    if owner:
-        skill_name, topic = owner
-        return {
-            "success": False,
-            "error": (
-                f"The '{topic}' topic belongs to the '{skill_name}' skill, which owns "
-                f"the platform workflow for it. A second skill on the same topic does "
-                f"not extend that workflow — it competes with it, and whichever one "
-                f"loads first wins, so the same request starts producing different "
-                f"results run to run. Follow '{skill_name}' instead; if it is missing "
-                f"something, say so in the conversation so it can be fixed at the "
-                f"source rather than forked here."
-            ),
-        }
+    reserved_guard = _reserved_topic_guard(name, content)
+    if reserved_guard:
+        return reserved_guard
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
@@ -1223,6 +1231,10 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     err = _existing_skill_frontmatter_guard(name, existing["path"])
     if err:
         return {"success": False, "error": err}
+
+    reserved_guard = _reserved_topic_guard(name, content)
+    if reserved_guard:
+        return reserved_guard
 
     skill_md = existing["path"] / "SKILL.md"
     read_guard = _background_review_read_before_write_guard(
@@ -1363,6 +1375,9 @@ def _patch_skill(
                 "success": False,
                 "error": f"Patch would break SKILL.md structure: {err}",
             }
+        reserved_guard = _reserved_topic_guard(name, new_content)
+        if reserved_guard:
+            return reserved_guard
 
     original_content = content  # for rollback
     atomic_write_text(target, new_content)
@@ -1541,6 +1556,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
     assert target is not None
+    if target == existing["path"] / "SKILL.md":
+        err = _validate_skill_frontmatter_name(name, file_content)
+        if err:
+            return {"success": False, "error": err}
+        reserved_guard = _reserved_topic_guard(name, file_content)
+        if reserved_guard:
+            return reserved_guard
     if target.exists():
         read_guard = _background_review_read_before_write_guard(
             name, target, "write_file", file_path

@@ -4695,18 +4695,14 @@ _AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS = _AGENT_CREATOR_PAYLOAD_KEYS | frozenset(
 # same string, so a caller cannot claim one subcommand to unlock the other's
 # keys.
 #
-# The approval operation is None for create-app-agent: the app-dedicated
-# agent is hidden from the user by design, and the user has already said yes
-# in business terms ("should this app auto-refresh its data daily?") right
-# before this call — a technical "approve creating agent X?" prompt would
-# both double-ask and expose the hidden agent. The waiver skips only the
-# human prompt; every trust gate below (pinned path, manifest capability,
-# snapshot digest, payload allowlist) still runs, and the server enforces
-# ownership (the caller can only bind its own app to its own new agent).
-# Ordinary create keeps its one-shot approval unchanged.
+# Both creation subcommands require the same one-shot approval. A model-written
+# payload is not proof that the user accepted the hidden maintainer or its
+# schedule; binding the approval fingerprint to the exact argv/stdin is the
+# verifiable consent boundary. The read-only {"probe": true} sentinel is
+# exempted after payload validation below because it creates nothing.
 _AGENT_CREATOR_CREATE_SUBCOMMANDS = {
     "create": (_AGENT_CREATOR_PAYLOAD_KEYS, "agent.create"),
-    "create-app-agent": (_AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS, None),
+    "create-app-agent": (_AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS, "agent.create"),
 }
 _AGENTCOMPUTER_CLI_VALUE_FLAGS = {
     ("file", "list"): frozenset({"--path", "--offset", "--limit"}),
@@ -5474,6 +5470,15 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
             except ValueError:
                 return None
         approval_operation = create_operation
+        if args[0] == "create-app-agent":
+            try:
+                validated_payload = json.loads(
+                    stdin_text if stdin_text is not None else args[2]
+                )
+            except (TypeError, ValueError):
+                return None
+            if validated_payload == {"probe": True}:
+                approval_operation = None
     elif args and args[0] == "cli":
         cli_args = args[1:]
         try:

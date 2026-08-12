@@ -953,15 +953,7 @@ _APP_AGENT_PAYLOAD = {
 
 
 def test_create_app_agent_payload_passes_over_stdin(monkeypatch, tmp_path):
-    # No approval stub: create-app-agent is approval-exempt by design (the
-    # user already said yes in business terms, and a technical prompt would
-    # expose the hidden agent). The bomb proves no approval is even requested.
-    monkeypatch.setattr(
-        "tools.approval.request_tool_approval",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("create-app-agent must not request approval")
-        ),
-    )
+    _auto_approve_mutations(monkeypatch)
     _configure(
         monkeypatch,
         tmp_path,
@@ -1003,6 +995,7 @@ def test_create_app_agent_payload_passes_over_stdin(monkeypatch, tmp_path):
 
 
 def test_create_app_agent_inline_payload_is_canonicalized(monkeypatch, tmp_path):
+    _auto_approve_mutations(monkeypatch)
     _configure(
         monkeypatch,
         tmp_path,
@@ -1181,15 +1174,11 @@ def test_forged_subcommand_names_do_not_unlock_the_wide_allowlist(
     assert "must not run" not in result["output"]
 
 
-def test_approval_waiver_is_scoped_to_create_app_agent_only(
+def test_create_app_agent_requires_approval_bound_to_its_payload(
     monkeypatch,
     tmp_path,
 ):
-    """The regression lock for the approval waiver: ordinary create MUST
-    still request one-shot human approval, while create-app-agent must not
-    request any. Anyone widening the waiver to create — or re-adding a
-    prompt to create-app-agent (which would expose the hidden agent) —
-    turns this red."""
+    """Both creation paths require a one-shot decision on their exact bytes."""
     _configure(
         monkeypatch,
         tmp_path,
@@ -1219,39 +1208,33 @@ def test_approval_waiver_is_scoped_to_create_app_agent_only(
             _canonical_command(f"create --payload {shlex.quote(plain_payload)}"),
             task_id="approval-scope-plain-create",
         ))
-        app_agent = json.loads(
-            terminal_tool_module._run_agent_creator_command_if_allowed(
-                _canonical_command(
-                    f"create-app-agent --payload {shlex.quote(app_payload)}"
-                ),
-                cwd=str(tmp_path),
-                timeout=5,
-            )
-        )
+        app_agent = json.loads(terminal_tool_module.terminal_tool(
+            _canonical_command(
+                f"create-app-agent --payload {shlex.quote(app_payload)}"
+            ),
+            task_id="approval-scope-app-create",
+        ))
 
     # Ordinary create: exactly one approval request, bound to agent.create,
     # and the run is held pending.
     assert plain["status"] == "pending_approval"
     assert plain["approval_pending"] is True
-    assert len(approval_requests) == 1
+    assert len(approval_requests) == 2
     assert approval_requests[0].startswith("agentcomputer:agent.create:")
-    # create-app-agent: no additional approval request, and the run completed.
-    assert app_agent["exit_code"] == 0
-    assert json.loads(app_agent["output"])["argv"][:2] == [
-        "create-app-agent", "--payload",
-    ]
-    assert len(approval_requests) == 1
+    # create-app-agent: a separate request bound to its app/schedule payload.
+    assert app_agent["status"] == "pending_approval"
+    assert app_agent["approval_pending"] is True
+    assert len(approval_requests) == 2
+    assert approval_requests[1].startswith("agentcomputer:agent.create:")
+    assert approval_requests[1] != approval_requests[0]
 
 
 def test_create_app_agent_capability_mismatch_blocks_before_secret(
     monkeypatch,
     tmp_path,
 ):
-    """The manifest capability gate applies to the new subcommand unchanged
-    — and with no approval stub in place, this also proves the approval
-    waiver does not waive the trust gates: an old preset without the
-    action-token-FD capability blocks the run before any scoped secret is
-    acquired."""
+    """The manifest capability gate applies after the creation approval."""
+    _auto_approve_mutations(monkeypatch)
     script = _configure(monkeypatch, tmp_path, "print('must not run')\n")
     (script.parent.parent / "manifest.yaml").write_text(
         "id: agent-creator\nruntime_capabilities: []\n",
@@ -1286,6 +1269,7 @@ def test_create_app_agent_script_digest_mismatch_blocks(monkeypatch, tmp_path):
     script rewritten after the snapshot must not run, even though its path
     and inode identity are unchanged. No approval stub — the approval-exempt
     path still walks every trust gate."""
+    _auto_approve_mutations(monkeypatch)
     script = _configure(monkeypatch, tmp_path, "print('snapshot version')\n")
     terminal_tool_module._capture_connector_runtime_root()
     with open(script, "w", encoding="utf-8") as handle:

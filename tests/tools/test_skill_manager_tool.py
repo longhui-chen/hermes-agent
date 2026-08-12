@@ -1381,6 +1381,40 @@ class TestReservedTopics:
         assert result["success"] is True
         assert (profile_dir / "himalaya-email" / "SKILL.md").exists()
 
+    def test_edit_cannot_turn_an_existing_skill_into_reserved_topic_rival(self, tmp_path):
+        with _platform_and_profile_dirs(tmp_path) as profile_dir:
+            created = _create_skill(
+                "market-quote-helper",
+                _rival_skill("market-quote-helper", "Format quote tables."),
+            )
+            assert created["success"] is True
+            result = _edit_skill(
+                "market-quote-helper",
+                _rival_skill(
+                    "market-quote-helper",
+                    "Build dashboards from external market data.",
+                ),
+            )
+        assert result["success"] is False
+        persisted = (profile_dir / "market-quote-helper" / "SKILL.md").read_text()
+        assert "Format quote tables" in persisted
+
+    def test_patch_cannot_turn_an_existing_skill_into_reserved_topic_rival(self, tmp_path):
+        with _platform_and_profile_dirs(tmp_path) as profile_dir:
+            created = _create_skill(
+                "market-quote-helper",
+                _rival_skill("market-quote-helper", "Format quote tables."),
+            )
+            assert created["success"] is True
+            result = _patch_skill(
+                "market-quote-helper",
+                "Format quote tables.",
+                "Build dashboards from external market data.",
+            )
+        assert result["success"] is False
+        persisted = (profile_dir / "market-quote-helper" / "SKILL.md").read_text()
+        assert "Format quote tables" in persisted
+
     def test_profile_authored_skill_cannot_reserve_a_topic(self, tmp_path):
         """Otherwise the agent could fence off ground from the platform."""
         with _platform_and_profile_dirs(tmp_path) as profile_dir:

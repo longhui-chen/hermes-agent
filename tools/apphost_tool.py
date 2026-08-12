@@ -77,7 +77,12 @@ _PUBLISH_MODES = ("install", "reload")
 # user asked to self-refresh that never got a maintainer is a fact someone can
 # query later instead of a promise that quietly evaporated.
 _DATA_REFRESH_CHOICES = ("static", "user_confirmed_auto", "user_declined")
-_CALL_HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+# The hidden maintainer gets one write capability, not the app's whole HTTP
+# surface. Generated apps expose POST /api/refresh as the user-confirmed data
+# maintenance verb; every other write path stays unavailable to model calls.
+# GET remains available for read-back verification.
+_CALL_HTTP_METHODS = ("GET", "POST")
+_CALL_WRITE_PATHS = frozenset({"/api/refresh"})
 # NOTE: no "recover" — the internal (agent) face deliberately does not expose
 # it (an action token authenticates one agent, not the device); recovery from
 # the recycle bin lives on the JWT member face, i.e. the client app's list.
@@ -115,9 +120,10 @@ APP_HOST_SCHEMA = {
         "delete (soft-delete into the "
         "recycle bin; recovery is done from the client app's list, there is "
         "no recover action here), lifecycle (start/stop/restart), logs "
-        "(recent log tail), call (invoke an HTTP endpoint of an app the "
-        "current agent owns — the way to write data into it: give the app's "
-        "slug plus its own API path such as /api/refresh, with http_method "
+        "(recent log tail), call (invoke a bounded HTTP capability of an app the "
+        "current agent owns — GET may read an app endpoint; the only exposed "
+        "write capability is POST /api/refresh from the user-confirmed "
+        "automatic-refresh flow. Give the app's slug and API path, with http_method "
         "and an optional JSON body; never a full URL, host or port — the "
         "host resolves the target from the slug, and only the owning agent "
         "can reach the app. The result's data.status / data.body are the "
@@ -156,7 +162,8 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Required for call: the app's own API path, starting "
-                    "with '/', e.g. \"/api/refresh\" (a query string is "
+                    "with '/'. Writes are limited to POST /api/refresh; GET "
+                    "may use another read path (a query string is "
                     "fine). Only the path within the app — never a full URL, "
                     "host or port; the host resolves the target from the "
                     "slug."
@@ -427,7 +434,7 @@ def _require_http_method(args):
     method = str(args.get("http_method", "") or "").strip().upper()
     if method not in _CALL_HTTP_METHODS:
         raise _BadRequest(
-            "call 需要 http_method 参数（GET/POST/PUT/PATCH/DELETE）"
+            "call 需要 http_method 参数（GET/POST）"
         )
     return method
 
@@ -496,6 +503,13 @@ def _build_request(action, args):
                 body["session_id"] = session_key
         return "POST", "/publish", body, _LONG_TIMEOUT
     if action == "install":
+        data_refresh = str(args.get("data_refresh", "") or "").strip()
+        if data_refresh not in _DATA_REFRESH_CHOICES:
+            raise _BadRequest(
+                "install 需要 data_refresh 参数（"
+                + "/".join(_DATA_REFRESH_CHOICES)
+                + "）：这个应用的数据要不要自己持续更新？照用户说过的话答"
+            )
         body = {
             "staging_dir": _require_staging_dir(args),
             "slug": _require_slug(args),
@@ -555,6 +569,11 @@ def _build_request(action, args):
         slug = _require_slug(args)
         path = _require_app_path(args)
         method = _require_http_method(args)
+        if method != "GET" and urlsplit(path).path not in _CALL_WRITE_PATHS:
+            raise _BadRequest(
+                "call 的写操作只允许用户已确认自动更新流程使用的 "
+                "POST /api/refresh；其他应用写端点不向 agent 开放"
+            )
         body = {"method": method, "path": path}
         if args.get("body") is not None:
             body["body"] = args["body"]

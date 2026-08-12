@@ -172,7 +172,8 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
      "POST", "/publish",
      {"mode": "reload", "source_subdir": "runs/run-2/app1",
       "note": "Footer 加了一个链接"}),
-    ("install", {"staging_dir": "/tmp/stage", "slug": "app1"}, "POST", "/install",
+    ("install", {"staging_dir": "/tmp/stage", "slug": "app1",
+                 "data_refresh": "static"}, "POST", "/install",
      {"staging_dir": "/tmp/stage", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/stage"}, "POST", "/app1/reload",
      {"staging_dir": "/tmp/stage"}),
@@ -242,7 +243,8 @@ _ALL_HTTP_ACTION_ARGS = [
     ("release_slot", {"slot_token": "s1"}),
     ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1",
                  "data_refresh": "static"}),
-    ("install", {"staging_dir": "/tmp/s", "slug": "app1"}),
+    ("install", {"staging_dir": "/tmp/s", "slug": "app1",
+                 "data_refresh": "static"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
     ("rollback", {"slug": "app1", "to_version": "v1"}),
     ("delete", {"slug": "app1"}),
@@ -370,7 +372,8 @@ def test_http_error_passes_upstream_error_body_verbatim(monkeypatch):
 
     with mux_profile_scope(monkeypatch, scope):
         with patch("tools.apphost_tool._urlopen", _boom):
-            out = app_host_tool({"action": "install", "slug": "a1", "staging_dir": "/tmp/s"})
+            out = app_host_tool({"action": "install", "slug": "a1",
+                                 "staging_dir": "/tmp/s", "data_refresh": "static"})
     parsed = json.loads(out)
     assert parsed["ok"] is False and parsed["status"] == 507
     assert parsed["error"] == upstream_body  # verbatim, key for key
@@ -629,7 +632,8 @@ def test_connection_error_does_not_leak_url_or_token(monkeypatch):
 
 
 @pytest.mark.parametrize("args", [
-    {"action": "install", "slug": "a1", "staging_dir": "/tmp/s"},
+    {"action": "install", "slug": "a1", "staging_dir": "/tmp/s",
+     "data_refresh": "static"},
     {"action": "publish", "mode": "reload", "source_subdir": "runs/run-2/a1"},
 ])
 def test_mutation_failure_is_never_auto_retried(monkeypatch, args):
@@ -733,7 +737,8 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     # selfCheck 5s); a client-side timeout cancels the request context and
     # triggers rollbackInstall on the server. acquire_slot pays the granted
     # slot's integrity walk before the response.
-    ("install", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
+    ("install", {"slug": "a1", "staging_dir": "/tmp/s",
+                 "data_refresh": "static"}, 120.0),
     ("reload", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
     ("publish", {"mode": "reload", "source_subdir": "runs/run-2/a1"}, 120.0),
     # No rebuild, but still stop + swap + health-check — long tier.
@@ -1014,7 +1019,8 @@ def test_malformed_staging_dir_rejected_without_http(monkeypatch, bad_staging):
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool(
-                {"action": "install", "slug": "app1", "staging_dir": bad_staging}
+                {"action": "install", "slug": "app1", "staging_dir": bad_staging,
+                 "data_refresh": "static"}
             ))
     assert out["ok"] is False and out["status"] == 0
     assert out["error"]["code"] == "invalid_request"
@@ -1079,6 +1085,33 @@ def test_call_http_method_is_case_normalized(monkeypatch):
             out = json.loads(app_host_tool({**_CALL_ARGS, "http_method": "post"}))
     assert out["ok"] is True
     assert json.loads(seen["req"].data.decode("utf-8"))["method"] == "POST"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/api/delete-account"),
+        ("POST", "/api/refresh-all"),
+        ("PUT", "/api/refresh"),
+        ("PATCH", "/api/config"),
+        ("DELETE", "/api/items/1"),
+    ],
+)
+def test_call_rejects_writes_outside_the_refresh_capability(
+    monkeypatch, method, path
+):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({
+                "action": "call",
+                "slug": "app1",
+                "path": path,
+                "http_method": method,
+            }))
+    assert out["ok"] is False
+    assert out["status"] == 0
+    assert "req" not in seen
 
 
 # --- response-size caps ------------------------------------------------------
@@ -1283,8 +1316,10 @@ def test_legacy_install_carries_stable_session_key(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
     body = _routed_body(monkeypatch, {
         "action": "install", "staging_dir": "/tmp/stage", "slug": "app1",
+        "data_refresh": "static",
     })
     assert body["session_id"] == _SESSION_KEY
+    assert "data_refresh" not in body
 
 
 def test_rotating_session_id_is_not_provenance(monkeypatch):
@@ -1317,6 +1352,18 @@ def test_install_without_data_refresh_never_reaches_the_network(monkeypatch):
                 "action": "publish",
                 "mode": "install",
                 "source_subdir": "runs/run-1/app1",
+            }))
+    assert out["ok"] is False
+    assert "data_refresh" in out["error"]["message"]
+
+
+def test_legacy_install_without_data_refresh_never_reaches_the_network(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _never_called):
+            out = json.loads(app_host_tool({
+                "action": "install",
+                "staging_dir": "/tmp/stage",
+                "slug": "app1",
             }))
     assert out["ok"] is False
     assert "data_refresh" in out["error"]["message"]
