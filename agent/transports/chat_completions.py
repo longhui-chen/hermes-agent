@@ -100,27 +100,36 @@ def _is_gemini_transport_without_response_format(provider_name: str, base_url: A
 def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str, Any]) -> None:
     """Forward the conversation/cron session as stable Zettlab headers.
 
-    X-Task-Id drives credit-ledger task grouping (mini-api 08-ai.md -> ai-api
-    scene_params -> ai-cloud ledger.task_id), so a multi-step task's per-turn
-    consumption aggregates into one task card. X-Zettlab-Conversation-ID gives
-    ai-gateway an explicit sticky/canary routing key using the same stable
-    session-derived value. The local-server ai-proxy relays these headers to the
-    IAM gateway.
+    X-Task-Id drives credit-ledger grouping (mini-api 08-ai.md -> ai-api
+    scene_params -> ai-cloud ledger.task_id), at the granularity of one unit of
+    usage: a chat turn, or a single cron run (see billing_usage_id_for).
 
-    The session -> task_id mapping (interactive vs cron, see billing_task_id_for)
-    also gates non-NAS sessions to '' so the billing headers never leak to a
-    third-party provider. Applied to BOTH the legacy and profile build paths —
-    the NAS ai-proxy agent runs with provider=custom, which takes the legacy path.
+    🔴 X-Zettlab-Conversation-ID is NOT the same value: it is ai-gateway's
+    sticky/canary routing key and prompt-cache affinity hash, so it stays at
+    conversation granularity (billing_conversation_id_for). Collapsing the two
+    back together would give every turn a fresh cache bucket.
+
+    The local-server ai-proxy relays these headers to the IAM gateway. The
+    session mapping also gates non-NAS sessions to '' so the billing headers
+    never leak to a third-party provider. Applied to BOTH the legacy and profile
+    build paths — the NAS ai-proxy agent runs with provider=custom, which takes
+    the legacy path.
     """
     # Best-effort: credit attribution must never break the main request path.
     # Wrapped in try/except like auxiliary_client._apply_user_default_headers so a
     # billing import/lookup error can't bubble up and abort build_kwargs.
     try:
-        from gateway.session_context import billing_task_id_for, billing_task_title_encoded
+        from gateway.session_context import (
+            billing_conversation_id_for,
+            billing_task_title_encoded,
+            billing_usage_id_for,
+        )
 
-        task_id = billing_task_id_for(params.get("session_id"))
+        session_id = params.get("session_id")
+        task_id = billing_usage_id_for(session_id)
         if not task_id:
             return
+        conversation_id = billing_conversation_id_for(session_id)
         existing = api_kwargs.get("extra_headers")
         headers: Dict[str, str] = {}
         if isinstance(existing, dict):
@@ -128,11 +137,12 @@ def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str,
                 str(k): str(v) for k, v in existing.items() if k and v is not None
             })
         headers.setdefault("X-Task-Id", task_id)
-        headers.setdefault("X-Zettlab-Conversation-ID", task_id)
+        if conversation_id:
+            headers.setdefault("X-Zettlab-Conversation-ID", conversation_id)
         headers.setdefault("X-Scene-Type", "agent")
-        # Cron runs also stamp the job name as X-Task-Title so the ledger's cron
-        # task card shows the real name (and survives the job being deleted).
-        # Empty for interactive sessions, which carry no title here.
+        # Cron runs stamp the job name as X-Task-Title so the ledger's cron card
+        # shows the real name (and survives the job being deleted); interactive
+        # turns stamp this turn's user-message summary.
         task_title = billing_task_title_encoded()
         if task_title:
             headers.setdefault("X-Task-Title", task_title)

@@ -1877,6 +1877,9 @@ def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dic
     agent_ids = _cron_agent_ids(job)
     path_hints = _cron_path_hints(messages)
     output_roots = _cron_output_bucket_roots(path_hints, agent_ids)
+    anchored = _anchored_session_root(job)
+    if anchored is not None and all(anchored != r for r in output_roots):
+        output_roots.append(anchored)
 
     seen: set[str] = set()
     produced: List[Dict[str, Any]] = []
@@ -2002,6 +2005,33 @@ def _clean_cron_path_hint(raw: str) -> str:
     if value.startswith("///"):
         value = "/" + value.lstrip("/")
     return value
+
+
+def _anchored_session_root(job: Optional[dict]) -> Optional[Path]:
+    """run_job 锚定的 session 桶（与其同一纯函数重建），无 hint 也能扫到。
+
+    纯相对路径写入不会在消息里留下绝对路径 hint，桶扫描就不会启动；这里用
+    origin.chat_id + 平台目录确定性重建同一个桶。只收 session 桶，agent 根
+    （suffix 不可推导时的回落值）不做扫描根。multiplex 下 delivery 阶段无
+    secret scope 时平台目录不可得，静默退回 hint 行为。
+    """
+    try:
+        from tools.runtime_workdir import (
+            agent_output_dir,
+            prepare_cron_session_output_dir,
+        )
+
+        base = agent_output_dir()
+        if not base:
+            return None
+        anchor = prepare_cron_session_output_dir(
+            ((job or {}).get("origin") or {}).get("chat_id")
+        )
+        if not anchor or anchor == base:
+            return None
+        return Path(anchor).resolve()
+    except Exception:
+        return None
 
 
 def _cron_output_bucket_roots(path_hints: Iterable[str], agent_ids: set[str]) -> List[Path]:

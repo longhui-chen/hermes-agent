@@ -80,6 +80,10 @@ _HERMES_CORE_TOOLS = [
     # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
     "list_my_channels",
     "send_channel_message",
+    # List the user's authorized business-data connectors (gated on zet_agent
+    # env via check_fn). Has a zettlab_connectors catalog entry so the
+    # non-configurable recovery walk keeps it reachable on the real path.
+    "list_my_connectors",
     # Main-only, session-bound read-only unified calendar.
     "get_personal_calendar",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -301,8 +305,24 @@ TOOLSETS = {
     # reverse-mapping silently drops — registered, gate open, yet absent from
     # the model's schema (found on a real device).
     "zettlab_apphost": {
-        "description": "Manage device-hosted generated applications via the local App Host (zettlab)",
-        "tools": ["app_host"],
+        "description": "Manage device-hosted generated applications and their owner-scoped data (zettlab)",
+        "tools": ["app_host", "app_data"],
+        "includes": []
+    },
+
+    "zettlab_skill_runtime": {
+        "description": "Run fixed App operations declared by the current Cron job's profile-local Skill",
+        "tools": ["skill_operation"],
+        "includes": []
+    },
+
+    # Same load-bearing pattern as zettlab_apphost above: without this catalog
+    # entry the reverse-mapping in _get_platform_tools would silently drop the
+    # tool from the zet_agent real path (see the zettlab_channels /
+    # personal_calendar known gaps in tests/test_toolsets.py).
+    "zettlab_connectors": {
+        "description": "List the user's authorized business-data connectors via local-server (zettlab)",
+        "tools": ["list_my_connectors"],
         "includes": []
     },
 
@@ -516,13 +536,12 @@ TOOLSETS = {
         # session (_own_session_id), so only THIS platform can use it — other
         # platforms would show the model a tool local-server always rejects.
         # Still schema-gated by ZET_AGENT_CALL_URL via check_fn.
-        # app_host likewise: local-server's App Host internal face (base URL +
-        # action token) only exists in a zet_agent profile, and installing
-        # generated applications on the device is a device-agent capability —
-        # not something telegram/slack/cron schemas should ever advertise.
-        # Still gated by ZET_APPHOST_BASE_URL + the action token via check_fn.
+        # app_host/app_data likewise: local-server's App Host internal face
+        # (base URL + action token) only exists in a zet_agent profile. Both
+        # tools are scoped to the active generated-app profile and must not be
+        # advertised by messaging or Cron platforms.
         "tools": _HERMES_CORE_TOOLS + [
-            "call_agent", "app_host", "desktop_pet_creator"
+            "call_agent", "app_host", "app_data", "desktop_pet_creator"
         ],
         "includes": []
     },
@@ -534,7 +553,7 @@ TOOLSETS = {
         # homeassistant) are excluded by _get_platform_tools() unless
         # the user explicitly enables them.
         "description": "Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["skill_operation"],
         "includes": []
     },
 

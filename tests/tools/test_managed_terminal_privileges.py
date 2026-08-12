@@ -726,8 +726,16 @@ def test_managed_service_keeps_filesystem_open_for_root_commands():
     assert "RuntimeDirectory=zettlab-claw" in service
     assert "RuntimeDirectoryMode=0755" in service
     assert (
+        "EnvironmentFile=-/volume1/system/zettos-main-data/"
+        "com.zettlab.claw/secrets/zettlab-claw.env"
+    ) in service
+    assert (
+        "Environment=HERMES_HOME=/volume1/system/zettos-main-data/"
+        "com.zettlab.claw/hermes_home"
+    ) in service
+    assert (
         "Environment=HERMES_LAZY_INSTALL_TARGET="
-        "__APP_BASE__/data/lazy-packages"
+        "/volume1/system/zettos-main-data/com.zettlab.claw/lazy-packages"
     ) in service
     assert "Environment=HERMES_DISABLE_LAZY_INSTALLS=1" in service
     assert "MemoryHigh=768M" in service

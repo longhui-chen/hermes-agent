@@ -153,6 +153,31 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert "repeated_exact_failure_warning" in messages[0]["content"]
 
 
+def test_guardrail_guidance_does_not_corrupt_browser_snapshot_completion_callbacks():
+    raw_result = json.dumps({
+        "success": True,
+        "url": "https://example.com/account",
+        "snapshot": '- heading "Account" [e1]',
+    })
+
+    for executor_name in ("_execute_tool_calls_sequential", "_execute_tool_calls_concurrent"):
+        agent = _make_agent("browser_snapshot")
+        completed = []
+        agent.tool_complete_callback = lambda *args: completed.append(args)
+        messages = []
+
+        with patch("run_agent.handle_function_call", return_value=raw_result):
+            for index in range(2):
+                call = _mock_tool_call("browser_snapshot", "{}", f"c-{index}")
+                message = SimpleNamespace(content="", tool_calls=[call])
+                getattr(agent, executor_name)(message, messages, "task-1")
+
+        assert [entry[3] for entry in completed] == [raw_result, raw_result]
+        assert json.loads(completed[-1][3])["success"] is True
+        assert "Tool loop warning" in messages[-1]["content"]
+        assert "idempotent_no_progress_warning" in messages[-1]["content"]
+
+
 def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     agent = _make_agent("terminal")
     guardrails = getattr(agent, "_tool_guardrails")

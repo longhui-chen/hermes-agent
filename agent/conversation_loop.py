@@ -1818,6 +1818,41 @@ def _purge_refused_rows_from_session_db(agent, messages: List[Dict], kept: int) 
             )
 
 
+def _turn_has_tool_moderation_block(messages: List[Dict], start_idx: int) -> bool:
+    """Whether a tool result appended this iteration signals an image
+    moderation refusal.
+
+    A text-only main model cannot see images, so a refused image is described
+    by the ``vision_analyze`` auxiliary tool. When the moderation gateway
+    blocks that image the tool returns ``{"moderation_blocked": true}`` instead
+    of a description. That result must TERMINATE the turn — never be fed back
+    to the main model, which would otherwise answer around the "内容不合规"
+    tool output and leak a reply for a refused image. (Native-vision models
+    already terminate: the re-embedded inline image is blocked on the next main
+    call. This closes the same hole for the text-only/legacy path.)
+    """
+    for msg in messages[start_idx:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or "moderation_blocked" not in content:
+            continue
+        try:
+            payload = json.loads(content)
+        except (ValueError, TypeError):
+            # A guardrail observation may have been appended, so the content no
+            # longer parses as bare JSON — fall back to a substring match.
+            if (
+                '"moderation_blocked": true' in content
+                or '"moderation_blocked":true' in content
+            ):
+                return True
+            continue
+        if isinstance(payload, dict) and payload.get("moderation_blocked") is True:
+            return True
+    return False
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
@@ -5007,6 +5042,11 @@ def run_conversation(
                     approx_tokens=approx_tokens,
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
+                    # Verifiable gateway origin: a content-policy block on the
+                    # ai-proxy route is the Zettlab moderation gateway's verdict
+                    # (compliance, no failover) even on its generic code="400"
+                    # shape — a custom endpoint is on a different base_url.
+                    via_moderation_gateway=_is_zettlab_ai_proxy_route(agent),
                 )
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
@@ -7589,7 +7629,49 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _pre_tool_msg_count = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # An image-moderation refusal surfaced by a tool result must END
+                # the turn as a content-policy block — never be fed back to the
+                # model. vision_analyze (the text-only-model image path) returns
+                # {"moderation_blocked": true} when the gateway refuses an image;
+                # feeding that to the main model lets it answer around the
+                # "内容不合规" tool output and leak a reply for a refused image.
+                # Terminate with the same result shape as the native-vision path
+                # so the App hides the image and renders the compliance notice.
+                if _turn_has_tool_moderation_block(messages, _pre_tool_msg_count):
+                    _kept_messages = _transcript_without_refused_turn(
+                        messages, user_message, current_turn_user_idx
+                    )
+                    _purge_refused_rows_from_session_db(
+                        agent, messages, len(_kept_messages)
+                    )
+                    agent._persist_session(_kept_messages, conversation_history)
+                    logger.warning(
+                        "%svision_analyze moderation block → terminating turn as "
+                        "content_policy_blocked (refused image not fed to model)",
+                        agent.log_prefix,
+                    )
+                    _policy_response = (
+                        "⚠️  The model provider's safety filter blocked this request "
+                        "(not a Hermes/gateway failure).\n\n"
+                        "Provider message: 内容不合规\n\n"
+                        f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                    )
+                    return _content_policy_blocked_result(
+                        _kept_messages,
+                        api_call_count,
+                        final_response=_policy_response,
+                        error_detail="image content refused by moderation gateway",
+                        provider_error={
+                            "code": "content_blocked",
+                            "reason": FailoverReason.content_policy_blocked.value,
+                            "retryable": False,
+                            "recoverable": False,
+                            "provider_message": "内容不合规",
+                        },
+                    )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

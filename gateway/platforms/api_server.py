@@ -90,6 +90,9 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from agent.browser_state_preview import project_browser_state_preview
+from agent.interrupt_compat import request_hard_interrupt
+from agent.redact import redact_sensitive_text
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -97,8 +100,6 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
-from agent.redact import redact_sensitive_text
-from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -1001,6 +1002,27 @@ def _tool_completion_payload(
         return payload
     decoded = _promote_connector_error_from_tool_output(decoded)
 
+    ui_hint = _takeover_ui_hint(decoded, function_name)
+    try:
+        browser_state = project_browser_state_preview(
+            function_name,
+            decoded,
+            browser_session_id=(
+                ui_hint.get("browser_session_id") if ui_hint is not None else None
+            ),
+        )
+    except Exception:
+        # Preview is an optional presentation projection.  A malformed browser
+        # result or projector defect must never suppress the real completion.
+        logger.warning(
+            "[api_server] browser state preview projection failed for tool=%s",
+            function_name,
+            exc_info=True,
+        )
+        browser_state = None
+    if browser_state is not None:
+        payload["browserState"] = browser_state
+
     if function_name in {"image_generate", "video_generate"}:
         artifact_output: Dict[str, Any] = {}
         if isinstance(decoded.get("success"), bool):
@@ -1023,7 +1045,6 @@ def _tool_completion_payload(
     has_error_code = _has_tool_error_value(decoded.get("errorCode"))
     connector_error = decoded.get("connector_error")
     has_connector_error = _has_tool_error_value(connector_error)
-    ui_hint = _takeover_ui_hint(decoded, function_name)
     if ui_hint is not None:
         payload["ui_hint"] = ui_hint
     if not (has_error or has_error_code or has_connector_error):
@@ -5847,9 +5868,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    event_data = json.dumps(item[1])
+                    # Keep browserState's wire representation identical to its
+                    # UTF-8 byte-budget calculation.  ASCII escaping can triple
+                    # CJK text and turn a bounded preview into an oversized SSE.
+                    event_data = json.dumps(
+                        item[1], ensure_ascii=False, separators=(",", ":")
+                    )
+                    # Other progress fields are not projected/sanitized.  Keep
+                    # malformed lone surrogates as valid JSON escapes instead
+                    # of allowing one label to terminate the whole SSE stream.
                     await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode(
+                            "utf-8", errors="backslashreplace"
+                        )
                     )
                 elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
                     event_data = json.dumps(item[1])

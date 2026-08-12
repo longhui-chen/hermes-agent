@@ -583,10 +583,12 @@ def make_tool_result_message(
 _UNTRUSTED_TOOL_NAMES = frozenset({
     "web_extract",
     "web_search",
-    # Device-hosted generated applications write their own logs (and shape
-    # their own error messages): anything a third party can feed the app can
-    # surface verbatim in app_host results, so treat them as data.
+    # Device-hosted generated applications write their own logs, data, and
+    # error messages: anything a third party can feed the app can surface
+    # verbatim in App operation results, so treat every bridge as data.
     "app_host",
+    "app_data",
+    "skill_operation",
 })
 
 _UNTRUSTED_TOOL_PREFIXES = (

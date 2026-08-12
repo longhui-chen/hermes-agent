@@ -794,6 +794,34 @@ class TestSensitivePathCheck:
         assert "managed sibling profile path" in result["error"]
         assert target.read_text(encoding="utf-8") == "private\n"
 
+    def test_r2_managed_roots_are_registered_and_isolate_profiles(
+        self, monkeypatch
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools import file_tools
+
+        data_root = "/volume1/system/zettos-main-data/com.zettlab.claw"
+        assert f"{data_root}/secrets" in file_tools._MANAGED_CLAW_SECRET_ROOTS
+        assert f"{data_root}/hermes_home" in file_tools._MANAGED_CLAW_HERMES_ROOTS
+
+        active = Path(f"{data_root}/hermes_home/profiles/agent-a")
+        sibling = Path(f"{data_root}/hermes_home/profiles/agent-b/private.txt")
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        token = set_hermes_home_override(active)
+        try:
+            sibling_error = file_tools._managed_sibling_profile_error(str(sibling))
+            own_error = file_tools._managed_sibling_profile_error(
+                str(active / "private.txt")
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "managed sibling profile path" in sibling_error
+        assert own_error is None
+
     def test_managed_profiles_each_block_their_own_config_write(
         self, tmp_path, monkeypatch
     ):
@@ -838,6 +866,14 @@ class TestSensitivePathCheck:
     @pytest.mark.parametrize(
         "target",
         [
+            (
+                "/volume1/system/zettos-main-data/com.zettlab.claw/"
+                "secrets/zettlab-claw.env"
+            ),
+            (
+                "/volume1/system/zettos-main-data/com.zettlab.claw/"
+                "secrets/zet_agent.key"
+            ),
             "/zettos/main/data/com.zettlab.claw/secrets/zettlab-claw.env",
             "/volume1/subvol/apps/com.zettlab.claw/data/secrets/zet_agent.key",
             (

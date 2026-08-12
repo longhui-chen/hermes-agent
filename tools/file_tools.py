@@ -663,14 +663,17 @@ _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 # Managed Claw secrets are consumed by a privileged, long-running gateway.
 # File tools run in-process and therefore must never be able to rewrite the
 # service EnvironmentFile/key or a multiplex profile's credential file.  Keep
-# both lexical device layouts and their durable resolved targets here because
-# deployments may expose app data through either symlink chain.
+# the canonical R2 state root together with historical roots as
+# defense-in-depth. Historical entries remain denied paths, not supported
+# storage layouts.
 _MANAGED_CLAW_SECRET_ROOTS = (
+    "/volume1/system/zettos-main-data/com.zettlab.claw/secrets",
     "/zettos/main/apps/com.zettlab.claw/data/secrets",
     "/zettos/main/data/com.zettlab.claw/secrets",
     "/volume1/subvol/apps/com.zettlab.claw/data/secrets",
 )
 _MANAGED_CLAW_HERMES_ROOTS = (
+    "/volume1/system/zettos-main-data/com.zettlab.claw/hermes_home",
     "/zettos/main/apps/com.zettlab.claw/data/hermes_home",
     "/zettos/main/data/com.zettlab.claw/hermes_home",
     "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",

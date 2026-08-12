@@ -29,7 +29,9 @@ def _load_plugin():
 
 def _candidate(
     *,
-    decision="agent",
+    # agent 品类在本部署禁用（AGENT_RECOMMENDATION_ENABLED=False，落地工具缺失），
+    # 通用用例改用 skill 承载"任一创建品类"的语义，不影响被测行为。
+    decision="skill",
     suggested_name="Google Ads Analyst",
     reason="Retained account context and judgment will improve future analysis.",
     confidence=0.82,
@@ -55,9 +57,9 @@ def _recommendation_response(
         "type": "creation_recommendation_response",
         "action": action,
         "proposal_id": proposal_id,
-        "creation_type": "agent",
+        "creation_type": "skill",
         "title": title,
-        "dedup_key": "agent:google-ads-analyst",
+        "dedup_key": "skill:google-ads-analyst",
         "evidence_turn_ids": ["evidence-1"],
     }
     return (
@@ -300,29 +302,32 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
     )
     assert transformed.startswith("Campaign A had the strongest ROAS.")
     assert "<!--creation-recommendation:start " in transformed
-    assert "This could become a reusable Agent" in transformed
+    assert "This could become a reusable Skill" in transformed
     payload = _decode_envelope(transformed)
     assert payload == {
         "version": 1,
         "type": "creation_recommendation",
         "proposal_id": payload["proposal_id"],
         "expires_at": payload["expires_at"],
-        "creation_type": "agent",
+        "creation_type": "skill",
         "title": "Google Ads Analyst",
+        # 保留 main 新增的 proposal_text / action_label / action_consequence 三个
+        # 字段，但措辞取 skill：agent 品类在本部署禁用（见 _candidate 注释），
+        # 这条链路实际产出的是 Skill 文案。
         "reason": (
             "Retained account context and judgment will improve future analysis. "
-            "Accepting opens the native assistant creation flow and asks you to "
+            "Accepting opens the native Skill creation flow and asks you to "
             "confirm the configuration before creation."
         ),
         "proposal_text": (
             "Would you like me to create this Google Ads Analyst Agent?"
         ),
-        "action_label": "Create assistant",
+        "action_label": "Create Skill",
         "action_consequence": (
-            "Accepting opens the native assistant creation flow and asks you to "
+            "Accepting opens the native Skill creation flow and asks you to "
             "confirm the configuration before creation."
         ),
-        "dedup_key": "agent:google-ads-analyst",
+        "dedup_key": "skill:google-ads-analyst",
         "confidence": 0.82,
         "evidence_turn_ids": ["evidence-1"],
         "source_turn_id": "turn-1",
@@ -532,7 +537,7 @@ def test_dismissal_latches_the_same_semantic_candidate():
         session_id="dismiss-session",
         response_text="分析完成。",
     )
-    assert "可以沉淀为一个 Agent" in shown
+    assert "可以沉淀为一个 Skill" in shown
 
     action = plugin._on_pre_llm_call(
         session_id="dismiss-session",
@@ -717,7 +722,7 @@ def test_optional_tool_accepts_none_and_rejects_invalid_or_low_confidence():
     ) == {"status": "no_candidate", "reason": "none"}
     assert json.loads(
         plugin._detect_creation_opportunity(
-            _candidate(decision="artifact"), session_id="invalid"
+            _candidate(decision="workflow"), session_id="invalid"
         )
     ) == {"status": "not_proposed", "reason": "unsupported_creation_type"}
     assert json.loads(
@@ -764,12 +769,17 @@ def test_tool_schema_is_zero_shot_and_supports_all_outcomes():
     assert "Missing connectors" in description
     assert "Meta" not in description
     assert "AI news" not in description
-    assert schema["parameters"]["properties"]["decision"]["enum"] == [
-        "agent",
+    # agent 品类由 AGENT_RECOMMENDATION_ENABLED 开关控制：关闭时不出现在 enum 里，
+    # 模型看不到这个选项（事后硬闸另有一道）。
+    assert schema["parameters"]["properties"]["decision"]["enum"] == (
+        (["agent"] if plugin.AGENT_RECOMMENDATION_ENABLED else []) + [
         "skill",
         "task",
+        "channel",
+        "connector",
+        "artifact",
         "none",
-    ]
+    ])
 
 
 def test_registers_region_safe_fast_auxiliary_model_alias():
@@ -790,7 +800,7 @@ def test_registers_region_safe_fast_auxiliary_model_alias():
     ]
 
 
-@pytest.mark.parametrize("decision", ["agent", "skill", "task"])
+@pytest.mark.parametrize("decision", ["skill", "task"])
 def test_all_creation_types_share_the_same_envelope(decision):
     plugin = _load_plugin()
     candidate = _candidate(decision=decision, dedup_key=f"{decision}-example")
