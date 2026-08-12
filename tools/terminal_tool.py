@@ -4615,10 +4615,18 @@ def _run_connector_runtime_command_if_allowed(
         from tools.environments.local import build_connector_runtime_env
 
         connector_env = build_connector_runtime_env()
-        from tools.environments.local import _sanitize_subprocess_env
 
-        run_env = _sanitize_subprocess_env(os.environ)
-        run_env.pop("PYTHONPATH", None)
+        # ⭐ 受信 runner **不继承进程环境**,照抄同文件 _run_camera_runtime_command_if_allowed
+        # 的做法(base_env={})。⛔ 别改回 _sanitize_subprocess_env(os.environ):那是**黑名单**
+        # ——只剥 Hermes 自己的密钥,其余一律放行,于是:
+        #   ① HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 会跟着进去。脚本随后拿 action token 和
+        #      ZETTLAB_LOCAL_SERVER_URL 访问 loopback,而 Python 的 requests/urllib **不会**
+        #      自动豁免 loopback —— 没配 NO_PROXY 时,带 X-Zettlab-Agent-Action-Token 的请求
+        #      会被发到外部代理。这不是假想:本线的设备上就跑着 mihomo,代理变量确实配着。
+        #   ② ZET_CHAT_APPEND_URL 这类**跨 profile 的陈旧回调地址**也会跟着进去,卡片/状态
+        #      可能回写到错误的会话或 profile。
+        # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
+        # 显式给,⛔ 不从进程环境里捡。
         secret_values = [
             connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
@@ -4630,7 +4638,7 @@ def _run_connector_runtime_command_if_allowed(
             script=script,
             argv=argv[1:],
             cwd=Path(run_cwd),
-            base_env=run_env,
+            base_env={},
             injected_env=connector_env,
             timeout=timeout,
             secret_values=secret_values,
@@ -4662,6 +4670,47 @@ _AGENT_CREATOR_MANIFEST_RELATIVE_PATH = Path(
 _AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY = (
     "zettlab.agent_action_token_fd.v1"
 )
+_OVERSEAS_CONNECT_SCRIPT = "connect.py"
+_OVERSEAS_CONNECT_RELATIVE_PATH = Path(
+    "skills/overseas-connect/scripts/connect.py"
+)
+_OVERSEAS_CONNECT_MANIFEST_RELATIVE_PATH = Path(
+    "skills/overseas-connect/manifest.yaml"
+)
+_OVERSEAS_CONNECT_ACTION_TOKEN_FD_CAPABILITY = (
+    "zettlab.agent_action_token_fd.v1"
+)
+# 带 --platform 的 5-token 子命令(capability / connect-card / disconnect)曾经在这里,
+# 受信通道一直放行它们 —— ⛔ 已于本次整组摘除,判据是**模型能不能到达**。
+#
+# 🔴 为什么必须摘:2026-08-07 拍板的设计是「不再弹单平台卡 → 弹一张海外渠道列表卡 →
+# 用户在卡内自己选平台」,即**AI 只剩弹卡**。改版当时加了 status-card 与 SKILL.md 的
+# 文字契约,却**没拆掉旧入口**;而模型不受自然语言契约约束,直接发 terminal 命令就能调:
+#   - `capability --platform X` 把「是否已配置 / 状态 / 是否已配对 / 是否 chat-created」
+#     写进 terminal 输出 ⇒ **绑定状态进了聊天记录**,这是产品明令禁止的;
+#   - `connect-card` / `disconnect` 让模型**替用户选定平台**,绕开总列表卡。
+# 影响面是全设备所有带 terminal 的 Agent,不限 Memo。
+#
+# ⛔ 别因为「SKILL.md 里已经写了不要用」就以为够了 —— 那是文档,不是闸门。这里才是。
+_OVERSEAS_CONNECT_PLATFORM_COMMANDS: frozenset[str] = frozenset()
+# 无参子命令(3 token)。改版后 AI 面前只剩这一条:它弹出海外渠道列表卡,平台由
+# 用户在卡里自己点,模型不再需要认平台。
+_OVERSEAS_CONNECT_CARD_ONLY_COMMANDS = frozenset({
+    "status-card",
+})
+# 三方镜像的一环:这份集合必须与 presets 的 connect.py SUPPORTED_PLATFORMS、板端
+# via_skill_channels.go 的 imConnectPlatforms 同集。三处跨三个仓、互相 import 不到,
+# 只能各自钉住自己那份字面量(见 test_overseas_connect_platform_allowlist_is_the_
+# agreed_set)。
+#
+# whatsapp 2026-08-07 从三处一起摘掉:产品线已彻底停掉(Meta 全球禁第三方 AI 助手
+# 接入),driver 不会再有。⛔ 别单独加回来 —— 受信通道是最外层的门,它松着就意味着
+# 放行一个内层三方都不支持的形态。
+_OVERSEAS_CONNECT_PLATFORMS = frozenset({
+    "telegram",
+    "slack",
+    "discord",
+})
 _AGENT_CREATOR_MAX_PAYLOAD_BYTES = 1024 * 1024
 _AGENTCOMPUTER_MAX_STDIN_BYTES = 4 * 1024 * 1024
 _AGENT_CREATOR_MAX_SCRIPT_BYTES = 1024 * 1024
@@ -4739,6 +4788,13 @@ class _AgentCreatorCommand:
     approval_operation: Optional[str]
 
 
+@dataclass(frozen=True)
+class _OverseasConnectCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+
+
 def _agent_creator_blocked_result(
     code: str,
     message: str,
@@ -4753,6 +4809,18 @@ def _agent_creator_blocked_result(
         "status": "error",
         "agent_creator_direct": direct,
         "agent_creator_blocked": True,
+    }, ensure_ascii=False)
+
+
+def _overseas_connect_blocked_result(code: str, message: str) -> str:
+    return json.dumps({
+        "output": "",
+        "exit_code": 2,
+        "error": message,
+        "errorCode": code,
+        "status": "error",
+        "overseas_connect_direct": True,
+        "overseas_connect_blocked": True,
     }, ensure_ascii=False)
 
 
@@ -5214,14 +5282,18 @@ def _log_agent_creator_rejection(reason: str) -> None:
     )
 
 
-def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
-    """Resolve only the fixed creator script below the pinned presets root."""
+def _resolve_fixed_preset_script(
+    raw_path: str,
+    expected: Path,
+    *,
+    log_agent_creator_trust_rejection: bool = False,
+) -> Optional[Path]:
+    """Resolve one fixed script below the pinned presets root."""
 
     anchor = _capture_connector_runtime_root()
     if anchor is None:
         return None
 
-    expected = _AGENT_CREATOR_RELATIVE_PATH
     relative: Optional[Path] = None
     for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
         if raw_path.startswith(prefix):
@@ -5261,14 +5333,27 @@ def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
         anchor.resolved_root,
         expected_root_identity=anchor.identity,
     ):
-        reason = _connector_runtime_trust_rejection_reason(
-            candidate,
-            anchor.resolved_root,
-            expected_root_identity=anchor.identity,
-        )
-        _log_agent_creator_rejection(reason or "trust_check_failed")
+        if log_agent_creator_trust_rejection:
+            reason = _connector_runtime_trust_rejection_reason(
+                candidate,
+                anchor.resolved_root,
+                expected_root_identity=anchor.identity,
+            )
+            _log_agent_creator_rejection(reason or "trust_check_failed")
         return None
     return resolved
+
+
+def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
+    return _resolve_fixed_preset_script(
+        raw_path,
+        _AGENT_CREATOR_RELATIVE_PATH,
+        log_agent_creator_trust_rejection=True,
+    )
+
+
+def _resolve_overseas_connect_script(raw_path: str) -> Optional[Path]:
+    return _resolve_fixed_preset_script(raw_path, _OVERSEAS_CONNECT_RELATIVE_PATH)
 
 
 def _split_agent_creator_heredoc(
@@ -5466,6 +5551,81 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
         script_identity=script_identity,
         stdin_text=stdin_text,
         approval_operation=approval_operation,
+    )
+
+
+def _parse_overseas_connect_command(
+    command: str,
+) -> Optional[_OverseasConnectCommand]:
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if (
+        len(tokens) < 3
+        or not _is_python_executable_token(tokens[0])
+        or Path(tokens[1]).name != _OVERSEAS_CONNECT_SCRIPT
+        or any(
+            token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+            for token in tokens
+        )
+    ):
+        return None
+
+    # 现在**只有一种**合法形态,token 数精确 —— 多一个参数就拒,不做前缀匹配:
+    #   status-card   → 3 token,⛔ 不接受 --platform
+    # 无参形态不能接受 --platform:脚本那边 status-card 根本不读它,静默放行会让
+    # 「我指定了平台」变成一个不报错的错觉。
+    # ⚠️ 5-token 的 `<子命令> --platform <平台>` 形态曾经也合法,已整组摘除
+    # (见 _OVERSEAS_CONNECT_PLATFORM_COMMANDS 现为空集及其说明)。下面那条 elif 分支
+    # 留着只是为了「有人往集合里加东西时形状校验仍然成立」,⛔ 别把它读成「还有 5-token
+    # 命令可用」。
+    subcommand = tokens[2]
+    if subcommand in _OVERSEAS_CONNECT_CARD_ONLY_COMMANDS:
+        if len(tokens) != 3:
+            return None
+    elif subcommand in _OVERSEAS_CONNECT_PLATFORM_COMMANDS:
+        # ⚠️ 该集合现在是**空的**(见其定义处的说明):带 --platform 的子命令整组不再被
+        # 受信通道接管。这条分支留着是为了在有人重新往集合里加东西时,校验形状仍然成立;
+        # ⛔ 别把它当成「还有 5-token 命令可用」的证据。
+        if (
+            len(tokens) != 5
+            or tokens[3] != "--platform"
+            or tokens[4] not in _OVERSEAS_CONNECT_PLATFORMS
+        ):
+            return None
+    else:
+        return None
+
+    script = _resolve_overseas_connect_script(tokens[1])
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if script is None or anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _OverseasConnectCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _overseas_connect_shell_guard_result(command: str) -> Optional[str]:
+    if "overseas-connect" not in command or _OVERSEAS_CONNECT_SCRIPT not in command:
+        return None
+    return _overseas_connect_blocked_result(
+        "overseas_connect_command_blocked",
+        "Overseas Connect must run as one direct canonical Python command.",
     )
 
 
@@ -5696,6 +5856,57 @@ def _agent_creator_manifest_supports_action_token_fd(
     return True
 
 
+def _overseas_connect_manifest_supports_action_token_fd(
+    anchor: _ConnectorRuntimeRootAnchor,
+) -> bool:
+    manifest = anchor.resolved_root / _OVERSEAS_CONNECT_MANIFEST_RELATIVE_PATH
+    if not _connector_runtime_path_is_trusted(
+        manifest,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        return False
+    try:
+        manifest_identity = _path_identity(manifest)
+        manifest_digest = anchor.file_digests.get(
+            manifest.relative_to(anchor.resolved_root).as_posix()
+        )
+        if manifest_digest is None:
+            raise OSError("manifest absent from startup trust snapshot")
+        raw = _read_verified_agent_creator_file(
+            manifest,
+            expected_identity=manifest_identity,
+            max_bytes=_AGENT_CREATOR_MAX_MANIFEST_BYTES,
+            expected_digest=manifest_digest,
+        )
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        capabilities = loaded.get("runtime_capabilities") if isinstance(loaded, dict) else None
+        if (
+            not isinstance(capabilities, list)
+            or len(capabilities) > _AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES
+            or not all(
+                isinstance(capability, str) and 0 < len(capability) <= 128
+                for capability in capabilities
+            )
+            or loaded.get("id") != "overseas-connect"
+            or _OVERSEAS_CONNECT_ACTION_TOKEN_FD_CAPABILITY not in capabilities
+        ):
+            raise ValueError("overseas-connect runtime capability unavailable")
+        return (
+            _path_identity(anchor.resolved_root) == anchor.identity
+            and _path_identity(manifest) == manifest_identity
+            and _connector_runtime_path_is_trusted(
+                manifest,
+                anchor.resolved_root,
+                expected_root_identity=anchor.identity,
+            )
+        )
+    except Exception:
+        return False
+
+
 _VIDEO_EDIT_PLAN_PREPARATION_ACTIONS = frozenset({
     "resolve",
     "finalize",
@@ -5824,16 +6035,24 @@ def _run_agent_creator_command_if_allowed(
     token = creator_env.pop("ZETTLAB_AGENT_ACTION_TOKEN", "")
     turn_id = creator_env.get("ZETTLAB_TURN_ID", "")
     try:
-        from tools.environments.local import _sanitize_subprocess_env
         from tools.trusted_direct_runner import run_trusted_python_script
 
-        run_env = _sanitize_subprocess_env(os.environ)
-        run_env.pop("ZETTLAB_TURN_ID", None)
+        # ⭐ 受信 runner **不继承进程环境**,照抄同文件 _run_camera_runtime_command_if_allowed
+        # 的做法(base_env={})。⛔ 别改回 _sanitize_subprocess_env(os.environ):那是**黑名单**
+        # ——只剥 Hermes 自己的密钥,其余一律放行,于是:
+        #   ① HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 会跟着进去。脚本随后拿 action token 和
+        #      ZETTLAB_LOCAL_SERVER_URL 访问 loopback,而 Python 的 requests/urllib **不会**
+        #      自动豁免 loopback —— 没配 NO_PROXY 时,带 X-Zettlab-Agent-Action-Token 的请求
+        #      会被发到外部代理。这不是假想:本线的设备上就跑着 mihomo,代理变量确实配着。
+        #   ② ZET_CHAT_APPEND_URL 这类**跨 profile 的陈旧回调地址**也会跟着进去,卡片/状态
+        #      可能回写到错误的会话或 profile。
+        # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
+        # 显式给,⛔ 不从进程环境里捡。
         completed = run_trusted_python_script(
             script=script,
             argv=parsed.argv[1:],
             cwd=anchor.resolved_root,
-            base_env=run_env,
+            base_env={},
             injected_env=creator_env,
             injected_secrets={"ZETTLAB_AGENT_ACTION_TOKEN": token},
             timeout=timeout,
@@ -5860,6 +6079,124 @@ def _run_agent_creator_command_if_allowed(
         "exit_code": completed.returncode,
         "error": error,
         "agent_creator_direct": True,
+    }, ensure_ascii=False)
+
+
+def _run_overseas_connect_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    del cwd
+    parsed = _parse_overseas_connect_command(command)
+    if parsed is None:
+        return _overseas_connect_shell_guard_result(command)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_identity_changed",
+            "Overseas Connect trust identity changed before execution.",
+        )
+    script = Path(parsed.argv[1])
+    try:
+        script_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
+        identities_match = (
+            script_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        )
+        if not identities_match:
+            raise OSError("overseas-connect trust identity changed")
+        script_bytes = _read_verified_agent_creator_script(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=script_digest,
+        )
+    except OSError:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_identity_changed",
+            "Overseas Connect trust identity changed before execution.",
+        )
+
+    if not _overseas_connect_manifest_supports_action_token_fd(anchor):
+        return _overseas_connect_blocked_result(
+            "overseas_connect_runtime_capability_unavailable",
+            "Overseas Connect is unavailable because its scoped authorization channel is missing.",
+        )
+    try:
+        from tools.environments.local import (
+            build_overseas_connect_runtime_env,
+        )
+        # ⭐ 先建立进程边界,再取 action token。照抄同文件 connector / camera 两个受信
+        # runner 的做法(_run_connector_runtime_command_if_allowed 与
+        # _run_camera_runtime_command_if_allowed 都在取凭据前调它),⛔ 没另发明一套。
+        # 边界建不起来就**直接阻断**这个 runner:模型启动的本地子进程若能 ptrace 父进程,
+        # 会在 token 进入内存的那一刻拿到连接授权。fail closed,⛔ 不降级放行。
+        if not _ensure_sensitive_runtime_boundary():
+            return _overseas_connect_blocked_result(
+                "overseas_connect_boundary_unavailable",
+                "Overseas Connect is unavailable because this process cannot establish a "
+                "trusted execution boundary.",
+            )
+        runtime_env, token = build_overseas_connect_runtime_env()
+    except Exception:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_scope_unavailable",
+            "Overseas Connect is unavailable because this turn has no scoped authorization.",
+        )
+
+    try:
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        turn_id = runtime_env.get("ZETTLAB_TURN_ID", "")
+        # ⭐ 受信 runner **不继承进程环境**,照抄同文件 _run_camera_runtime_command_if_allowed
+        # 的做法(base_env={})。⛔ 别改回 _sanitize_subprocess_env(os.environ):那是**黑名单**
+        # ——只剥 Hermes 自己的密钥,其余一律放行,于是:
+        #   ① HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 会跟着进去。脚本随后拿 action token 和
+        #      ZETTLAB_LOCAL_SERVER_URL 访问 loopback,而 Python 的 requests/urllib **不会**
+        #      自动豁免 loopback —— 没配 NO_PROXY 时,带 X-Zettlab-Agent-Action-Token 的请求
+        #      会被发到外部代理。这不是假想:本线的设备上就跑着 mihomo,代理变量确实配着。
+        #   ② ZET_CHAT_APPEND_URL 这类**跨 profile 的陈旧回调地址**也会跟着进去,卡片/状态
+        #      可能回写到错误的会话或 profile。
+        # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
+        # 显式给,⛔ 不从进程环境里捡。
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=anchor.resolved_root,
+            base_env={},
+            injected_env=runtime_env,
+            injected_secrets={"ZETTLAB_AGENT_ACTION_TOKEN": token},
+            timeout=timeout,
+            secret_values=(token, turn_id),
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+    except Exception:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_execution_unavailable",
+            "Overseas Connect could not start its secure device action.",
+        )
+
+    error = None
+    if completed.timed_out:
+        error = "Command timed out while running Overseas Connect."
+    elif completed.interrupted:
+        error = "Overseas Connect was interrupted."
+    return json.dumps({
+        "output": completed.output,
+        "exit_code": completed.returncode,
+        "error": error,
+        "overseas_connect_direct": True,
     }, ensure_ascii=False)
 
 
@@ -7542,6 +7879,13 @@ def terminal_tool(
             )
             if agent_creator_result is not None:
                 return agent_creator_result
+            overseas_connect_result = _run_overseas_connect_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if overseas_connect_result is not None:
+                return overseas_connect_result
             connector_runtime_result = _run_connector_runtime_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -7562,6 +7906,9 @@ def terminal_tool(
             agent_creator_result = _agent_creator_shell_guard_result(command)
             if agent_creator_result is not None:
                 return agent_creator_result
+            overseas_connect_result = _overseas_connect_shell_guard_result(command)
+            if overseas_connect_result is not None:
+                return overseas_connect_result
             connector_runtime_result = _connector_runtime_shell_guard_result(command)
             if connector_runtime_result is not None:
                 return connector_runtime_result
