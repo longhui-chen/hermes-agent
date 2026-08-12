@@ -1431,6 +1431,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         ):
             return
 
+        # hermes.todo 快照（并发路径）：在主线程、canonical 结果落盘成功之后
+        # 才推送——worker 内先推会在 DB busy 时 fail-open：App 已看到新清单，
+        # 下一轮 hydrate 却是旧状态（codex P1）。
+        if name == "todo":
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(function_result)
+                    _todo_emit_cb(
+                        _todo_payload.get("todos", []),
+                        _todo_payload.get("summary", {}),
+                    )
+                except Exception:
+                    pass
+
         # Every completion surface is downstream of the canonical append. If
         # the UI bridge or process dies while projecting one of these events,
         # resume can reconstruct the tool result that was already visible.

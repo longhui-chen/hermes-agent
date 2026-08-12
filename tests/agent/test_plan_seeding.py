@@ -150,10 +150,31 @@ def test_demote_stale_in_progress():
 
 def test_injection_carries_group_linkage():
     store = TodoStore()
-    store.seed_from_plan("plan08", _groups(1, 1))
+    store.seed_from_plan("plan08", _groups(1, 1), plan_turn_id="turn-08")
     text = store.format_for_injection()
     assert "[group 0]" in text
     assert "[group 1]" in text
+    # 压缩注入携带计划关联（codex P1）：canonical result 被折叠后模型只剩注入
+    # 块，缺 plan_id/plan_turn_id 会让后续写入退化成普通清单。
+    assert "plan_id: plan08" in text
+    assert "plan_turn_id: turn-08" in text
+
+
+def test_protection_disarms_after_plan_reaches_terminal_state():
+    # 终态计划解除保护（codex P1）：条目全部 completed/cancelled 后，模型为新
+    # 任务 merge=false 建清单不能再被旧骨架劫持。
+    store = TodoStore()
+    store.seed_from_plan("plan18", _groups(2))
+    store.write([
+        {"id": "plan18-1-1", "content": "step 0-0", "status": "completed"},
+        {"id": "plan18-1-2", "content": "step 0-1", "status": "cancelled"},
+    ], merge=True)
+
+    store.write([{"id": "new-1", "content": "无关新任务", "status": "pending"}], merge=False)
+    items = store.read()
+    assert [i["id"] for i in items] == ["new-1"]
+    assert "plan_id" not in items[0]
+    assert store.plan_id is None
 
 
 # ------------------------------------------------- seed_pending_plan_todos

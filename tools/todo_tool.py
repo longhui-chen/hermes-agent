@@ -144,6 +144,14 @@ class TodoStore:
                    existing items by id and append new ones.
         """
         if not merge:
+            # 终态计划解除保护（codex P1）：播种条目全部 completed/cancelled 后
+            # 计划已经收场，后续 merge=false 是模型在为**新任务**建清单——继续
+            # 保护会把旧计划骨架强行保留、新条目误归旧 plan。
+            if self._plan_id and self._plan_seeded_ids:
+                seeded = [i for i in self._items if i["id"] in self._plan_seeded_ids]
+                if seeded and all(i["status"] in {"completed", "cancelled"} for i in seeded):
+                    self._plan_id = None
+                    self._plan_seeded_ids = set()
             if self._plan_id and self._plan_seeded_ids:
                 # 播种保护（方案 §3.4）：schema 鼓励模型 merge=false 整表重写，
                 # 但计划骨架是 App 合一卡的渲染契约——以播种骨架为准，按 id 回
@@ -321,6 +329,26 @@ class TodoStore:
             return None
 
         lines = [TODO_INJECTION_HEADER]
+        # 计划关联随注入块传递（codex P1）：压缩把 canonical todo result 折叠
+        # 出最近窗口后，注入块是模型重建清单的唯一来源——不带 plan_id /
+        # plan_turn_id 的话，后续 todo 写入会退化成普通清单，App 合一卡与取消
+        # ack 的目标绑定同时丢失。明确指示模型在每个条目上回填这两个字段。
+        if self._plan_id:
+            plan_turn_id = next(
+                (
+                    str(item.get("plan_turn_id") or "").strip()
+                    for item in self._items
+                    if item.get("plan_turn_id")
+                ),
+                "",
+            )
+            linkage = f"plan_id: {self._plan_id}"
+            if plan_turn_id:
+                linkage += f" | plan_turn_id: {plan_turn_id}"
+            lines.append(
+                f"[{linkage}] — when updating this list, keep each item's "
+                "plan_id/plan_turn_id/group_index fields exactly as seeded."
+            )
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
             # 计划播种条目带上组归属：长任务（恰恰是最需要计划的场景）压缩一次
