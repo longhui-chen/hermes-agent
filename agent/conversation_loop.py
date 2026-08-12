@@ -98,6 +98,17 @@ from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
+
+def _onboarding_fast_retry_delay(agent, status_code, is_rate_limited):
+    """Return the onboarding-only 502 retry delay, else ``None``."""
+    if (
+        getattr(agent, "_onboarding_fast_retry", False)
+        and status_code == 502
+        and not is_rate_limited
+    ):
+        return 0.25
+    return None
+
 logger = logging.getLogger(__name__)
 
 # Stable prefix of the local interrupt status string emitted when a turn is
@@ -850,6 +861,33 @@ def _append_api_system_instruction(
     api_kwargs["messages"] = patched
 
 
+def _compact_lightweight_api_messages(
+    agent: Any, api_messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep only the stable system policy and current structured user turn.
+
+    The onboarding service includes the complete GuideContextSnapshot in each
+    current user message. Durable SessionDB persistence still retains the full
+    UI transcript; this changes only the provider-bound copy.
+    """
+    if not getattr(agent, "_onboarding_lightweight", False):
+        return api_messages
+
+    system = next(
+        (msg for msg in api_messages if msg.get("role") == "system"), None
+    )
+    current_user = next(
+        (msg for msg in reversed(api_messages) if msg.get("role") == "user"),
+        None,
+    )
+    compacted: List[Dict[str, Any]] = []
+    if system is not None:
+        compacted.append(system)
+    if current_user is not None:
+        compacted.append(current_user)
+    return compacted or api_messages
+
+
 def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
     """Inject the Plan decision protocol into the API-only system message.
 
@@ -1394,8 +1432,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            updated = agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+            agent._system_prompt_persist_pending = updated is False
         except Exception as exc:
+            agent._system_prompt_persist_pending = True
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
                 "%s. Subsequent turns will rebuild the system prompt and "
@@ -2697,6 +2739,8 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        api_messages = _compact_lightweight_api_messages(agent, api_messages)
+
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -3349,6 +3393,19 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
+                    _started = getattr(agent, "_onboarding_upstream_started_mono", None)
+                    if (
+                        getattr(agent, "_onboarding_lightweight", False)
+                        and isinstance(_started, (int, float))
+                        and not getattr(agent, "_onboarding_ttft_logged", False)
+                    ):
+                        agent._onboarding_ttft_logged = True
+                        logger.info(
+                            "onboarding lightweight upstream first delta: "
+                            "session=%s ttft_ms=%d",
+                            agent.session_id or "none",
+                            int((time.monotonic() - _started) * 1000),
+                        )
 
                 _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
@@ -3386,6 +3443,23 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    if getattr(agent, "_onboarding_lightweight", False):
+                        _upstream_started = time.monotonic()
+                        agent._onboarding_upstream_started_mono = _upstream_started
+                        agent._onboarding_ttft_logged = False
+                        _received = getattr(agent, "_onboarding_received_mono", None)
+                        logger.info(
+                            "onboarding lightweight upstream request: "
+                            "session=%s preflight_ms=%d messages=%d tools=%d "
+                            "approx_tokens=%d",
+                            agent.session_id or "none",
+                            int((_upstream_started - _received) * 1000)
+                            if isinstance(_received, (int, float))
+                            else -1,
+                            len(next_api_kwargs.get("messages") or []),
+                            len(next_api_kwargs.get("tools") or []),
+                            approx_tokens,
+                        )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -6726,6 +6800,15 @@ def run_conversation(
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                onboarding_retry_delay = _onboarding_fast_retry_delay(
+                    agent, status_code, is_rate_limited
+                )
+                if onboarding_retry_delay is not None:
+                    # Onboarding gets exactly one fast retry (the agent factory
+                    # caps max_retries at two).  Normal Agent traffic keeps the
+                    # existing adaptive backoff unchanged.
+                    wait_time = onboarding_retry_delay
+                    _backoff_policy = "onboarding_fast_502"
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
