@@ -197,21 +197,40 @@ def _onboarding_lightweight_system_prompt(agent: Any) -> str:
     return _ONBOARDING_LIGHTWEIGHT_SYSTEM_PROMPT
 
 
+def _session_key_account_id(request: "web.Request") -> str:
+    """Account embedded in the authenticated zettlab:<account>:<agent>:<conv> key."""
+    session_key = str(request.headers.get("X-Hermes-Session-Key", "") or "").strip()
+    parts = session_key.split(":", 3)
+    if len(parts) == 4 and parts[0] == "zettlab" and parts[1] and parts[2]:
+        return parts[1]
+    return ""
+
+
 def _request_account_id(request: "web.Request") -> str:
-    """Return the bounded account identity asserted by managed local-server."""
+    """Return the bounded account identity asserted by managed local-server.
+
+    Raises ``web.HTTPForbidden`` when the explicit account header disagrees with
+    the account carried by the authenticated session key.
+    """
     value = str(request.headers.get("X-Zettlab-Account-Id", "") or "").strip()
+    # Compatibility for a partially upgraded device: local-server has always
+    # sent the authenticated stable session key in the form
+    # zettlab:<account>:<agent>:<conversation>.  The explicit account header
+    # remains authoritative; this fallback only keeps personal Memo writes
+    # working while the two packages roll forward independently.
+    keyed = _session_key_account_id(request)
     if not value:
-        # Compatibility for a partially upgraded device: local-server has
-        # always sent the authenticated stable session key in the form
-        # zettlab:<account>:<agent>:<conversation>.  The explicit account
-        # header remains authoritative; this fallback only keeps personal Memo
-        # writes working while the two packages roll forward independently.
-        session_key = str(
-            request.headers.get("X-Hermes-Session-Key", "") or ""
-        ).strip()
-        parts = session_key.split(":", 3)
-        if len(parts) == 4 and parts[0] == "zettlab" and parts[1] and parts[2]:
-            value = parts[1]
+        return keyed[:256]
+    # Both identities present: they must agree.  Letting the header win
+    # silently means one wrong header — a rolling-back local-server, a local
+    # caller holding ZET_AGENT_KEY — makes user_id, the Memo provider and MCP
+    # meta read and write personal memory under someone else's account.
+    if keyed and keyed != value:
+        logger.warning(
+            "rejecting chat request: X-Zettlab-Account-Id does not match the "
+            "account in X-Hermes-Session-Key"
+        )
+        raise web.HTTPForbidden(reason="account identity mismatch")
     return value[:256]
 
 
@@ -3144,7 +3163,13 @@ class ZetAgentAdapter(APIServerAdapter):
         if onboarding_fast_path:
             onboarding_cache_key = (
                 active_profile.lower(),
-                str(gateway_session_key or session_id or ""),
+                # session key 与 session id 必须同时入键。X-Hermes-Session-Key 按
+                # base API 契约跨 transcript 持续，而 session_id 在 /new 时轮换：
+                # 只用前者会让新引导会话复用上一段的 AIAgent，而复用分支不会重绑
+                # agent.session_id，于是新会话的消息、标题和 system prompt 继续写进
+                # 旧 SessionDB 行——表现为 onboarding transcript 串会话。
+                str(gateway_session_key or ""),
+                str(session_id or ""),
                 str(model or ""),
                 str(runtime_kwargs.get("provider") or ""),
                 str(runtime_kwargs.get("base_url") or ""),
