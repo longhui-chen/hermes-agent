@@ -68,6 +68,15 @@ def _urlopen(req, timeout):
 
 _LIFECYCLE_ACTIONS = ("start", "stop", "restart")
 _PUBLISH_MODES = ("install", "reload")
+# Installing an app forces an answer to "does this app's data need to refresh
+# on its own?". Five real device runs showed the question being skipped in
+# silence — the skill text asks for it, and the run still walks past it and
+# ships a dashboard with a manual button after the user asked for a daily
+# fetch. A skill can be out-argued by another skill; a required tool argument
+# cannot. "user_confirmed_auto" is also recorded server-side, so an app the
+# user asked to self-refresh that never got a maintainer is a fact someone can
+# query later instead of a promise that quietly evaporated.
+_DATA_REFRESH_CHOICES = ("static", "user_confirmed_auto", "user_declined")
 _CALL_HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 # NOTE: no "recover" — the internal (agent) face deliberately does not expose
 # it (an action token authenticates one agent, not the device); recovery from
@@ -182,6 +191,23 @@ APP_HOST_SCHEMA = {
                     "agent output root (note: that root does NOT include the "
                     "per-session subdirectory the system prompt appends). "
                     "Never an absolute path."
+                ),
+            },
+            "data_refresh": {
+                "type": "string",
+                "enum": list(_DATA_REFRESH_CHOICES),
+                "description": (
+                    "Required for publish(mode=install). Does this app's data "
+                    "need to keep refreshing on its own? "
+                    "static = the user types the data in themselves (ledger, "
+                    "to-do, notes) and nothing outside the device changes it. "
+                    "user_confirmed_auto = the data comes from outside and the "
+                    "user agreed to a schedule — you must finish configuring it "
+                    "before reporting done. "
+                    "user_declined = you asked and the user said no. "
+                    "Answer from what the user actually said, not from what the "
+                    "app could get away with: an app that shows prices, weather "
+                    "or rates and only has a manual refresh button is not static."
                 ),
             },
             "staging_dir": {
@@ -457,6 +483,14 @@ def _build_request(action, args):
         # Creation provenance rides only on install: a reload updates code,
         # it never rewrites who created the app.
         if mode == "install":
+            data_refresh = str(args.get("data_refresh", "") or "").strip()
+            if data_refresh not in _DATA_REFRESH_CHOICES:
+                raise _BadRequest(
+                    "publish(mode=install) 需要 data_refresh 参数（"
+                    + "/".join(_DATA_REFRESH_CHOICES)
+                    + "）：这个应用的数据要不要自己持续更新？照用户说过的话答"
+                )
+            body["data_refresh"] = data_refresh
             session_key = _session_key()
             if session_key:
                 body["session_id"] = session_key

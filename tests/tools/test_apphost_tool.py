@@ -162,9 +162,11 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     ("list", {}, "GET", "?mine=1", None),
     ("acquire_slot", {}, "POST", "/buildslot", None),
     ("release_slot", {"slot_token": "s1"}, "DELETE", "/buildslot/s1", None),
-    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1"},
+    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1",
+                 "data_refresh": "static"},
      "POST", "/publish",
-     {"mode": "install", "source_subdir": "runs/run-1/app1"}),
+     {"mode": "install", "source_subdir": "runs/run-1/app1",
+      "data_refresh": "static"}),
     ("publish", {"mode": "reload", "source_subdir": "runs/run-2/app1",
                  "note": "Footer 加了一个链接"},
      "POST", "/publish",
@@ -238,7 +240,8 @@ _ALL_HTTP_ACTION_ARGS = [
     ("list", {}),
     ("acquire_slot", {}),
     ("release_slot", {"slot_token": "s1"}),
-    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1"}),
+    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1",
+                 "data_refresh": "static"}),
     ("install", {"staging_dir": "/tmp/s", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
     ("rollback", {"slug": "app1", "to_version": "v1"}),
@@ -426,6 +429,7 @@ def test_publish_404_without_body_points_at_legacy_route(monkeypatch):
                 "action": "publish",
                 "mode": "install",
                 "source_subdir": "runs/run-1/app1",
+                "data_refresh": "static",
             }))
     assert out["ok"] is False and out["status"] == 404
     assert out["error"]["code"] == "unsupported"
@@ -480,7 +484,8 @@ def test_unsupported_code_alone_does_not_mean_the_device_lacks_publish(monkeypat
     schema_version the server rejects. Both were observed live in ZET/#138."""
     with mux_profile_scope(monkeypatch, {k: "" for k in _scope()}):
         no_apphost = json.loads(app_host_tool({
-            "action": "publish", "mode": "install", "source_subdir": "runs/r/a"}))
+            "action": "publish", "mode": "install", "source_subdir": "runs/r/a",
+            "data_refresh": "static"}))
     assert no_apphost["error"]["code"] == "unsupported"
     assert no_apphost["status"] == 0, "no-App-Host must stay distinguishable by status"
 
@@ -491,7 +496,8 @@ def test_unsupported_code_alone_does_not_mean_the_device_lacks_publish(monkeypat
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", _http_error(422, body)):
             bad_schema = json.loads(app_host_tool({
-                "action": "publish", "mode": "install", "source_subdir": "runs/r/a"}))
+                "action": "publish", "mode": "install", "source_subdir": "runs/r/a",
+            "data_refresh": "static"}))
     assert bad_schema["error"]["code"] == "unsupported"
     assert bad_schema["status"] == 422, "a fixable metadata error must stay distinguishable by status"
 
@@ -1260,6 +1266,7 @@ def test_publish_install_carries_stable_session_key(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "api-rotated-tip")
     body = _routed_body(monkeypatch, {
         "action": "publish", "mode": "install", "source_subdir": "runs/run-1/app1",
+        "data_refresh": "static",
     })
     assert body["session_id"] == _SESSION_KEY
 
@@ -1288,5 +1295,78 @@ def test_rotating_session_id_is_not_provenance(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "api-rotated-tip")
     body = _routed_body(monkeypatch, {
         "action": "publish", "mode": "install", "source_subdir": "runs/run-1/app1",
+        "data_refresh": "static",
     })
     assert "session_id" not in body
+
+
+# --- data_refresh: installing forces an answer -------------------------------
+# Five device runs shipped a dashboard with a manual button after the user
+# asked for a daily fetch. Every one of them had read the skill text that says
+# to ask. Skill text loses arguments with other skill text; a required argument
+# does not, so the decision moved into the tool call itself.
+
+def _never_called(req, timeout=None):
+    raise AssertionError("the tool must reject this before any HTTP call")
+
+
+def test_install_without_data_refresh_never_reaches_the_network(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _never_called):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": "runs/run-1/app1",
+            }))
+    assert out["ok"] is False
+    assert "data_refresh" in out["error"]["message"]
+
+
+@pytest.mark.parametrize("value", ["", "auto", "yes", "AUTO_CONFIGURED", "true"])
+def test_install_rejects_values_outside_the_enum(monkeypatch, value):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _never_called):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": "runs/run-1/app1",
+                "data_refresh": value,
+            }))
+    assert out["ok"] is False
+    assert "data_refresh" in out["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "value", ["static", "user_confirmed_auto", "user_declined"])
+def test_install_forwards_every_accepted_answer(monkeypatch, value):
+    captured = {}
+
+    seen = {}
+
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": "runs/run-1/app1",
+                "data_refresh": value,
+            }))
+    assert out["ok"] is True
+    # The server records "the user asked for this", so it has to arrive intact.
+    assert json.loads(seen["req"].data.decode("utf-8"))["data_refresh"] == value
+
+
+def test_reload_does_not_ask_again(monkeypatch):
+    """Reload changes code on an app that already answered this at install."""
+    seen = {}
+
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "reload",
+                "source_subdir": "runs/run-2/app1",
+                "note": "Footer 加了一个链接",
+            }))
+    assert out["ok"] is True
+    assert "data_refresh" not in json.loads(seen["req"].data.decode("utf-8"))
