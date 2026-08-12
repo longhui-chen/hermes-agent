@@ -45,6 +45,27 @@
       }
     },
     {
+      "name": "snapshot_real_accessibility_tree",
+      "tool_name": "browser_snapshot",
+      "output": {
+        "success": true,
+        "_browser_content_provenance": "page_text",
+        "snapshot": "- banner:\n  - link \"Docs\" [ref=e1]:\n- main:\n  - heading \"Models & Pricing\" [level=1]\n  - paragraph:\n    - text: Compare the two models.\n  - row \"MODEL model-flash model-pro\":\n    - columnheader \"MODEL\" [ref=e2]\n    - gridcell \"model-flash\" [ref=e3]\n    - gridcell \"model-pro\" [ref=e4]\n  - link \"Models & Pricing\" [ref=e5]:"
+      },
+      "expected": {
+        "version": 1,
+        "provenance": "page_text",
+        "blocks": [
+          { "kind": "other", "text": "Docs" },
+          { "kind": "heading", "text": "Models & Pricing" },
+          { "kind": "paragraph", "text": "Compare the two models." },
+          { "kind": "table_row", "text": "MODEL model-flash model-pro" }
+        ],
+        "originalBlockCount": 8,
+        "duplicateBlockCount": 4
+      }
+    },
+    {
       "name": "snapshot_task_extraction",
       "tool_name": "browser_snapshot",
       "output": {

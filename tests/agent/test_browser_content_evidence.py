@@ -89,6 +89,20 @@ def test_browser_content_evidence_sanitizes_and_omits_input_values():
     assert "sanitization" in evidence["truncationReasons"]
 
 
+def test_browser_content_evidence_prefers_semantic_role_when_link_appears_first():
+    evidence = project_browser_content_evidence(
+        "browser_snapshot",
+        {
+            "success": True,
+            "_browser_content_provenance": "page_text",
+            "snapshot": '- link "Quarterly report"\n- heading "Quarterly report"',
+        },
+    )
+    assert evidence is not None
+    assert evidence["blocks"] == [{"kind": "heading", "text": "Quarterly report"}]
+    assert evidence["duplicateBlockCount"] == 1
+
+
 def test_browser_content_evidence_enforces_block_and_byte_budgets():
     long_text = "🦞" * (MAX_BLOCK_CHARS + 100)
     snapshot = "\n".join(

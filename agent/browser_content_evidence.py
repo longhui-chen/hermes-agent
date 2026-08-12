@@ -30,6 +30,9 @@ _SNAPSHOT_LINE_RE = re.compile(
     r'\b(?:\s+"(?P<label>(?:[^"\\]|\\.)*)")?',
     re.IGNORECASE,
 )
+_SNAPSHOT_TRAILING_REF_RE = re.compile(
+    r"\s+\[(?:ref|id)=[^\]]+\]\s*:?\s*$", re.IGNORECASE
+)
 _HIDDEN_STATE_RE = re.compile(
     r"\[[^\]]*\bhidden\b[^\]]*\]|aria-hidden\s*=\s*true", re.IGNORECASE
 )
@@ -70,6 +73,14 @@ _PROVENANCE_BY_TOOL = {
     "browser_snapshot": {"page_text", "task_extraction"},
 }
 _TRUNCATION_REASON_ORDER = ("source", "sanitization", "step_budget")
+_BLOCK_KIND_PRIORITY = {
+    "other": 0,
+    "paragraph": 1,
+    "list_item": 2,
+    "quote": 2,
+    "table_row": 2,
+    "heading": 3,
+}
 
 
 def _clean_block_text(
@@ -115,15 +126,62 @@ def _snapshot_blocks(value: str) -> tuple[list[tuple[str, str]], bool]:
         match = _SNAPSHOT_LINE_RE.match(line)
         if match is None or _HIDDEN_STATE_RE.search(line[match.end() :]):
             continue
-        raw_label = match.group("label")
-        if not raw_label:
-            continue
         role = match.group("role").lower()
         if role in _SENSITIVE_SNAPSHOT_ROLES:
             continue
+        raw_label = match.group("label")
+        if raw_label is not None:
+            label = _decode_label(raw_label)
+        else:
+            remainder = line[match.end() :].strip()
+            if not remainder.startswith(":"):
+                continue
+            label = _SNAPSHOT_TRAILING_REF_RE.sub("", remainder[1:]).strip()
+        if not label:
+            continue
         kind = _SNAPSHOT_KIND_BY_ROLE.get(role, "other")
-        blocks.append((kind, _decode_label(raw_label)))
+        blocks.append((kind, label))
     return blocks, source_truncated
+
+
+def _append_deduplicated_block(
+    blocks: list[dict[str, str]], kind: str, text: str
+) -> int:
+    """Append one block and return the number of semantic duplicates removed.
+
+    Accessibility snapshots commonly expose the same label through a semantic
+    role (for example ``heading``) and an interactive role (for example
+    ``link``). Keep the richer representation regardless of which one appears
+    first. Table rows also contain their child cells, so child labels that are
+    already present in a retained row are redundant evidence.
+    """
+    normalized = text.casefold()
+    for index, block in enumerate(blocks):
+        if block["text"].casefold() != normalized:
+            continue
+        if _BLOCK_KIND_PRIORITY[kind] > _BLOCK_KIND_PRIORITY[block["kind"]]:
+            blocks[index] = {"kind": kind, "text": text}
+        return 1
+
+    if kind == "other":
+        if any(
+            block["kind"] == "table_row" and normalized in block["text"].casefold()
+            for block in blocks
+        ):
+            return 1
+    elif kind == "table_row":
+        redundant_indexes = [
+            index
+            for index, block in enumerate(blocks)
+            if block["kind"] == "other" and block["text"].casefold() in normalized
+        ]
+        for index in reversed(redundant_indexes):
+            blocks.pop(index)
+        blocks.append({"kind": kind, "text": text})
+        return len(redundant_indexes)
+
+    blocks.append({"kind": kind, "text": text})
+    return 0
 
 
 def _plain_text_blocks(value: str) -> tuple[list[tuple[str, str]], bool]:
@@ -245,12 +303,8 @@ def project_browser_content_evidence(
     if source_truncated:
         reasons.add("source")
     blocks: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
     duplicate_count = 0
     for kind, raw_text in candidates:
-        if len(blocks) >= MAX_BLOCKS:
-            reasons.add("step_budget")
-            break
         text, sanitized, block_truncated = _clean_block_text(raw_text)
         if sanitized:
             reasons.add("sanitization")
@@ -258,12 +312,14 @@ def project_browser_content_evidence(
             reasons.add("step_budget")
         if not text:
             continue
-        key = (kind, text)
-        if key in seen:
-            duplicate_count += 1
+        duplicate_delta = _append_deduplicated_block(blocks, kind, text)
+        duplicate_count += duplicate_delta
+        if duplicate_delta:
             continue
-        seen.add(key)
-        blocks.append({"kind": kind, "text": text})
+        if len(blocks) > MAX_BLOCKS:
+            blocks.pop()
+            reasons.add("step_budget")
+            break
     if not blocks:
         return None
 
