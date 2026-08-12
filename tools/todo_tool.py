@@ -170,6 +170,11 @@ class TodoStore:
                 else:
                     # New item -- validate fully and append to end
                     validated = self._validate(t)
+                    # 播种清单的执行期新增 = 该计划的「计划外任务」：盖上
+                    # plan_id（不带 group_index），客户端才能把它与无关的普通
+                    # 条目区分开、归进合一卡的计划外分组（codex P1）。
+                    if self._plan_id and "plan_id" not in validated:
+                        validated["plan_id"] = self._plan_id
                     existing[validated["id"]] = validated
                     self._items.append(validated)
             # Rebuild _items preserving order for existing items
@@ -210,6 +215,9 @@ class TodoStore:
             if validated["id"] in self._plan_seeded_ids:
                 incoming_by_id[validated["id"]] = validated
             else:
+                # 计划外任务盖 plan_id（同 merge 分支，codex P1）。
+                if self._plan_id and "plan_id" not in validated:
+                    validated["plan_id"] = self._plan_id
                 extras.append(validated)
 
         rebuilt: List[Dict[str, str]] = []
