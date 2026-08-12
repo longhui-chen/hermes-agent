@@ -711,23 +711,26 @@ def _enforce_single_plan_interaction_tool_call(
         ),
         None,
     )
-    manual_present_plan = (
+    # auto / manual 一视同仁（codex P1）：auto 兼容路径下模型可能在同一批次里
+    # present_plan 后接 todo/副作用工具，而播种要等批次收尾——后续 todo 会先在
+    # 空/旧 store 上跑、再被 seed_from_plan 整表覆盖回全 pending。批次切段：只
+    # 保留 present_plan，被裁掉的调用由模型在播种完成后的下一轮重发。
+    zet_present_plan = (
         (getattr(agent, "platform", "") or "") == "zet_agent"
         and present_plan_call is not None
-        and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
-    if not plan_mode_active and not trusted_scope and not manual_present_plan:
+    if not plan_mode_active and not trusted_scope and not zet_present_plan:
         return False
 
     if not plan_mode_active:
-        selected = present_plan_call if manual_present_plan else tool_calls[0]
+        selected = present_plan_call if zet_present_plan else tool_calls[0]
         assistant_message.tool_calls = [selected]
         _filter_provider_replay_tool_calls(assistant_message, selected)
         logger.warning(
             "zet_agent %s: provider returned parallel tools; keeping only %s",
             (
-                "manual plan interaction"
-                if manual_present_plan
+                "plan interaction"
+                if zet_present_plan
                 else "trusted execution scope"
             ),
             _tool_call_name(selected) or "first call",
@@ -8677,14 +8680,24 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # 计划播种清单的宿主端收尾（顺序：先取消回执、后状态校正）：
+                # - 取消回执（plan_ack cancelled）：把播种待办整体置 cancelled 并
+                #   持久化，否则下一轮 hydration 把已取消计划恢复成待执行（codex P1）。
+                # - 状态校正：turn 正常结束后残留的 in_progress 降回 pending
+                #   （Codex #21327 教训——状态约束只写提示词必然漂移）。
+                # 两者都必须在最终 assistant 消息 **之前** 追加工具对：追加在其
+                # 后会让 finalize_turn 看到 transcript 以 tool 结尾而再补一次
+                # 最终回复，用户刷新后看到答案重复（codex P1）。
+                from agent.plan_seeding import (
+                    apply_plan_ack_cancellation_at_turn_end,
+                    correct_stale_in_progress_at_turn_end,
+                )
+                apply_plan_ack_cancellation_at_turn_end(agent, messages)
+                correct_stale_in_progress_at_turn_end(agent, messages)
+
                 messages.append(final_msg)
 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
-                # 计划播种清单的宿主端收尾校正：turn 正常结束后不该有条目还挂
-                # 「进行中」，模型忘了收尾时降回 pending 并重推快照（Codex
-                # #21327 教训——状态约束只写提示词必然漂移）。
-                from agent.plan_seeding import correct_stale_in_progress_at_turn_end
-                correct_stale_in_progress_at_turn_end(agent, messages)
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break

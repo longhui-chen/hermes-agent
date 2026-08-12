@@ -248,6 +248,22 @@ class TodoStore:
             self._plan_id = None
             self._plan_seeded_ids = set()
 
+    def cancel_plan_items(self) -> bool:
+        """Cancel every unfinished item of the seeded plan（取消回执处理）.
+
+        用户对计划卡回执 cancelled 后，播种的 pending/in_progress 条目不能继续
+        当待办——否则下一轮 hydration 会把已取消计划恢复成待执行（codex P1）。
+        Returns True when anything changed (caller persists + re-emits).
+        """
+        if not self._plan_id:
+            return False
+        changed = False
+        for item in self._items:
+            if item.get("plan_id") == self._plan_id and item.get("status") in {"pending", "in_progress"}:
+                item["status"] = "cancelled"
+                changed = True
+        return changed
+
     def demote_stale_in_progress(self) -> bool:
         """Turn-end host-side correction (Codex #21327 lesson).
 

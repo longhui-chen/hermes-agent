@@ -114,6 +114,85 @@ def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
         _emit_todo_snapshot(agent, result_json)
 
 
+def _persist_store_snapshot(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    store: Any,
+    *,
+    call_prefix: str,
+    stage: str,
+) -> None:
+    """把 store 当前状态写成一对 canonical todo 消息并 fail-closed 推送。
+
+    只改内存 + 推 SSE 的话，下一轮新 agent 实例从历史 hydrate 出来的还是旧
+    状态（codex P1）；与播种同构的消息对让 hydration / 压缩 / ACP 全链路复用。
+    落盘成功才推快照。
+    """
+    from tools.todo_tool import todo_tool
+
+    result_json = todo_tool(store=store)
+    call_id = f"{call_prefix}_{store.plan_id}_{len(messages)}"
+    messages.append({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "todo",
+                "arguments": json.dumps(
+                    {"todos": store.read(), "merge": False},
+                    ensure_ascii=False,
+                ),
+            },
+        }],
+    })
+    from agent.tool_dispatch_helpers import make_tool_result_message
+
+    messages.append(make_tool_result_message("todo", result_json, call_id))
+
+    from agent.tool_executor import _flush_session_db_after_tool_progress
+
+    persisted = _flush_session_db_after_tool_progress(agent, messages, stage=stage)
+    if persisted:
+        _emit_todo_snapshot(agent, result_json)
+
+
+def apply_plan_ack_cancellation_at_turn_end(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+) -> None:
+    """取消回执落地（codex P1）：用户对计划卡回执 cancelled 时清掉播种待办。
+
+    此前取消回执只撤销执行 token，播种的 pending 条目留在历史里——下一轮
+    hydration 会把已取消计划恢复成待执行，合一卡与模型上下文都继续把它当
+    待办。这里把该计划的未完成条目整体置 cancelled 并写 canonical 对持久化。
+    """
+    store = getattr(agent, "_todo_store", None)
+    if store is None or not getattr(store, "plan_id", None):
+        return
+    try:
+        from gateway.session_context import get_session_env
+
+        status = str(get_session_env("HERMES_PLAN_ACK_STATUS") or "").strip().lower()
+    except Exception:
+        return
+    if status != "cancelled":
+        return
+    try:
+        if not store.cancel_plan_items():
+            return
+        _persist_store_snapshot(
+            agent,
+            messages,
+            store,
+            call_prefix="call_todocancel",
+            stage=f"plan ack cancellation {store.plan_id}",
+        )
+    except Exception:
+        logger.exception("plan ack cancellation failed")
+
+
 def correct_stale_in_progress_at_turn_end(
     agent: Any,
     messages: List[Dict[str, Any]],
@@ -122,11 +201,8 @@ def correct_stale_in_progress_at_turn_end(
 
     turn 结束后不该有条目还挂着「进行中」——模型忘了收尾时宿主端把残留的
     in_progress 降回 pending（宁可显示未完成，不虚报完成）。仅对计划播种清单
-    生效，避免改变普通清单语义。
-
-    校正必须与播种一样写一对 canonical todo 消息（codex P1）：只改内存 +
-    推 SSE 的话，下一轮新 agent 实例从历史 hydrate 出来的还是旧的
-    in_progress，校正在刷新后被静默还原。同样 fail-closed：落盘成功才推快照。
+    生效，避免改变普通清单语义。取消回执优先处理（见
+    apply_plan_ack_cancellation_at_turn_end，调用方先取消后校正）。
     """
     store = getattr(agent, "_todo_store", None)
     if store is None or not getattr(store, "plan_id", None):
@@ -134,38 +210,13 @@ def correct_stale_in_progress_at_turn_end(
     try:
         if not store.demote_stale_in_progress():
             return
-        from tools.todo_tool import todo_tool
-
-        result_json = todo_tool(store=store)
-        call_id = f"call_todofix_{store.plan_id}_{len(messages)}"
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": "todo",
-                    "arguments": json.dumps(
-                        {"todos": store.read(), "merge": False},
-                        ensure_ascii=False,
-                    ),
-                },
-            }],
-        })
-        from agent.tool_dispatch_helpers import make_tool_result_message
-
-        messages.append(make_tool_result_message("todo", result_json, call_id))
-
-        from agent.tool_executor import _flush_session_db_after_tool_progress
-
-        persisted = _flush_session_db_after_tool_progress(
+        _persist_store_snapshot(
             agent,
             messages,
+            store,
+            call_prefix="call_todofix",
             stage=f"turn-end todo correction {store.plan_id}",
         )
-        if persisted:
-            _emit_todo_snapshot(agent, result_json)
     except Exception:
         logger.exception("turn-end todo correction failed")
 

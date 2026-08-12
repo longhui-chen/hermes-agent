@@ -267,6 +267,61 @@ def test_turn_end_correction_writes_canonical_pair():
     assert AIAgent._tool_response_matches_todo_call(messages, len(messages) - 1)
 
 
+def test_cancel_plan_items_cancels_unfinished_seeded_items():
+    store = TodoStore()
+    store.seed_from_plan("plan13", _groups(2))
+    store.write(
+        [{"id": "plan13-1-1", "content": "step 0-0", "status": "completed"}],
+        merge=True,
+    )
+    assert store.cancel_plan_items() is True
+    statuses = {i["id"]: i["status"] for i in store.read()}
+    assert statuses["plan13-1-1"] == "completed"  # 已完成不动
+    assert statuses["plan13-1-2"] == "cancelled"
+    # 幂等：没有未完成条目时返回 False。
+    assert store.cancel_plan_items() is False
+
+
+def test_plan_ack_cancellation_writes_canonical_pair(monkeypatch):
+    # 取消回执落地（codex P1）：cancelled 回执把播种待办整体置 cancelled 并
+    # 写 canonical 对，否则下一轮 hydration 恢复出已取消计划的待办。
+    from agent import plan_seeding as ps
+
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "cancelled" if name == "HERMES_PLAN_ACK_STATUS" else default,
+    )
+    emitted = []
+    agent = _FakeAgent(
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    agent._todo_store.seed_from_plan("plan14", _groups(2))
+    messages = []
+    ps.apply_plan_ack_cancellation_at_turn_end(agent, messages)
+
+    payload = json.loads(messages[-1]["content"])
+    assert all(t["status"] == "cancelled" for t in payload["todos"])
+    assert len(emitted) == 1
+    from run_agent import AIAgent
+    assert AIAgent._tool_response_matches_todo_call(messages, len(messages) - 1)
+
+
+def test_plan_ack_cancellation_noop_without_cancelled_status(monkeypatch):
+    from agent import plan_seeding as ps
+
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "confirmed" if name == "HERMES_PLAN_ACK_STATUS" else default,
+    )
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan15", _groups(1))
+    messages = []
+    ps.apply_plan_ack_cancellation_at_turn_end(agent, messages)
+    assert messages == []
+    assert agent._todo_store.read()[0]["status"] == "pending"
+
+
 def test_seed_from_plan_respects_content_budget():
     # 内容预算（codex P1）：极端大计划不把 ~150KB 重复文本塞进合成消息对。
     from tools.todo_tool import MAX_SEED_CONTENT_CHARS
