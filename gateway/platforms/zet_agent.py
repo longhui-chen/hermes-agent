@@ -125,6 +125,7 @@ from gateway.platforms.api_server import (
     _strip_skill_display_token,
 )
 from gateway.platforms.base import SendResult
+from gateway.deep_memory_identity import bounded_identity_header as _bounded_identity_header
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -233,6 +234,12 @@ def _request_account_id(request: "web.Request") -> str:
         raise web.HTTPForbidden(reason="account identity mismatch")
     return value[:256]
 
+_deep_memory_principal: ContextVar[str] = ContextVar(
+    "zettlab_deep_memory_principal", default=""
+)
+_deep_memory_subject: ContextVar[str] = ContextVar(
+    "zettlab_deep_memory_subject", default=""
+)
 
 async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
     """Keep a cancelled request alive until its non-cancellable worker exits.
@@ -908,9 +915,26 @@ class ZetAgentAdapter(APIServerAdapter):
             request.headers.get("X-Zettlab-Browser-Session-Token", "")
         )
         account_token = _zettlab_request_account_id.set(_request_account_id(request))
+        principal = _bounded_identity_header(
+            request.headers.get("X-Zettlab-Auth-Principal-Id", "")
+        )
+        subject = _bounded_identity_header(
+            request.headers.get("X-Zettlab-User-Id", ""), max_bytes=512
+        )
+        if not principal or not subject:
+            logger.warning(
+                "[deep_memory] trusted request identity is incomplete "
+                "(principal_present=%s subject_present=%s)",
+                bool(principal),
+                bool(subject),
+            )
+        principal_token = _deep_memory_principal.set(principal)
+        subject_token = _deep_memory_subject.set(subject)
         try:
             return await super()._handle_chat_completions(request)
         finally:
+            _deep_memory_subject.reset(subject_token)
+            _deep_memory_principal.reset(principal_token)
             _zettlab_request_account_id.reset(account_token)
             pop_zettlab_browser_session_token(token)
 
@@ -3149,6 +3173,8 @@ class ZetAgentAdapter(APIServerAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
             "request_overrides": agent_request_overrides or None,
+            "user_id": _deep_memory_principal.get(),
+            "user_id_alt": _deep_memory_subject.get(),
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
