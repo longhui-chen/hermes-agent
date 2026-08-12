@@ -291,6 +291,16 @@ if (
         assert "--no-editable" in sync_argv
         assert "pip" not in sync_argv
         assert "install" not in sync_argv
+        assert sync_argv[sync_argv.index("--exclude-newer") + 1] == "14 days"
+        assert {
+            sync_argv[index + 1]
+            for index, argument in enumerate(sync_argv[:-1])
+            if argument == "--exclude-newer-package"
+        } == {
+            "vercel=false",
+            "nemo-relay=false",
+            "huggingface-hub=false",
+        }
         assert {
             sync_argv[index + 1]
             for index, argument in enumerate(sync_argv[:-1])

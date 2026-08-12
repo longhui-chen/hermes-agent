@@ -21,6 +21,13 @@ override ZPK_UV_SYNC_EXTRAS := \
 	--extra langfuse \
 	--extra anthropic \
 	--extra zpk-runtime
+# UV_NO_CONFIG=1 rejects unreviewed builder settings, so pass the lockfile's
+# resolver policy explicitly rather than dropping it from the sync command.
+override ZPK_UV_LOCK_POLICY := \
+	--exclude-newer "14 days" \
+	--exclude-newer-package vercel=false \
+	--exclude-newer-package nemo-relay=false \
+	--exclude-newer-package huggingface-hub=false
 ZPK_PACK_JOBS ?= 0
 ZPK_VERBOSE ?= 0
 ZPK_LOG_DIR ?= build
@@ -191,20 +198,22 @@ zpk-venv: check-zpk-python
 	@echo "Installing locked zettlab-claw dependencies ($(ZPK_INSTALL_SPEC))..."
 	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build $(ZPK_UV_SYNC_EXTRAS) && \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build \
+				$(ZPK_UV_LOCK_POLICY) $(ZPK_UV_SYNC_EXTRAS) && \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
 			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation \
-				--reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS); \
+				$(ZPK_UV_LOCK_POLICY) --reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS); \
 	else \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build $(ZPK_UV_SYNC_EXTRAS) >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build \
+				$(ZPK_UV_LOCK_POLICY) $(ZPK_UV_SYNC_EXTRAS) >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
 			echo "uv locked dependency sync failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
 			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
 			exit 1; \
 		}; \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
 			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation \
-				--reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS) >>"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+				$(ZPK_UV_LOCK_POLICY) --reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS) >>"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
 			echo "uv locked project sync failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
 			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
 			exit 1; \
