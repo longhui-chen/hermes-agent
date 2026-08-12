@@ -339,7 +339,8 @@ async def test_silent_automation_skips_goal_and_title_hooks(monkeypatch):
     await adapter._run_agent(
         user_message="run frozen manifest",
         session_id="s1",
-        business_execution_token="a" * 64,
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
         execution_policy="silent_automation",
     )
 

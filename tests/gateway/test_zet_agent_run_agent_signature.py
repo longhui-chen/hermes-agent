@@ -165,7 +165,14 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
-    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    ordinary_db = object()
+    session_db_calls = []
+
+    def ensure_session_db():
+        session_db_calls.append(True)
+        return ordinary_db
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", ensure_session_db)
     monkeypatch.setattr(adapter, "_session_model_override_for", lambda _key: None)
     adapter._create_agent(
         session_id="api-lineage-tip",
@@ -188,6 +195,9 @@ def test_silent_automation_skips_memory_before_agent_construction(monkeypatch):
 
     assert constructed[0]["skip_memory"] is True
     assert constructed[1]["skip_memory"] is False
+    assert constructed[0]["session_db"] is None
+    assert constructed[1]["session_db"] is ordinary_db
+    assert session_db_calls == [True]
     assert constructed[0]["strict_memory_isolation"] is True
     assert constructed[1]["strict_memory_isolation"] is False
     assert constructed[0]["skip_context_files"] is True
@@ -244,13 +254,13 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
 
         def run_conversation(self, **_kwargs):
             from gateway.session_context import (
-                business_execution_token,
+                business_execution_action,
                 execution_policy,
             )
 
             observed.update(
                 {
-                    "business_token": business_execution_token(),
+                    "business_action": business_execution_action(),
                     "execution_policy": execution_policy(),
                     "persist_disabled": self._persist_disabled,
                     "session_db": self._session_db,
@@ -301,7 +311,8 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
         session_id="api-lineage-tip",
         gateway_session_key="zettlab:owner:agent:stable",
         turn_id="pvm-" + "a" * 24,
-        business_execution_token="a" * 64,
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
         execution_policy="silent_automation",
         plan_ack={
             "turn_id": "plan-turn-1",
@@ -314,7 +325,7 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
     assert constructed[0]["skip_memory"] is True
     assert constructed[0]["strict_memory_isolation"] is True
     assert observed == {
-        "business_token": "",
+        "business_action": "",
         "execution_policy": "silent_automation",
         "persist_disabled": True,
         "session_db": None,
@@ -451,10 +462,17 @@ async def test_zet_agent_preserves_stable_session_key_across_queue_scoping(
 
     async def fake_run_agent(self, **kwargs):
         del self
+        from gateway import session_context
         from tools.approval import get_current_session_key
 
         captured.update(kwargs)
         captured["approval_session_key"] = get_current_session_key(default="")
+        execution_session_key = getattr(
+            session_context,
+            "execution_session_key",
+            lambda: "",
+        )
+        captured["execution_session_key"] = execution_session_key()
         return (
             {"final_response": "ok", "session_id": "api-lineage-tip"},
             {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
@@ -471,9 +489,69 @@ async def test_zet_agent_preserves_stable_session_key_across_queue_scoping(
     )
 
     assert captured["gateway_session_key"] == stable_key
+    assert captured["execution_session_key"] == stable_key
     assert captured["approval_session_key"] == adapter._interaction_queue_key(
         "api-lineage-tip"
     )
     assert "_zet_stable_gateway_session_key" not in (
         captured.get("request_overrides") or {}
     )
+
+
+@pytest.mark.asyncio
+async def test_zet_agent_scopes_and_revokes_hardware_capability(monkeypatch):
+    observed = []
+
+    async def fake_run_agent(self, **kwargs):
+        del self
+        from gateway.session_context import (
+            business_execution_action,
+            business_execution_action_version,
+            hardware_execution_token,
+        )
+
+        observed.append(
+            {
+                "kwargs": kwargs,
+                "hardware_token": hardware_execution_token(),
+                "business_action": business_execution_action(),
+                "action_version": business_execution_action_version(),
+            }
+        )
+        return (
+            {"final_response": "ok", "session_id": "camera-session"},
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
+        lambda: True,
+    )
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    hardware_token = "b" * 64
+
+    await adapter._run_agent(
+        user_message="list cameras",
+        session_id="camera-session",
+        turn_id="camera-turn",
+        hardware_execution_token=hardware_token,
+    )
+    await adapter._run_agent(
+        user_message="cancel camera plan",
+        session_id="camera-session",
+        turn_id="camera-cancel-turn",
+        plan_ack={"status": "cancelled", "turn_id": "camera-plan-turn"},
+        hardware_execution_token=hardware_token,
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
+
+    assert observed[0]["hardware_token"] == hardware_token
+    assert observed[0]["business_action"] == ""
+    assert observed[0]["kwargs"]["hardware_execution_token"] == hardware_token
+    assert observed[1]["hardware_token"] == ""
+    assert observed[1]["business_action"] == ""
+    assert observed[1]["action_version"] == ""
+    assert observed[1]["kwargs"]["hardware_execution_token"] == ""
+    assert observed[1]["kwargs"]["business_execution_action"] == ""

@@ -58,9 +58,6 @@ import stat
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -104,7 +101,6 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from gateway.readiness import collect_runtime_readiness
-from tools.loopback_transport import is_trusted_loopback_http, urlopen_hardened
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -604,38 +600,34 @@ def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
     return _strip_skill_display_token(user_message, skill_slug)
 
 
-def _extract_business_execution_token(raw: Any) -> str:
-    """Accept only local-server's fixed-width opaque capability format."""
-    token = str(raw or "").strip()
-    return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
+_ACTION_VERSION = "1"
+_ACTION_HEADER = "X-Zettlab-Business-Execution-Action"
+_ACTION_VERSION_HEADER = "X-Zettlab-Business-Execution-Action-Version"
+_ACTION_RE = re.compile(r"[0-9a-f]{64}")
+_HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Business-Execution-Token"
 
 
-def _extract_execution_scope_digest(raw: Any) -> str:
-    """Accept only local-server's canonical execution-scope receipt."""
-    digest = str(raw or "").strip()
-    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
+def _extract_business_execution_action(request: Any) -> Optional[Dict[str, str]]:
+    """Parse the opaque ActionV1 relay envelope without semantic auth."""
+    if request is None:
+        return None
+    raw = str(request.headers.get(_ACTION_HEADER, "") or "").strip()
+    version = str(request.headers.get(_ACTION_VERSION_HEADER, "") or "").strip()
+    if not raw and not version:
+        return None
+    if version != _ACTION_VERSION or _ACTION_RE.fullmatch(raw) is None:
+        return {}
+    return {"action_version": version, "action": raw}
 
 
-_BUSINESS_EXECUTION_AUTHORIZATION_PATH = (
-    "/api/v1/ai-proxy/business/authorization/check"
-)
-_BUSINESS_EXECUTION_AUTHORIZATION_RESPONSE_BYTES = 16 << 10
-_BUSINESS_EXECUTION_AUTHORIZATION_TIMEOUT_SECONDS = 1.5
-_BUSINESS_EXECUTION_AUTHORIZATION_ATTEMPTS = 2
-_BUSINESS_EXECUTION_SCOPE_MAX_ENTRIES = 64
-_BUSINESS_EXECUTION_SCOPE_MAX_KEY_BYTES = 128
-_BUSINESS_EXECUTION_SCOPE_MAX_VALUE_BYTES = 1024
-_BUSINESS_EXECUTION_SCOPE_MAX_BYTES = 16 << 10
-_BUSINESS_EXECUTION_ACTION_TOKEN_MAX_BYTES = 4096
-_BUSINESS_EXECUTION_SKILL_SLUG_MAX_BYTES = 128
-_BUSINESS_EXECUTION_REQUEST_DOMAIN = b"zettlab-business-execution-request-v1"
-_BUSINESS_EXECUTION_SCOPE_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
-
-
-class _BusinessExecutionAuthorizationError(RuntimeError):
-    def __init__(self, reason: str, *, retryable: bool = False):
-        super().__init__(reason)
-        self.retryable = retryable
+def _extract_hardware_execution_token(request: Any) -> str:
+    """Relay the legacy-named capability only to trusted hardware helpers."""
+    if request is None:
+        return ""
+    token = str(
+        request.headers.get(_HARDWARE_EXECUTION_TOKEN_HEADER, "") or ""
+    ).strip()
+    return token if _ACTION_RE.fullmatch(token) is not None else ""
 
 
 def _extract_requested_execution_policy(body: Dict[str, Any]) -> str:
@@ -646,315 +638,6 @@ def _extract_requested_execution_policy(body: Dict[str, Any]) -> str:
     if not isinstance(raw, str):
         return ""
     return raw.strip().lower()
-
-
-def _valid_execution_scope_text(value: str, max_bytes: int, *, allow_empty: bool) -> bool:
-    if not value:
-        return allow_empty
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return (
-        len(encoded) <= max_bytes
-        and all(ord(char) >= 0x20 and ord(char) != 0x7F for char in value)
-    )
-
-
-def _extract_agent_action_token(raw: Any) -> str:
-    """Accept the profile action token as a bounded opaque header value."""
-    if not isinstance(raw, str):
-        return ""
-    if not _valid_execution_scope_text(
-        raw,
-        _BUSINESS_EXECUTION_ACTION_TOKEN_MAX_BYTES,
-        allow_empty=False,
-    ):
-        return ""
-    token = raw.strip()
-    return token if token else ""
-
-
-def _business_execution_request_digest(task: Any, skill_slug: Any) -> str:
-    """Bind authorization to the exact normalized task and selected skill."""
-    if not isinstance(task, str) or not isinstance(skill_slug, str):
-        return ""
-    slug = skill_slug.strip().lstrip("/")
-    if not _valid_execution_scope_text(
-        slug,
-        _BUSINESS_EXECUTION_SKILL_SLUG_MAX_BYTES,
-        allow_empty=True,
-    ):
-        return ""
-    try:
-        task_digest = hashlib.sha256(task.encode("utf-8")).hexdigest()
-        canonical = b"\0".join(
-            (
-                _BUSINESS_EXECUTION_REQUEST_DOMAIN,
-                task_digest.encode("ascii"),
-                slug.encode("utf-8"),
-            )
-        )
-    except UnicodeEncodeError:
-        return ""
-    return hashlib.sha256(canonical).hexdigest()
-
-
-def _extract_execution_scope(body: Dict[str, Any]) -> Dict[str, str]:
-    """Return the bounded generic scope supplied by a trusted producer.
-
-    Scope keys and values are intentionally opaque to Hermes. local-server is
-    the authorization authority and computes the canonical digest; this mirror
-    only bounds work before the loopback request and rejects ambiguous keys.
-    """
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return {}
-    raw_scope = metadata.get(
-        "execution_scope",
-        metadata.get("executionScope"),
-    )
-    if not isinstance(raw_scope, dict) or not raw_scope:
-        return {}
-    if len(raw_scope) > _BUSINESS_EXECUTION_SCOPE_MAX_ENTRIES:
-        return {}
-
-    normalized: Dict[str, str] = {}
-    for raw_key, raw_value in raw_scope.items():
-        if not isinstance(raw_key, str) or not isinstance(raw_value, str):
-            return {}
-        key = raw_key.strip()
-        value = raw_value.strip()
-        if (
-            not _valid_execution_scope_text(
-                key,
-                _BUSINESS_EXECUTION_SCOPE_MAX_KEY_BYTES,
-                allow_empty=False,
-            )
-            or not _valid_execution_scope_text(
-                value,
-                _BUSINESS_EXECUTION_SCOPE_MAX_VALUE_BYTES,
-                allow_empty=True,
-            )
-            or key in normalized
-        ):
-            return {}
-        normalized[key] = value
-    try:
-        canonical = json.dumps(
-            normalized,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, UnicodeEncodeError, ValueError):
-        return {}
-    if len(canonical) > _BUSINESS_EXECUTION_SCOPE_MAX_BYTES:
-        return {}
-    return normalized
-
-
-def _business_execution_authorization_url(append_url: Optional[str] = None) -> str:
-    raw_url = (
-        str(_get_scoped_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
-        if append_url is None
-        else str(append_url or "").strip()
-    )
-    if not raw_url or any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw_url):
-        return ""
-    try:
-        parts = urllib.parse.urlsplit(raw_url)
-        # Accessing .port performs urllib's range and syntax validation.
-        _ = parts.port
-    except ValueError:
-        return ""
-    if (
-        not parts.netloc
-        or parts.username is not None
-        or parts.password is not None
-        or not is_trusted_loopback_http(parts)
-    ):
-        return ""
-    return urllib.parse.urlunsplit(
-        (
-            "http",
-            parts.netloc,
-            _BUSINESS_EXECUTION_AUTHORIZATION_PATH,
-            "",
-            "",
-        )
-    )
-
-
-def _business_execution_authorization_request(
-    url: str,
-    *,
-    action_token: str,
-    business_execution_token: str,
-    turn_id: str,
-    session_id: str,
-    session_key: str,
-    scope: Dict[str, str],
-    request_digest: str,
-) -> Dict[str, Any]:
-    payload = json.dumps(
-        {"request_digest": request_digest, "scope": scope},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "X-Zettlab-Agent-Action-Token": action_token,
-            "X-Zettlab-Business-Execution-Token": business_execution_token,
-            "X-Hermes-Turn-Id": turn_id,
-            "X-Hermes-Session-Id": session_id,
-            "X-Hermes-Session-Key": session_key,
-        },
-    )
-    try:
-        with urlopen_hardened(
-            request,
-            timeout=_BUSINESS_EXECUTION_AUTHORIZATION_TIMEOUT_SECONDS,
-        ) as response:
-            status_value = getattr(response, "status", None)
-            if status_value is None:
-                status_value = response.getcode()
-            status = int(status_value)
-            if status < 200 or status >= 300:
-                raise _BusinessExecutionAuthorizationError(
-                    f"http_{status}",
-                    retryable=status >= 500,
-                )
-            raw = response.read(
-                _BUSINESS_EXECUTION_AUTHORIZATION_RESPONSE_BYTES + 1
-            )
-    except _BusinessExecutionAuthorizationError:
-        raise
-    except urllib.error.HTTPError as exc:
-        try:
-            exc.close()
-        except Exception:
-            pass
-        raise _BusinessExecutionAuthorizationError(
-            f"http_{exc.code}",
-            retryable=500 <= int(exc.code) < 600,
-        ) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise _BusinessExecutionAuthorizationError(
-            "transport_unavailable",
-            retryable=True,
-        ) from exc
-    if len(raw) > _BUSINESS_EXECUTION_AUTHORIZATION_RESPONSE_BYTES:
-        raise _BusinessExecutionAuthorizationError("response_too_large")
-    try:
-        decoded = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise _BusinessExecutionAuthorizationError("invalid_response") from exc
-    if not isinstance(decoded, dict):
-        raise _BusinessExecutionAuthorizationError("invalid_response")
-    return decoded
-
-
-def _valid_authorization_identifier(value: str, max_bytes: int) -> bool:
-    return _valid_execution_scope_text(value, max_bytes, allow_empty=False)
-
-
-async def _authorize_business_execution(
-    *,
-    business_execution_token: str,
-    turn_id: str,
-    session_id: str,
-    session_key: str,
-    scope: Dict[str, str],
-    trusted_task_message: Any,
-    skill_slug: str,
-) -> Optional[Dict[str, Any]]:
-    """Validate one silent turn against local-server's generic capability store."""
-    action_token = _extract_agent_action_token(
-        _get_scoped_secret("ZETTLAB_AGENT_ACTION_TOKEN", "")
-    )
-    agent_id = str(_get_scoped_secret("ZET_AGENT_ID", "") or "").strip()
-    url = _business_execution_authorization_url()
-    request_digest = _business_execution_request_digest(
-        trusted_task_message,
-        skill_slug,
-    )
-    if (
-        not action_token
-        or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(
-            business_execution_token
-        )
-        is None
-        or not _valid_authorization_identifier(agent_id, 128)
-        or not _valid_authorization_identifier(turn_id, 256)
-        or not _valid_authorization_identifier(session_id, 1024)
-        or not _valid_authorization_identifier(session_key, 1024)
-        or not scope
-        or not request_digest
-        or not url
-    ):
-        return None
-
-    response: Optional[Dict[str, Any]] = None
-    for attempt in range(_BUSINESS_EXECUTION_AUTHORIZATION_ATTEMPTS):
-        try:
-            response = await asyncio.to_thread(
-                _business_execution_authorization_request,
-                url,
-                action_token=action_token,
-                business_execution_token=business_execution_token,
-                turn_id=turn_id,
-                session_id=session_id,
-                session_key=session_key,
-                scope=scope,
-                request_digest=request_digest,
-            )
-            break
-        except _BusinessExecutionAuthorizationError as exc:
-            if not exc.retryable or attempt + 1 >= _BUSINESS_EXECUTION_AUTHORIZATION_ATTEMPTS:
-                logger.warning(
-                    "[api_server] silent execution authorization failed: %s",
-                    str(exc),
-                )
-                if exc.retryable:
-                    raise
-                return None
-            await asyncio.sleep(0.05)
-
-    if response is None:
-        return None
-    scope_digest = response.get("scope_digest")
-    returned_request_digest = response.get("request_digest")
-    authorization_mode = response.get("authorization_mode")
-    if (
-        response.get("ok") is not True
-        or response.get("scope_matched") is not True
-        or response.get("request_matched") is not True
-        or response.get("agent_id") != agent_id
-        or response.get("turn_id") != turn_id
-        or response.get("session_id") != session_id
-        or response.get("session_key") != session_key
-        or not isinstance(scope_digest, str)
-        or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(scope_digest) is None
-        or returned_request_digest != request_digest
-        or authorization_mode not in {"automatic", "plan_confirmation"}
-    ):
-        return None
-    return {
-        "agent_id": agent_id,
-        "turn_id": turn_id,
-        "session_id": session_id,
-        "session_key": session_key,
-        "scope_digest": scope_digest,
-        "request_digest": request_digest,
-        "authorization_mode": authorization_mode,
-    }
 
 
 def _normalize_chat_content(
@@ -1834,16 +1517,13 @@ class ResponseStore:
 # CORS middleware
 # ---------------------------------------------------------------------------
 
-# X-Zettlab-Agent-Action-Token is intentionally absent. It is a profile-scoped
-# loopback capability, not a browser/App contract; omission makes browser
-# preflight fail closed even for an allowed origin.
+# ActionV1 headers and X-Zettlab-Agent-Action-Token are intentionally absent.
+# They are loopback capability transport, not a browser/App contract; omission
+# makes browser preflight fail closed even for an allowed origin.
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": (
-        "Authorization, Content-Type, Idempotency-Key, "
-        "X-Zettlab-Business-Execution-Token"
-    ),
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
 }
 
 
@@ -2188,21 +1868,34 @@ def _make_request_fingerprint(
     body: Dict[str, Any],
     keys: List[str],
     *,
-    business_execution_token: str = "",
+    business_execution_action: str = "",
+    hardware_execution_token: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
     body_fingerprint = hashlib.sha256(repr(subset).encode("utf-8")).hexdigest()
-    token = _extract_business_execution_token(business_execution_token)
-    if not token:
+    action = str(business_execution_action or "").strip()
+    hardware_token = str(hardware_execution_token or "").strip()
+    capability_digests: List[bytes] = []
+    if _ACTION_RE.fullmatch(action) is not None:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-business-execution-action-v1\0" + action.encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    if _ACTION_RE.fullmatch(hardware_token) is not None:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-hardware-execution-token-v1\0"
+                + hardware_token.encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    if not capability_digests:
         return body_fingerprint
-    token_digest = hashlib.sha256(
-        b"zettlab-business-execution-token-v1\0" + token.encode("ascii")
-    ).hexdigest()
     return hashlib.sha256(
-        b"zettlab-request-idempotency-v2\0"
+        b"zettlab-request-idempotency-v4\0"
         + body_fingerprint.encode("ascii")
         + b"\0"
-        + token_digest.encode("ascii")
+        + b"\0".join(capability_digests)
     ).hexdigest()
 
 
@@ -2210,34 +1903,14 @@ def _make_silent_automation_fingerprint(
     authorization: Dict[str, Any],
 ) -> str:
     """Bind retries to stable authorization identity, not mutable request bytes."""
-    claims = {
-        "agent_id": authorization.get("agent_id"),
-        "turn_id": authorization.get("turn_id"),
-        "session_key": authorization.get("session_key"),
-        "scope_digest": authorization.get("scope_digest"),
-        "request_digest": authorization.get("request_digest"),
-        "authorization_mode": authorization.get("authorization_mode"),
-    }
+    action = str(authorization.get("action", "") or "").strip()
     if (
-        not all(isinstance(value, str) and value for value in claims.values())
-        or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(
-            str(claims["scope_digest"])
-        )
-        is None
-        or _BUSINESS_EXECUTION_SCOPE_DIGEST_RE.fullmatch(
-            str(claims["request_digest"])
-        )
-        is None
+        authorization.get("action_version") != _ACTION_VERSION
+        or _ACTION_RE.fullmatch(action) is None
     ):
         return ""
-    canonical = json.dumps(
-        claims,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
     return hashlib.sha256(
-        b"zettlab-silent-automation-authorization-v1\0" + canonical
+        b"zettlab-silent-automation-action-v1\0" + action.encode("ascii")
     ).hexdigest()
 
 
@@ -5705,20 +5378,25 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
         connector_route_capability = _extract_connector_route_capability(body)
-        business_execution_token = _extract_business_execution_token(
-            request.headers.get("X-Zettlab-Business-Execution-Token", "")
-        )
-        requested_execution_scope_digest = _extract_execution_scope_digest(
-            request.headers.get("X-Zettlab-Execution-Scope-Digest", "")
-        )
+        business_execution_action = _extract_business_execution_action(request)
+        hardware_execution_token = _extract_hardware_execution_token(request)
         requested_execution_policy = _extract_requested_execution_policy(body)
         requested_silent_automation = (
             requested_execution_policy == "silent_automation"
         )
         execution_policy = ""
-        execution_scope_digest = ""
-        execution_request_digest = ""
         execution_authorization: Dict[str, Any] = {}
+        if business_execution_action == {}:
+            return web.json_response(
+                _openai_error(
+                    "invalid business execution action",
+                    param=_ACTION_HEADER,
+                    code="invalid_business_execution_action",
+                ),
+                status=403,
+            )
+        if business_execution_action is not None:
+            execution_authorization = dict(business_execution_action)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -5843,48 +5521,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        execution_scope = _extract_execution_scope(body)
-        if (
-            business_execution_token
-            and requested_execution_scope_digest
-            and execution_scope
-        ):
-            try:
-                execution_authorization = (
-                    await _authorize_business_execution(
-                        business_execution_token=business_execution_token,
-                        turn_id=turn_id,
-                        session_id=session_id,
-                        session_key=gateway_session_key or "",
-                        scope=execution_scope,
-                        trusted_task_message=trusted_task_message,
-                        skill_slug=skill_slug,
-                    )
-                    or {}
-                )
-            except _BusinessExecutionAuthorizationError as exc:
-                logger.warning(
-                    "[api_server] %s execution authorization unavailable: %s",
-                    "silent" if requested_silent_automation else "interactive",
-                    str(exc),
-                )
-                if requested_silent_automation:
-                    return web.json_response(
-                        _openai_error(
-                            "silent_automation authorization service unavailable",
-                            param="metadata.execution_policy",
-                            code="silent_automation_authorization_unavailable",
-                        ),
-                        status=503,
-                        headers={"Retry-After": "1"},
-                    )
-
         if requested_silent_automation:
-            if (
-                not execution_authorization
-                or execution_authorization.get("scope_digest")
-                != requested_execution_scope_digest
-            ):
+            if business_execution_action is None:
                 # A silent request is an internal capability boundary. Never
                 # downgrade an invalid receipt to an ordinary turn: that would
                 # expose the caller's history/memory and interactive tools.
@@ -5897,26 +5535,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=403,
                 )
             execution_policy = "silent_automation"
-            execution_scope_digest = str(
-                execution_authorization["scope_digest"]
-            )
-            execution_request_digest = str(
-                execution_authorization["request_digest"]
-            )
-        elif (
-            execution_authorization
-            and execution_authorization.get("scope_digest")
-            == requested_execution_scope_digest
-        ):
-            # Interactive chat remains available when the local authorization
-            # service is temporarily unavailable, but trusted side-effect
-            # helpers receive a receipt only after exact scope/request proof.
-            execution_scope_digest = str(
-                execution_authorization["scope_digest"]
-            )
-            execution_request_digest = str(
-                execution_authorization["request_digest"]
-            )
 
         if execution_policy == "silent_automation":
             # Silent receipts authorize one server-owned workflow. UI/API
@@ -5926,7 +5544,11 @@ class APIServerAdapter(BasePlatformAdapter):
             plan_ack = {}
             plan_auto_execute = False
 
-        trusted_business_execution_token = business_execution_token
+        trusted_business_execution_action = (
+            str(business_execution_action.get("action", "") or "")
+            if business_execution_action is not None
+            else ""
+        )
 
         if execution_policy == "silent_automation":
             # A silent authorization is a self-contained task receipt, not permission
@@ -6164,10 +5786,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
-                business_execution_token=trusted_business_execution_token,
+                hardware_execution_token=hardware_execution_token,
+                business_execution_action=trusted_business_execution_action,
+                business_execution_action_version=(
+                    _ACTION_VERSION if trusted_business_execution_action else ""
+                ),
                 execution_policy=execution_policy,
-                execution_scope_digest=execution_scope_digest,
-                execution_request_digest=execution_request_digest,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
                 trusted_user_message=trusted_user_message,
@@ -6223,10 +5847,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
-                    business_execution_token=trusted_business_execution_token,
+                    hardware_execution_token=hardware_execution_token,
+                    business_execution_action=trusted_business_execution_action,
+                    business_execution_action_version=(
+                        _ACTION_VERSION if trusted_business_execution_action else ""
+                    ),
                     execution_policy=execution_policy,
-                    execution_scope_digest=execution_scope_digest,
-                    execution_request_digest=execution_request_digest,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
@@ -6252,7 +5878,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         "stream",
                         "metadata",
                     ],
-                    business_execution_token=trusted_business_execution_token,
+                    business_execution_action=trusted_business_execution_action,
+                    hardware_execution_token=hardware_execution_token,
                 )
             )
             try:
@@ -8543,10 +8170,10 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
-        business_execution_token: Optional[str] = None,
+        hardware_execution_token: Optional[str] = None,
+        business_execution_action: Optional[str] = None,
+        business_execution_action_version: Optional[str] = None,
         execution_policy: Optional[str] = None,
-        execution_scope_digest: Optional[str] = None,
-        execution_request_digest: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,

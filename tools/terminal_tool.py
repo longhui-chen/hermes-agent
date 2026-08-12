@@ -60,9 +60,40 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Mapping
 
+from agent.trusted_tool_result import TrustedToolResult
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+_NON_RETRYABLE_VIDEO_EDIT_FAILURE_REASONS = frozenset(
+    {
+        "workflow_checkpoint_ambiguous",
+        "workflow_checkpoint_identity_invalid",
+        "workflow_checkpoint_not_found",
+        "workflow_state_not_found",
+    }
+)
+
+
+def _trusted_video_edit_terminal_failure_reason(
+    output: str,
+    returncode: int,
+) -> str:
+    """Classify signed-helper failures before output enters model-visible hooks."""
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    reason = payload.get("reason") or payload.get("error")
+    if not isinstance(reason, str):
+        reason = ""
+    if payload.get("terminal_failure") is True:
+        return reason or "trusted_runtime_terminal_failure"
+    if returncode == 2 and reason in _NON_RETRYABLE_VIDEO_EDIT_FAILURE_REASONS:
+        return reason
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1474,7 +1505,8 @@ def _factory_loop(factory_channel, parent_guard, ready_channel, supervisor_pid):
                 ):
                     raise PermissionError("seed parent-death boundary is unavailable")
                 os.setsid()
-                sys.argv = [worker_path, str(seed_channel.fileno())]
+                seed_fd = seed_channel.detach()
+                sys.argv = [worker_path, str(seed_fd)]
                 returncode = worker.main()
             except BaseException:
                 returncode = 1
@@ -3993,10 +4025,9 @@ def _shutdown_video_edit_worker_seed() -> None:
     _discard_video_edit_worker_seed()
     channel = _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
     process = _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-    _VIDEO_EDIT_WORKER_FACTORY_CHANNEL = None
-    _VIDEO_EDIT_WORKER_FACTORY_PROCESS = None
     _VIDEO_EDIT_WORKER_SEED_CHANNEL = None
     _VIDEO_EDIT_WORKER_SEED_PROCESS = None
+    parent_reaped = False
     if channel is not None and process is not None and process.poll() is None:
         try:
             channel.sendall(b"Q")
@@ -4006,6 +4037,13 @@ def _shutdown_video_edit_worker_seed() -> None:
             )
         except (EOFError, OSError, socket.timeout, ValueError):
             pass
+    if process is not None:
+        parent_reaped = _request_video_edit_worker_parent_reap(
+            process,
+            parent_control="supervisor",
+        )
+    _VIDEO_EDIT_WORKER_FACTORY_CHANNEL = None
+    _VIDEO_EDIT_WORKER_FACTORY_PROCESS = None
     if channel is not None:
         try:
             channel.close()
@@ -4014,7 +4052,7 @@ def _shutdown_video_edit_worker_seed() -> None:
     if process is None:
         return
     try:
-        if process.poll() is None:
+        if not parent_reaped and process.poll() is None:
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -6042,29 +6080,25 @@ def _run_video_edit_runtime_command_if_allowed(
         trusted_env = build_video_edit_runtime_env()
         if not _video_edit_runtime_claims_match_receipt(parsed, trusted_env):
             return _video_edit_runtime_shell_guard_result(command)
-        # Keep both identities inside the trusted worker: HERMES_SESSION_KEY is
-        # the current lineage, while HERMES_GATEWAY_SESSION_KEY binds helper
-        # authorization to the stable App/profile session across compaction.
         secret_values = [
-            trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
-            trusted_env.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
+            trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", ""),
         ]
         trusted_secrets = {
             key: trusted_env.pop(key)
             for key in (
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
-                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_BUSINESS_EXECUTION_ACTION",
             )
             if trusted_env.get(key)
         }
         trusted_context = {
             key: trusted_env[key]
             for key in (
+                "ZET_AGENT_ID",
                 "HERMES_TURN_ID",
                 "HERMES_SESSION_KEY",
+                "HERMES_SESSION_ID",
                 "HERMES_GATEWAY_SESSION_KEY",
-                "ZETTLAB_EXECUTION_SCOPE_DIGEST",
-                "ZETTLAB_EXECUTION_REQUEST_DIGEST",
+                "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
             )
             if trusted_env.get(key)
         }
@@ -6100,7 +6134,17 @@ def _run_video_edit_runtime_command_if_allowed(
         ))
         result.pop("connector_runtime_direct", None)
         result["video_edit_runtime_direct"] = True
-        return json.dumps(result, ensure_ascii=False)
+        visible_result = json.dumps(result, ensure_ascii=False)
+        terminal_failure_reason = _trusted_video_edit_terminal_failure_reason(
+            result.get("output", ""),
+            returncode,
+        )
+        if terminal_failure_reason:
+            return TrustedToolResult(
+                visible_result,
+                terminal_failure_reason=terminal_failure_reason,
+            )
+        return visible_result
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
         stderr = exc.stderr or ""

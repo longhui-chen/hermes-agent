@@ -55,6 +55,24 @@ def _create_protected_trees(root: Path) -> None:
         (root / tree).mkdir(parents=True, exist_ok=True)
 
 
+def _write_fake_python(root: Path) -> None:
+    python = root / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo \'Python 3.11.2\'; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    (root / "venv" / "pyvenv.cfg").write_text(
+        "home = /usr/bin\n"
+        "include-system-site-packages = false\n"
+        "version_info = 3.11.2\n",
+        encoding="utf-8",
+    )
+
+
 def _load_check_module():
     spec = importlib.util.spec_from_file_location("check_zpk_stage", CHECK_SCRIPT)
     assert spec and spec.loader
@@ -87,6 +105,10 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
     archive = tmp_path / "payload.tar"
 
     for relative_path in (
+        ".env",
+        ".env.local",
+        ".DS_Store",
+        ".omx/state.json",
         "web/root-only.txt",
         "data/root-only.txt",
         "dist/root-only.txt",
@@ -107,6 +129,7 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
         "venv/lib/python3.11/site-packages/slack_sdk/web/client.py",
     ):
         _write_file(source, relative_path)
+    _write_fake_python(source)
 
     staged.mkdir()
     subprocess.run(
@@ -124,6 +147,9 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
     ):
         assert not (staged / root_only_path).exists()
 
+    for local_only_path in (".env", ".env.local", ".DS_Store", ".omx/state.json"):
+        assert not (staged / local_only_path).exists()
+
     for runtime_path in (
         "config/skill_seed_policy.json",
         "locales/en.yaml",
@@ -139,7 +165,9 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
         "venv/lib/python3.11/site-packages/botocore/data/endpoints.json",
         "venv/lib/python3.11/site-packages/slack_sdk/web/client.py",
     ):
-        assert (staged / runtime_path).is_file(), f"runtime path was excluded: {runtime_path}"
+        assert (
+            staged / runtime_path
+        ).is_file(), f"runtime path was excluded: {runtime_path}"
 
 
 def test_find_missing_runtime_paths_reports_files_removed_from_protected_trees(
@@ -157,6 +185,8 @@ def test_find_missing_runtime_paths_reports_files_removed_from_protected_trees(
     _write_file(staged, kept_path)
     _create_protected_trees(source)
     _create_protected_trees(staged)
+    _write_fake_python(source)
+    _write_fake_python(staged)
 
     module = _load_check_module()
 
@@ -174,6 +204,8 @@ def test_zpk_stage_payload_check_flow_fails_when_runtime_content_is_missing(
     missing_path = "plugins/kanban/dashboard/dist/index.js"
     _create_protected_trees(source)
     _create_protected_trees(staged)
+    _write_fake_python(source)
+    _write_fake_python(staged)
     _write_file(source, missing_path)
 
     result = subprocess.run(
@@ -208,6 +240,7 @@ def test_zpk_stage_payload_check_flow_accepts_complete_runtime_trees(
     for relative_path in runtime_paths:
         _write_file(source, relative_path)
     _create_protected_trees(source)
+    _write_fake_python(source)
     shutil.copytree(source, staged)
 
     result = subprocess.run(
@@ -227,3 +260,66 @@ def test_zpk_stage_payload_check_flow_accepts_complete_runtime_trees(
 
     assert result.returncode == 0, result.stdout
     assert "ZPK stage check ok" in result.stdout
+
+
+def test_check_staged_python_rejects_unbundled_libpython(
+    monkeypatch, tmp_path: Path
+) -> None:
+    stage = tmp_path / "stage"
+    _write_fake_python(stage)
+    module = _load_check_module()
+
+    monkeypatch.setattr(
+        module, "_elf_machine", lambda _path: module.ELF_MACHINE_AARCH64
+    )
+    monkeypatch.setattr(
+        module,
+        "_needed_libraries",
+        lambda _path: ("libpython3.11.so.1.0", "libc.so.6"),
+    )
+
+    with pytest.raises(RuntimeError, match="unbundled libpython"):
+        module.check_staged_python(
+            stage, target_arch="arm64", python_version="3.11", python_home="/usr/bin"
+        )
+
+
+def test_check_staged_python_rejects_missing_dynamic_library(
+    monkeypatch, tmp_path: Path
+) -> None:
+    stage = tmp_path / "stage"
+    _write_fake_python(stage)
+    module = _load_check_module()
+
+    monkeypatch.setattr(
+        module, "_elf_machine", lambda _path: module.ELF_MACHINE_AARCH64
+    )
+    monkeypatch.setattr(module, "_needed_libraries", lambda _path: ("libc.so.6",))
+    monkeypatch.setattr(
+        module,
+        "_missing_dynamic_libraries",
+        lambda _path: ("libpython3.11.so.1.0",),
+    )
+
+    with pytest.raises(RuntimeError, match="unresolved dynamic libraries"):
+        module.check_staged_python(
+            stage, target_arch="arm64", python_version="3.11", python_home="/usr/bin"
+        )
+
+
+def test_check_staged_python_accepts_target_compatible_interpreter(
+    monkeypatch, tmp_path: Path
+) -> None:
+    stage = tmp_path / "stage"
+    _write_fake_python(stage)
+    module = _load_check_module()
+
+    monkeypatch.setattr(
+        module, "_elf_machine", lambda _path: module.ELF_MACHINE_AARCH64
+    )
+    monkeypatch.setattr(module, "_needed_libraries", lambda _path: ("libc.so.6",))
+    monkeypatch.setattr(module, "_missing_dynamic_libraries", lambda _path: ())
+
+    module.check_staged_python(
+        stage, target_arch="arm64", python_version="3.11", python_home="/usr/bin"
+    )

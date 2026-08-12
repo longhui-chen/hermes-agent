@@ -2927,7 +2927,7 @@ class ZetAgentAdapter(APIServerAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            "session_db": None if silent_execution else self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
@@ -3147,10 +3147,10 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
-        business_execution_token: Optional[str] = None,
+        hardware_execution_token: Optional[str] = None,
+        business_execution_action: Optional[str] = None,
+        business_execution_action_version: Optional[str] = None,
         execution_policy: Optional[str] = None,
-        execution_scope_digest: Optional[str] = None,
-        execution_request_digest: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
@@ -3179,9 +3179,8 @@ class ZetAgentAdapter(APIServerAdapter):
             agent_ref = [None]
 
         if (
-            business_execution_token
-            and not gateway_sensitive_process_boundary_ready()
-        ):
+            business_execution_action or hardware_execution_token
+        ) and not gateway_sensitive_process_boundary_ready():
             raise PermissionError(
                 "gateway process memory boundary is unavailable"
             )
@@ -3196,22 +3195,25 @@ class ZetAgentAdapter(APIServerAdapter):
             ack_revision_requested = (
                 "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
             )
-        scoped_business_execution_token = str(business_execution_token or "")
+        scoped_hardware_execution_token = str(
+            hardware_execution_token or ""
+        ).strip()
+        scoped_business_execution_action = str(
+            business_execution_action or ""
+        ).strip()
+        scoped_business_execution_action_version = str(
+            business_execution_action_version or ""
+        ).strip()
         if ack_status == "cancelled" or (ack_status and not ack_turn_id):
-            # Legacy receipts remain visible to released clients, but cannot
-            # carry the newer turn-bound side-effect capability. Cancellation
-            # similarly preserves the receipt while revoking execution.
-            scoped_business_execution_token = ""
-        # ``plan_ack`` is a UI receipt, not part of the HMAC proof.  It may
+            # A cancelled or malformed plan acknowledgement cannot carry the
+            # turn-bound side-effect capability into the resumed turn.
+            scoped_hardware_execution_token = ""
+            scoped_business_execution_action = ""
+            scoped_business_execution_action_version = ""
+        # ``plan_ack`` is a UI receipt, not part of ActionV1. It may
         # revoke the side-effect capability on cancellation, but it must not
         # turn a verified silent turn back into an ordinary memory/tool turn.
         scoped_execution_policy = str(execution_policy or "").strip().lower()
-        scoped_execution_scope_digest = str(
-            execution_scope_digest or ""
-        ).strip().lower()
-        scoped_execution_request_digest = str(
-            execution_request_digest or ""
-        ).strip().lower()
         if scoped_execution_policy == "silent_automation":
             # Silent execution is a receipt-bound workflow, never a caller
             # supplied interaction mode or plan acknowledgement.
@@ -3256,7 +3258,9 @@ class ZetAgentAdapter(APIServerAdapter):
 
         from gateway.session_context import (
             clear_turn_vars,
+            pop_execution_session_key,
             pop_zettlab_turn_title,
+            push_execution_session_key,
             push_zettlab_turn_title,
             set_turn_vars,
             summarize_turn_title,
@@ -3267,10 +3271,15 @@ class ZetAgentAdapter(APIServerAdapter):
             plan_ack_status=ack_status,
             plan_ack_turn_id=ack_turn_id,
             plan_ack_revision_requested=ack_revision_requested,
-            business_execution_token=scoped_business_execution_token,
+            hardware_execution_token=scoped_hardware_execution_token,
+            business_execution_action=scoped_business_execution_action,
+            business_execution_action_version=(
+                scoped_business_execution_action_version
+            ),
             execution_policy=scoped_execution_policy,
-            execution_scope_digest=scoped_execution_scope_digest,
-            execution_request_digest=scoped_execution_request_digest,
+        )
+        execution_session_token = push_execution_session_key(
+            str(gateway_session_key or "")
         )
         # This turn's ledger card title (X-Task-Title). Bound here, before the
         # base adapter's copy_context() hands the request to its executor, so
@@ -3332,10 +3341,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
-                business_execution_token=scoped_business_execution_token,
+                hardware_execution_token=scoped_hardware_execution_token,
+                business_execution_action=scoped_business_execution_action,
+                business_execution_action_version=(
+                    scoped_business_execution_action_version
+                ),
                 execution_policy=scoped_execution_policy,
-                execution_scope_digest=scoped_execution_scope_digest,
-                execution_request_digest=scoped_execution_request_digest,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
@@ -3507,8 +3518,11 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 reset_current_session_key(approval_session_token)
             finally:
-                clear_turn_vars(turn_context_tokens)
-                pop_zettlab_turn_title(turn_title_token)
+                try:
+                    clear_turn_vars(turn_context_tokens)
+                finally:
+                    pop_execution_session_key(execution_session_token)
+                    pop_zettlab_turn_title(turn_title_token)
 
     def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
         """Return the model this session will actually use this turn: the
@@ -6141,11 +6155,10 @@ class ZetAgentAdapter(APIServerAdapter):
         downstream ``await request.json()`` inside the base handler reuses
         them — we only pay one read.
         """
-        raw_business_token = request.headers.get(
-            "X-Zettlab-Business-Execution-Token",
-            "",
+        raw_business_action = request.headers.get(
+            "X-Zettlab-Business-Execution-Action", ""
         )
-        if raw_business_token and not gateway_sensitive_process_boundary_ready():
+        if raw_business_action and not gateway_sensitive_process_boundary_ready():
             return web.json_response(
                 _openai_error(
                     "ZetAgent process memory boundary is unavailable",

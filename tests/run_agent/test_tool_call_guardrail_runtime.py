@@ -5,7 +5,9 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.trusted_tool_result import TrustedToolResult
 from run_agent import AIAgent
+from tools import terminal_tool as terminal_tool_module
 
 
 def _make_tool_defs(*names: str) -> list[dict]:
@@ -217,12 +219,15 @@ def test_trusted_video_runtime_non_retryable_exit_halts_default_turn():
         tool_calls=[_mock_tool_call("terminal", '{"command":"resume-state"}', "c-terminal")],
     )
     agent.client.chat.completions.create.return_value = response
-    trusted_failure = json.dumps(
-        {
-            "video_edit_runtime_direct": True,
-            "exit_code": 2,
-            "output": '{"ok":false,"error":"workflow_state_not_found","terminal_failure":true}',
-        }
+    trusted_failure = TrustedToolResult(
+        json.dumps(
+            {
+                "video_edit_runtime_direct": True,
+                "exit_code": 2,
+                "output": '{"ok":false,"error":"workflow_state_not_found"}',
+            }
+        ),
+        terminal_failure_reason="workflow_state_not_found",
     )
 
     with (
@@ -237,6 +242,140 @@ def test_trusted_video_runtime_non_retryable_exit_halts_default_turn():
     assert result["turn_exit_reason"] == "guardrail_halt"
     assert result["guardrail"]["code"] == "trusted_runtime_terminal_failure"
     assert "stopped retrying" in result["final_response"]
+
+
+def test_raw_video_terminal_failure_halts_once_and_skips_later_calls(
+    monkeypatch, tmp_path
+):
+    """The signed terminal envelope must stop the turn before skill/model work."""
+    agent = _make_agent("terminal", "skill_view", max_iterations=4)
+    response = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[
+            _mock_tool_call(
+                "terminal",
+                '{"command":"python3 \\\"$ZETTLAB_PRESETS_DIR/skills/'
+                'video-edit-workflow-mini/scripts/preference_resolver.py\\\" '
+                'resolve-freeze"}',
+                "c-checkpoint",
+            ),
+            _mock_tool_call(
+                "skill_view",
+                '{"name":"video-edit-workflow-mini"}',
+                "c-skill-view",
+            ),
+        ],
+    )
+    model_calls = []
+
+    def model_call(*args, **kwargs):
+        model_calls.append((args, kwargs))
+        return response
+
+    agent.client.chat.completions.create.side_effect = model_call
+
+    script = (
+        tmp_path
+        / "presets"
+        / "skills"
+        / "video-edit-workflow-mini"
+        / "scripts"
+        / "preference_resolver.py"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text("print('runner is replaced in this regression')\n", encoding="utf-8")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(terminal_tool_module, "_CONNECTOR_RUNTIME_ROOT_ANCHOR", None)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_trusted_video_edit_release_digests",
+        lambda: dict(
+            terminal_tool_module._capture_connector_runtime_root().file_digests
+        ),
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_run_video_edit_worker",
+        lambda payload, *, timeout: {
+            "stdout": (
+                '{"ok":false,"reason":'
+                '"workflow_checkpoint_identity_invalid"}'
+            ),
+            "stderr": "",
+            "returncode": 2,
+        },
+    )
+    monkeypatch.setattr(
+        "agent.zet_agent_response_mode.trusted_video_edit_runtime_receipt",
+        lambda: {
+            "ZET_AGENT_ID": "agent-1",
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
+            "HERMES_TURN_ID": "turn-1",
+            "HERMES_SESSION_KEY": "session-1",
+            "HERMES_GATEWAY_SESSION_KEY": "stable-session-1",
+        },
+    )
+
+    dispatch_names = []
+    raw_results = []
+
+    def dispatch(function_name, function_args, *args, **kwargs):
+        del args, kwargs
+        dispatch_names.append(function_name)
+        if function_name == "terminal":
+            raw_result = terminal_tool_module._run_video_edit_runtime_command_if_allowed(
+                function_args["command"],
+                cwd=str(tmp_path),
+                timeout=5,
+            )
+            raw_results.append(raw_result)
+            return raw_result
+        raise AssertionError(f"unexpected post-halt dispatch: {function_name}")
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("剪辑")
+
+    assert dispatch_names == ["terminal"]
+    assert len(raw_results) == 1
+    assert isinstance(raw_results[0], TrustedToolResult)
+    assert raw_results[0].terminal_failure_reason == (
+        "workflow_checkpoint_identity_invalid"
+    )
+    assert json.loads(raw_results[0]) == {
+        "output": '{"ok":false,"reason":"workflow_checkpoint_identity_invalid"}',
+        "exit_code": 2,
+        "error": None,
+        "video_edit_runtime_direct": True,
+    }
+    assert sum(name == "skill_view" for name in dispatch_names) == 0
+    assert len(model_calls) == 1
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "trusted_runtime_terminal_failure"
+    assert sum(
+        message.get("role") == "assistant"
+        and "stopped retrying" in str(message.get("content", ""))
+        for message in result["messages"]
+    ) == 1
+    cancelled = [
+        message
+        for message in result["messages"]
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "c-skill-view"
+    ]
+    assert len(cancelled) == 1
+    assert "guardrail halt" in cancelled[0]["content"]
 
 
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():

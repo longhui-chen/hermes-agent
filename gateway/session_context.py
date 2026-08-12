@@ -125,8 +125,27 @@ _PLAN_ACK_REVISION_REQUESTED: ContextVar = ContextVar(
     "HERMES_PLAN_ACK_REVISION_REQUESTED",
     default=_UNSET,
 )
-_BUSINESS_EXECUTION_TOKEN: ContextVar = ContextVar(
+_BUSINESS_EXECUTION_ACTION: ContextVar = ContextVar(
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION",
+    default=_UNSET,
+)
+_BUSINESS_EXECUTION_ACTION_VERSION: ContextVar = ContextVar(
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
+    default=_UNSET,
+)
+# Legacy-named capability retained only for hardware skills such as camsnap.
+# It stays outside _VAR_MAP so generic subprocesses cannot inherit it, and it
+# must never be used as a fallback for the ActionV1 video path.
+_HARDWARE_EXECUTION_TOKEN: ContextVar = ContextVar(
     "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    default=_UNSET,
+)
+# Stable caller session bound alongside an ActionV1 receipt. It stays
+# outside _VAR_MAP so generic subprocesses cannot inherit authorization
+# identity, and remains available when an interaction resumes without the
+# API-server's transient session ContextVars.
+_EXECUTION_SESSION_KEY: ContextVar = ContextVar(
+    "ZETTLAB_EXECUTION_SESSION_KEY",
     default=_UNSET,
 )
 # The verified per-turn execution policy is kept separate from the legacy
@@ -136,18 +155,6 @@ _EXECUTION_POLICY: ContextVar = ContextVar(
     "HERMES_EXECUTION_POLICY",
     default=_UNSET,
 )
-# Digest returned by local-server after exact generic scope validation. It is
-# task-local authorization data and is exposed only through a dedicated trusted
-# runner receipt, never through the generic session environment map.
-_EXECUTION_SCOPE_DIGEST: ContextVar = ContextVar(
-    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
-    default=_UNSET,
-)
-_EXECUTION_REQUEST_DIGEST: ContextVar = ContextVar(
-    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
-    default=_UNSET,
-)
-
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -209,6 +216,24 @@ def set_zettlab_turn_id(turn_id: str) -> None:
 
 def zettlab_turn_id() -> str:
     return _ZETTLAB_TURN_ID.get().strip()
+
+
+def push_execution_session_key(value: str):
+    """Bind the stable session identity for one business-execution turn."""
+    return _EXECUTION_SESSION_KEY.set(str(value or "").strip())
+
+
+def pop_execution_session_key(token) -> None:
+    """Restore the business-execution session identity preceding this turn."""
+    _EXECUTION_SESSION_KEY.reset(token)
+
+
+def execution_session_key() -> str:
+    """Return the stable session key frozen at the execution boundary."""
+    value = _EXECUTION_SESSION_KEY.get()
+    if value is _UNSET or value is None:
+        return ""
+    return str(value).strip()
 
 
 def push_zettlab_turn_title(title: str):
@@ -307,10 +332,10 @@ def set_turn_vars(
     plan_ack_status: str = "",
     plan_ack_turn_id: str = "",
     plan_ack_revision_requested: str = "",
-    business_execution_token: str = "",
+    hardware_execution_token: str = "",
+    business_execution_action: str = "",
+    business_execution_action_version: str = "",
     execution_policy: str = "",
-    execution_scope_digest: str = "",
-    execution_request_digest: str = "",
 ) -> list:
     """Bind one request's turn identity and plan receipt task-locally."""
     global _session_context_engaged
@@ -321,10 +346,12 @@ def set_turn_vars(
         _PLAN_ACK_STATUS.set(plan_ack_status),
         _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
         _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
-        _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
+        _HARDWARE_EXECUTION_TOKEN.set(hardware_execution_token),
+        _BUSINESS_EXECUTION_ACTION.set(business_execution_action),
+        _BUSINESS_EXECUTION_ACTION_VERSION.set(
+            str(business_execution_action_version or "").strip()
+        ),
         _EXECUTION_POLICY.set(execution_policy),
-        _EXECUTION_SCOPE_DIGEST.set(execution_scope_digest),
-        _EXECUTION_REQUEST_DIGEST.set(execution_request_digest),
     ]
 
 
@@ -337,10 +364,10 @@ def clear_turn_vars(tokens: list) -> None:
             _PLAN_ACK_STATUS,
             _PLAN_ACK_TURN_ID,
             _PLAN_ACK_REVISION_REQUESTED,
-            _BUSINESS_EXECUTION_TOKEN,
+            _HARDWARE_EXECUTION_TOKEN,
+            _BUSINESS_EXECUTION_ACTION,
+            _BUSINESS_EXECUTION_ACTION_VERSION,
             _EXECUTION_POLICY,
-            _EXECUTION_SCOPE_DIGEST,
-            _EXECUTION_REQUEST_DIGEST,
         ),
         tokens,
     ):
@@ -365,16 +392,30 @@ def current_turn_identity() -> tuple[str, object] | None:
     return normalized_turn_id, binding
 
 
-def business_execution_token() -> str:
-    """Return the task-local capability for the trusted video executor only.
+def business_execution_action() -> str:
+    """Return the task-local opaque ActionV1 for the video executor only."""
+    value = _BUSINESS_EXECUTION_ACTION.get()
+    if value is _UNSET or value is None:
+        return ""
+    normalized = str(value).strip()
+    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
 
-    This value intentionally lives outside ``_VAR_MAP`` so generic terminal,
-    execute-code, plugin, and model-driving subprocesses cannot inherit it.
-    """
-    value = _BUSINESS_EXECUTION_TOKEN.get()
+
+def business_execution_action_version() -> str:
+    """Return the frozen ActionV1 transport version for this turn."""
+    value = _BUSINESS_EXECUTION_ACTION_VERSION.get()
     if value is _UNSET or value is None:
         return ""
     return str(value).strip()
+
+
+def hardware_execution_token() -> str:
+    """Return the task-local opaque capability for trusted hardware helpers."""
+    value = _HARDWARE_EXECUTION_TOKEN.get()
+    if value is _UNSET or value is None:
+        return ""
+    normalized = str(value).strip()
+    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
 
 
 def execution_policy() -> str:
@@ -388,24 +429,6 @@ def execution_policy() -> str:
     if value is _UNSET or value is None:
         return ""
     return str(value).strip().lower()
-
-
-def execution_scope_digest() -> str:
-    """Return the local-server-validated generic execution scope digest."""
-    value = _EXECUTION_SCOPE_DIGEST.get()
-    if value is _UNSET or value is None:
-        return ""
-    normalized = str(value).strip().lower()
-    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
-
-
-def execution_request_digest() -> str:
-    """Return the local-server-validated request digest for silent turns."""
-    value = _EXECUTION_REQUEST_DIGEST.get()
-    if value is _UNSET or value is None:
-        return ""
-    normalized = str(value).strip().lower()
-    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -615,9 +638,11 @@ def reset_session_vars() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
-    _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
+    _HARDWARE_EXECUTION_TOKEN.set(_UNSET)
+    _BUSINESS_EXECUTION_ACTION.set(_UNSET)
+    _BUSINESS_EXECUTION_ACTION_VERSION.set(_UNSET)
+    _EXECUTION_SESSION_KEY.set(_UNSET)
     _EXECUTION_POLICY.set(_UNSET)
-    _EXECUTION_SCOPE_DIGEST.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.

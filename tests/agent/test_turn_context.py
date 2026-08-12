@@ -426,7 +426,8 @@ description: Trusted video-edit execution flow test
     )
     turn_tokens = set_turn_vars(
         turn_id="external-api-turn",
-        business_execution_token="business-token",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     try:
         agent = _FakeAgent()
@@ -464,7 +465,10 @@ description: Trusted video-edit execution flow test
             function_args=terminal_args,
         ) is None
 
-        business_token = session_context_module._BUSINESS_EXECUTION_TOKEN.set("")
+        action_token = session_context_module._BUSINESS_EXECUTION_ACTION.set("")
+        action_version_token = (
+            session_context_module._BUSINESS_EXECUTION_ACTION_VERSION.set("")
+        )
         session_key_token = session_context_module._SESSION_KEY.set("")
         empty_secret_token = secret_scope_module.set_secret_scope({})
         try:
@@ -473,11 +477,10 @@ description: Trusted video-edit execution flow test
             def _dispatch():
                 runtime_env = build_video_edit_runtime_env({})
                 assert runtime_env["ZET_AGENT_ID"] == "main"
-                assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
-                assert (
-                    runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
-                    == "business-token"
-                )
+                assert "ZETTLAB_AGENT_ACTION_TOKEN" not in runtime_env
+                assert runtime_env["ZETTLAB_BUSINESS_EXECUTION_ACTION"] == "a" * 64
+                assert runtime_env["ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION"] == "1"
+                assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in runtime_env
                 assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
                 assert (
                     runtime_env["HERMES_SESSION_KEY"]
@@ -501,7 +504,10 @@ description: Trusted video-edit execution flow test
         finally:
             secret_scope_module.reset_secret_scope(empty_secret_token)
             session_context_module._SESSION_KEY.reset(session_key_token)
-            session_context_module._BUSINESS_EXECUTION_TOKEN.reset(business_token)
+            session_context_module._BUSINESS_EXECUTION_ACTION_VERSION.reset(
+                action_version_token
+            )
+            session_context_module._BUSINESS_EXECUTION_ACTION.reset(action_token)
     finally:
         response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
         clear_turn_vars(turn_tokens)
@@ -543,7 +549,8 @@ def test_video_edit_followup_turn_reuses_same_session_capability_flow(
     )
     turn_tokens = set_turn_vars(
         turn_id="video-turn-1",
-        business_execution_token="business-token-1",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
     try:
@@ -563,7 +570,8 @@ def test_video_edit_followup_turn_reuses_same_session_capability_flow(
         clear_turn_vars(turn_tokens)
         turn_tokens = set_turn_vars(
             turn_id="video-turn-2",
-            business_execution_token="business-token-2",
+            business_execution_action="b" * 64,
+            business_execution_action_version="1",
         )
         response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
         resumed_agent = _FakeAgent()
@@ -757,7 +765,8 @@ def test_confirmed_plan_ack_inherits_only_bound_video_edit_turn_unit():
             turn_id="video-confirm-turn",
             plan_ack_status="confirmed",
             plan_ack_turn_id="video-plan-turn",
-            business_execution_token="business-token",
+            business_execution_action="a" * 64,
+            business_execution_action_version="1",
         )
         try:
             confirmed_agent = _FakeAgent()
@@ -775,7 +784,8 @@ def test_confirmed_plan_ack_inherits_only_bound_video_edit_turn_unit():
             turn_id="other-confirm-turn",
             plan_ack_status="confirmed",
             plan_ack_turn_id="unrelated-plan-turn",
-            business_execution_token="business-token",
+            business_execution_action="a" * 64,
+            business_execution_action_version="1",
         )
         try:
             mismatched_agent = _FakeAgent()
@@ -926,7 +936,8 @@ def test_raw_slash_text_cannot_mint_trusted_video_scope_flow(
     )
     turn_tokens = set_turn_vars(
         turn_id="raw-slash-turn",
-        business_execution_token="business-token",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     try:
         agent = _FakeAgent()
@@ -982,7 +993,8 @@ def test_model_switch_note_video_edit_resume_scope_flow(tmp_path, monkeypatch):
     )
     turn_tokens = set_turn_vars(
         turn_id="model-switch-video-turn",
-        business_execution_token="business-token",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
     try:
@@ -1291,7 +1303,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
     secret_token = secret_scope_module.set_secret_scope(
         {
             "ZET_AGENT_ID": "main",
-            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "a" * 64,
         }
     )
     session_tokens = set_session_vars(
@@ -1300,7 +1312,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
     )
     turn_tokens = set_turn_vars(
         turn_id="camera-turn",
-        business_execution_token="business-token",
+        hardware_execution_token="b" * 64,
     )
     try:
         with pytest.raises(PermissionError):
@@ -1328,8 +1340,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
             frozen = build_camera_runtime_env()
             assert frozen == {
                 "ZET_AGENT_ID": "main",
-                "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-token",
+                "ZETTLAB_AGENT_ACTION_TOKEN": "a" * 64,
+                "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "b" * 64,
                 "HERMES_TURN_ID": "camera-turn",
                 "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
                 "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",

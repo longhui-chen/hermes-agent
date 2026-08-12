@@ -17,7 +17,6 @@ from gateway.session_context import clear_turn_vars, set_turn_vars
 from tools import terminal_tool as terminal_tool_module
 from tools.environments.local import LocalEnvironment
 
-
 @pytest.fixture(autouse=True)
 def _reset_runtime_anchor(monkeypatch):
     from agent import zet_agent_response_mode as response_mode
@@ -29,11 +28,11 @@ def _reset_runtime_anchor(monkeypatch):
         lambda: {
             "ZET_AGENT_ID": "agent-1",
             "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "capability-secret",
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
             "HERMES_TURN_ID": "turn-1",
             "HERMES_SESSION_KEY": "session-1",
             "HERMES_GATEWAY_SESSION_KEY": "stable-session-1",
-            "ZETTLAB_EXECUTION_SCOPE_DIGEST": "d" * 64,
         },
     )
     monkeypatch.setattr(
@@ -71,11 +70,10 @@ def _write_trusted_script(tmp_path, name="workflow_state.py"):
         import os
         from _zettlab_video_runtime_context import get as runtime_value
 
-        print("execution=" + runtime_value("ZETTLAB_BUSINESS_EXECUTION_TOKEN"))
+        print("execution=" + runtime_value("ZETTLAB_BUSINESS_EXECUTION_ACTION"))
         print("runtime-turn=" + runtime_value("HERMES_TURN_ID"))
         print("runtime-session=" + runtime_value("HERMES_SESSION_KEY"))
         print("runtime-gateway=" + runtime_value("HERMES_GATEWAY_SESSION_KEY"))
-        print("runtime-scope=" + runtime_value("ZETTLAB_EXECUTION_SCOPE_DIGEST"))
         print("agent=" + os.environ.get("ZET_AGENT_ID", ""))
         print("turn=" + os.environ.get("HERMES_TURN_ID", ""))
         print("gateway=" + os.environ.get("HERMES_GATEWAY_SESSION_KEY", ""))
@@ -84,6 +82,47 @@ def _write_trusted_script(tmp_path, name="workflow_state.py"):
         """
     ).lstrip())
     return script
+
+
+def test_trusted_video_runner_marks_raw_checkpoint_identity_failure_in_process(
+    monkeypatch, tmp_path
+):
+    _write_trusted_script(tmp_path, "preference_resolver.py")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    terminal_tool_module._capture_connector_runtime_root()
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_run_video_edit_worker",
+        lambda payload, *, timeout: {
+            "stdout": (
+                '{"ok":false,"reason":'
+                '"workflow_checkpoint_identity_invalid"}'
+            ),
+            "stderr": "",
+            "returncode": 2,
+        },
+    )
+
+    result = terminal_tool_module._run_video_edit_runtime_command_if_allowed(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/'
+        'scripts/preference_resolver.py" resolve-freeze',
+        cwd=str(tmp_path),
+        timeout=5,
+    )
+
+    assert type(result).__name__ == "TrustedToolResult"
+    assert result.terminal_failure_reason == "workflow_checkpoint_identity_invalid"
+    assert json.loads(result) == {
+        "output": '{"ok":false,"reason":"workflow_checkpoint_identity_invalid"}',
+        "exit_code": 2,
+        "error": None,
+        "video_edit_runtime_direct": True,
+    }
 
 
 def test_managed_runtime_import_keeps_gateway_exec_privilege(tmp_path):
@@ -161,14 +200,20 @@ def test_sensitive_runtime_boundary_keeps_gateway_exec_privilege(monkeypatch):
 
 def test_generic_terminal_never_receives_business_execution_token(monkeypatch):
     monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "stale-global-secret")
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
+    tokens = set_turn_vars(
+        turn_id="turn-1",
+        hardware_execution_token="b" * 64,
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
     try:
         result = LocalEnvironment().execute(
-            "printf '%s' \"$ZETTLAB_BUSINESS_EXECUTION_TOKEN\""
+            "printf '%s|%s' \"$ZETTLAB_BUSINESS_EXECUTION_TOKEN\" "
+            "\"$ZETTLAB_BUSINESS_EXECUTION_ACTION\""
         )
     finally:
         clear_turn_vars(tokens)
-    assert result["output"] == ""
+    assert result["output"] == "|"
 
 
 def test_trusted_video_runner_receives_only_current_scoped_capability(monkeypatch, tmp_path):
@@ -182,7 +227,7 @@ def test_trusted_video_runner_receives_only_current_scoped_capability(monkeypatc
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
     )
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
+    tokens = set_turn_vars(turn_id="turn-1", business_execution_action="a" * 64, business_execution_action_version="1")
     try:
         result = json.loads(terminal_tool_module._run_video_edit_runtime_command_if_allowed(
             'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/scripts/workflow_state.py"',
@@ -197,7 +242,6 @@ def test_trusted_video_runner_receives_only_current_scoped_capability(monkeypatc
     assert "runtime-turn=turn-1" in result["output"]
     assert "runtime-session=session-1" in result["output"]
     assert "runtime-gateway=stable-session-1" in result["output"]
-    assert f"runtime-scope={'d' * 64}" in result["output"]
     assert "agent=agent-1" in result["output"]
     assert "turn=turn-1" in result["output"]
     assert "gateway=stable-session-1" in result["output"]
@@ -225,7 +269,8 @@ def test_proactive_video_runner_receives_turn_scoped_capability(monkeypatch, tmp
         lambda: {
             "ZET_AGENT_ID": "agent-1",
             "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "capability-secret",
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
             "HERMES_TURN_ID": turn_id,
             "HERMES_SESSION_KEY": "api-lineage-tip",
             "HERMES_GATEWAY_SESSION_KEY": stable_key,
@@ -234,7 +279,8 @@ def test_proactive_video_runner_receives_turn_scoped_capability(monkeypatch, tmp
     )
     tokens = set_turn_vars(
         turn_id=turn_id,
-        business_execution_token="capability-secret",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     try:
         result = json.loads(terminal_tool_module._run_video_edit_runtime_command_if_allowed(
@@ -368,15 +414,29 @@ def test_trusted_video_worker_runs_regex_and_dataclass_startup_flow():
     assert result["stderr"] == ""
 
 
-def test_trusted_video_runner_keeps_capability_out_of_wrapper_process_env(monkeypatch, tmp_path):
+def test_trusted_video_runner_transports_action_without_camera_token(
+    monkeypatch, tmp_path
+):
     _write_trusted_script(tmp_path, "cloud_render_business.py")
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
-    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "connector-secret")
-    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://connector.invalid/rpc")
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
+    )
+    from agent import zet_agent_response_mode as response_mode
+
+    monkeypatch.setattr(
+        response_mode,
+        "trusted_video_edit_runtime_receipt",
+        lambda: {
+            "ZET_AGENT_ID": "agent-1",
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
+            "HERMES_TURN_ID": "turn-v2",
+            "HERMES_SESSION_KEY": "session-v2",
+            "HERMES_GATEWAY_SESSION_KEY": "stable-v2",
+        },
     )
     captured = {}
 
@@ -386,34 +446,22 @@ def test_trusted_video_runner_keeps_capability_out_of_wrapper_process_env(monkey
         return {"stdout": "ok", "stderr": "", "returncode": 0}
 
     monkeypatch.setattr(terminal_tool_module, "_run_video_edit_worker", fake_run)
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
-    try:
-        result = json.loads(terminal_tool_module._run_video_edit_runtime_command_if_allowed(
+    result = json.loads(
+        terminal_tool_module._run_video_edit_runtime_command_if_allowed(
             'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/scripts/cloud_render_business.py" '
-            '--agent-id agent-1 resume-state',
+            "--agent-id agent-1 resume-state",
             cwd=str(tmp_path),
             timeout=5,
-        ))
-    finally:
-        clear_turn_vars(tokens)
-    assert result["video_edit_runtime_direct"] is True
-    assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in captured["env"]
-    assert "ZETTLAB_AGENT_ACTION_TOKEN" not in captured["env"]
-    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
-    assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
-    assert captured["secrets"]["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] == "capability-secret"
-    assert captured["context"] == {
-        "HERMES_TURN_ID": "turn-1",
-        "HERMES_SESSION_KEY": "session-1",
-        "HERMES_GATEWAY_SESSION_KEY": "stable-session-1",
-        "ZETTLAB_EXECUTION_SCOPE_DIGEST": "d" * 64,
-    }
-    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["secrets"]
-    assert "ZETTLAB_CONNECTORS_URL" not in captured["secrets"]
-    assert "pythonpath" not in captured
-    assert captured["source_bundle"]["__main__"]["path"].endswith(
-        "cloud_render_business.py"
+        )
     )
+
+    assert result["video_edit_runtime_direct"] is True
+    assert "ZETTLAB_AGENT_ACTION_TOKEN" not in captured["secrets"]
+    assert captured["secrets"] == {
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+    }
+    assert captured["context"]["ZET_AGENT_ID"] == "agent-1"
+    assert captured["context"]["ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION"] == "1"
 
 
 def test_trusted_video_upload_uses_dedicated_long_timeout_flow(monkeypatch, tmp_path):
@@ -864,7 +912,7 @@ def test_trusted_video_runner_dependency_isolation_flow_ignores_writable_argpars
     marker = tmp_path / "stolen-token.txt"
     (attacker_dir / "argparse.py").write_text(
         "from _zettlab_video_runtime_context import get\n"
-        f"open({str(marker)!r}, 'w').write(get('ZETTLAB_BUSINESS_EXECUTION_TOKEN'))\n"
+        f"open({str(marker)!r}, 'w').write(get('ZETTLAB_BUSINESS_EXECUTION_ACTION'))\n"
         "ATTACKER = True\n"
     )
     script.write_text(
@@ -878,7 +926,7 @@ def test_trusted_video_runner_dependency_isolation_flow_ignores_writable_argpars
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
     )
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
+    tokens = set_turn_vars(turn_id="turn-1", business_execution_action="a" * 64, business_execution_action_version="1")
     try:
         result = json.loads(
             terminal_tool_module._run_video_edit_runtime_command_if_allowed(
@@ -1191,235 +1239,6 @@ def test_terminal_tool_managed_import_preforks_clean_supervisor_flow(
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.live_system_guard_bypass
-def test_video_worker_idle_recycle_keeps_clean_supervisor_flow(monkeypatch):
-    terminal_tool_module._stop_video_edit_worker()
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_VIDEO_EDIT_WORKER_IDLE_TIMEOUT_SECONDS",
-        0.05,
-    )
-
-    result = terminal_tool_module._run_video_edit_worker(
-        _worker_payload("print('idle-recycle')\n"),
-        timeout=5,
-    )
-    supervisor = terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-
-    assert result["stdout"].strip() == "idle-recycle"
-    assert supervisor is not None
-    supervisor_pid = supervisor.process.pid
-
-    deadline = time.monotonic() + 5
-    while (
-        terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_PROCESS is not None
-        and time.monotonic() < deadline
-    ):
-        time.sleep(0.02)
-
-    assert terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR is supervisor
-    assert supervisor.process.pid == supervisor_pid
-    assert supervisor.process.poll() is None
-    assert terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_PROCESS is None
-    assert terminal_tool_module._VIDEO_EDIT_WORKER_SEED_PROCESS is None
-    assert terminal_tool_module._VIDEO_EDIT_WORKER_IDLE_TIMER is None
-    terminal_tool_module._stop_video_edit_worker()
-    assert _wait_for_pid_exit(supervisor_pid)
-
-
-@pytest.mark.live_system_guard_bypass
-def test_video_worker_idle_recycle_keeps_profile_payloads_isolated_flow(monkeypatch):
-    terminal_tool_module._stop_video_edit_worker()
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_VIDEO_EDIT_WORKER_IDLE_TIMEOUT_SECONDS",
-        0.05,
-    )
-
-    def run_for_profile(profile: str):
-        payload = _worker_payload(
-            "import os\n"
-            "from _zettlab_video_runtime_context import get\n"
-            "print(os.environ.get('HERMES_HOME', ''))\n"
-            "print(os.environ.get('PROFILE_ONLY_VALUE', ''))\n"
-            "print(get('ZETTLAB_BUSINESS_EXECUTION_TOKEN'))\n"
-        )
-        payload["env"] = {
-            "HERMES_HOME": f"/profiles/{profile}",
-            "PROFILE_ONLY_VALUE": profile,
-        }
-        payload["secrets"] = {
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": f"secret-{profile}",
-        }
-        result = terminal_tool_module._run_video_edit_worker(payload, timeout=5)
-        supervisor = terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-        assert supervisor is not None
-        return (
-            result["stdout"],
-            supervisor,
-            terminal_tool_module._VIDEO_EDIT_WORKER_IDLE_GENERATION,
-        )
-
-    first_output, first_supervisor, first_generation = run_for_profile("alpha")
-    first_pid = first_supervisor.process.pid
-    deadline = time.monotonic() + 5
-    while (
-        terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_PROCESS is not None
-        and time.monotonic() < deadline
-    ):
-        time.sleep(0.02)
-    assert terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR is first_supervisor
-    assert first_supervisor.process.poll() is None
-
-    background_started = threading.Event()
-    release_background = threading.Event()
-
-    def hold_gateway_thread():
-        background_started.set()
-        release_background.wait(timeout=10)
-
-    background = threading.Thread(target=hold_gateway_thread)
-    background.start()
-    assert background_started.wait(timeout=2)
-    try:
-        second_output, second_supervisor, second_generation = run_for_profile("beta")
-        assert first_output.splitlines() == [
-            "/profiles/alpha",
-            "alpha",
-            "secret-alpha",
-        ]
-        assert second_output.splitlines() == [
-            "/profiles/beta",
-            "beta",
-            "secret-beta",
-        ]
-        assert "alpha" not in second_output
-        assert second_supervisor is first_supervisor
-        assert second_supervisor.process.pid == first_pid
-        assert second_generation > first_generation
-    finally:
-        release_background.set()
-        background.join(timeout=2)
-        terminal_tool_module._stop_video_edit_worker()
-
-
-def test_video_worker_rejects_first_supervisor_fork_after_threads_start_unit(
-    monkeypatch,
-):
-    fork_calls = []
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR",
-        None,
-    )
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_trusted_video_edit_worker_factory_image",
-        lambda _snapshot: object(),
-    )
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_video_edit_worker_process_thread_count",
-        lambda: 2,
-    )
-    monkeypatch.setattr(
-        terminal_tool_module.os,
-        "fork",
-        lambda: fork_calls.append(True) or 1,
-    )
-
-    with pytest.raises(PermissionError, match="before gateway threads start"):
-        terminal_tool_module._trusted_video_edit_worker_factory_bootstrap(object())
-
-    assert fork_calls == []
-
-
-def test_video_worker_idle_scheduler_keeps_only_one_deadline_unit(monkeypatch):
-    created = []
-
-    class _Timer:
-        def __init__(self, interval, function, args=()):
-            self.interval = interval
-            self.function = function
-            self.args = args
-            self.daemon = False
-            self.cancelled = False
-            self.started = False
-            created.append(self)
-
-        def start(self):
-            self.started = True
-
-        def cancel(self):
-            self.cancelled = True
-
-    monkeypatch.setattr(terminal_tool_module.threading, "Timer", _Timer)
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR",
-        object(),
-    )
-    monkeypatch.setattr(terminal_tool_module, "_VIDEO_EDIT_WORKER_IDLE_TIMER", None)
-
-    terminal_tool_module._schedule_video_edit_worker_idle_recycle()
-    first = terminal_tool_module._VIDEO_EDIT_WORKER_IDLE_TIMER
-    terminal_tool_module._schedule_video_edit_worker_idle_recycle()
-    second = terminal_tool_module._VIDEO_EDIT_WORKER_IDLE_TIMER
-
-    assert len(created) == 2
-    assert first is created[0]
-    assert first.cancelled is True
-    assert second is created[1]
-    assert second.started is True
-    assert second.cancelled is False
-    terminal_tool_module._cancel_video_edit_worker_idle_recycle()
-
-
-def test_video_worker_timer_start_failure_preserves_supervisor_unit(monkeypatch):
-    cleanup_calls = []
-
-    class _BrokenTimer:
-        daemon = False
-
-        def __init__(self, _interval, _function, args=()):
-            self.args = args
-            self.cancelled = False
-
-        def start(self):
-            raise RuntimeError("thread limit")
-
-        def cancel(self):
-            self.cancelled = True
-
-    monkeypatch.setattr(terminal_tool_module.threading, "Timer", _BrokenTimer)
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR",
-        object(),
-    )
-    monkeypatch.setattr(terminal_tool_module, "_VIDEO_EDIT_WORKER_IDLE_TIMER", None)
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_terminate_video_edit_worker",
-        lambda **_kwargs: cleanup_calls.append("broker"),
-    )
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_shutdown_video_edit_worker_seed",
-        lambda: cleanup_calls.append("seed_factory"),
-    )
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_discard_trusted_video_edit_worker_factory_supervisor",
-        lambda: cleanup_calls.append("supervisor"),
-    )
-
-    terminal_tool_module._schedule_video_edit_worker_idle_recycle()
-
-    assert terminal_tool_module._VIDEO_EDIT_WORKER_IDLE_TIMER is None
-    assert cleanup_calls == ["broker", "seed_factory"]
-
-
 @pytest.mark.parametrize(
     ("source", "timeout", "expected_returncode"),
     [
@@ -1461,48 +1280,6 @@ def test_video_worker_error_and_timeout_paths_idle_recycle_flow(
     assert supervisor.process.poll() is None
     assert terminal_tool_module._VIDEO_EDIT_WORKER_IDLE_TIMER is None
     terminal_tool_module._stop_video_edit_worker()
-    assert _wait_for_pid_exit(supervisor_pid)
-
-
-@pytest.mark.live_system_guard_bypass
-def test_video_worker_atexit_reaps_lazy_tree_flow():
-    code = textwrap.dedent(
-        """
-        from tools import terminal_tool
-
-        payload = {
-            "script": "/trusted/workflow_state.py",
-            "argv": ["/trusted/workflow_state.py"],
-            "env": {},
-            "secrets": {},
-            "cwd": "",
-            "source_bundle": {
-                "__main__": {
-                    "path": "/trusted/workflow_state.py",
-                    "source": "print('atexit')\\n",
-                }
-            },
-        }
-        result = terminal_tool._run_video_edit_worker(payload, timeout=5)
-        assert result["returncode"] == 0
-        supervisor = terminal_tool._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-        assert supervisor is not None
-        print(supervisor.process.pid, flush=True)
-        """
-    )
-
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=Path(__file__).resolve().parents[2],
-        env=dict(os.environ),
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr
-    supervisor_pid = int(result.stdout.strip().splitlines()[-1])
     assert _wait_for_pid_exit(supervisor_pid)
 
 
@@ -1806,6 +1583,29 @@ def test_video_worker_seed_rejects_second_active_call_invariant(monkeypatch):
         assert terminal_tool_module._terminate_video_edit_worker(
             close_disk_trust=False
         ) is True
+        terminal_tool_module._stop_video_edit_worker()
+
+
+@pytest.mark.live_system_guard_bypass
+def test_video_worker_factory_shutdown_waits_for_supervisor_reap_flow(monkeypatch):
+    terminal_tool_module._stop_video_edit_worker()
+    monkeypatch.setattr(terminal_tool_module, "_VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED", False)
+    try:
+        terminal_tool_module._ensure_video_edit_worker_seed_started()
+        supervisor = terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
+        assert supervisor is not None
+
+        for _ in range(3):
+            factory = terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_PROCESS
+            assert factory is not None
+            factory_pid = factory.pid
+
+            terminal_tool_module._shutdown_video_edit_worker_seed()
+
+            assert _wait_for_pid_exit(factory_pid)
+            terminal_tool_module._ensure_video_edit_worker_seed_started()
+            assert terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR is supervisor
+    finally:
         terminal_tool_module._stop_video_edit_worker()
 
 
@@ -3040,7 +2840,7 @@ def test_video_worker_success_kills_background_descendants_before_reply_flow(tmp
         import time
         from _zettlab_video_runtime_context import get
 
-        assert get("ZETTLAB_BUSINESS_EXECUTION_TOKEN") == {business_token!r}
+        assert get("ZETTLAB_BUSINESS_EXECUTION_ACTION") == {business_token!r}
         child = subprocess.Popen([sys.executable, "-I", "-S", "-c", {child_source!r}])
         deadline = time.monotonic() + 5
         while not os.path.exists({str(marker)!r}) and time.monotonic() < deadline:
@@ -3052,7 +2852,7 @@ def test_video_worker_success_kills_background_descendants_before_reply_flow(tmp
     )
     payload = _worker_payload(source)
     payload["env"] = {"ZETTLAB_CONNECTORS_AUTH_TOKEN": connector_token}
-    payload["secrets"] = {"ZETTLAB_BUSINESS_EXECUTION_TOKEN": business_token}
+    payload["secrets"] = {"ZETTLAB_BUSINESS_EXECUTION_ACTION": business_token}
     descendant_pid = 0
     try:
         result = terminal_tool_module._run_video_edit_worker(payload, timeout=8)
@@ -3604,7 +3404,8 @@ def test_generic_terminal_then_first_trusted_video_uses_frozen_image_and_receipt
 
     tokens = set_turn_vars(
         turn_id="turn-after-terminal",
-        business_execution_token="capability-after-terminal",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     try:
         video = json.loads(

@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
+from agent.trusted_tool_result import TrustedToolResult
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -279,23 +280,11 @@ def _trusted_runtime_terminal_failure(tool_name: str, result: str | None) -> boo
     codes alone are intentionally not treated as control flow because some
     trusted helpers use exit code 2 for recoverable input guidance.
     """
-    if tool_name != "terminal" or not result:
-        return False
-    try:
-        payload = json.loads(result)
-    except (json.JSONDecodeError, TypeError):
-        return False
-    if (
-        not isinstance(payload, dict)
-        or payload.get("video_edit_runtime_direct") is not True
-        or not isinstance(payload.get("output"), str)
-    ):
-        return False
-    try:
-        helper_payload = json.loads(payload["output"])
-    except (json.JSONDecodeError, TypeError):
-        return False
-    return isinstance(helper_payload, dict) and helper_payload.get("terminal_failure") is True
+    return (
+        tool_name == "terminal"
+        and isinstance(result, TrustedToolResult)
+        and bool(result.terminal_failure_reason)
+    )
 
 
 class ToolCallGuardrailController:
@@ -388,7 +377,7 @@ class ToolCallGuardrailController:
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 
-        if failed and _trusted_runtime_terminal_failure(tool_name, result):
+        if _trusted_runtime_terminal_failure(tool_name, result):
             decision = ToolGuardrailDecision(
                 action="halt",
                 code="trusted_runtime_terminal_failure",

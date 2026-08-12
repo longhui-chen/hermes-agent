@@ -208,13 +208,13 @@ class _SkillDirectTaskContext:
 class _TrustedExecutionReceipt:
     agent_id: str = field(repr=False)
     action_token: str = field(repr=False)
-    business_execution_token: str = field(repr=False)
+    hardware_execution_token: str = field(repr=False)
+    business_execution_action: str = field(repr=False)
     turn_id: str
     session_id: str
     gateway_session_key: str = ""
+    business_execution_action_version: str = ""
     execution_policy: str = ""
-    execution_scope_digest: str = ""
-    execution_request_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -374,8 +374,12 @@ def _confirmed_video_edit_plan_resume(
 
 def _capture_trusted_execution_receipt(
     turn_identity: _TurnIdentity,
+    relative_path: str = _VIDEO_EDIT_SKILL_PATH,
 ) -> _TrustedExecutionReceipt | None:
     """Freeze request-bound execution claims before later tool boundaries."""
+    if relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH}:
+        return None
+    camera_skill = relative_path == _CAMERA_SKILL_PATH
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
@@ -393,63 +397,95 @@ def _capture_trusted_execution_receipt(
 
     try:
         from gateway.session_context import (
-            business_execution_token,
+            business_execution_action,
+            business_execution_action_version,
+            execution_session_key,
             execution_policy,
-            execution_scope_digest,
-            execution_request_digest,
             get_session_env,
+            hardware_execution_token,
         )
 
-        business_token = business_execution_token()
+        business_action = business_execution_action() if not camera_skill else ""
+        bound_action_version = (
+            business_execution_action_version() if not camera_skill else ""
+        )
+        hardware_token = hardware_execution_token() if camera_skill else ""
         bound_execution_policy = execution_policy()
-        bound_execution_scope_digest = execution_scope_digest()
-        bound_execution_request_digest = execution_request_digest()
-        gateway_session_key = get_session_env("HERMES_SESSION_KEY")
-        session_id = get_session_env("HERMES_SESSION_ID") or gateway_session_key
+        gateway_session_key = execution_session_key() or get_session_env(
+            "HERMES_SESSION_KEY"
+        )
+        session_id = get_session_env("HERMES_SESSION_ID")
+        if not session_id:
+            session_id = gateway_session_key
     except Exception:
-        business_token = ""
+        business_action = ""
+        bound_action_version = ""
+        hardware_token = ""
         bound_execution_policy = ""
-        bound_execution_scope_digest = ""
-        bound_execution_request_digest = ""
         session_id = ""
         gateway_session_key = ""
 
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
-        action_token=_profile_value("ZETTLAB_AGENT_ACTION_TOKEN"),
-        business_execution_token=str(business_token or "").strip(),
+        action_token=(
+            _profile_value("ZETTLAB_AGENT_ACTION_TOKEN") if camera_skill else ""
+        ),
+        hardware_execution_token=str(hardware_token or "").strip(),
+        business_execution_action=str(business_action or "").strip(),
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
         gateway_session_key=str(gateway_session_key or "").strip(),
+        business_execution_action_version=str(
+            bound_action_version or ""
+        ).strip(),
         execution_policy=str(bound_execution_policy or "").strip().lower(),
-        execution_scope_digest=str(
-            bound_execution_scope_digest or ""
-        ).strip().lower(),
-        execution_request_digest=str(
-            bound_execution_request_digest or ""
-        ).strip().lower(),
     )
     present = {
         "agent_id": bool(receipt.agent_id),
-        "action_token": bool(receipt.action_token),
-        "business_execution_token": bool(receipt.business_execution_token),
         "turn_id": bool(receipt.turn_id),
-        "session_id": bool(receipt.session_id),
     }
+    if camera_skill:
+        present.update(
+            {
+                "action_token": bool(receipt.action_token),
+                "hardware_execution_token": bool(
+                    receipt.hardware_execution_token
+                ),
+                "session_id": bool(receipt.session_id),
+            }
+        )
+    else:
+        present["session_key"] = bool(receipt.gateway_session_key)
+        present["action_version"] = (
+            receipt.business_execution_action_version == "1"
+        )
     if not all(present.values()):
         logger.warning(
             "zet_agent: trusted execution receipt incomplete: %s",
             present,
         )
         return None
-    if receipt.execution_policy == "silent_automation" and (
-        not receipt.gateway_session_key
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.execution_scope_digest) is None
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.execution_request_digest) is None
+    if camera_skill and (
+        re.fullmatch(r"[0-9a-f]{64}", receipt.action_token) is None
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
+        is None
     ):
-        logger.warning(
-            "zet_agent: trusted silent execution receipt missing stable scope"
-        )
+        logger.warning("zet_agent: hardware execution receipt is malformed")
+        return None
+    if not camera_skill and (
+        re.fullmatch(r"[0-9a-f]{64}", receipt.business_execution_action)
+        is None
+        or receipt.business_execution_action_version != "1"
+        or not receipt.gateway_session_key
+    ):
+        logger.warning("zet_agent: business execution action is malformed")
+        return None
+    if (
+        not camera_skill
+        and receipt.execution_policy == "silent_automation"
+        and not receipt.business_execution_action
+    ):
+        logger.warning("zet_agent: silent video action is missing")
         return None
     return receipt
 
@@ -457,38 +493,56 @@ def _capture_trusted_execution_receipt(
 def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the dedicated worker."""
     receipt = _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.get()
-    if receipt is None:
+    if (
+        receipt is None
+        or receipt.hardware_execution_token
+        or receipt.business_execution_action_version != "1"
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.business_execution_action)
+        is None
+    ):
         return {}
     result = {
         "ZET_AGENT_ID": receipt.agent_id,
-        "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": receipt.business_execution_token,
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION": receipt.business_execution_action,
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": (
+            receipt.business_execution_action_version
+        ),
         "HERMES_TURN_ID": receipt.turn_id,
-        "HERMES_SESSION_KEY": receipt.session_id,
+        "HERMES_SESSION_KEY": receipt.gateway_session_key,
     }
+    if receipt.session_id:
+        result["HERMES_SESSION_ID"] = receipt.session_id
     if receipt.gateway_session_key:
         # Preserve the caller's stable session key separately from the lineage
-        # session id used by deployed helper authorization. Terminal policy
-        # consumes this private field before launching the helper.
+        # session id. Terminal policy consumes this private correlation field
+        # before launching the helper.
         result["HERMES_GATEWAY_SESSION_KEY"] = receipt.gateway_session_key
     if receipt.execution_policy:
         # Keep the policy in the frozen receipt so terminal authorization cannot
         # be weakened by a later session-context mutation.
         result["HERMES_EXECUTION_POLICY"] = receipt.execution_policy
-    if receipt.execution_scope_digest:
-        result["ZETTLAB_EXECUTION_SCOPE_DIGEST"] = (
-            receipt.execution_scope_digest
-        )
-    if receipt.execution_request_digest:
-        result["ZETTLAB_EXECUTION_REQUEST_DIGEST"] = (
-            receipt.execution_request_digest
-        )
     return result
 
 
 def trusted_camera_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the camsnap helper."""
-    return trusted_video_edit_runtime_receipt()
+    receipt = _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.get()
+    if (
+        receipt is None
+        or receipt.business_execution_action
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.action_token) is None
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
+        is None
+        or not receipt.session_id
+    ):
+        return {}
+    return {
+        "ZET_AGENT_ID": receipt.agent_id,
+        "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
+        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": receipt.hardware_execution_token,
+        "HERMES_TURN_ID": receipt.turn_id,
+        "HERMES_SESSION_KEY": receipt.session_id,
+    }
 
 
 def trusted_video_edit_manifest_digests() -> Mapping[str, str]:
@@ -2247,7 +2301,10 @@ def apply_trusted_skill_execution(
             pending.relative_path,
         )
         return False
-    execution_receipt = _capture_trusted_execution_receipt(current_turn_identity)
+    execution_receipt = _capture_trusted_execution_receipt(
+        current_turn_identity,
+        pending.relative_path,
+    )
     if execution_receipt is None:
         return False
     allowed_tools = (

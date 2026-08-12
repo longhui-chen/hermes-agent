@@ -47,7 +47,6 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 
-
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
 # ---------------------------------------------------------------------------
@@ -378,6 +377,41 @@ class TestResponseStore:
 
 
 class TestIdempotencyCache:
+    def test_request_fingerprint_binds_action_and_hardware_capabilities(self):
+        body = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "run trusted skill"}],
+        }
+        keys = ["model", "messages"]
+        action = "a" * 64
+        hardware_token = "b" * 64
+
+        plain = api_server_module._make_request_fingerprint(body, keys)
+        action_only = api_server_module._make_request_fingerprint(
+            body,
+            keys,
+            business_execution_action=action,
+        )
+        hardware_only = api_server_module._make_request_fingerprint(
+            body,
+            keys,
+            hardware_execution_token=hardware_token,
+        )
+        both = api_server_module._make_request_fingerprint(
+            body,
+            keys,
+            business_execution_action=action,
+            hardware_execution_token=hardware_token,
+        )
+
+        assert len({plain, action_only, hardware_only, both}) == 4
+        assert both != api_server_module._make_request_fingerprint(
+            body,
+            keys,
+            business_execution_action=action,
+            hardware_execution_token="c" * 64,
+        )
+
     def test_silent_fingerprint_uses_stable_authorization_identity(self):
         body = {
             "model": "hermes-agent",
@@ -396,14 +430,7 @@ class TestIdempotencyCache:
             api_server_module._make_request_fingerprint(body, keys)
             == legacy_fingerprint
         )
-        authorization = {
-            "agent_id": "agent-1",
-            "turn_id": "turn-1",
-            "session_key": "zettlab:user:agent-1:session-1",
-            "scope_digest": "c" * 64,
-            "request_digest": "e" * 64,
-            "authorization_mode": "automatic",
-        }
+        authorization = {"action_version": "1", "action": "a" * 64}
         fingerprint = api_server_module._make_silent_automation_fingerprint(
             authorization
         )
@@ -418,13 +445,32 @@ class TestIdempotencyCache:
             changed_body, keys
         )
         assert fingerprint != api_server_module._make_silent_automation_fingerprint(
-            {**authorization, "scope_digest": "d" * 64}
-        )
-        assert fingerprint != api_server_module._make_silent_automation_fingerprint(
-            {**authorization, "request_digest": "f" * 64}
+            {**authorization, "action": "b" * 64}
         )
         assert token_a not in fingerprint
         assert token_b not in fingerprint
+
+    def test_action_v1_silent_fingerprint_binds_only_opaque_action(self):
+        action = "a" * 64
+        authorization = {
+            "action_version": "1",
+            "action": action,
+        }
+
+        fingerprint = api_server_module._make_silent_automation_fingerprint(
+            authorization
+        )
+
+        assert fingerprint
+        assert fingerprint == api_server_module._make_silent_automation_fingerprint(
+            {
+                **authorization,
+                "action": action,
+            }
+        )
+        assert fingerprint != api_server_module._make_silent_automation_fingerprint(
+            {**authorization, "action": "b" * 64}
+        )
 
     @pytest.mark.asyncio
     async def test_concurrent_same_key_and_fingerprint_runs_once(self):
@@ -1490,170 +1536,6 @@ class TestToolsetsEndpoint:
 # ---------------------------------------------------------------------------
 
 
-class TestChatCompletionsEndpoint:
-    @pytest.mark.asyncio
-    async def test_ordinary_idempotency_isolated_by_business_execution_token(
-        self, adapter, monkeypatch, caplog
-    ):
-        cache = _IdempotencyCache()
-        monkeypatch.setattr(api_server_module, "_idem_cache", cache)
-        token_a = "a" * 64
-        token_b = "b" * 64
-        body = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": "render"}],
-            "stream": False,
-        }
-        calls = []
-
-        async def run_agent(**kwargs):
-            token = kwargs["business_execution_token"]
-            calls.append(token)
-            return (
-                {
-                    "final_response": f"run-{len(calls)}",
-                    "messages": [],
-                    "api_calls": 1,
-                },
-                {
-                    "input_tokens": 1,
-                    "output_tokens": 1,
-                    "total_tokens": 2,
-                },
-            )
-
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_run_agent", side_effect=run_agent):
-                first = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={
-                        "Idempotency-Key": "same-key",
-                        "X-Zettlab-Business-Execution-Token": token_a,
-                    },
-                )
-                first_body = await first.json()
-                same_scope = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={
-                        "Idempotency-Key": "same-key",
-                        "X-Zettlab-Business-Execution-Token": token_a,
-                    },
-                )
-                same_scope_body = await same_scope.json()
-                other_token = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={
-                        "Idempotency-Key": "same-key",
-                        "X-Zettlab-Business-Execution-Token": token_b,
-                    },
-                )
-                other_token_body = await other_token.json()
-
-                missing_token = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={"Idempotency-Key": "same-key"},
-                )
-                missing_token_body = await missing_token.json()
-
-        assert [first.status, same_scope.status, other_token.status, missing_token.status] == [
-            200,
-            200,
-            200,
-            200,
-        ]
-        assert first_body["choices"][0]["message"]["content"] == "run-1"
-        assert same_scope_body["choices"][0]["message"]["content"] == "run-1"
-        assert other_token_body["choices"][0]["message"]["content"] == "run-2"
-        assert missing_token_body["choices"][0]["message"]["content"] == "run-3"
-        assert calls == [token_a, token_b, ""]
-        cache_state = repr((cache._store, cache._inflight))
-        response_state = repr(
-            (first_body, same_scope_body, other_token_body, missing_token_body)
-        )
-        assert token_a not in cache_state
-        assert token_b not in cache_state
-        assert token_a not in response_state
-        assert token_b not in response_state
-        assert token_a not in caplog.text
-        assert token_b not in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_interactive_business_receipt_requires_exact_authorization(
-        self, adapter
-    ):
-        adapter._api_key = "sk-secret"
-        turn_id = "turn-interactive-video"
-        session_id = "api-interactive-video"
-        session_key = "zettlab:owner:agent-video:session-1"
-        task = "把这些视频剪成旅行 vlog"
-        token = "a" * 64
-        scope_digest = "b" * 64
-        request_digest = api_server_module._business_execution_request_digest(
-            task,
-            "",
-        )
-        authorization = {
-            "agent_id": "agent-video",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_key,
-            "scope_digest": scope_digest,
-            "request_digest": request_digest,
-            "authorization_mode": "automatic",
-        }
-        payload = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": task}],
-            "stream": False,
-            "metadata": {
-                "turn_id": turn_id,
-                "execution_scope": {
-                    "operation": "interactive_video_edit",
-                    "task_id": turn_id,
-                },
-            },
-        }
-
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                return_value=authorization,
-            ) as authorize, patch.object(
-                adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as run_agent:
-                run_agent.return_value = (
-                    {"final_response": "ok", "messages": [], "api_calls": 1},
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                )
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers={
-                        "Authorization": "Bearer sk-secret",
-                        "X-Hermes-Session-Key": session_key,
-                        "X-Hermes-Session-Id": session_id,
-                        "X-Zettlab-Business-Execution-Token": token,
-                        "X-Zettlab-Execution-Scope-Digest": scope_digest,
-                    },
-                )
-
-        assert response.status == 200
-        authorize.assert_awaited_once()
-        assert run_agent.await_args.kwargs["execution_policy"] == ""
-        assert run_agent.await_args.kwargs["execution_scope_digest"] == scope_digest
-        assert run_agent.await_args.kwargs["execution_request_digest"] == request_digest
-        assert run_agent.await_args.kwargs["business_execution_token"] == token
-
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
@@ -1764,820 +1646,6 @@ class TestChatCompletionsEndpoint:
             assert mock_run.await_args.kwargs["request_overrides"] == {
                 "response_format": {"type": "json_object"},
             }
-
-    @pytest.mark.asyncio
-    async def test_silent_execution_policy_is_bound_to_business_capability(
-        self,
-        auth_adapter,
-        monkeypatch,
-    ):
-        monkeypatch.setattr(api_server_module, "_idem_cache", _IdempotencyCache())
-        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
-        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        turn_id = "pvm-" + "a" * 24
-        session_id = "proactive-" + turn_id
-        token = "a" * 64
-        skill_slug = "video-edit-workflow-mini"
-        task = "run the selected skill"
-        scope = {"operation": "weekly_memory_video", "task_id": turn_id}
-        request_digest = api_server_module._business_execution_request_digest(
-            task,
-            skill_slug,
-        )
-        authorization = {
-            "agent_id": "memory-agent",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_id,
-            "scope_digest": "d" * 64,
-            "request_digest": request_digest,
-            "authorization_mode": "automatic",
-        }
-        payload = {
-            "model": "caller-selected-model",
-            "provider": "caller-selected-provider",
-            "model_options": {"temperature": 0.9},
-            "tool_choice": "none",
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "user", "content": task}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "response_mode": "plan",
-                "turn_id": turn_id,
-                "skill_slug": skill_slug,
-                "execution_scope": scope,
-            },
-        }
-        headers = {
-            "Authorization": "Bearer sk-secret",
-            "Idempotency-Key": "silent-capability",
-            "X-Hermes-Session-Key": session_id,
-            "X-Hermes-Session-Id": session_id,
-            "X-Zettlab-Business-Execution-Token": token,
-            "X-Zettlab-Execution-Scope-Digest": "d" * 64,
-        }
-
-        async def authorize_request(**kwargs):
-            if (
-                kwargs["trusted_task_message"] != task
-                or kwargs["skill_slug"] != skill_slug
-            ):
-                return None
-            return authorization
-
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                side_effect=authorize_request,
-            ) as authorize, patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as mock_run:
-                mock_run.return_value = (mock_result, usage)
-                trusted = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                retried_with_mutated_request = await cli.post(
-                    "/v1/chat/completions",
-                    json={
-                        **payload,
-                        "messages": [
-                            {"role": "user", "content": "rebuilt manifest body"}
-                        ],
-                        "metadata": {
-                            **payload["metadata"],
-                            "skill_slug": "another-trusted-skill",
-                        },
-                    },
-                    headers=headers,
-                )
-
-        assert trusted.status == 200
-        assert retried_with_mutated_request.status == 403
-        assert authorize.await_count == 2
-        assert authorize.await_args_list[0].kwargs == {
-            "business_execution_token": token,
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_id,
-            "scope": scope,
-            "trusted_task_message": task,
-            "skill_slug": skill_slug,
-        }
-        assert mock_run.await_count == 1
-        assert mock_run.await_args.kwargs["execution_policy"] == "silent_automation"
-        assert mock_run.await_args.kwargs["route"] is None
-        assert mock_run.await_args.kwargs["response_mode"] == ""
-        assert mock_run.await_args.kwargs["plan_ack"] == {}
-        assert mock_run.await_args.kwargs["plan_auto_execute"] is False
-        assert mock_run.await_args.kwargs["execution_scope_digest"] == "d" * 64
-        assert mock_run.await_args.kwargs["business_execution_token"] == token
-        assert mock_run.await_args.kwargs["trusted_skill_slug"] == skill_slug
-        assert "provider" not in mock_run.await_args.kwargs
-        assert "model_options" not in mock_run.await_args.kwargs
-        assert mock_run.await_args.kwargs["request_overrides"] is None
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("scope_digest_header", "authorization_digest", "authorize_count"),
-        [
-            ("", "d" * 64, 0),
-            ("D" * 64, "d" * 64, 0),
-            ("c" * 64, "d" * 64, 1),
-        ],
-    )
-    async def test_silent_execution_rejects_untrusted_scope_digest_header(
-        self,
-        auth_adapter,
-        monkeypatch,
-        scope_digest_header,
-        authorization_digest,
-        authorize_count,
-    ):
-        monkeypatch.setattr(api_server_module, "_idem_cache", _IdempotencyCache())
-        turn_id = "pvm-digest-" + "a" * 20
-        session_id = "proactive-" + turn_id
-        payload = {
-            "model": "caller-selected-model",
-            "provider": "caller-selected-provider",
-            "model_options": {"temperature": 0.9},
-            "tool_choice": "none",
-            "messages": [{"role": "user", "content": "run the manifest"}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        authorization = {
-            "agent_id": "memory-agent",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_id,
-            "scope_digest": authorization_digest,
-            "authorization_mode": "automatic",
-        }
-        headers = {
-            "Authorization": "Bearer sk-secret",
-            "Idempotency-Key": "silent-digest-boundary",
-            "X-Hermes-Session-Key": session_id,
-            "X-Hermes-Session-Id": session_id,
-            "X-Zettlab-Business-Execution-Token": "a" * 64,
-        }
-        if scope_digest_header:
-            headers["X-Zettlab-Execution-Scope-Digest"] = scope_digest_header
-
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                return_value=authorization,
-            ) as authorize, patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as run_agent:
-                run_agent.return_value = (
-                    {"final_response": "unexpected", "messages": [], "api_calls": 1},
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                )
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                data = await response.json()
-
-        assert response.status == 403
-        assert data["error"]["code"] == "invalid_silent_automation_authorization"
-        assert authorize.await_count == authorize_count
-        run_agent.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_invalid_silent_authorization_fails_before_context_or_agent_work(
-        self,
-        auth_adapter,
-    ):
-        turn_id = "pvm-invalid-" + "a" * 20
-        session_id = "proactive-" + turn_id
-        token = "e" * 64
-        payload = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": "run the manifest"}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "skill_slug": "video-edit-workflow-mini",
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        headers = {
-            "Authorization": "Bearer sk-secret",
-            "Idempotency-Key": "invalid-proof-test",
-            "X-Hermes-Session-Key": session_id,
-            "X-Hermes-Session-Id": session_id,
-            "X-Zettlab-Business-Execution-Token": token,
-            "X-Zettlab-Execution-Scope-Digest": "1" * 64,
-        }
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                return_value=None,
-            ) as authorize, patch.object(
-                auth_adapter,
-                "_ensure_session_db_async",
-                new_callable=AsyncMock,
-            ) as ensure_db, patch.object(
-                auth_adapter,
-                "_expand_inbound_skill_invocation",
-                new_callable=AsyncMock,
-            ) as expand, patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as run_agent:
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                data = await response.json()
-
-        assert response.status == 403
-        assert data["error"]["code"] == "invalid_silent_automation_authorization"
-        assert authorize.await_count == 1
-        assert ensure_db.await_count == 0
-        assert expand.await_count == 0
-        assert run_agent.await_count == 0
-
-    @pytest.mark.asyncio
-    async def test_retryable_silent_authorization_failure_returns_503(
-        self,
-        auth_adapter,
-    ):
-        turn_id = "pvm-unavailable-" + "a" * 16
-        session_id = "proactive-" + turn_id
-        payload = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": "run the manifest"}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "skill_slug": "video-edit-workflow-mini",
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        headers = {
-            "Authorization": "Bearer sk-secret",
-            "Idempotency-Key": "unavailable-proof-test",
-            "X-Hermes-Session-Key": session_id,
-            "X-Hermes-Session-Id": session_id,
-            "X-Zettlab-Business-Execution-Token": "e" * 64,
-            "X-Zettlab-Execution-Scope-Digest": "1" * 64,
-        }
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                side_effect=api_server_module._BusinessExecutionAuthorizationError(
-                    "transport_unavailable",
-                    retryable=True,
-                ),
-            ), patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as run_agent:
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                data = await response.json()
-
-        assert response.status == 503
-        assert response.headers["Retry-After"] == "1"
-        assert data["error"]["code"] == "silent_automation_authorization_unavailable"
-        run_agent.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("idempotency_header", [None, "   "])
-    async def test_silent_automation_requires_non_empty_idempotency_key(
-        self,
-        auth_adapter,
-        idempotency_header,
-    ):
-        turn_id = "pvm-no-idem-" + "b" * 20
-        session_id = "proactive-" + turn_id
-        token = "f" * 64
-        skill_slug = "video-edit-workflow-mini"
-        task = "run the manifest"
-        payload = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": task}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "skill_slug": skill_slug,
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        headers = {
-            "Authorization": "Bearer sk-secret",
-            "X-Hermes-Session-Key": session_id,
-            "X-Hermes-Session-Id": session_id,
-            "X-Zettlab-Business-Execution-Token": token,
-        }
-        if idempotency_header is not None:
-            headers["Idempotency-Key"] = idempotency_header
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-            ) as authorize, patch.object(
-                auth_adapter,
-                "_ensure_session_db_async",
-                new_callable=AsyncMock,
-            ) as ensure_db, patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as run_agent:
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                data = await response.json()
-
-        assert response.status == 400
-        assert data["error"]["code"] == "silent_automation_idempotency_required"
-        assert data["error"]["param"] == "Idempotency-Key"
-        authorize.assert_not_awaited()
-        assert ensure_db.await_count == 0
-        assert run_agent.await_count == 0
-
-    @pytest.mark.asyncio
-    async def test_trusted_silent_turn_strips_quick_pick_and_skips_expansion(
-        self,
-        auth_adapter,
-    ):
-        turn_id = "pvm-" + "c" * 24
-        session_id = "proactive-" + turn_id
-        token = "c" * 64
-        skill_slug = "video-edit-workflow-mini"
-        task = "run the frozen manifest"
-        displayed_task = f"/{skill_slug} {task}"
-        payload = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": displayed_task}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "skill_slug": skill_slug,
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        authorization = {
-            "agent_id": "memory-agent",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_id,
-            "scope_digest": "1" * 64,
-            "request_digest": api_server_module._business_execution_request_digest(
-                task,
-                skill_slug,
-            ),
-            "authorization_mode": "automatic",
-        }
-
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                return_value=authorization,
-            ), patch.object(
-                auth_adapter,
-                "_expand_inbound_skill_invocation",
-                new_callable=AsyncMock,
-            ) as expand, patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as run_agent:
-                run_agent.return_value = (
-                    {"final_response": "ok", "messages": [], "api_calls": 1},
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                )
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers={
-                        "Authorization": "Bearer sk-secret",
-                        "Idempotency-Key": "silent-quick-pick",
-                        "X-Hermes-Session-Key": session_id,
-                        "X-Hermes-Session-Id": session_id,
-                        "X-Zettlab-Business-Execution-Token": token,
-                        "X-Zettlab-Execution-Scope-Digest": "1" * 64,
-                    },
-                )
-
-        assert response.status == 200
-        expand.assert_not_awaited()
-        assert run_agent.await_args.kwargs["execution_policy"] == "silent_automation"
-        assert run_agent.await_args.kwargs["execution_scope_digest"] == "1" * 64
-        assert run_agent.await_args.kwargs["business_execution_token"] == token
-        assert run_agent.await_args.kwargs["user_message"] == task
-        assert run_agent.await_args.kwargs["trusted_user_message"] == task
-        assert run_agent.await_args.kwargs["trusted_skill_slug"] == skill_slug
-
-    @pytest.mark.asyncio
-    async def test_trusted_silent_stream_fails_before_context_or_agent_work(
-        self,
-        auth_adapter,
-    ):
-        turn_id = "pvm-" + "d" * 24
-        session_id = "proactive-" + turn_id
-        token = "d" * 64
-        skill_slug = "video-edit-workflow-mini"
-        task = "run the frozen manifest"
-        payload = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": task}],
-            "stream": True,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "skill_slug": skill_slug,
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-            ) as authorize, patch.object(
-                auth_adapter,
-                "_ensure_session_db_async",
-                new_callable=AsyncMock,
-            ) as ensure_db, patch.object(
-                auth_adapter,
-                "_expand_inbound_skill_invocation",
-                new_callable=AsyncMock,
-            ) as expand, patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as run_agent:
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers={
-                        "Authorization": "Bearer sk-secret",
-                        "Idempotency-Key": "silent-stream",
-                        "X-Hermes-Session-Key": session_id,
-                        "X-Hermes-Session-Id": session_id,
-                        "X-Zettlab-Business-Execution-Token": token,
-                        "X-Zettlab-Execution-Scope-Digest": "2" * 64,
-                    },
-                )
-                data = await response.json()
-
-        assert response.status == 400
-        assert data["error"]["param"] == "stream"
-        authorize.assert_not_awaited()
-        ensure_db.assert_not_awaited()
-        expand.assert_not_awaited()
-        run_agent.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_trusted_silent_turn_never_loads_or_forwards_chat_context(
-        self,
-        auth_adapter,
-    ):
-        turn_id = "pvm-" + "b" * 24
-        session_id = "proactive-" + turn_id
-        token = "b" * 64
-        skill_slug = "video-edit-workflow-mini"
-        task = "run the frozen manifest"
-        payload = {
-            "model": "hermes-agent",
-            "messages": [
-                {"role": "system", "content": "private caller system prompt"},
-                {"role": "user", "content": "private prior request"},
-                {"role": "assistant", "content": "private prior reply"},
-                {"role": "user", "content": task},
-            ],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "skill_slug": skill_slug,
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        authorization = {
-            "agent_id": "memory-agent",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_id,
-            "scope_digest": "2" * 64,
-            "request_digest": api_server_module._business_execution_request_digest(
-                task,
-                skill_slug,
-            ),
-            "authorization_mode": "automatic",
-        }
-
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                return_value=authorization,
-            ), patch.object(
-                auth_adapter,
-                "_ensure_session_db_async",
-                new_callable=AsyncMock,
-            ) as ensure_db, patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-            ) as mock_run:
-                mock_run.return_value = (
-                    {"final_response": "ok", "messages": [], "api_calls": 1},
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                )
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    json=payload,
-                    headers={
-                        "Authorization": "Bearer sk-secret",
-                        "Idempotency-Key": "silent-context",
-                        "X-Hermes-Session-Key": session_id,
-                        "X-Hermes-Session-Id": session_id,
-                        "X-Zettlab-Business-Execution-Token": token,
-                        "X-Zettlab-Execution-Scope-Digest": "2" * 64,
-                    },
-                )
-
-        assert response.status == 200
-        ensure_db.assert_not_awaited()
-        assert mock_run.await_args.kwargs["conversation_history"] == []
-        assert mock_run.await_args.kwargs["ephemeral_system_prompt"] is None
-        assert mock_run.await_args.kwargs["current_turn_reference_image"] == ""
-
-    @pytest.mark.asyncio
-    async def test_idempotency_does_not_cross_verified_execution_policy(
-        self,
-        auth_adapter,
-        monkeypatch,
-    ):
-        cache = _IdempotencyCache()
-        monkeypatch.setattr(api_server_module, "_idem_cache", cache)
-        token = "a" * 64
-        turn_id = "pvm-" + "a" * 24
-        session_id = "proactive-" + turn_id
-        skill_slug = "video-edit-workflow-mini"
-        task = "run the selected skill"
-        body = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": task}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "skill_slug": skill_slug,
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        common_headers = {
-            "Authorization": "Bearer sk-secret",
-            "Idempotency-Key": "same-policy-key",
-            "X-Hermes-Session-Key": session_id,
-            "X-Hermes-Session-Id": session_id,
-            "X-Zettlab-Business-Execution-Token": token,
-            "X-Zettlab-Execution-Scope-Digest": "3" * 64,
-        }
-        ordinary_body = {
-            **body,
-            "metadata": {
-                "turn_id": turn_id,
-                "skill_slug": skill_slug,
-            },
-        }
-        authorization = {
-            "agent_id": "memory-agent",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_id,
-            "scope_digest": "3" * 64,
-            "request_digest": api_server_module._business_execution_request_digest(
-                task,
-                skill_slug,
-            ),
-            "authorization_mode": "automatic",
-        }
-        policies = []
-
-        async def run_agent(**kwargs):
-            policies.append(kwargs["execution_policy"])
-            return (
-                {
-                    "final_response": f"run-{len(policies)}",
-                    "messages": [],
-                    "api_calls": 1,
-                },
-                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-            )
-
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                return_value=authorization,
-            ), patch.object(auth_adapter, "_run_agent", side_effect=run_agent):
-                ordinary = await cli.post(
-                    "/v1/chat/completions",
-                    json=ordinary_body,
-                    headers=common_headers,
-                )
-                ordinary_body = await ordinary.json()
-                silent = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers=common_headers,
-                )
-                silent_body = await silent.json()
-                silent_retry = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers=common_headers,
-                )
-                silent_retry_body = await silent_retry.json()
-
-        assert [ordinary.status, silent.status, silent_retry.status] == [200, 200, 200]
-        assert ordinary_body["choices"][0]["message"]["content"] == "run-1"
-        assert silent_body["choices"][0]["message"]["content"] == "run-2"
-        assert silent_retry_body["choices"][0]["message"]["content"] == "run-2"
-        assert policies == ["", "silent_automation"]
-
-    @pytest.mark.asyncio
-    async def test_silent_idempotency_uses_authorization_identity_not_token(
-        self,
-        auth_adapter,
-        monkeypatch,
-        caplog,
-    ):
-        cache = _IdempotencyCache()
-        monkeypatch.setattr(api_server_module, "_idem_cache", cache)
-        token_a = "a" * 64
-        token_b = "b" * 64
-        token_c = "c" * 64
-        turn_id = "silent-scope-1"
-        session_id = "silent-session-1"
-        body = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": "run the manifest"}],
-            "stream": False,
-            "metadata": {
-                "execution_policy": "silent_automation",
-                "turn_id": turn_id,
-                "execution_scope": {
-                    "operation": "weekly_memory_video",
-                    "task_id": turn_id,
-                },
-            },
-        }
-        headers = {
-            "Authorization": "Bearer sk-secret",
-            "Idempotency-Key": "same-silent-key",
-            "X-Hermes-Session-Key": session_id,
-            "X-Hermes-Session-Id": session_id,
-        }
-        base_authorization = {
-            "agent_id": "memory-agent",
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "session_key": session_id,
-            "request_digest": api_server_module._business_execution_request_digest(
-                "run the manifest",
-                "",
-            ),
-            "authorization_mode": "automatic",
-        }
-        authorization_by_token = {
-            token_a: {**base_authorization, "scope_digest": "d" * 64},
-            token_b: {**base_authorization, "scope_digest": "d" * 64},
-            token_c: {**base_authorization, "scope_digest": "e" * 64},
-        }
-        executed_tokens = []
-
-        async def authorize(**kwargs):
-            return authorization_by_token[kwargs["business_execution_token"]]
-
-        async def run_agent(**kwargs):
-            executed_tokens.append(kwargs["business_execution_token"])
-            return (
-                {
-                    "final_response": f"run-{len(executed_tokens)}",
-                    "messages": [],
-                    "api_calls": 1,
-                },
-                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-            )
-
-        app = _create_app(auth_adapter)
-        responses = []
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                api_server_module,
-                "_authorize_business_execution",
-                new_callable=AsyncMock,
-                side_effect=authorize,
-            ) as authorize_mock, patch.object(
-                auth_adapter,
-                "_run_agent",
-                side_effect=run_agent,
-            ):
-                for token in (token_a, token_b, token_c):
-                    response = await cli.post(
-                        "/v1/chat/completions",
-                        json=body,
-                        headers={
-                            **headers,
-                            "X-Zettlab-Business-Execution-Token": token,
-                            "X-Zettlab-Execution-Scope-Digest": authorization_by_token[token]["scope_digest"],
-                        },
-                    )
-                    responses.append((response, await response.json()))
-
-        assert [response.status for response, _body in responses] == [200, 200, 200]
-        assert [
-            response_body["choices"][0]["message"]["content"]
-            for _response, response_body in responses
-        ] == ["run-1", "run-1", "run-2"]
-        assert executed_tokens == [token_a, token_c]
-        assert authorize_mock.await_count == 3
-        cache_state = repr((cache._store, cache._inflight))
-        response_state = repr([response_body for _response, response_body in responses])
-        for token in (token_a, token_b, token_c):
-            assert token not in cache_state
-            assert token not in response_state
-            assert token not in caplog.text
 
     @pytest.mark.asyncio
     async def test_tool_choice_none_skips_skill_invocation(self, adapter):
@@ -4533,7 +3601,7 @@ class TestCORS:
         assert headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
         assert "POST" in headers["Access-Control-Allow-Methods"]
 
-    def test_cors_headers_allow_business_execution_token_unit(self):
+    def test_cors_headers_do_not_allow_business_execution_action_unit(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         headers = adapter._cors_headers_for_origin("http://localhost:3000")
         assert headers is not None
@@ -4541,7 +3609,8 @@ class TestCORS:
             value.strip().lower()
             for value in headers["Access-Control-Allow-Headers"].split(",")
         }
-        assert "x-zettlab-business-execution-token" in allowed
+        assert "x-zettlab-business-execution-action" not in allowed
+        assert "x-zettlab-business-execution-action-version" not in allowed
 
     def test_cors_headers_for_origin_rejects_unknown_origin(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -4583,7 +3652,7 @@ class TestCORS:
             assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
 
     @pytest.mark.asyncio
-    async def test_cors_business_execution_token_preflight_flow(self):
+    async def test_cors_business_execution_action_preflight_is_not_granted(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -4593,7 +3662,8 @@ class TestCORS:
                     "Origin": "http://localhost:3000",
                     "Access-Control-Request-Method": "POST",
                     "Access-Control-Request-Headers": (
-                        "Content-Type, X-Zettlab-Business-Execution-Token"
+                        "Content-Type, X-Zettlab-Business-Execution-Action, "
+                        "X-Zettlab-Business-Execution-Action-Version"
                     ),
                 },
             )
@@ -4608,7 +3678,8 @@ class TestCORS:
                     "",
                 ).split(",")
             }
-            assert "x-zettlab-business-execution-token" in allowed
+            assert "x-zettlab-business-execution-action" not in allowed
+            assert "x-zettlab-business-execution-action-version" not in allowed
 
     @pytest.mark.asyncio
     async def test_cors_agent_action_token_preflight_is_not_granted(self):
@@ -4620,10 +3691,7 @@ class TestCORS:
                 headers={
                     "Origin": "http://localhost:3000",
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": (
-                        "X-Zettlab-Business-Execution-Token, "
-                        "X-Zettlab-Agent-Action-Token"
-                    ),
+                    "Access-Control-Request-Headers": "X-Zettlab-Agent-Action-Token",
                 },
             )
             assert resp.status == 200
@@ -4634,7 +3702,6 @@ class TestCORS:
                     "",
                 ).split(",")
             }
-            assert "x-zettlab-business-execution-token" in allowed
             assert "x-zettlab-agent-action-token" not in allowed
 
     @pytest.mark.asyncio
@@ -5782,3 +4849,327 @@ class TestTakeoverUIHintOverSSE:
         assert "private@example.com" not in json.dumps(completed[0])
         assert "credential" not in json.dumps(completed[0])
         assert "snapshot" not in completed[0]
+
+
+def test_action_v1_parser_accepts_only_fixed_header_pair():
+    request = types.SimpleNamespace(
+        headers={
+            "X-Zettlab-Business-Execution-Action": "a" * 64,
+            "X-Zettlab-Business-Execution-Action-Version": "1",
+        }
+    )
+    assert api_server_module._extract_business_execution_action(request) == {
+        "action": "a" * 64,
+        "action_version": "1",
+    }
+    assert api_server_module._extract_business_execution_action(
+        types.SimpleNamespace(
+            headers={
+                "X-Zettlab-Business-Execution-Action": "a" * 64,
+                "X-Zettlab-Business-Execution-Action-Version": "2",
+            }
+        )
+    ) == {}
+
+
+def test_hardware_execution_token_parser_accepts_only_fixed_opaque_header():
+    request = types.SimpleNamespace(
+        headers={"X-Zettlab-Business-Execution-Token": "b" * 64}
+    )
+    assert api_server_module._extract_hardware_execution_token(request) == "b" * 64
+    assert api_server_module._extract_hardware_execution_token(
+        types.SimpleNamespace(
+            headers={"X-Zettlab-Business-Execution-Token": "not-a-token"}
+        )
+    ) == ""
+
+
+@pytest.mark.asyncio
+async def test_hardware_execution_token_relays_opaquely_to_agent(auth_adapter):
+    app = _create_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(
+            auth_adapter,
+            "_run_agent",
+            new_callable=AsyncMock,
+            return_value=(
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            ),
+        ) as run_agent:
+            response = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "查看摄像头"}],
+                    "stream": False,
+                    "metadata": {"skill_slug": "camsnap"},
+                },
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Zettlab-Business-Execution-Token": "b" * 64,
+                },
+            )
+
+    assert response.status == 200
+    assert run_agent.await_args.kwargs["hardware_execution_token"] == "b" * 64
+    assert run_agent.await_args.kwargs["business_execution_action"] == ""
+
+
+@pytest.mark.asyncio
+async def test_missing_action_silent_turn_fails_without_agent_or_session_reset(
+    auth_adapter,
+):
+    app = _create_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+            response = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "run video"}],
+                    "stream": False,
+                    "metadata": {
+                        "execution_policy": "silent_automation",
+                        "turn_id": "pvm-" + "a" * 24,
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "missing-action",
+                },
+            )
+    assert response.status == 403
+    assert run_agent.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_action_v1_silent_turn_strips_all_chat_context_before_agent_work(
+    auth_adapter,
+):
+    action = "a" * 64
+    app = _create_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with (
+            patch.object(
+                auth_adapter,
+                "_ensure_session_db_async",
+                new_callable=AsyncMock,
+            ) as ensure_session_db,
+            patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=(
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                ),
+            ) as run_agent,
+        ):
+            response = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "caller/model",
+                    "messages": [
+                        {"role": "system", "content": "private system prompt"},
+                        {"role": "user", "content": "private prior request"},
+                        {"role": "assistant", "content": "private prior reply"},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "run frozen manifest"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": "data:image/png;base64,iVBORw0KGgo="
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                    "stream": False,
+                    "metadata": {
+                        "execution_policy": "silent_automation",
+                        "turn_id": "pvm-" + "a" * 24,
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "silent-context",
+                    "X-Hermes-Session-Key": "stable-session",
+                    "X-Hermes-Session-Id": "lineage-session",
+                    "X-Zettlab-Business-Execution-Action": action,
+                    "X-Zettlab-Business-Execution-Action-Version": "1",
+                },
+            )
+
+    assert response.status == 200
+    ensure_session_db.assert_not_awaited()
+    kwargs = run_agent.await_args.kwargs
+    assert kwargs["conversation_history"] == []
+    assert kwargs["ephemeral_system_prompt"] is None
+    assert kwargs["current_turn_reference_image"] == ""
+    assert kwargs["business_execution_action"] == action
+    assert kwargs["business_execution_action_version"] == "1"
+    assert kwargs["execution_policy"] == "silent_automation"
+
+
+@pytest.mark.asyncio
+async def test_action_v1_silent_turn_skips_quick_pick_pre_expansion(auth_adapter):
+    app = _create_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with (
+            patch.object(
+                auth_adapter,
+                "_expand_inbound_skill_invocation",
+                new_callable=AsyncMock,
+            ) as expand,
+            patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=(
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                ),
+            ) as run_agent,
+        ):
+            response = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "/video-edit-workflow-mini run frozen manifest",
+                        }
+                    ],
+                    "stream": False,
+                    "metadata": {
+                        "execution_policy": "silent_automation",
+                        "turn_id": "pvm-" + "b" * 24,
+                        "skill_slug": "video-edit-workflow-mini",
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "silent-skill",
+                    "X-Zettlab-Business-Execution-Action": "b" * 64,
+                    "X-Zettlab-Business-Execution-Action-Version": "1",
+                },
+            )
+
+    assert response.status == 200
+    expand.assert_not_awaited()
+    assert run_agent.await_args.kwargs["user_message"] == "run frozen manifest"
+    assert run_agent.await_args.kwargs["trusted_skill_slug"] == (
+        "video-edit-workflow-mini"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idempotency_header", [None, "   "])
+async def test_action_v1_silent_turn_requires_non_empty_idempotency_key(
+    auth_adapter,
+    idempotency_header,
+):
+    headers = {
+        "Authorization": "Bearer sk-secret",
+        "X-Zettlab-Business-Execution-Action": "c" * 64,
+        "X-Zettlab-Business-Execution-Action-Version": "1",
+    }
+    if idempotency_header is not None:
+        headers["Idempotency-Key"] = idempotency_header
+
+    app = _create_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(
+            auth_adapter,
+            "_run_agent",
+            new_callable=AsyncMock,
+        ) as run_agent:
+            response = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "run manifest"}],
+                    "stream": False,
+                    "metadata": {"execution_policy": "silent_automation"},
+                },
+                headers=headers,
+            )
+            payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["param"] == "Idempotency-Key"
+    run_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_action_v1_idempotency_isolates_policy_and_action(
+    auth_adapter,
+    monkeypatch,
+):
+    monkeypatch.setattr(api_server_module, "_idem_cache", _IdempotencyCache())
+    calls = []
+
+    async def run_agent(**kwargs):
+        calls.append(
+            (kwargs["execution_policy"], kwargs["business_execution_action"])
+        )
+        return (
+            {
+                "final_response": f"run-{len(calls)}",
+                "messages": [],
+                "api_calls": 1,
+            },
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+
+    ordinary_body = {
+        "model": "hermes-agent",
+        "messages": [{"role": "user", "content": "run manifest"}],
+        "stream": False,
+    }
+    silent_body = {
+        **ordinary_body,
+        "metadata": {"execution_policy": "silent_automation"},
+    }
+    common_headers = {
+        "Authorization": "Bearer sk-secret",
+        "Idempotency-Key": "shared-action-key",
+        "X-Zettlab-Business-Execution-Action-Version": "1",
+    }
+
+    app = _create_app(auth_adapter)
+    bodies = []
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(auth_adapter, "_run_agent", side_effect=run_agent):
+            for body, action in (
+                (ordinary_body, "a" * 64),
+                (silent_body, "a" * 64),
+                (silent_body, "a" * 64),
+                (silent_body, "b" * 64),
+            ):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={
+                        **common_headers,
+                        "X-Zettlab-Business-Execution-Action": action,
+                    },
+                )
+                assert response.status == 200
+                bodies.append(await response.json())
+
+    assert [body["choices"][0]["message"]["content"] for body in bodies] == [
+        "run-1",
+        "run-2",
+        "run-2",
+        "run-3",
+    ]
+    assert calls == [
+        ("", "a" * 64),
+        ("silent_automation", "a" * 64),
+        ("silent_automation", "b" * 64),
+    ]

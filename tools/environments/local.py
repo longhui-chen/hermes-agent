@@ -1801,11 +1801,15 @@ AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
 VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    # Turn-scoped side-effect capability. Generic subprocesses must not
-    # inherit either a live ContextVar or a stale process-global fallback.
+    # Current ActionV1 plus retired video authorization keys. Generic
+    # subprocesses must never inherit either current or stale capability data.
     "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
+    "ZETTLAB_BUSINESS_EXECUTION_MODE",
     "ZETTLAB_EXECUTION_SCOPE_DIGEST",
     "ZETTLAB_EXECUTION_REQUEST_DIGEST",
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION",
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -1977,6 +1981,12 @@ def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]
         frozen_receipt = {}
     if not frozen_receipt:
         raise PermissionError("trusted video-edit execution receipt unavailable")
+    action = str(frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", "") or "").strip()
+    if (
+        frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION") != "1"
+        or re.fullmatch(r"[0-9a-f]{64}", action) is None
+    ):
+        raise PermissionError("trusted video-edit ActionV1 receipt unavailable")
     env.update(frozen_receipt)
     return env
 
@@ -1984,11 +1994,10 @@ def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]
 def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
-    Camera credentials never enter Hermes. The helper receives only the
-    profile action token and the current request's business capability so the
-    device-local CameraService can bind the call to one Agent, user, turn, and
-    session. Generic subprocesses continue to have all of these values
-    stripped by :func:`_apply_profile_secret_scope_env`.
+    The helper receives the profile action token and the independently scoped
+    hardware capability plus turn/session correlation. Video ActionV1 is not
+    aliased into this path. Generic subprocesses continue to have all of these
+    values stripped by :func:`_apply_profile_secret_scope_env`.
     """
     try:
         from agent.zet_agent_response_mode import trusted_camera_runtime_receipt
@@ -2010,23 +2019,11 @@ def build_camera_runtime_env() -> dict[str, str]:
         # Keep the legacy alias for already deployed camsnap v0.1.x helpers.
         "HERMES_SESSION_KEY": session_id,
     }
-    scope_digest = str(
-        frozen_receipt.get("ZETTLAB_EXECUTION_SCOPE_DIGEST", "") or ""
-    ).strip()
-    if scope_digest:
-        env["ZETTLAB_EXECUTION_SCOPE_DIGEST"] = scope_digest
-    request_digest = str(
-        frozen_receipt.get("ZETTLAB_EXECUTION_REQUEST_DIGEST", "") or ""
-    ).strip()
-    if request_digest:
-        env["ZETTLAB_EXECUTION_REQUEST_DIGEST"] = request_digest
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
         "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
-        "ZETTLAB_EXECUTION_SCOPE_DIGEST": 64,
-        "ZETTLAB_EXECUTION_REQUEST_DIGEST": 64,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
     }

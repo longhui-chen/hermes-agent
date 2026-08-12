@@ -568,16 +568,19 @@ def test_trusted_video_receipt_and_rearm_ignore_plugin_result_rewrite(
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
         action_token="action-secret",
-        business_execution_token="business-secret",
+        hardware_execution_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
         turn_id="trusted-terminal-plugin-boundary",
         session_id="session-1",
     )
     expected_receipt = {
         "ZET_AGENT_ID": "agent-1",
-        "ZETTLAB_AGENT_ACTION_TOKEN": "action-secret",
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-secret",
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
         "HERMES_TURN_ID": "trusted-terminal-plugin-boundary",
-        "HERMES_SESSION_KEY": "session-1",
+        "HERMES_SESSION_KEY": "",
+        "HERMES_SESSION_ID": "session-1",
     }
     events = []
 
@@ -685,7 +688,9 @@ def test_trusted_video_terminal_authorization_normalizes_registry_args(
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
         action_token="action-secret",
-        business_execution_token="business-secret",
+        hardware_execution_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
         turn_id="trusted-terminal-coercion",
         session_id="session-1",
     )
@@ -738,12 +743,13 @@ def test_trusted_video_receipt_preserves_stable_and_lineage_sessions():
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
         action_token="action-secret",
-        business_execution_token="business-secret",
+        hardware_execution_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
         turn_id="pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
         session_id="api-lineage-tip",
         gateway_session_key="proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
         execution_policy="silent_automation",
-        execution_scope_digest="4" * 64,
     )
     token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
     try:
@@ -751,13 +757,13 @@ def test_trusted_video_receipt_preserves_stable_and_lineage_sessions():
     finally:
         response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(token)
 
-    assert captured["HERMES_SESSION_KEY"] == "api-lineage-tip"
+    assert captured["HERMES_SESSION_KEY"] == "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
+    assert captured["HERMES_SESSION_ID"] == "api-lineage-tip"
     assert (
         captured["HERMES_GATEWAY_SESSION_KEY"]
         == "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
     )
     assert captured["HERMES_EXECUTION_POLICY"] == "silent_automation"
-    assert captured["ZETTLAB_EXECUTION_SCOPE_DIGEST"] == "4" * 64
 
 
 @pytest.mark.parametrize(
@@ -773,10 +779,12 @@ def test_trusted_skill_scope_uses_final_displayed_skill_view_result(
     monkeypatch.setattr(
         response_mode,
         "_capture_trusted_execution_receipt",
-        lambda _turn_identity: response_mode._TrustedExecutionReceipt(
+        lambda _turn_identity, _relative_path: response_mode._TrustedExecutionReceipt(
             agent_id="agent-1",
             action_token="action-secret",
-            business_execution_token="business-secret",
+            hardware_execution_token="",
+            business_execution_action="a" * 64,
+            business_execution_action_version="1",
             turn_id="final-skill-view-result",
             session_id="session-1",
         ),
@@ -863,7 +871,9 @@ def test_trusted_video_blocks_terminal_args_changed_after_preflight(monkeypatch)
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
         action_token="action-secret",
-        business_execution_token="business-secret",
+        hardware_execution_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
         turn_id="trusted-terminal-args",
         session_id="session-1",
     )
