@@ -47,6 +47,37 @@ def _size_delta_label(saved_mb):
     return _m()._size_delta_label(saved_mb)
 
 
+def importable_transcript_messages(rows, *, now=None):
+    """Keep only what the runtime-import contract accepts, in source order.
+
+    ``hermes_state._normalize_import_messages`` rejects anything that is not a
+    user/assistant message carrying non-empty text — tool calls and in-flight
+    state are deliberately not importable, because the target profile runs its
+    own toolset and replaying calls it cannot make would only teach it to
+    invoke missing tools. A generation transcript is mostly those: on the first
+    real app this ran against, 64 rows yielded 2 (29 of the 30 assistant rows
+    were pure tool_calls with NULL content).
+
+    Rows are dict-like with ``role`` / ``content`` / ``timestamp``.
+    """
+    import time as _t
+
+    fallback = _t.time() if now is None else now
+    kept = []
+    for row in rows:
+        if row["role"] not in ("user", "assistant"):
+            continue
+        content = (row["content"] or "").strip()
+        if not content:
+            continue
+        kept.append({
+            "role": row["role"],
+            "content": content,
+            "created_at": float(row["timestamp"] or fallback),
+        })
+    return kept
+
+
 def _confirm_prompt(prompt: str) -> bool:
     """Prompt for y/N confirmation, safe against non-TTY environments."""
     try:
@@ -904,6 +935,115 @@ def cmd_sessions(args, sessions_parser=None):
                 f"Archived {count} session(s). They're hidden from listings "
                 "but fully recoverable (nothing was deleted)."
             )
+
+    elif action == "import-transcript":
+        # Fork a conversation across profiles. The import contract
+        # (hermes_state._normalize_import_messages) accepts only user/assistant
+        # messages with non-empty text: tool calls and in-flight state are
+        # rejected on purpose, since the target profile runs its own toolset and
+        # a replayed history of calls it cannot make would just teach it to
+        # invoke missing tools. A generation transcript is therefore mostly
+        # untransferable — 64 rows collapsed to 2 on the first real app we ran
+        # this against — so report what was skipped rather than pretending the
+        # copy was faithful.
+        import hashlib
+        import sqlite3
+        import time as _time
+
+        from hermes_state import RUNTIME_IMPORT_MAX_CHUNK_MESSAGES
+
+        def _fail(message: str) -> None:
+            if getattr(args, "json", False):
+                print(_json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+            else:
+                print(f"Error: {message}", file=sys.stderr)
+
+        source_profile = args.source_profile
+        # Profiles are siblings: HERMES_HOME is <root>/profiles/<name> when the
+        # command runs under -p, so the source lives next door.
+        home = Path(get_hermes_home())
+        source_db = (
+            home.parent / source_profile / "state.db"
+            if home.parent.name == "profiles"
+            else home / "profiles" / source_profile / "state.db"
+        )
+        if not source_db.exists():
+            _fail(f"source profile has no session store at {source_db}")
+            return 1
+
+        # Read-only URI: never open another profile's live store for writing.
+        src = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+        src.row_factory = sqlite3.Row
+        try:
+            session_row = src.execute(
+                "SELECT id, title FROM sessions WHERE id = ?", (args.source_session,)
+            ).fetchone()
+            if session_row is None:
+                _fail(f"source session {args.source_session!r} not found")
+                return 1
+            rows = src.execute(
+                "SELECT role, content, timestamp FROM messages "
+                "WHERE session_id = ? ORDER BY id",
+                (args.source_session,),
+            ).fetchall()
+        finally:
+            src.close()
+
+        total_rows = len(rows)
+        messages = importable_transcript_messages(rows, now=_time.time())
+        if not messages:
+            _fail(
+                f"nothing importable in {args.source_session!r}: "
+                f"{total_rows} rows, none of them user/assistant text"
+            )
+            return 1
+
+        # Idempotency: same source + target must reuse one import_id so a retry
+        # replays the receipt instead of creating a second session.
+        pair = f"{source_profile}\x00{args.source_session}\x00{args.target_session}"
+        import_id = "fork-" + hashlib.sha256(pair.encode("utf-8")).hexdigest()[:32]
+        canonical = _json.dumps(messages, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"))
+        payload_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        title = args.title or session_row["title"]
+
+        try:
+            for chunk_index, start in enumerate(
+                range(0, len(messages), RUNTIME_IMPORT_MAX_CHUNK_MESSAGES)
+            ):
+                db.stage_completed_transcript_import(
+                    import_id=import_id,
+                    source=f"profile:{source_profile}",
+                    source_session_id=args.source_session,
+                    target_session_id=args.target_session,
+                    title=title,
+                    payload_sha256=payload_sha256,
+                    expected_message_count=len(messages),
+                    chunk_index=chunk_index,
+                    messages=messages[start:start + RUNTIME_IMPORT_MAX_CHUNK_MESSAGES],
+                )
+            committed = db.commit_completed_transcript_import(import_id)
+        except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the caller
+            _fail(f"{type(exc).__name__}: {exc}")
+            return 1
+
+        result = {
+            "ok": True,
+            "target_session_id": args.target_session,
+            "source_session_id": args.source_session,
+            "imported": len(messages),
+            "skipped": total_rows - len(messages),
+            "replayed": bool(committed.get("replayed")),
+        }
+        if getattr(args, "json", False):
+            print(_json.dumps(result, ensure_ascii=False))
+        else:
+            print(
+                f"Imported {result['imported']} message(s) into "
+                f"{args.target_session} (skipped {result['skipped']} "
+                f"tool/empty row(s))."
+            )
+        return 0
 
     elif action == "rename":
         resolved_session_id = db.resolve_session_id(args.session_id)
