@@ -758,4 +758,9 @@ registry.register(
     handler=app_host_tool,
     check_fn=_check_app_host,
     emoji="🏗️",
+    # App Host is the platform-native entry point for creating and managing
+    # generated apps. Keep its schema directly visible when Tool Search is
+    # enabled, matching app_data; the toolset and scope gates still decide
+    # whether it is available at all.
+    defer_to_tool_search=False,
 )
