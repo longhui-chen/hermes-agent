@@ -97,25 +97,36 @@ def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
     for msg in build_seed_messages(plan_id, seeded, result_json):
         messages.append(msg)
 
-    # 播种即推送：App 在计划卡（决策点态）阶段就拿到带 plan_id 的清单数据，
-    # 确认后原地演化不需要额外往返。
-    _emit_todo_snapshot(agent, result_json)
-
     from agent.tool_executor import _flush_session_db_after_tool_progress
 
-    _flush_session_db_after_tool_progress(
+    persisted = _flush_session_db_after_tool_progress(
         agent,
         messages,
         stage=f"plan seed todo {plan_id}",
     )
+    # Fail-closed（codex P1）：合成消息对没落盘就不给 App 推快照——否则用户
+    # 看到可确认的清单，下一轮却 hydrate 不出骨架。flush 失败时 helper 已置
+    # _incremental_persistence_failed，conversation_loop 在播种后复查该标志，
+    # 走既有 session_persistence_failed 路径终止 turn。
+    if persisted:
+        # 播种即推送：App 在计划卡（决策点态）阶段就拿到带 plan_id 的清单数据，
+        # 确认后原地演化不需要额外往返。
+        _emit_todo_snapshot(agent, result_json)
 
 
-def correct_stale_in_progress_at_turn_end(agent: Any) -> None:
+def correct_stale_in_progress_at_turn_end(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+) -> None:
     """Turn 结束宿主端状态校正（Codex #21327 教训，方案 §3.5）.
 
     turn 结束后不该有条目还挂着「进行中」——模型忘了收尾时宿主端把残留的
-    in_progress 降回 pending（宁可显示未完成，不虚报完成），并重推一次快照
-    让 App 面板与 store 一致。仅对计划播种清单生效，避免改变普通清单语义。
+    in_progress 降回 pending（宁可显示未完成，不虚报完成）。仅对计划播种清单
+    生效，避免改变普通清单语义。
+
+    校正必须与播种一样写一对 canonical todo 消息（codex P1）：只改内存 +
+    推 SSE 的话，下一轮新 agent 实例从历史 hydrate 出来的还是旧的
+    in_progress，校正在刷新后被静默还原。同样 fail-closed：落盘成功才推快照。
     """
     store = getattr(agent, "_todo_store", None)
     if store is None or not getattr(store, "plan_id", None):
@@ -125,7 +136,36 @@ def correct_stale_in_progress_at_turn_end(agent: Any) -> None:
             return
         from tools.todo_tool import todo_tool
 
-        _emit_todo_snapshot(agent, todo_tool(store=store))
+        result_json = todo_tool(store=store)
+        call_id = f"call_todofix_{store.plan_id}_{len(messages)}"
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "todo",
+                    "arguments": json.dumps(
+                        {"todos": store.read(), "merge": False},
+                        ensure_ascii=False,
+                    ),
+                },
+            }],
+        })
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        messages.append(make_tool_result_message("todo", result_json, call_id))
+
+        from agent.tool_executor import _flush_session_db_after_tool_progress
+
+        persisted = _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"turn-end todo correction {store.plan_id}",
+        )
+        if persisted:
+            _emit_todo_snapshot(agent, result_json)
     except Exception:
         logger.exception("turn-end todo correction failed")
 

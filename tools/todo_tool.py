@@ -36,6 +36,12 @@ MAX_TODO_ITEMS = 256
 # before it is parsed and re-injected (see AIAgent._hydrate_todo_store).
 MAX_TODO_RESULT_CHARS = 512_000
 _TRUNCATION_MARKER = "… [truncated]"
+# 计划播种的内容总量预算（字符）。播种会合成一对 todo tool_call/result 写进
+# 对话历史（跨 turn 存活），这对消息不经过 maybe_persist_tool_result /
+# enforce_turn_budget 的工具结果裁剪——极端大计划（上游上限 20 组 × 50 条 ×
+# 500 字符）会产生 ~150KB 重复上下文，压爆设备端小上下文模型（codex P1）。
+# 预算按组边界对齐截断；24K 字符 ≈ 正常计划（几十条 × 短句）的十倍余量。
+MAX_SEED_CONTENT_CHARS = 24_000
 # Persisted as ordinary message content. ContextCompressor uses this stable
 # header to distinguish the synthetic post-compaction row from a real user.
 TODO_INJECTION_HEADER = (
@@ -86,12 +92,14 @@ class TodoStore:
         清单」——层级映射由代码保证（方案 §3，FND-004 详略错位的根治）。
 
         Cap alignment: plan 上限（20 组 × 50 条 = 1000）大于 MAX_TODO_ITEMS
-        （256）。裁剪按**组边界**对齐——放不下的组整组丢弃，不把一个阶段砍成
-        半截；若第一组单独超限则组内截断（必须播出内容）。
+        （256），另有 MAX_SEED_CONTENT_CHARS 内容总量预算（合成消息对不走工具
+        结果裁剪，见常量注释）。两种裁剪都按**组边界**对齐——放不下的组整组
+        丢弃，不把一个阶段砍成半截；若第一组单独超限则组内截断（必须播出内容）。
 
         Returns the seeded list (copy).
         """
         items: List[Dict[str, str]] = []
+        content_chars = 0
         for gi, group in enumerate(groups or []):
             if not isinstance(group, dict):
                 continue
@@ -100,14 +108,20 @@ class TodoStore:
             ]
             if not group_items:
                 continue
-            if items and len(items) + len(group_items) > MAX_TODO_ITEMS:
-                break  # 组边界对齐：这一组放不下就整组停止
+            group_chars = sum(len(i) for i in group_items)
+            if items and (
+                len(items) + len(group_items) > MAX_TODO_ITEMS
+                or content_chars + group_chars > MAX_SEED_CONTENT_CHARS
+            ):
+                break  # 组边界对齐：这一组放不下（条数或内容预算）就整组停止
             for ii, content in enumerate(group_items):
-                if len(items) >= MAX_TODO_ITEMS:
+                if len(items) >= MAX_TODO_ITEMS or content_chars >= MAX_SEED_CONTENT_CHARS:
                     break  # 首组单独超限：组内截断兜底
+                capped = self._cap_content(content)
+                content_chars += len(capped)
                 items.append({
                     "id": f"{plan_id}-{gi + 1}-{ii + 1}",
-                    "content": self._cap_content(content),
+                    "content": capped,
                     "status": "pending",
                     "group_index": gi,
                     "plan_id": plan_id,

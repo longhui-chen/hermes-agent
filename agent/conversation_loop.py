@@ -7675,6 +7675,15 @@ def run_conversation(
                         },
                     )
 
+                # 计划播种：present_plan 本批次成功呈现后，用同一份计划骨架
+                # 播种 TodoStore + 合成 todo 调用消息对（跨 turn 存活）。必须
+                # 在批次收尾后、present_plan break 之前——manual 确认卡模式
+                # 随后立即结束 turn，晚一步播种就随 agent 实例蒸发。放在持久化
+                # 失败检查之前：播种落盘失败也要走 session_persistence_failed
+                # 终止，而不是带着"看似成功"的计划卡结束 turn（codex P1）。
+                from agent.plan_seeding import seed_pending_plan_todos
+                seed_pending_plan_todos(agent, messages)
+
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any
@@ -7683,13 +7692,6 @@ def run_conversation(
                     final_response = ""
                     failed = True
                     break
-
-                # 计划播种：present_plan 本批次成功呈现后，用同一份计划骨架
-                # 播种 TodoStore + 合成 todo 调用消息对（跨 turn 存活）。必须
-                # 在批次收尾后、present_plan break 之前——manual 确认卡模式
-                # 随后立即结束 turn，晚一步播种就随 agent 实例蒸发。
-                from agent.plan_seeding import seed_pending_plan_todos
-                seed_pending_plan_todos(agent, messages)
 
                 if _should_end_after_present_plan(agent):
                     _turn_exit_reason = "text_response(plan_presented)"
@@ -8682,7 +8684,7 @@ def run_conversation(
                 # 「进行中」，模型忘了收尾时降回 pending 并重推快照（Codex
                 # #21327 教训——状态约束只写提示词必然漂移）。
                 from agent.plan_seeding import correct_stale_in_progress_at_turn_end
-                correct_stale_in_progress_at_turn_end(agent)
+                correct_stale_in_progress_at_turn_end(agent, messages)
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break

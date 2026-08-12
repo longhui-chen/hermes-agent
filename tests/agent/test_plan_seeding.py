@@ -218,6 +218,76 @@ def test_seed_pending_plan_todos_noop_without_meta():
     assert emitted == []
 
 
+class _FlushFailAgent(SimpleNamespace):
+    def _flush_messages_to_session_db(self, messages):
+        return False
+
+
+def test_seed_does_not_emit_snapshot_when_persistence_fails():
+    # Fail-closed（codex P1）：合成消息对没落盘就不给 App 推快照——否则用户
+    # 看到可确认的清单，下一轮却 hydrate 不出骨架。
+    emitted = []
+    agent = _FlushFailAgent(
+        _pending_plan_seed={"plan_id": "plan10", "title": "t", "groups": _groups(1)},
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    seed_pending_plan_todos(agent, [])
+    assert emitted == []
+    assert agent._incremental_persistence_failed is True
+
+
+def test_turn_end_correction_writes_canonical_pair():
+    # 校正只改内存的话，下一轮从历史 hydrate 出旧的 in_progress（codex P1）：
+    # 必须像播种一样写一对 canonical todo 消息并在落盘成功后才推快照。
+    from agent.plan_seeding import correct_stale_in_progress_at_turn_end
+
+    emitted = []
+    agent = _FakeAgent(
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    agent._todo_store.seed_from_plan("plan11", _groups(2))
+    agent._todo_store.write(
+        [{"id": "plan11-1-1", "content": "step 0-0", "status": "in_progress"}],
+        merge=True,
+    )
+    messages = []
+    correct_stale_in_progress_at_turn_end(agent, messages)
+
+    assert messages[-2]["role"] == "assistant"
+    assert messages[-2]["tool_calls"][0]["function"]["name"] == "todo"
+    assert messages[-1]["role"] == "tool"
+    payload = json.loads(messages[-1]["content"])
+    statuses = {t["id"]: t["status"] for t in payload["todos"]}
+    assert statuses["plan11-1-1"] == "pending"
+    assert len(emitted) == 1
+    # hydration 配对校验兼容。
+    from run_agent import AIAgent
+    assert AIAgent._tool_response_matches_todo_call(messages, len(messages) - 1)
+
+
+def test_seed_from_plan_respects_content_budget():
+    # 内容预算（codex P1）：极端大计划不把 ~150KB 重复文本塞进合成消息对。
+    from tools.todo_tool import MAX_SEED_CONTENT_CHARS
+
+    big_groups = [
+        {
+            "icon": "📦",
+            "label": f"g{gi}",
+            "count": 50,
+            "items": ["x" * 500 for _ in range(50)],
+        }
+        for gi in range(10)
+    ]
+    store = TodoStore()
+    items = store.seed_from_plan("plan12", big_groups)
+    total_chars = sum(len(i["content"]) for i in items)
+    assert total_chars <= MAX_SEED_CONTENT_CHARS
+    # 组边界对齐：每组 50×500=25000 > 24000 预算 → 首组组内截断兜底。
+    assert {i["group_index"] for i in items} == {0}
+
+
 def test_build_seed_messages_shape():
     msgs = build_seed_messages("planXY", [{"id": "planXY-1-1"}], '{"todos": []}')
     assert msgs[0]["tool_calls"][0]["id"] == "call_planseed_planXY"
