@@ -19,6 +19,7 @@ cannot see what Python put into ``os.environ`` afterwards. The only honest
 observation is the child reporting its own environment.
 """
 
+import ast
 import json
 import subprocess
 import sys
@@ -136,15 +137,33 @@ def test_no_spawn_site_re_points_hermes_home_on_its_own(tmp_path):
     sites = [root / "tui_gateway" / "server.py", root / "hermes_cli" / "web_server.py"]
     for site in sites:
         source = site.read_text(encoding="utf-8")
-        assert "apply_profile_scoped_env" in source, (
+        tree = ast.parse(source)
+        profile_scope_calls = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else getattr(node.func, "attr", None)
+            )
+            == "apply_profile_scoped_env"
+        ]
+        assert profile_scope_calls, (
             f"{site.name} re-points a child at a session profile and must use the contract"
         )
-        offenders = [
-            line.strip()
-            for line in source.splitlines()
-            if 'env["HERMES_HOME"] =' in line or "env['HERMES_HOME'] =" in line
-        ]
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "HERMES_HOME"
+                ):
+                    offenders.append(node.lineno)
         assert not offenders, (
-            f"{site.name} sets HERMES_HOME directly: {offenders}. Every profile-scoped "
+            f"{site.name} sets HERMES_HOME directly at lines {offenders}. Every profile-scoped "
             "key has to move together, which is what apply_profile_scoped_env is for"
         )
