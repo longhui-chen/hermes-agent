@@ -264,10 +264,9 @@ def _get_default_output_dir() -> str:
     return str(get_hermes_dir("cache/audio", "audio_cache"))
 
 DEFAULT_OUTPUT_DIR = _get_default_output_dir()
-_SAFE_SESSION_OUTPUT_BUCKET_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
-def _default_output_dir_for_session(*, platform: str, session_id: str) -> Path:
+def _default_output_dir_for_session(*, platform: str) -> Path:
     """Resolve the per-call default without leaking another profile's root.
 
     Managed Zettlab turns expose a profile-scoped semantic Agent output root.
@@ -280,7 +279,9 @@ def _default_output_dir_for_session(*, platform: str, session_id: str) -> Path:
         str(platform or "").strip().lower() != "zet_agent"
         or os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
     ):
-        return Path(DEFAULT_OUTPUT_DIR)
+        output_dir = Path(DEFAULT_OUTPUT_DIR)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
 
     try:
         from tools.runtime_workdir import agent_output_dir
@@ -294,24 +295,10 @@ def _default_output_dir_for_session(*, platform: str, session_id: str) -> Path:
             "ZET_AGENT_OUTPUT_DIR must name an existing directory"
         )
 
-    root = Path(output_root).resolve()
-    bucket = str(session_id or "").strip().rsplit(":", 1)[-1]
-    if not bucket:
-        return root
-    if bucket in {".", ".."} or not _SAFE_SESSION_OUTPUT_BUCKET_RE.fullmatch(bucket):
-        logger.warning(
-            "Unsafe Zettlab session output bucket ignored; using flat Agent output"
-        )
-        return root
-    candidate = (root / bucket).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        logger.warning(
-            "Zettlab session output bucket escaped Agent output; using flat output"
-        )
-        return root
-    return candidate
+    # local-server owns profile/session scoping and injects the final existing
+    # product directory. Hermes must not invent another artifact root or
+    # recreate a missing platform-owned directory.
+    return Path(output_root)
 
 # ---------------------------------------------------------------------------
 # Per-provider input-character limits (from official provider docs).
@@ -1776,11 +1763,11 @@ def _generate_openai_tts(
                 )
         else:
             response = client.audio.speech.create(**create_kwargs)
-            _write_tts_response_to_file(
-                response,
-                output_path,
-                label=label,
-            )
+            # Preserve the direct-provider contract. The bounded atomic sink
+            # is a managed-gateway guard; applying its 16 MiB product limit to
+            # a user's direct OpenAI-compatible endpoint would be an unrelated
+            # behavior change.
+            response.stream_to_file(output_path)
         return output_path
     finally:
         close = getattr(client, "close", None)
@@ -3086,7 +3073,6 @@ def text_to_speech_tool(
     # always outputs MP3 and needs ffmpeg for conversion.
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    session_id = get_session_env("HERMES_SESSION_ID", "")
     want_opus = platform in OPUS_VOICE_PLATFORMS
 
     # Determine output path
@@ -3130,13 +3116,9 @@ def text_to_speech_tool(
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         try:
-            out_dir = _default_output_dir_for_session(
-                platform=platform,
-                session_id=session_id,
-            )
+            out_dir = _default_output_dir_for_session(platform=platform)
         except RuntimeError as exc:
             return tool_error(f"TTS output unavailable: {exc}", success=False)
-        out_dir.mkdir(parents=True, exist_ok=True)
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             file_path = out_dir / f"tts_{timestamp}.{fmt}"

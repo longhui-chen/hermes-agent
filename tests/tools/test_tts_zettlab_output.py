@@ -41,7 +41,7 @@ def _stub_edge_tts(monkeypatch) -> None:
     monkeypatch.setattr(tts_tool, "_generate_edge_tts", _write_edge_output)
 
 
-def test_managed_zettlab_tts_defaults_to_session_output_dir(tmp_path, monkeypatch):
+def test_managed_zettlab_tts_defaults_to_platform_output_dir(tmp_path, monkeypatch):
     output_root = tmp_path / "agent-output"
     output_root.mkdir()
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
@@ -55,7 +55,7 @@ def test_managed_zettlab_tts_defaults_to_session_output_dir(tmp_path, monkeypatc
 
     file_path = Path(result["file_path"])
     assert result["success"] is True
-    assert file_path.parent == output_root / "session-abc"
+    assert file_path.parent == output_root
     assert file_path.read_bytes() == b"mp3"
     assert result["media_tag"] == f"MEDIA:{file_path}"
 
@@ -73,8 +73,8 @@ def test_managed_zettlab_tts_resolves_output_root_per_profile(tmp_path, monkeypa
     with _managed_zettlab_session(output_b, "zettlab:local-dev:b:session-b"):
         result_b = json.loads(tts_tool.text_to_speech_tool("profile b"))
 
-    assert Path(result_a["file_path"]).parent == output_a / "session-a"
-    assert Path(result_b["file_path"]).parent == output_b / "session-b"
+    assert Path(result_a["file_path"]).parent == output_a
+    assert Path(result_b["file_path"]).parent == output_b
 
 
 def test_managed_zettlab_tts_fails_when_agent_output_is_unavailable(
@@ -96,43 +96,6 @@ def test_managed_zettlab_tts_fails_when_agent_output_is_unavailable(
     assert result["success"] is False
     assert "ZET_AGENT_OUTPUT_DIR must name an existing directory" in result["error"]
     assert not cache_root.exists()
-
-
-def test_managed_zettlab_tts_rejects_unsafe_session_bucket(tmp_path, monkeypatch):
-    output_root = tmp_path / "agent-output"
-    output_root.mkdir()
-    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    _stub_edge_tts(monkeypatch)
-
-    with _managed_zettlab_session(
-        output_root,
-        "zettlab:local-dev:main:../../escape",
-    ):
-        result = json.loads(tts_tool.text_to_speech_tool("hello"))
-
-    file_path = Path(result["file_path"])
-    assert result["success"] is True
-    assert file_path.parent == output_root
-    assert file_path.is_relative_to(output_root)
-
-
-def test_managed_zettlab_tts_rejects_dot_session_buckets(tmp_path, monkeypatch):
-    output_root = tmp_path / "agent-output"
-    output_root.mkdir()
-    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    _stub_edge_tts(monkeypatch)
-
-    for bucket in (".", ".."):
-        with _managed_zettlab_session(
-            output_root,
-            f"zettlab:local-dev:main:{bucket}",
-        ):
-            result = json.loads(tts_tool.text_to_speech_tool("hello"))
-
-        file_path = Path(result["file_path"])
-        assert result["success"] is True
-        assert file_path.parent == output_root.resolve()
-        assert file_path.is_relative_to(output_root.resolve())
 
 
 def test_non_zettlab_tts_keeps_existing_cache_default(tmp_path, monkeypatch):
