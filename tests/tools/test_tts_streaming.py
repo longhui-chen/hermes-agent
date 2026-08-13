@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from contextvars import ContextVar
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -969,7 +970,8 @@ def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(monke
     pipeline.speak("Provider-selected output format.")
     pipeline.close()
 
-    assert played == provider_outputs
+    assert len(played) == 1
+    assert os.path.realpath(played[0]) == os.path.realpath(provider_outputs[0])
     assert not [path for path in placeholders + provider_outputs if os.path.exists(path)]
 
 
@@ -1012,6 +1014,51 @@ def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
     assert len(played) == 1
     assert os.path.realpath(played[0]) == os.path.realpath(returned_paths[0])
     assert not [path for path in returned_paths if os.path.exists(path)]
+
+
+def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    alias_dir = tmp_path / "alias"
+    try:
+        alias_dir.symlink_to(real_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+    real_mkstemp = tempfile.mkstemp
+
+    def controlled_mkstemp(*args, **kwargs):
+        kwargs["dir"] = real_dir
+        return real_mkstemp(*args, **kwargs)
+
+    def fake_synth(text, output_path):
+        del text
+        provider_path = Path(output_path).with_suffix(".wav")
+        provider_path.write_bytes(b"provider audio")
+        alias_path = alias_dir / provider_path.name
+        return json.dumps({"success": True, "file_path": str(alias_path)})
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", controlled_mkstemp)
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    try:
+        output_path = pipeline._synthesize_to_tmp("Canonical temporary path.")
+        assert output_path is not None
+        assert Path(output_path).parent == real_dir
+
+        alias_dir.unlink()
+        alias_dir.symlink_to(decoy_dir, target_is_directory=True)
+        decoy_path = decoy_dir / Path(output_path).name
+        decoy_path.write_bytes(b"keep me")
+
+        Path(output_path).unlink()
+        assert decoy_path.read_bytes() == b"keep me"
+    finally:
+        pipeline.close()
 
 
 def test_sync_pipeline_rejects_unowned_provider_path(monkeypatch, tmp_path):

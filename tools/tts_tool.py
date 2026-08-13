@@ -3699,7 +3699,7 @@ class _SyncSentencePipeline:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-            return tmp_path if same_path else output_path
+            return str(tmp_real_path if same_path else output_real_path)
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
             if tmp_path:
