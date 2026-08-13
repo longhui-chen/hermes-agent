@@ -110,12 +110,121 @@ def _canonical_command(suffix: str) -> str:
     )
 
 
+def _write_application_app_agent_helper(tmp_path, body: str) -> os.PathLike:
+    script = (
+        tmp_path
+        / "presets"
+        / "skills"
+        / "application-create"
+        / "scripts"
+        / "create_agent.py"
+    )
+    script.parent.mkdir(parents=True)
+    preamble = """
+import os as _secret_os
+
+def _read_injected_secret(key):
+    descriptor = int(_secret_os.environ.pop(key + "_FD"))
+    with _secret_os.fdopen(descriptor, "rb", closefd=True) as stream:
+        return stream.read(4097).decode("utf-8")
+
+"""
+    script.write_text(
+        textwrap.dedent(preamble).lstrip() + textwrap.dedent(body).lstrip(),
+        encoding="utf-8",
+    )
+    (script.parent.parent / "manifest.yaml").write_text(
+        "id: application-create\n"
+        "optional_runtime_capabilities:\n"
+        "  - zettlab.agent_action_token_fd.v1\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def _application_app_agent_command(suffix: str) -> str:
+    return (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/application-create/'
+        f'scripts/create_agent.py" {suffix}'
+    )
+
+
 def _auto_approve_mutations(monkeypatch) -> None:
     monkeypatch.setattr(
         terminal_tool_module,
         "_request_agentcomputer_mutation_approval",
         lambda _parsed: None,
     )
+
+
+def test_application_helper_uses_optional_scoped_capability(
+    monkeypatch,
+    tmp_path,
+):
+    _write_application_app_agent_helper(
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({
+            "argv": sys.argv[1:],
+            "token": _read_injected_secret("ZETTLAB_AGENT_ACTION_TOKEN"),
+        }))
+        """,
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    _auto_approve_mutations(monkeypatch)
+    payload = json.dumps({
+        "app_slug": "prices",
+        "name": "Prices maintainer",
+        "soul_identity": "Maintain prices",
+        "cron_job": {
+            "name": "refresh",
+            "schedule": "0 8 * * *",
+            "prompt": "refresh prices",
+            "output_language": "zh-CN",
+        },
+    })
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(terminal_tool_module.terminal_tool(
+            _application_app_agent_command(
+                f"create-app-agent --payload {shlex.quote(payload)}"
+            ),
+            task_id="application-app-agent-helper",
+        ))
+
+    assert result["exit_code"] == 0
+    output = json.loads(result["output"])
+    assert output["argv"][:2] == ["create-app-agent", "--payload"]
+    assert output["token"] == "***"
+    assert "scope-token" not in result["output"]
+
+
+def test_application_helper_rejects_unrelated_creator_commands(
+    monkeypatch,
+    tmp_path,
+):
+    _write_application_app_agent_helper(tmp_path, "print('must not run')\n")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+
+    result = terminal_tool_module._parse_agent_creator_command(
+        _application_app_agent_command("preflight")
+    )
+
+    assert result is None
 
 
 def test_terminal_dispatch_runs_preflight_with_only_scoped_credentials(

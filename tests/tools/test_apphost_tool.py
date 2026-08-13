@@ -227,11 +227,6 @@ def test_app_host_request_keeps_its_own_base_url(monkeypatch):
               "body": {"source": "cron"}},
      "POST", "/app1/call",
      {"method": "POST", "path": "/api/refresh", "body": {"source": "cron"}}),
-    # GET with a query string and no body: the body key must be absent, not
-    # null — the server treats "present" as "forward a JSON body".
-    ("call", {"slug": "app1", "path": "/api/items?limit=10",
-              "http_method": "GET"},
-     "POST", "/app1/call", {"method": "GET", "path": "/api/items?limit=10"}),
 ])
 def test_action_routing_flow(monkeypatch, action, args, method, path, body):
     seen = {}
@@ -279,7 +274,7 @@ _ALL_HTTP_ACTION_ARGS = [
     ("delete", {"slug": "app1"}),
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}),
     ("logs", {"slug": "app1"}),
-    ("call", {"slug": "app1", "path": "/api/health", "http_method": "GET"}),
+    ("call", {"slug": "app1", "path": "/api/refresh", "http_method": "POST"}),
 ]
 
 
@@ -778,7 +773,7 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     # Deliberately the default tier: the server's wake+respond budget (~25s)
     # must expire first so failures arrive as structured error codes, not as
     # a client-side status=null transport_error.
-    ("call", {"slug": "a1", "path": "/api/x", "http_method": "GET"}, 30.0),
+    ("call", {"slug": "a1", "path": "/api/refresh", "http_method": "POST"}, 30.0),
 ])
 def test_timeout_is_tiered_per_action(monkeypatch, action, args, expected_timeout):
     seen = {}
@@ -1119,6 +1114,7 @@ def test_call_http_method_is_case_normalized(monkeypatch):
 @pytest.mark.parametrize(
     "method,path",
     [
+        ("GET", "/api/refresh"),
         ("POST", "/api/delete-account"),
         ("POST", "/api/refresh-all"),
         ("PUT", "/api/refresh"),

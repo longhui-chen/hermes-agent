@@ -80,8 +80,9 @@ _DATA_REFRESH_CHOICES = ("static", "user_confirmed_auto", "user_declined")
 # The hidden maintainer gets one write capability, not the app's whole HTTP
 # surface. Generated apps expose POST /api/refresh as the user-confirmed data
 # maintenance verb; every other write path stays unavailable to model calls.
-# GET remains available for read-back verification.
-_CALL_HTTP_METHODS = ("GET", "POST")
+# Reads use declared typed AppOperation capabilities. This legacy call action
+# exposes only the user-confirmed refresh mutation.
+_CALL_HTTP_METHODS = ("POST",)
 _CALL_WRITE_PATHS = frozenset({"/api/refresh"})
 # NOTE: no "recover" — the internal (agent) face deliberately does not expose
 # it (an action token authenticates one agent, not the device); recovery from
@@ -120,9 +121,8 @@ APP_HOST_SCHEMA = {
         "delete (soft-delete into the "
         "recycle bin; recovery is done from the client app's list, there is "
         "no recover action here), lifecycle (start/stop/restart), logs "
-        "(recent log tail), call (invoke a bounded HTTP capability of an app the "
-        "current agent owns — GET may read an app endpoint; the only exposed "
-        "write capability is POST /api/refresh from the user-confirmed "
+        "(recent log tail), call (invoke the single bounded HTTP capability of an "
+        "app bound to the current hidden maintainer: POST /api/refresh from the user-confirmed "
         "automatic-refresh flow. Give the app's slug and API path, with http_method "
         "and an optional JSON body; never a full URL, host or port — the "
         "host resolves the target from the slug, and only the owning agent "
@@ -162,9 +162,9 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Required for call: the app's own API path, starting "
-                    "with '/'. Writes are limited to POST /api/refresh; GET "
-                    "may use another read path (a query string is "
-                    "fine). Only the path within the app — never a full URL, "
+                    "with '/'. It must be exactly /api/refresh, without a "
+                    "query string. General reads and writes require declared "
+                    "typed app capabilities. Only the path within the app — never a full URL, "
                     "host or port; the host resolves the target from the "
                     "slug."
                 ),
@@ -434,7 +434,7 @@ def _require_http_method(args):
     method = str(args.get("http_method", "") or "").strip().upper()
     if method not in _CALL_HTTP_METHODS:
         raise _BadRequest(
-            "call 需要 http_method 参数（GET/POST）"
+            "call 需要 http_method 参数（POST）"
         )
     return method
 
@@ -569,10 +569,10 @@ def _build_request(action, args):
         slug = _require_slug(args)
         path = _require_app_path(args)
         method = _require_http_method(args)
-        if method != "GET" and urlsplit(path).path not in _CALL_WRITE_PATHS:
+        if method != "POST" or path not in _CALL_WRITE_PATHS:
             raise _BadRequest(
-                "call 的写操作只允许用户已确认自动更新流程使用的 "
-                "POST /api/refresh；其他应用写端点不向 agent 开放"
+                "call 只允许用户已确认自动更新流程使用的精确能力 "
+                "POST /api/refresh；读取和其他写入须走应用声明的能力"
             )
         body = {"method": method, "path": path}
         if args.get("body") is not None:

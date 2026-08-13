@@ -4659,6 +4659,12 @@ _AGENT_CREATOR_RELATIVE_PATH = Path(
 _AGENT_CREATOR_MANIFEST_RELATIVE_PATH = Path(
     "skills/agent-creator/manifest.yaml"
 )
+_APP_AGENT_HELPER_RELATIVE_PATH = Path(
+    "skills/application-create/scripts/create_agent.py"
+)
+_APP_AGENT_HELPER_MANIFEST_RELATIVE_PATH = Path(
+    "skills/application-create/manifest.yaml"
+)
 _AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY = (
     "zettlab.agent_action_token_fd.v1"
 )
@@ -5245,13 +5251,16 @@ def _log_agent_creator_rejection(reason: str) -> None:
 
 
 def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
-    """Resolve only the fixed creator script below the pinned presets root."""
+    """Resolve one fixed creator helper below the pinned presets root."""
 
     anchor = _capture_connector_runtime_root()
     if anchor is None:
         return None
 
-    expected = _AGENT_CREATOR_RELATIVE_PATH
+    expected_paths = {
+        _AGENT_CREATOR_RELATIVE_PATH,
+        _APP_AGENT_HELPER_RELATIVE_PATH,
+    }
     relative: Optional[Path] = None
     for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
         if raw_path.startswith(prefix):
@@ -5259,8 +5268,8 @@ def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
             break
     else:
         supplied = Path(raw_path)
-        if raw_path == expected.as_posix():
-            relative = expected
+        if Path(raw_path) in expected_paths:
+            relative = Path(raw_path)
         elif not supplied.is_absolute():
             return None
         else:
@@ -5274,13 +5283,13 @@ def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
                 except ValueError:
                     continue
 
-    if relative is None or relative != expected or ".." in relative.parts:
+    if relative is None or relative not in expected_paths or ".." in relative.parts:
         return None
 
-    candidate = anchor.resolved_root / expected
+    candidate = anchor.resolved_root / relative
     try:
         resolved = candidate.resolve(strict=True)
-        if resolved.relative_to(anchor.resolved_root) != expected:
+        if resolved.relative_to(anchor.resolved_root) != relative:
             return None
     except (OSError, ValueError):
         return None
@@ -5440,6 +5449,17 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
         return None
 
     args = tokens[2:]
+    try:
+        script_relative = script.relative_to(
+            _CONNECTOR_RUNTIME_ROOT_ANCHOR.resolved_root
+        )
+    except (AttributeError, ValueError):
+        return None
+    if (
+        script_relative == _APP_AGENT_HELPER_RELATIVE_PATH
+        and (not args or args[0] != "create-app-agent")
+    ):
+        return None
     stdin_text: Optional[str] = None
     approval_operation: Optional[str] = None
     if args in (["preflight"], ["list"]):
@@ -5687,10 +5707,23 @@ def _read_verified_agent_creator_script(
 
 def _agent_creator_manifest_supports_action_token_fd(
     anchor: _ConnectorRuntimeRootAnchor,
+    script: Path,
 ) -> bool:
     """Validate the preset ABI before acquiring or injecting a scoped token."""
 
-    manifest = anchor.resolved_root / _AGENT_CREATOR_MANIFEST_RELATIVE_PATH
+    try:
+        script_relative = script.relative_to(anchor.resolved_root)
+    except ValueError:
+        return False
+    if script_relative == _APP_AGENT_HELPER_RELATIVE_PATH:
+        manifest_relative = _APP_AGENT_HELPER_MANIFEST_RELATIVE_PATH
+        capability_field = "optional_runtime_capabilities"
+    elif script_relative == _AGENT_CREATOR_RELATIVE_PATH:
+        manifest_relative = _AGENT_CREATOR_MANIFEST_RELATIVE_PATH
+        capability_field = "runtime_capabilities"
+    else:
+        return False
+    manifest = anchor.resolved_root / manifest_relative
     if not _connector_runtime_path_is_trusted(
         manifest,
         anchor.resolved_root,
@@ -5718,7 +5751,7 @@ def _agent_creator_manifest_supports_action_token_fd(
         loaded = yaml.safe_load(raw.decode("utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError("manifest root must be a mapping")
-        capabilities = loaded.get("runtime_capabilities")
+        capabilities = loaded.get(capability_field)
         if (
             not isinstance(capabilities, list)
             or len(capabilities) > _AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES
@@ -5854,7 +5887,7 @@ def _run_agent_creator_command_if_allowed(
             direct=True,
         )
 
-    if not _agent_creator_manifest_supports_action_token_fd(anchor):
+    if not _agent_creator_manifest_supports_action_token_fd(anchor, script):
         return _agent_creator_blocked_result(
             "agent_creator_runtime_capability_unavailable",
             (
