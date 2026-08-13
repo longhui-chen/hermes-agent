@@ -16,6 +16,7 @@ import pytest
 
 from hermes_cli.sessions_cmd import (
     _assert_trusted_transcript_import_parent,
+    _assert_transcript_import_scope,
     cmd_sessions,
     importable_transcript_messages,
 )
@@ -27,6 +28,10 @@ def trusted_local_server_runner(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.sessions_cmd._assert_trusted_transcript_import_parent",
         lambda: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.sessions_cmd._assert_transcript_import_scope",
+        lambda *_args: None,
     )
 
 
@@ -215,6 +220,21 @@ def cmd_sessions_with_db(args, db):
 
 
 class TestForkAcrossProfiles:
+    def test_rejects_a_scope_for_a_different_source_or_target(
+        self, forked, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.sessions_cmd._assert_transcript_import_scope",
+            _assert_transcript_import_scope,
+        )
+        monkeypatch.setenv("ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT_SCOPE", "0" * 64)
+        result = forked.run()
+        assert result == {
+            "ok": False,
+            "error": "transcript import scope does not match the requested operation",
+        }
+        assert forked.staged == []
+
     def test_rejects_public_cli_before_reading_a_sibling_profile(
         self, forked, monkeypatch
     ):

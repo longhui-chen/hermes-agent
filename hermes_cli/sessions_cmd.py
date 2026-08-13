@@ -19,6 +19,8 @@ one-way (main.py imports this module; the reverse happens only lazily at call
 time — no import cycle).
 """
 
+import hashlib
+import hmac
 import os
 import stat
 import sys
@@ -26,6 +28,7 @@ from pathlib import Path
 
 
 _TRUSTED_TRANSCRIPT_IMPORT_ENV = "ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT"
+_TRUSTED_TRANSCRIPT_IMPORT_SCOPE_ENV = "ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT_SCOPE"
 _ZETTOS_LOCAL_SERVER_ROOT = "/zettos/main/apps/com.zettlab.local-server"
 
 
@@ -57,6 +60,22 @@ def _assert_trusted_transcript_import_parent() -> None:
         raise PermissionError("transcript import runner is not a root-owned executable")
     if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise PermissionError("transcript import runner is writable by an untrusted principal")
+
+
+def _assert_transcript_import_scope(
+    source_profile: str,
+    source_session: str,
+    target_profile: str,
+    target_session: str,
+) -> None:
+    """Bind the trusted invocation to the exact cross-profile operation."""
+    payload = "\0".join(
+        (source_profile, source_session, target_profile, target_session)
+    ).encode("utf-8")
+    expected = hashlib.sha256(payload).hexdigest()
+    supplied = os.environ.get(_TRUSTED_TRANSCRIPT_IMPORT_SCOPE_ENV, "")
+    if not hmac.compare_digest(supplied, expected):
+        raise PermissionError("transcript import scope does not match the requested operation")
 
 
 def _m():
@@ -1025,6 +1044,21 @@ def cmd_sessions(args, sessions_parser=None):
             source_profile = normalize_profile_name(args.source_profile)
             validate_profile_name(source_profile)
         except ValueError as exc:
+            _fail(str(exc))
+            return 1
+
+        target_home = Path(get_hermes_home()).resolve()
+        target_profile = (
+            target_home.name if target_home.parent.name == "profiles" else "default"
+        )
+        try:
+            _assert_transcript_import_scope(
+                source_profile,
+                args.source_session,
+                target_profile,
+                args.target_session,
+            )
+        except PermissionError as exc:
             _fail(str(exc))
             return 1
 
