@@ -1122,47 +1122,76 @@ def cmd_sessions(args, sessions_parser=None):
                 "SELECT COUNT(*) FROM messages WHERE session_id = ?",
                 (args.source_session,),
             ).fetchone()[0]
+            # A structured message is stored as ``\0json:<payload>``.  It is
+            # deliberately not importable, so exclude it in SQLite before its
+            # payload crosses into Python.  The CASE separately keeps an
+            # oversized plain row out of Python too, allowing a deterministic
+            # rejection based on its stored byte length rather than decoding a
+            # multi-megabyte value first.
+            structured_prefix = SessionDB._CONTENT_JSON_PREFIX.encode("utf-8")
+            raw_content_limit = RUNTIME_IMPORT_MAX_CONTENT_CHARS * 4
+            select_messages = (
+                "SELECT id, role, CASE WHEN length(CAST(content AS BLOB)) <= ? "
+                "THEN content ELSE NULL END AS content, "
+                "length(CAST(content AS BLOB)) AS content_bytes, timestamp "
+                "FROM messages "
+            )
+            importable_text_where = (
+                " AND content IS NOT NULL "
+                "AND substr(CAST(content AS BLOB), 1, ?) != ?"
+            )
             frozen_ids = existing_snapshot.get("source_message_ids") if existing_snapshot else None
             if frozen_ids:
-                source_rows = []
-                for start in range(0, len(frozen_ids), 500):
-                    batch = frozen_ids[start:start + 500]
-                    placeholders = ",".join("?" for _ in batch)
-                    source_rows.extend(src._conn.execute(
-                        "SELECT id, role, content, timestamp FROM messages "
-                        f"WHERE session_id = ? AND id IN ({placeholders}) ORDER BY id",
-                        (args.source_session, *batch),
-                    ).fetchall())
-                source_rows.sort(key=lambda row: row["id"])
-                cursor = iter(source_rows)
+                def _frozen_rows():
+                    for start in range(0, len(frozen_ids), 500):
+                        batch = frozen_ids[start:start + 500]
+                        placeholders = ",".join("?" for _ in batch)
+                        yield from src._conn.execute(
+                            select_messages
+                            + f"WHERE session_id = ? AND id IN ({placeholders})"
+                            + importable_text_where
+                            + " ORDER BY id",
+                            (
+                                raw_content_limit,
+                                args.source_session,
+                                *batch,
+                                len(structured_prefix),
+                                structured_prefix,
+                            ),
+                        )
+
+                cursor = _frozen_rows()
                 total_rows = int(existing_snapshot.get("source_total_rows") or current_total_rows)
             else:
                 cursor = src._conn.execute(
-                    "SELECT id, role, content, timestamp FROM messages "
-                    "WHERE session_id = ? AND active = 1 AND llm_visible = 1 "
-                    "AND id > ? AND role IN ('user', 'assistant') ORDER BY id",
+                    select_messages
+                    + "WHERE session_id = ? AND active = 1 AND llm_visible = 1 "
+                    "AND id > ? AND role IN ('user', 'assistant')"
+                    + importable_text_where
+                    + " ORDER BY id",
                     (
+                        raw_content_limit,
                         args.source_session,
                         int(session_row["model_history_cutoff_message_id"] or 0),
+                        len(structured_prefix),
+                        structured_prefix,
                     ),
                 )
                 total_rows = current_total_rows
             messages = []
             content_bytes = 0
-            while True:
-                if hasattr(cursor, "fetchmany"):
-                    rows = cursor.fetchmany(RUNTIME_IMPORT_MAX_CHUNK_MESSAGES)
-                else:
-                    from itertools import islice
-                    rows = list(islice(cursor, RUNTIME_IMPORT_MAX_CHUNK_MESSAGES))
-                if not rows:
-                    break
-                decoded = []
-                for row in rows:
-                    item = dict(row)
-                    item["content"] = SessionDB._decode_content(item["content"])
-                    decoded.append(item)
-                for message in importable_transcript_messages(decoded):
+            for row in cursor:
+                raw_bytes = int(row["content_bytes"] or 0)
+                if raw_bytes > raw_content_limit:
+                    _fail(
+                        "source transcript contains a message exceeding the "
+                        f"{RUNTIME_IMPORT_MAX_CONTENT_CHARS}-character storage limit"
+                    )
+                    return 1
+                # The SQL filter has already excluded the only encoded content
+                # representation, so this is bounded plain text and requires
+                # no JSON decode or decoded-batch copy.
+                for message in importable_transcript_messages([dict(row)]):
                     if len(message["content"]) > RUNTIME_IMPORT_MAX_CONTENT_CHARS:
                         _fail(
                             "source transcript contains a message exceeding "

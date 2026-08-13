@@ -192,6 +192,28 @@ async def test_concurrent_principals_stay_in_their_own_executor_request_metadata
 
 
 @pytest.mark.asyncio
+async def test_zet_agent_passes_account_to_api_executor_separately_from_principal(monkeypatch):
+    captured = {}
+
+    async def base_run(_self, **kwargs):
+        captured.update(kwargs["request_overrides"])
+        return ({"final_response": "ok"}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", base_run)
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    account_token = _zettlab_request_account_id.set("account-1")
+    principal_token = push_zettlab_auth_principal("iam:alice")
+    try:
+        await adapter._run_agent(user_message="hi", conversation_history=[])
+    finally:
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert captured["_zettlab_auth_principal"] == "iam:alice"
+    assert captured["_zettlab_session_context_account_id"] == "account-1"
+
+
+@pytest.mark.asyncio
 async def test_agent_executor_keeps_browser_and_approval_session_scopes_separate(
     monkeypatch,
 ):
@@ -209,6 +231,7 @@ async def test_agent_executor_keeps_browser_and_approval_session_scopes_separate
 
         def run_conversation(self, **_kwargs):
             seen["session_key"] = get_session_env("HERMES_SESSION_KEY", "")
+            seen["session_user_id"] = get_session_env("HERMES_SESSION_USER_ID", "")
             seen["router_session_id"] = browser_backend_router._session_id()
             seen["browser_token"] = zettlab_browser_session_token()
             seen["approval_session_key"] = approval.get_current_session_key()
@@ -230,6 +253,8 @@ async def test_agent_executor_keeps_browser_and_approval_session_scopes_separate
     )
 
     browser_token = push_zettlab_browser_session_token("signed-request-scope")
+    account_token = _zettlab_request_account_id.set("account-1")
+    principal_token = push_zettlab_auth_principal("iam:alice")
     try:
         result, _usage = await adapter._run_agent(
             user_message="[ZETTLAB:BROWSER_SESSION_SCOPE_TEST]",
@@ -238,12 +263,15 @@ async def test_agent_executor_keeps_browser_and_approval_session_scopes_separate
             gateway_session_key=app_session_key,
         )
     finally:
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
         pop_zettlab_browser_session_token(browser_token)
 
     assert result["final_response"] == "ok"
     assert seen == {
         "agent_gateway_session_key": app_session_key,
         "session_key": app_session_key,
+        "session_user_id": "account-1",
         "router_session_id": app_session_key,
         "browser_token": "signed-request-scope",
         "approval_session_key": interaction_queue_key,

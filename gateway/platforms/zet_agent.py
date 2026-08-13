@@ -986,14 +986,17 @@ class ZetAgentAdapter(APIServerAdapter):
         if not session_id:
             return
         try:
-            from gateway.session_context import set_session_vars, zettlab_auth_principal
+            from gateway.session_context import set_session_vars
 
             set_session_vars(
                 platform="zet_agent",
                 chat_id=session_id,
                 chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
                 thread_id="",
-                user_id=zettlab_auth_principal() or _zettlab_request_account_id.get(),
+                # HERMES_SESSION_USER_ID reaches managed Memo MCP metadata;
+                # it is therefore always the personal account, never the
+                # transcript-owner principal.
+                user_id=_zettlab_request_account_id.get(),
                 user_name="",
                 session_key=session_key or session_id,
                 profile=str(_api_request_profile.get() or "main").strip() or "main",
@@ -1023,6 +1026,10 @@ class ZetAgentAdapter(APIServerAdapter):
         return set_session_vars(
             platform="zet_agent",
             chat_id=chat_id,
+            # Zet's wrapper supplies the authenticated account explicitly
+            # because API-server execution runs in an executor that does not
+            # inherit the request ContextVars.  Principal ownership remains
+            # private to AIAgent's separate ``session_owner_id``.
             user_id=session_user_id or _zettlab_request_account_id.get(),
             session_key=session_key,
             session_id=session_id,
@@ -1031,6 +1038,10 @@ class ZetAgentAdapter(APIServerAdapter):
             cron_session="",
             exec_ask="1",
         )
+
+    def _api_run_session_context_user_id(self) -> str:
+        """Snapshot the authenticated account before a Runs worker starts."""
+        return str(_zettlab_request_account_id.get() or "").strip()
 
     @staticmethod
     def _public_session_id_for_current_profile(session_key: str) -> Optional[str]:
@@ -2914,6 +2925,11 @@ class ZetAgentAdapter(APIServerAdapter):
         agent_request_overrides = dict(request_overrides or {})
         from gateway.session_context import zettlab_auth_principal
 
+        account_id = str(
+            agent_request_overrides.pop("_zettlab_session_context_account_id", "")
+            or _zettlab_request_account_id.get()
+            or ""
+        ).strip()
         session_owner_id = str(
             zettlab_auth_principal()
             or agent_request_overrides.pop("_zettlab_auth_principal", "")
@@ -3198,7 +3214,7 @@ class ZetAgentAdapter(APIServerAdapter):
             "request_overrides": agent_request_overrides or None,
             # `user_id` remains the Memo/account partition.  Transcript rows
             # use the separate principal-only `session_owner_id`.
-            "user_id": _zettlab_request_account_id.get() or None,
+            "user_id": account_id or None,
             "session_owner_id": session_owner_id or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
@@ -3230,7 +3246,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 str(model or ""),
                 str(runtime_kwargs.get("provider") or ""),
                 str(runtime_kwargs.get("base_url") or ""),
-                str(_zettlab_request_account_id.get() or ""),
+                account_id,
                 session_owner_id,
             )
             agent = self._cached_onboarding_agent(onboarding_cache_key)
@@ -3515,6 +3531,9 @@ class ZetAgentAdapter(APIServerAdapter):
         principal = zettlab_auth_principal()
         if principal:
             request_overrides["_zettlab_auth_principal"] = principal
+        account_id = _zettlab_request_account_id.get()
+        if account_id:
+            request_overrides["_zettlab_session_context_account_id"] = account_id
 
         # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
         # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本

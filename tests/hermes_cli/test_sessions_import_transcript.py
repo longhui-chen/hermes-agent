@@ -201,7 +201,12 @@ def forked(tmp_path, monkeypatch, capsys):
         cmd_sessions_with_db(args, FakeDB())
         return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
-    return types.SimpleNamespace(run=run, staged=staged, source_session=source_session)
+    return types.SimpleNamespace(
+        run=run,
+        staged=staged,
+        source_session=source_session,
+        source_db=profiles / "source" / "state.db",
+    )
 
 
 def cmd_sessions_with_db(args, db):
@@ -225,6 +230,57 @@ class TestForkAcrossProfiles:
         result = forked.run(owner_principal="")
         assert result["ok"] is False
         assert "owner_principal" in result["error"]
+
+    def test_structured_source_payload_is_filtered_before_json_decode(self, forked, monkeypatch):
+        """Image/tool JSON never crosses the importer's Python decode boundary."""
+        from hermes_state import SessionDB
+
+        source = sqlite3.connect(forked.source_db)
+        source.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (
+                forked.source_session,
+                "user",
+                SessionDB._CONTENT_JSON_PREFIX + json.dumps([
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]),
+                1_700_000_100.0,
+            ),
+        )
+        source.commit()
+        source.close()
+
+        def must_not_decode(_cls, _content):
+            raise AssertionError("structured transcript content reached JSON decode")
+
+        monkeypatch.setattr(SessionDB, "_decode_content", classmethod(must_not_decode))
+        result = forked.run()
+        assert result["ok"] is True
+        assert result["imported"] == 2
+
+    def test_oversized_plain_source_row_is_rejected_before_content_is_returned(self, forked, monkeypatch):
+        from hermes_state import RUNTIME_IMPORT_MAX_CONTENT_CHARS, SessionDB
+
+        source = sqlite3.connect(forked.source_db)
+        source.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (
+                forked.source_session,
+                "user",
+                "x" * (RUNTIME_IMPORT_MAX_CONTENT_CHARS * 4 + 1),
+                1_700_000_100.0,
+            ),
+        )
+        source.commit()
+        source.close()
+
+        def must_not_decode(_cls, _content):
+            raise AssertionError("oversized transcript content reached JSON decode")
+
+        monkeypatch.setattr(SessionDB, "_decode_content", classmethod(must_not_decode))
+        result = forked.run()
+        assert result["ok"] is False
+        assert "storage limit" in result["error"]
 
     def test_rejects_missing_or_wrong_owner_before_reading_messages(self, forked, monkeypatch):
         from hermes_state import SessionDB

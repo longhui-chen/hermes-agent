@@ -8001,6 +8001,16 @@ class APIServerAdapter(BasePlatformAdapter):
             cron_session="",
         )
 
+    def _api_run_session_context_user_id(self) -> str:
+        """Capture a platform's public session-metadata user before handoff.
+
+        ``/v1/runs`` has a task and executor lifecycle of its own, so it
+        cannot rely on request ContextVars surviving to the worker.  The base
+        platform has no separate public identity; platform overrides may
+        supply one without changing the private session-owner argument.
+        """
+        return ""
+
     async def _run_agent(
         self,
         user_message: str,
@@ -8063,6 +8073,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
         session_user_id = str((request_overrides or {}).get("_zettlab_auth_principal") or "").strip()
+        # Zet's authenticated account is separate from its private transcript
+        # owner principal.  ``run_in_executor`` does not inherit ContextVars,
+        # so the Zet wrapper supplies this internal context-only value before
+        # the hop.  Other API-server callers keep their existing principal
+        # binding unchanged.
+        session_context_user_id = str(
+            (request_overrides or {}).get("_zettlab_session_context_account_id")
+            or session_user_id
+        ).strip()
 
         def _run():
             from gateway.session_context import (
@@ -8078,7 +8097,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
-                    session_user_id=session_user_id,
+                    session_user_id=session_context_user_id,
                 )
                 agent = None
                 # turn_id is request-scoped correlation for NAS fallback and
@@ -8545,6 +8564,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        run_session_context_user_id = self._api_run_session_context_user_id()
         profile_run_key = self._claim_admitted_profile_run()
 
         def _release_profile_run() -> None:
@@ -8575,6 +8595,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         chat_id=session_id or "",
                         session_key=gateway_session_key or session_id or "",
                         session_id=session_id or "",
+                        session_user_id=run_session_context_user_id,
                     )
                     try:
                         agent = self._create_agent(
@@ -8662,6 +8683,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                session_user_id=run_session_context_user_id,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             if run_cancelled.is_set():
