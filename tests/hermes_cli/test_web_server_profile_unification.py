@@ -474,6 +474,34 @@ class TestProfileScopedAudio:
         assert response.status_code == 200
         assert seen["token"] is None
 
+    def test_speak_target_config_env_ref_does_not_expand_process_secret(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        from tools import tts_tool
+
+        worker_home = isolated_profiles["worker_beta"]
+        (worker_home / "config.yaml").write_text(
+            "tts:\n  provider: openai\n  api_key: ${env:OPENAI_API_KEY}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "dashboard-openai-key")
+        seen = {}
+
+        def fake_tts(_text):
+            seen["api_key"] = tts_tool._load_tts_config().get("api_key")
+            audio_path = worker_home / "speech.mp3"
+            audio_path.write_bytes(b"audio")
+            return json.dumps({"success": True, "file_path": str(audio_path)})
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+        response = client.post(
+            "/api/audio/speak?profile=worker_beta",
+            json={"text": "hello"},
+        )
+
+        assert response.status_code == 200
+        assert seen["api_key"] == "${env:OPENAI_API_KEY}"
+
     def test_speak_current_profile_preserves_process_env(
         self, client, isolated_profiles, monkeypatch
     ):
@@ -481,6 +509,10 @@ class TestProfileScopedAudio:
         from tools import tts_tool
 
         default_home = isolated_profiles["default"]
+        (default_home / ".env").write_text(
+            "ZETTLAB_AGENT_ACTION_TOKEN=stale-dotenv-token\n",
+            encoding="utf-8",
+        )
         monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "process-action-token")
         seen = {}
 

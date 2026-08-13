@@ -13715,6 +13715,7 @@ def _tts_profile_scope(profile: Optional[str]):
     """Install target-profile home and secret scopes for TTS workers."""
     from agent.secret_scope import (
         build_profile_secret_scope,
+        is_multiplex_active,
         reset_secret_scope,
         set_secret_scope,
         strict_secret_scope,
@@ -13729,6 +13730,10 @@ def _tts_profile_scope(profile: Optional[str]):
         if cross_profile:
             with strict_secret_scope(secrets):
                 yield home
+            return
+
+        if not is_multiplex_active():
+            yield home
             return
 
         token = set_secret_scope(secrets)

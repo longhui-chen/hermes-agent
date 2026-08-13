@@ -3662,25 +3662,21 @@ class _SyncSentencePipeline:
 
     @staticmethod
     def _cleanup_private_temp_dir(path: Optional[str]) -> None:
-        """Remove entries from a pipeline-owned directory without following links."""
+        """Remove a pipeline-owned directory without following replacement links."""
         if not path:
             return
         try:
-            with os.scandir(path) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            os.rmdir(entry.path)
-                        else:
-                            os.unlink(entry.path)
-                    except OSError:
-                        pass
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            return
         except OSError:
-            pass
-        try:
-            os.rmdir(path)
-        except OSError:
-            pass
+            # rmtree refuses a top-level symlink instead of following it. If
+            # the provider swapped our private directory for one, remove only
+            # the link itself; os.unlink never traverses its target.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _synthesize_to_tmp(self, cleaned: str) -> Optional[_SyncAudioArtifact]:
         if self._stop.is_set():

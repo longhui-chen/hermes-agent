@@ -139,6 +139,44 @@ def test_stream_current_profile_preserves_process_env(stream_client, monkeypatch
     assert seen == ["process-stream-token"]
 
 
+def test_stream_target_config_env_ref_does_not_expand_process_secret(
+    stream_client, monkeypatch
+):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import profiles
+
+    default_home = get_hermes_home()
+    profiles_root = default_home / "profiles"
+    worker_home = profiles_root / "worker_beta"
+    worker_home.mkdir(parents=True)
+    (worker_home / "config.yaml").write_text(
+        "tts:\n  provider: openai\n  api_key: ${env:OPENAI_API_KEY}\n",
+        encoding="utf-8",
+    )
+    (worker_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "dashboard-openai-key")
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+
+    seen = {}
+    streamer = _FakeStreamer([b"\x01\x02"])
+
+    def resolve(cfg):
+        seen["api_key"] = cfg.get("api_key")
+        return streamer
+
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", resolve)
+    monkeypatch.setattr("tools.tts_tool._resolve_max_text_length", lambda *_args: 4000)
+
+    with stream_client.websocket_connect(_url(profile="worker_beta")) as conn:
+        assert conn.receive_json()["type"] == "start"
+        conn.send_text(json.dumps({"text": "Hello worker stream.", "done": True}))
+        assert conn.receive_bytes() == b"\x01\x02"
+        assert conn.receive_json() == {"type": "end"}
+
+    assert seen["api_key"] == "${env:OPENAI_API_KEY}"
+
+
 
 
 

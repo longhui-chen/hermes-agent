@@ -1170,6 +1170,29 @@ def test_sync_pipeline_rejects_placeholder_replaced_with_external_symlink(
     assert all(not os.path.exists(path) for path in synthesis_dirs)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires directory symlinks")
+def test_sync_pipeline_cleanup_does_not_follow_replaced_root(tmp_path):
+    from tools import tts_tool
+
+    synthesis_dir = tmp_path / "hermes-tts-synthesis-owned"
+    synthesis_dir.mkdir()
+    victim_dir = tmp_path / "victim"
+    victim_dir.mkdir()
+    victim_file = victim_dir / "keep.txt"
+    victim_file.write_text("keep me", encoding="utf-8")
+
+    synthesis_dir.rmdir()
+    try:
+        synthesis_dir.symlink_to(victim_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+
+    tts_tool._SyncSentencePipeline._cleanup_private_temp_dir(str(synthesis_dir))
+
+    assert victim_file.read_text(encoding="utf-8") == "keep me"
+    assert not synthesis_dir.is_symlink()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="requires O_NOFOLLOW symlinks")
 def test_sync_pipeline_rejects_symlink_swap_during_output_open(monkeypatch, tmp_path):
     from tools import tts_tool
