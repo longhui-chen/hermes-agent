@@ -266,16 +266,13 @@ def test_present_plan_does_not_end_turn_when_auto_execute_enabled():
     )
 
 
-def test_present_plan_ends_regular_tool_turns_too():
-    # 决策点语义（合一方案 §0）：普通模式下模型自发的高风险拦截计划同样结束
-    # turn 等确认——不再依赖「模型自觉停下」的提示词约定。
-    assert _should_end_after_present_plan(
+def test_present_plan_does_not_end_regular_tool_turns():
+    assert not _should_end_after_present_plan(
         _agent(
             _zet_agent_plan_mode_active=False,
             _zet_agent_plan_presented=True,
         )
     )
-    # 非 zet_agent 平台不受影响（CLI / messaging 无计划卡）。
     assert not _should_end_after_present_plan(
         _agent(
             platform="telegram",
@@ -361,25 +358,17 @@ def test_zet_agent_plan_blocks_are_scoped_to_app_plan_mode():
 
 
 def test_workflow_addendum_plan_first_section_is_capability_aware():
-    # auto opt-in（旧 App 兼容）：Plan-First 段命令展示后同轮继续执行、不等确认。
+    # auto opt-in：Plan-First 段命令展示后同轮继续执行、不等确认。
     auto = _zettlab_workflow_addendum(True)
     assert "直接在同一轮继续把计划执行下去" in auto
     assert "不要停下、不要等用户确认" in auto
-    assert "停下、等用户确认后再执行" not in auto
+    assert "停下、等用户在确认卡上确认后再执行" not in auto
 
-    # manual（默认 / 未 opt-in）：计划卡 = 决策点，停下等确认，禁止先跑副作用。
+    # manual（默认 / 未 opt-in）：Plan-First 段命令停下等用户确认，禁止先跑副作用。
     manual = _zettlab_workflow_addendum(False)
-    assert "停下、等用户确认后再执行" in manual
-    assert "收到用户确认前，不要执行计划里的任何实际操作" in manual
+    assert "停下、等用户在确认卡上确认后再执行" in manual
+    assert "在收到用户确认前，不要执行计划里的任何实际操作" in manual
     assert "直接在同一轮继续把计划执行下去" not in manual
-
-    # 触发条件双版收敛（合一方案 §0）：用户求计划或高风险才出计划卡，
-    # 复杂非高风险任务直接走 todo；播种衔接指令两版都在。
-    for text in (auto, manual):
-        assert "只在以下两种情况调用 `present_plan`" in text
-        assert "复杂多步但非高风险的任务不需要 present_plan" in text
-        assert "系统已按计划骨架自动创建任务清单" in text
-        assert "不要整表重建" in text
 
     # 两版共享工作风格 / 用户画像语言段，只有 Plan-First 段随能力切换。
     for text in (auto, manual):
@@ -395,6 +384,10 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         # 把任何一头说成无条件的，模型都会把产物写到收不回来的地方。
         assert "相对路径没有稳定含义" in text
         assert "终端命令的锚点也不与文件工具共用" in text
+    # 播种衔接指令两版都在（清单由系统按计划骨架创建，模型只更新状态）。
+    for text in (auto, manual):
+        assert "系统已按计划骨架自动创建任务清单" in text
+        assert "不要整表重建" in text
 
 
 def test_workflow_addendum_workdir_alias_line_follows_capability(monkeypatch):
