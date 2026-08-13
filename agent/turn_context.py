@@ -655,6 +655,21 @@ def build_turn_context(
         else:
             with persist_lock:
                 agent._ensure_db_session()
+        if (
+            getattr(agent, "_system_prompt_persist_pending", False)
+            and getattr(agent, "_session_db", None) is not None
+        ):
+            updated = agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+            if updated is not False:
+                agent._system_prompt_persist_pending = False
+            else:
+                logger.warning(
+                    "System prompt still could not be persisted after session "
+                    "row creation (session=%s)",
+                    agent.session_id or "none",
+                )
     except Exception:
         logger.warning(
             "Turn-start session row creation failed for session=%s",
@@ -1092,6 +1107,7 @@ def build_turn_context(
             model=agent.model,
             api_mode=getattr(agent, "api_mode", None) or "",
             platform=getattr(agent, "platform", None) or "",
+            profile_name=getattr(agent, "_profile_name", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=(
                 getattr(agent, "_user_id_alt", None)
@@ -1203,6 +1219,13 @@ def build_turn_context(
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                if ext_prefetch_cache:
+                    # memory.citations（需求 3 预取路径）：注入即引用，zet_agent 在
+                    # turn 收尾统一发射（与 search_memory 工具命中同通道）。
+                    # 放在 is_trivial_prompt 闸内：没触发预取就没有注入，自然也
+                    # 不该产生引用角标。
+                    from agent.agent_runtime_helpers import collect_prefetch_citations
+                    collect_prefetch_citations(agent, agent._memory_manager.last_prefetch_parts())
         except Exception:
             pass
 

@@ -42,6 +42,7 @@ import os
 import sys
 import threading
 import types
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
@@ -187,6 +188,10 @@ VALID_HOOKS: Set[str] = {
     #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
+    # Generic chat-attachment action notifications. The HTTP ingress validates
+    # and queues these off the aiohttp loop; hooks must treat action_token as
+    # the idempotency key and return quickly. Return values are ignored.
+    "attachment_action",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the
@@ -217,6 +222,23 @@ VALID_HOOKS: Set[str] = {
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
+
+
+_attachment_emitter: ContextVar[Optional[Callable[[Dict[str, Any]], bool]]] = (
+    ContextVar("hermes_plugin_attachment_emitter", default=None)
+)
+
+
+def bind_attachment_emitter(
+    emitter: Callable[[Dict[str, Any]], bool],
+) -> Token:
+    """Bind a request-local attachment emitter for the current agent turn."""
+    return _attachment_emitter.set(emitter)
+
+
+def reset_attachment_emitter(token: Token) -> None:
+    """Restore the previous emitter after the request stream terminates."""
+    _attachment_emitter.reset(token)
 
 
 def _env_enabled(name: str) -> bool:
@@ -404,6 +426,32 @@ class PluginContext:
             return get_active_profile_name()
         except Exception:
             return "default"
+
+    def emit_attachment(self, attachment: Dict[str, Any]) -> bool:
+        """Emit one generic chat attachment on the current turn's SSE lane.
+
+        The method is intentionally unavailable outside an active zet_agent
+        request. It returns ``False`` when no stream is bound or the adapter
+        rejects the payload, keeping optional UI output off the answer path.
+        """
+        if not isinstance(attachment, dict):
+            raise TypeError("attachment must be a dict")
+        emitter = _attachment_emitter.get()
+        if emitter is None:
+            logger.debug(
+                "Plugin %s emitted attachment outside an active stream",
+                self.manifest.name,
+            )
+            return False
+        try:
+            return bool(emitter(dict(attachment)))
+        except Exception:
+            logger.warning(
+                "Plugin %s attachment emission failed",
+                self.manifest.name,
+                exc_info=True,
+            )
+            return False
 
     # -- tool registration --------------------------------------------------
 

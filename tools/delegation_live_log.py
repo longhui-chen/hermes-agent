@@ -362,11 +362,24 @@ def _dispatch_context_fields() -> Dict[str, str]:
     """
     fields: Dict[str, str] = {}
     try:
-        from tools.approval import get_current_session_key
+        # HTTP adapters (api_server / zet_agent) first: the approval contextvar
+        # there holds the internal profile-scoped key "{hermes_home}|{sid}"
+        # (see zet_agent._raw_active_turn_key: "never expose this value on the
+        # wire"), which local-server cannot attribute — it 403s the whole
+        # delegation and the App sees an empty list (no viewer, no cancel, no
+        # terminal-state reconciliation). Route the manifest with the public
+        # session id instead, mirroring what the completion-delivery path
+        # already does (delegate_tool routes detached results with the public
+        # App session id, never the approval namespace).
+        from tools.async_delegation import _current_origin_session_id
 
-        # Explicit empty default: the helper's own default is the literal
-        # string "default", which would stamp every CLI manifest.
-        session_key = str(get_current_session_key("") or "").strip()
+        session_key = str(_current_origin_session_id() or "").strip()
+        if not session_key:
+            from tools.approval import get_current_session_key
+
+            # Explicit empty default: the helper's own default is the literal
+            # string "default", which would stamp every CLI manifest.
+            session_key = str(get_current_session_key("") or "").strip()
         if session_key:
             fields["session_key"] = session_key
     except Exception:

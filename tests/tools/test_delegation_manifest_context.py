@@ -41,6 +41,38 @@ def test_manifest_includes_gateway_context_when_set():
         set_zettlab_turn_id("")
 
 
+def test_manifest_prefers_public_session_id_over_approval_key(monkeypatch):
+    """zet_agent HTTP turns: the approval contextvar holds the internal
+    profile-scoped key ``{hermes_home}|{sid}`` which must never reach the
+    manifest — local-server cannot attribute it and hides the whole
+    delegation from the App (empty /delegations/live => no viewer, no
+    cancel, terminal states never reconcile). The public wire session id
+    from the request binding wins."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "zet_agent")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "zettlab:u1:agentA:s9")
+    token = set_current_session_key("/root/.hermes/profiles/agentA|zettlab:u1:agentA:s9")
+    try:
+        deleg_id, _writers, _paths = create_live_transcripts([{"goal": "g"}])
+        manifest = _manifest(deleg_id)
+        assert manifest["session_key"] == "zettlab:u1:agentA:s9"
+    finally:
+        reset_current_session_key(token)
+
+
+def test_manifest_keeps_gateway_key_without_http_binding(monkeypatch):
+    """Push-platform / TUI dispatches have no HTTP session binding; the
+    gateway conversation key must keep flowing into the manifest unchanged."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_123")
+    token = set_current_session_key("agent:main:feishu:dm:u1")
+    try:
+        deleg_id, _writers, _paths = create_live_transcripts([{"goal": "g"}])
+        manifest = _manifest(deleg_id)
+        assert manifest["session_key"] == "agent:main:feishu:dm:u1"
+    finally:
+        reset_current_session_key(token)
+
+
 def test_manifest_survives_context_helper_failure(monkeypatch):
     """Correlation is best-effort: a broken helper must not kill dispatch."""
     import tools.delegation_live_log as live_log

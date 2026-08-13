@@ -23,7 +23,7 @@ class _Llm:
         self.calls.append((_messages, _kwargs))
         return SimpleNamespace(
             text=json.dumps({
-                "decision": "agent",
+                "decision": "skill",
                 "suggested_name": "Business Research Partner",
                 "reason": "Future questions benefit from retained context and judgment.",
                 "evidence_turn_ids": ["evidence-1"],
@@ -63,7 +63,11 @@ def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch)
     loaded = manager._plugins["creation-governor"]
     assert loaded.enabled is True, loaded.error
     assert loaded.tools_registered == ["detect_creation_opportunity"]
-    assert set(loaded.hooks_registered) == {"pre_llm_call", "transform_llm_output"}
+    assert set(loaded.hooks_registered) == {
+        "pre_llm_call",
+        "transform_llm_output",
+        "attachment_action",
+    }
     assert manager._aux_tasks["creation_governor_checkpoint"]["plugin"] == "creation-governor"
 
 
@@ -79,6 +83,7 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
     assert [args[0] for args, _kwargs in context.hooks] == [
         "pre_llm_call",
         "transform_llm_output",
+        "attachment_action",
     ]
     assert [tool["name"] for tool in context.tools] == ["detect_creation_opportunity"]
 
@@ -162,9 +167,9 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
             .strip()
             + "=="
         ).decode("utf-8"),
-        "creation_type": "agent",
+        "creation_type": "skill",
         "title": "Business Research Partner",
-        "dedup_key": "agent:business-research-partner",
+        "dedup_key": "skill:business-research-partner",
         "evidence_turn_ids": ["evidence-1"],
     }
     response["proposal_id"] = json.loads(response["proposal_id"])["proposal_id"]
@@ -225,9 +230,9 @@ def test_invalid_card_action_flow_is_denied_without_entering_creation():
                 "type": "creation_recommendation_response",
                 "action": "create",
                 "proposal_id": "stale-proposal",
-                "creation_type": "agent",
+                "creation_type": "skill",
                 "title": "Business Research Partner",
-                "dedup_key": "agent:business-research-partner",
+                "dedup_key": "skill:business-research-partner",
             })
             + "\n[/creation_recommendation_response]"
         ),
@@ -255,9 +260,9 @@ def test_invalid_card_action_flow_is_denied_without_entering_creation():
                 "type": "creation_recommendation_response",
                 "action": "create",
                 "proposal_id": "stale-proposal",
-                "creation_type": "agent",
+                "creation_type": "skill",
                 "title": "Business Research Partner",
-                "dedup_key": "agent:business-research-partner",
+                "dedup_key": "skill:business-research-partner",
             })
             + "\n[/creation_recommendation_response]"
         ),
