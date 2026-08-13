@@ -2499,11 +2499,12 @@ def _env_expand_match(m: re.Match, env_getter=None) -> str:
     Two accepted shapes, matching what MCP server config already resolves
     (``tools/mcp_tool.py::_env_ref_name``):
 
-    * ``${VAR}`` — legacy bare name, resolved via ``os.environ``.
-    * ``${env:VAR}`` — Cursor-style SecretRef, same resolution after the
-      ``env:`` prefix is stripped.  Before this, the prefixed form worked in
-      MCP config but stayed a literal string in config.yaml — a confusing
-      half-support.
+    * ``${VAR}`` — legacy bare name, resolved through the active profile's
+      secret policy.
+    * ``${env:VAR}`` — Cursor-style SecretRef, with the same profile-aware
+      resolution after the ``env:`` prefix is stripped.  Before this, the
+      prefixed form worked in MCP config but stayed a literal string in
+      config.yaml — a confusing half-support.
 
     Other SecretRef sources (``file:``, ``bitwarden:``, ``vault:``, ...)
     are NOT resolved here — external secret backends inject their values
@@ -2546,10 +2547,10 @@ def _env_expand_match(m: re.Match, env_getter=None) -> str:
 def _env_ref_value(name: str) -> Optional[str]:
     """Read a user-config env reference through the profile secret policy.
 
-    Single-profile callers without a scope preserve legacy process-environment
-    behavior. Profile-aware callers follow their overlay/strict scope, while
-    an unscoped multiplex caller fails closed rather than reading another
-    profile's process credential.
+    Single-profile callers preserve the legacy process-environment fallback,
+    with any installed profile scope acting as an overlay. Multiplex callers
+    resolve only from their installed profile scope; an unscoped multiplex
+    caller fails closed rather than reading another profile's process credential.
     """
     from agent.secret_scope import get_secret
 
