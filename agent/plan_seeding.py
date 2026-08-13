@@ -60,26 +60,57 @@ def build_seed_messages(
     return [assistant_msg, tool_msg]
 
 
-def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
+def _seed_budget_chars(agent: Any) -> int:
+    """播种内容预算：取「固定上限」与「本 agent 的 todo 工具结果阈值」的较小值。
+
+    小上下文模型的 ``maybe_persist_tool_result`` 单结果阈值会被降到 8K；播种
+    清单落在阈值以上时，确认后普通 ``todo`` 调用的 canonical result 会被换成
+    ``<persisted-output>`` 引用，下一轮 hydration 解析不出 todos、整份清单丢失
+    （codex P1）。留 20% 余量给 JSON 结构与状态字段。
+    """
+    from tools.todo_tool import MAX_SEED_CONTENT_CHARS
+
+    try:
+        from agent.tool_executor import _budget_for_agent
+
+        threshold = _budget_for_agent(agent).resolve_threshold("todo")
+        if isinstance(threshold, (int, float)) and threshold > 0:
+            return int(min(MAX_SEED_CONTENT_CHARS, threshold * 0.8))
+    except Exception:
+        logger.debug("seed budget resolution failed; using default", exc_info=True)
+    return MAX_SEED_CONTENT_CHARS
+
+
+def seed_pending_plan_todos(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    defer_emit: bool = False,
+) -> Any:
     """Consume ``agent._pending_plan_seed`` and seed the TodoStore.
 
     幂等：无 pending 元数据时是 no-op。由 conversation_loop 在工具批次收尾后
     调用（present_plan 手动模式随后 break 结束 turn，auto 模式继续本 turn），
     两条路径共用这一个播种点。
+
+    ``defer_emit=True``（计划轮结束路径）时不在这里推送 UI，而是返回一个
+    ``emit()`` 供调用方在追加并落盘闭合 assistant 之后再调用——否则闭合消息
+    只靠 finalizer 落盘，而 finalizer 会吞掉 SQLite busy，用户看到可确认卡片
+    时历史仍可能停在 ``tool``（codex P1）。
     """
     meta = getattr(agent, "_pending_plan_seed", None)
     if not meta:
-        return
+        return None
     agent._pending_plan_seed = None
 
     store = getattr(agent, "_todo_store", None)
     if store is None:
-        return
+        return None
 
     plan_id = meta.get("plan_id") or ""
     groups = meta.get("groups") or []
     if not plan_id or not groups:
-        return
+        return None
 
     # 计划呈现 turn 的（App/LS 侧）turn id：随播种条目持久化，取消回执按它
     # 匹配目标计划（codex P1——同会话先后两份计划时，从旧卡取消不能误杀
@@ -93,12 +124,17 @@ def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
         plan_turn_id = ""
 
     try:
-        seeded = store.seed_from_plan(plan_id, groups, plan_turn_id=plan_turn_id)
+        seeded = store.seed_from_plan(
+            plan_id,
+            groups,
+            plan_turn_id=plan_turn_id,
+            budget_chars=_seed_budget_chars(agent),
+        )
     except Exception:
         logger.exception("plan seeding failed for plan_id=%s", plan_id)
-        return
+        return None
     if not seeded:
-        return
+        return None
 
     # 结果 JSON 直接用真实 todo 工具的读路径生成，保证与正常 todo result 同构
     # （hydration / 压缩折叠 / ACP、TUI 嗅探全部按同一形状消费）。
@@ -120,7 +156,10 @@ def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
     # session_persistence_failed、下一轮 hydrate 不出任何骨架。此处 flush 覆盖
     # 的 messages 同时包含 present_plan 的 tool result 与播种消息对，两者一起
     # 成为 canonical 之后再发布 UI。
-    if persisted:
+    if not persisted:
+        return None
+
+    def _publish() -> None:
         emit_plan_card = meta.get("emit")
         if callable(emit_plan_card):
             try:
@@ -130,6 +169,11 @@ def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
         # 播种即推送：App 在计划卡（决策点态）阶段就拿到带 plan_id 的清单数据，
         # 确认后原地演化不需要额外往返。
         _emit_todo_snapshot(agent, result_json)
+
+    if defer_emit:
+        return _publish
+    _publish()
+    return None
 
 
 def _persist_store_snapshot(

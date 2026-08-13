@@ -85,6 +85,7 @@ class TodoStore:
         plan_id: str,
         groups: List[Dict[str, Any]],
         plan_turn_id: str = "",
+        budget_chars: Optional[int] = None,
     ) -> List[Dict[str, str]]:
         """Seed the list from a present_plan skeleton (code-guaranteed mapping).
 
@@ -105,6 +106,8 @@ class TodoStore:
         # _validate 同界（128），超限按缺省（取消回执退回 fail-safe no-op）。
         if plan_turn_id and len(plan_turn_id) > 128:
             plan_turn_id = ""
+        budget = MAX_SEED_CONTENT_CHARS if not budget_chars or budget_chars <= 0 \
+            else min(MAX_SEED_CONTENT_CHARS, int(budget_chars))
         items: List[Dict[str, str]] = []
         content_chars = 0
         for gi, group in enumerate(groups or []):
@@ -118,11 +121,11 @@ class TodoStore:
             group_chars = sum(len(i) for i in group_items)
             if items and (
                 len(items) + len(group_items) > MAX_TODO_ITEMS
-                or content_chars + group_chars > MAX_SEED_CONTENT_CHARS
+                or content_chars + group_chars > budget
             ):
                 break  # 组边界对齐：这一组放不下（条数或内容预算）就整组停止
             for ii, content in enumerate(group_items):
-                if len(items) >= MAX_TODO_ITEMS or content_chars >= MAX_SEED_CONTENT_CHARS:
+                if len(items) >= MAX_TODO_ITEMS or content_chars >= budget:
                     break  # 首组单独超限：组内截断兜底
                 capped = self._cap_content(content)
                 content_chars += len(capped)
@@ -149,15 +152,12 @@ class TodoStore:
             merge: if False, replace the entire list. If True, update
                    existing items by id and append new ones.
         """
+        # 终态计划解除保护（codex P1）：播种条目全部 completed/cancelled 后计划
+        # 已经收场，后续写入都是模型在为**新任务**记录——merge=false 继续保护会
+        # 把旧骨架强行保留，merge=true 则会把新待办盖上旧 plan_id 混进已结束的
+        # 计划卡。两个分支写入前统一解除。
+        self._disarm_if_plan_terminal()
         if not merge:
-            # 终态计划解除保护（codex P1）：播种条目全部 completed/cancelled 后
-            # 计划已经收场，后续 merge=false 是模型在为**新任务**建清单——继续
-            # 保护会把旧计划骨架强行保留、新条目误归旧 plan。
-            if self._plan_id and self._plan_seeded_ids:
-                seeded = [i for i in self._items if i["id"] in self._plan_seeded_ids]
-                if seeded and all(i["status"] in {"completed", "cancelled"} for i in seeded):
-                    self._plan_id = None
-                    self._plan_seeded_ids = set()
             if self._plan_id and self._plan_seeded_ids:
                 # 播种保护（方案 §3.4）：schema 鼓励模型 merge=false 整表重写，
                 # 但计划骨架是 App 合一卡的渲染契约——以播种骨架为准，按 id 回
@@ -223,6 +223,15 @@ class TodoStore:
     def read(self) -> List[Dict[str, str]]:
         """Return a copy of the current list."""
         return [item.copy() for item in self._items]
+
+    def _disarm_if_plan_terminal(self) -> None:
+        """Drop plan armament once every seeded item is completed/cancelled."""
+        if not (self._plan_id and self._plan_seeded_ids):
+            return
+        seeded = [i for i in self._items if i["id"] in self._plan_seeded_ids]
+        if seeded and all(i["status"] in {"completed", "cancelled"} for i in seeded):
+            self._plan_id = None
+            self._plan_seeded_ids = set()
 
     def _plan_protected_replace(
         self,
@@ -296,7 +305,14 @@ class TodoStore:
                 for item in self._items
                 if item.get("plan_id") == plan_id and item.get("group_index") is not None
             }
-            if seeded_ids:
+            # 终态计划不重新上膛：骨架条目已全部 completed/cancelled 时计划已
+            # 收场，重新上膛会把刚解除的保护又装回去（codex P1）。
+            terminal = seeded_ids and all(
+                item["status"] in {"completed", "cancelled"}
+                for item in self._items
+                if item["id"] in seeded_ids
+            )
+            if seeded_ids and not terminal:
                 self._plan_id = plan_id
                 self._plan_seeded_ids = seeded_ids
             else:

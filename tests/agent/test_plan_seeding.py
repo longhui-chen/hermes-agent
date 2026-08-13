@@ -169,11 +169,25 @@ def test_rearm_only_treats_seeded_items_as_skeleton():
          "group_index": 0, "plan_id": "plan21"},
         {"id": "extra-x", "content": "计划外", "status": "pending", "plan_id": "plan21"},
     ], merge=False)
-    assert store.plan_id == "plan21"
+    # 骨架（唯一带 group_index 的那条）已终态 → 不重新上膛；计划外项虽 pending
+    # 也不算骨架，不能把保护撑住。
+    assert store.plan_id is None
 
-    # 骨架已全终态 → 下一次 merge=false 应解除保护、按新清单替换。
+    # 下一次 merge=false 按新清单干净替换。
     store.write([{"id": "fresh", "content": "新任务", "status": "pending"}], merge=False)
     assert [i["id"] for i in store.read()] == ["fresh"]
+    assert store.plan_id is None
+
+
+def test_merge_after_terminal_plan_does_not_stamp_old_plan():
+    # 终态解保护同样作用于 merge=true（codex P1）：计划做完后用户开新任务，
+    # 新待办不能被盖上旧 plan_id 混进已结束的计划卡。
+    store = TodoStore()
+    store.seed_from_plan("plan26", _groups(1))
+    store.write([{"id": "plan26-1-1", "status": "completed"}], merge=True)
+    store.write([{"id": "new-task", "content": "无关新任务", "status": "pending"}], merge=True)
+    fresh = next(i for i in store.read() if i["id"] == "new-task")
+    assert "plan_id" not in fresh
     assert store.plan_id is None
 
 
