@@ -3679,15 +3679,27 @@ class _SyncSentencePipeline:
             if not isinstance(output_path, str) or not output_path:
                 raise RuntimeError("TTS tool returned no output path")
 
-            same_path = os.path.normcase(os.path.abspath(output_path)) == os.path.normcase(
-                os.path.abspath(tmp_path)
+            tmp_real_path = Path(os.path.realpath(tmp_path))
+            output_real_path = Path(os.path.realpath(output_path))
+            same_path = os.path.normcase(str(output_real_path)) == os.path.normcase(
+                str(tmp_real_path)
             )
+            same_stem_output = (
+                os.path.normcase(str(output_real_path.parent))
+                == os.path.normcase(str(tmp_real_path.parent))
+                and os.path.normcase(output_real_path.stem)
+                == os.path.normcase(tmp_real_path.stem)
+                and output_real_path.suffix.lower()
+                in {".flac", ".mp3", ".ogg", ".opus", ".wav"}
+            )
+            if not same_path and not same_stem_output:
+                raise RuntimeError("TTS tool returned an unowned output path")
             if not same_path:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-            return output_path
+            return tmp_path if same_path else output_path
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
             if tmp_path:

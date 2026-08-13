@@ -973,6 +973,82 @@ def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(monke
     assert not [path for path in placeholders + provider_outputs if os.path.exists(path)]
 
 
+def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    alias_dir = tmp_path / "alias"
+    try:
+        alias_dir.symlink_to(real_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+    returned_paths = []
+    played = []
+    real_mkstemp = tempfile.mkstemp
+
+    def controlled_mkstemp(*args, **kwargs):
+        kwargs["dir"] = real_dir
+        return real_mkstemp(*args, **kwargs)
+
+    def fake_synth(text, output_path):
+        del text
+        with open(output_path, "wb") as output:
+            output.write(b"mp3")
+        alias_path = str(alias_dir / os.path.basename(output_path))
+        returned_paths.append(alias_path)
+        return json.dumps({"success": True, "file_path": alias_path})
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", controlled_mkstemp)
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Equivalent temporary path.")
+    pipeline.close()
+
+    assert len(played) == 1
+    assert os.path.realpath(played[0]) == os.path.realpath(returned_paths[0])
+    assert not [path for path in returned_paths if os.path.exists(path)]
+
+
+def test_sync_pipeline_rejects_unowned_provider_path(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    protected_path = tmp_path / "existing.wav"
+    protected_path.write_bytes(b"keep me")
+    placeholders = []
+    played = []
+    real_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        placeholders.append(path)
+        return fd, path
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(
+        tts_tool,
+        "text_to_speech_tool",
+        lambda **_kwargs: json.dumps(
+            {"success": True, "file_path": str(protected_path)}
+        ),
+    )
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Unexpected output path.")
+    pipeline.close()
+
+    assert played == []
+    assert protected_path.read_bytes() == b"keep me"
+    assert not [path for path in placeholders if os.path.exists(path)]
+
+
 def test_sync_pipeline_rejects_unsuccessful_tool_result(monkeypatch):
     from tools import tts_tool
 
