@@ -484,6 +484,56 @@ def _prepare_managed_execute_code_workspace(
     return uid
 
 
+def _managed_terminal_profile_tag(env: Mapping[str, str] | None) -> str:
+    """返回受管终端 HOME 的稳定 profile 后缀。"""
+
+    profile_id = Path(_managed_terminal_profile_scope(env)).name
+    if not profile_id or profile_id in {".", ".."}:
+        raise OSError("managed terminal profile identity is unavailable")
+    return f"-{profile_id}"
+
+
+def _link_profile_lark_cli_credentials(
+    home: Path,
+    env: Mapping[str, str] | None,
+    profile_tag: str,
+) -> None:
+    """把当前 profile 的 lark-cli 凭据目录软链到受管 HOME。"""
+
+    if not profile_tag:
+        return
+    profile_root = Path(_managed_terminal_profile_scope(env))
+    source_home = profile_root / "home"
+    try:
+        source_info = os.lstat(source_home)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+    trusted_profile_root = _validate_managed_root_directory_chain(profile_root)
+    trusted_source_home = _validate_managed_root_directory_chain(source_home)
+    if trusted_source_home.parent != trusted_profile_root:
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+    for relative in (Path(".lark-cli"), Path(".local") / "share" / "lark-cli"):
+        source = trusted_source_home / relative
+        if not source.is_dir():
+            continue
+        destination = home / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            if destination.resolve() == source.resolve():
+                continue
+            destination.unlink()
+        elif destination.exists():
+            try:
+                destination.rmdir()
+            except OSError as exc:
+                raise OSError(
+                    "managed terminal lark-cli credential directory is occupied"
+                ) from exc
+        os.symlink(source, destination)
+
+
 def _managed_terminal_home_path(
     env: Mapping[str, str] | None,
 ) -> Path:
@@ -513,7 +563,8 @@ def _managed_terminal_home_path(
         raise OSError("managed terminal home root is not trusted")
     os.chmod(_MANAGED_TERMINAL_HOME_ROOT, 0o711)
 
-    home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+    profile_tag = _managed_terminal_profile_tag(env)
+    home = _MANAGED_TERMINAL_HOME_ROOT / f"{uid}{profile_tag}"
     created = False
     try:
         os.mkdir(home, 0o700)
@@ -531,6 +582,7 @@ def _managed_terminal_home_path(
         or home_info.st_mode & 0o077
     ):
         raise OSError("managed terminal profile home is not trusted")
+    _link_profile_lark_cli_credentials(home, env, profile_tag)
 
     return home
 
@@ -673,13 +725,19 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
 
         killed = _terminate_managed_uid(uid)
         cgroup_removed = _remove_managed_terminal_cgroup(uid)
-        home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+        profile_tag = _managed_terminal_profile_tag(
+            {"HERMES_HOME": profile_home}
+        )
+        homes = (
+            _MANAGED_TERMINAL_HOME_ROOT / f"{uid}{profile_tag}",
+            _MANAGED_TERMINAL_HOME_ROOT / str(uid),
+        )
         removed = False
-        try:
-            info = os.lstat(home)
-        except FileNotFoundError:
-            pass
-        else:
+        for home in homes:
+            try:
+                info = os.lstat(home)
+            except FileNotFoundError:
+                continue
             if (
                 not stat.S_ISDIR(info.st_mode)
                 or info.st_uid != uid
@@ -1329,7 +1387,6 @@ def _managed_terminal_cwd(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return cwd
     home = _prepare_managed_terminal_home(env)
-    _wire_lark_cli_relay(env)
     try:
         _prepare_managed_profile_runtime(env)
     except OSError as exc:
@@ -1716,15 +1773,43 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
 
 def _inject_context_hermes_home(env: dict) -> None:
-    """Bridge the context-local Hermes home override into subprocess env."""
+    """把 context-local 的 Hermes home 覆盖桥接进子进程环境。
+
+    ⚠️ 这里**曾经**是一个 ``except Exception: pass``。它把三件性质完全不同的事
+    压成了同一个"静默通过",其中最毒的一件是:连 ``from hermes_constants import``
+    的 ImportError 也一起吞掉 ⇒ 打包/部署一出问题,这个 pin **永久静默失效、全路径、
+    全时间**,而日志上一切正常。那不是降级,那是"保护装置整个不存在,却没人知道"。
+
+    ⇒ 三个分支必须分开处置,⛔ 不许再合并成一个 catch:
+
+    ① **没有 pin**(override 为空)⇒ 静默 no-op、**不记日志**。
+       这是绝大多数正常路径(单 profile),记日志只会刷屏,把真信号淹掉。
+
+    ② **机制本身不可用**(ImportError / 符号缺失)⇒ **响亮地失败**。
+       这是部署错误,不是运行时条件。悄悄跑下去 = 带着一个并不存在的安全边界在服务。
+
+    ③ **有 pin,但取用时抛异常** ⇒ **fail closed**,让异常上抛、子进程不要起。
+       "明知该指向 A 却指向了 B 的凭据库"比"这次操作失败"严重得多:各 profile 绑的是
+       **不同的真人身份**,指错=一个 agent 拿别人的身份去操作。
+       ⭐ 爆炸半径很窄:只有 pin 存在(多 profile 会话)才可能触发,单 profile 走 ①。
+    """
     try:
         from hermes_constants import get_hermes_home_override
+    except ImportError:
+        # ② 机制不可用:先留下能定位的日志,再上抛 —— ⛔ 不许静默继续。
+        logger.error(
+            "profile pin unavailable: cannot import get_hermes_home_override; "
+            "a child process may be pointed at another profile's credential store",
+            exc_info=True,
+        )
+        raise
 
-        value = get_hermes_home_override()
-        if value:
-            env["HERMES_HOME"] = value
-    except Exception:
-        pass
+    # ③ 取 pin 若抛异常,**不接住** —— fail closed 好过指向别人的凭据库。
+    value = get_hermes_home_override()
+    if not value:
+        # ① 无 pin:静默返回。
+        return
+    env["HERMES_HOME"] = value
 
 
 def _inject_session_context_env(env: dict) -> None:

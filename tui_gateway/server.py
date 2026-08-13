@@ -349,18 +349,65 @@ class _SlashWorker:
 
         # slash_worker runs the Hermes agent → needs provider credentials.
         # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
-        # Global-remote / multi-profile sessions: the worker must resolve
-        # config/skills/state against the session's profile home, not the
-        # gateway's launch HERMES_HOME (#40677). The override goes through the
-        # build_subprocess_env factory's `extra` (applied last, always wins)
-        # instead of a hand-rolled env["HERMES_HOME"] assignment.
-        from tools.environments.local import build_subprocess_env
-        env = build_subprocess_env(
-            hermes_subprocess_env(inherit_credentials=True),
-            scrub_secrets=False,
-            inherit_profile_home=False,  # base already carries the HOME contract
-            extra={"HERMES_HOME": str(profile_home)} if profile_home else None,
+        # slash_worker 要在**会话自己的 profile** 下解析 config/skills/state,
+        # ⛔ 不是 gateway 启动时那个 HERMES_HOME(#40677)。
+        #
+        # 这里有**两类**键,分别由两个 owner 负责,⛔ 不许合成一处:
+        #
+        #   ① **路径事实** —— HERMES_HOME / WECOM_CLI_CONFIG_DIR。
+        #      由 apply_profile_scoped_env 统一改指,加新键只加一处、五条 spawn 路径同时受益。
+        #      ⛔ wecom-cli 只认 WECOM_CLI_CONFIG_DIR(既不认 HOME 也不认 HERMES_HOME),
+        #      而继承来的那个值是 local-server 按 **gateway 的 agent** 算的 ⇒ 不改指就等于
+        #      让这个 worker 去读**别人的凭据库**。
+        #
+        #   ② **策略产物** —— HOME。它有自己的 owner(apply_subprocess_home_env,
+        #      按 TERMINAL_HOME_MODE 的 profile/real/auto 三档决定),所以这里**只把
+        #      inherit_profile_home 打开**让那个 owner 跑起来,⛔ 不把 HOME 塞进 ①。
+        #      塞进去就等于造出第二套 HOME 政策,把用户钉死的 TERMINAL_HOME_MODE=real 也一并改写。
+        #      ⭐ HOME 必须落对的原因:lark-cli 只认 $HOME —— 它的绑定在
+        #      $HOME/.lark-cli/hermes/config.json、密钥在 $HOME/.local/share/lark-cli/*.enc
+        #      (二进制里除 HERMES_HOME/OPENCLAW_HOME 外没有任何配置路径键)。HOME 没设时它
+        #      回落 /root,于是**明明已经授权过**却报 "not bound",AI 助手因此每次会话都提议
+        #      重新绑定。更要命的是回落点是**全 agent 共用**的,而各 profile 绑的是不同真人身份。
+        #
+        # ⚠️ extra 保留同值:它在工厂里**最后应用**,是"调用方 always wins"的既有语义,
+        # 与 ① 幂等;⛔ 别因为看着重复就删掉,那会把那条语义悄悄改掉。
+        # ⭐ 作用域在**构造函数自己**体内应用,⛔ 不在各构造点。四个构造点各写一遍的形态
+        # 出厂 0.0.57 里就有(1647/3141/5227/14810,只有 1 个带 pin)—— 那种形状下
+        # 「worker 崩了重启」就会静默掉进共享 HOME。判定与应用放同一处,新构造点不可能忘。
+        base = hermes_subprocess_env(inherit_credentials=True)
+        from hermes_constants import (
+            apply_profile_scoped_env,
+            reset_hermes_home_override,
+            set_hermes_home_override,
         )
+        from tools.environments.local import build_subprocess_env
+
+        extra = None
+        home_token = None
+        if profile_home:
+            apply_profile_scoped_env(base, profile_home)
+            extra = {"HERMES_HOME": str(profile_home)}
+            # 🔴 光写 base 不够。hermes_constants._profile_home_path 取 HERMES_HOME 的顺序是
+            #   `get_hermes_home_override() or env["HERMES_HOME"] or os.getenv("HERMES_HOME")`
+            # —— **context pin 排在 env 字典前面**,而 ② 的 HOME 正由它派生。于是构造点只要
+            # 落在**别的会话**的 pin 作用域里(_run_prompt_submit 那条就整段挂着 pin),就会:
+            #   HERMES_HOME / WECOM_CLI_CONFIG_DIR → 本会话   HOME → 别人
+            # lark-cli 只认 $HOME ⇒ 这个 worker 拿另一个真人的凭据库操作,且无任何日志。
+            # ⇒ 组装期把 pin 也钉成本会话:构造参数是更具体的真相源,让那条优先级链的第一项
+            # 就是正确答案。⛔ 不改 _profile_home_path 的优先级 —— 那条"任务级 pin 压过继承
+            # 环境"的语义是别的调用方在用的,改它是把爆炸半径扩到全仓。
+            home_token = set_hermes_home_override(str(profile_home))
+        try:
+            env = build_subprocess_env(
+                base,
+                scrub_secrets=False,
+                inherit_profile_home=True,
+                extra=extra,
+            )
+        finally:
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
 
         # start_new_session=True detaches the slash worker into its own
         # process group / session. Without this, the worker inherits the

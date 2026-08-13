@@ -14902,7 +14902,12 @@ def _resolve_chat_argv(
     env["HERMES_TUI_DASHBOARD"] = "1"
 
     if profile_dir is not None:
-        env["HERMES_HOME"] = str(profile_dir)
+        # Same contract as the slash worker: this PTY child leads to a gateway
+        # inside the profile, so every profile-scoped path has to follow it,
+        # not just HERMES_HOME.
+        from hermes_constants import apply_profile_scoped_env
+
+        apply_profile_scoped_env(env, profile_dir)
 
     if resume:
         _resume_db = _open_session_db_for_profile(
