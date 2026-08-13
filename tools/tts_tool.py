@@ -45,6 +45,7 @@ import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -59,6 +60,7 @@ from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 def get_env_value(name, default=None):
@@ -1689,47 +1691,33 @@ def _generate_openai_tts(
     # Only resolve the OpenAI auth chain when the caller didn't pass explicit
     # credentials. OpenAI-compatible backends (DeepInfra) pass api_key /
     # base_url / model / voice through and never hit the managed-gateway path.
-    # A configured endpoint is also an explicit trust boundary: pair it only
-    # with direct credentials, never with a local-server action token resolved
-    # for the board-local gateway.
+    # The resolver keeps credentials and endpoints paired. An explicit caller
+    # (for example DeepInfra or the Zettlab plugin) passes both arguments and
+    # skips this path; profile config still honors ``use_gateway: true`` over
+    # stale direct credentials and endpoints left by a previous selection.
     fallback_base: Optional[str] = None
     is_managed = False
     explicit_base_url = base_url is not None
     if api_key is None:
-        if config_base_url:
-            api_key = str(oai_config.get("api_key") or "").strip()
-            if not api_key:
-                api_key = _resolve_profile_openai_audio_api_key()
-            if not api_key:
-                raise ValueError(
-                    "tts.openai.base_url requires VOICE_TOOLS_OPENAI_KEY or "
-                    "OPENAI_API_KEY"
-                )
-        else:
-            api_key, fallback_base, is_managed = _resolve_openai_audio_client_config(
-                tts_config
-            )
+        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config(
+            tts_config
+        )
 
     if model is None:
         model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
     if voice is None:
         voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
     if base_url is None:
-        # Config override wins over the auth-chain fallback (restores the
-        # pre-refactor precedence, where tts.openai.base_url beat the resolved
-        # default); the auth-chain value is the last-resort default. An
-        # explicit base_url arg from an OpenAI-compatible caller (DeepInfra)
-        # skips this block entirely and always wins.
-        base_url = config_base_url or fallback_base or DEFAULT_OPENAI_BASE_URL
+        # Managed credentials must stay paired with the managed endpoint.
+        # Direct resolution already folds config/env base URLs into fallback.
+        base_url = fallback_base or config_base_url or DEFAULT_OPENAI_BASE_URL
     if speed is None:
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
     language = oai_config.get("language")
 
     managed_model = DEFAULT_OPENAI_MODEL if is_managed else None
-    managed_contract_active = bool(
-        is_managed and not explicit_base_url and not config_base_url
-    )
+    managed_contract_active = bool(is_managed and not explicit_base_url)
     # Managed gateways expose one product model. A model set for direct OpenAI
     # would be rejected there, so coerce it unless the user explicitly
     # redirected base_url to their own endpoint.
@@ -3485,6 +3473,12 @@ def _resolve_openai_audio_client_config(
     cfg_api_key = str(openai_cfg.get("api_key") or "").strip()
     cfg_base_url = str(openai_cfg.get("base_url") or "").strip()
     direct_api_key = _resolve_profile_openai_audio_api_key()
+    raw_gateway_preference = tts_config.get("use_gateway")
+    gateway_preferred = (
+        prefers_gateway("tts")
+        if raw_gateway_preference is None
+        else is_truthy_value(raw_gateway_preference, default=False)
+    )
 
     def direct_base_url() -> str:
         # OPENAI_BASE_URL remains part of the direct OpenAI-compatible TTS
@@ -3502,9 +3496,9 @@ def _resolve_openai_audio_client_config(
             "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
         )
 
-    if cfg_api_key and not prefers_gateway("tts"):
+    if cfg_api_key and not gateway_preferred:
         return cfg_api_key, direct_base_url(), False
-    if direct_api_key and not prefers_gateway("tts"):
+    if direct_api_key and not gateway_preferred:
         return direct_api_key, direct_base_url(), False
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
@@ -3513,7 +3507,7 @@ def _resolve_openai_audio_client_config(
             "Neither tts.openai.api_key in config nor "
             "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
         )
-        if managed_nous_tools_enabled() or prefers_gateway("tts"):
+        if managed_nous_tools_enabled() or gateway_preferred:
             message += (
                 ". "
                 + nous_tool_gateway_unavailable_message(
@@ -3663,6 +3657,8 @@ class _SyncSentencePipeline:
         if self._stop.is_set():
             return None
         tmp_path = None
+        owned_output_path = None
+        playback_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
@@ -3680,31 +3676,69 @@ class _SyncSentencePipeline:
             if not isinstance(output_path, str) or not output_path:
                 raise RuntimeError("TTS tool returned no output path")
 
-            output_real_path = Path(os.path.realpath(output_path))
-            same_path = os.path.normcase(str(output_real_path)) == os.path.normcase(
+            output = Path(output_path)
+            output_owned_path = Path(os.path.realpath(output.parent)) / output.name
+            same_path = os.path.normcase(str(output_owned_path)) == os.path.normcase(
                 str(tmp_real_path)
             )
             same_stem_output = (
-                os.path.normcase(str(output_real_path.parent))
+                os.path.normcase(str(output_owned_path.parent))
                 == os.path.normcase(str(tmp_real_path.parent))
-                and os.path.normcase(output_real_path.stem)
+                and os.path.normcase(output_owned_path.stem)
                 == os.path.normcase(tmp_real_path.stem)
-                and output_real_path.suffix.lower().lstrip(".")
+                and output_owned_path.suffix.lower().lstrip(".")
                 in COMMAND_TTS_OUTPUT_FORMATS
             )
             if not same_path and not same_stem_output:
                 raise RuntimeError("TTS tool returned an unowned output path")
-            if not same_path:
+
+            owned_output_path = str(output_owned_path)
+            source_stat = os.lstat(owned_output_path)
+            if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size <= 0:
+                raise RuntimeError("TTS tool returned an invalid output file")
+
+            open_flags = os.O_RDONLY
+            open_flags |= getattr(os, "O_BINARY", 0)
+            open_flags |= getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(owned_output_path, open_flags)
+            try:
+                opened_stat = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or (opened_stat.st_dev, opened_stat.st_ino)
+                    != (source_stat.st_dev, source_stat.st_ino)
+                ):
+                    raise RuntimeError("TTS output changed during validation")
+
+                playback_fd, playback_path = tempfile.mkstemp(
+                    suffix=output_owned_path.suffix.lower()
+                )
                 try:
-                    os.unlink(tmp_path)
+                    with os.fdopen(source_fd, "rb") as source:
+                        source_fd = -1
+                        with os.fdopen(playback_fd, "wb") as playback:
+                            playback_fd = -1
+                            shutil.copyfileobj(source, playback)
+                finally:
+                    if playback_fd >= 0:
+                        os.close(playback_fd)
+            finally:
+                if source_fd >= 0:
+                    os.close(source_fd)
+
+            for owned_path in {tmp_path, owned_output_path}:
+                try:
+                    os.unlink(owned_path)
                 except OSError:
                     pass
-            return str(tmp_real_path if same_path else output_real_path)
+            return playback_path
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
-            if tmp_path:
+            for owned_path in {tmp_path, owned_output_path, playback_path}:
+                if not owned_path:
+                    continue
                 try:
-                    os.unlink(tmp_path)
+                    os.unlink(owned_path)
                 except OSError:
                     pass
             return None

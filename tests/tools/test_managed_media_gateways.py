@@ -566,6 +566,34 @@ def test_zettlab_tts_never_sends_action_token_to_custom_endpoint(monkeypatch, tm
     assert captured["base_url"] == "https://tts.example.test/v1"
 
 
+def test_openai_tts_use_gateway_overrides_stale_direct_endpoint(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured)
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
+    monkeypatch.setenv("TOOL_GATEWAY_DOMAIN", "nousresearch.com")
+    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "nous-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    output_path = tmp_path / "speech.mp3"
+    tts_tool._generate_openai_tts(
+        "hello world",
+        str(output_path),
+        {
+            "use_gateway": True,
+            "openai": {
+                "api_key": "stale-direct-key",
+                "base_url": "https://tts.example.test/v1",
+                "model": "tts-1-hd",
+            },
+        },
+    )
+
+    assert captured["api_key"] == "nous-token"
+    assert captured["base_url"] == "https://openai-audio-gateway.nousresearch.com/v1"
+    assert captured["speech_kwargs"]["model"] == "gpt-4o-mini-tts"
+
+
 def test_openai_tts_coerces_direct_only_model_on_managed_gateway(monkeypatch, tmp_path):
     """A tts.openai.model valid only for direct OpenAI (e.g. tts-1-hd) must be
     coerced to a managed-supported model, else the gateway 400s with

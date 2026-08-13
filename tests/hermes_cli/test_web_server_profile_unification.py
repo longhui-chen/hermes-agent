@@ -6,6 +6,8 @@ profile switcher can target any profile's HERMES_HOME. These tests pin:
 reads/writes land in the REQUESTED profile, the dashboard's own profile
 stays untouched, and the chat PTY env is scoped via HERMES_HOME.
 """
+import json
+
 import pytest
 import yaml
 
@@ -416,6 +418,36 @@ class TestProfileScopedAudio:
     profile's TTS/STT settings were silently ignored (#53441 #45506 #66012
     #64057).
     """
+
+    def test_speak_installs_target_profile_secret_scope(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        from agent.secret_scope import current_secret_scope
+        from tools import tts_tool
+
+        worker_home = isolated_profiles["worker_beta"]
+        (worker_home / ".env").write_text(
+            "ZETTLAB_AGENT_ACTION_TOKEN=worker-action-token\n",
+            encoding="utf-8",
+        )
+        seen = {}
+
+        def fake_tts(text):
+            seen["text"] = text
+            seen["scope"] = current_secret_scope()
+            audio_path = worker_home / "speech.mp3"
+            audio_path.write_bytes(b"audio")
+            return json.dumps({"success": True, "file_path": str(audio_path)})
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+        response = client.post(
+            "/api/audio/speak?profile=worker_beta",
+            json={"text": "hello"},
+        )
+
+        assert response.status_code == 200
+        assert seen["text"] == "hello"
+        assert seen["scope"]["ZETTLAB_AGENT_ACTION_TOKEN"] == "worker-action-token"
 
 
 

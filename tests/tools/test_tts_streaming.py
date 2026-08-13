@@ -9,6 +9,9 @@ the chunked-streamer playback path, and the universal per-sentence sync fallback
 import json
 import os
 import queue
+import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -966,7 +969,9 @@ def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(
     monkeypatch.setattr(tts_tool.tempfile, "mkstemp", tracking_mkstemp)
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
     fake_vm = MagicMock()
-    fake_vm.play_audio_file.side_effect = played.append
+    fake_vm.play_audio_file.side_effect = lambda path: played.append(
+        (path, Path(path).read_bytes())
+    )
     monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
 
     pipeline = tts_tool._SyncSentencePipeline(threading.Event())
@@ -974,10 +979,56 @@ def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(
     pipeline.close()
 
     assert len(played) == 1
-    assert os.path.realpath(played[0]) == os.path.realpath(provider_outputs[0])
+    assert Path(played[0][0]).suffix == suffix
+    assert played[0][1] == b"opus"
     assert not [path for path in placeholders + provider_outputs if os.path.exists(path)]
 
 
+def test_sync_pipeline_uses_real_command_provider_returned_path(monkeypatch):
+    from tools import tts_tool
+
+    provider_outputs = []
+    played = []
+
+    def fake_command(command, _timeout, env_passthrough=None):
+        del env_passthrough
+        output_path = shlex.split(command, posix=os.name != "nt")[-1].strip('"')
+        Path(output_path).write_bytes(b"command audio")
+        provider_outputs.append(output_path)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_load_tts_config",
+        lambda: {
+            "provider": "test-command",
+            "providers": {
+                "test-command": {
+                    "type": "command",
+                    "command": "fake-tts {output_path}",
+                    "output_format": "m4a",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(tts_tool, "_run_command_tts", fake_command)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = lambda path: played.append(
+        (path, Path(path).read_bytes())
+    )
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Real command provider path.")
+    pipeline.close()
+
+    assert len(played) == 1
+    assert Path(played[0][0]).suffix == ".m4a"
+    assert played[0][1] == b"command audio"
+    assert not [path for path in provider_outputs if os.path.exists(path)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires directory symlinks")
 def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
     from tools import tts_tool
 
@@ -1007,7 +1058,9 @@ def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
     monkeypatch.setattr(tts_tool.tempfile, "mkstemp", controlled_mkstemp)
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
     fake_vm = MagicMock()
-    fake_vm.play_audio_file.side_effect = played.append
+    fake_vm.play_audio_file.side_effect = lambda path: played.append(
+        (path, Path(path).read_bytes())
+    )
     monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
 
     pipeline = tts_tool._SyncSentencePipeline(threading.Event())
@@ -1015,10 +1068,11 @@ def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
     pipeline.close()
 
     assert len(played) == 1
-    assert os.path.realpath(played[0]) == os.path.realpath(returned_paths[0])
+    assert played[0][1] == b"mp3"
     assert not [path for path in returned_paths if os.path.exists(path)]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires directory symlinks")
 def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp_path):
     from tools import tts_tool
 
@@ -1064,6 +1118,7 @@ def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp
         pipeline.close()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires file symlinks")
 def test_sync_pipeline_rejects_placeholder_replaced_with_external_symlink(
     monkeypatch, tmp_path
 ):
@@ -1092,6 +1147,47 @@ def test_sync_pipeline_rejects_placeholder_replaced_with_external_symlink(
 
     pipeline = tts_tool._SyncSentencePipeline(threading.Event())
     pipeline.speak("Replaced placeholder path.")
+    pipeline.close()
+
+    assert played == []
+    assert protected_path.read_bytes() == b"keep me"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires O_NOFOLLOW symlinks")
+def test_sync_pipeline_rejects_symlink_swap_during_output_open(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    protected_path = tmp_path / "protected.wav"
+    protected_path.write_bytes(b"keep me")
+    provider_output = []
+    played = []
+    real_os_open = os.open
+
+    def fake_synth(text, output_path):
+        del text
+        path = str(Path(output_path).with_suffix(".wav"))
+        Path(path).write_bytes(b"provider audio")
+        provider_output.append(path)
+        return json.dumps({"success": True, "file_path": path})
+
+    def swapping_open(path, flags, *args, **kwargs):
+        same_path = provider_output and (
+            os.path.normcase(os.path.realpath(path))
+            == os.path.normcase(os.path.realpath(provider_output[0]))
+        )
+        if same_path:
+            os.unlink(path)
+            os.symlink(protected_path, path)
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    monkeypatch.setattr(tts_tool.os, "open", swapping_open)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Swap during output open.")
     pipeline.close()
 
     assert played == []
