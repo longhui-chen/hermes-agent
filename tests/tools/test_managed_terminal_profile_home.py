@@ -259,3 +259,41 @@ def test_created_credential_dirs_are_private(tmp_path, monkeypatch):
         source_home / ".local" / "share" / "lark-cli",
     ):
         assert oct(path.stat().st_mode & 0o777) == "0o700", path
+
+
+@pytest.mark.parametrize(
+    "linked_source",
+    [Path(".lark-cli"), Path(".local"), Path(".local/share")],
+)
+def test_symlinked_source_path_cannot_escape_profile_home(
+    tmp_path, monkeypatch, linked_source
+):
+    """source 侧任一级软链都不得让 mkdir/chmod 写出 profile HOME。"""
+
+    profile_home = _bare_profile(tmp_path, "agent-one")
+    source_home = profile_home / "home"
+    source_home.mkdir()
+    sandbox = tmp_path / "terminal-homes" / "1000-agent-one"
+    sandbox.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    if linked_source == Path(".local/share"):
+        (source_home / ".local").mkdir()
+    (source_home / linked_source).symlink_to(external, target_is_directory=True)
+    marker = external / "must-stay-put"
+    marker.write_text("outside")
+    monkeypatch.setattr(
+        "tools.environments.local._validate_managed_root_directory_chain",
+        lambda path: path.resolve(),
+    )
+
+    with pytest.raises(OSError, match="credential source is not trusted"):
+        _link_profile_lark_cli_credentials(
+            sandbox,
+            {"HERMES_HOME": str(profile_home)},
+            "-agent-one",
+        )
+
+    assert marker.read_text() == "outside"
+    assert not (external / "share").exists()
+    assert not (external / "lark-cli").exists()

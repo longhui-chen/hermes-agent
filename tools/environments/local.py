@@ -493,8 +493,8 @@ def _managed_terminal_profile_tag(env: Mapping[str, str] | None) -> str:
     return f"-{profile_id}"
 
 
-def _ensure_credential_dir(path: Path) -> None:
-    """按 root:root 0700 建出凭据目录(含父级),权限显式给,不受 umask 影响。
+def _ensure_credential_dir(root: Path, relative: Path) -> Path:
+    """在可信根内无跟随地建出 root:root 0700 凭据目录。
 
     受管终端**不降权**:_managed_terminal_identity 的 docstring 写明那个 uid 只是
     「profile resource ID」,命令仍以 service UID(root)执行;本模块里也确实没有任何
@@ -502,19 +502,81 @@ def _ensure_credential_dir(path: Path) -> None:
     既有目录一致(2026-08-13 板 .212 实测 <profile>/home 及其下全是 root:root 700)。
     """
 
-    for parent in reversed(path.parents):
-        if parent.exists():
-            continue
-        try:
-            os.mkdir(parent)
-        except FileExistsError:
-            continue
-        os.chmod(parent, 0o700)
+    root_info = os.lstat(root)
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise OSError("managed terminal lark-cli credential root is not trusted")
+
+    if _IS_WINDOWS:
+        trusted_root = root.resolve(strict=True)
+        current = root
+        for component in relative.parts:
+            current /= component
+            created = False
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                os.mkdir(current, 0o700)
+                created = True
+                info = os.lstat(current)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential source is not trusted"
+                )
+            if created:
+                os.chmod(current, 0o700)
+            if not current.resolve(strict=True).is_relative_to(trusted_root):
+                raise OSError(
+                    "managed terminal lark-cli credential source is not trusted"
+                )
+        return current
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(root, directory_flags)
+    opened_root = os.fstat(directory_fd)
+    if (
+        opened_root.st_dev != root_info.st_dev
+        or opened_root.st_ino != root_info.st_ino
+        or not stat.S_ISDIR(opened_root.st_mode)
+    ):
+        os.close(directory_fd)
+        raise OSError("managed terminal lark-cli credential root changed")
+
     try:
-        os.mkdir(path)
-    except FileExistsError:
-        return
-    os.chmod(path, 0o700)
+        for component in relative.parts:
+            created = False
+            try:
+                os.mkdir(component, 0o700, dir_fd=directory_fd)
+                created = True
+            except FileExistsError:
+                pass
+            info = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential source is not trusted"
+                )
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            opened = os.fstat(child_fd)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or not stat.S_ISDIR(opened.st_mode)
+            ):
+                os.close(child_fd)
+                raise OSError(
+                    "managed terminal lark-cli credential source changed"
+                )
+            if created:
+                os.fchmod(child_fd, 0o700)
+            os.close(directory_fd)
+            directory_fd = child_fd
+    finally:
+        os.close(directory_fd)
+
+    path = root / relative
+    if not path.resolve(strict=True).is_relative_to(root.resolve(strict=True)):
+        raise OSError("managed terminal lark-cli credential source is not trusted")
+    return path
 
 
 def _retire_occupied_credential_path(
@@ -666,7 +728,7 @@ def _link_profile_lark_cli_credentials(
         # 且把 ~/.lark-cli 变成真目录挡住下一轮的软链。用户体感是「我明明授权了,
         # 它却说没授权」——2026-08-13 板 .212 整晚都困在这个循环里。
         # 触发窗口:克隆刚建好 profile、home 还没写完,第一条命令就跑起来了。
-        _ensure_credential_dir(source_home)
+        _ensure_credential_dir(trusted_profile_root, Path("home"))
         source_info = os.lstat(source_home)
     if not stat.S_ISDIR(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
         raise OSError("managed terminal lark-cli credential home is not trusted")
@@ -674,10 +736,9 @@ def _link_profile_lark_cli_credentials(
     if trusted_source_home.parent != trusted_profile_root:
         raise OSError("managed terminal lark-cli credential home is not trusted")
     for relative in (Path(".lark-cli"), Path(".local") / "share" / "lark-cli"):
-        source = trusted_source_home / relative
-        if not source.is_dir():
-            # 同上:缺哪个补哪个,保证沙箱里从第一秒起就是软链。
-            _ensure_credential_dir(source)
+        # 缺哪个补哪个,保证沙箱里从第一秒起就是软链；每级都通过目录 FD 创建并
+        # 校验，已有 symlink 会在触碰其目标前被拒绝。
+        source = _ensure_credential_dir(trusted_source_home, relative)
         destination = home / relative
         parent_fd = _open_managed_credential_parent(home, relative)
         try:
