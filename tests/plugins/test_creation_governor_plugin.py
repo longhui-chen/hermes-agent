@@ -135,6 +135,23 @@ def _decode_envelope(text):
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
 
 
+def test_onboarding_profile_skips_governor_checkpoint_entirely():
+    plugin = _load_plugin()
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    result = plugin._on_pre_llm_call(
+        profile_name="onboarding",
+        session_id="onboarding-session",
+        user_message="Frank",
+        conversation_history=[],
+    )
+
+    assert result is None
+    assert llm.calls == []
+    assert plugin._session_states == {}
+
+
 def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     plugin = _load_plugin()
     none = _candidate(

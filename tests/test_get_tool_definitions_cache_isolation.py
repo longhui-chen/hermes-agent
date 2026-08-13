@@ -82,6 +82,38 @@ class TestQuietModeCacheIsolation:
         model_tools.get_tool_definitions(quiet_mode=False)
         assert len(model_tools._tool_defs_cache) == 0
 
+    def test_scope_failure_recomputes_without_failing_ordinary_tools(
+        self, monkeypatch
+    ):
+        calls = 0
+        expected = [
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {}},
+            }
+        ]
+
+        def compute(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return expected
+
+        def fail_scope():
+            raise RuntimeError("scope bridge unavailable")
+
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute)
+        monkeypatch.setattr(
+            model_tools, "_session_platform_cache_scope", fail_scope
+        )
+
+        first = model_tools.get_tool_definitions(quiet_mode=True)
+        second = model_tools.get_tool_definitions(quiet_mode=True)
+
+        assert first == expected
+        assert second == expected
+        assert calls == 2
+        assert not model_tools._tool_defs_cache
+
     def test_multiplex_quiet_mode_bypasses_process_cache(self, monkeypatch):
         calls = 0
 

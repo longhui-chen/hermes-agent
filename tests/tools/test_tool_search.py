@@ -106,6 +106,46 @@ class TestClassification:
         assert "xx_unknown_tool" in names
         assert deferrable == []
 
+    def test_platform_tool_can_stay_direct_without_joining_shared_core(self):
+        """A selected platform tool may preserve a direct-call contract.
+
+        The opt-out is a registry property, not membership in
+        ``_HERMES_CORE_TOOLS``. A normal non-core registration remains
+        deferrable alongside it.
+        """
+        from tools.registry import registry
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+        from toolsets import _HERMES_CORE_TOOLS
+
+        eager_name = "test_platform_eager_tool"
+        deferred_name = "test_platform_deferred_tool"
+        def schema(name):
+            return _td(name, "Test platform capability")["function"]
+        registry.register(
+            name=eager_name,
+            handler=lambda args, **kwargs: "{}",
+            schema=schema(eager_name),
+            toolset="test-platform-surface",
+            defer_to_tool_search=False,
+        )
+        registry.register(
+            name=deferred_name,
+            handler=lambda args, **kwargs: "{}",
+            schema=schema(deferred_name),
+            toolset="test-plugin-surface",
+        )
+
+        assert eager_name not in _HERMES_CORE_TOOLS
+        result = assemble_tool_defs(
+            [_td(eager_name), _td(deferred_name)],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        names = {td["function"]["name"] for td in result.tool_defs}
+        assert eager_name in names
+        assert deferred_name not in names
+        assert {"tool_search", "tool_describe", "tool_call"}.issubset(names)
+
 
 # ---------------------------------------------------------------------------
 # Token estimation + threshold gate

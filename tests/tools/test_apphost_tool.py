@@ -113,6 +113,19 @@ def test_check_gate_rejects_malformed_base_url(monkeypatch):
         assert _check_app_host() is False
 
 
+def test_app_data_url_never_substitutes_for_app_host_url(monkeypatch):
+    with mux_profile_scope(
+        monkeypatch,
+        _scope(
+            ZET_APPHOST_BASE_URL="",
+            ZET_APP_DATA_BASE_URL=(
+                "http://127.0.0.1:18080/api/v1/internal/apps"
+            ),
+        ),
+    ):
+        assert _check_app_host() is False
+
+
 def test_check_gate_is_profile_scope_sensitive():
     # The registry must re-evaluate this gate per profile scope instead of
     # serving a TTL-cached verdict across multiplexed profiles.
@@ -152,6 +165,22 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     with mux_profile_scope(monkeypatch, scope):  # scope keys purged from env
         with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool({"action": "probe"}))
+    assert out["ok"] is True
+    assert seen["req"].full_url == _BASE_URL + "/storage"
+
+
+def test_app_host_request_keeps_its_own_base_url(monkeypatch):
+    seen = {}
+    with mux_profile_scope(
+        monkeypatch,
+        _scope(
+            ZET_APP_DATA_BASE_URL=(
+                "http://127.0.0.1:18080/api/v1/internal/apps"
+            )
+        ),
+    ), patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+        out = json.loads(app_host_tool({"action": "probe"}))
+
     assert out["ok"] is True
     assert seen["req"].full_url == _BASE_URL + "/storage"
 

@@ -1,0 +1,3 @@
+name: zettlab_memo
+version: 0.1.0
+description: "Managed on-device Zettlab Memo graph provider; keeps Hermes native memory enabled."

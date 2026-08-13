@@ -109,6 +109,37 @@ _EXEC_ASK: ContextVar = ContextVar("HERMES_EXEC_ASK", default=_UNSET)
 # masks any leaked process env value.
 _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
+# Exact profile-local Skills attached to the current scheduled job. This is a
+# task-local host capability, not an environment variable or model argument.
+# Cron-only tools use it to prevent a prompt from borrowing an operation
+# manifest from another installed Skill in the same profile.
+_CRON_ATTACHED_SKILLS: ContextVar[tuple[str, ...]] = ContextVar(
+    "hermes_cron_attached_skills", default=()
+)
+
+
+def push_cron_attached_skills(skills) -> object:
+    """Bind a normalized, immutable scheduled-job Skill set."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    values = skills if isinstance(skills, (list, tuple)) else []
+    for raw in values[:32]:
+        value = str(raw or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return _CRON_ATTACHED_SKILLS.set(tuple(normalized))
+
+
+def pop_cron_attached_skills(token: object) -> None:
+    """Restore the scheduled-job Skill binding preceding this task."""
+    _CRON_ATTACHED_SKILLS.reset(token)
+
+
+def cron_attached_skills() -> tuple[str, ...]:
+    """Return the immutable Skill names authorized for this Cron task."""
+    return _CRON_ATTACHED_SKILLS.get()
+
 # Current chat turn and its structured plan-review receipt. These values are
 # consumed by skill subprocesses, so they must follow the same task-local
 # ContextVar -> child-process bridge as HERMES_SESSION_* rather than using the

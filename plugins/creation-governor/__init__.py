@@ -1406,6 +1406,12 @@ def _handle_previous_proposal_action(
 
 
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
+    # Onboarding is a fixed, latency-sensitive state machine and never offers
+    # reusable-object recommendations.  Skip the checkpoint before it mutates
+    # governor state or invokes its auxiliary model.
+    if _text(kwargs.get("profile_name"), 80).strip().lower() == "onboarding":
+        return None
+
     raw_session_id = _raw_session_key(kwargs)
     owner_id = next(
         (
