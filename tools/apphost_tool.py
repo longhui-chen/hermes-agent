@@ -76,7 +76,9 @@ _PUBLISH_MODES = ("install", "reload")
 # cannot. "user_confirmed_auto" is also recorded server-side, so an app the
 # user asked to self-refresh that never got a maintainer is a fact someone can
 # query later instead of a promise that quietly evaporated.
-_DATA_REFRESH_CHOICES = ("static", "user_confirmed_auto", "user_declined")
+_DATA_REFRESH_CHOICES = (
+    "static", "external_unconfirmed", "user_confirmed_auto", "user_declined"
+)
 # The hidden maintainer gets one write capability, not the app's whole HTTP
 # surface. Generated apps expose POST /api/refresh as the user-confirmed data
 # maintenance verb; every other write path stays unavailable to model calls.
@@ -208,6 +210,9 @@ APP_HOST_SCHEMA = {
                     "need to keep refreshing on its own? "
                     "static = the user types the data in themselves (ledger, "
                     "to-do, notes) and nothing outside the device changes it. "
+                    "external_unconfirmed = the data comes from outside, but "
+                    "the device could not ask for refresh consent because the "
+                    "optional capability was unavailable. "
                     "user_confirmed_auto = the data comes from outside and the "
                     "user agreed to a schedule — you must finish configuring it "
                     "before reporting done. "

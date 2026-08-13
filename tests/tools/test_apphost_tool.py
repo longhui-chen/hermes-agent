@@ -1409,7 +1409,7 @@ def test_install_rejects_values_outside_the_enum(monkeypatch, value):
 
 
 @pytest.mark.parametrize(
-    "value", ["static", "user_confirmed_auto", "user_declined"])
+    "value", ["static", "external_unconfirmed", "user_confirmed_auto", "user_declined"])
 def test_install_forwards_every_accepted_answer(monkeypatch, value):
     captured = {}
 
