@@ -474,7 +474,9 @@ def test_build_seed_messages_shape():
 # ------------------------------------------------------ present_plan_with_meta
 
 
-def test_present_plan_with_meta_generates_plan_id_and_passes_to_callback():
+def test_present_plan_with_meta_defers_card_emit_until_persisted():
+    # 卡片延迟到持久化成功后再推（codex P1）：present_plan 本身不 emit，
+    # 只把 emit 放进 meta 交给播种在 flush 成功后调用。
     seen = {}
 
     def cb(title, groups, plan_id):
@@ -485,10 +487,14 @@ def test_present_plan_with_meta_generates_plan_id_and_passes_to_callback():
         "整理计划", _groups(1), callback=cb, auto_execute=False,
     )
     assert meta is not None
-    assert meta["plan_id"] == seen["plan_id"]
+    assert seen == {}  # 尚未推送
     assert len(meta["plan_id"]) == 12
     assert meta["groups"][0]["items"] == ["step 0-0"]
     assert "seeded from this plan" in result
+
+    meta["emit"]()
+    assert seen["plan_id"] == meta["plan_id"]
+    assert seen["title"] == "整理计划"
 
 
 def test_present_plan_with_meta_supports_legacy_two_arg_callback():
@@ -498,8 +504,33 @@ def test_present_plan_with_meta_supports_legacy_two_arg_callback():
         callback=lambda title, groups: seen.append(title),
         auto_execute=False,
     )
-    assert seen == ["整理计划"]
     assert meta is not None and meta["plan_id"]
+    meta["emit"]()
+    assert seen == ["整理计划"]
+
+
+def test_seed_emits_plan_card_only_after_flush():
+    # flush 成功 → 计划卡与清单一起发布；flush 失败 → 两者都不发布。
+    meta_ok = {"plan_id": "plan22", "title": "t", "groups": _groups(1)}
+    emitted_cards = []
+    meta_ok["emit"] = lambda: emitted_cards.append("card")
+    agent, emitted = _fake_agent_with_pending(meta_ok)
+    seed_pending_plan_todos(agent, [])
+    assert emitted_cards == ["card"]
+    assert len(emitted) == 1
+
+    fail_cards = []
+    meta_fail = {"plan_id": "plan23", "title": "t", "groups": _groups(1),
+                 "emit": lambda: fail_cards.append("card")}
+    fail_emitted = []
+    fail_agent = _FlushFailAgent(
+        _pending_plan_seed=meta_fail,
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: fail_emitted.append(todos),
+    )
+    seed_pending_plan_todos(fail_agent, [])
+    assert fail_cards == []
+    assert fail_emitted == []
 
 
 def test_present_plan_with_meta_no_callback_returns_no_meta():

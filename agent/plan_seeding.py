@@ -115,11 +115,18 @@ def seed_pending_plan_todos(agent: Any, messages: List[Dict[str, Any]]) -> None:
         messages,
         stage=f"plan seed todo {plan_id}",
     )
-    # Fail-closed（codex P1）：合成消息对没落盘就不给 App 推快照——否则用户
-    # 看到可确认的清单，下一轮却 hydrate 不出骨架。flush 失败时 helper 已置
-    # _incremental_persistence_failed，conversation_loop 在播种后复查该标志，
-    # 走既有 session_persistence_failed 路径终止 turn。
+    # Fail-closed（codex P1）：计划卡与清单都只在落盘成功后才推给 App——否则
+    # 用户看到一张只存在于内存的可确认卡片，而 flush 失败时 turn 走
+    # session_persistence_failed、下一轮 hydrate 不出任何骨架。此处 flush 覆盖
+    # 的 messages 同时包含 present_plan 的 tool result 与播种消息对，两者一起
+    # 成为 canonical 之后再发布 UI。
     if persisted:
+        emit_plan_card = meta.get("emit")
+        if callable(emit_plan_card):
+            try:
+                emit_plan_card()
+            except Exception:
+                logger.exception("plan card emit failed for plan_id=%s", plan_id)
         # 播种即推送：App 在计划卡（决策点态）阶段就拿到带 plan_id 的清单数据，
         # 确认后原地演化不需要额外往返。
         _emit_todo_snapshot(agent, result_json)

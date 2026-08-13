@@ -99,6 +99,12 @@ class TodoStore:
 
         Returns the seeded list (copy).
         """
+        # plan_turn_id 长度上限（codex P1）：调用方 metadata.turn_id 无空白时
+        # 长度不受限，原样复制到每个条目会让 synthetic result 膨胀到 MB 级、
+        # 超 MAX_TODO_RESULT_CHARS 后下一轮 hydrate 直接跳过整份清单。与
+        # _validate 同界（128），超限按缺省（取消回执退回 fail-safe no-op）。
+        if plan_turn_id and len(plan_turn_id) > 128:
+            plan_turn_id = ""
         items: List[Dict[str, str]] = []
         content_chars = 0
         for gi, group in enumerate(groups or []):
@@ -201,6 +207,12 @@ class TodoStore:
                     rebuilt.append(current)
                     seen.add(current["id"])
             self._items = rebuilt
+            # 压缩后重建路径（codex P1）：canonical result 被折出窗口时 store 是
+            # 空的，模型按注入块用 merge=true 回填带骨架字段的条目——此时必须
+            # 重新上膛，否则 store.plan_id 一直是 None，本轮取消落地 / turn-end
+            # 校正全被跳过，同轮 merge=false 也失去骨架保护。
+            if not self._plan_id:
+                self._rearm_plan_seeding_from_items()
         # Bound total item count so a replayed/oversized list can't grow the
         # re-injection block without limit. Keep the highest-priority head
         # (list order is priority).

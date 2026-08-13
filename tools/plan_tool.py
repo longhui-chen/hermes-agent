@@ -140,18 +140,25 @@ def present_plan_with_meta(
         # plan_id 是「计划 ↔ 任务清单」的锚：App 按它把两者渲染成同一张卡，
         # 播种的 todo 条目也携带它（跨 turn / 冷启动 / 历史回放归并的唯一键）。
         plan_id = uuid.uuid4().hex[:12]
-        try:
+
+        # 卡片延迟到持久化成功后再推（codex P1）：在这里直接 emit 会让 App 拿到
+        # 一张只存在于内存的可确认计划卡——随后 state.db 写失败时 turn 走
+        # session_persistence_failed，播种也没落盘，用户确认后的下一轮历史里
+        # 没有可配对的 plan/todo 状态，合一卡与执行上下文一起丢。emit 交给
+        # agent/plan_seeding 在 flush 成功后调用。
+        def _emit_plan_card() -> None:
             try:
                 callback(title, cleaned_groups, plan_id)
             except TypeError:
                 # 旧签名 callback(title, groups)：测试替身 / 未升级平台兼容。
                 callback(title, cleaned_groups)
-        except Exception:
-            return json.dumps(
-                {"error": "failed to present plan"},
-                ensure_ascii=False,
-            ), None
-        meta = {"plan_id": plan_id, "title": title, "groups": cleaned_groups}
+
+        meta = {
+            "plan_id": plan_id,
+            "title": title,
+            "groups": cleaned_groups,
+            "emit": _emit_plan_card,
+        }
         if auto_execute:
             # 旧 App 兼容路径（metadata opt-in 直跑）：计划卡只读展示，agent 在
             # 同一 turn 直接继续执行。任务清单已由播种机制按计划骨架创建，
