@@ -520,6 +520,11 @@ def _apply_profile_override() -> None:
     profile_name = None
     consume = 0
     profile_index = None
+    # True once profile_name came from the sticky active_profile file rather
+    # than an explicit --profile/-p. Step 3 treats the two differently: an
+    # explicit flag that does not resolve is a hard error, while a stale
+    # sticky pointer must not brick every hermes command on the device.
+    from_sticky = False
 
     def _inside_mcp_add_args(index: int) -> bool:
         """True once argv reaches `hermes mcp add ... --args <command argv>`.
@@ -655,6 +660,7 @@ def _apply_profile_override() -> None:
                 name = active_path.read_text(encoding="utf-8").strip()
                 if name and name != "default":
                     profile_name = name
+                    from_sticky = True
                     consume = 0  # don't strip anything from argv
         except (UnicodeDecodeError, OSError):
             pass  # corrupted file, skip
@@ -667,7 +673,27 @@ def _apply_profile_override() -> None:
             hermes_home = resolve_profile_env(profile_name)
         except FileNotFoundError as exc:
             hermes_home = _resolve_sudo_user_profile_env(profile_name)
+            if not hermes_home and from_sticky:
+                # A dangling *sticky* pointer must not brick the CLI. delete_profile
+                # and rename_profile keep active_profile in sync, but a profile
+                # removed by anything else (e.g. the device's local-server clone
+                # flow, which deletes the old profile and creates a differently
+                # named one) leaves it naming a directory that no longer exists.
+                # Exiting here would take down every hermes invocation on the
+                # device — including `hermes profile use <name>`, the one command
+                # that repairs it. Fall back to default and say so loudly.
+                # Observed 2026-08-13 on board .212 (profile "zettlab" re-cloned
+                # as "zettlab-2").
+                print(
+                    f"Warning: active_profile names '{profile_name}', which no longer "
+                    f"exists — falling back to the default profile. "
+                    f"Repair with: hermes profile use <name>",
+                    file=sys.stderr,
+                )
+                return
             if not hermes_home:
+                # An explicit --profile/-p stays strict: the caller named this
+                # profile for this run, so a missing one is a hard error.
                 print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(1)
         except ValueError as exc:

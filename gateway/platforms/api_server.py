@@ -90,6 +90,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from agent.browser_content_evidence import project_browser_content_evidence
 from agent.browser_state_preview import project_browser_state_preview
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
@@ -823,6 +824,14 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _content_has_image(content: Any) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _IMAGE_PART_TYPES
+        for part in content
+    )
+
+
 def _extract_current_turn_reference_image(content: Any) -> str:
     """Return one bounded data image from the current normalized user turn.
 
@@ -1022,6 +1031,26 @@ def _tool_completion_payload(
         browser_state = None
     if browser_state is not None:
         payload["browserState"] = browser_state
+
+    try:
+        browser_content_evidence = project_browser_content_evidence(
+            function_name,
+            decoded,
+            browser_session_id=(
+                ui_hint.get("browser_session_id") if ui_hint is not None else None
+            ),
+        )
+    except Exception:
+        # Evidence is optional presentation data. Projection failure must not
+        # change the model-facing result or the tool lifecycle event.
+        logger.warning(
+            "[api_server] browser content evidence projection failed for tool=%s",
+            function_name,
+            exc_info=True,
+        )
+        browser_content_evidence = None
+    if browser_content_evidence is not None:
+        payload["browserContentEvidence"] = browser_content_evidence
 
     if function_name in {"image_generate", "video_generate"}:
         artifact_output: Dict[str, Any] = {}
@@ -8102,10 +8131,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
                     _publish_turn_process_ownership(agent, effective_task_id)
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if _content_has_image(user_message):
+                        conversation_kwargs.update(
+                            user_authored_message=(
+                                trusted_user_message
+                                if trusted_user_message is not None
+                                else user_message
+                            ),
+                            user_message_has_image=True,
+                        )
                     result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                        **conversation_kwargs,
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -8638,11 +8679,17 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            conversation_kwargs = {
+                                "user_message": user_message,
+                                "conversation_history": conversation_history,
+                                "task_id": effective_task_id,
+                            }
+                            if _content_has_image(user_message):
+                                conversation_kwargs.update(
+                                    user_authored_message=user_message,
+                                    user_message_has_image=True,
+                                )
+                            r = agent.run_conversation(**conversation_kwargs)
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later

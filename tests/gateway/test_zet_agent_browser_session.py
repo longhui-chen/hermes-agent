@@ -4,7 +4,11 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.platforms.zet_agent import (
+    ZetAgentAdapter,
+    _request_account_id,
+    _zettlab_request_account_id,
+)
 from gateway.session_context import (
     get_session_env,
     pop_zettlab_browser_session_token,
@@ -15,6 +19,21 @@ from gateway.session_context import (
     zettlab_browser_session_token,
 )
 from tools import approval, browser_backend_router
+
+
+def test_request_account_id_accepts_matching_explicit_managed_header():
+    request = SimpleNamespace(headers={
+        "X-Zettlab-Account-Id": "account-explicit",
+        "X-Hermes-Session-Key": "zettlab:account-explicit:main:chat-1",
+    })
+    assert _request_account_id(request) == "account-explicit"
+
+
+def test_request_account_id_falls_back_to_stable_zettlab_session_key():
+    request = SimpleNamespace(headers={
+        "X-Hermes-Session-Key": "zettlab:account-fallback:main:chat-1",
+    })
+    assert _request_account_id(request) == "account-fallback"
 
 
 @pytest.mark.asyncio
@@ -69,6 +88,27 @@ async def test_chat_request_binds_and_clears_internal_principal(monkeypatch):
     await adapter._handle_chat_completions(request)
     assert seen == ["iam:alice"]
     assert zettlab_auth_principal() == ""
+
+
+@pytest.mark.asyncio
+async def test_chat_request_keeps_account_and_app_owner_principal_separate(monkeypatch):
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    seen = []
+
+    async def base_handler(_self, _request):
+        seen.append((zettlab_auth_principal(), _zettlab_request_account_id.get()))
+        return object()
+
+    monkeypatch.setattr(APIServerAdapter, "_handle_chat_completions", base_handler)
+    request = SimpleNamespace(headers={
+        "X-Zettlab-Auth-Principal-Id": "iam:alice",
+        "X-Zettlab-Account-Id": "account-1",
+        "X-Hermes-Session-Key": "zettlab:account-1:main:chat-1",
+    })
+    await adapter._handle_chat_completions(request)
+    assert seen == [("iam:alice", "account-1")]
+    assert zettlab_auth_principal() == ""
+    assert _zettlab_request_account_id.get() == ""
 
 
 @pytest.mark.asyncio

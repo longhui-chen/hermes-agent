@@ -315,10 +315,14 @@ class TestSessionLifecycle:
 
     def test_update_system_prompt(self, db):
         db.create_session(session_id="s1", source="cli")
-        db.update_system_prompt("s1", "You are a helpful assistant.")
+        assert db.update_system_prompt("s1", "You are a helpful assistant.") is True
 
         session = db.get_session("s1")
         assert session["system_prompt"] == "You are a helpful assistant."
+
+    def test_update_system_prompt_reports_missing_session(self, db):
+        assert db.update_system_prompt("missing", "prompt") is False
+        assert db.get_session("missing") is None
 
     def test_clear_all_system_prompts_nulls_filled_rows(self, db):
         """clear_all_system_prompts nulls every row that had a prompt."""

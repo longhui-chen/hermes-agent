@@ -121,6 +121,36 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    async def test_multimodal_input_forwards_caption_provenance(self, adapter):
+        app = _create_runs_app(adapter)
+        image_payload = [
+            {"type": "text", "text": "Describe this."},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ]
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": [{"role": "user", "content": image_payload}]},
+                )
+                assert resp.status == 202
+                for _ in range(20):
+                    if mock_agent.run_conversation.called:
+                        break
+                    await asyncio.sleep(0.02)
+
+                kwargs = mock_agent.run_conversation.call_args.kwargs
+                assert kwargs["user_authored_message"] == image_payload
+                assert kwargs["user_message_has_image"] is True
+
+    @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

@@ -4296,17 +4296,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def update_system_prompt(
         self, session_id: str, system_prompt: Optional[str]
-    ) -> None:
-        """Store the full assembled system prompt snapshot."""
+    ) -> bool:
+        """Store the full assembled system prompt snapshot.
+
+        Return ``False`` when the session row does not exist yet.  SQLite
+        treats that UPDATE as success with zero affected rows; exposing the
+        result lets the turn setup retry immediately after creating the row.
+        """
+        updated = False
+
         def _do(conn):
+            nonlocal updated
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE sessions "
                 "SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
                 (system_prompt_hash, session_id),
             )
+            updated = cursor.rowcount > 0
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
+        return updated
 
     def update_session_model(self, session_id: str, model: str) -> None:
         """Update the model for a session after a mid-session switch.

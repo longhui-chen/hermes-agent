@@ -80,6 +80,9 @@ _HERMES_CORE_TOOLS = [
     # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
     "list_my_channels",
     "send_channel_message",
+    # Read-only device meeting library bridge; exposed only when local-server
+    # injects the loopback callback URL and action token.
+    "device_meetings",
     # List the user's authorized business-data connectors (gated on zet_agent
     # env via check_fn). Has a zettlab_connectors catalog entry so the
     # non-configurable recovery walk keeps it reachable on the real path.
@@ -317,8 +320,8 @@ TOOLSETS = {
     },
 
     "zettlab_skill_runtime": {
-        "description": "Run fixed App operations declared by the current Cron job's profile-local Skill",
-        "tools": ["skill_operation"],
+        "description": "Profile-local Agent application operations and device evidence reads",
+        "tools": ["skill_operation", "device_meetings"],
         "includes": []
     },
 
