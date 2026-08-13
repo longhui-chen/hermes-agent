@@ -1,6 +1,9 @@
 """Read meeting summaries already stored by the local Zettlab device."""
-import json, os, urllib.request, urllib.parse
+
+import json, urllib.request, urllib.parse
 from urllib.parse import urlsplit, urlunsplit
+
+from agent.secret_scope import get_secret
 from tools.registry import registry
 
 _TOKEN = "X-Zettlab-Agent-Action-Token"
@@ -8,15 +11,24 @@ _LIST = "/api/v1/internal/meetings"
 _GET = "/api/v1/internal/meetings/"
 SCHEMA = {"name":"device_meetings", "description":"Read stored device meetings. Use action list or get; meeting_id must come from list.", "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get"]},"meeting_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20},"offset":{"type":"integer","minimum":0}},"required":["action"],"additionalProperties":False}}
 
+def _secret(name):
+    try:
+        return str(get_secret(name, "") or "").strip()
+    except Exception:
+        return ""
+
 def _base():
-    raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip(); p = urlsplit(raw)
+    raw = _secret("ZET_CHAT_APPEND_URL"); p = urlsplit(raw)
     return urlunsplit((p.scheme,p.netloc,"","", "")) if p.scheme and p.netloc else None
 
 def _available():
-    return bool(_base() and os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip())
+    return bool(_base() and _secret("ZETTLAB_AGENT_ACTION_TOKEN"))
+
+# Do not reuse a cached availability result across multiplexed profiles.
+_available._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 def device_meetings_tool(args, **_kw):
-    args = args or {}; action = str(args.get("action", "")).strip(); base = _base(); token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    args = args or {}; action = str(args.get("action", "")).strip(); base = _base(); token = _secret("ZETTLAB_AGENT_ACTION_TOKEN")
     if not base or not token: return json.dumps({"error":"device meeting bridge unavailable"}, ensure_ascii=False)
     if action == "list":
         path = _LIST + "?limit=" + str(max(1,min(20,int(args.get("limit",20))))) + "&offset=" + str(max(0,int(args.get("offset",0))))
