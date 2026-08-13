@@ -5900,7 +5900,11 @@ def _run_agent_creator_command_if_allowed(
     try:
         from tools.environments.local import build_agent_creator_runtime_env
 
-        creator_env = build_agent_creator_runtime_env()
+        creator_env = build_agent_creator_runtime_env(
+            app_auto_refresh=(
+                len(parsed.argv) >= 3 and parsed.argv[2] == "create-app-agent"
+            )
+        )
     except Exception:
         return _agent_creator_blocked_result(
             "agent_creator_scope_unavailable",

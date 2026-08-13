@@ -29,6 +29,10 @@ def _reset_agent_creator_runtime(monkeypatch):
         "agent.credential_broker.request_agentcomputer_token",
         lambda agent_id: str(agent_id).removeprefix("test-broker:"),
     )
+    monkeypatch.setattr(
+        "agent.credential_broker.request_app_auto_refresh_token",
+        lambda agent_id: str(agent_id).removeprefix("test-broker:"),
+    )
     yield
     set_zettlab_turn_id(previous_turn_id)
     secret_scope.set_multiplex_active(previous_multiplex)
@@ -608,9 +612,9 @@ def test_agentcomputer_mkdir_deferred_approval_replays_exactly_once(
     real_build_runtime_env = local_environment.build_agent_creator_runtime_env
     token_acquisitions = []
 
-    def tracked_build_runtime_env():
+    def tracked_build_runtime_env(**kwargs):
         token_acquisitions.append(True)
-        return real_build_runtime_env()
+        return real_build_runtime_env(**kwargs)
 
     monkeypatch.setattr(
         local_environment,
