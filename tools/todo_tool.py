@@ -265,10 +265,22 @@ class TodoStore:
             if item.get("plan_id")
         }
         if len(plan_ids) == 1:
-            self._plan_id = next(iter(plan_ids))
-            self._plan_seeded_ids = {
-                item["id"] for item in self._items if item.get("plan_id") == self._plan_id
+            plan_id = next(iter(plan_ids))
+            # 只有**真正播种**的条目（带合法 group_index）算骨架（codex P1）：
+            # 执行期新增的计划外项也被盖了同一 plan_id，若一并当成受保护骨架，
+            # 原计划条目全终态、计划外项还 pending 时终态解保护判定不成立 →
+            # 旧计划永远解不开、后续普通 merge=false 继续被劫持。
+            seeded_ids = {
+                item["id"]
+                for item in self._items
+                if item.get("plan_id") == plan_id and item.get("group_index") is not None
             }
+            if seeded_ids:
+                self._plan_id = plan_id
+                self._plan_seeded_ids = seeded_ids
+            else:
+                self._plan_id = None
+                self._plan_seeded_ids = set()
         else:
             self._plan_id = None
             self._plan_seeded_ids = set()

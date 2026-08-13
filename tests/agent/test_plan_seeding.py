@@ -160,6 +160,23 @@ def test_injection_carries_group_linkage():
     assert "plan_turn_id: turn-08" in text
 
 
+def test_rearm_only_treats_seeded_items_as_skeleton():
+    # 只用骨架字段恢复保护（codex P1）：计划外项也带同一 plan_id，若一并算
+    # 骨架，原计划全终态后终态解保护判定不成立、旧计划永远解不开。
+    store = TodoStore()
+    store.write([
+        {"id": "plan21-1-1", "content": "a", "status": "completed",
+         "group_index": 0, "plan_id": "plan21"},
+        {"id": "extra-x", "content": "计划外", "status": "pending", "plan_id": "plan21"},
+    ], merge=False)
+    assert store.plan_id == "plan21"
+
+    # 骨架已全终态 → 下一次 merge=false 应解除保护、按新清单替换。
+    store.write([{"id": "fresh", "content": "新任务", "status": "pending"}], merge=False)
+    assert [i["id"] for i in store.read()] == ["fresh"]
+    assert store.plan_id is None
+
+
 def test_extras_are_normalized_to_current_plan():
     # 幻觉/过期 plan_id 或自封 group_index 的计划外新增（codex P1）：强制归到
     # 当前计划并剥骨架字段，否则双 plan_id 让下一轮 _rearm 解除保护。

@@ -7702,6 +7702,13 @@ def run_conversation(
                         getattr(agent, "_zet_agent_plan_fallback_response", "")
                         or ""
                     )
+                    # 闭合 assistant 消息（codex P1）：App 路径有 plan_emit_callback
+                    # → fallback_response 为空 → finalize_turn 不补闭合，而播种又
+                    # 追加了 todo tool 对，持久化历史会以 tool 结尾。下一轮变成
+                    # `... tool -> user`，严格 provider 直接拒绝，用户确认后的计划
+                    # 执行不了。以 tool 结尾时补一条空 assistant 收尾。
+                    if messages and messages[-1].get("role") == "tool":
+                        messages.append({"role": "assistant", "content": ""})
                     logger.info(
                         "zet_agent: present_plan emitted; ending turn "
                         "without a post-tool LLM follow-up"
