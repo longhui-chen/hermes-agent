@@ -602,7 +602,9 @@ def test_manual_present_plan_outside_plan_mode_drops_parallel_side_effect_flow()
         result = agent.run_conversation("先展示计划卡片")
 
     assert executed == [["present_plan"]]
-    assert result["api_calls"] == 2
+    # 决策点语义：普通模式下自发的 manual 计划同样在 present_plan 后结束 turn
+    # 等用户确认，不再有「计划后继续」的第二次 API 调用。
+    assert result["api_calls"] == 1
 
 
 class _CapturingQ:

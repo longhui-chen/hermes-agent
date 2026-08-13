@@ -164,11 +164,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "defer_to_tool_search",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 defer_to_tool_search=True):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +189,11 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Tool Search is opt-out only for a small set of platform-native tools
+        # whose schema must remain directly callable when their platform
+        # toolset is selected. Selection still happens through toolsets; this
+        # flag never grants a tool to another platform.
+        self.defer_to_tool_search = bool(defer_to_tool_search)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +276,14 @@ def check_fn_cache_scope() -> Optional[str]:
 
 
 def _must_recheck_profile_scope(fn: Callable) -> bool:
-    """Whether *fn* reads profile-local authorization in a shared gateway."""
+    """Whether *fn* reads authorization from request-local runtime scope.
+
+    Session-sensitive checks must never use the process-wide TTL/last-good
+    cache, even in a single-profile gateway. Profile-sensitive checks retain
+    the historical uncached behavior only for multiplex gateways.
+    """
+    if getattr(fn, "_session_scope_sensitive", False):
+        return True
     if not getattr(fn, "_profile_scope_sensitive", False):
         return False
     try:
@@ -449,6 +463,32 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
                 ensure_ascii=False,
             )
         return None
+
+
+_DELEGATED_CHILD_PROTECTED_TOOLS = frozenset({"app_host", "app_data"})
+
+
+def _delegated_child_scope_gate(name: str) -> Optional[str]:
+    """Deny profile-secret App tools to anonymous delegated children."""
+    if name not in _DELEGATED_CHILD_PROTECTED_TOOLS:
+        return None
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        is_child = bool(is_delegated_child_context())
+    except Exception:
+        logger.warning(
+            "Unable to resolve delegated-child scope for %s; denying dispatch",
+            name,
+        )
+        is_child = True
+    if not is_child:
+        return None
+    return tool_error(
+        f"{name} is unavailable to delegate_task child agents.",
+        error_type="delegated_child_scope",
+        tool=name,
+    )
 
 
 def _resolve_runtime_tool_args(name: str, args: dict) -> dict:
@@ -644,6 +684,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        defer_to_tool_search: bool = True,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -652,6 +693,11 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
+
+        ``defer_to_tool_search`` defaults to True for non-core tools. A
+        platform-native tool may set it to False when its direct schema is a
+        compatibility contract; toolset selection remains the authority for
+        whether that tool is available at all.
         """
         with self._lock:
             existing = self._tools.get(name)
@@ -703,6 +749,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                defer_to_tool_search=defer_to_tool_search,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -892,6 +939,10 @@ class ToolRegistry:
                 },
                 ensure_ascii=False,
             )
+
+        blocked = _delegated_child_scope_gate(name)
+        if blocked is not None:
+            return blocked
 
         # Zettlab file-change protection：registry.dispatch 是所有工具执行的
         # 统一汇聚点，gate 必须在这里——除 model_tools.handle_function_call

@@ -2,13 +2,17 @@
 
 When enabled, MCP and non-core plugin tools are replaced in the model-visible
 tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
+``tool_call`` — and surfaced on demand. Core Hermes tools never defer. A
+platform-native tool can explicitly opt out of deferral at registration time
+when direct visibility is part of its compatibility contract; toolset
+selection still controls whether that tool is available at all.
 
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
+  Always-load means always-load. Platform-native tools may additionally opt
+  out through the registry without becoming shared core tools.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -204,10 +208,12 @@ def _core_tool_names() -> frozenset[str]:
 def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
-    A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    A tool is deferrable iff it is registered with an MCP toolset prefix or
+    explicitly opts into Tool Search deferral. Core tools are never deferred
+    even when their registry entry says otherwise (this protects against
+    accidental shadowing). A platform-native compatibility tool can opt out
+    without being added to ``_HERMES_CORE_TOOLS``; its toolset still has to be
+    selected before it can appear in the input list.
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
@@ -221,8 +227,7 @@ def is_deferrable_tool_name(name: str) -> bool:
             return False
         if entry.toolset.startswith("mcp-"):
             return True
-        # Non-MCP, non-core → plugin tool, eligible.
-        return True
+        return bool(getattr(entry, "defer_to_tool_search", True))
     except Exception:
         return False
 
@@ -231,8 +236,8 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
-    every core tool, plus any tool we can't classify. ``deferrable`` is the
-    candidate set for catalog entry.
+    every core or explicitly eager platform tool, plus any tool we can't
+    classify. ``deferrable`` is the candidate set for catalog entry.
     """
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
@@ -778,9 +783,10 @@ def assemble_tool_defs(
     """Return the tool-defs list the model should actually see.
 
     When tool search is inactive (off, no deferrable tools, or below
-    threshold), this is a passthrough. When active, MCP and plugin tools
-    are stripped from the visible list and replaced with the three bridge
-    tools. Core tools are *never* deferred regardless of config.
+    threshold), this is a passthrough. When active, eligible MCP and plugin
+    tools are stripped from the visible list and replaced with the three
+    bridge tools. Core and explicitly eager platform tools are *never*
+    deferred regardless of config.
 
     Idempotent: calling with bridge tools already in the input is a no-op
     (they classify as non-core/non-deferrable but their names are reserved,

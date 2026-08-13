@@ -3032,6 +3032,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
+            # hermes.todo 快照不在 worker 里推：由 tool_executor 的并发收集
+            # 点在 canonical 结果落盘成功后统一推送（codex P1——先推后写会
+            # 在 DB busy 时 fail-open，App 看到的清单下一轮 hydrate 不回来）。
             return _finish_agent_tool(
                 _todo_tool(
                     todos=next_args.get("todos"),
@@ -3125,9 +3128,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "present_plan":
         def _execute(next_args: dict) -> Any:
-            from tools.plan_tool import present_plan as _present_plan
+            from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 
-            result = _present_plan(
+            result, plan_meta = _present_plan_with_meta(
                 title=next_args.get("title", ""),
                 groups=next_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
@@ -3146,6 +3149,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 agent._zet_agent_plan_presented = True
                 if getattr(agent, "plan_emit_callback", None) is None:
                     agent._zet_agent_plan_fallback_response = result
+                if plan_meta is not None:
+                    # 与顺序路径一致：播种延迟到批次收尾统一执行
+                    # （agent/plan_seeding.seed_pending_plan_todos）。
+                    agent._pending_plan_seed = plan_meta
             return _finish_agent_tool(result, next_args)
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:

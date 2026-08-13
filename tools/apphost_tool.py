@@ -85,11 +85,19 @@ APP_HOST_SCHEMA = {
         "storage headroom check), list (installed apps), acquire_slot / "
         "release_slot (build-slot admission before compiling; acquire answers "
         "immediately with a slot token, or queue_ahead while queued — poll by "
-        "calling again), publish (preferred formal install/update: securely "
-        "copy a generated app from the current agent's output workspace, then "
-        "install or reload it; the app name comes from metadata.json), install "
-        "(legacy: register an app already staged by App Host), reload "
-        "(rebuild + restart from a staging dir; idempotent — resending the "
+        "calling again), publish (formal install/update from the current "
+        "agent's output workspace: securely copy a generated app, then install "
+        "or reload it; the app name comes from metadata.json; on devices whose "
+        "local-server predates this route it fails with code \"unsupported\" "
+        "AND HTTP status 404 or 409 — only that pair means the route is "
+        "missing, and only then does the calling skill fall back to "
+        "install/reload; an \"unsupported\" carrying any other status is a "
+        "different problem and falling back cannot help it), install "
+        "(register an app from a directory staged directly under App Host's "
+        ".staging root; the fallback creation path on devices without publish "
+        "support), reload "
+        "(rebuild + restart from a staging dir — the fallback update path when "
+        "publish is unsupported; idempotent — resending the "
         "same commit returns current state), rollback (put the previous "
         "version back — one step, no rebuild; requires to_version from the "
         "app's prev_version_id so a retry cannot swap it forward again), "
@@ -97,7 +105,7 @@ APP_HOST_SCHEMA = {
         "recycle bin; recovery is done from the client app's list, there is "
         "no recover action here), lifecycle (start/stop/restart), logs "
         "(recent log tail), build_env (local check of the shared Go vendor "
-        "dir to copy into the staging area; makes no HTTP request)."
+        "dir to copy into the build workspace; makes no HTTP request)."
     ),
     "parameters": {
         "type": "object",
@@ -125,22 +133,24 @@ APP_HOST_SCHEMA = {
             "source_subdir": {
                 "type": "string",
                 "description": (
-                    "Required for publish: portable relative path below the "
-                    "current agent output directory. Never pass an absolute "
-                    "path or an App Host .staging path."
+                    "Required for publish: relative path below the current "
+                    "agent output root (note: that root does NOT include the "
+                    "per-session subdirectory the system prompt appends). "
+                    "Never an absolute path."
                 ),
             },
             "staging_dir": {
                 "type": "string",
                 "description": (
-                    "Absolute path of the staged application source on the "
-                    "device. Required for install and reload."
+                    "Absolute path of a direct child of App Host's .staging "
+                    "root. Required for install and reload (the fallback path "
+                    "when publish is unsupported on this device)."
                 ),
             },
             "note": {
                 "type": "string",
                 "description": (
-                    "For publish(mode=reload) or legacy reload: one line "
+                    "For publish(mode=reload) or reload: one line "
                     "saying what this change did, in the "
                     "user's own words (\u201cFooter \u52a0\u4e86\u4e00\u4e2a\u94fe\u63a5\u201d). It is stored with the "
                     "version and is what the user is shown when deciding "
@@ -521,7 +531,11 @@ def app_host_tool(args, **_kw):
             if action == "publish":
                 message = (
                     "设备端 App Host 尚不支持 publish（local-server 版本较旧）。"
-                    "请先升级设备端服务；不要尝试直接写入 .staging"
+                    "改用老设备发布通道：把本次 source_subdir 指向的那个目录"
+                    "（metadata.json 就在它下面那一层）整个拷到 App Host 的 "
+                    ".staging 下作为其直接子目录——拷完 metadata.json 必须正好在 "
+                    ".staging/<新目录>/ 里，不能再套一层——再调 install（新建）"
+                    "或 reload（修改）"
                 )
             else:
                 message = (
@@ -587,4 +601,9 @@ registry.register(
     handler=app_host_tool,
     check_fn=_check_app_host,
     emoji="🏗️",
+    # App Host is the platform-native entry point for creating and managing
+    # generated apps. Keep its schema directly visible when Tool Search is
+    # enabled, matching app_data; the toolset and scope gates still decide
+    # whether it is available at all.
+    defer_to_tool_search=False,
 )

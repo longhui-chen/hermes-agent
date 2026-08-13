@@ -98,6 +98,17 @@ from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
+
+def _onboarding_fast_retry_delay(agent, status_code, is_rate_limited):
+    """Return the onboarding-only 502 retry delay, else ``None``."""
+    if (
+        getattr(agent, "_onboarding_fast_retry", False)
+        and status_code == 502
+        and not is_rate_limited
+    ):
+        return 0.25
+    return None
+
 logger = logging.getLogger(__name__)
 
 # Stable prefix of the local interrupt status string emitted when a turn is
@@ -560,12 +571,20 @@ def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None
     api_kwargs.pop("reasoning_effort", None)
 
 
+# 计划轮尾部闭合文案：播种追加 todo 工具对后，历史不能以 tool 结尾（下一轮
+# 会变成 tool -> user，严格 provider 拒绝），也不能用空 assistant content
+# （Moonshot/Kimi 同样拒绝）。这条短文案只做结构闭合，不进 UI（App 走 plan 卡）。
+PLAN_PRESENTED_CLOSING_TEXT = "计划已提交，等待你的确认。"
+
+
 def _should_end_after_present_plan(agent: Any) -> bool:
-    # Only an explicit manual Plan-mode turn waits for confirmation. Plans
-    # presented during a regular tool turn are status UI, not an execution gate.
+    # 决策点语义（方案 §0）：zet_agent 上任何成功呈现且非 auto 直跑的计划卡
+    # 都结束本 turn、等用户在卡上确认——包括普通模式下模型自发的高风险拦截
+    # 计划（此前只有显式 plan 模式才等，自发计划靠提示词约定「模型自觉停」，
+    # 弱模型一次不自觉就会在用户确认前跑出副作用）。auto 直跑仅剩旧 App
+    # capability opt-in 兼容路径。
     return (
         (getattr(agent, "platform", "") or "") == "zet_agent"
-        and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
         and bool(getattr(agent, "_zet_agent_plan_presented", False))
         and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
@@ -698,23 +717,26 @@ def _enforce_single_plan_interaction_tool_call(
         ),
         None,
     )
-    manual_present_plan = (
+    # auto / manual 一视同仁（codex P1）：auto 兼容路径下模型可能在同一批次里
+    # present_plan 后接 todo/副作用工具，而播种要等批次收尾——后续 todo 会先在
+    # 空/旧 store 上跑、再被 seed_from_plan 整表覆盖回全 pending。批次切段：只
+    # 保留 present_plan，被裁掉的调用由模型在播种完成后的下一轮重发。
+    zet_present_plan = (
         (getattr(agent, "platform", "") or "") == "zet_agent"
         and present_plan_call is not None
-        and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
-    if not plan_mode_active and not trusted_scope and not manual_present_plan:
+    if not plan_mode_active and not trusted_scope and not zet_present_plan:
         return False
 
     if not plan_mode_active:
-        selected = present_plan_call if manual_present_plan else tool_calls[0]
+        selected = present_plan_call if zet_present_plan else tool_calls[0]
         assistant_message.tool_calls = [selected]
         _filter_provider_replay_tool_calls(assistant_message, selected)
         logger.warning(
             "zet_agent %s: provider returned parallel tools; keeping only %s",
             (
-                "manual plan interaction"
-                if manual_present_plan
+                "plan interaction"
+                if zet_present_plan
                 else "trusted execution scope"
             ),
             _tool_call_name(selected) or "first call",
@@ -987,6 +1009,33 @@ def _vision_capability_key(agent: Any) -> tuple[str, str, str]:
         str(getattr(agent, field, "") or "").strip().lower()
         for field in ("provider", "model", "base_url")
     )
+
+
+def _compact_lightweight_api_messages(
+    agent: Any, api_messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep only the stable system policy and current structured user turn.
+
+    The onboarding service includes the complete GuideContextSnapshot in each
+    current user message. Durable SessionDB persistence still retains the full
+    UI transcript; this changes only the provider-bound copy.
+    """
+    if not getattr(agent, "_onboarding_lightweight", False):
+        return api_messages
+
+    system = next(
+        (msg for msg in api_messages if msg.get("role") == "system"), None
+    )
+    current_user = next(
+        (msg for msg in reversed(api_messages) if msg.get("role") == "user"),
+        None,
+    )
+    compacted: List[Dict[str, Any]] = []
+    if system is not None:
+        compacted.append(system)
+    if current_user is not None:
+        compacted.append(current_user)
+    return compacted or api_messages
 
 
 def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
@@ -1533,8 +1582,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            updated = agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+            agent._system_prompt_persist_pending = updated is False
         except Exception as exc:
+            agent._system_prompt_persist_pending = True
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
                 "%s. Subsequent turns will rebuild the system prompt and "
@@ -1915,6 +1968,41 @@ def _purge_refused_rows_from_session_db(agent, messages: List[Dict], kept: int) 
                 "content refusal: failed to delete persisted message row %s: %s",
                 row_id, exc,
             )
+
+
+def _turn_has_tool_moderation_block(messages: List[Dict], start_idx: int) -> bool:
+    """Whether a tool result appended this iteration signals an image
+    moderation refusal.
+
+    A text-only main model cannot see images, so a refused image is described
+    by the ``vision_analyze`` auxiliary tool. When the moderation gateway
+    blocks that image the tool returns ``{"moderation_blocked": true}`` instead
+    of a description. That result must TERMINATE the turn — never be fed back
+    to the main model, which would otherwise answer around the "内容不合规"
+    tool output and leak a reply for a refused image. (Native-vision models
+    already terminate: the re-embedded inline image is blocked on the next main
+    call. This closes the same hole for the text-only/legacy path.)
+    """
+    for msg in messages[start_idx:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or "moderation_blocked" not in content:
+            continue
+        try:
+            payload = json.loads(content)
+        except (ValueError, TypeError):
+            # A guardrail observation may have been appended, so the content no
+            # longer parses as bare JSON — fall back to a substring match.
+            if (
+                '"moderation_blocked": true' in content
+                or '"moderation_blocked":true' in content
+            ):
+                return True
+            continue
+        if isinstance(payload, dict) and payload.get("moderation_blocked") is True:
+            return True
+    return False
 
 
 def _content_policy_blocked_result(
@@ -2830,6 +2918,8 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        api_messages = _compact_lightweight_api_messages(agent, api_messages)
+
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -3516,6 +3606,19 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
+                    _started = getattr(agent, "_onboarding_upstream_started_mono", None)
+                    if (
+                        getattr(agent, "_onboarding_lightweight", False)
+                        and isinstance(_started, (int, float))
+                        and not getattr(agent, "_onboarding_ttft_logged", False)
+                    ):
+                        agent._onboarding_ttft_logged = True
+                        logger.info(
+                            "onboarding lightweight upstream first delta: "
+                            "session=%s ttft_ms=%d",
+                            agent.session_id or "none",
+                            int((time.monotonic() - _started) * 1000),
+                        )
 
                 _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
@@ -3553,6 +3656,23 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    if getattr(agent, "_onboarding_lightweight", False):
+                        _upstream_started = time.monotonic()
+                        agent._onboarding_upstream_started_mono = _upstream_started
+                        agent._onboarding_ttft_logged = False
+                        _received = getattr(agent, "_onboarding_received_mono", None)
+                        logger.info(
+                            "onboarding lightweight upstream request: "
+                            "session=%s preflight_ms=%d messages=%d tools=%d "
+                            "approx_tokens=%d",
+                            agent.session_id or "none",
+                            int((_upstream_started - _received) * 1000)
+                            if isinstance(_received, (int, float))
+                            else -1,
+                            len(next_api_kwargs.get("messages") or []),
+                            len(next_api_kwargs.get("tools") or []),
+                            approx_tokens,
+                        )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -6941,6 +7061,15 @@ def run_conversation(
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                onboarding_retry_delay = _onboarding_fast_retry_delay(
+                    agent, status_code, is_rate_limited
+                )
+                if onboarding_retry_delay is not None:
+                    # Onboarding gets exactly one fast retry (the agent factory
+                    # caps max_retries at two).  Normal Agent traffic keeps the
+                    # existing adaptive backoff unchanged.
+                    wait_time = onboarding_retry_delay
+                    _backoff_policy = "onboarding_fast_502"
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
@@ -7770,7 +7899,58 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _pre_tool_msg_count = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # An image-moderation refusal surfaced by a tool result must END
+                # the turn as a content-policy block — never be fed back to the
+                # model. vision_analyze (the text-only-model image path) returns
+                # {"moderation_blocked": true} when the gateway refuses an image;
+                # feeding that to the main model lets it answer around the
+                # "内容不合规" tool output and leak a reply for a refused image.
+                # Terminate with the same result shape as the native-vision path
+                # so the App hides the image and renders the compliance notice.
+                if _turn_has_tool_moderation_block(messages, _pre_tool_msg_count):
+                    _kept_messages = _transcript_without_refused_turn(
+                        messages, user_message, current_turn_user_idx
+                    )
+                    _purge_refused_rows_from_session_db(
+                        agent, messages, len(_kept_messages)
+                    )
+                    agent._persist_session(_kept_messages, conversation_history)
+                    logger.warning(
+                        "%svision_analyze moderation block → terminating turn as "
+                        "content_policy_blocked (refused image not fed to model)",
+                        agent.log_prefix,
+                    )
+                    _policy_response = (
+                        "⚠️  The model provider's safety filter blocked this request "
+                        "(not a Hermes/gateway failure).\n\n"
+                        "Provider message: 内容不合规\n\n"
+                        f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                    )
+                    return _content_policy_blocked_result(
+                        _kept_messages,
+                        api_call_count,
+                        final_response=_policy_response,
+                        error_detail="image content refused by moderation gateway",
+                        provider_error={
+                            "code": "content_blocked",
+                            "reason": FailoverReason.content_policy_blocked.value,
+                            "retryable": False,
+                            "recoverable": False,
+                            "provider_message": "内容不合规",
+                        },
+                    )
+
+                # 计划播种：present_plan 本批次成功呈现后，用同一份计划骨架
+                # 播种 TodoStore + 合成 todo 调用消息对（跨 turn 存活）。必须
+                # 在批次收尾后、present_plan break 之前——manual 确认卡模式
+                # 随后立即结束 turn，晚一步播种就随 agent 实例蒸发。放在持久化
+                # 失败检查之前：播种落盘失败也要走 session_persistence_failed
+                # 终止，而不是带着"看似成功"的计划卡结束 turn（codex P1）。
+                from agent.plan_seeding import seed_pending_plan_todos
+                seed_pending_plan_todos(agent, messages)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7787,6 +7967,18 @@ def run_conversation(
                         getattr(agent, "_zet_agent_plan_fallback_response", "")
                         or ""
                     )
+                    # 闭合 assistant 消息（codex P1）：App 路径有 plan_emit_callback
+                    # → fallback_response 为空 → finalize_turn 不补闭合，而播种又
+                    # 追加了 todo tool 对，持久化历史会以 tool 结尾。下一轮变成
+                    # `... tool -> user`，严格 provider 直接拒绝，用户确认后的计划
+                    # 执行不了。内容必须非空：Moonshot/Kimi 等严格 OpenAI 兼容端
+                    # 同样拒绝空 assistant content（同文件 partial-stream 防护已
+                    # 记录该行为）——用一句可读的短文案闭合。
+                    if messages and messages[-1].get("role") == "tool":
+                        messages.append({
+                            "role": "assistant",
+                            "content": PLAN_PRESENTED_CLOSING_TEXT,
+                        })
                     logger.info(
                         "zet_agent: present_plan emitted; ending turn "
                         "without a post-tool LLM follow-up"
@@ -8765,8 +8957,32 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # 计划播种清单的宿主端收尾（顺序：先取消回执、后状态校正）：
+                # - 取消回执（plan_ack cancelled）：把播种待办整体置 cancelled 并
+                #   持久化，否则下一轮 hydration 把已取消计划恢复成待执行（codex P1）。
+                # - 状态校正：turn 正常结束后残留的 in_progress 降回 pending
+                #   （Codex #21327 教训——状态约束只写提示词必然漂移）。
+                # 两者都必须在最终 assistant 消息 **之前** 追加工具对：追加在其
+                # 后会让 finalize_turn 看到 transcript 以 tool 结尾而再补一次
+                # 最终回复，用户刷新后看到答案重复（codex P1）。
+                from agent.plan_seeding import (
+                    apply_plan_ack_cancellation_at_turn_end,
+                    correct_stale_in_progress_at_turn_end,
+                )
+                apply_plan_ack_cancellation_at_turn_end(agent, messages)
+                correct_stale_in_progress_at_turn_end(agent, messages)
+                if getattr(agent, "_incremental_persistence_failed", False):
+                    # 收尾工具对（取消落地/状态校正）落盘失败：与批次内工具
+                    # 结果同规——不能带着「看似成功」的最终回复结束 turn，
+                    # 否则下一轮 hydrate 恢复旧 todo 状态、与用户看到的回复
+                    # 相矛盾（codex P1）。
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
+                    break
+
                 messages.append(final_msg)
-                
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")

@@ -1,0 +1,644 @@
+"""计划 × 任务清单合一（方案 §3）：播种机制测试。
+
+覆盖：
+- TodoStore.seed_from_plan 的骨架生成 / 上限组边界对齐
+- merge=false 整表重写的结构保护合并（骨架不可摧毁）
+- merge=true 更新保留 plan 关联字段
+- 历史回放（write merge=False 携带 plan_id 条目）后保护重新上膛
+- turn 结束宿主端 in_progress 降级校正
+- format_for_injection 携带组归属
+- seed_pending_plan_todos 合成消息对：与 hydration 的 GHSA 配对校验兼容
+- present_plan_with_meta 的 plan_id 生成与新旧 callback 签名兼容
+"""
+
+import json
+from types import SimpleNamespace
+
+from tools.todo_tool import TodoStore, MAX_TODO_ITEMS
+from tools.plan_tool import present_plan_with_meta
+from agent.plan_seeding import seed_pending_plan_todos, build_seed_messages
+
+
+def _groups(*sizes):
+    return [
+        {
+            "icon": "📦",
+            "label": f"phase-{gi}",
+            "count": n,
+            "items": [f"step {gi}-{ii}" for ii in range(n)],
+        }
+        for gi, n in enumerate(sizes)
+    ]
+
+
+# ---------------------------------------------------------------- seed_from_plan
+
+
+def test_seed_from_plan_builds_skeleton_with_linkage():
+    store = TodoStore()
+    items = store.seed_from_plan("plan01", _groups(2, 3))
+
+    assert [i["id"] for i in items] == [
+        "plan01-1-1", "plan01-1-2",
+        "plan01-2-1", "plan01-2-2", "plan01-2-3",
+    ]
+    assert all(i["status"] == "pending" for i in items)
+    assert [i["group_index"] for i in items] == [0, 0, 1, 1, 1]
+    assert all(i["plan_id"] == "plan01" for i in items)
+    assert store.plan_id == "plan01"
+
+
+def test_seed_from_plan_caps_on_group_boundary():
+    # 6 组 × 50 条 = 300 > 256：裁剪必须整组丢弃，不把一个阶段砍成半截。
+    store = TodoStore()
+    items = store.seed_from_plan("plan02", _groups(50, 50, 50, 50, 50, 50))
+    assert len(items) == 250  # 5 whole groups; the 6th would exceed 256
+    assert {i["group_index"] for i in items} == {0, 1, 2, 3, 4}
+
+
+def test_seed_from_plan_truncates_within_single_oversized_group():
+    # 单组超限（防御性：正常上游 plan 裁剪不会产生，但必须播出内容）。
+    store = TodoStore()
+    oversized = [{
+        "icon": "📦",
+        "label": "big",
+        "count": 300,
+        "items": [f"s{i}" for i in range(300)],
+    }]
+    items = store.seed_from_plan("plan03", oversized)
+    assert len(items) == MAX_TODO_ITEMS
+
+
+# ---------------------------------------------------- structure-protected merge
+
+
+def test_merge_false_rewrite_cannot_destroy_seeded_skeleton():
+    store = TodoStore()
+    store.seed_from_plan("plan04", _groups(2, 1))
+
+    # 模型无视骨架整表重写：改了一条状态、丢了两条、加了一条自编任务。
+    store.write([
+        {"id": "plan04-1-1", "content": "step 0-0", "status": "completed"},
+        {"id": "extra-1", "content": "计划外任务", "status": "in_progress"},
+    ], merge=False)
+
+    items = store.read()
+    ids = [i["id"] for i in items]
+    # 骨架三条全部存活（遗漏 ≠ 取消），计划外条目追加在末尾。
+    assert ids == ["plan04-1-1", "plan04-1-2", "plan04-2-1", "extra-1"]
+    assert items[0]["status"] == "completed"
+    assert items[0]["plan_id"] == "plan04"
+    assert items[0]["group_index"] == 0
+    assert items[1]["status"] == "pending"
+    assert "group_index" not in items[3]
+
+
+def test_merge_true_preserves_plan_linkage_fields():
+    store = TodoStore()
+    store.seed_from_plan("plan05", _groups(1))
+    store.write([
+        {"id": "plan05-1-1", "content": "step 0-0", "status": "in_progress"},
+    ], merge=True)
+    item = store.read()[0]
+    assert item["status"] == "in_progress"
+    assert item["plan_id"] == "plan05"
+    assert item["group_index"] == 0
+
+
+def test_hydration_replay_rearms_protection():
+    # 历史回放：全新 store 整表写入带 plan_id 的条目 → 保护重新上膛。
+    store = TodoStore()
+    store.write([
+        {"id": "plan06-1-1", "content": "a", "status": "pending",
+         "group_index": 0, "plan_id": "plan06"},
+        {"id": "plan06-1-2", "content": "b", "status": "completed",
+         "group_index": 0, "plan_id": "plan06"},
+    ], merge=False)
+    assert store.plan_id == "plan06"
+
+    # 上膛后的整表重写走保护合并：骨架存活。
+    store.write([{"id": "x", "content": "y", "status": "pending"}], merge=False)
+    ids = [i["id"] for i in store.read()]
+    assert ids == ["plan06-1-1", "plan06-1-2", "x"]
+
+
+def test_plain_list_without_plan_id_keeps_replace_semantics():
+    # 普通清单（无 plan 关联）不受保护语义影响：replace 还是 replace。
+    store = TodoStore()
+    store.write([{"id": "a", "content": "1", "status": "pending"}], merge=False)
+    store.write([{"id": "b", "content": "2", "status": "pending"}], merge=False)
+    assert [i["id"] for i in store.read()] == ["b"]
+
+
+# ------------------------------------------------------------- turn-end 校正
+
+
+def test_demote_stale_in_progress():
+    store = TodoStore()
+    store.seed_from_plan("plan07", _groups(2))
+    store.write([
+        {"id": "plan07-1-1", "content": "step 0-0", "status": "in_progress"},
+    ], merge=True)
+    assert store.demote_stale_in_progress() is True
+    assert store.read()[0]["status"] == "pending"
+    # 幂等：没有 in_progress 时返回 False。
+    assert store.demote_stale_in_progress() is False
+
+
+# ------------------------------------------------------------- injection 格式
+
+
+def test_injection_carries_group_linkage():
+    store = TodoStore()
+    store.seed_from_plan("plan08", _groups(1, 1), plan_turn_id="turn-08")
+    text = store.format_for_injection()
+    assert "[group 0]" in text
+    assert "[group 1]" in text
+    # 压缩注入携带计划关联（codex P1）：canonical result 被折叠后模型只剩注入
+    # 块，缺 plan_id/plan_turn_id 会让后续写入退化成普通清单。
+    assert "plan_id: plan08" in text
+    assert "plan_turn_id: turn-08" in text
+
+
+def test_rearm_only_treats_seeded_items_as_skeleton():
+    # 只用骨架字段恢复保护（codex P1）：计划外项也带同一 plan_id，若一并算
+    # 骨架，原计划全终态后终态解保护判定不成立、旧计划永远解不开。
+    store = TodoStore()
+    store.write([
+        {"id": "plan21-1-1", "content": "a", "status": "completed",
+         "group_index": 0, "plan_id": "plan21"},
+        {"id": "extra-x", "content": "计划外", "status": "pending", "plan_id": "plan21"},
+    ], merge=False)
+    # 骨架（唯一带 group_index 的那条）已终态 → 不重新上膛；计划外项虽 pending
+    # 也不算骨架，不能把保护撑住。
+    assert store.plan_id is None
+
+    # 下一次 merge=false 按新清单干净替换。
+    store.write([{"id": "fresh", "content": "新任务", "status": "pending"}], merge=False)
+    assert [i["id"] for i in store.read()] == ["fresh"]
+    assert store.plan_id is None
+
+
+def test_unconfirmed_plan_protection_expires_next_turn(monkeypatch):
+    # 决策点语义允许「看了计划不确认就聊别的」（codex P1）：新 turn 开始时
+    # 未确认的旧计划保护过期，新任务清单不被旧骨架劫持。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "", "")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan27", _groups(2), plan_turn_id="turn-27")
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id is None
+
+    agent._todo_store.write([{"id": "new", "content": "新任务", "status": "pending"}], merge=False)
+    assert [i["id"] for i in agent._todo_store.read()] == ["new"]
+
+
+def test_matching_confirm_keeps_plan_protection(monkeypatch):
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "confirmed", "turn-28")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan28", _groups(1), plan_turn_id="turn-28")
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id == "plan28"
+
+
+def test_confirm_ack_from_a_stale_card_does_not_authorize_current_plan(monkeypatch):
+    # 确认目标校验（codex P1，与取消侧对称）：同会话先后两份计划，用户从旧卡
+    # 点确认时不能把授权算到当前计划头上。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "confirmed", "turn-OLD")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan29", _groups(1), plan_turn_id="turn-NEW")
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id is None
+
+
+def test_started_plan_survives_turn_start_expiry(monkeypatch):
+    # 已经开始执行的计划不受过期影响（有条目非 pending）。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "", "")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan30", _groups(2), plan_turn_id="turn-30")
+    agent._todo_store.write([{"id": "plan30-1-1", "status": "in_progress"}], merge=True)
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id == "plan30"
+
+
+def test_merge_after_terminal_plan_does_not_stamp_old_plan():
+    # 终态解保护同样作用于 merge=true（codex P1）：计划做完后用户开新任务，
+    # 新待办不能被盖上旧 plan_id 混进已结束的计划卡。
+    store = TodoStore()
+    store.seed_from_plan("plan26", _groups(1))
+    store.write([{"id": "plan26-1-1", "status": "completed"}], merge=True)
+    store.write([{"id": "new-task", "content": "无关新任务", "status": "pending"}], merge=True)
+    fresh = next(i for i in store.read() if i["id"] == "new-task")
+    assert "plan_id" not in fresh
+    assert store.plan_id is None
+
+
+def test_extras_are_normalized_to_current_plan():
+    # 幻觉/过期 plan_id 或自封 group_index 的计划外新增（codex P1）：强制归到
+    # 当前计划并剥骨架字段，否则双 plan_id 让下一轮 _rearm 解除保护。
+    store = TodoStore()
+    store.seed_from_plan("plan19", _groups(1), plan_turn_id="turn-19")
+    store.write([
+        {"id": "x1", "content": "新任务", "status": "pending",
+         "plan_id": "stale-plan", "group_index": 0, "plan_turn_id": "turn-fake"},
+    ], merge=True)
+    extra = next(i for i in store.read() if i["id"] == "x1")
+    assert extra["plan_id"] == "plan19"
+    assert "group_index" not in extra
+    assert "plan_turn_id" not in extra
+
+
+def test_validate_rejects_oversized_group_index_string():
+    # 几千位数字串会让 int() 抛 ValueError，hydration 每轮重放历史 → 会话
+    # 持续无法恢复（codex P1）。超长/超界一律按无效丢弃且不抛。
+    store = TodoStore()
+    items = store.write([
+        {"id": "a", "content": "x", "status": "pending", "group_index": "9" * 5000},
+        {"id": "b", "content": "y", "status": "pending", "group_index": "99999999"},
+        {"id": "c", "content": "z", "status": "pending", "group_index": "3"},
+    ], merge=False)
+    by_id = {i["id"]: i for i in items}
+    assert "group_index" not in by_id["a"]
+    assert "group_index" not in by_id["b"]
+    assert by_id["c"]["group_index"] == 3
+
+
+def test_turn_end_snapshot_respects_budget(monkeypatch):
+    # 收尾快照预算（codex P1）：store 被长计划外项塞大后，快照超
+    # MAX_TODO_RESULT_CHARS 会被下一轮 hydration 跳过 → 状态回滚。
+    from agent import plan_seeding as ps
+
+    emitted = []
+    agent = _FakeAgent(
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    agent._todo_store.seed_from_plan("plan20", _groups(2))
+    # 用 merge 塞入 60 条 ~4000 字符的长计划外项（~240K 字符）。
+    agent._todo_store.write([
+        {"id": f"big-{i}", "content": "长" * 3900, "status": "in_progress" if i == 0 else "pending"}
+        for i in range(60)
+    ], merge=True)
+    messages = []
+    ps.correct_stale_in_progress_at_turn_end(agent, messages)
+
+    result_json = messages[-1]["content"]
+    assert len(result_json) <= 96_000
+    payload = json.loads(result_json)
+    assert len(payload["todos"]) == 62  # 条目一个不丢，只压内容
+
+
+def test_injection_keeps_full_skeleton_for_active_plan():
+    # 完整骨架注入（codex P1）：只带未完成项会让模型回填出缺了已完成步骤的
+    # 清单，合一卡进度与 hydration 一起错位。
+    store = TodoStore()
+    store.seed_from_plan("plan24", _groups(3), plan_turn_id="turn-24")
+    store.write([
+        {"id": "plan24-1-1", "content": "step 0-0", "status": "completed"},
+        {"id": "plan24-1-2", "content": "step 0-1", "status": "cancelled"},
+    ], merge=True)
+    text = store.format_for_injection()
+    assert "plan24-1-1" in text and "[x]" in text
+    assert "plan24-1-2" in text and "[~]" in text
+    assert "plan24-1-3" in text  # 仍待办的那条
+
+    # 普通清单（无计划）维持原语义：只注入未完成项。
+    plain = TodoStore()
+    plain.write([
+        {"id": "a", "content": "done", "status": "completed"},
+        {"id": "b", "content": "todo", "status": "pending"},
+    ], merge=False)
+    plain_text = plain.format_for_injection()
+    assert "b." in plain_text
+    assert "a." not in plain_text
+
+
+def test_status_only_rewrite_keeps_seeded_content():
+    # 状态更新常只带 id+status（codex P1）：不能把播种文案覆盖成「(no description)」。
+    store = TodoStore()
+    store.seed_from_plan("plan25", _groups(2))
+    store.write([
+        {"id": "plan25-1-1", "status": "completed"},
+        {"id": "plan25-1-2", "status": "in_progress"},
+    ], merge=False)
+    by_id = {i["id"]: i for i in store.read()}
+    assert by_id["plan25-1-1"]["content"] == "step 0-0"
+    assert by_id["plan25-1-1"]["status"] == "completed"
+    assert by_id["plan25-1-2"]["content"] == "step 0-1"
+    # 显式给了非空 content 时仍然覆盖。
+    store.write([{"id": "plan25-1-1", "content": "改写后的步骤", "status": "completed"}], merge=False)
+    assert next(i for i in store.read() if i["id"] == "plan25-1-1")["content"] == "改写后的步骤"
+
+
+def test_protection_disarms_after_plan_reaches_terminal_state():
+    # 终态计划解除保护（codex P1）：条目全部 completed/cancelled 后，模型为新
+    # 任务 merge=false 建清单不能再被旧骨架劫持。
+    store = TodoStore()
+    store.seed_from_plan("plan18", _groups(2))
+    store.write([
+        {"id": "plan18-1-1", "content": "step 0-0", "status": "completed"},
+        {"id": "plan18-1-2", "content": "step 0-1", "status": "cancelled"},
+    ], merge=True)
+
+    store.write([{"id": "new-1", "content": "无关新任务", "status": "pending"}], merge=False)
+    items = store.read()
+    assert [i["id"] for i in items] == ["new-1"]
+    assert "plan_id" not in items[0]
+    assert store.plan_id is None
+
+
+# ------------------------------------------------- seed_pending_plan_todos
+
+
+class _FakeAgent(SimpleNamespace):
+    def _flush_messages_to_session_db(self, messages):
+        return True
+
+
+def _fake_agent_with_pending(meta):
+    emitted = []
+    agent = _FakeAgent(
+        _pending_plan_seed=meta,
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append((todos, summary)),
+    )
+    return agent, emitted
+
+
+def test_seed_pending_plan_todos_appends_hydratable_pair():
+    meta = {"plan_id": "plan09", "title": "整理下载目录", "groups": _groups(2)}
+    agent, emitted = _fake_agent_with_pending(meta)
+    messages = [
+        {"role": "user", "content": "帮我计划整理下载目录"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call-plan", "type": "function",
+             "function": {"name": "present_plan", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "name": "present_plan", "tool_call_id": "call-plan",
+         "content": "Plan presented to user."},
+    ]
+
+    seed_pending_plan_todos(agent, messages)
+
+    # 消费掉 pending 元数据（幂等）。
+    assert agent._pending_plan_seed is None
+    # store 播种完成。
+    assert agent._todo_store.plan_id == "plan09"
+    # 合成消息对：assistant todo tool_call + tool result。
+    assert messages[-2]["role"] == "assistant"
+    call = messages[-2]["tool_calls"][0]
+    assert call["function"]["name"] == "todo"
+    assert messages[-1]["role"] == "tool"
+    assert messages[-1]["tool_call_id"] == call["id"]
+    payload = json.loads(messages[-1]["content"])
+    assert [t["plan_id"] for t in payload["todos"]] == ["plan09", "plan09"]
+    # SSE 快照已推送。
+    assert len(emitted) == 1
+    assert emitted[0][1]["total"] == 2
+
+    # GHSA 配对校验兼容：hydration 的 matcher 认这对消息。
+    from run_agent import AIAgent
+    assert AIAgent._tool_response_matches_todo_call(messages, len(messages) - 1)
+
+
+def test_seed_pending_plan_todos_noop_without_meta():
+    agent, emitted = _fake_agent_with_pending(None)
+    messages = []
+    seed_pending_plan_todos(agent, messages)
+    assert messages == []
+    assert emitted == []
+
+
+class _FlushFailAgent(SimpleNamespace):
+    def _flush_messages_to_session_db(self, messages):
+        return False
+
+
+def test_seed_does_not_emit_snapshot_when_persistence_fails():
+    # Fail-closed（codex P1）：合成消息对没落盘就不给 App 推快照——否则用户
+    # 看到可确认的清单，下一轮却 hydrate 不出骨架。
+    emitted = []
+    agent = _FlushFailAgent(
+        _pending_plan_seed={"plan_id": "plan10", "title": "t", "groups": _groups(1)},
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    seed_pending_plan_todos(agent, [])
+    assert emitted == []
+    assert agent._incremental_persistence_failed is True
+
+
+def test_turn_end_correction_writes_canonical_pair():
+    # 校正只改内存的话，下一轮从历史 hydrate 出旧的 in_progress（codex P1）：
+    # 必须像播种一样写一对 canonical todo 消息并在落盘成功后才推快照。
+    from agent.plan_seeding import correct_stale_in_progress_at_turn_end
+
+    emitted = []
+    agent = _FakeAgent(
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    agent._todo_store.seed_from_plan("plan11", _groups(2))
+    agent._todo_store.write(
+        [{"id": "plan11-1-1", "content": "step 0-0", "status": "in_progress"}],
+        merge=True,
+    )
+    messages = []
+    correct_stale_in_progress_at_turn_end(agent, messages)
+
+    assert messages[-2]["role"] == "assistant"
+    assert messages[-2]["tool_calls"][0]["function"]["name"] == "todo"
+    assert messages[-1]["role"] == "tool"
+    payload = json.loads(messages[-1]["content"])
+    statuses = {t["id"]: t["status"] for t in payload["todos"]}
+    assert statuses["plan11-1-1"] == "pending"
+    assert len(emitted) == 1
+    # hydration 配对校验兼容。
+    from run_agent import AIAgent
+    assert AIAgent._tool_response_matches_todo_call(messages, len(messages) - 1)
+
+
+def test_cancel_plan_items_cancels_unfinished_seeded_items():
+    store = TodoStore()
+    store.seed_from_plan("plan13", _groups(2))
+    store.write(
+        [{"id": "plan13-1-1", "content": "step 0-0", "status": "completed"}],
+        merge=True,
+    )
+    assert store.cancel_plan_items() is True
+    statuses = {i["id"]: i["status"] for i in store.read()}
+    assert statuses["plan13-1-1"] == "completed"  # 已完成不动
+    assert statuses["plan13-1-2"] == "cancelled"
+    # 幂等：没有未完成条目时返回 False。
+    assert store.cancel_plan_items() is False
+
+
+def _mock_ack_env(monkeypatch, status: str, turn_id: str) -> None:
+    def _env(name, default=""):
+        if name == "HERMES_PLAN_ACK_STATUS":
+            return status
+        if name == "HERMES_PLAN_ACK_TURN_ID":
+            return turn_id
+        return default
+
+    monkeypatch.setattr("gateway.session_context.get_session_env", _env)
+
+
+def test_plan_ack_cancellation_writes_canonical_pair(monkeypatch):
+    # 取消回执落地（codex P1）：cancelled 回执把播种待办整体置 cancelled 并
+    # 写 canonical 对，否则下一轮 hydration 恢复出已取消计划的待办。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "cancelled", "turn-plan-14")
+    emitted = []
+    agent = _FakeAgent(
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: emitted.append(todos),
+    )
+    agent._todo_store.seed_from_plan("plan14", _groups(2), plan_turn_id="turn-plan-14")
+    messages = []
+    ps.apply_plan_ack_cancellation_at_turn_end(agent, messages)
+
+    payload = json.loads(messages[-1]["content"])
+    assert all(t["status"] == "cancelled" for t in payload["todos"])
+    assert len(emitted) == 1
+    from run_agent import AIAgent
+    assert AIAgent._tool_response_matches_todo_call(messages, len(messages) - 1)
+
+
+def test_plan_ack_cancellation_noop_on_turn_mismatch(monkeypatch):
+    # 目标匹配（codex P1）：从旧计划卡发来的 cancelled 回执不能误杀当前计划；
+    # 旧播种数据没有 plan_turn_id 时同样 fail-safe no-op。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "cancelled", "turn-plan-OLD")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan16", _groups(1), plan_turn_id="turn-plan-NEW")
+    messages = []
+    ps.apply_plan_ack_cancellation_at_turn_end(agent, messages)
+    assert messages == []
+    assert agent._todo_store.read()[0]["status"] == "pending"
+
+    # legacy：播种无 plan_turn_id → no-op。
+    agent2 = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent2._todo_store.seed_from_plan("plan17", _groups(1))
+    ps.apply_plan_ack_cancellation_at_turn_end(agent2, messages)
+    assert agent2._todo_store.read()[0]["status"] == "pending"
+
+
+def test_plan_ack_cancellation_noop_without_cancelled_status(monkeypatch):
+    from agent import plan_seeding as ps
+
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "confirmed" if name == "HERMES_PLAN_ACK_STATUS" else default,
+    )
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan15", _groups(1))
+    messages = []
+    ps.apply_plan_ack_cancellation_at_turn_end(agent, messages)
+    assert messages == []
+    assert agent._todo_store.read()[0]["status"] == "pending"
+
+
+def test_seed_from_plan_respects_content_budget():
+    # 内容预算（codex P1）：极端大计划不把 ~150KB 重复文本塞进合成消息对。
+    from tools.todo_tool import MAX_SEED_CONTENT_CHARS
+
+    big_groups = [
+        {
+            "icon": "📦",
+            "label": f"g{gi}",
+            "count": 50,
+            "items": ["x" * 500 for _ in range(50)],
+        }
+        for gi in range(10)
+    ]
+    store = TodoStore()
+    items = store.seed_from_plan("plan12", big_groups)
+    total_chars = sum(len(i["content"]) for i in items)
+    assert total_chars <= MAX_SEED_CONTENT_CHARS
+    # 组边界对齐：每组 50×500=25000 > 24000 预算 → 首组组内截断兜底。
+    assert {i["group_index"] for i in items} == {0}
+
+
+def test_build_seed_messages_shape():
+    msgs = build_seed_messages("planXY", [{"id": "planXY-1-1"}], '{"todos": []}')
+    assert msgs[0]["tool_calls"][0]["id"] == "call_planseed_planXY"
+    assert msgs[1]["tool_call_id"] == "call_planseed_planXY"
+    assert msgs[1]["name"] == "todo"
+
+
+# ------------------------------------------------------ present_plan_with_meta
+
+
+def test_present_plan_with_meta_defers_card_emit_until_persisted():
+    # 卡片延迟到持久化成功后再推（codex P1）：present_plan 本身不 emit，
+    # 只把 emit 放进 meta 交给播种在 flush 成功后调用。
+    seen = {}
+
+    def cb(title, groups, plan_id):
+        seen["title"] = title
+        seen["plan_id"] = plan_id
+
+    result, meta = present_plan_with_meta(
+        "整理计划", _groups(1), callback=cb, auto_execute=False,
+    )
+    assert meta is not None
+    assert seen == {}  # 尚未推送
+    assert len(meta["plan_id"]) == 12
+    assert meta["groups"][0]["items"] == ["step 0-0"]
+    assert "seeded from this plan" in result
+
+    meta["emit"]()
+    assert seen["plan_id"] == meta["plan_id"]
+    assert seen["title"] == "整理计划"
+
+
+def test_present_plan_with_meta_supports_legacy_two_arg_callback():
+    seen = []
+    result, meta = present_plan_with_meta(
+        "整理计划", _groups(1),
+        callback=lambda title, groups: seen.append(title),
+        auto_execute=False,
+    )
+    assert meta is not None and meta["plan_id"]
+    meta["emit"]()
+    assert seen == ["整理计划"]
+
+
+def test_seed_emits_plan_card_only_after_flush():
+    # flush 成功 → 计划卡与清单一起发布；flush 失败 → 两者都不发布。
+    meta_ok = {"plan_id": "plan22", "title": "t", "groups": _groups(1)}
+    emitted_cards = []
+    meta_ok["emit"] = lambda: emitted_cards.append("card")
+    agent, emitted = _fake_agent_with_pending(meta_ok)
+    seed_pending_plan_todos(agent, [])
+    assert emitted_cards == ["card"]
+    assert len(emitted) == 1
+
+    fail_cards = []
+    meta_fail = {"plan_id": "plan23", "title": "t", "groups": _groups(1),
+                 "emit": lambda: fail_cards.append("card")}
+    fail_emitted = []
+    fail_agent = _FlushFailAgent(
+        _pending_plan_seed=meta_fail,
+        _todo_store=TodoStore(),
+        todo_emit_callback=lambda todos, summary: fail_emitted.append(todos),
+    )
+    seed_pending_plan_todos(fail_agent, [])
+    assert fail_cards == []
+    assert fail_emitted == []
+
+
+def test_present_plan_with_meta_no_callback_returns_no_meta():
+    result, meta = present_plan_with_meta("整理计划", _groups(1))
+    assert meta is None
+    assert "📋 整理计划" in result

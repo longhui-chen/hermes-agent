@@ -16012,9 +16012,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from agent.auxiliary_client import scoped_runtime_main
 
                     with scoped_runtime_main(vision_runtime):
-                        message_text = await self._enrich_message_with_vision(
-                            message_text,
-                            image_paths,
+                        message_text, _vision_moderation_blocked = (
+                            await self._enrich_message_with_vision(
+                                message_text,
+                                image_paths,
+                            )
+                        )
+                    if _vision_moderation_blocked:
+                        # The image was refused by content moderation during
+                        # pre-analysis. Re-attach it inline (like the native path)
+                        # so the main-model call is refused by the gateway too →
+                        # content_policy_blocked terminates the turn and the model
+                        # never runs. Text-only models now honour the same image
+                        # gate as vision-capable ones.
+                        self._session_state(
+                            session_key
+                        ).persistent.native_image_paths = list(image_paths)
+                        logger.info(
+                            "Image routing: text-path pre-analysis was refused by "
+                            "content moderation; re-attaching %d image(s) inline so "
+                            "the main-model call is refused and the turn terminates.",
+                            len(image_paths),
                         )
 
             if audio_paths:
@@ -19521,7 +19539,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if image_paths:
                     try:
                         self._install_turn_auxiliary_runtime(turn_route)
-                        enriched_prompt = await self._enrich_message_with_vision(
+                        # Background path: a moderation refusal drops the image
+                        # (returns the prompt text only), so the violating image
+                        # never reaches the model even without a user-facing turn.
+                        enriched_prompt, _ = await self._enrich_message_with_vision(
                             prompt, image_paths,
                         )
                     except Exception as e:
@@ -21518,7 +21539,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         image_paths: List[str],
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
         Auto-analyze user-attached images with the vision tool and prepend
         the descriptions to the message text.
@@ -21533,7 +21554,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             image_paths: List of local file paths to cached images.
 
         Returns:
-            The enriched message string with vision descriptions prepended.
+            ``(enriched_text, moderation_blocked)``. ``moderation_blocked`` is
+            True when content moderation REFUSED one of the images — the caller
+            must refuse the whole turn (re-attach the image inline so the
+            main-model call is refused and the model never runs) instead of
+            letting the model answer around a benign "couldn't see it" note.
         """
         from tools.vision_tools import vision_analyze_tool
         from agent.memory_manager import sanitize_context
@@ -21553,6 +21578,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     user_prompt=analysis_prompt,
                 )
                 result = json.loads(result_json)
+                if result.get("moderation_blocked"):
+                    # Content moderation refused this image. Do NOT swallow it
+                    # into a benign note — signal the caller to refuse the turn so
+                    # the image never reaches the main model. Short-circuit: the
+                    # turn is already refused, the other images don't matter.
+                    logger.info(
+                        "Vision pre-analysis: image refused by content moderation; "
+                        "turn will be refused so the image never reaches the model."
+                    )
+                    return user_text, True
                 if result.get("success"):
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
@@ -21579,9 +21614,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if enriched_parts:
             prefix = "\n\n".join(enriched_parts)
             if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+                return f"{prefix}\n\n{user_text}", False
+            return prefix, False
+        return user_text, False
 
     async def _enrich_message_with_transcription(
         self,
