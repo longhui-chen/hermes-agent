@@ -189,20 +189,58 @@ def test_zettlab_provider_omits_speed_when_capability_disables_it(
     assert captured["speed"] is None
 
 
-def test_zettlab_provider_rejects_format_not_in_selected_model(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("formats", "expected_format", "expected_suffix"),
+    [
+        (["mp3"], "mp3", ".mp3"),
+        (["opus"], "opus", ".ogg"),
+        (["wav"], "wav", ".wav"),
+        (["aac"], "aac", ".aac"),
+        (["pcm"], "pcm", ".pcm"),
+    ],
+)
+def test_zettlab_provider_negotiates_supported_format(
+    monkeypatch,
+    tmp_path,
+    formats,
+    expected_format,
+    expected_suffix,
+):
+    model_capability = {
+        **_tts_capability()["models"][0],
+        "formats": formats,
+    }
     monkeypatch.setattr(
         media_client,
         "resolve_model_with_capability",
-        lambda media_type, requested=None: (
-            "public-fast",
-            _tts_capability()["models"][0],
-        ),
+        lambda media_type, requested=None: ("public-fast", model_capability),
+    )
+    monkeypatch.setattr(
+        media_client,
+        "action_headers",
+        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
+    )
+    monkeypatch.setattr(
+        media_client,
+        "base_url",
+        lambda media_type: "http://127.0.0.1:9090/v1",
+    )
+    captured = {}
+
+    def fake_generate(text, output_path, config, **kwargs):
+        captured["output_path"] = output_path
+        Path(output_path).write_bytes(b"audio")
+        return output_path
+
+    monkeypatch.setattr(tts_tool, "_generate_openai_tts", fake_generate)
+
+    result = ZettlabTTSProvider().synthesize(
+        "hello", str(tmp_path / "speech.mp3"), format="flac"
     )
 
-    with pytest.raises(ValueError, match="does not support response format 'opus'"):
-        ZettlabTTSProvider().synthesize(
-            "hello", str(tmp_path / "speech.ogg"), format="opus"
-        )
+    assert result.endswith(expected_suffix)
+    assert captured["output_path"] == result
+    assert tts_tool._tts_response_format_from_path(result) == expected_format
 
 
 def test_text_to_speech_auto_dispatches_to_zettlab_plugin(monkeypatch, tmp_path):
@@ -275,6 +313,33 @@ def test_zettlab_provider_is_unavailable_without_action_token(monkeypatch):
         "action_headers",
         lambda: (_ for _ in ()).throw(
             media_client.ZettlabMediaError("action token is missing")
+        ),
+    )
+
+    assert ZettlabTTSProvider().is_available() is False
+
+
+def test_zettlab_provider_is_unavailable_without_supported_format(monkeypatch):
+    monkeypatch.setattr(
+        media_client,
+        "action_headers",
+        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
+    )
+    monkeypatch.setattr(
+        media_client,
+        "base_url",
+        lambda media_type: "http://127.0.0.1:9090/v1",
+    )
+    monkeypatch.setattr(media_client, "is_available", lambda media_type: True)
+    monkeypatch.setattr(
+        media_client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "public-default",
+            {
+                **_tts_capability()["models"][1],
+                "formats": ["unsupported"],
+            },
         ),
     )
 

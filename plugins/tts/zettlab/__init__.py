@@ -15,6 +15,14 @@ _CONNECT_TIMEOUT_SECONDS = 5.0
 _READ_TIMEOUT_SECONDS = 120.0
 _WRITE_TIMEOUT_SECONDS = 30.0
 _POOL_TIMEOUT_SECONDS = 5.0
+_FORMAT_SUFFIXES = {
+    "aac": ".aac",
+    "flac": ".flac",
+    "mp3": ".mp3",
+    "opus": ".ogg",
+    "pcm": ".pcm",
+    "wav": ".wav",
+}
 
 
 def _format_values(model_capability: Dict[str, Any]) -> List[str]:
@@ -22,7 +30,7 @@ def _format_values(model_capability: Dict[str, Any]) -> List[str]:
     for value in model_capability.get("formats") or []:
         if isinstance(value, str) and value.strip():
             normalized = value.strip().lower()
-            if normalized not in out:
+            if normalized in _FORMAT_SUFFIXES and normalized not in out:
                 out.append(normalized)
     return out
 
@@ -42,7 +50,13 @@ class ZettlabTTSProvider(TTSProvider):
             media_client.base_url("tts")
         except Exception:
             return False
-        return media_client.is_available("tts")
+        if not media_client.is_available("tts"):
+            return False
+        try:
+            _, model = media_client.resolve_model_with_capability("tts")
+        except Exception:
+            return False
+        return isinstance(model, dict) and bool(_format_values(model))
 
     def list_models(self) -> List[Dict[str, Any]]:
         return [
@@ -103,14 +117,15 @@ class ZettlabTTSProvider(TTSProvider):
             )
 
         formats = _format_values(model_capability)
+        if not formats:
+            raise ValueError(
+                f"Zettlab TTS model {model_id!r} has no supported response format"
+            )
         requested_format = str(format or "mp3").strip().lower()
         if requested_format == "ogg":
             requested_format = "opus"
         if requested_format not in formats:
-            raise ValueError(
-                f"Zettlab TTS model {model_id!r} does not support "
-                f"response format {requested_format!r}"
-            )
+            requested_format = formats[0]
 
         selected_voice = str(voice or "").strip()
         if not selected_voice:
@@ -134,7 +149,9 @@ class ZettlabTTSProvider(TTSProvider):
             follow_redirects=False,
         )
         output = Path(output_path)
-        expected_suffix = ".ogg" if requested_format == "opus" else f".{requested_format}"
+        expected_suffix = _FORMAT_SUFFIXES.get(
+            requested_format, f".{requested_format}"
+        )
         if output.suffix.lower() != expected_suffix:
             output = output.with_suffix(expected_suffix)
         try:
