@@ -693,6 +693,10 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
     def fake_create_agent(**_kwargs):
         from agent.secret_scope import current_secret_scope
         from gateway.platforms.api_server import _api_request_profile
+        from gateway.platforms.zet_agent import (
+            _deep_memory_principal,
+            _deep_memory_subject,
+        )
         from hermes_constants import get_hermes_home
 
         scope = current_secret_scope()
@@ -700,6 +704,8 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
             get_hermes_home(),
             None if scope is None else scope.get("ZET_AGENT_ID"),
             _api_request_profile.get(),
+            _deep_memory_principal.get(),
+            _deep_memory_subject.get(),
         ))
         return FakeAgent()
 
@@ -714,11 +720,18 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
                 "model": "hermes-agent",
                 "messages": [{"role": "user", "content": "hello coder"}],
             },
-            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            headers={
+                "Authorization": "Bearer test-key-0123456789abcdef",
+                "X-Zettlab-Auth-Principal-Id": "iam:issuer:user:user-1",
+                "X-Zettlab-User-Id": "user-1",
+            },
         )
 
     assert response.status == 200
-    assert seen == [(profile_homes["coder"], "coder", "coder")]
+    assert seen == [(
+        profile_homes["coder"], "coder", "coder",
+        "iam:issuer:user:user-1", "user-1",
+    )]
 
 
 @pytest.mark.asyncio
