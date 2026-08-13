@@ -8,7 +8,10 @@ from gateway.platforms.zet_agent import ZetAgentAdapter
 from gateway.session_context import (
     get_session_env,
     pop_zettlab_browser_session_token,
+    pop_zettlab_auth_principal,
     push_zettlab_browser_session_token,
+    push_zettlab_auth_principal,
+    zettlab_auth_principal,
     zettlab_browser_session_token,
 )
 from tools import approval, browser_backend_router
@@ -50,6 +53,47 @@ async def test_chat_request_clears_browser_scope_token_on_error(monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         await adapter._handle_chat_completions(request)
     assert zettlab_browser_session_token() == ""
+
+
+@pytest.mark.asyncio
+async def test_chat_request_binds_and_clears_internal_principal(monkeypatch):
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    seen = []
+
+    async def base_handler(_self, _request):
+        seen.append(zettlab_auth_principal())
+        return object()
+
+    monkeypatch.setattr(APIServerAdapter, "_handle_chat_completions", base_handler)
+    request = SimpleNamespace(headers={"X-Zettlab-Auth-Principal-Id": "iam:alice"})
+    await adapter._handle_chat_completions(request)
+    assert seen == ["iam:alice"]
+    assert zettlab_auth_principal() == ""
+
+
+@pytest.mark.asyncio
+async def test_concurrent_principals_stay_in_their_own_executor_request_metadata(monkeypatch):
+    import asyncio
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    seen = []
+
+    async def base_run(_self, **kwargs):
+        await asyncio.sleep(0)
+        seen.append(kwargs["request_overrides"].get("_zettlab_auth_principal"))
+        return ({"final_response": "ok"}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", base_run)
+
+    async def one(principal):
+        token = push_zettlab_auth_principal(principal)
+        try:
+            return await adapter._run_agent(user_message="hi", conversation_history=[])
+        finally:
+            pop_zettlab_auth_principal(token)
+
+    await asyncio.gather(one("iam:alice"), one("iam:bob"))
+    assert sorted(seen) == ["iam:alice", "iam:bob"]
 
 
 @pytest.mark.asyncio

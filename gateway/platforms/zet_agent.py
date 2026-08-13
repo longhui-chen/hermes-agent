@@ -752,16 +752,23 @@ class ZetAgentAdapter(APIServerAdapter):
         workers without exposing it through process-global environment state.
         """
         from gateway.session_context import (
+            pop_zettlab_auth_principal,
             pop_zettlab_browser_session_token,
+            push_zettlab_auth_principal,
             push_zettlab_browser_session_token,
         )
 
         token = push_zettlab_browser_session_token(
             request.headers.get("X-Zettlab-Browser-Session-Token", "")
         )
+        principal = str(request.headers.get("X-Zettlab-Auth-Principal-Id", "") or "").strip()
+        if principal and (len(principal) > 256 or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in principal)):
+            return web.json_response({"error": {"message": "Invalid auth principal", "type": "invalid_request_error"}}, status=400)
+        principal_token = push_zettlab_auth_principal(principal)
         try:
             return await super()._handle_chat_completions(request)
         finally:
+            pop_zettlab_auth_principal(principal_token)
             pop_zettlab_browser_session_token(token)
 
     def _bind_turn_session_context(
@@ -818,6 +825,7 @@ class ZetAgentAdapter(APIServerAdapter):
         chat_id: str,
         session_key: str,
         session_id: str,
+        session_user_id: str = "",
     ) -> list:
         """Bind inherited API routes as Zet, without touching the parent.
 
@@ -833,6 +841,7 @@ class ZetAgentAdapter(APIServerAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            user_id=session_user_id,
             async_delivery=self.supports_async_delivery,
             cron_session="",
             exec_ask="1",
@@ -2690,6 +2699,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # matches the turn's confirm/auto behaviour. Absent (async /v1/runs path,
         # or non-plan callers) → None → manual (safe default).
         agent_request_overrides = dict(request_overrides or {})
+        session_user_id = str(agent_request_overrides.pop("_zettlab_auth_principal", "") or "").strip()
         plan_auto_execute = agent_request_overrides.pop(
             "_zet_plan_auto_execute", None
         )
@@ -2952,6 +2962,7 @@ class ZetAgentAdapter(APIServerAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
             "request_overrides": agent_request_overrides or None,
+            "user_id": session_user_id or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -3175,6 +3186,14 @@ class ZetAgentAdapter(APIServerAdapter):
         below is bound through approval's dedicated ContextVar. Neither scope
         is mirrored into process-global ``os.environ`` because HTTP turns overlap.
         """
+        from gateway.session_context import zettlab_auth_principal
+        request_overrides = dict(request_overrides or {})
+        # Capture before base _run_agent hops to its executor. The principal
+        # remains private request metadata, never a model argument.
+        principal = zettlab_auth_principal()
+        if principal:
+            request_overrides["_zettlab_auth_principal"] = principal
+
         # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
         # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
         # 轮 _current_turn_id 做精确收尾——否则空 turn_id 收不了尾，写入轮的

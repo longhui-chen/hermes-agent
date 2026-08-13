@@ -12376,6 +12376,10 @@ def main():
         "--target-session", required=True, help="Session id to create here"
     )
     sessions_import_transcript.add_argument(
+        "--owner-principal", required=True,
+        help="Local Server-attested owner principal; source and target must match it",
+    )
+    sessions_import_transcript.add_argument(
         "--title", default=None, help="Title for the created session"
     )
     sessions_import_transcript.add_argument(

@@ -312,6 +312,7 @@ CREATE TABLE IF NOT EXISTS runtime_imports (
     source TEXT NOT NULL,
     source_session_id TEXT NOT NULL,
     target_session_id TEXT NOT NULL,
+    owner_principal TEXT NOT NULL DEFAULT '',
     title TEXT,
     payload_sha256 TEXT NOT NULL,
     expected_message_count INTEGER NOT NULL,

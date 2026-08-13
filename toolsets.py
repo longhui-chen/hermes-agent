@@ -310,6 +310,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "zettlab_app_workspace": {
+        "description": "Edit a dedicated maintainer's bounded App Host workspace (zettlab)",
+        "tools": ["app_workspace"],
+        "includes": []
+    },
+
     "zettlab_skill_runtime": {
         "description": "Run fixed App operations declared by the current Cron job's profile-local Skill",
         "tools": ["skill_operation"],

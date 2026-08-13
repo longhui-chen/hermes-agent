@@ -1879,6 +1879,7 @@ try:
         get_job as _cron_get,
         create_job as _cron_create,
         update_job as _cron_update,
+        JobRevisionConflict as _CronJobRevisionConflict,
         remove_job as _cron_remove,
         pause_job as _cron_pause,
         resume_job as _cron_resume,
@@ -1891,6 +1892,7 @@ except ImportError:
     _cron_get = None
     _cron_create = None
     _cron_update = None
+    _CronJobRevisionConflict = RuntimeError
     _cron_remove = None
     _cron_pause = None
     _cron_resume = None
@@ -7026,6 +7028,10 @@ class APIServerAdapter(BasePlatformAdapter):
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
         "repeat", "enabled", "timezone", "output_language",
+        # A server-owned optimistic-concurrency fence. Its only current
+        # caller is local-server's dedicated-maintainer schedule bridge; it
+        # is not persisted as a mutable job field.
+        "expected_revision",
     }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
@@ -7375,6 +7381,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except _CronJobRevisionConflict as e:
+            return web.json_response(
+                {"error": str(e), "code": "revision_conflict"}, status=409
+            )
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
@@ -7933,6 +7943,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        session_user_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -7956,6 +7967,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            user_id=session_user_id,
             async_delivery=False,
             cron_session="",
         )
@@ -8021,6 +8033,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        session_user_id = str((request_overrides or {}).get("_zettlab_auth_principal") or "").strip()
 
         def _run():
             from gateway.session_context import (
@@ -8036,6 +8049,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    session_user_id=session_user_id,
                 )
                 agent = None
                 # turn_id is request-scoped correlation for NAS fallback and

@@ -127,7 +127,7 @@ def _seed_source_profile(db_path, session_id, rows):
     """Write a minimal source transcript — only the columns the fork reads."""
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, "
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, user_id TEXT, "
         "model_history_cutoff_message_id INTEGER NOT NULL DEFAULT 0)"
     )
     conn.execute(
@@ -135,8 +135,8 @@ def _seed_source_profile(db_path, session_id, rows):
         "session_id TEXT, role TEXT, content TEXT, timestamp REAL, "
         "active INTEGER NOT NULL DEFAULT 1, llm_visible INTEGER NOT NULL DEFAULT 1)"
     )
-    conn.execute("INSERT INTO sessions (id, title) VALUES (?, ?)",
-                 (session_id, "app build"))
+    conn.execute("INSERT INTO sessions (id, title, user_id) VALUES (?, ?, ?)",
+                 (session_id, "app build", "iam:test-owner"))
     for r in rows:
         conn.execute(
             "INSERT INTO messages "
@@ -188,12 +188,13 @@ def forked(tmp_path, monkeypatch, capsys):
             committed["count"] += 1
             return {"replayed": committed["count"] > 1}
 
-    def run(target_session="zettlab:u:target:fork1", source_profile="source"):
+    def run(target_session="zettlab:u:target:fork1", source_profile="source", owner_principal="iam:test-owner"):
         args = types.SimpleNamespace(
             sessions_action="import-transcript",
             source_profile=source_profile,
             source_session=source_session,
             target_session=target_session,
+            owner_principal=owner_principal,
             title=None,
             json=True,
         )
@@ -220,6 +221,28 @@ def cmd_sessions_with_db(args, db):
 
 
 class TestForkAcrossProfiles:
+    def test_requires_an_explicit_owner_principal(self, forked):
+        result = forked.run(owner_principal="")
+        assert result["ok"] is False
+        assert "owner_principal" in result["error"]
+
+    def test_rejects_missing_or_wrong_owner_before_reading_messages(self, forked, monkeypatch):
+        from hermes_state import SessionDB
+        original = SessionDB
+
+        class GuardedSourceDB(original):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._conn.set_authorizer(
+                    lambda action, arg1, *_rest: sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_READ and arg1 == "messages" else sqlite3.SQLITE_OK
+                )
+
+        monkeypatch.setattr("hermes_state.SessionDB", GuardedSourceDB)
+        result = forked.run(owner_principal="iam:other-owner")
+        assert result["ok"] is False
+        assert "not found" in result["error"]
+
     def test_rejects_a_scope_for_a_different_source_or_target(
         self, forked, monkeypatch
     ):
@@ -320,6 +343,7 @@ class TestForkAcrossProfiles:
             source_profile="source",
             source_session=session_id,
             target_session="zettlab:u:target:filtered",
+            owner_principal="iam:test-owner",
             title=None,
             json=True,
         )
@@ -353,6 +377,7 @@ class TestForkAcrossProfiles:
             source_profile="default",
             source_session=session_id,
             target_session="zettlab:u:target:default",
+            owner_principal="iam:test-owner",
             title=None,
             json=True,
         )
@@ -388,6 +413,7 @@ class TestForkAcrossProfiles:
             source_profile="source",
             source_session=session_id,
             target_session="zettlab:u:target:frozen",
+            owner_principal="iam:test-owner",
             title=None,
             json=True,
         )
@@ -448,6 +474,7 @@ class TestForkAcrossProfiles:
             source_profile="source",
             source_session=session_id,
             target_session="zettlab:u:target:receipt",
+            owner_principal="iam:test-owner",
             title=None,
             json=True,
         )

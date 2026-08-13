@@ -92,6 +92,10 @@ _CALL_WRITE_PATHS = frozenset({"/api/refresh"})
 _HTTP_ACTIONS = (
     "probe", "list", "acquire_slot", "release_slot", "publish", "install",
     "reload", "rollback", "delete", "lifecycle", "logs", "call",
+    # Typed AppOperation endpoints are intentionally distinct from the
+    # operation journal: the former invokes a declared app capability, the
+    # latter only reads the state of an already accepted workflow.
+    "app_capabilities", "app_operation", "workflow_operation_status", "workflow_operation_resume",
 )
 _ACTIONS = _HTTP_ACTIONS + ("build_env",)
 
@@ -206,7 +210,8 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "enum": list(_DATA_REFRESH_CHOICES),
                 "description": (
-                    "Required for publish(mode=install). Does this app's data "
+                    "Required for both install paths: publish(mode=install) "
+                    "and legacy action=install. Does this app's data "
                     "need to keep refreshing on its own? "
                     "static = the user types the data in themselves (ledger, "
                     "to-do, notes) and nothing outside the device changes it. "
@@ -267,6 +272,35 @@ APP_HOST_SCHEMA = {
             "slot_token": {
                 "type": "string",
                 "description": "Required for release_slot: the token returned by acquire_slot.",
+            },
+            "app_operation": {
+                "type": "string",
+                "description": "Required for app_operation: declared AppOperation name.",
+            },
+            "payload": {
+                "type": "object",
+                "description": "Required for app_operation: operation payload, passed unchanged inside App Host's closed envelope.",
+            },
+            "query": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "Optional app_operation query values declared by the app capability.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional app_operation idempotency key declared by the app capability.",
+            },
+            "capability_digest": {
+                "type": "string",
+                "description": "Required for app_operation: digest returned by app_capabilities for the declared operation contract.",
+            },
+            "operation": {
+                "type": "object",
+                "description": "Optional immutable workflow operation intent for publish(mode=install/reload), passed unchanged to App Host as operation. Legacy install and reload do not support workflow operations.",
+            },
+            "operation_id": {
+                "type": "string",
+                "description": "Required for workflow_operation_status: App Host operation journal receipt id.",
             },
         },
         "required": ["action"],
@@ -457,8 +491,37 @@ def _session_key():
 
         value = get_session_env("HERMES_SESSION_KEY", "")
     except Exception:
+        value = ""
+    if not value:
+        # Outside a bound request the ContextVar getter deliberately returns
+        # its empty default; CLI tests and the single-profile daemon still
+        # use the legacy process environment in that case.
         value = os.environ.get("HERMES_SESSION_KEY", "")
     return str(value or "").strip()
+
+
+def _execution_headers():
+    """Forward server-issued execution context; model arguments never shape it."""
+    try:
+        from gateway.session_context import (
+            business_execution_token,
+            current_turn_identity,
+            get_session_env,
+        )
+        token = str(business_execution_token() or "").strip()
+        identity = current_turn_identity()
+        turn_id = identity[0] if identity else ""
+        session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+    except Exception:
+        return {}
+    headers = {}
+    if token:
+        headers["X-Zettlab-Business-Execution-Token"] = token
+    if turn_id:
+        headers["X-Hermes-Turn-Id"] = str(turn_id)
+    if session_id:
+        headers["X-Hermes-Session-Id"] = session_id
+    return headers
 
 
 def _build_request(action, args):
@@ -471,6 +534,41 @@ def _build_request(action, args):
         # the owner gates on reload/delete/lifecycle/logs would then 404 —
         # the model must only see what it can act on.
         return "GET", "?mine=1", None, timeout
+    if action == "app_capabilities":
+        return "GET", f"/{_require_slug(args)}/capabilities", None, timeout
+    if action == "app_operation":
+        slug = _require_slug(args)
+        operation = str(args.get("app_operation", "") or "").strip()
+        if not _SLUG_RE.match(operation):
+            raise _BadRequest("app_operation 需要合法的 operation 名称")
+        payload = args.get("payload")
+        if not isinstance(payload, dict):
+            raise _BadRequest("app_operation 需要 object 类型的 payload")
+        capability_digest = str(args.get("capability_digest", "") or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", capability_digest):
+            raise _BadRequest("app_operation 需要 64 位 capability_digest")
+        body = {"payload": payload, "capability_digest": capability_digest.lower()}
+        query = args.get("query")
+        if query is not None:
+            if not isinstance(query, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in query.items()):
+                raise _BadRequest("app_operation 的 query 必须是 string map")
+            body["query"] = query
+        idempotency_key = str(args.get("idempotency_key", "") or "").strip()
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key
+        return "POST", f"/{slug}/operations/{quote(operation, safe='')}", body, timeout
+    if action == "workflow_operation_status":
+        slug = _require_slug(args)
+        operation_id = str(args.get("operation_id", "") or "").strip()
+        if not operation_id or len(operation_id) > 256 or any(ord(ch) < 0x20 for ch in operation_id):
+            raise _BadRequest("workflow_operation_status 需要合法的 operation_id")
+        return "GET", f"/{slug}/operation/{quote(operation_id, safe='')}", None, timeout
+    if action == "workflow_operation_resume":
+        slug = _require_slug(args)
+        operation_id = str(args.get("operation_id", "") or "").strip()
+        if not operation_id or len(operation_id) > 256 or any(ord(ch) < 0x20 for ch in operation_id):
+            raise _BadRequest("workflow_operation_resume 需要合法的 operation_id")
+        return "POST", f"/{slug}/operation/{quote(operation_id, safe='')}/resume", None, _LONG_TIMEOUT
     if action == "acquire_slot":
         # Non-blocking on the server (queued → immediate queue_ahead; poll by
         # calling again), but a GRANTED slot pays the integrity walk before
@@ -506,8 +604,28 @@ def _build_request(action, args):
             session_key = _session_key()
             if session_key:
                 body["session_id"] = session_key
+        operation = args.get("operation")
+        if operation is not None:
+            if not isinstance(operation, dict):
+                raise _BadRequest("operation 必须是 object")
+            operation_data_refresh = str(operation.get("data_refresh", "") or "").strip()
+            if operation_data_refresh not in _DATA_REFRESH_CHOICES:
+                raise _BadRequest("operation 需要有效 data_refresh")
+            outer_data_refresh = str(body.get("data_refresh", "") or "").strip()
+            if outer_data_refresh and outer_data_refresh != operation_data_refresh:
+                raise _BadRequest("operation.data_refresh 必须与 data_refresh 一致")
+            # Local Server validates this exact outer/inner equality for both
+            # install and reload publication. The immutable intent is the
+            # source of truth, so callers never need to duplicate it for reload.
+            body["data_refresh"] = operation_data_refresh
+            body["operation"] = operation
         return "POST", "/publish", body, _LONG_TIMEOUT
     if action == "install":
+        if args.get("operation") is not None:
+            # Legacy install predates the journal-aware publication endpoint.
+            # Never send or silently drop an immutable operation intent: use
+            # publish(mode=install) so App Host can drive the transaction.
+            raise _BadRequest("legacy install 不支持 operation；请使用 publish(mode=install)")
         data_refresh = str(args.get("data_refresh", "") or "").strip()
         if data_refresh not in _DATA_REFRESH_CHOICES:
             raise _BadRequest(
@@ -518,12 +636,18 @@ def _build_request(action, args):
         body = {
             "staging_dir": _require_staging_dir(args),
             "slug": _require_slug(args),
+            "data_refresh": data_refresh,
         }
         session_key = _session_key()
         if session_key:
             body["session_id"] = session_key
         return "POST", "/install", body, _LONG_TIMEOUT
     if action == "reload":
+        if args.get("operation") is not None:
+            # This legacy route predates the journal-aware publication
+            # endpoint. Silently dropping the intent would make the caller
+            # believe it received the durable workflow semantics it did not.
+            raise _BadRequest("legacy reload 不支持 operation；请使用 publish(mode=reload)")
         slug = _require_slug(args)
         body = {"staging_dir": _require_staging_dir(args)}
         note = str(args.get("note", "") or "").strip()
@@ -621,6 +745,62 @@ def _build_env_result():
     return _ok({"vendor_dir": vendor_dir, "ready": ready})
 
 
+_COMPLETION_STATUS = {
+    "probe": {200}, "list": {200}, "app_capabilities": {200},
+    "app_operation": {200}, "acquire_slot": {200}, "release_slot": {204},
+    "publish": {200, 202}, "install": {200, 202}, "reload": {200, 202}, "rollback": {200},
+    "delete": {204}, "lifecycle": {200}, "logs": {200}, "call": {200},
+    "workflow_operation_status": {200, 202}, "workflow_operation_resume": {200, 202},
+}
+
+
+def _workflow_operation_status(status, parsed):
+    if not isinstance(parsed, dict):
+        return _local_error("outcome_unknown", "operation journal returned no object", status=status)
+    operation_id, terminal = parsed.get("operation_id"), parsed.get("terminal")
+    if not isinstance(operation_id, str) or not operation_id or not isinstance(terminal, str) or not terminal:
+        return _local_error("outcome_unknown", "operation journal omitted operation_id or terminal", status=status)
+    if status == 202:
+        if terminal not in {"pending", "unknown"}:
+            return _local_error("outcome_unknown", "accepted operation is not pending or unknown", status=status)
+        outcome = "pending"
+    else:
+        if terminal not in {"succeeded", "failed"}:
+            return _local_error("outcome_unknown", "terminal operation has an unknown state", status=status)
+        outcome = "completed"
+    return _ok({"outcome": outcome, "operation_id": operation_id, "state": terminal, "operation": parsed})
+
+
+def _operation_outcome_unknown(status, requested_id, message):
+    """Keep a safe requested receipt id available for a later status lookup."""
+    result = {
+        "ok": False,
+        "error": {"code": "outcome_unknown", "message": message},
+        "status": status,
+    }
+    if isinstance(requested_id, str) and requested_id:
+        result["operation_id"] = requested_id
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _mutation_operation_outcome(status, request_body, parsed):
+    """Every operation-enabled mutation response must prove its journal receipt."""
+    requested = (request_body or {}).get("operation")
+    receipt = parsed.get("operation") if isinstance(parsed, dict) else None
+    requested_id = requested.get("operation_id") if isinstance(requested, dict) else None
+    if not isinstance(requested, dict) or not isinstance(receipt, dict):
+        return _operation_outcome_unknown(status, requested_id, "mutation omitted operation receipt")
+    operation_id = receipt.get("operation_id")
+    terminal = receipt.get("terminal")
+    expected_terminals = {202: {"pending", "unknown"}, 200: {"succeeded", "failed"}}
+    if not isinstance(requested_id, str) or not requested_id or requested_id != operation_id:
+        return _operation_outcome_unknown(status, requested_id, "mutation returned a mismatched operation receipt")
+    if terminal not in expected_terminals.get(status, set()):
+        return _operation_outcome_unknown(status, requested_id, "mutation returned an operation receipt with an invalid terminal")
+    outcome = "pending" if status == 202 else "completed"
+    return _ok({"outcome": outcome, "operation_id": operation_id, "state": terminal, "operation": receipt})
+
+
 def app_host_tool(args, **_kw):
     # Tool handlers must return a STRING (json-encoded) — a raw dict reaches
     # the model provider as non-string content and gets rejected (same
@@ -648,6 +828,7 @@ def app_host_tool(args, **_kw):
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = {_ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
+    headers.update(_execution_headers())
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
@@ -719,14 +900,35 @@ def app_host_tool(args, **_kw):
     if len(raw) > _MAX_RESPONSE_BYTES:
         return _local_error("transport_error", "App Host 返回内容过大", status=status)
 
-    # Any 2xx is success by HTTP semantics — regardless of body. The upstream
+    # Each action has a frozen completion code. A generic 2xx acceptance would
+    # wrongly report an asynchronous 202 as completed.
     # deliberately answers 204 with no body (release_slot always; delete is
     # idempotent, a retried DELETE must also get 204), and logs answers 2xx
     # with text/plain. Treating "2xx but body isn't JSON" as transport_error
     # reported every successful release/delete as a failure. The tier test is
     # the 2xx range, never an enumeration of specific codes.
-    if 200 <= status < 300:
+    if status in _COMPLETION_STATUS.get(action, set()):
         text = raw.decode("utf-8", errors="replace")
+        if action in {"publish", "install", "reload"} and isinstance((body or {}).get("operation"), dict):
+            if not text.strip() or "json" not in content_type:
+                return _operation_outcome_unknown(
+                    status, body["operation"].get("operation_id"),
+                    "mutation returned no JSON receipt",
+                )
+            try:
+                return _mutation_operation_outcome(status, body, json.loads(text))
+            except Exception:
+                return _operation_outcome_unknown(
+                    status, body["operation"].get("operation_id"),
+                    "mutation returned invalid JSON",
+                )
+        if action in {"workflow_operation_status", "workflow_operation_resume"}:
+            if not text.strip() or "json" not in content_type:
+                return _local_error("outcome_unknown", "operation journal returned no JSON receipt", status=status)
+            try:
+                return _workflow_operation_status(status, json.loads(text))
+            except Exception:
+                return _local_error("outcome_unknown", "operation journal returned invalid JSON", status=status)
         if content_type.startswith("text/"):
             # Declared text (logs): the response SHAPE follows the declared
             # type, never the accident of emptiness — a fresh app's empty log
@@ -747,10 +949,11 @@ def app_host_tool(args, **_kw):
                 return _ok(_text_payload(text))
         return _ok(_text_payload(text))
 
-    # Defensive: urllib raises HTTPError for non-2xx, so this is unreachable
-    # in practice — keep the failure explicit rather than mislabeling.
+    # A response arrived, but it is not a completion for this action. This is
+    # especially important for asynchronous mutation routes: callers must
+    # query the returned receipt instead of retrying or claiming completion.
     return _local_error(
-        "transport_error", f"App Host 返回了意外状态（HTTP {status}）", status=status
+        "outcome_unknown", f"App Host 返回了非完成状态（HTTP {status}）", status=status
     )
 
 

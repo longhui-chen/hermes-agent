@@ -67,10 +67,11 @@ def _assert_transcript_import_scope(
     source_session: str,
     target_profile: str,
     target_session: str,
+    owner_principal: str,
 ) -> None:
     """Bind the trusted invocation to the exact cross-profile operation."""
     payload = "\0".join(
-        (source_profile, source_session, target_profile, target_session)
+        (source_profile, source_session, target_profile, target_session, owner_principal)
     ).encode("utf-8")
     expected = hashlib.sha256(payload).hexdigest()
     supplied = os.environ.get(_TRUSTED_TRANSCRIPT_IMPORT_SCOPE_ENV, "")
@@ -1043,6 +1044,9 @@ def cmd_sessions(args, sessions_parser=None):
         try:
             source_profile = normalize_profile_name(args.source_profile)
             validate_profile_name(source_profile)
+            owner_principal = str(getattr(args, "owner_principal", "") or "").strip()
+            if not owner_principal or len(owner_principal) > 256 or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in owner_principal):
+                raise ValueError("owner_principal is invalid")
         except ValueError as exc:
             _fail(str(exc))
             return 1
@@ -1057,6 +1061,7 @@ def cmd_sessions(args, sessions_parser=None):
                 args.source_session,
                 target_profile,
                 args.target_session,
+                owner_principal,
             )
         except PermissionError as exc:
             _fail(str(exc))
@@ -1066,7 +1071,7 @@ def cmd_sessions(args, sessions_parser=None):
         # touching the live source: an earlier commit may have succeeded while
         # its response was lost, and the source conversation may since have
         # advanced, rewound, or compressed.
-        pair = f"{source_profile}\x00{args.source_session}\x00{args.target_session}"
+        pair = f"{source_profile}\x00{args.source_session}\x00{args.target_session}\x00{owner_principal}"
         import_id = "fork-" + hashlib.sha256(pair.encode("utf-8")).hexdigest()[:32]
         snapshot_reader = getattr(db, "get_completed_transcript_import_snapshot", None)
         existing_snapshot = snapshot_reader(import_id) if snapshot_reader else None
@@ -1107,8 +1112,8 @@ def cmd_sessions(args, sessions_parser=None):
         try:
             session_row = src._conn.execute(
                 "SELECT id, title, model_history_cutoff_message_id "
-                "FROM sessions WHERE id = ?",
-                (args.source_session,),
+                "FROM sessions WHERE id = ? AND user_id = ?",
+                (args.source_session, owner_principal),
             ).fetchone()
             if session_row is None:
                 _fail(f"source session {args.source_session!r} not found")
@@ -1212,6 +1217,7 @@ def cmd_sessions(args, sessions_parser=None):
                     source=f"profile:{source_profile}",
                     source_session_id=args.source_session,
                     target_session_id=args.target_session,
+                    owner_principal=owner_principal,
                     title=title,
                     payload_sha256=payload_sha256,
                     expected_message_count=len(messages),

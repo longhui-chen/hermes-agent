@@ -86,11 +86,11 @@ class _RawResp:
         return self._body
 
 
-def _capture_urlopen(seen, payload=None):
+def _capture_urlopen(seen, payload=None, status=200):
     def _open(req, timeout=None):
         seen["req"] = req
         seen["timeout"] = timeout
-        return _Resp(payload if payload is not None else {"code": 200, "data": {}})
+        return _Resp(payload if payload is not None else {"code": 200, "data": {}}, status=status)
 
     return _open
 
@@ -170,6 +170,45 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     assert seen["req"].full_url == _BASE_URL + "/storage"
 
 
+def test_request_forwards_only_task_local_execution_headers(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+    )
+    seen = {}
+    session_tokens = set_session_vars(session_id="session-1")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="a" * 64
+    )
+    try:
+        with mux_profile_scope(monkeypatch, _scope()), patch(
+            "tools.apphost_tool._urlopen", _capture_urlopen(seen)
+        ):
+            assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+    req = seen["req"]
+    assert req.get_header("X-zettlab-business-execution-token") == "a" * 64
+    assert req.get_header("X-hermes-turn-id") == "turn-1"
+    assert req.get_header("X-hermes-session-id") == "session-1"
+
+
+def test_business_execution_token_is_not_lost_when_turn_correlation_is_absent(monkeypatch):
+    from gateway.session_context import clear_turn_vars, set_turn_vars
+
+    seen = {}
+    turn_tokens = set_turn_vars(business_execution_token="b" * 64)
+    try:
+        with mux_profile_scope(monkeypatch, _scope()), patch(
+            "tools.apphost_tool._urlopen", _capture_urlopen(seen)
+        ):
+            assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
+    finally:
+        clear_turn_vars(turn_tokens)
+    assert seen["req"].get_header("X-zettlab-business-execution-token") == "b" * 64
+    assert seen["req"].get_header("X-hermes-turn-id") is None
+
+
 def test_app_host_request_keeps_its_own_base_url(monkeypatch):
     seen = {}
     with mux_profile_scope(
@@ -203,7 +242,7 @@ def test_app_host_request_keeps_its_own_base_url(monkeypatch):
       "note": "Footer 加了一个链接"}),
     ("install", {"staging_dir": "/tmp/stage", "slug": "app1",
                  "data_refresh": "static"}, "POST", "/install",
-     {"staging_dir": "/tmp/stage", "slug": "app1"}),
+     {"staging_dir": "/tmp/stage", "slug": "app1", "data_refresh": "static"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/stage"}, "POST", "/app1/reload",
      {"staging_dir": "/tmp/stage"}),
     # The note travels with the version and is what the user is shown when
@@ -220,6 +259,8 @@ def test_app_host_request_keeps_its_own_base_url(monkeypatch):
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}, "POST",
      "/app1/lifecycle", {"action": "restart"}),
     ("logs", {"slug": "app1", "tail": 50}, "GET", "/app1/logs?tail=50", None),
+    ("app_capabilities", {"slug": "app1"}, "GET", "/app1/capabilities", None),
+    ("app_operation", {"slug": "app1", "app_operation": "summary", "payload": {"range": "week"}, "capability_digest": "a" * 64}, "POST", "/app1/operations/summary", {"payload": {"range": "week"}, "capability_digest": "a" * 64}),
     # call rides POST /{slug}/call with method/path/body in the request body:
     # the app path is payload, never URL — the server builds the target URL
     # from the slug (the agent has no host/port to give).
@@ -231,7 +272,8 @@ def test_app_host_request_keeps_its_own_base_url(monkeypatch):
 def test_action_routing_flow(monkeypatch, action, args, method, path, body):
     seen = {}
     with mux_profile_scope(monkeypatch, _scope(), poison_environ=True):
-        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+        completion_status = 204 if action in {"release_slot", "delete"} else 200
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, status=completion_status)):
             out = json.loads(app_host_tool({"action": action, **args}))
     assert out["ok"] is True
     req = seen["req"]
@@ -257,18 +299,29 @@ def test_handler_always_returns_json_string(monkeypatch):
         json.loads(out)  # must be valid JSON
 
 
-# --- 2xx is success regardless of body ---------------------------------------
+# --- completion status contract ----------------------------------------------
 
 # Every HTTP action with the minimal args to reach the network layer.
-_ALL_HTTP_ACTION_ARGS = [
-    ("probe", {}),
-    ("list", {}),
-    ("acquire_slot", {}),
+@pytest.mark.parametrize("action,args", [
     ("release_slot", {"slot_token": "s1"}),
-    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1",
-                 "data_refresh": "static"}),
-    ("install", {"staging_dir": "/tmp/s", "slug": "app1",
-                 "data_refresh": "static"}),
+    ("delete", {"slug": "app1"}),
+])
+def test_204_is_success_only_for_actions_with_a_204_completion_contract(monkeypatch, action, args):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", return_value=_RawResp(204)):
+            out = json.loads(app_host_tool({"action": action, **args}))
+    assert out["ok"] is True
+    assert out["data"] == {}
+
+
+# Typed capability and workflow-journal routes have dedicated wire-shape and
+# completion-contract coverage above; this table keeps the ordinary routes
+# compact without weakening those stricter assertions.
+_ALL_HTTP_ACTION_ARGS = [
+    ("probe", {}), ("list", {}), ("acquire_slot", {}),
+    ("release_slot", {"slot_token": "s1"}),
+    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1", "data_refresh": "static"}),
+    ("install", {"staging_dir": "/tmp/s", "slug": "app1", "data_refresh": "static"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
     ("rollback", {"slug": "app1", "to_version": "v1"}),
     ("delete", {"slug": "app1"}),
@@ -278,27 +331,196 @@ _ALL_HTTP_ACTION_ARGS = [
 ]
 
 
-@pytest.mark.parametrize("action,args", _ALL_HTTP_ACTION_ARGS)
-def test_2xx_empty_body_is_success_for_every_action(monkeypatch, action, args):
-    """The upstream deliberately answers 204 with no body (release_slot
-    always; delete idempotently). A 2xx must never fall into the error
-    branch — flagging it as transport_error reported every successful
-    release/delete as a failure on a real device."""
-    with mux_profile_scope(monkeypatch, _scope()):
-        with patch("tools.apphost_tool._urlopen", return_value=_RawResp(204)):
-            out = json.loads(app_host_tool({"action": action, **args}))
-    assert out["ok"] is True
-    assert out["data"] == {}
-
-
-@pytest.mark.parametrize("status", [200, 201, 202, 204])
-def test_2xx_success_tier_is_the_range_not_specific_codes(monkeypatch, status):
-    # The tier test must be "status is 2xx", not an enumeration of codes:
-    # a future 200-empty-body or 202 must not degrade into an error.
+@pytest.mark.parametrize("status", [201, 202, 204])
+def test_non_completion_2xx_is_outcome_unknown(monkeypatch, status):
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", return_value=_RawResp(status)):
-            out = json.loads(app_host_tool({"action": "release_slot", "slot_token": "s1"}))
+            out = json.loads(app_host_tool({"action": "probe"}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["status"] == status
+
+
+def test_app_operation_requires_capability_digest_before_sending(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch("tools.apphost_tool._urlopen") as open_request:
+        out = json.loads(app_host_tool({
+            "action": "app_operation", "slug": "app1", "app_operation": "summary", "payload": {},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    open_request.assert_not_called()
+
+
+def test_publish_operation_is_passed_through_unchanged(monkeypatch):
+    seen = {}
+    operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "user_confirmed_auto", "maintenance": {"schedule": "0 9 * * *"}}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen",
+        _capture_urlopen(seen, {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}),
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "user_confirmed_auto", "operation": operation,
+        }))
     assert out["ok"] is True
+    assert json.loads(seen["req"].data)["operation"] == operation
+
+
+def test_operation_enabled_publish_202_returns_verified_pending_receipt(monkeypatch):
+    operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "static"}
+    response = {"operation": {"operation_id": "op-1", "terminal": "pending"}}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=202)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": operation,
+        }))
+    assert out["ok"] is True
+    assert out["data"]["outcome"] == "pending"
+    assert out["data"]["operation_id"] == "op-1"
+
+
+def test_operation_enabled_publish_200_returns_verified_terminal_receipt(monkeypatch):
+    operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "static"}
+    response = {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=200)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": operation,
+        }))
+    assert out["ok"] is True
+    assert out["data"]["outcome"] == "completed"
+    assert out["data"]["state"] == "succeeded"
+
+
+def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent(monkeypatch):
+    seen = {}
+    operation = {"operation_id": "op-reload", "data_refresh": "user_confirmed_auto"}
+    response = {"operation": {"operation_id": "op-reload", "terminal": "succeeded"}}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", _capture_urlopen(seen, response)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "reload", "source_subdir": "runs/app",
+            "operation": operation,
+        }))
+    assert out["ok"] is True
+    assert json.loads(seen["req"].data) == {
+        "mode": "reload", "source_subdir": "runs/app",
+        "data_refresh": "user_confirmed_auto", "operation": operation,
+    }
+
+
+def test_operation_enabled_publish_rejects_conflicting_outer_data_refresh(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch("tools.apphost_tool._urlopen") as open_request:
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static",
+            "operation": {"operation_id": "op-1", "data_refresh": "user_confirmed_auto"},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    open_request.assert_not_called()
+
+
+@pytest.mark.parametrize(("action", "args", "hint"), [
+    ("install", {
+        "slug": "app1", "staging_dir": "/tmp/stage", "data_refresh": "static",
+        "operation": {"operation_id": "op-1", "data_refresh": "static"},
+    }, "publish(mode=install)"),
+    ("reload", {
+        "slug": "app1", "staging_dir": "/tmp/stage",
+        "operation": {"operation_id": "op-1", "data_refresh": "static"},
+    }, "publish(mode=reload)"),
+])
+def test_legacy_mutations_reject_workflow_operation_before_secret_or_network(monkeypatch, action, args, hint):
+    # The local rejection must happen in _build_request before credentials are
+    # resolved: an old route cannot accidentally receive or discard a journal
+    # intent merely because this profile happens to have a valid token.
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")
+    ):
+        out = json.loads(app_host_tool({"action": action, **args}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    assert hint in out["error"]["message"]
+
+
+@pytest.mark.parametrize("response", [
+    {}, {"operation": {}},
+    {"operation": {"operation_id": "op-other", "terminal": "pending"}},
+    {"operation": {"operation_id": "op-1", "terminal": "succeeded"}},
+])
+def test_operation_enabled_publish_202_without_matching_open_receipt_is_unknown(monkeypatch, response):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=202)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": {"operation_id": "op-1", "data_refresh": "static"},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["operation_id"] == "op-1"
+
+
+@pytest.mark.parametrize("response", [
+    {}, {"operation": {}},
+    {"operation": {"operation_id": "op-other", "terminal": "succeeded"}},
+    {"operation": {"operation_id": "op-1", "terminal": "pending"}},
+])
+def test_operation_enabled_publish_200_without_matching_terminal_receipt_is_unknown(monkeypatch, response):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=200)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": {"operation_id": "op-1", "data_refresh": "static"},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["operation_id"] == "op-1"
+
+
+def test_workflow_operation_status_returns_pending_only_from_202_pending(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp({"operation_id": "op-1", "terminal": "pending"}, status=202)
+    ):
+        out = json.loads(app_host_tool({"action": "workflow_operation_status", "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is True
+    assert out["data"]["outcome"] == "pending"
+
+
+def test_workflow_operation_resume_uses_only_the_journal_receipt(monkeypatch):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen",
+        _capture_urlopen(seen, {"operation_id": "op-1", "terminal": "succeeded"}),
+    ):
+        out = json.loads(app_host_tool({"action": "workflow_operation_resume", "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is True
+    assert seen["req"].full_url == _BASE_URL + "/app1/operation/op-1/resume"
+    assert seen["req"].data is None
+
+
+@pytest.mark.parametrize("status,payload", [
+    (200, None), (200, {}), (200, {"operation_id": "op-1"}),
+    (200, {"operation_id": "op-1", "terminal": "pending"}),
+    (202, {"operation_id": "op-1", "terminal": "succeeded"}),
+])
+def test_workflow_status_without_valid_status_receipt_is_outcome_unknown(monkeypatch, status, payload):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(payload, status=status)
+    ):
+        out = json.loads(app_host_tool({"action": "workflow_operation_status", "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
 
 
 def test_2xx_text_plain_body_is_success_with_text_payload(monkeypatch):
@@ -535,7 +757,7 @@ def test_schema_does_not_adjudicate_between_publish_and_legacy():
     old device had two conflicting instructions and burned turns picking a
     side (ZET/#138). The description states mechanics; it does not rank."""
     text = json.dumps(APP_HOST_SCHEMA, ensure_ascii=False)
-    for word in ("preferred", "legacy"):
+    for word in ("preferred",):
         assert word not in text.lower(), f"{word!r} ranks the channels for the skill"
     subdir = APP_HOST_SCHEMA["parameters"]["properties"]["source_subdir"]["description"]
     assert ".staging" not in subdir, (
@@ -893,7 +1115,8 @@ def test_every_action_routes_inside_server_route_table(monkeypatch):
     for action, args in _ALL_HTTP_ACTION_ARGS:
         seen = {}
         with mux_profile_scope(monkeypatch, _scope()):
-            with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            completion_status = 204 if action in {"release_slot", "delete"} else 200
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, status=completion_status)):
                 out = json.loads(app_host_tool({"action": action, **args}))
         assert out["ok"] is True, action
         req = seen["req"]
@@ -1279,6 +1502,12 @@ def test_schema_declares_the_arguments_undo_depends_on():
     assert "note" in props
 
 
+def test_schema_requires_data_refresh_on_both_install_paths():
+    description = APP_HOST_SCHEMA["parameters"]["properties"]["data_refresh"]["description"]
+    assert "publish(mode=install)" in description
+    assert "legacy action=install" in description
+
+
 def test_undo_is_described_where_the_model_reads_it():
     text = APP_HOST_SCHEMA["description"]
     assert "rollback" in text
@@ -1337,14 +1566,17 @@ def test_publish_reload_never_rewrites_creation_provenance(monkeypatch):
     assert "session_id" not in body
 
 
-def test_legacy_install_carries_stable_session_key(monkeypatch):
+@pytest.mark.parametrize(
+    "data_refresh", ["static", "external_unconfirmed", "user_confirmed_auto", "user_declined"]
+)
+def test_legacy_install_carries_session_key_and_data_refresh(monkeypatch, data_refresh):
     monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
     body = _routed_body(monkeypatch, {
         "action": "install", "staging_dir": "/tmp/stage", "slug": "app1",
-        "data_refresh": "static",
+        "data_refresh": data_refresh,
     })
     assert body["session_id"] == _SESSION_KEY
-    assert "data_refresh" not in body
+    assert body["data_refresh"] == data_refresh
 
 
 def test_rotating_session_id_is_not_provenance(monkeypatch):

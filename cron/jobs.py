@@ -491,7 +491,29 @@ def _jobs_lock():
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "revision"})
+
+
+class JobRevisionConflict(ValueError):
+    """A caller tried to update a job using a stale server-owned revision."""
+
+
+def _job_revision(job: Dict[str, Any]) -> int:
+    """Return the persisted edit revision, treating legacy jobs as revision 0."""
+    value = job.get("revision", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _expected_job_revision(updates: Dict[str, Any]) -> Optional[int]:
+    """Extract the optional CAS fence without ever persisting caller input."""
+    if "expected_revision" not in updates:
+        return None
+    expected = updates.pop("expected_revision")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        raise ValueError("expected_revision must be a non-negative integer")
+    return expected
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1180,6 +1202,10 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+    # Old jobs have no revision. Read compatibility deliberately treats that
+    # as the initial server-owned revision instead of rewriting jobs.json on a
+    # GET; the first successful mutation persists revision 1 atomically.
+    normalized["revision"] = _job_revision(normalized)
 
     # A task grant is durable scheduler-private material.  Its opaque token
     # must never leave jobs.json via any list/get/update API; only the raw
@@ -2326,6 +2352,9 @@ def create_job(
 
     job = {
         "id": job_id,
+        # The server owns this counter. It is an edit fence, not an app
+        # version nor a model-supplied field; a newly created job starts at 0.
+        "revision": 0,
         "name": name or label_source[:50].strip(),
         "prompt": prompt_text,
         "skills": normalized_skills,
@@ -2457,7 +2486,15 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+    """Update a job, optionally guarded by its server-owned edit revision.
+
+    ``expected_revision`` is an optional compare-and-swap fence used by the
+    dedicated-maintainer scheduling bridge. It is never stored as a caller
+    field. Every successful update advances ``revision`` under the job-store
+    lock, so ordinary edits cannot silently race a guarded update.
+    """
+    updates = dict(updates or {})
+    expected_revision = _expected_job_revision(updates)
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -2472,6 +2509,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            current_revision = _job_revision(job)
+            if expected_revision is not None and expected_revision != current_revision:
+                raise JobRevisionConflict(
+                    f"job revision changed (expected {expected_revision}, current {current_revision})"
+                )
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -2582,6 +2625,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 # recover it.
                 updated["fire_claim"] = None
                 updated["in_flight_occurrence"] = None
+
+            # Never take a caller-provided revision. This is the single
+            # mutation seam for user/job configuration edits, so advancing it
+            # here makes a stale maintainer schedule update fail atomically.
+            updated["revision"] = current_revision + 1
 
             jobs[i] = updated
             save_jobs(jobs)

@@ -15,6 +15,7 @@ from cron.jobs import (
     get_job,
     list_jobs,
     update_job,
+    JobRevisionConflict,
     pause_job,
     resume_job,
     remove_job,
@@ -349,6 +350,35 @@ class TestJobCRUD:
 
 
 class TestUpdateJob:
+    def test_revision_is_server_owned_and_legacy_jobs_read_as_zero(self, tmp_cron_dir):
+        save_jobs([{
+            "id": "legacy-job", "name": "legacy", "prompt": "x",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+            "enabled": True,
+        }])
+        assert get_job("legacy-job")["revision"] == 0
+        updated = update_job("legacy-job", {"name": "renamed", "expected_revision": 0})
+        assert updated["revision"] == 1
+        assert get_job("legacy-job")["revision"] == 1
+
+    def test_expected_revision_is_atomic_cas_and_does_not_modify_on_conflict(self, tmp_cron_dir):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        assert job["revision"] == 0
+        first = update_job(job["id"], {"name": "first", "expected_revision": 0})
+        assert first["revision"] == 1
+        with pytest.raises(JobRevisionConflict, match="expected 0, current 1"):
+            update_job(job["id"], {"name": "stale", "expected_revision": 0})
+        persisted = get_job(job["id"])
+        assert persisted["name"] == "first"
+        assert persisted["revision"] == 1
+
+    def test_ordinary_update_advances_revision_and_caller_cannot_set_it(self, tmp_cron_dir):
+        job = create_job(prompt="Check server status", schedule="every 1h")
+        assert update_job(job["id"], {"name": "ordinary"})["revision"] == 1
+        with pytest.raises(ValueError, match="revision"):
+            update_job(job["id"], {"revision": 99})
+        assert get_job(job["id"])["revision"] == 1
+
     def test_update_name(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="every 1h", name="Old Name")
         assert job["name"] == "Old Name"

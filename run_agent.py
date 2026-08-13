@@ -654,7 +654,9 @@ class AIAgent:
                 model=self.model,
                 model_config=_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                # New Zet API sessions are principal-owned. Existing NULL rows
+                # are intentionally not backfilled by SessionDB conflict paths.
+                user_id=self._user_id or None,
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,

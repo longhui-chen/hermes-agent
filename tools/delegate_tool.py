@@ -60,6 +60,8 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         # application lifecycle mutations
         "app_data",  # same scope: children must not access owner-scoped
         # application data with the parent's action token
+        "app_workspace",  # fixed App Host workspace mutations stay
+        # with the dedicated maintainer, never an anonymous delegated child
     ]
 )
 

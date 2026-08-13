@@ -7126,7 +7126,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _completed_runtime_import_target_matches(conn, row) -> bool:
         target = conn.execute(
-            "SELECT model_config FROM sessions WHERE id = ?",
+            "SELECT model_config, user_id FROM sessions WHERE id = ?",
             (row["target_session_id"],),
         ).fetchone()
         if target is None:
@@ -7143,6 +7143,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return (
             metadata.get("import_id") == row["import_id"]
             and metadata.get("payload_sha256") == row["payload_sha256"]
+            and metadata.get("owner_principal", "") == row["owner_principal"]
+            and (target["user_id"] or "") == row["owner_principal"]
         )
 
     def discard_runtime_import_staging(self) -> int:
@@ -7189,6 +7191,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         source: str,
         source_session_id: str,
         target_session_id: str,
+        owner_principal: str = "",
         title: Optional[str],
         payload_sha256: str,
         expected_message_count: int,
@@ -7204,6 +7207,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         have different canonical encodings. ``commit`` returns a separate
         server-computed ``normalized_sha256`` for the Hermes-normalized rows.
         """
+        owner_principal = str(owner_principal or "").strip()
         for field, value in (("import_id", import_id), ("source", source),
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
@@ -7213,6 +7217,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
             reject_portable_credentials(value, field=field)
+        if owner_principal:
+            _validate_runtime_import_identifier("owner_principal", owner_principal, max_length=256)
         if title is not None and not isinstance(title, str):
             raise ValueError("title must be text when provided")
         title = self.sanitize_title(title)
@@ -7270,7 +7276,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = conn.execute(
                 "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
             ).fetchone()
-            metadata = (source, source_session_id, target_session_id,
+            metadata = (source, source_session_id, target_session_id, owner_principal,
                         payload_sha256.lower(), expected_message_count,
                         source_message_ids_json, source_total_rows)
             if row is None:
@@ -7291,11 +7297,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                 conn.execute(
                     """INSERT INTO runtime_imports
-                       (import_id, source, source_session_id, target_session_id, title,
+                       (import_id, source, source_session_id, target_session_id, owner_principal, title,
                         payload_sha256, expected_message_count, source_message_ids_json,
                         source_total_rows, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (import_id, source, source_session_id, target_session_id, title,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (import_id, source, source_session_id, target_session_id, owner_principal, title,
                      payload_sha256.lower(), expected_message_count,
                      source_message_ids_json, source_total_rows, now, now),
                 )
@@ -7315,6 +7321,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["source"] == source
                     and source_session_matches
                     and row["target_session_id"] == target_session_id
+                    and row["owner_principal"] == owner_principal
                     and row["payload_sha256"] == payload_sha256.lower()
                     and row["expected_message_count"] == expected_message_count
                 )
@@ -7338,6 +7345,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeImportConflict("target_session_id already exists")
             if tuple(row[k] for k in (
                 "source", "source_session_id", "target_session_id",
+                "owner_principal",
                 "payload_sha256", "expected_message_count",
                 "source_message_ids_json", "source_total_rows"
             )) != metadata:
@@ -7452,15 +7460,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         row["source_session_id"]
                     ),
                     "payload_sha256": row["payload_sha256"],
+                    "owner_principal": row["owner_principal"],
                 }
             })
             conn.execute(
                 """INSERT INTO sessions
-                   (id, source, model_config, started_at, ended_at, end_reason, title)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (id, source, model_config, started_at, ended_at, end_reason, title, user_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (row["target_session_id"], f"import:{row['source']}",
                  model_config, started_at, completed_at,
-                 "import_completed", title),
+                 "import_completed", title, row["owner_principal"] or None),
             )
             # Hash the exact normalized message sequence that becomes canonical
             # state. Staging-only source IDs and transport chunk boundaries must

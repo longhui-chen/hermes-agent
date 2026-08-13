@@ -465,7 +465,7 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
         return None
 
 
-_DELEGATED_CHILD_PROTECTED_TOOLS = frozenset({"app_host", "app_data"})
+_DELEGATED_CHILD_PROTECTED_TOOLS = frozenset({"app_host", "app_data", "app_workspace"})
 
 
 def _delegated_child_scope_gate(name: str) -> Optional[str]:

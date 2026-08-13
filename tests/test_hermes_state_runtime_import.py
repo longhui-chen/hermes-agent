@@ -15,12 +15,13 @@ from hermes_state import (
 
 
 def _stage(db, *, import_id="imp-1", chunk_index=0, messages=None, expected=2,
-           target_session_id="imported-session"):
+           target_session_id="imported-session", owner_principal=""):
     return db.stage_completed_transcript_import(
         import_id=import_id,
         source="workbuddy",
         source_session_id="source-session",
         target_session_id=target_session_id,
+        owner_principal=owner_principal,
         title="Imported chat",
         payload_sha256=hashlib.sha256(b"source-payload").hexdigest(),
         expected_message_count=expected,
@@ -110,6 +111,48 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
             )
     finally:
         db.close()
+
+
+def test_owned_import_binds_target_and_completed_receipt_to_owner(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _stage(db, expected=1, owner_principal="iam:alice")
+        db.commit_completed_transcript_import("imp-1")
+        target = db._conn.execute(
+            "SELECT user_id, model_config FROM sessions WHERE id = 'imported-session'"
+        ).fetchone()
+        assert target["user_id"] == "iam:alice"
+        assert json.loads(target["model_config"])["_runtime_import"]["owner_principal"] == "iam:alice"
+        with pytest.raises(RuntimeImportConflict, match="different metadata"):
+            _stage(db, expected=1, owner_principal="iam:bob")
+    finally:
+        db.close()
+
+
+def test_runtime_import_owner_column_reconciles_on_an_existing_database(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.close()
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE runtime_imports RENAME TO runtime_imports_old")
+    conn.execute(
+        "CREATE TABLE runtime_imports (import_id TEXT PRIMARY KEY, source TEXT NOT NULL, "
+        "source_session_id TEXT NOT NULL, target_session_id TEXT NOT NULL, title TEXT, "
+        "payload_sha256 TEXT NOT NULL, expected_message_count INTEGER NOT NULL, "
+        "source_message_ids_json TEXT, source_total_rows INTEGER, next_chunk_index INTEGER NOT NULL DEFAULT 0, "
+        "staged_message_count INTEGER NOT NULL DEFAULT 0, staged_bytes INTEGER NOT NULL DEFAULT 0, "
+        "status TEXT NOT NULL DEFAULT 'staging', normalized_sha256 TEXT, created_at REAL NOT NULL, "
+        "updated_at REAL NOT NULL, completed_at REAL)"
+    )
+    conn.execute("DROP TABLE runtime_imports_old")
+    conn.commit()
+    conn.close()
+    upgraded = SessionDB(path)
+    try:
+        columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(runtime_imports)")}
+        assert "owner_principal" in columns
+    finally:
+        upgraded.close()
 
 
 def test_completed_transcript_can_reopen_and_remains_retention_eligible(tmp_path):
