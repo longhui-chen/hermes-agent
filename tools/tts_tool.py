@@ -615,6 +615,18 @@ def _load_tts_config() -> Dict[str, Any]:
         raw_config = read_raw_config()
         raw_tts = raw_config.get("tts") if isinstance(raw_config, dict) else None
         raw_provider = raw_tts.get("provider") if isinstance(raw_tts, dict) else None
+        # The provider picker writes ``use_gateway: false`` together with a
+        # direct provider choice. ``save_config`` may then strip
+        # ``provider: edge`` because Edge is the schema default, but it keeps
+        # this non-default opt-out. Treat it as explicit intent only when the
+        # effective config still contains the same opt-out; a managed override
+        # must continue to win.
+        raw_gateway_opt_out = (
+            _gateway_is_explicitly_disabled(raw_tts)
+            if isinstance(raw_tts, dict)
+            else False
+        )
+        effective_gateway_opt_out = _gateway_is_explicitly_disabled(tts_config)
         managed_config = load_managed_config()
         managed_tts = (
             managed_config.get("tts") if isinstance(managed_config, dict) else None
@@ -625,7 +637,7 @@ def _load_tts_config() -> Dict[str, Any]:
         provider_is_explicit = any(
             isinstance(value, str) and value.strip()
             for value in (raw_provider, managed_provider)
-        )
+        ) or (raw_gateway_opt_out and effective_gateway_opt_out)
         if not provider_is_explicit:
             tts_config["_provider_is_default"] = True
         return tts_config

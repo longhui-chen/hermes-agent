@@ -474,12 +474,9 @@ def test_zettlab_tts_preserves_managed_scope_provider(monkeypatch, tmp_path):
     assert tts_tool._get_provider(tts_config) == "edge"
 
 
-def test_zettlab_tts_ignores_openai_gateway_opt_out(monkeypatch, tmp_path):
+def test_zettlab_tts_preserves_edge_picker_opt_out(monkeypatch, tmp_path):
     user_home = tmp_path / "user"
     user_home.mkdir()
-    (user_home / "config.yaml").write_text(
-        "tts:\n  use_gateway: false\n", encoding="utf-8"
-    )
     monkeypatch.setenv("HERMES_HOME", str(user_home))
     monkeypatch.setenv(
         "ZET_CHAT_APPEND_URL",
@@ -487,16 +484,28 @@ def test_zettlab_tts_ignores_openai_gateway_opt_out(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
 
-    from hermes_cli import config, managed_scope
+    from hermes_cli import config, managed_scope, tools_config
 
     config._LOAD_CONFIG_CACHE.clear()
     config._RAW_CONFIG_CACHE.clear()
     managed_scope.invalidate_managed_cache()
+    picker_config = {}
+    tools_config.apply_provider_selection(
+        "tts",
+        "Microsoft Edge TTS",
+        picker_config,
+    )
+    assert picker_config["tts"] == {"provider": "edge", "use_gateway": False}
+    config.save_config(picker_config)
+    raw_tts = config.read_raw_config()["tts"]
+    assert "provider" not in raw_tts
+    assert raw_tts["use_gateway"] is False
+
     _install_fake_tools_package()
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
 
     tts_config = tts_tool._load_tts_config()
-    assert tts_tool._get_provider(tts_config) == "zettlab"
+    assert tts_tool._get_provider(tts_config) == "edge"
 
 
 def test_zettlab_tts_ignores_openai_gateway_toggle_for_provider_selection(
