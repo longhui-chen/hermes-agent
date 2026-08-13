@@ -1041,6 +1041,16 @@ def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
         pytest.skip("directory symlinks are unavailable on this platform")
     returned_paths = []
     played = []
+    real_mkdtemp = tempfile.mkdtemp
+    mkdtemp_calls = 0
+
+    def synthesis_dir_first(**kwargs):
+        nonlocal mkdtemp_calls
+        mkdtemp_calls += 1
+        if mkdtemp_calls == 1:
+            return str(real_dir)
+        return real_mkdtemp(**kwargs)
+
     def fake_synth(text, output_path):
         del text
         with open(output_path, "wb") as output:
@@ -1049,7 +1059,7 @@ def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
         returned_paths.append(alias_path)
         return json.dumps({"success": True, "file_path": alias_path})
 
-    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", lambda **_kwargs: str(real_dir))
+    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", synthesis_dir_first)
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
     fake_vm = MagicMock()
     fake_vm.play_audio_file.side_effect = lambda path: played.append(
@@ -1080,6 +1090,15 @@ def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp
     except OSError:
         pytest.skip("directory symlinks are unavailable on this platform")
     provider_paths = []
+    real_mkdtemp = tempfile.mkdtemp
+    mkdtemp_calls = 0
+
+    def synthesis_dir_first(**kwargs):
+        nonlocal mkdtemp_calls
+        mkdtemp_calls += 1
+        if mkdtemp_calls == 1:
+            return str(real_dir)
+        return real_mkdtemp(**kwargs)
 
     def fake_synth(text, output_path):
         del text
@@ -1089,7 +1108,7 @@ def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp
         alias_path = alias_dir / provider_path.name
         return json.dumps({"success": True, "file_path": str(alias_path)})
 
-    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", lambda **_kwargs: str(real_dir))
+    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", synthesis_dir_first)
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
 
     pipeline = tts_tool._SyncSentencePipeline(threading.Event())
@@ -1127,9 +1146,11 @@ def test_sync_pipeline_rejects_placeholder_replaced_with_external_symlink(
         pytest.skip("file symlinks are unavailable on this platform")
     probe_path.unlink()
     played = []
+    synthesis_dirs = []
 
     def fake_synth(text, output_path):
         del text
+        synthesis_dirs.append(str(Path(output_path).parent))
         os.unlink(output_path)
         os.symlink(protected_path, output_path)
         return json.dumps({"success": True, "file_path": output_path})
@@ -1145,6 +1166,8 @@ def test_sync_pipeline_rejects_placeholder_replaced_with_external_symlink(
 
     assert played == []
     assert protected_path.read_bytes() == b"keep me"
+    assert synthesis_dirs
+    assert all(not os.path.exists(path) for path in synthesis_dirs)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="requires O_NOFOLLOW symlinks")
@@ -1155,10 +1178,12 @@ def test_sync_pipeline_rejects_symlink_swap_during_output_open(monkeypatch, tmp_
     protected_path.write_bytes(b"keep me")
     provider_output = []
     played = []
+    synthesis_dirs = []
     real_os_open = os.open
 
     def fake_synth(text, output_path):
         del text
+        synthesis_dirs.append(str(Path(output_path).parent))
         path = str(Path(output_path).with_suffix(".wav"))
         Path(path).write_bytes(b"provider audio")
         provider_output.append(path)
@@ -1186,6 +1211,8 @@ def test_sync_pipeline_rejects_symlink_swap_during_output_open(monkeypatch, tmp_
 
     assert played == []
     assert protected_path.read_bytes() == b"keep me"
+    assert synthesis_dirs
+    assert all(not os.path.exists(path) for path in synthesis_dirs)
 
 
 def test_sync_pipeline_rejects_unowned_provider_path(monkeypatch, tmp_path):

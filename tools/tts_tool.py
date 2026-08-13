@@ -3661,17 +3661,24 @@ class _SyncSentencePipeline:
         self._executor.shutdown(wait=True)
 
     @staticmethod
-    def _unlink_if_unchanged(path: Optional[str], expected: os.stat_result) -> None:
+    def _cleanup_private_temp_dir(path: Optional[str]) -> None:
+        """Remove entries from a pipeline-owned directory without following links."""
         if not path:
             return
         try:
-            current = os.lstat(path)
-            if (
-                stat.S_ISREG(current.st_mode)
-                and (current.st_dev, current.st_ino)
-                == (expected.st_dev, expected.st_ino)
-            ):
-                os.unlink(path)
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            os.rmdir(entry.path)
+                        else:
+                            os.unlink(entry.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        try:
+            os.rmdir(path)
         except OSError:
             pass
 
@@ -3679,17 +3686,12 @@ class _SyncSentencePipeline:
         if self._stop.is_set():
             return None
         synthesis_dir = None
-        tmp_path = None
-        tmp_initial_stat = None
-        owned_output_path = None
-        source_stat = None
         playback_dir = None
         playback_path = None
         try:
             synthesis_dir = tempfile.mkdtemp(prefix="hermes-tts-synthesis-")
             fd, tmp_path = tempfile.mkstemp(dir=synthesis_dir, suffix=".mp3")
             os.close(fd)
-            tmp_initial_stat = os.lstat(tmp_path)
             tmp_real_path = Path(os.path.realpath(tmp_path))
             raw_result = text_to_speech_tool(text=cleaned, output_path=tmp_path)
             try:
@@ -3756,27 +3758,11 @@ class _SyncSentencePipeline:
                 if source_fd >= 0:
                     os.close(source_fd)
 
-            if same_path:
-                self._unlink_if_unchanged(tmp_path, source_stat)
-            else:
-                self._unlink_if_unchanged(tmp_path, tmp_initial_stat)
-                self._unlink_if_unchanged(owned_output_path, source_stat)
-            try:
-                os.rmdir(synthesis_dir)
-            except OSError:
-                pass
+            self._cleanup_private_temp_dir(synthesis_dir)
             return _SyncAudioArtifact(playback_path, playback_dir)
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
-            if tmp_initial_stat is not None:
-                self._unlink_if_unchanged(tmp_path, tmp_initial_stat)
-            if source_stat is not None:
-                self._unlink_if_unchanged(owned_output_path, source_stat)
-            if synthesis_dir:
-                try:
-                    os.rmdir(synthesis_dir)
-                except OSError:
-                    pass
+            self._cleanup_private_temp_dir(synthesis_dir)
             if playback_path or playback_dir:
                 _SyncAudioArtifact(playback_path or "", playback_dir or "").cleanup()
             return None
