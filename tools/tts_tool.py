@@ -3666,6 +3666,7 @@ class _SyncSentencePipeline:
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
+            tmp_real_path = Path(os.path.realpath(tmp_path))
             raw_result = text_to_speech_tool(text=cleaned, output_path=tmp_path)
             try:
                 result = json.loads(raw_result)
@@ -3679,7 +3680,6 @@ class _SyncSentencePipeline:
             if not isinstance(output_path, str) or not output_path:
                 raise RuntimeError("TTS tool returned no output path")
 
-            tmp_real_path = Path(os.path.realpath(tmp_path))
             output_real_path = Path(os.path.realpath(output_path))
             same_path = os.path.normcase(str(output_real_path)) == os.path.normcase(
                 str(tmp_real_path)
@@ -3689,8 +3689,8 @@ class _SyncSentencePipeline:
                 == os.path.normcase(str(tmp_real_path.parent))
                 and os.path.normcase(output_real_path.stem)
                 == os.path.normcase(tmp_real_path.stem)
-                and output_real_path.suffix.lower()
-                in {".flac", ".mp3", ".ogg", ".opus", ".wav"}
+                and output_real_path.suffix.lower().lstrip(".")
+                in COMMAND_TTS_OUTPUT_FORMATS
             )
             if not same_path and not same_stem_output:
                 raise RuntimeError("TTS tool returned an unowned output path")

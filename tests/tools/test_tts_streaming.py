@@ -939,7 +939,10 @@ def test_sync_pipeline_cleans_temp_files(monkeypatch):
     assert not leftovers, f"temp files not cleaned: {leftovers}"
 
 
-def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(monkeypatch):
+@pytest.mark.parametrize("suffix", [".opus", ".m4a"])
+def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(
+    monkeypatch, suffix
+):
     from tools import tts_tool
 
     placeholders = []
@@ -954,7 +957,7 @@ def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(monke
 
     def fake_synth(text, output_path):
         del text
-        provider_path = os.path.splitext(output_path)[0] + ".opus"
+        provider_path = os.path.splitext(output_path)[0] + suffix
         with open(provider_path, "wb") as output:
             output.write(b"opus")
         provider_outputs.append(provider_path)
@@ -1059,6 +1062,40 @@ def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp
         assert decoy_path.read_bytes() == b"keep me"
     finally:
         pipeline.close()
+
+
+def test_sync_pipeline_rejects_placeholder_replaced_with_external_symlink(
+    monkeypatch, tmp_path
+):
+    from tools import tts_tool
+
+    protected_path = tmp_path / "protected.mp3"
+    protected_path.write_bytes(b"keep me")
+    probe_path = tmp_path / "symlink-probe"
+    try:
+        probe_path.symlink_to(protected_path)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this platform")
+    probe_path.unlink()
+    played = []
+
+    def fake_synth(text, output_path):
+        del text
+        os.unlink(output_path)
+        os.symlink(protected_path, output_path)
+        return json.dumps({"success": True, "file_path": output_path})
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Replaced placeholder path.")
+    pipeline.close()
+
+    assert played == []
+    assert protected_path.read_bytes() == b"keep me"
 
 
 def test_sync_pipeline_rejects_unowned_provider_path(monkeypatch, tmp_path):
