@@ -1431,6 +1431,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         ):
             return
 
+        # hermes.todo 快照（并发路径）：在主线程、canonical 结果落盘成功之后
+        # 才推送——worker 内先推会在 DB busy 时 fail-open：App 已看到新清单，
+        # 下一轮 hydrate 却是旧状态（codex P1）。
+        if name == "todo":
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(function_result)
+                    _todo_emit_cb(
+                        _todo_payload.get("todos", []),
+                        _todo_payload.get("summary", {}),
+                    )
+                except Exception:
+                    pass
+
         # Every completion surface is downstream of the canonical append. If
         # the UI bridge or process dies while projecting one of these events,
         # resume can reconstruct the tool result that was already visible.
@@ -1642,17 +1658,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
-            # Emit hermes.todo event onto the SSE stream (zet_agent platform).
-            # todo_emit_callback is injected by ZetAgentAdapter._create_agent
-            # when a stream_q is available; absent it, this is a no-op.
-            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
-            if callable(_todo_emit_cb):
-                try:
-                    import json as _json
-                    _todo_payload = _json.loads(function_result)
-                    _todo_emit_cb(_todo_payload.get("todos", []), _todo_payload.get("summary", {}))
-                except Exception:
-                    pass
+            # hermes.todo 快照不在这里推：与并发路径统一，由下方 canonical tool
+            # result 落盘成功后再 emit（codex P1）——计划执行进度现在绑定在这些
+            # 单条 merge=true 更新上，先推后写会在 DB busy 时让 App 看到下一轮
+            # hydrate 不回来的进度。
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
@@ -1775,9 +1784,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
         elif function_name == "present_plan":
-            from tools.plan_tool import present_plan as _present_plan
+            from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 
-            function_result = _present_plan(
+            function_result, _plan_meta = _present_plan_with_meta(
                 title=function_args.get("title", ""),
                 groups=function_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
@@ -1798,6 +1807,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._zet_agent_plan_presented = True
                 if getattr(agent, "plan_emit_callback", None) is None:
                     agent._zet_agent_plan_fallback_response = function_result
+                if _plan_meta is not None:
+                    # 播种延迟到批次收尾（conversation_loop 调 seed_pending_plan_todos）：
+                    # 就地 append 合成消息对会插进本批次其余 tool result 中间，破坏
+                    # assistant↔tool 配对与 messages[-num_tools:] 预算统计。
+                    agent._pending_plan_seed = _plan_meta
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")
@@ -2168,6 +2182,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         ):
             return
+
+        # hermes.todo 快照（串行路径）：canonical 结果落盘成功之后才推——与并发
+        # 路径同规（codex P1）。用 display_function_result：function_result 可能
+        # 已被 maybe_persist_tool_result 换成文件引用，解析不出 todos。
+        if function_name == "todo":
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(display_function_result)
+                    _todo_emit_cb(
+                        _todo_payload.get("todos", []),
+                        _todo_payload.get("summary", {}),
+                    )
+                except Exception:
+                    pass
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.

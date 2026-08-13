@@ -571,12 +571,20 @@ def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None
     api_kwargs.pop("reasoning_effort", None)
 
 
+# 计划轮尾部闭合文案：播种追加 todo 工具对后，历史不能以 tool 结尾（下一轮
+# 会变成 tool -> user，严格 provider 拒绝），也不能用空 assistant content
+# （Moonshot/Kimi 同样拒绝）。这条短文案只做结构闭合，不进 UI（App 走 plan 卡）。
+PLAN_PRESENTED_CLOSING_TEXT = "计划已提交，等待你的确认。"
+
+
 def _should_end_after_present_plan(agent: Any) -> bool:
-    # Only an explicit manual Plan-mode turn waits for confirmation. Plans
-    # presented during a regular tool turn are status UI, not an execution gate.
+    # 决策点语义（方案 §0）：zet_agent 上任何成功呈现且非 auto 直跑的计划卡
+    # 都结束本 turn、等用户在卡上确认——包括普通模式下模型自发的高风险拦截
+    # 计划（此前只有显式 plan 模式才等，自发计划靠提示词约定「模型自觉停」，
+    # 弱模型一次不自觉就会在用户确认前跑出副作用）。auto 直跑仅剩旧 App
+    # capability opt-in 兼容路径。
     return (
         (getattr(agent, "platform", "") or "") == "zet_agent"
-        and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
         and bool(getattr(agent, "_zet_agent_plan_presented", False))
         and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
@@ -709,23 +717,26 @@ def _enforce_single_plan_interaction_tool_call(
         ),
         None,
     )
-    manual_present_plan = (
+    # auto / manual 一视同仁（codex P1）：auto 兼容路径下模型可能在同一批次里
+    # present_plan 后接 todo/副作用工具，而播种要等批次收尾——后续 todo 会先在
+    # 空/旧 store 上跑、再被 seed_from_plan 整表覆盖回全 pending。批次切段：只
+    # 保留 present_plan，被裁掉的调用由模型在播种完成后的下一轮重发。
+    zet_present_plan = (
         (getattr(agent, "platform", "") or "") == "zet_agent"
         and present_plan_call is not None
-        and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
-    if not plan_mode_active and not trusted_scope and not manual_present_plan:
+    if not plan_mode_active and not trusted_scope and not zet_present_plan:
         return False
 
     if not plan_mode_active:
-        selected = present_plan_call if manual_present_plan else tool_calls[0]
+        selected = present_plan_call if zet_present_plan else tool_calls[0]
         assistant_message.tool_calls = [selected]
         _filter_provider_replay_tool_calls(assistant_message, selected)
         logger.warning(
             "zet_agent %s: provider returned parallel tools; keeping only %s",
             (
-                "manual plan interaction"
-                if manual_present_plan
+                "plan interaction"
+                if zet_present_plan
                 else "trusted execution scope"
             ),
             _tool_call_name(selected) or "first call",
@@ -7673,6 +7684,15 @@ def run_conversation(
                         },
                     )
 
+                # 计划播种：present_plan 本批次成功呈现后，用同一份计划骨架
+                # 播种 TodoStore + 合成 todo 调用消息对（跨 turn 存活）。必须
+                # 在批次收尾后、present_plan break 之前——manual 确认卡模式
+                # 随后立即结束 turn，晚一步播种就随 agent 实例蒸发。放在持久化
+                # 失败检查之前：播种落盘失败也要走 session_persistence_failed
+                # 终止，而不是带着"看似成功"的计划卡结束 turn（codex P1）。
+                from agent.plan_seeding import seed_pending_plan_todos
+                seed_pending_plan_todos(agent, messages)
+
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any
@@ -7688,6 +7708,18 @@ def run_conversation(
                         getattr(agent, "_zet_agent_plan_fallback_response", "")
                         or ""
                     )
+                    # 闭合 assistant 消息（codex P1）：App 路径有 plan_emit_callback
+                    # → fallback_response 为空 → finalize_turn 不补闭合，而播种又
+                    # 追加了 todo tool 对，持久化历史会以 tool 结尾。下一轮变成
+                    # `... tool -> user`，严格 provider 直接拒绝，用户确认后的计划
+                    # 执行不了。内容必须非空：Moonshot/Kimi 等严格 OpenAI 兼容端
+                    # 同样拒绝空 assistant content（同文件 partial-stream 防护已
+                    # 记录该行为）——用一句可读的短文案闭合。
+                    if messages and messages[-1].get("role") == "tool":
+                        messages.append({
+                            "role": "assistant",
+                            "content": PLAN_PRESENTED_CLOSING_TEXT,
+                        })
                     logger.info(
                         "zet_agent: present_plan emitted; ending turn "
                         "without a post-tool LLM follow-up"
@@ -8666,8 +8698,32 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # 计划播种清单的宿主端收尾（顺序：先取消回执、后状态校正）：
+                # - 取消回执（plan_ack cancelled）：把播种待办整体置 cancelled 并
+                #   持久化，否则下一轮 hydration 把已取消计划恢复成待执行（codex P1）。
+                # - 状态校正：turn 正常结束后残留的 in_progress 降回 pending
+                #   （Codex #21327 教训——状态约束只写提示词必然漂移）。
+                # 两者都必须在最终 assistant 消息 **之前** 追加工具对：追加在其
+                # 后会让 finalize_turn 看到 transcript 以 tool 结尾而再补一次
+                # 最终回复，用户刷新后看到答案重复（codex P1）。
+                from agent.plan_seeding import (
+                    apply_plan_ack_cancellation_at_turn_end,
+                    correct_stale_in_progress_at_turn_end,
+                )
+                apply_plan_ack_cancellation_at_turn_end(agent, messages)
+                correct_stale_in_progress_at_turn_end(agent, messages)
+                if getattr(agent, "_incremental_persistence_failed", False):
+                    # 收尾工具对（取消落地/状态校正）落盘失败：与批次内工具
+                    # 结果同规——不能带着「看似成功」的最终回复结束 turn，
+                    # 否则下一轮 hydrate 恢复旧 todo 状态、与用户看到的回复
+                    # 相矛盾（codex P1）。
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
+                    break
+
                 messages.append(final_msg)
-                
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
