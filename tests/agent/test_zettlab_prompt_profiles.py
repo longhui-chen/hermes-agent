@@ -314,7 +314,10 @@ def test_turn_contract_is_the_last_system_prompt_block_flow(monkeypatch):
     assert parts["volatile"].endswith("</zettlab_turn_contract>")
     assert "整段回复必须使用英文" in parts["volatile"]
     assert "不得在等待答案时继续调用工具" in parts["volatile"]
-    assert "不得扫描整个用户主目录" in parts["volatile"]
+    assert "不得扫描整个原始用户主目录" in parts["volatile"]
+    assert '`skill_view(name="file-search")`' in parts["volatile"]
+    assert "受控索引和权限范围检索，不要先要求准确路径" in parts["volatile"]
+    assert "只有 `file-search` 不可用" in parts["volatile"]
     assert "具体发到哪个地址或群组" in parts["volatile"]
     assert "健康问题也必须遵循第 1 条回复语言规则" in parts["volatile"]
 
