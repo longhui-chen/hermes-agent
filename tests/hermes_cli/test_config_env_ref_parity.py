@@ -111,3 +111,18 @@ def test_managed_config_refs_remain_process_env_only(
 
     with strict_secret_scope({"OPENAI_API_KEY": "worker-key"}):
         assert load_config()["tts"]["api_key"] == "managed-process-key"
+
+
+def test_user_config_expansion_fails_closed_when_multiplex_is_unscoped(monkeypatch):
+    from agent.secret_scope import (
+        UnscopedSecretError,
+        set_multiplex_active,
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "other-profile-key")
+    set_multiplex_active(True)
+    try:
+        with pytest.raises(UnscopedSecretError):
+            _expand_env_vars("${OPENAI_API_KEY}")
+    finally:
+        set_multiplex_active(False)

@@ -2544,18 +2544,16 @@ def _env_expand_match(m: re.Match, env_getter=None) -> str:
 
 
 def _env_ref_value(name: str) -> Optional[str]:
-    """Read an env reference through an installed profile secret scope.
+    """Read a user-config env reference through the profile secret policy.
 
-    With no scope, preserve config loading's legacy process-environment
-    behavior. A profile-aware caller installs a scope before loading config;
-    in that case ``get_secret`` enforces the scope's overlay/strict policy and
-    prevents a cross-profile reference from bypassing it via ``os.environ``.
+    Single-profile callers without a scope preserve legacy process-environment
+    behavior. Profile-aware callers follow their overlay/strict scope, while
+    an unscoped multiplex caller fails closed rather than reading another
+    profile's process credential.
     """
-    from agent.secret_scope import current_secret_scope, get_secret
+    from agent.secret_scope import get_secret
 
-    if current_secret_scope() is not None:
-        return get_secret(name)
-    return os.environ.get(name)
+    return get_secret(name)
 
 
 def _process_env_ref_value(name: str) -> Optional[str]:
