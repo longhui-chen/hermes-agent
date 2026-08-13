@@ -167,12 +167,24 @@ _ORIGINAL_PROCESS_ENV: frozenset[str] | None = None
 # global is exactly what _ORIGINAL_PROCESS_ENV (key-set only) avoids.
 _LIVE_RESOLVED_ENV_KEYS: frozenset[str] = frozenset({
     "GATEWAY_MULTIPLEX_PROFILES",
+    "HERMES_LANGFUSE_BASE_URL",
+    "HERMES_LANGFUSE_MODE",
+    "HERMES_MANAGED_GATEWAY",
     "HERMES_TIMEZONE",
     "ZETTLAB_PRESETS_DIR",
     "ZETTLAB_PRESETS_DEV_KEY_ID",
     "ZETTLAB_PRESETS_DEV_PUBLIC_KEY_B64",
 })
 _ORIGINAL_OPERATOR_VALUES: dict[str, str] | None = None
+
+_MANAGED_LANGFUSE_CREDENTIAL_KEYS: frozenset[str] = frozenset({
+    "HERMES_LANGFUSE_PUBLIC_KEY",
+    "HERMES_LANGFUSE_SECRET_KEY",
+    "LANGFUSE_BASIC_AUTH",
+    "LANGFUSE_OTEL_TRACES_EXPORT_PATH",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+})
 
 
 def env_var_was_operator_set(name: str) -> bool:
@@ -579,6 +591,7 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+    _reapply_managed_langfuse_policy()
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
@@ -595,6 +608,26 @@ def load_hermes_dotenv(
     _reapply_terminal_config_bridge(home_path)
 
     return loaded
+
+
+def _reapply_managed_langfuse_policy() -> None:
+    """Keep packaged gateways on the secretless loopback relay policy.
+
+    User, project, and managed dotenv files all load after the service wrapper.
+    A legacy value in any of them must not restore project credentials or
+    redirect Langfuse's fixed OTLP path. The pristine process snapshot is the
+    authority: standalone Hermes processes without the packaged managed flag
+    retain the existing direct-mode behavior.
+    """
+    operator_values = _ORIGINAL_OPERATOR_VALUES or {}
+    if operator_values.get("HERMES_MANAGED_GATEWAY") != "1":
+        return
+    os.environ["HERMES_MANAGED_GATEWAY"] = "1"
+    for key in ("HERMES_LANGFUSE_MODE", "HERMES_LANGFUSE_BASE_URL"):
+        if key in operator_values:
+            os.environ[key] = operator_values[key]
+    for key in _MANAGED_LANGFUSE_CREDENTIAL_KEYS:
+        os.environ.pop(key, None)
 
 
 def _reapply_terminal_config_bridge(home_path: Path) -> None:

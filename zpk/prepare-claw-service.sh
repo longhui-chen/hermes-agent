@@ -5,6 +5,7 @@ APP_ROOT=$(dirname "$(readlink -f "$0")")
 HERMES_SRC="$APP_ROOT/lib/hermes-agent"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 DATA_DIR="/volume1/system/zettos-main-data/com.zettlab.claw"
+LEGACY_DATA_DIR="/zettos/main/apps/com.zettlab.claw/data"
 HERMES_HOME="$DATA_DIR/hermes_home"
 SECRET_DIR="$DATA_DIR/secrets"
 LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
@@ -453,6 +454,73 @@ if overflow:
 PY
 }
 
+scrub_langfuse_env_file() {
+    local path="$1" resolved uid tmp
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0
+    fi
+    if [ -L "$path" ]; then
+        echo "refusing symlinked Langfuse environment file: $path" >&2
+        return 1
+    fi
+    resolved="$(readlink -f "$path" 2>/dev/null || true)"
+    if [ -z "$resolved" ] || [ ! -f "$resolved" ]; then
+        echo "refusing non-regular Langfuse environment file: $path" >&2
+        return 1
+    fi
+    uid="$(stat -c '%u' "$resolved" 2>/dev/null || stat -f '%u' "$resolved" 2>/dev/null || true)"
+    if [ "$uid" != "$(id -u)" ]; then
+        echo "refusing Langfuse environment file not owned by service user: $path" >&2
+        return 1
+    fi
+
+    tmp="$(mktemp "${resolved}.tmp.XXXXXX")"
+    if ! "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
+        --filter-excluding "$resolved" \
+        HERMES_LANGFUSE_PUBLIC_KEY HERMES_LANGFUSE_SECRET_KEY \
+        LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY \
+        LANGFUSE_BASIC_AUTH LANGFUSE_OTEL_TRACES_EXPORT_PATH > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
+        "$tmp" >/dev/null; then
+        rm -f "$tmp"
+        echo "refusing invalid scrubbed Langfuse environment file: $path" >&2
+        return 1
+    fi
+    chmod 0600 "$tmp"
+    if cmp -s "$tmp" "$resolved"; then
+        chmod 0600 "$resolved"
+        rm -f "$tmp"
+    else
+        mv "$tmp" "$resolved"
+    fi
+}
+
+scrub_profile_langfuse_credentials() {
+    local profiles_root="$1" path count=0
+    if [ ! -d "$profiles_root" ] || [ -L "$profiles_root" ]; then
+        return 0
+    fi
+    while IFS= read -r -d '' path; do
+        scrub_langfuse_env_file "$path"
+        count=$((count + 1))
+        if [ "$count" -ge 4096 ]; then
+            echo "bounded Langfuse credential scrub stopped after 4096 profiles" >&2
+            break
+        fi
+    done < <(find "$profiles_root" -mindepth 2 -maxdepth 2 -name .env \( -type f -o -type l \) -print0)
+}
+
+scrub_legacy_langfuse_credentials() {
+    scrub_langfuse_env_file "$HERMES_HOME/.env"
+    scrub_profile_langfuse_credentials "$HERMES_HOME/profiles"
+    scrub_langfuse_env_file "$LEGACY_DATA_DIR/hermes_home/.env"
+    scrub_profile_langfuse_credentials "$LEGACY_DATA_DIR/hermes_home/profiles"
+    scrub_langfuse_env_file "$LEGACY_DATA_DIR/secrets/zettlab-claw.env"
+}
+
 acquire_prepare_lock() {
     if [ -L "$LOCK_FILE" ] || { [ -e "$LOCK_FILE" ] && [ ! -f "$LOCK_FILE" ]; }; then
         echo "refusing non-regular prepare lock file: $LOCK_FILE" >&2
@@ -564,7 +632,10 @@ write_agent_env() {
                 HERMES_BUNDLED_LOCALES \
                 HERMES_LAZY_INSTALL_TARGET \
                 HERMES_MANAGED_GATEWAY HERMES_MANAGED_CGROUP_UNIT \
-                HERMES_MANAGED_CGROUP_ROOT
+                HERMES_MANAGED_CGROUP_ROOT \
+                HERMES_LANGFUSE_PUBLIC_KEY HERMES_LANGFUSE_SECRET_KEY \
+                LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY \
+                LANGFUSE_BASIC_AUTH LANGFUSE_OTEL_TRACES_EXPORT_PATH
         fi
     } > "$ENV_FILE.tmp.$$"
     if ! "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
@@ -600,6 +671,7 @@ esac
 secure_state_directories
 acquire_prepare_lock
 secure_profile_secret_files
+scrub_legacy_langfuse_credentials
 ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"
 write_agent_env
 
