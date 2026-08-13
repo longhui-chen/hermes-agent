@@ -21,6 +21,12 @@ from gateway.session_context import (
 from tools import approval, browser_backend_router
 
 
+@pytest.fixture(autouse=True)
+def _allow_minimal_request_doubles(monkeypatch):
+    """Route-unit doubles do not provide aiohttp's audit metadata."""
+    monkeypatch.setattr(APIServerAdapter, "_check_auth", lambda _self, _request: None)
+
+
 def test_request_account_id_accepts_matching_explicit_managed_header():
     request = SimpleNamespace(headers={
         "X-Zettlab-Account-Id": "account-explicit",
@@ -107,6 +113,55 @@ async def test_chat_request_keeps_account_and_app_owner_principal_separate(monke
     })
     await adapter._handle_chat_completions(request)
     assert seen == [("iam:alice", "account-1")]
+    assert zettlab_auth_principal() == ""
+    assert _zettlab_request_account_id.get() == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "base_route"),
+    [
+        ("_handle_chat_completions", "_handle_chat_completions"),
+        ("_handle_responses", "_handle_responses"),
+        ("_handle_runs", "_handle_runs"),
+    ],
+)
+async def test_every_agent_route_binds_and_clears_account_and_principal(
+    monkeypatch, route, base_route
+):
+    """Chat, Responses, and Runs carry the same split identity contract."""
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    seen = []
+
+    async def base_handler(_self, _request):
+        seen.append((zettlab_auth_principal(), _zettlab_request_account_id.get()))
+        return object()
+
+    monkeypatch.setattr(APIServerAdapter, base_route, base_handler)
+    request = SimpleNamespace(headers={
+        "X-Zettlab-Auth-Principal-Id": "iam:alice",
+        "X-Zettlab-Account-Id": "account-1",
+        "X-Hermes-Session-Key": "zettlab:account-1:main:chat-1",
+    })
+
+    await getattr(adapter, route)(request)
+    assert seen == [("iam:alice", "account-1")]
+    assert zettlab_auth_principal() == ""
+    assert _zettlab_request_account_id.get() == ""
+
+
+@pytest.mark.asyncio
+async def test_rejected_gateway_request_never_binds_identity(monkeypatch):
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    rejected = object()
+    monkeypatch.setattr(adapter, "_check_auth", lambda _request: rejected)
+
+    response = await adapter._handle_responses(SimpleNamespace(headers={
+        "X-Zettlab-Auth-Principal-Id": "iam:alice",
+        "X-Zettlab-Account-Id": "account-1",
+    }))
+
+    assert response is rejected
     assert zettlab_auth_principal() == ""
     assert _zettlab_request_account_id.get() == ""
 

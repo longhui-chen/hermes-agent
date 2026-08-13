@@ -509,6 +509,21 @@ def test_workflow_operation_resume_uses_only_the_journal_receipt(monkeypatch):
     assert seen["req"].data is None
 
 
+@pytest.mark.parametrize(("action", "status", "terminal"), [
+    ("workflow_operation_status", 202, "pending"),
+    ("workflow_operation_resume", 200, "succeeded"),
+])
+def test_workflow_operation_receipt_must_match_requested_operation_id(monkeypatch, action, status, terminal):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen",
+        return_value=_Resp({"operation_id": "op-other", "terminal": terminal}, status=status),
+    ):
+        out = json.loads(app_host_tool({"action": action, "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["operation_id"] == "op-1"
+
+
 @pytest.mark.parametrize("status,payload", [
     (200, None), (200, {}), (200, {"operation_id": "op-1"}),
     (200, {"operation_id": "op-1", "terminal": "pending"}),

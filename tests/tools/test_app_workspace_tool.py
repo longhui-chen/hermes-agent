@@ -5,7 +5,12 @@ import urllib.error
 from unittest.mock import patch
 
 from tests.tools._profile_scope import mux_profile_scope
-from tools.app_workspace_tool import APP_WORKSPACE_SCHEMA, app_workspace_tool
+from tools.app_workspace_tool import (
+    APP_WORKSPACE_SCHEMA,
+    _MAX_PATCH_BYTES,
+    _MAX_PATH_CHARS,
+    app_workspace_tool,
+)
 
 
 _BASE = "http://127.0.0.1:18080/api/v1/internal/apphost"
@@ -60,7 +65,7 @@ def test_schema_is_fixed_workspace_surface_not_generic_host_access():
     props = APP_WORKSPACE_SCHEMA["parameters"]["properties"]
     assert set(props["action"]["enum"]) == {
         "status", "checkout", "read", "apply_patch", "build", "publish",
-        "discard", "maintainer_schedule_status", "maintainer_schedule",
+        "discard", "maintainer_schedule_status",
     }
     assert not {"command", "url", "host", "env", "shell", "directory"} & set(props)
     assert "relative" in props["path"]["description"]
@@ -74,7 +79,6 @@ def test_workspace_routes_and_wire_shapes(monkeypatch):
         ("build", {}, "POST", f"/{_SLUG}/workspace/build", {"expected_instance_id": _INSTANCE}, {"revision": 4}),
         ("publish", {"expected_revision": 4, "note": "Fix title"}, "POST", f"/{_SLUG}/workspace/publish", {"expected_instance_id": _INSTANCE, "expected_revision": 4, "note": "Fix title"}, {"version_id": "v2"}),
         ("maintainer_schedule_status", {}, "GET", f"/{_SLUG}/maintainer_schedule?expected_instance_id={_INSTANCE}", None, {"app_instance_id": _INSTANCE, "schedule": "0 9 * * *", "timezone": "Asia/Shanghai", "enabled": False, "schedule_revision": 4}),
-        ("maintainer_schedule", {"expected_schedule_revision": 4, "schedule": "0 9 * * *", "timezone": "Asia/Shanghai", "enabled": False}, "POST", f"/{_SLUG}/maintainer_schedule", {"expected_instance_id": _INSTANCE, "expected_schedule_revision": 4, "schedule": "0 9 * * *", "timezone": "Asia/Shanghai", "enabled": False}, {"app_instance_id": _INSTANCE, "schedule_revision": 5}),
     ]
     with mux_profile_scope(monkeypatch, _SCOPE):
         for action, extra, method, path, expected_body, response in cases:
@@ -123,6 +127,29 @@ def test_workspace_rejects_generic_path_and_unused_fields_without_request(monkey
     assert extra_result["status"] == 0 and extra_result["error"]["code"] == "invalid_request"
 
 
+def test_apply_patch_rejects_content_that_cannot_fit_a_follow_up_read(monkeypatch):
+    def never(*_):
+        raise AssertionError("unreadable replacement must not be sent")
+
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", never):
+        output = json.loads(app_workspace_tool(_args(
+            "apply_patch", path="main.go", expected_sha256=_SHA,
+            content="x" * (_MAX_PATCH_BYTES + 1),
+        )))
+    assert output["status"] == 0
+    assert output["error"]["code"] == "invalid_request"
+
+
+def test_workspace_rejects_path_that_would_exhaust_the_read_response_margin(monkeypatch):
+    def never(*_):
+        raise AssertionError("oversized path must not be sent")
+
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", never):
+        output = json.loads(app_workspace_tool(_args("read", path="a" * (_MAX_PATH_CHARS + 1))))
+    assert output["status"] == 0
+    assert output["error"]["code"] == "invalid_request"
+
+
 def test_bodyless_old_server_404_fails_closed_without_fallback(monkeypatch):
     error = urllib.error.HTTPError(_BASE + "/x", 404, "not found", {}, io.BytesIO(b"404 page not found"))
     with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", side_effect=error):
@@ -141,43 +168,16 @@ def test_workspace_rejects_wrong_success_status(monkeypatch):
     assert output["error"]["code"] == "outcome_unknown"
 
 
-def test_maintainer_schedule_requires_its_own_revision_and_verified_receipt(monkeypatch):
+def test_maintainer_schedule_mutation_is_not_exposed_without_a_confirmation_contract(monkeypatch):
     def never(*_):
-        raise AssertionError("invalid schedule request must not be sent")
+        raise AssertionError("unconfirmed schedule request must not be sent")
     with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", never):
-        missing = json.loads(app_workspace_tool(_args(
-            "maintainer_schedule", schedule="0 9 * * *", timezone="Asia/Shanghai", enabled=True,
-        )))
-        old_field = json.loads(app_workspace_tool(_args(
-            "maintainer_schedule", expected_revision=4, schedule="0 9 * * *", timezone="Asia/Shanghai", enabled=True,
-        )))
-    assert missing["error"]["code"] == "invalid_request" and missing["status"] == 0
-    assert old_field["error"]["code"] == "invalid_request" and old_field["status"] == 0
-
-    with mux_profile_scope(monkeypatch, _SCOPE), patch(
-        "tools.app_workspace_tool._apphost._urlopen",
-        _capture({}, _Response({"app_instance_id": _INSTANCE, "schedule_revision": 5})),
-    ):
-        accepted = json.loads(app_workspace_tool(_args(
+        output = json.loads(app_workspace_tool(_args(
             "maintainer_schedule", expected_schedule_revision=4,
             schedule="0 9 * * *", timezone="Asia/Shanghai", enabled=True,
         )))
-    assert accepted["ok"] is True
-
-    for bad in (
-        {"app_instance_id": _INSTANCE},
-        {"app_instance_id": "other", "schedule_revision": 5},
-        {"app_instance_id": _INSTANCE, "schedule_revision": -1},
-    ):
-        with mux_profile_scope(monkeypatch, _SCOPE), patch(
-            "tools.app_workspace_tool._apphost._urlopen", _capture({}, _Response(bad))
-        ):
-            rejected = json.loads(app_workspace_tool(_args(
-                "maintainer_schedule", expected_schedule_revision=4,
-                schedule="0 9 * * *", timezone="Asia/Shanghai", enabled=True,
-            )))
-        assert rejected["ok"] is False
-        assert rejected["error"]["code"] == "outcome_unknown"
+    assert output["error"]["code"] == "invalid_request"
+    assert output["status"] == 0
 
 
 def test_maintainer_schedule_status_rejects_absent_or_incomplete_revision(monkeypatch):

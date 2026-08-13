@@ -3090,6 +3090,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def migrate_session_owner_from_account(
+        self,
+        session_id: str,
+        expected_account_id: str,
+        owner_principal: str,
+    ) -> bool:
+        """Atomically upgrade one proven legacy Zet session owner.
+
+        The caller must have received both identities from the authenticated
+        Zet boundary.  This deliberately cannot infer ownership for NULL rows
+        or for a session belonging to another account.
+        """
+        if not session_id or not expected_account_id or not owner_principal:
+            return False
+
+        def _do(conn):
+            result = conn.execute(
+                "UPDATE sessions SET user_id = ? WHERE id = ? AND user_id = ?",
+                (owner_principal, session_id, expected_account_id),
+            )
+            return result.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
     def record_gateway_session_peer(
         self,
         session_id: str,

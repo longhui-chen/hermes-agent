@@ -754,12 +754,19 @@ _COMPLETION_STATUS = {
 }
 
 
-def _workflow_operation_status(status, parsed):
+def _workflow_operation_status(status, parsed, requested_operation_id):
     if not isinstance(parsed, dict):
         return _local_error("outcome_unknown", "operation journal returned no object", status=status)
     operation_id, terminal = parsed.get("operation_id"), parsed.get("terminal")
     if not isinstance(operation_id, str) or not operation_id or not isinstance(terminal, str) or not terminal:
         return _local_error("outcome_unknown", "operation journal omitted operation_id or terminal", status=status)
+    if operation_id != requested_operation_id:
+        # The route itself identifies the requested journal.  Accepting a
+        # different body receipt would let a stale or misrouted response make
+        # the caller act on another workflow's state.
+        return _operation_outcome_unknown(
+            status, requested_operation_id, "operation journal returned a mismatched operation receipt"
+        )
     if status == 202:
         if terminal not in {"pending", "unknown"}:
             return _local_error("outcome_unknown", "accepted operation is not pending or unknown", status=status)
@@ -926,7 +933,9 @@ def app_host_tool(args, **_kw):
             if not text.strip() or "json" not in content_type:
                 return _local_error("outcome_unknown", "operation journal returned no JSON receipt", status=status)
             try:
-                return _workflow_operation_status(status, json.loads(text))
+                return _workflow_operation_status(
+                    status, json.loads(text), str(args.get("operation_id", "") or "").strip()
+                )
             except Exception:
                 return _local_error("outcome_unknown", "operation journal returned invalid JSON", status=status)
         if content_type.startswith("text/"):

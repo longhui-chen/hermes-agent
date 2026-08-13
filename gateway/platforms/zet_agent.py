@@ -892,17 +892,47 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return bool(_delegation_advance_url())
 
-    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
-        """Bind local-server's browser scope capability for this API request.
+    async def _handle_with_zettlab_identity(self, request, handler):
+        """Bind authenticated Zet account/principal identity for one API route.
 
-        The base handler creates the agent task while this context is active,
-        so ContextVar propagation carries the token into synchronous tool
-        workers without exposing it through process-global environment state.
+        Base handlers authenticate before constructing an agent, so these
+        request-scoped values cannot affect agent or memory state before the
+        gateway token is accepted.  The account stays separate for Memo;
+        principal is passed only as the persistent SessionDB owner.
         """
         from gateway.session_context import (
             pop_zettlab_auth_principal,
-            pop_zettlab_browser_session_token,
             push_zettlab_auth_principal,
+        )
+
+        # Do not even bind request-supplied identity until the Zet gateway
+        # token has been accepted. The inherited handler repeats this cheap
+        # check as part of its admission/deadline reservation.
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        principal = str(request.headers.get("X-Zettlab-Auth-Principal-Id", "") or "").strip()
+        if principal and (
+            len(principal) > 256
+            or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in principal)
+        ):
+            return web.json_response(
+                {"error": {"message": "Invalid auth principal", "type": "invalid_request_error"}},
+                status=400,
+            )
+        account_token = _zettlab_request_account_id.set(_request_account_id(request))
+        principal_token = push_zettlab_auth_principal(principal)
+        try:
+            return await handler(request)
+        finally:
+            pop_zettlab_auth_principal(principal_token)
+            _zettlab_request_account_id.reset(account_token)
+
+    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
+        """Bind browser capability and Zet identity for chat completions."""
+        from gateway.session_context import (
+            pop_zettlab_browser_session_token,
             push_zettlab_browser_session_token,
         )
 
@@ -910,27 +940,19 @@ class ZetAgentAdapter(APIServerAdapter):
             request.headers.get("X-Zettlab-Browser-Session-Token", "")
         )
         try:
-            principal = str(request.headers.get("X-Zettlab-Auth-Principal-Id", "") or "").strip()
-            if principal and (
-                len(principal) > 256
-                or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in principal)
-            ):
-                return web.json_response(
-                    {"error": {"message": "Invalid auth principal", "type": "invalid_request_error"}},
-                    status=400,
-                )
-            # The account identity keeps main's personal Memo isolation intact;
-            # the explicit principal remains the owner identity for App Host
-            # transcript forks and wins where the two integrations share user_id.
-            account_token = _zettlab_request_account_id.set(_request_account_id(request))
-            principal_token = push_zettlab_auth_principal(principal)
-            try:
-                return await super()._handle_chat_completions(request)
-            finally:
-                pop_zettlab_auth_principal(principal_token)
-                _zettlab_request_account_id.reset(account_token)
+            return await self._handle_with_zettlab_identity(
+                request, super()._handle_chat_completions
+            )
         finally:
             pop_zettlab_browser_session_token(token)
+
+    async def _handle_responses(self, request: "web.Request") -> "web.Response":
+        return await self._handle_with_zettlab_identity(
+            request, super()._handle_responses
+        )
+
+    async def _handle_runs(self, request: "web.Request") -> "web.Response":
+        return await self._handle_with_zettlab_identity(request, super()._handle_runs)
 
     def _bind_turn_session_context(
         self,
@@ -2890,7 +2912,13 @@ class ZetAgentAdapter(APIServerAdapter):
         # matches the turn's confirm/auto behaviour. Absent (async /v1/runs path,
         # or non-plan callers) → None → manual (safe default).
         agent_request_overrides = dict(request_overrides or {})
-        session_user_id = str(agent_request_overrides.pop("_zettlab_auth_principal", "") or "").strip()
+        from gateway.session_context import zettlab_auth_principal
+
+        session_owner_id = str(
+            zettlab_auth_principal()
+            or agent_request_overrides.pop("_zettlab_auth_principal", "")
+            or ""
+        ).strip()
         plan_auto_execute = agent_request_overrides.pop(
             "_zet_plan_auto_execute", None
         )
@@ -3168,7 +3196,10 @@ class ZetAgentAdapter(APIServerAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
             "request_overrides": agent_request_overrides or None,
-            "user_id": session_user_id or _zettlab_request_account_id.get() or None,
+            # `user_id` remains the Memo/account partition.  Transcript rows
+            # use the separate principal-only `session_owner_id`.
+            "user_id": _zettlab_request_account_id.get() or None,
+            "session_owner_id": session_owner_id or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -3200,6 +3231,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 str(runtime_kwargs.get("provider") or ""),
                 str(runtime_kwargs.get("base_url") or ""),
                 str(_zettlab_request_account_id.get() or ""),
+                session_owner_id,
             )
             agent = self._cached_onboarding_agent(onboarding_cache_key)
         reused_onboarding_agent = agent is not None

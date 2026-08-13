@@ -2,7 +2,7 @@
 
 This is intentionally not a terminal or filesystem bridge.  App Host owns the
 checkout, validates the dedicated maintainer binding, and exposes only the
-seven fixed workspace actions plus the typed maintainer schedule update.
+seven fixed workspace actions plus read-only maintainer schedule status.
 """
 
 from __future__ import annotations
@@ -20,10 +20,15 @@ from tools.registry import registry
 
 _ACTIONS = frozenset({
     "status", "checkout", "read", "apply_patch", "build", "publish",
-    "discard", "maintainer_schedule_status", "maintainer_schedule",
+    "discard", "maintainer_schedule_status",
 })
-_MAX_PATCH_BYTES = 8 << 20
 _MAX_RESPONSE_BYTES = 1024 * 1024
+# App Host accepts an 8 MiB patch, but a subsequent read serializes its
+# ``[]byte`` content as base64 while this adapter intentionally caps every
+# response at 1 MiB.  Keep a 10 KiB wire-envelope margin (path + JSON) below
+# that cap so every accepted UTF-8 replacement can be read back by this tool.
+_MAX_PATCH_BYTES = 760 << 10
+_MAX_PATH_CHARS = 1024
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -72,26 +77,9 @@ APP_WORKSPACE_SCHEMA = {
                 "minimum": 0,
                 "description": "For publish only: app workspace revision returned by status, preventing a stale checkout from publishing.",
             },
-            "expected_schedule_revision": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "For maintainer_schedule only: schedule_revision returned by maintainer_schedule_status. This is a separate server-owned cron-job revision, not the app workspace revision.",
-            },
             "note": {
                 "type": "string",
                 "description": "For publish only: a concise user-facing description of this version change.",
-            },
-            "schedule": {
-                "type": "string",
-                "description": "For maintainer_schedule only: the schedule expression to apply to this dedicated maintainer.",
-            },
-            "timezone": {
-                "type": "string",
-                "description": "For maintainer_schedule only: IANA timezone for the schedule.",
-            },
-            "enabled": {
-                "type": "boolean",
-                "description": "For maintainer_schedule only: whether this schedule is enabled.",
             },
         },
         "required": ["action", "slug", "expected_instance_id"],
@@ -121,6 +109,8 @@ def _required_path(args: dict) -> str:
     path = str(args.get("path", "") or "").strip()
     if not path or path == "." or path.startswith("/") or "\\" in path:
         raise _apphost._BadRequest("path 必须是 app workspace 内的相对文件路径")
+    if len(path) > _MAX_PATH_CHARS:
+        raise _apphost._BadRequest("path 超过 App Workspace 上限")
     parts = path.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise _apphost._BadRequest("path 必须是 app workspace 内的相对文件路径")
@@ -131,15 +121,6 @@ def _required_revision(args: dict) -> int:
     revision = args.get("expected_revision")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise _apphost._BadRequest("expected_revision 必须是 status 返回的非负整数")
-    return revision
-
-
-def _required_schedule_revision(args: dict) -> int:
-    revision = args.get("expected_schedule_revision")
-    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-        raise _apphost._BadRequest(
-            "expected_schedule_revision 必须是 maintainer_schedule_status 返回的非负整数"
-        )
     return revision
 
 
@@ -205,21 +186,7 @@ def _build_request(args: dict):
             "expected_revision": _required_revision(args),
             "note": note,
         }, _apphost._LONG_TIMEOUT
-    _only(args, base_fields | {"expected_schedule_revision", "schedule", "timezone", "enabled"})
-    schedule, timezone, enabled = args.get("schedule"), args.get("timezone"), args.get("enabled")
-    if not isinstance(schedule, str) or not schedule.strip():
-        raise _apphost._BadRequest("maintainer_schedule 需要非空 schedule")
-    if not isinstance(timezone, str) or not timezone.strip():
-        raise _apphost._BadRequest("maintainer_schedule 需要非空 timezone")
-    if not isinstance(enabled, bool):
-        raise _apphost._BadRequest("maintainer_schedule 需要 boolean enabled")
-    return "POST", f"/{quote(slug, safe='')}/maintainer_schedule", {
-        "expected_instance_id": instance,
-        "expected_schedule_revision": _required_schedule_revision(args),
-        "schedule": schedule,
-        "timezone": timezone,
-        "enabled": enabled,
-    }, _apphost._DEFAULT_TIMEOUT
+    raise AssertionError("declared workspace actions were handled above")
 
 
 def _normalize_read(parsed):
@@ -310,11 +277,11 @@ def app_workspace_tool(args, **_kw) -> str:
         parsed = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return _apphost._local_error("outcome_unknown", "App Workspace 返回了无效 JSON", status=status)
-    if action in {"maintainer_schedule_status", "maintainer_schedule"}:
+    if action == "maintainer_schedule_status":
         checked = _schedule_response(
             parsed,
             expected_instance_id=str(args.get("expected_instance_id") or "").strip(),
-            is_status=action == "maintainer_schedule_status",
+            is_status=True,
         )
         if checked is None:
             return _apphost._local_error(

@@ -35,6 +35,31 @@ def _stage(db, *, import_id="imp-1", chunk_index=0, messages=None, expected=2,
     )
 
 
+def test_session_owner_migration_is_exact_and_never_infers_null_rows(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("account-owned", "zet_agent", user_id="account-1")
+        db.create_session("other-account", "zet_agent", user_id="account-2")
+        db.create_session("unowned", "zet_agent", user_id=None)
+
+        assert db.migrate_session_owner_from_account(
+            "account-owned", "account-1", "iam:alice"
+        ) is True
+        assert db.get_session("account-owned")["user_id"] == "iam:alice"
+
+        assert db.migrate_session_owner_from_account(
+            "other-account", "account-1", "iam:alice"
+        ) is False
+        assert db.get_session("other-account")["user_id"] == "account-2"
+
+        assert db.migrate_session_owner_from_account(
+            "unowned", "account-1", "iam:alice"
+        ) is False
+        assert db.get_session("unowned")["user_id"] is None
+    finally:
+        db.close()
+
+
 def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
