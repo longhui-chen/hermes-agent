@@ -12353,7 +12353,8 @@ def main():
         "import-transcript",
         help="Copy another profile's conversation into this profile as a new session",
         description=(
-            "Fork a session across profiles: read the source profile's "
+            "Trusted Local Server operation. Fork a session across profiles: "
+            "read the source profile's "
             "transcript read-only and publish the importable part of it as a "
             "new session here. Only user/assistant messages carrying text "
             "cross over — tool calls and in-flight state are rejected by the "

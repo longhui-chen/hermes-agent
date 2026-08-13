@@ -14,7 +14,20 @@ import types
 
 import pytest
 
-from hermes_cli.sessions_cmd import cmd_sessions, importable_transcript_messages
+from hermes_cli.sessions_cmd import (
+    _assert_trusted_transcript_import_parent,
+    cmd_sessions,
+    importable_transcript_messages,
+)
+
+
+@pytest.fixture(autouse=True)
+def trusted_local_server_runner(monkeypatch):
+    """Existing import-contract tests run behind the production auth boundary."""
+    monkeypatch.setattr(
+        "hermes_cli.sessions_cmd._assert_trusted_transcript_import_parent",
+        lambda: None,
+    )
 
 
 def row(role, content, timestamp=1_700_000_000.0, *, active=1, llm_visible=1):
@@ -69,6 +82,40 @@ class TestImportableTranscriptMessages:
             row("assistant", "text survives"),
         ])
         assert [message["content"] for message in kept] == ["text survives"]
+
+
+class TestTranscriptImportRunnerAuthorization:
+    def test_an_environment_marker_alone_cannot_authorize(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT", "1")
+        monkeypatch.setattr("hermes_cli.sessions_cmd.sys.platform", "linux")
+        monkeypatch.setattr(
+            "hermes_cli.sessions_cmd.os.readlink",
+            lambda _path: "/tmp/zettlab-local-server",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.sessions_cmd.os.stat",
+            lambda _path: types.SimpleNamespace(st_mode=0o100755, st_uid=1000),
+        )
+
+        with pytest.raises(PermissionError, match="not Local Server"):
+            _assert_trusted_transcript_import_parent()
+
+    def test_accepts_only_the_root_owned_packaged_local_server(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT", "1")
+        monkeypatch.setattr("hermes_cli.sessions_cmd.sys.platform", "linux")
+        monkeypatch.setattr(
+            "hermes_cli.sessions_cmd.os.readlink",
+            lambda _path: (
+                "/zettos/main/apps/com.zettlab.local-server/1.2.3/"
+                "sbin/zettlab-local-server"
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.sessions_cmd.os.stat",
+            lambda _path: types.SimpleNamespace(st_mode=0o100755, st_uid=0),
+        )
+
+        _assert_trusted_transcript_import_parent()
 
 
 def _seed_source_profile(db_path, session_id, rows):
@@ -168,6 +215,25 @@ def cmd_sessions_with_db(args, db):
 
 
 class TestForkAcrossProfiles:
+    def test_rejects_public_cli_before_reading_a_sibling_profile(
+        self, forked, monkeypatch
+    ):
+        def reject():
+            raise PermissionError(
+                "transcript import requires the trusted Local Server runner"
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.sessions_cmd._assert_trusted_transcript_import_parent",
+            reject,
+        )
+        result = forked.run()
+        assert result == {
+            "ok": False,
+            "error": "transcript import requires the trusted Local Server runner",
+        }
+        assert forked.staged == []
+
     def test_reports_what_crossed_over_and_what_did_not(self, forked):
         result = forked.run()
         assert result["ok"] is True

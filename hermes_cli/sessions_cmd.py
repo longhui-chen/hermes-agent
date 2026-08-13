@@ -20,8 +20,43 @@ time — no import cycle).
 """
 
 import os
+import stat
 import sys
 from pathlib import Path
+
+
+_TRUSTED_TRANSCRIPT_IMPORT_ENV = "ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT"
+_ZETTOS_LOCAL_SERVER_ROOT = "/zettos/main/apps/com.zettlab.local-server"
+
+
+def _assert_trusted_transcript_import_parent() -> None:
+    """Allow cross-profile reads only for a direct Local Server child.
+
+    The environment marker is intent, not authority: a model can set its own
+    environment.  Authority comes from Linux' parent-process metadata plus the
+    immutable ZettOS package boundary.  The executable must be the root-owned,
+    non-writable Local Server binary under its package root.  A terminal command
+    spawned by Hermes has Hermes/the shell as its parent and therefore fails.
+    """
+    if os.environ.get(_TRUSTED_TRANSCRIPT_IMPORT_ENV) != "1":
+        raise PermissionError("transcript import requires the trusted Local Server runner")
+    if not sys.platform.startswith("linux"):
+        raise PermissionError("transcript import is available only on a managed ZettOS device")
+
+    try:
+        parent_exe = os.path.realpath(os.readlink(f"/proc/{os.getppid()}/exe"))
+        parent_stat = os.stat(parent_exe)
+    except OSError as exc:
+        raise PermissionError("cannot attest the transcript import runner") from exc
+
+    expected_prefix = _ZETTOS_LOCAL_SERVER_ROOT + "/"
+    expected_suffix = "/sbin/zettlab-local-server"
+    if not parent_exe.startswith(expected_prefix) or not parent_exe.endswith(expected_suffix):
+        raise PermissionError("transcript import runner is not Local Server")
+    if not stat.S_ISREG(parent_stat.st_mode) or parent_stat.st_uid != 0:
+        raise PermissionError("transcript import runner is not a root-owned executable")
+    if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError("transcript import runner is writable by an untrusted principal")
 
 
 def _m():
@@ -977,6 +1012,14 @@ def cmd_sessions(args, sessions_parser=None):
                 print(_json.dumps({"ok": False, "error": message}, ensure_ascii=False))
             else:
                 print(f"Error: {message}", file=sys.stderr)
+
+        # Do this before consulting receipts or resolving the source profile:
+        # both the sibling read and a replayed target commit are privileged.
+        try:
+            _assert_trusted_transcript_import_parent()
+        except PermissionError as exc:
+            _fail(str(exc))
+            return 1
 
         try:
             source_profile = normalize_profile_name(args.source_profile)
