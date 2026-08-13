@@ -52,7 +52,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Any, Iterator, Optional
@@ -63,6 +63,21 @@ from hermes_constants import display_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+# Internal cancellation signal for synchronous providers invoked by the
+# conversational sentence pipeline. Keeping this context-local avoids adding a
+# model-visible tool parameter while still letting a provider abort its active
+# transport when the user barges in.
+_TTS_CANCEL_EVENT: ContextVar[Optional[threading.Event]] = ContextVar(
+    "_TTS_CANCEL_EVENT",
+    default=None,
+)
+
+
+def _current_tts_cancel_event() -> Optional[threading.Event]:
+    return _TTS_CANCEL_EVENT.get()
+
+
 def get_env_value(name, default=None):
     """Read env values through the live config module.
 
@@ -450,6 +465,7 @@ def _write_tts_response_to_file(
     *,
     label: str,
     limit: Optional[int] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
     """Stage a bounded response beside the target, then atomically publish it."""
     limit = TTS_RESPONSE_BODY_LIMIT_BYTES if limit is None else limit
@@ -457,6 +473,13 @@ def _write_tts_response_to_file(
     partial_id = str(uuid.uuid4()).replace("-", "")
     partial = target.with_name(f".{target.name}.{partial_id}.part")
     total = 0
+
+    def _raise_if_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            _close_response(response)
+            raise RuntimeError(f"{label} request cancelled")
+
+    _raise_if_cancelled()
 
     headers = getattr(response, "headers", None)
     content_length = None
@@ -497,13 +520,16 @@ def _write_tts_response_to_file(
             stream_to_file = getattr(response, "stream_to_file", None)
             if not callable(stream_to_file):
                 raise RuntimeError(f"{label} response is not streamable")
+            _raise_if_cancelled()
             stream_to_file(str(partial))
+            _raise_if_cancelled()
             total = partial.stat().st_size
             if total > limit:
                 raise RuntimeError(f"{label} response exceeds {limit} bytes")
         else:
             with partial.open("wb") as output:
                 for chunk in iterator:
+                    _raise_if_cancelled()
                     if not chunk:
                         continue
                     if isinstance(chunk, str):
@@ -514,6 +540,7 @@ def _write_tts_response_to_file(
                         raise RuntimeError(f"{label} response exceeds {limit} bytes")
                     output.write(chunk)
 
+        _raise_if_cancelled()
         os.replace(partial, target)
     except Exception:
         try:
@@ -1673,6 +1700,7 @@ def _generate_openai_tts(
     stream_response: bool = False,
     client_kwargs: Optional[Dict[str, Any]] = None,
     label: str = "OpenAI TTS",
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     """Generate audio via the OpenAI ``audio.speech.create`` SDK shape.
 
@@ -1702,6 +1730,9 @@ def _generate_openai_tts(
             file sink sees bytes as they arrive.
         client_kwargs: Optional already-resolved OpenAI client transport args.
         label: Provider label used in bounded-response errors.
+        cancel_event: Internal conversational cancellation signal. When set,
+            close the active transport so a barge-in does not leave a managed
+            request running until its read timeout.
 
     Returns:
         Path to the saved audio file.
@@ -1756,6 +1787,45 @@ def _generate_openai_tts(
 
     OpenAIClient = _import_openai_client()
     client = OpenAIClient(api_key=api_key, base_url=base_url, **(client_kwargs or {}))
+    close_lock = threading.Lock()
+    close_complete = False
+    cancel_watch_done = threading.Event()
+
+    def _close_client_once() -> None:
+        nonlocal close_complete
+        with close_lock:
+            if close_complete:
+                return
+            close_complete = True
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    cancel_watcher: Optional[threading.Thread] = None
+    if cancel_event is not None:
+        if cancel_event.is_set():
+            _close_client_once()
+            raise RuntimeError(f"{label} request cancelled")
+
+        def _close_on_cancel() -> None:
+            while not cancel_watch_done.wait(0.05):
+                if cancel_event.is_set():
+                    try:
+                        _close_client_once()
+                    except Exception:
+                        logger.debug(
+                            "%s client close failed during cancellation",
+                            label,
+                            exc_info=True,
+                        )
+                    return
+
+        cancel_watcher = threading.Thread(
+            target=_close_on_cancel,
+            name="tts-openai-cancel",
+            daemon=True,
+        )
+        cancel_watcher.start()
     try:
         create_kwargs: Dict[str, Any] = {
             "model": model,
@@ -1782,6 +1852,7 @@ def _generate_openai_tts(
                     response,
                     output_path,
                     label=label,
+                    cancel_event=cancel_event,
                 )
         else:
             response = client.audio.speech.create(**create_kwargs)
@@ -1792,9 +1863,10 @@ def _generate_openai_tts(
             response.stream_to_file(output_path)
         return output_path
     finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()
+        cancel_watch_done.set()
+        _close_client_once()
+        if cancel_watcher is not None:
+            cancel_watcher.join(timeout=0.2)
 
 
 # ===========================================================================
@@ -3779,7 +3851,14 @@ class _SyncSentencePipeline:
             fd, tmp_path = tempfile.mkstemp(dir=synthesis_dir, suffix=".mp3")
             os.close(fd)
             tmp_real_path = Path(os.path.realpath(tmp_path))
-            raw_result = text_to_speech_tool(text=cleaned, output_path=tmp_path)
+            cancel_token = _TTS_CANCEL_EVENT.set(self._stop)
+            try:
+                raw_result = text_to_speech_tool(
+                    text=cleaned,
+                    output_path=tmp_path,
+                )
+            finally:
+                _TTS_CANCEL_EVENT.reset(cancel_token)
             try:
                 result = json.loads(raw_result)
             except (TypeError, json.JSONDecodeError) as exc:

@@ -408,6 +408,52 @@ class TestBundledDiscovery:
         assert not loaded.enabled
         assert loaded.error == "disabled via config"
 
+    def test_disabled_policy_ignores_unscoped_unrelated_secret_refs(
+        self,
+        _isolate_env,
+    ):
+        """Multiplex startup must honor deny-list policy before profile scope."""
+        import yaml
+        from agent import secret_scope
+        from hermes_cli import plugins as pmod
+
+        cfg_path = _isolate_env / "config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump(
+                {
+                    "plugins": {"disabled": ["tts/zettlab"]},
+                    "tts": {"openai": {"api_key": "${env:OPENAI_API_KEY}"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        previous_multiplex = secret_scope.is_multiplex_active()
+        secret_scope.set_multiplex_active(True)
+        try:
+            mgr = pmod.PluginManager()
+            mgr.discover_and_load()
+        finally:
+            secret_scope.set_multiplex_active(previous_multiplex)
+
+        loaded = mgr._plugins["tts/zettlab"]
+        assert not loaded.enabled
+        assert loaded.error == "disabled via config"
+
+    def test_plugin_policy_parse_failure_aborts_discovery(self, _isolate_env):
+        """Unreadable policy must not turn into an empty allow/deny list."""
+        cfg_path = _isolate_env / "config.yaml"
+        cfg_path.write_text("plugins: [", encoding="utf-8")
+
+        from hermes_cli import plugins as pmod
+
+        mgr = pmod.PluginManager()
+        with pytest.raises(Exception):
+            mgr.discover_and_load()
+
+        assert mgr._plugins == {}
+        assert mgr._discovered is False
+
     def test_memory_and_context_engine_subdirs_skipped(self, _isolate_env):
         """Bundled scan must NOT pick up plugins/memory or plugins/context_engine
         as top-level plugins — they have their own discovery paths."""

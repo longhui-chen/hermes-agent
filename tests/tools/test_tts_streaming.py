@@ -921,6 +921,32 @@ def test_sync_pipeline_stop_skips_queued_playback(monkeypatch):
     assert stop.is_set() and done.is_set()
 
 
+def test_sync_pipeline_propagates_stop_to_inflight_synthesis(monkeypatch):
+    from tools import tts_tool
+
+    started = threading.Event()
+    cancelled = threading.Event()
+    stop = threading.Event()
+
+    def fake_synth(**_kwargs):
+        active_cancel_event = tts_tool._current_tts_cancel_event()
+        assert active_cancel_event is stop
+        started.set()
+        assert active_cancel_event.wait(timeout=1)
+        cancelled.set()
+        return json.dumps({"success": False, "error": "cancelled"})
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+
+    pipeline = tts_tool._SyncSentencePipeline(stop)
+    pipeline.speak("Cancel this synthesis.")
+    assert started.wait(timeout=1)
+    stop.set()
+    pipeline.close()
+
+    assert cancelled.is_set()
+
+
 def test_sync_pipeline_cleans_temp_files(monkeypatch):
     from tools import tts_tool
 

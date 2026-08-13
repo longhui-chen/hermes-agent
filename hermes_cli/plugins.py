@@ -246,23 +246,48 @@ def _env_enabled(name: str) -> bool:
     return env_var_enabled(name)
 
 
-def _get_disabled_plugins() -> set:
+def _load_plugin_policy_config() -> Dict[str, Any]:
+    """Read plugin policy without expanding unrelated config secrets.
+
+    Plugin discovery can run before a multiplex request has installed its
+    profile secret scope. Loading the complete resolved config here would make
+    an unrelated ``${...}`` reference abort policy resolution and silently
+    drop ``plugins.disabled``. Read the raw user file instead, then apply the
+    administrator-managed overlay so plugin policy keeps the same precedence.
+
+    Parse and I/O errors deliberately propagate: discovery must fail closed
+    before any plugin is loaded when its allow/deny policy cannot be read.
+    """
+    config_path = get_hermes_home() / "config.yaml"
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            config = fast_safe_load(config_file) or {}
+    except FileNotFoundError:
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+
+    from hermes_cli.managed_scope import apply_managed_overlay
+
+    return apply_managed_overlay(config)
+
+
+def _get_disabled_plugins(config: Optional[Dict[str, Any]] = None) -> set:
     """Read the disabled plugins list from config.yaml.
 
     Kept for backward compat and explicit deny-list semantics. A plugin
     name in this set will never load, even if it appears in
     ``plugins.enabled``.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        disabled = cfg_get(config, "plugins", "disabled", default=[])
-        return set(disabled) if isinstance(disabled, list) else set()
-    except Exception:
-        return set()
+    if config is None:
+        config = _load_plugin_policy_config()
+    disabled = cfg_get(config, "plugins", "disabled", default=[])
+    return set(disabled) if isinstance(disabled, list) else set()
 
 
-def _get_enabled_plugins() -> Optional[set]:
+def _get_enabled_plugins(
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[set]:
     """Read the enabled-plugins allow-list from config.yaml.
 
     Plugins are opt-in by default — only plugins whose name appears in
@@ -276,20 +301,17 @@ def _get_enabled_plugins() -> Optional[set]:
     * ``set()`` — an empty list was explicitly set; nothing loads.
     * ``set(...)`` — the concrete allow-list.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        plugins_cfg = config.get("plugins")
-        if not isinstance(plugins_cfg, dict):
-            return None
-        if "enabled" not in plugins_cfg:
-            return None
-        enabled = plugins_cfg.get("enabled")
-        if not isinstance(enabled, list):
-            return None
-        return set(enabled)
-    except Exception:
+    if config is None:
+        config = _load_plugin_policy_config()
+    plugins_cfg = config.get("plugins")
+    if not isinstance(plugins_cfg, dict):
         return None
+    if "enabled" not in plugins_cfg:
+        return None
+    enabled = plugins_cfg.get("enabled")
+    if not isinstance(enabled, list):
+        return None
+    return set(enabled)
 
 
 # ---------------------------------------------------------------------------

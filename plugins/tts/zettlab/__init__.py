@@ -134,7 +134,10 @@ class ZettlabTTSProvider(TTSProvider):
 
         gateway_base_url, gateway_headers = media_client.tts_gateway_runtime()
         token = gateway_headers[media_client.ACTION_TOKEN_HEADER]
-        from tools.tts_tool import _generate_openai_tts
+        from tools.tts_tool import (
+            _current_tts_cancel_event,
+            _generate_openai_tts,
+        )
 
         http_client = httpx.Client(
             trust_env=False,
@@ -163,6 +166,7 @@ class ZettlabTTSProvider(TTSProvider):
                 stream_response=True,
                 client_kwargs={"http_client": http_client, "max_retries": 0},
                 label="Zettlab TTS",
+                cancel_event=_current_tts_cancel_event(),
             )
         finally:
             http_client.close()

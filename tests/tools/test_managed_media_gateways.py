@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -310,6 +311,98 @@ def test_tts_bounded_file_sink_removes_partial_output(monkeypatch, tmp_path):
 
     assert not output_path.exists()
     assert list(tmp_path.glob("*.part")) == []
+
+
+def test_tts_bounded_file_sink_cancellation_removes_partial_output(
+    monkeypatch,
+    tmp_path,
+):
+    _install_fake_tools_package()
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    output_path = tmp_path / "cancelled.mp3"
+    cancel_event = threading.Event()
+    response_closed = threading.Event()
+
+    class CancelledResponse:
+        headers = {}
+
+        def iter_bytes(self, chunk_size=None):
+            del chunk_size
+            yield b"partial-audio"
+            cancel_event.set()
+            yield b"must-not-be-written"
+
+        def close(self):
+            response_closed.set()
+
+    with pytest.raises(RuntimeError, match="request cancelled"):
+        tts_tool._write_tts_response_to_file(
+            CancelledResponse(),
+            str(output_path),
+            label="test TTS",
+            cancel_event=cancel_event,
+        )
+
+    assert response_closed.is_set()
+    assert not output_path.exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_openai_tts_cancellation_closes_blocked_client(monkeypatch, tmp_path):
+    _install_fake_tools_package()
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    request_started = threading.Event()
+    transport_released = threading.Event()
+    client_closed = threading.Event()
+    cancel_event = threading.Event()
+    failures = []
+    close_calls = []
+
+    class BlockingClient:
+        def __init__(self, **_kwargs):
+            def create(**_create_kwargs):
+                request_started.set()
+                assert transport_released.wait(timeout=2)
+                raise RuntimeError("transport closed")
+
+            self.audio = types.SimpleNamespace(
+                speech=types.SimpleNamespace(
+                    with_streaming_response=types.SimpleNamespace(create=create)
+                )
+            )
+
+        def close(self):
+            close_calls.append(True)
+            client_closed.set()
+            transport_released.set()
+
+    monkeypatch.setattr(tts_tool, "_import_openai_client", lambda: BlockingClient)
+
+    def invoke() -> None:
+        try:
+            tts_tool._generate_openai_tts(
+                "cancel me",
+                str(tmp_path / "cancelled.mp3"),
+                {},
+                api_key="action-token",
+                base_url="http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                stream_response=True,
+                cancel_event=cancel_event,
+                label="Zettlab TTS",
+            )
+        except Exception as exc:
+            failures.append(exc)
+
+    request_thread = threading.Thread(target=invoke, daemon=True)
+    request_thread.start()
+    assert request_started.wait(timeout=1)
+    cancel_event.set()
+
+    assert client_closed.wait(timeout=1)
+    request_thread.join(timeout=1)
+    assert not request_thread.is_alive()
+    assert len(close_calls) == 1
+    assert failures and str(failures[0]) == "transport closed"
 
 
 def test_zettlab_tts_explicit_direct_openai_opt_out_wins(monkeypatch, tmp_path):

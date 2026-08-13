@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -134,12 +135,17 @@ def test_zettlab_provider_uses_capability_transport_contract(monkeypatch, tmp_pa
 
     monkeypatch.setattr(tts_tool, "_generate_openai_tts", fake_generate)
 
-    result = ZettlabTTSProvider().synthesize(
-        "hello",
-        str(tmp_path / "speech.mp3"),
-        format="opus",
-        speed=1.25,
-    )
+    cancel_event = threading.Event()
+    cancel_token = tts_tool._TTS_CANCEL_EVENT.set(cancel_event)
+    try:
+        result = ZettlabTTSProvider().synthesize(
+            "hello",
+            str(tmp_path / "speech.mp3"),
+            format="opus",
+            speed=1.25,
+        )
+    finally:
+        tts_tool._TTS_CANCEL_EVENT.reset(cancel_token)
 
     assert result == str(tmp_path / "speech.ogg")
     assert captured["api_key"] == "action-token"
@@ -148,6 +154,7 @@ def test_zettlab_provider_uses_capability_transport_contract(monkeypatch, tmp_pa
     assert captured["voice"] == "voice-default"
     assert captured["speed"] == 1.25
     assert captured["stream_response"] is True
+    assert captured["cancel_event"] is cancel_event
     assert captured["client_kwargs"]["max_retries"] == 0
     http_client = captured["client_kwargs"]["http_client"]
     assert http_client._trust_env is False
