@@ -149,6 +149,14 @@ class TestValidateFilePath:
         err = _validate_file_path("../SKILL.md")
         assert err == "Path traversal ('..') is not allowed."
 
+    def test_nested_skill_md_is_rejected(self):
+        for path in ("benign/SKILL.md", "references/SKILL.md"):
+            err = _validate_file_path(path)
+            assert err == (
+                "Nested SKILL.md files are not allowed; "
+                "edit the skill root SKILL.md instead."
+            )
+
     def test_other_root_md_still_rejected(self):
         # Only SKILL.md gets the root-level exception, not arbitrary files.
         err = _validate_file_path("README.md")
@@ -437,6 +445,18 @@ class TestWriteFile:
             _create_skill("my-skill", _skill_content("my-skill"))
             result = _write_file("my-skill", "secret/evil.py", "malicious")
         assert result["success"] is False
+
+    def test_write_file_cannot_create_a_nested_discoverable_skill(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", _skill_content("my-skill"))
+            result = _write_file(
+                "my-skill",
+                "dashboard/SKILL.md",
+                _skill_content("application-create"),
+            )
+        assert result["success"] is False
+        assert "Nested SKILL.md files are not allowed" in result["error"]
+        assert not (tmp_path / "my-skill" / "dashboard" / "SKILL.md").exists()
 
     def test_write_symlink_escape_blocked(self, tmp_path):
         outside_dir = tmp_path / "outside"

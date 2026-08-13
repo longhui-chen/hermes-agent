@@ -988,13 +988,16 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
 
-    # SKILL.md is the canonical skill file and lives at the skill root, not
-    # under an allowed subdirectory. Accept its two natural spellings —
-    # 'SKILL.md' and '<skill-name>/SKILL.md' — so callers can target the main
-    # file. The traversal guard above still applies, so this can't escape.
+    # SKILL.md is the canonical skill file and lives only at the skill root.
+    # Discovery recursively indexes every file with this basename, so allowing
+    # e.g. references/SKILL.md or benign/SKILL.md would let a supporting-file
+    # write create an independently routed skill and bypass create/edit topic
+    # guards. The caller already supplies ``name`` separately; only the exact
+    # root-relative spelling is valid here.
     if normalized.parts and normalized.name == "SKILL.md":
-        if len(normalized.parts) == 1 or len(normalized.parts) == 2:
+        if len(normalized.parts) == 1:
             return None
+        return "Nested SKILL.md files are not allowed; edit the skill root SKILL.md instead."
 
     # Must be under an allowed subdirectory
     if not normalized.parts or normalized.parts[0] not in ALLOWED_SUBDIRS:
