@@ -89,6 +89,7 @@ class TurnContext:
     _interrupt_depth: int = 0
     event_message_id: Optional[str] = None
     moa_config: Optional[dict] = None
+    user_authored_message: Optional[Any] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     user_config: Any = None

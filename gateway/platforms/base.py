@@ -2126,6 +2126,11 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Original user-authored content before an adapter injects media anchors,
+    # sender attribution, reply context, or other model-facing scaffolding.
+    # Kept at the end to preserve existing positional construction.
+    user_authored_message: Optional[Any] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

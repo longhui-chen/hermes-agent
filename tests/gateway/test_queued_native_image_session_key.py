@@ -56,8 +56,8 @@ class CaptureQueuedNativeImageAgent:
         self.tools = []
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
-        type(self).calls.append(message)
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        type(self).calls.append({"message": message, "kwargs": kwargs})
         return {
             "final_response": f"done-{len(type(self).calls)}",
             "messages": [],
@@ -125,12 +125,13 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     )
 
     adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
-        text="describe this",
+        text="[image|ybres:RID]",
         message_type=MessageType.PHOTO,
         source=pending_source,
         media_urls=[str(image_path)],
         media_types=["image/png"],
         message_id="queued-1",
+        user_authored_message="",
     )
 
     result = await runner._run_agent(
@@ -144,8 +145,11 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
 
     assert result["final_response"] == "done-2"
     assert len(CaptureQueuedNativeImageAgent.calls) == 2
-    queued_message = CaptureQueuedNativeImageAgent.calls[1]
+    queued_call = CaptureQueuedNativeImageAgent.calls[1]
+    queued_message = queued_call["message"]
     assert isinstance(queued_message, list)
     assert queued_message[0]["type"] == "text"
-    assert queued_message[0]["text"].startswith("describe this")
+    assert queued_message[0]["text"].startswith("[image|ybres:RID]")
     assert any(part.get("type") == "image_url" for part in queued_message)
+    assert queued_call["kwargs"]["user_authored_message"] == ""
+    assert queued_call["kwargs"]["user_message_has_image"] is True
