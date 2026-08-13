@@ -571,6 +571,12 @@ def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None
     api_kwargs.pop("reasoning_effort", None)
 
 
+# 计划轮尾部闭合文案：播种追加 todo 工具对后，历史不能以 tool 结尾（下一轮
+# 会变成 tool -> user，严格 provider 拒绝），也不能用空 assistant content
+# （Moonshot/Kimi 同样拒绝）。这条短文案只做结构闭合，不进 UI（App 走 plan 卡）。
+PLAN_PRESENTED_CLOSING_TEXT = "计划已提交，等待你的确认。"
+
+
 def _should_end_after_present_plan(agent: Any) -> bool:
     # 决策点语义（方案 §0）：zet_agent 上任何成功呈现且非 auto 直跑的计划卡
     # 都结束本 turn、等用户在卡上确认——包括普通模式下模型自发的高风险拦截
@@ -7706,9 +7712,14 @@ def run_conversation(
                     # → fallback_response 为空 → finalize_turn 不补闭合，而播种又
                     # 追加了 todo tool 对，持久化历史会以 tool 结尾。下一轮变成
                     # `... tool -> user`，严格 provider 直接拒绝，用户确认后的计划
-                    # 执行不了。以 tool 结尾时补一条空 assistant 收尾。
+                    # 执行不了。内容必须非空：Moonshot/Kimi 等严格 OpenAI 兼容端
+                    # 同样拒绝空 assistant content（同文件 partial-stream 防护已
+                    # 记录该行为）——用一句可读的短文案闭合。
                     if messages and messages[-1].get("role") == "tool":
-                        messages.append({"role": "assistant", "content": ""})
+                        messages.append({
+                            "role": "assistant",
+                            "content": PLAN_PRESENTED_CLOSING_TEXT,
+                        })
                     logger.info(
                         "zet_agent: present_plan emitted; ending turn "
                         "without a post-tool LLM follow-up"

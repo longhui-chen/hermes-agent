@@ -235,6 +235,14 @@ class TodoStore:
         - 骨架条目被整表遗漏：原样保留（遗漏 ≠ 取消，取消要显式 cancelled）
         - 模型新增条目：验证后追加末尾（计划外任务）
         """
+        # 记录模型是否真的给了 content（codex P1）：状态更新常只带 id+status，
+        # _validate 会把缺失 content 规范成「(no description)」，无条件覆盖会把
+        # 播种的真实步骤文案洗掉并随 canonical 结果持久化。
+        provided_content: set = {
+            str(t.get("id", "")).strip()
+            for t in todos
+            if isinstance(t, dict) and str(t.get("content", "") or "").strip()
+        }
         incoming_by_id: Dict[str, Dict[str, str]] = {}
         extras: List[Dict[str, str]] = []
         for t in self._dedupe_by_id(todos):
@@ -257,7 +265,8 @@ class TodoStore:
             if incoming is not None:
                 item = {
                     **item,
-                    "content": incoming["content"],
+                    # 只有模型显式给了非空 content 才覆盖，否则保留骨架文案。
+                    **({"content": incoming["content"]} if item["id"] in provided_content else {}),
                     "status": incoming["status"],
                 }
             rebuilt.append(item)
@@ -396,7 +405,12 @@ class TodoStore:
                 f"[{linkage}] — when updating this list, keep each item's "
                 "plan_id/plan_turn_id/group_index fields exactly as seeded."
             )
-        for item in active_items:
+        # 计划激活时注入完整骨架（codex P1）：注入块是 canonical result 被折叠
+        # 后的唯一恢复通道，只带未完成项会让模型回填出「缺了已完成/已取消步骤」
+        # 的清单——合一卡进度、hydration 与取消绑定一起错位。已完成项的文案压到
+        # 80 字符（进度只需要 id + status，不需要全文）控制注入体积。
+        rendered = self._items if self._plan_id else active_items
+        for item in rendered:
             marker = markers.get(item["status"], "[?]")
             # 计划播种条目带上组归属：长任务（恰恰是最需要计划的场景）压缩一次
             # 后，注入行是模型唯一的任务记忆——丢掉归属，后续更新就会错组
@@ -404,7 +418,10 @@ class TodoStore:
             group_suffix = ""
             if item.get("group_index") is not None:
                 group_suffix = f" [group {item['group_index']}]"
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']}){group_suffix}")
+            content = item["content"]
+            if item["status"] in {"completed", "cancelled"} and len(content) > 80:
+                content = content[:77] + "..."
+            lines.append(f"- {marker} {item['id']}. {content} ({item['status']}){group_suffix}")
 
         return "\n".join(lines)
 

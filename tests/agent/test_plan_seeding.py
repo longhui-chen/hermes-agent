@@ -232,6 +232,48 @@ def test_turn_end_snapshot_respects_budget(monkeypatch):
     assert len(payload["todos"]) == 62  # 条目一个不丢，只压内容
 
 
+def test_injection_keeps_full_skeleton_for_active_plan():
+    # 完整骨架注入（codex P1）：只带未完成项会让模型回填出缺了已完成步骤的
+    # 清单，合一卡进度与 hydration 一起错位。
+    store = TodoStore()
+    store.seed_from_plan("plan24", _groups(3), plan_turn_id="turn-24")
+    store.write([
+        {"id": "plan24-1-1", "content": "step 0-0", "status": "completed"},
+        {"id": "plan24-1-2", "content": "step 0-1", "status": "cancelled"},
+    ], merge=True)
+    text = store.format_for_injection()
+    assert "plan24-1-1" in text and "[x]" in text
+    assert "plan24-1-2" in text and "[~]" in text
+    assert "plan24-1-3" in text  # 仍待办的那条
+
+    # 普通清单（无计划）维持原语义：只注入未完成项。
+    plain = TodoStore()
+    plain.write([
+        {"id": "a", "content": "done", "status": "completed"},
+        {"id": "b", "content": "todo", "status": "pending"},
+    ], merge=False)
+    plain_text = plain.format_for_injection()
+    assert "b." in plain_text
+    assert "a." not in plain_text
+
+
+def test_status_only_rewrite_keeps_seeded_content():
+    # 状态更新常只带 id+status（codex P1）：不能把播种文案覆盖成「(no description)」。
+    store = TodoStore()
+    store.seed_from_plan("plan25", _groups(2))
+    store.write([
+        {"id": "plan25-1-1", "status": "completed"},
+        {"id": "plan25-1-2", "status": "in_progress"},
+    ], merge=False)
+    by_id = {i["id"]: i for i in store.read()}
+    assert by_id["plan25-1-1"]["content"] == "step 0-0"
+    assert by_id["plan25-1-1"]["status"] == "completed"
+    assert by_id["plan25-1-2"]["content"] == "step 0-1"
+    # 显式给了非空 content 时仍然覆盖。
+    store.write([{"id": "plan25-1-1", "content": "改写后的步骤", "status": "completed"}], merge=False)
+    assert next(i for i in store.read() if i["id"] == "plan25-1-1")["content"] == "改写后的步骤"
+
+
 def test_protection_disarms_after_plan_reaches_terminal_state():
     # 终态计划解除保护（codex P1）：条目全部 completed/cancelled 后，模型为新
     # 任务 merge=false 建清单不能再被旧骨架劫持。
