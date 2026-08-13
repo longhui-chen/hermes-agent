@@ -231,6 +231,45 @@ def _persist_store_snapshot(
         _emit_todo_snapshot(agent, result_json)
 
 
+def expire_unconfirmed_plan_at_turn_start(agent: Any) -> None:
+    """新 turn 开始时清掉「没被确认」的旧计划保护（codex P1）。
+
+    决策点语义明确鼓励「看了计划不确认、直接聊别的」；此时旧计划的播种骨架
+    仍全 pending 且保护挂着，模型为新任务发 ``todo(merge=false)`` 会被结构保护
+    劫持——新任务混进未确认的旧计划卡。规则：骨架一步未动（全 pending）且本轮
+    没有指向该计划的 ``confirmed`` 回执 → 解除保护，清单回到普通语义。
+
+    同一处顺带做**确认目标校验**：ack 是 confirmed 但 turn_id 与骨架记录的
+    plan_turn_id 不匹配（同会话先后两份计划，用户从旧卡确认）时也解除——不
+    把这次授权算到当前计划头上（取消侧已有对称校验）。
+    """
+    store = getattr(agent, "_todo_store", None)
+    if store is None or not getattr(store, "plan_id", None):
+        return
+    if not store.plan_untouched():
+        return  # 已经开始执行的计划不受影响
+    try:
+        from gateway.session_context import get_session_env
+
+        status = str(get_session_env("HERMES_PLAN_ACK_STATUS") or "").strip().lower()
+        ack_turn_id = str(get_session_env("HERMES_PLAN_ACK_TURN_ID") or "").strip()
+    except Exception:
+        status, ack_turn_id = "", ""
+    seeded_turn_id = store.plan_turn_id()
+    confirmed_for_this_plan = (
+        status == "confirmed"
+        and bool(ack_turn_id)
+        and bool(seeded_turn_id)
+        and ack_turn_id == seeded_turn_id
+    )
+    if confirmed_for_this_plan:
+        return
+    if store.disarm_plan_protection():
+        logger.info(
+            "plan protection expired at turn start (no matching confirm ack)"
+        )
+
+
 def apply_plan_ack_cancellation_at_turn_end(
     agent: Any,
     messages: List[Dict[str, Any]],
@@ -257,14 +296,7 @@ def apply_plan_ack_cancellation_at_turn_end(
     # 记录的 plan_turn_id 一致才取消——同会话先后两份计划时，从旧卡取消
     # 不能误杀当前计划。旧播种数据没有 plan_turn_id（滚动窗口）或 ack 缺
     # turn_id 时 fail-safe no-op（保持修复前行为：宁可不取消）。
-    store_turn_id = next(
-        (
-            str(item.get("plan_turn_id") or "").strip()
-            for item in store.read()
-            if item.get("plan_turn_id")
-        ),
-        "",
-    )
+    store_turn_id = store.plan_turn_id()
     if not ack_turn_id or not store_turn_id or ack_turn_id != store_turn_id:
         return
     try:

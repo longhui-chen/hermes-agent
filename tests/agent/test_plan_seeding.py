@@ -179,6 +179,55 @@ def test_rearm_only_treats_seeded_items_as_skeleton():
     assert store.plan_id is None
 
 
+def test_unconfirmed_plan_protection_expires_next_turn(monkeypatch):
+    # 决策点语义允许「看了计划不确认就聊别的」（codex P1）：新 turn 开始时
+    # 未确认的旧计划保护过期，新任务清单不被旧骨架劫持。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "", "")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan27", _groups(2), plan_turn_id="turn-27")
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id is None
+
+    agent._todo_store.write([{"id": "new", "content": "新任务", "status": "pending"}], merge=False)
+    assert [i["id"] for i in agent._todo_store.read()] == ["new"]
+
+
+def test_matching_confirm_keeps_plan_protection(monkeypatch):
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "confirmed", "turn-28")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan28", _groups(1), plan_turn_id="turn-28")
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id == "plan28"
+
+
+def test_confirm_ack_from_a_stale_card_does_not_authorize_current_plan(monkeypatch):
+    # 确认目标校验（codex P1，与取消侧对称）：同会话先后两份计划，用户从旧卡
+    # 点确认时不能把授权算到当前计划头上。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "confirmed", "turn-OLD")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan29", _groups(1), plan_turn_id="turn-NEW")
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id is None
+
+
+def test_started_plan_survives_turn_start_expiry(monkeypatch):
+    # 已经开始执行的计划不受过期影响（有条目非 pending）。
+    from agent import plan_seeding as ps
+
+    _mock_ack_env(monkeypatch, "", "")
+    agent = _FakeAgent(_todo_store=TodoStore(), todo_emit_callback=None)
+    agent._todo_store.seed_from_plan("plan30", _groups(2), plan_turn_id="turn-30")
+    agent._todo_store.write([{"id": "plan30-1-1", "status": "in_progress"}], merge=True)
+    ps.expire_unconfirmed_plan_at_turn_start(agent)
+    assert agent._todo_store.plan_id == "plan30"
+
+
 def test_merge_after_terminal_plan_does_not_stamp_old_plan():
     # 终态解保护同样作用于 merge=true（codex P1）：计划做完后用户开新任务，
     # 新待办不能被盖上旧 plan_id 混进已结束的计划卡。

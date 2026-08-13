@@ -224,6 +224,33 @@ class TodoStore:
         """Return a copy of the current list."""
         return [item.copy() for item in self._items]
 
+    def disarm_plan_protection(self) -> bool:
+        """Drop plan armament explicitly (unconfirmed / mismatched-ack expiry).
+
+        用于「用户没确认这个计划就开始别的事」——保护继续挂着会让新任务的
+        清单被旧骨架劫持（codex P1）。Returns True when armament was dropped.
+        """
+        if not self._plan_id:
+            return False
+        self._plan_id = None
+        self._plan_seeded_ids = set()
+        return True
+
+    def plan_untouched(self) -> bool:
+        """True when the armed plan's skeleton is still entirely pending."""
+        if not (self._plan_id and self._plan_seeded_ids):
+            return False
+        seeded = [i for i in self._items if i["id"] in self._plan_seeded_ids]
+        return bool(seeded) and all(i["status"] == "pending" for i in seeded)
+
+    def plan_turn_id(self) -> str:
+        """plan_turn_id recorded on the seeded skeleton（取消/确认目标匹配用）。"""
+        for item in self._items:
+            value = str(item.get("plan_turn_id") or "").strip()
+            if value:
+                return value
+        return ""
+
     def _disarm_if_plan_terminal(self) -> None:
         """Drop plan armament once every seeded item is completed/cancelled."""
         if not (self._plan_id and self._plan_seeded_ids):
