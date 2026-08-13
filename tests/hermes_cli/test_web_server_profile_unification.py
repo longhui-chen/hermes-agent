@@ -449,6 +449,31 @@ class TestProfileScopedAudio:
         assert seen["text"] == "hello"
         assert seen["scope"]["ZETTLAB_AGENT_ACTION_TOKEN"] == "worker-action-token"
 
+    def test_speak_resolves_cache_dir_from_target_profile(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        from tools import tts_tool
+
+        worker_home = isolated_profiles["worker_beta"]
+        seen = {}
+
+        def fake_tts(_text):
+            seen["output_dir"] = tts_tool._default_output_dir_for_session(
+                platform="desktop"
+            )
+            audio_path = worker_home / "speech.mp3"
+            audio_path.write_bytes(b"audio")
+            return json.dumps({"success": True, "file_path": str(audio_path)})
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+        response = client.post(
+            "/api/audio/speak?profile=worker_beta",
+            json={"text": "hello"},
+        )
+
+        assert response.status_code == 200
+        assert seen["output_dir"] == worker_home / "cache" / "audio"
+
     def test_speak_missing_target_secret_does_not_fall_back_to_process_env(
         self, client, isolated_profiles, monkeypatch
     ):

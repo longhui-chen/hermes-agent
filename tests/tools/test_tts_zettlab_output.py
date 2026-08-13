@@ -84,7 +84,7 @@ def test_managed_zettlab_tts_fails_when_agent_output_is_unavailable(
     missing_output_root = tmp_path / "missing-agent-output"
     cache_root = tmp_path / "cache" / "audio"
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    monkeypatch.setattr(tts_tool, "DEFAULT_OUTPUT_DIR", str(cache_root))
+    monkeypatch.setattr(tts_tool, "_get_default_output_dir", lambda: str(cache_root))
     _stub_edge_tts(monkeypatch)
 
     with _managed_zettlab_session(
@@ -103,7 +103,7 @@ def test_non_zettlab_tts_keeps_existing_cache_default(tmp_path, monkeypatch):
     cache_root = tmp_path / "cache" / "audio"
     output_root.mkdir()
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    monkeypatch.setattr(tts_tool, "DEFAULT_OUTPUT_DIR", str(cache_root))
+    monkeypatch.setattr(tts_tool, "_get_default_output_dir", lambda: str(cache_root))
     _stub_edge_tts(monkeypatch)
 
     previous_multiplex = secret_scope.is_multiplex_active()
