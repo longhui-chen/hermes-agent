@@ -218,9 +218,6 @@ DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
-# Public model already configured on Zettlab's ai-api TTS channel. The cloud
-# gateway is deliberately a thin relay and does not translate product aliases.
-ZETTLAB_AI_API_TTS_MODEL = "seed-tts-1.1"
 DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
@@ -262,11 +259,6 @@ GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
 TTS_RESPONSE_BODY_LIMIT_BYTES = 16 * 1024 * 1024
 TTS_RESPONSE_BODY_CHUNK_BYTES = 64 * 1024
-ZETTLAB_TTS_CONNECT_TIMEOUT_SECONDS = 5.0
-ZETTLAB_TTS_READ_TIMEOUT_SECONDS = 120.0
-ZETTLAB_TTS_WRITE_TIMEOUT_SECONDS = 30.0
-ZETTLAB_TTS_POOL_TIMEOUT_SECONDS = 5.0
-
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
     return str(get_hermes_dir("cache/audio", "audio_cache"))
@@ -616,13 +608,6 @@ def _gateway_is_explicitly_disabled(tts_config: Dict[str, Any]) -> bool:
     )
 
 
-def _gateway_is_explicitly_enabled(tts_config: Dict[str, Any]) -> bool:
-    value = tts_config.get("use_gateway")
-    return value is True or (
-        isinstance(value, str) and value.strip().lower() == "true"
-    )
-
-
 def _load_tts_config() -> Dict[str, Any]:
     """
     Load TTS configuration from ~/.hermes/config.yaml.
@@ -650,14 +635,10 @@ def _load_tts_config() -> Dict[str, Any]:
         managed_provider = (
             managed_tts.get("provider") if isinstance(managed_tts, dict) else None
         )
-        # use_gateway is a normal mergeable setting, so consult the effective
-        # value after managed scope has overridden the user layer. Unlike the
-        # provider default, it has no DEFAULT_CONFIG value to disambiguate.
-        gateway_opted_out = _gateway_is_explicitly_disabled(tts_config)
         provider_is_explicit = any(
             isinstance(value, str) and value.strip()
             for value in (raw_provider, managed_provider)
-        ) or gateway_opted_out
+        )
         if not provider_is_explicit:
             tts_config["_provider_is_default"] = True
         return tts_config
@@ -682,8 +663,14 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     provider_is_default = tts_config.get("_provider_is_default") is True
     if configured and not provider_is_default:
         return str(configured).lower().strip()
-    if resolve_zettlab_tool_gateway("openai-tts") is not None:
-        return "openai"
+    if resolve_zettlab_tool_gateway("zettlab-tts") is not None:
+        openai_cfg = _get_provider_section(tts_config, "openai")
+        if (
+            str(openai_cfg.get("api_key") or "").strip()
+            or _resolve_profile_openai_audio_api_key()
+        ):
+            return "openai"
+        return "zettlab"
     return str(configured or DEFAULT_PROVIDER).lower().strip()
 
 
@@ -923,7 +910,7 @@ def _dispatch_to_plugin_provider(
        a refactor of the caller can't silently break the invariant.
     3. Plugin dispatch fires only when ``provider`` matches a registered
        :class:`TTSProvider` whose ``name`` equals the configured value.
-       Unknown names return None (caller falls through to Edge default).
+       Unknown names return None for the caller's existing fallback policy.
 
     Plugin exceptions are caught and re-raised — the outer
     ``text_to_speech_tool`` try/except converts them to the standard
@@ -966,11 +953,10 @@ def _dispatch_to_plugin_provider(
     voice = tts_config.get("voice") if isinstance(tts_config, dict) else None
     model = tts_config.get("model") if isinstance(tts_config, dict) else None
     speed = tts_config.get("speed") if isinstance(tts_config, dict) else None
-    fmt = (
-        tts_config.get("output_format", DEFAULT_COMMAND_TTS_OUTPUT_FORMAT)
-        if isinstance(tts_config, dict)
-        else DEFAULT_COMMAND_TTS_OUTPUT_FORMAT
+    configured_format = (
+        tts_config.get("output_format") if isinstance(tts_config, dict) else None
     )
+    fmt = configured_format or _tts_response_format_from_path(output_path)
 
     logger.info(
         "Generating speech with plugin TTS provider '%s'...", key,
@@ -1003,7 +989,9 @@ def _plugin_provider_is_voice_compatible(provider: str) -> bool:
         return False
     try:
         from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
 
+        _ensure_plugins_discovered()
         plugin_provider = get_provider(key)
         if plugin_provider is None:
             return False
@@ -1659,6 +1647,9 @@ def _generate_openai_tts(
     voice: Optional[str] = None,
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
+    stream_response: bool = False,
+    client_kwargs: Optional[Dict[str, Any]] = None,
+    label: str = "OpenAI TTS",
 ) -> str:
     """Generate audio via the OpenAI ``audio.speech.create`` SDK shape.
 
@@ -1684,6 +1675,10 @@ def _generate_openai_tts(
             truthy; omitted otherwise so ``tts-1``/``tts-1-hd`` and strict
             OpenAI-compatible servers that reject unknown kwargs are
             unaffected.
+        stream_response: Use the SDK streaming response context so the bounded
+            file sink sees bytes as they arrive.
+        client_kwargs: Optional already-resolved OpenAI client transport args.
+        label: Provider label used in bounded-response errors.
 
     Returns:
         Path to the saved audio file.
@@ -1732,19 +1727,7 @@ def _generate_openai_tts(
         speed = float(oai_config.get("speed", speed_default))
     language = oai_config.get("language")
 
-    managed_model: Optional[str] = None
-    if is_managed:
-        zettlab_gateway = resolve_zettlab_tool_gateway("openai-tts")
-        zettlab_base = (
-            urljoin(f"{zettlab_gateway.gateway_origin.rstrip('/')}/", "v1")
-            if zettlab_gateway is not None
-            else None
-        )
-        managed_model = (
-            ZETTLAB_AI_API_TTS_MODEL
-            if zettlab_base == fallback_base
-            else DEFAULT_OPENAI_MODEL
-        )
+    managed_model = DEFAULT_OPENAI_MODEL if is_managed else None
     managed_contract_active = bool(
         is_managed and not explicit_base_url and not config_base_url
     )
@@ -1763,28 +1746,7 @@ def _generate_openai_tts(
     response_format = _tts_response_format_from_path(output_path)
 
     OpenAIClient = _import_openai_client()
-    client_kwargs: Dict[str, Any] = {}
-    if managed_contract_active and managed_model == ZETTLAB_AI_API_TTS_MODEL:
-        # Board-local traffic must never inherit HTTP(S)_PROXY: otherwise
-        # httpx sends 127.0.0.1 to the desktop/system proxy and the managed
-        # route fails before it reaches local-server. Keep the OpenAI SDK's
-        # long audio timeout shape while disabling only environment proxies.
-        import httpx
-        client_kwargs["http_client"] = httpx.Client(
-            trust_env=False,
-            timeout=httpx.Timeout(
-                connect=ZETTLAB_TTS_CONNECT_TIMEOUT_SECONDS,
-                read=ZETTLAB_TTS_READ_TIMEOUT_SECONDS,
-                write=ZETTLAB_TTS_WRITE_TIMEOUT_SECONDS,
-                pool=ZETTLAB_TTS_POOL_TIMEOUT_SECONDS,
-            ),
-            follow_redirects=False,
-        )
-        # The speech request is billable and not known to be idempotent at the
-        # provider. local-server alone may retry one explicit
-        # AUTH_TOKEN_INVALID rejection, before ai-api reaches the provider.
-        client_kwargs["max_retries"] = 0
-    client = OpenAIClient(api_key=api_key, base_url=base_url, **client_kwargs)
+    client = OpenAIClient(api_key=api_key, base_url=base_url, **(client_kwargs or {}))
     try:
         create_kwargs: Dict[str, Any] = {
             "model": model,
@@ -1799,7 +1761,7 @@ def _generate_openai_tts(
             create_kwargs["instructions"] = instructions
         if language:
             create_kwargs["extra_body"] = {"lang_code": language}
-        if managed_contract_active:
+        if managed_contract_active or stream_response:
             # ``audio.speech.create`` may eagerly buffer the entire binary
             # response before our bounded file sink sees it. Managed audio
             # must use the SDK's streaming response so the 16 MiB limit is
@@ -1810,14 +1772,14 @@ def _generate_openai_tts(
                 _write_tts_response_to_file(
                     response,
                     output_path,
-                    label="OpenAI TTS",
+                    label=label,
                 )
         else:
             response = client.audio.speech.create(**create_kwargs)
             _write_tts_response_to_file(
                 response,
                 output_path,
-                label="OpenAI TTS",
+                label=label,
             )
         return output_path
     finally:
@@ -3180,7 +3142,10 @@ def text_to_speech_tool(
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and (
+            provider in {"openai", "elevenlabs", "mistral", "gemini"}
+            or _plugin_provider_is_voice_compatible(provider)
+        ):
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -3200,19 +3165,20 @@ def text_to_speech_tool(
             )
 
         # Plugin-registered TTS backend (issue #30398). Fires when the
-        # configured provider is neither a built-in nor a command-type
-        # entry, AND a plugin is registered under that name. The walrus
-        # binds `_plugin_path` only when the dispatcher returns a path
-        # (i.e. a plugin was actually found); a None return falls
-        # through to the built-in elif chain so unknown names hit the
-        # Edge TTS default at the bottom. The dispatcher itself enforces
-        # built-ins-always-win + command-wins-over-plugin defensively.
+        # configured provider is neither a built-in nor a command-type entry,
+        # and a plugin is registered under that name. Preserve the historical
+        # unknown-provider fallback below; only the bundled managed provider
+        # is fail-closed because silently routing it elsewhere would violate
+        # the Zettlab capability contract.
         elif provider not in BUILTIN_TTS_PROVIDERS and (
             _plugin_path := _dispatch_to_plugin_provider(
                 text, file_str, provider, tts_config,
             )
         ) is not None:
             file_str = _plugin_path
+
+        elif provider == "zettlab":
+            raise ValueError("Zettlab TTS provider is not registered or available")
 
         elif provider == "elevenlabs":
             try:
@@ -3372,7 +3338,7 @@ def text_to_speech_tool(
             # (mirrors the command-provider opt-in). Plugins that
             # already write Opus skip the ffmpeg conversion.
             plugin_voice_compatible = _plugin_provider_is_voice_compatible(provider)
-            if plugin_voice_compatible:
+            if want_opus and plugin_voice_compatible:
                 if not file_str.endswith(".ogg"):
                     opus_path = _convert_to_opus(file_str)
                     if opus_path:
@@ -3513,10 +3479,9 @@ def _resolve_openai_audio_client_config(
 ) -> tuple[str, str, bool]:
     """Return ``(api_key, base_url, is_managed)`` for OpenAI audio.
 
-    On a Zettlab device, an existing direct TTS key keeps its historical
-    priority unless ``tts.use_gateway: true`` explicitly selects the managed
-    path. Outside a Zettlab session, preserve upstream's config/env/credential-
-    pool resolution before falling back to the Nous managed audio gateway.
+    Preserve upstream's config/env/credential-pool resolution before falling
+    back to the Nous managed audio gateway. Zettlab is a separate TTS provider
+    and never enters this resolver.
     """
     if tts_config is None:
         tts_config = _load_tts_config()
@@ -3541,19 +3506,6 @@ def _resolve_openai_audio_client_config(
         raise ValueError(
             "Neither tts.openai.api_key in config nor "
             "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
-        )
-
-    gateway_forced = _gateway_is_explicitly_enabled(tts_config)
-    zettlab_gateway = resolve_zettlab_tool_gateway("openai-tts")
-    if zettlab_gateway is not None and not gateway_forced:
-        selected_key = cfg_api_key or direct_api_key
-        if selected_key:
-            return selected_key, direct_base_url(), False
-    if zettlab_gateway is not None:
-        return (
-            zettlab_gateway.token,
-            urljoin(f"{zettlab_gateway.gateway_origin.rstrip('/')}/", "v1"),
-            True,
         )
 
     if cfg_api_key and not prefers_gateway("tts"):
@@ -3595,8 +3547,7 @@ def _has_openai_audio_backend(tts_config: Optional[Dict[str, Any]] = None) -> bo
     if isinstance(tts_config, dict) and _gateway_is_explicitly_disabled(tts_config):
         return bool(cfg_api_key or direct_api_key)
     return bool(
-        resolve_zettlab_tool_gateway("openai-tts")
-        or cfg_api_key
+        cfg_api_key
         or direct_api_key
         or resolve_managed_tool_gateway("openai-audio")
     )

@@ -256,10 +256,10 @@ def _resolve_openai_streaming_config(
 ) -> Optional[tuple[str, str]]:
     """Return a direct OpenAI key/base pair, never managed credentials.
 
-    Zettlab's managed provider returns encoded MP3/Opus through local-server,
-    not the raw PCM contract required by this streamer. In that case the
-    caller deliberately falls back to the shared per-sentence sync pipeline,
-    which reuses ``text_to_speech_tool`` and its managed resolver.
+    A managed OpenAI gateway returns encoded MP3/Opus, not the raw PCM
+    contract required by this streamer. In that case the caller deliberately
+    falls back to the shared per-sentence sync pipeline. Non-OpenAI plugin
+    providers, including Zettlab, naturally take that same sync path.
     """
     try:
         from tools.tts_tool import _resolve_openai_audio_client_config

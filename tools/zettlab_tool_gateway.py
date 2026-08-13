@@ -43,8 +43,9 @@ _LOCAL_SERVER_ANCHOR_ENVS = (
 _ACTION_TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
 _VENDOR_GATEWAY_PATHS = {
     "browser-use": "/api/v1/browser-use",
-    # OpenAI SDK appends /v1/audio/speech to this origin.
-    "openai-tts": "/api/v1/ai-proxy",
+    # The Zettlab TTS provider uses an OpenAI-compatible transport internally;
+    # the public provider boundary remains ``zettlab``.
+    "zettlab-tts": "/api/v1/ai-proxy",
 }
 
 

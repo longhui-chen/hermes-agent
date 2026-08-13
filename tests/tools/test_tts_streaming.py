@@ -164,7 +164,7 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert captured["client"]["max_retries"] == 0
 
 
-def test_openai_managed_backend_uses_sync_pipeline(monkeypatch):
+def test_managed_openai_backend_uses_sync_pipeline(monkeypatch):
     monkeypatch.setattr(
         ts,
         "_resolve_openai_streaming_config",

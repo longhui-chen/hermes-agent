@@ -253,10 +253,8 @@ def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatc
     assert captured["close_calls"] == 1
 
 
-def test_zettlab_tts_auto_selects_local_gateway_and_ai_api_model(monkeypatch, tmp_path):
-    captured = {}
+def test_zettlab_tts_auto_selects_independent_provider(monkeypatch):
     _install_fake_tools_package()
-    _install_fake_openai_module(captured)
     monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv(
@@ -266,62 +264,13 @@ def test_zettlab_tts_auto_selects_local_gateway_and_ai_api_model(monkeypatch, tm
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
 
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
-    assert tts_tool._get_provider({}) == "openai"
-    assert tts_tool._get_provider({"provider": "edge", "_provider_is_default": True}) == "openai"
+    assert tts_tool._get_provider({}) == "zettlab"
+    assert tts_tool._get_provider({"provider": "edge", "_provider_is_default": True}) == "zettlab"
     assert tts_tool._get_provider({"provider": "edge"}) == "edge"
 
-    output_path = tmp_path / "speech.mp3"
-    tts_tool._generate_openai_tts(
-        "hello world",
-        str(output_path),
-        {"openai": {"model": "tts-1-hd", "voice": "nova", "speed": 3.0}},
-    )
 
-    assert captured["api_key"] == "local-action-token"
-    assert captured["base_url"] == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
-    assert captured["client_kwargs"]["http_client"]._trust_env is False
-    assert captured["client_kwargs"]["http_client"].follow_redirects is False
-    assert captured["client_kwargs"]["max_retries"] == 0
-    assert captured["streaming_create_calls"] == 1
-    assert captured["speech_kwargs"]["model"] == "seed-tts-1.1"
-    assert captured["speech_kwargs"]["voice"] == "nova"
-    assert captured["speech_kwargs"]["speed"] == 3.0
-
-
-def test_zettlab_tts_streaming_limit_removes_partial_output(monkeypatch, tmp_path):
-    captured = {}
+def test_zettlab_tts_existing_direct_key_selects_openai(monkeypatch):
     _install_fake_tools_package()
-    _install_fake_openai_module(
-        captured,
-        speech_chunks=(b"1234", b"5678"),
-    )
-    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setenv(
-        "ZET_CHAT_APPEND_URL",
-        "http://127.0.0.1:9090/api/v1/internal/chat/append",
-    )
-    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
-
-    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
-    monkeypatch.setattr(tts_tool, "TTS_RESPONSE_BODY_LIMIT_BYTES", 6)
-    output_path = tmp_path / "speech.mp3"
-
-    with pytest.raises(RuntimeError, match="exceeds 6 bytes"):
-        tts_tool._generate_openai_tts("hello world", str(output_path), {})
-
-    assert captured["streaming_create_calls"] == 1
-    assert not output_path.exists()
-    assert list(tmp_path.glob("*.part")) == []
-
-
-def test_zettlab_tts_existing_direct_key_wins_unless_gateway_is_forced(
-    monkeypatch,
-    tmp_path,
-):
-    captured = {}
-    _install_fake_tools_package()
-    _install_fake_openai_module(captured)
     monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
     monkeypatch.setenv(
         "ZET_CHAT_APPEND_URL",
@@ -330,25 +279,8 @@ def test_zettlab_tts_existing_direct_key_wins_unless_gateway_is_forced(
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
 
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
-    direct_path = tmp_path / "direct.mp3"
-    tts_tool._generate_openai_tts(
-        "direct",
-        str(direct_path),
-        {"openai": {"model": "tts-1-hd"}},
-    )
-    assert captured["api_key"] == "direct-openai-key"
-    assert captured["base_url"] == "https://api.openai.com/v1"
-    assert captured["speech_kwargs"]["model"] == "tts-1-hd"
-
-    managed_path = tmp_path / "managed.mp3"
-    tts_tool._generate_openai_tts(
-        "managed",
-        str(managed_path),
-        {"use_gateway": True, "openai": {"model": "tts-1-hd"}},
-    )
-    assert captured["api_key"] == "local-action-token"
-    assert captured["base_url"] == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
-    assert captured["speech_kwargs"]["model"] == "seed-tts-1.1"
+    assert tts_tool._get_provider({}) == "openai"
+    assert tts_tool._get_provider({"use_gateway": True}) == "openai"
 
 
 def test_tts_bounded_file_sink_removes_partial_output(monkeypatch, tmp_path):
@@ -462,28 +394,6 @@ def test_zettlab_tts_direct_keys_are_isolated_by_profile(monkeypatch, tmp_path):
     assert profile_b_base_url == "https://profile-b.example/v1"
 
 
-def test_zettlab_tts_requirements_accept_gateway_without_direct_key(monkeypatch):
-    _install_fake_tools_package()
-    _install_fake_openai_module({})
-    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
-    monkeypatch.setenv(
-        "ZET_CHAT_APPEND_URL",
-        "http://127.0.0.1:9090/api/v1/internal/chat/append",
-    )
-    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
-
-    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
-    monkeypatch.setattr(
-        tts_tool,
-        "_load_tts_config",
-        lambda: {"provider": "edge", "_provider_is_default": True},
-    )
-
-    assert tts_tool.check_tts_requirements() is True
-
-
 def test_zettlab_tts_direct_opt_out_requires_direct_key(monkeypatch):
     _install_fake_tools_package()
     _install_fake_openai_module({})
@@ -538,8 +448,12 @@ def test_zettlab_tts_preserves_managed_scope_provider(monkeypatch, tmp_path):
     managed_dir = tmp_path / "managed"
     user_home.mkdir()
     managed_dir.mkdir()
-    (user_home / "config.yaml").write_text("tts:\n  speed: 1.0\n")
-    (managed_dir / "config.yaml").write_text("tts:\n  provider: edge\n")
+    (user_home / "config.yaml").write_text(
+        "tts:\n  speed: 1.0\n", encoding="utf-8"
+    )
+    (managed_dir / "config.yaml").write_text(
+        "tts:\n  provider: edge\n", encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(user_home))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
     monkeypatch.setenv(
@@ -560,10 +474,12 @@ def test_zettlab_tts_preserves_managed_scope_provider(monkeypatch, tmp_path):
     assert tts_tool._get_provider(tts_config) == "edge"
 
 
-def test_zettlab_tts_preserves_user_gateway_opt_out(monkeypatch, tmp_path):
+def test_zettlab_tts_ignores_openai_gateway_opt_out(monkeypatch, tmp_path):
     user_home = tmp_path / "user"
     user_home.mkdir()
-    (user_home / "config.yaml").write_text("tts:\n  use_gateway: false\n")
+    (user_home / "config.yaml").write_text(
+        "tts:\n  use_gateway: false\n", encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(user_home))
     monkeypatch.setenv(
         "ZET_CHAT_APPEND_URL",
@@ -580,10 +496,10 @@ def test_zettlab_tts_preserves_user_gateway_opt_out(monkeypatch, tmp_path):
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
 
     tts_config = tts_tool._load_tts_config()
-    assert tts_tool._get_provider(tts_config) == "edge"
+    assert tts_tool._get_provider(tts_config) == "zettlab"
 
 
-def test_zettlab_tts_managed_gateway_opt_in_overrides_user_opt_out(
+def test_zettlab_tts_ignores_openai_gateway_toggle_for_provider_selection(
     monkeypatch,
     tmp_path,
 ):
@@ -591,8 +507,12 @@ def test_zettlab_tts_managed_gateway_opt_in_overrides_user_opt_out(
     managed_dir = tmp_path / "managed"
     user_home.mkdir()
     managed_dir.mkdir()
-    (user_home / "config.yaml").write_text("tts:\n  use_gateway: false\n")
-    (managed_dir / "config.yaml").write_text("tts:\n  use_gateway: true\n")
+    (user_home / "config.yaml").write_text(
+        "tts:\n  use_gateway: false\n", encoding="utf-8"
+    )
+    (managed_dir / "config.yaml").write_text(
+        "tts:\n  use_gateway: true\n", encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(user_home))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
     monkeypatch.setenv(
@@ -610,7 +530,7 @@ def test_zettlab_tts_managed_gateway_opt_in_overrides_user_opt_out(
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
 
     tts_config = tts_tool._load_tts_config()
-    assert tts_tool._get_provider(tts_config) == "openai"
+    assert tts_tool._get_provider(tts_config) == "zettlab"
 
 
 def test_zettlab_tts_never_sends_action_token_to_custom_endpoint(monkeypatch, tmp_path):
@@ -700,7 +620,9 @@ def test_transcription_uses_model_specific_response_formats(monkeypatch, tmp_pat
     _install_fake_tools_package()
     _install_fake_openai_module(whisper_capture, transcription_response="hello from whisper")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "config.yaml").write_text("stt:\n  provider: openai\n")
+    (tmp_path / "config.yaml").write_text(
+        "stt:\n  provider: openai\n", encoding="utf-8"
+    )
     monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("TOOL_GATEWAY_DOMAIN", "nousresearch.com")

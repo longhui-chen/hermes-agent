@@ -46,14 +46,14 @@ def test_resolves_from_local_server_env(monkeypatch: pytest.MonkeyPatch) -> None
     assert cfg.token == "local-browser-use"
 
 
-def test_resolves_only_openai_tts_to_local_ai_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolves_only_zettlab_tts_to_local_ai_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-tts-token")
-    cfg = resolve_zettlab_tool_gateway("openai-tts")
+    cfg = resolve_zettlab_tool_gateway("zettlab-tts")
     assert cfg is not None
     assert cfg.gateway_origin == "http://127.0.0.1:9090/api/v1/ai-proxy"
     assert cfg.token == "local-tts-token"
-    assert resolve_zettlab_tool_gateway("openai-audio") is None
+    assert resolve_zettlab_tool_gateway("openai-tts") is None
 
 
 def test_can_use_share_action_url_as_local_server_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,7 +98,7 @@ def test_rejects_non_loopback_or_non_http_callback_url(
     monkeypatch.setenv("ZET_CHAT_APPEND_URL", callback_url)
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "must-not-leave-device")
 
-    assert resolve_zettlab_tool_gateway("openai-tts") is None
+    assert resolve_zettlab_tool_gateway("zettlab-tts") is None
 
 
 def test_resolves_profile_scoped_local_server_secrets(
@@ -118,7 +118,7 @@ def test_resolves_profile_scoped_local_server_secrets(
         }
     )
     try:
-        cfg = resolve_zettlab_tool_gateway("openai-tts")
+        cfg = resolve_zettlab_tool_gateway("zettlab-tts")
     finally:
         reset_secret_scope(scope)
 
