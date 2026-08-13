@@ -16397,6 +16397,64 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_passes_native_image_caption_provenance(monkeypatch, tmp_path):
+    captured = {}
+    image_path = tmp_path / "cat.png"
+    image_path.write_bytes(b"png")
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA"},
+    }
+
+    class _Agent:
+        provider = "openai"
+        model = "vision-model"
+        api_mode = ""
+
+        def run_conversation(self, prompt, **kwargs):
+            captured["prompt"] = prompt
+            captured.update(kwargs)
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+    monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+    monkeypatch.setattr(server, "_emit", lambda *a: None)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_a: None)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr("agent.image_routing.decide_image_input_mode", lambda *_a, **_k: "native")
+    monkeypatch.setattr(
+        "agent.image_routing.build_native_content_parts",
+        lambda prompt, _images: ([{"type": "text", "text": prompt}, image_part], []),
+    )
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    try:
+        server._run_prompt_submit(
+            "1",
+            "sid",
+            server._sessions["sid"],
+            "Describe this image.",
+            image_paths=[str(image_path)],
+        )
+
+        assert captured["prompt"][-1] == image_part
+        assert captured["user_authored_message"] == "Describe this image."
+        assert captured["user_message_has_image"] is True
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
     """The trim boundary must not retain the just-pruned history snapshots."""
     observed = {}

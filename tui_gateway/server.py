@@ -9723,6 +9723,12 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            if isinstance(run_message, list) and any(
+                isinstance(part, dict) and part.get("type") == "image_url"
+                for part in run_message
+            ):
+                run_kwargs["user_authored_message"] = text
+                run_kwargs["user_message_has_image"] = True
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is

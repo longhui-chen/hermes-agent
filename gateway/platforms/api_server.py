@@ -824,6 +824,14 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _content_has_image(content: Any) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _IMAGE_PART_TYPES
+        for part in content
+    )
+
+
 def _extract_current_turn_reference_image(content: Any) -> str:
     """Return one bounded data image from the current normalized user turn.
 
@@ -8109,10 +8117,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
                     _publish_turn_process_ownership(agent, effective_task_id)
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if _content_has_image(user_message):
+                        conversation_kwargs.update(
+                            user_authored_message=(
+                                trusted_user_message
+                                if trusted_user_message is not None
+                                else user_message
+                            ),
+                            user_message_has_image=True,
+                        )
                     result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                        **conversation_kwargs,
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -8645,11 +8665,17 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            conversation_kwargs = {
+                                "user_message": user_message,
+                                "conversation_history": conversation_history,
+                                "task_id": effective_task_id,
+                            }
+                            if _content_has_image(user_message):
+                                conversation_kwargs.update(
+                                    user_authored_message=user_message,
+                                    user_message_has_image=True,
+                                )
+                            r = agent.run_conversation(**conversation_kwargs)
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later

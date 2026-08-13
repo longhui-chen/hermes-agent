@@ -1645,6 +1645,14 @@ class HermesACPAgent(acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
+        user_content_has_image = bool(
+            isinstance(user_content, list)
+            and any(
+                isinstance(part, dict)
+                and part.get("type") in {"image", "image_url", "input_image"}
+                for part in user_content
+            )
+        )
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
@@ -1910,6 +1918,14 @@ class HermesACPAgent(acp.Agent):
                     conversation_history=state.history,
                     task_id=session_id,
                     persist_user_message=user_text or "[Image attachment]",
+                    **(
+                        {
+                            "user_authored_message": user_text,
+                            "user_message_has_image": True,
+                        }
+                        if user_content_has_image
+                        else {}
+                    ),
                 )
                 return result
             except Exception as e:

@@ -236,6 +236,8 @@ def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():
     assert agent.captured is not None
     assert agent.captured["persist_user_message"] == clean_parts
     assert agent.captured["persist_user_message"] is not agent.captured["user_message"]
+    assert agent.captured["user_authored_message"] == clean_parts
+    assert agent.captured["user_message_has_image"] is True
     api_parts = agent.captured["user_message"]
     assert api_parts[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
     assert api_parts[1] == clean_parts[1]

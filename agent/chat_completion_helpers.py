@@ -3261,11 +3261,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         agent, "_should_suppress_plan_stream_text", lambda: False
                     )()
                 ):
-                    try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
-                    except Exception:
-                        pass
+                    _callback = agent.stream_delta_callback
+                    _text = delta.content
+
+                    def _deliver_tool_suppressed_text(
+                        callback=_callback, text=_text
+                    ):
+                        callback(text)
+                        agent._record_streamed_assistant_text(text)
+
+                    if not agent._defer_provisional_stream_event(
+                        _deliver_tool_suppressed_text
+                    ):
+                        try:
+                            _deliver_tool_suppressed_text()
+                        except Exception:
+                            pass
 
             # Accumulate tool call deltas — notify display on first name
             if delta and delta.tool_calls:
