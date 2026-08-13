@@ -49,9 +49,19 @@ _VIDEO_EDIT_SKILL_PATH = "skills/video-edit-workflow-mini/SKILL.md"
 _VIDEO_EDIT_DIRECT_TOOLS = frozenset({"clarify", "terminal", "todo"})
 _CAMERA_SKILL_PATH = "skills/camsnap/SKILL.md"
 _CAMERA_DIRECT_TOOLS = frozenset({"terminal"})
+_PRINTER3D_SKILL_PATHS = frozenset({
+    "skills/printer3d/SKILL.md",
+    "skills/printer3d-control/SKILL.md",
+})
+_PRINTER3D_DIRECT_TOOLS = frozenset({"terminal"})
 _CAMERA_INTENT_RE = re.compile(
     r"(?:摄像头|镜头|camera).{0,32}(?:查看|看看|列出|截图|快照|短视频|录像|诊断|状态|view|list|snap|snapshot|clip|doctor)"
     r"|(?:查看|看看|列出|截图|快照|短视频|录像|诊断|状态|view|list|snap|snapshot|clip|doctor).{0,32}(?:摄像头|镜头|camera)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PRINTER3D_INTENT_RE = re.compile(
+    r"(?:3d\s*打印机|三维打印机|printer).{0,32}(?:查看|列出|状态|进度|暂停|继续|恢复|取消|list|status|progress|pause|resume|cancel)"
+    r"|(?:查看|列出|状态|进度|暂停|继续|恢复|取消|list|status|progress|pause|resume|cancel).{0,32}(?:3d\s*打印机|三维打印机|printer)",
     re.IGNORECASE | re.DOTALL,
 )
 _VIDEO_EDIT_POLICY_VIOLATION_RETRIES = 2
@@ -202,6 +212,8 @@ class _SkillDirectTaskContext:
     video_edit_explicit: bool = False
     camera_applicable: bool = False
     camera_explicit: bool = False
+    printer3d_applicable: bool = False
+    printer3d_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -440,6 +452,11 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
 
 def trusted_camera_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the camsnap helper."""
+    return trusted_video_edit_runtime_receipt()
+
+
+def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
+    """Return the private one-operation receipt for signed printer helpers."""
     return trusted_video_edit_runtime_receipt()
 
 
@@ -782,6 +799,10 @@ def _capture_trusted_presets_snapshot(
             expected_trusted_skill_hashes[_CAMERA_SKILL_PATH] = (
                 expected_camera_sha256
             )
+        for printer_skill_path in _PRINTER3D_SKILL_PATHS:
+            expected_printer_sha256 = expected_hashes.get(printer_skill_path)
+            if expected_printer_sha256:
+                expected_trusted_skill_hashes[printer_skill_path] = expected_printer_sha256
         video_edit_scripts_root = Path(_VIDEO_EDIT_SKILL_PATH).parent / "scripts"
         video_edit_script_digests = tuple(sorted(
             (relative_path, digest)
@@ -1211,6 +1232,7 @@ def _skill_direct_task_context(
         normalized_skill_slug == "video-edit-workflow-mini"
     )
     camera_transport_selection = normalized_skill_slug == "camsnap"
+    printer3d_transport_selection = normalized_skill_slug in {"printer3d", "printer3d-control"}
     # A slash token inside user-authored text is display/content, not a trusted
     # transport selection. Ignore the token itself for semantic intent while
     # preserving the remaining natural-language request.
@@ -1251,7 +1273,7 @@ def _skill_direct_task_context(
         resume_sessions.move_to_end(resume_key)
     task_binding = (
         f"skill:{normalized_skill_slug}\n{normalized}"
-        if explicit_transport_selection or camera_transport_selection
+        if explicit_transport_selection or camera_transport_selection or printer3d_transport_selection
         else normalized
     )
     return _SkillDirectTaskContext(
@@ -1261,6 +1283,8 @@ def _skill_direct_task_context(
         video_edit_explicit=explicit,
         camera_applicable=camera_transport_selection or bool(_CAMERA_INTENT_RE.search(normalized)),
         camera_explicit=camera_transport_selection,
+        printer3d_applicable=printer3d_transport_selection or bool(_PRINTER3D_INTENT_RE.search(normalized)),
+        printer3d_explicit=printer3d_transport_selection,
     )
 
 
@@ -1356,6 +1380,43 @@ def _camera_command_policy(function_args: Mapping[str, Any]) -> bool:
     ):
         return False
     return _camera_runtime_argv(function_args) is not None
+
+
+def _printer3d_runtime_argv(function_args: Mapping[str, Any]) -> list[str] | None:
+    command = function_args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        from tools.terminal_tool import _parse_printer3d_runtime_command
+
+        parsed = _parse_printer3d_runtime_command(command)
+    except Exception:
+        return None
+    argv = getattr(parsed, "argv", None)
+    if not isinstance(argv, list) or len(argv) < 3 or not all(isinstance(value, str) for value in argv):
+        return None
+    return list(argv)
+
+
+def _printer3d_command_policy(
+    function_args: Mapping[str, Any],
+    *,
+    relative_path: str,
+) -> bool:
+    if any(
+        bool(function_args.get(field))
+        for field in ("background", "force", "notify_on_complete", "pty", "watch_patterns", "workdir")
+    ):
+        return False
+    argv = _printer3d_runtime_argv(function_args)
+    if argv is None:
+        return False
+    script_name = os.path.basename(argv[1])
+    if relative_path == "skills/printer3d/SKILL.md":
+        return script_name == "printer3d_connector.py"
+    if relative_path == "skills/printer3d-control/SKILL.md":
+        return script_name == "printer3d_control.py"
+    return False
 
 
 def _video_edit_command_policy(
@@ -1592,6 +1653,18 @@ def trusted_skill_operation_block_message(
                     "scope minted by the attested `camsnap` skill_view result. "
                     "Load that trusted skill and retry the exact operation."
                 )
+            if (
+                function_name == "terminal"
+                and _printer3d_runtime_argv(function_args) is not None
+            ):
+                logger.warning(
+                    "zet_agent: blocked printer3d runtime command without a current trusted scope"
+                )
+                return (
+                    "Trusted 3D-printer commands require a current request-bound "
+                    "scope minted by an attested printer skill. Load the matching "
+                    "trusted skill and retry the exact operation."
+                )
             return None
 
         if scope.policy_exhausted:
@@ -1615,6 +1688,11 @@ def trusted_skill_operation_block_message(
             else:
                 if scope.relative_path == _CAMERA_SKILL_PATH:
                     allowed = _camera_command_policy(normalized_args)
+                elif scope.relative_path in _PRINTER3D_SKILL_PATHS:
+                    allowed = _printer3d_command_policy(
+                        normalized_args,
+                        relative_path=scope.relative_path,
+                    )
                 else:
                     allowed, may_authorize_memory = _video_edit_command_policy(
                         normalized_args
@@ -1792,6 +1870,7 @@ def _claim_trusted_terminal_dispatch(
             if (
                 _video_edit_runtime_argv(function_args) is not None
                 or _camera_runtime_argv(function_args) is not None
+                or _printer3d_runtime_argv(function_args) is not None
             ):
                 return None, (
                     "Trusted runtime commands require a current "
@@ -1832,6 +1911,12 @@ def _claim_trusted_terminal_dispatch(
             allowed, may_authorize_memory = False, False
         elif scope.relative_path == _CAMERA_SKILL_PATH:
             allowed = _camera_command_policy(normalized_args)
+            may_authorize_memory = False
+        elif scope.relative_path in _PRINTER3D_SKILL_PATHS:
+            allowed = _printer3d_command_policy(
+                normalized_args,
+                relative_path=scope.relative_path,
+            )
             may_authorize_memory = False
         else:
             allowed, may_authorize_memory = _video_edit_command_policy(
@@ -1988,16 +2073,15 @@ def _rearm_skill_direct_scope_after_success(
             except (TypeError, ValueError):
                 result = None
             exit_code = result.get("exit_code") if isinstance(result, dict) else None
-            runtime_direct_field = (
-                "camera_runtime_direct"
-                if scope.relative_path == _CAMERA_SKILL_PATH
-                else "video_edit_runtime_direct"
-            )
-            runtime_blocked_field = (
-                "camera_runtime_blocked"
-                if scope.relative_path == _CAMERA_SKILL_PATH
-                else "video_edit_runtime_blocked"
-            )
+            if scope.relative_path == _CAMERA_SKILL_PATH:
+                runtime_direct_field = "camera_runtime_direct"
+                runtime_blocked_field = "camera_runtime_blocked"
+            elif scope.relative_path in _PRINTER3D_SKILL_PATHS:
+                runtime_direct_field = "printer3d_runtime_direct"
+                runtime_blocked_field = "printer3d_runtime_blocked"
+            else:
+                runtime_direct_field = "video_edit_runtime_direct"
+                runtime_blocked_field = "video_edit_runtime_blocked"
             successful = bool(
                 isinstance(result, dict)
                 and result.get(runtime_direct_field) is True
@@ -2118,7 +2202,7 @@ def apply_trusted_skill_execution(
     if (getattr(agent, "platform", "") or "") != "zet_agent":
         return False
 
-    if pending.relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH}:
+    if pending.relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH, *_PRINTER3D_SKILL_PATHS}:
         return False
     task = getattr(agent, "_zet_agent_skill_direct_task", None)
     task_matches_skill = bool(
@@ -2131,6 +2215,10 @@ def apply_trusted_skill_execution(
             or (
                 pending.relative_path == _CAMERA_SKILL_PATH
                 and task.camera_applicable
+            )
+            or (
+                pending.relative_path in _PRINTER3D_SKILL_PATHS
+                and task.printer3d_applicable
             )
         )
     )
@@ -2157,6 +2245,8 @@ def apply_trusted_skill_execution(
     allowed_tools = (
         _CAMERA_DIRECT_TOOLS
         if pending.relative_path == _CAMERA_SKILL_PATH
+        else _PRINTER3D_DIRECT_TOOLS
+        if pending.relative_path in _PRINTER3D_SKILL_PATHS
         else _VIDEO_EDIT_DIRECT_TOOLS
     )
 
