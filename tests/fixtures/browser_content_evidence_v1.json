@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "navigate_page_text",
+      "tool_name": "browser_navigate",
+      "browser_session_id": "browser-1",
+      "output": {
+        "success": true,
+        "_browser_content_provenance": "page_text",
+        "snapshot": "- heading \"Market report\" [ref=e1]\n- text \"Global AI grew 20%.\"\n- text \"Global AI grew 20%.\"\n- textbox \"typed value\" [ref=e2]"
+      },
+      "expected": {
+        "version": 1,
+        "provenance": "page_text",
+        "browserSessionId": "browser-1",
+        "blocks": [
+          { "kind": "heading", "text": "Market report" },
+          { "kind": "paragraph", "text": "Global AI grew 20%." }
+        ],
+        "originalBlockCount": 3,
+        "duplicateBlockCount": 1
+      }
+    },
+    {
+      "name": "snapshot_page_text",
+      "tool_name": "browser_snapshot",
+      "output": {
+        "success": true,
+        "_browser_content_provenance": "page_text",
+        "_browser_content_source_truncated": true,
+        "snapshot": "- blockquote \"Demand remains strong.\"\n- row \"Region | Growth\"\n- listitem \"Manufacturing leads adoption\""
+      },
+      "expected": {
+        "version": 1,
+        "provenance": "page_text",
+        "blocks": [
+          { "kind": "quote", "text": "Demand remains strong." },
+          { "kind": "table_row", "text": "Region | Growth" },
+          { "kind": "list_item", "text": "Manufacturing leads adoption" }
+        ],
+        "originalBlockCount": 3,
+        "truncated": true,
+        "truncationReasons": ["source"]
+      }
+    },
+    {
+      "name": "snapshot_real_accessibility_tree",
+      "tool_name": "browser_snapshot",
+      "output": {
+        "success": true,
+        "_browser_content_provenance": "page_text",
+        "snapshot": "- banner:\n  - link \"Docs\" [ref=e1]:\n- main:\n  - heading \"Models & Pricing\" [level=1]\n  - paragraph:\n    - text: Compare the two models.\n  - row \"MODEL model-flash model-pro\":\n    - columnheader \"MODEL\" [ref=e2]\n    - gridcell \"model-flash\" [ref=e3]\n    - gridcell \"model-pro\" [ref=e4]\n  - link \"Models & Pricing\" [ref=e5]:"
+      },
+      "expected": {
+        "version": 1,
+        "provenance": "page_text",
+        "blocks": [
+          { "kind": "other", "text": "Docs" },
+          { "kind": "heading", "text": "Models & Pricing" },
+          { "kind": "paragraph", "text": "Compare the two models." },
+          { "kind": "table_row", "text": "MODEL model-flash model-pro" }
+        ],
+        "originalBlockCount": 8,
+        "duplicateBlockCount": 4
+      }
+    },
+    {
+      "name": "snapshot_task_extraction",
+      "tool_name": "browser_snapshot",
+      "output": {
+        "success": true,
+        "_browser_content_provenance": "task_extraction",
+        "_browser_content_source_truncated": true,
+        "snapshot": "## Key findings\n\n- Enterprise adoption reached 42%.\n- Healthcare grew fastest.\n\n| Region | Share |\n| --- | --- |\n| APAC | 31% |"
+      },
+      "expected": {
+        "version": 1,
+        "provenance": "task_extraction",
+        "blocks": [
+          { "kind": "heading", "text": "Key findings" },
+          { "kind": "list_item", "text": "Enterprise adoption reached 42%." },
+          { "kind": "list_item", "text": "Healthcare grew fastest." },
+          { "kind": "table_row", "text": "Region | Share" },
+          { "kind": "table_row", "text": "APAC | 31%" }
+        ],
+        "originalBlockCount": 5,
+        "truncated": true,
+        "truncationReasons": ["source"]
+      }
+    },
+    {
+      "name": "vision_analysis",
+      "tool_name": "browser_vision",
+      "output": {
+        "success": true,
+        "analysis": "# Visual summary\n\nThe chart rises steadily from January to June.\n\n> June is the highest point."
+      },
+      "expected": {
+        "version": 1,
+        "provenance": "vision_analysis",
+        "blocks": [
+          { "kind": "heading", "text": "Visual summary" },
+          { "kind": "paragraph", "text": "The chart rises steadily from January to June." },
+          { "kind": "quote", "text": "June is the highest point." }
+        ],
+        "originalBlockCount": 3
+      }
+    }
+  ]
+}
