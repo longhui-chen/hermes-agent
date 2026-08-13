@@ -493,7 +493,11 @@ def _managed_terminal_profile_tag(env: Mapping[str, str] | None) -> str:
     return f"-{profile_id}"
 
 
-def _retire_occupied_credential_path(destination: Path) -> None:
+def _retire_occupied_credential_path(
+    destination: Path,
+    *,
+    parent_fd: int | None = None,
+) -> None:
     """把挡住软链的实体挪开,而不是抛错把整台设备卡死。
 
     受管 HOME 里出现真目录/真文件是常态,不是异常:软链只在本函数里建,而在它建成
@@ -512,19 +516,109 @@ def _retire_occupied_credential_path(destination: Path) -> None:
     retired = destination.with_name(
         f"{destination.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}"
     )
+
+    def _exists(name: str) -> bool:
+        if parent_fd is None:
+            candidate = destination.with_name(name)
+            return candidate.exists() or candidate.is_symlink()
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
     suffix = 1
-    while retired.exists() or retired.is_symlink():
+    while _exists(retired.name):
         retired = destination.with_name(
             f"{destination.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}-{suffix}"
         )
         suffix += 1
     try:
-        destination.rename(retired)
+        if parent_fd is None:
+            destination.rename(retired)
+        else:
+            os.rename(
+                destination.name,
+                retired.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
     except OSError as exc:
         raise OSError(
             "managed terminal lark-cli credential path is occupied and could not "
             f"be moved aside: {destination}"
         ) from exc
+
+
+def _open_managed_credential_parent(home: Path, relative: Path) -> int | None:
+    """Open/create ``relative.parent`` without following links outside HOME."""
+
+    home_info = os.lstat(home)
+    if not stat.S_ISDIR(home_info.st_mode) or stat.S_ISLNK(home_info.st_mode):
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+
+    if _IS_WINDOWS:
+        # Managed terminal execution is Linux-only. Keep local Windows tests and
+        # development usable while still rejecting an already-linked parent.
+        trusted_home = home.resolve(strict=True)
+        parent = home
+        for component in relative.parent.parts:
+            parent /= component
+            try:
+                info = os.lstat(parent)
+            except FileNotFoundError:
+                parent.mkdir()
+                info = os.lstat(parent)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential parent is not trusted"
+                )
+            if not parent.resolve(strict=True).is_relative_to(trusted_home):
+                raise OSError(
+                    "managed terminal lark-cli credential parent is not trusted"
+                )
+        return None
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(home, directory_flags)
+    opened_home = os.fstat(directory_fd)
+    if (
+        opened_home.st_dev != home_info.st_dev
+        or opened_home.st_ino != home_info.st_ino
+        or not stat.S_ISDIR(opened_home.st_mode)
+    ):
+        os.close(directory_fd)
+        raise OSError("managed terminal lark-cli credential home changed")
+
+    try:
+        for component in relative.parent.parts:
+            try:
+                os.mkdir(component, 0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            info = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential parent is not trusted"
+                )
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            opened = os.fstat(child_fd)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or not stat.S_ISDIR(opened.st_mode)
+            ):
+                os.close(child_fd)
+                raise OSError(
+                    "managed terminal lark-cli credential parent changed"
+                )
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
 
 
 def _link_profile_lark_cli_credentials(
@@ -553,14 +647,41 @@ def _link_profile_lark_cli_credentials(
         if not source.is_dir():
             continue
         destination = home / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink():
-            if destination.resolve() == source.resolve():
+        parent_fd = _open_managed_credential_parent(home, relative)
+        try:
+            if parent_fd is None:
+                if destination.is_symlink():
+                    if destination.resolve() == source.resolve():
+                        continue
+                    destination.unlink()
+                elif destination.exists():
+                    _retire_occupied_credential_path(destination)
+                os.symlink(source, destination)
                 continue
-            destination.unlink()
-        elif destination.exists():
-            _retire_occupied_credential_path(destination)
-        os.symlink(source, destination)
+
+            try:
+                destination_info = os.stat(
+                    destination.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                destination_info = None
+            if destination_info is not None:
+                if stat.S_ISLNK(destination_info.st_mode):
+                    target = os.readlink(destination.name, dir_fd=parent_fd)
+                    if target == str(source):
+                        continue
+                    os.unlink(destination.name, dir_fd=parent_fd)
+                else:
+                    _retire_occupied_credential_path(
+                        destination,
+                        parent_fd=parent_fd,
+                    )
+            os.symlink(source, destination.name, dir_fd=parent_fd)
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
 
 def _managed_terminal_home_path(

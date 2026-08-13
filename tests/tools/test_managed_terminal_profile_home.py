@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from tools.environments.local import (
     _link_profile_lark_cli_credentials,
     _managed_terminal_profile_tag,
@@ -28,9 +30,7 @@ def test_sandbox_home_name_is_scoped_to_the_session_profile(tmp_path):
     assert tag == "-agent-one"
 
 
-def test_session_profile_credentials_are_linked_into_the_sandbox(
-    tmp_path, monkeypatch
-):
+def test_session_profile_credentials_are_linked_into_the_sandbox(tmp_path, monkeypatch):
     profile_home, source_home = _profile(tmp_path, "agent-one")
     sandbox = tmp_path / "terminal-homes" / "1000-agent-one"
     sandbox.mkdir(parents=True)
@@ -92,7 +92,7 @@ def test_occupied_credential_dir_is_moved_aside_instead_of_bricking(
     sandbox = tmp_path / "terminal-homes" / "1000-agent-one"
     sandbox.mkdir(parents=True)
     occupied = sandbox / ".lark-cli"
-    (occupied / "cache").mkdir(parents=True)          # 非空:rmdir 必失败
+    (occupied / "cache").mkdir(parents=True)  # 非空:rmdir 必失败
     (occupied / "update-state.json").write_text("{}")
     monkeypatch.setattr(
         "tools.environments.local._validate_managed_root_directory_chain",
@@ -138,8 +138,6 @@ def test_occupied_plain_file_is_also_moved_aside(tmp_path, monkeypatch):
 def test_untrusted_source_home_is_still_rejected(tmp_path, monkeypatch):
     """挪开挡路实体是为了别把设备卡死,不是放松信任校验:源不可信照样拒绝。"""
 
-    import pytest
-
     profile_home, _source_home = _profile(tmp_path, "agent-one")
     sandbox = tmp_path / "terminal-homes" / "1000-agent-one"
     sandbox.mkdir(parents=True)
@@ -154,3 +152,38 @@ def test_untrusted_source_home_is_still_rejected(tmp_path, monkeypatch):
             {"HERMES_HOME": str(profile_home)},
             "-agent-one",
         )
+
+
+@pytest.mark.parametrize("linked_parent", [Path(".local"), Path(".local/share")])
+def test_symlinked_credential_parent_cannot_escape_managed_home(
+    tmp_path, monkeypatch, linked_parent
+):
+    """父目录软链不得让 rename/symlink 写到受管 HOME 之外。"""
+
+    profile_home, _source_home = _profile(tmp_path, "agent-one")
+    sandbox = tmp_path / "terminal-homes" / "1000-agent-one"
+    sandbox.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    if linked_parent == Path(".local/share"):
+        (sandbox / ".local").mkdir()
+    (sandbox / linked_parent).symlink_to(external, target_is_directory=True)
+    occupied = external / "lark-cli"
+    occupied.mkdir()
+    marker = occupied / "must-stay-put"
+    marker.write_text("outside")
+    monkeypatch.setattr(
+        "tools.environments.local._validate_managed_root_directory_chain",
+        lambda path: path.resolve(),
+    )
+
+    with pytest.raises(OSError, match="credential parent is not trusted"):
+        _link_profile_lark_cli_credentials(
+            sandbox,
+            {"HERMES_HOME": str(profile_home)},
+            "-agent-one",
+        )
+
+    assert marker.read_text() == "outside"
+    assert occupied.is_dir()
+    assert not list(external.glob("lark-cli.replaced-*"))
