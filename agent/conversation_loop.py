@@ -578,13 +578,12 @@ PLAN_PRESENTED_CLOSING_TEXT = "计划已提交，等待你的确认。"
 
 
 def _should_end_after_present_plan(agent: Any) -> bool:
-    # 决策点语义（方案 §0）：zet_agent 上任何成功呈现且非 auto 直跑的计划卡
-    # 都结束本 turn、等用户在卡上确认——包括普通模式下模型自发的高风险拦截
-    # 计划（此前只有显式 plan 模式才等，自发计划靠提示词约定「模型自觉停」，
-    # 弱模型一次不自觉就会在用户确认前跑出副作用）。auto 直跑仅剩旧 App
-    # capability opt-in 兼容路径。
+    # Only an explicit manual Plan-mode turn waits for confirmation. Plans
+    # presented during a regular tool turn are status UI, not an execution gate
+    # （「不确定不阻塞」：计划卡是进度呈现，不拦执行）。
     return (
         (getattr(agent, "platform", "") or "") == "zet_agent"
+        and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
         and bool(getattr(agent, "_zet_agent_plan_presented", False))
         and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
