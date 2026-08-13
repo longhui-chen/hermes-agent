@@ -2227,7 +2227,16 @@ def _exempt_explicit_platform_native(
 #: schemas to a user with no Nous credential — the same split Home Assistant
 #: uses. Probing the portal from this path would put a network call on every
 #: CLI start, gateway session and cron tick.
-_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl"})
+_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl", "zettlab_connectors"})
+# ⚠️ zettlab_connectors 随统一 Chat Attachment（需求 5，connector 连接推荐）本期新增。
+# 它是全仓唯一**同时**有 catalog 条目、且工具（list_my_connectors）又进了
+# _HERMES_CORE_TOOLS 的 toolset —— zettlab_apphost 有条目但工具不在 core，
+# zettlab_channels 工具在 core 但没条目，两者都不会被平台反向映射捞出来，只有它会。
+# 于是老用户存过的 platform_toolsets 里没有它，读时却被解析出来，正是本清单要覆盖的
+# 「新 toolset 相对存量配置的回填」场景。
+# ⛔ 下个 release 必须连同 bfl 一起清空（见上方注释：留到第二个 release 会把回填变成
+#    卡住的勾选框）。它的工具在 zet_agent 之外零 schema（check_fn 门控），所以回填对
+#    cli/discord 等平台是空操作。
 
 
 def _enable_recently_shipped_toolsets(

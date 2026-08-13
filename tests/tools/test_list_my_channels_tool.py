@@ -119,3 +119,35 @@ def test_profile_scope_flow_works_with_poisoned_environ(monkeypatch):
     assert req.get_header("X-zettlab-agent-action-token") == scope["ZETTLAB_AGENT_ACTION_TOKEN"]
     assert "stale-" not in request_fingerprint(req)
     assert getattr(_check_list_my_channels, "_profile_scope_sensitive") is True
+
+
+def test_tool_passes_through_available_kinds(monkeypatch):
+    """区域感知可连清单必须透传（governor 库存判定与主模型口径接地都依赖它）；
+    老版 local-server 无此字段时输出也不携带（tolerant）。"""
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
+
+    fake = {"code": 200, "data": {
+        "installed_channels": [{"kind": "feishu", "name": "飞书", "status": "online"}],
+        "available_kinds": ["wecom", "wechat"],
+    }}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps(fake).encode("utf-8")
+
+    with patch("urllib.request.urlopen", return_value=FakeResp()):
+        parsed = json.loads(list_my_channels_tool({}))
+    assert parsed["available_kinds"] == ["wecom", "wechat"]
+
+    legacy = {"code": 200, "data": {"installed_channels": []}}
+
+    class LegacyResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps(legacy).encode("utf-8")
+
+    with patch("urllib.request.urlopen", return_value=LegacyResp()):
+        parsed = json.loads(list_my_channels_tool({}))
+    assert "available_kinds" not in parsed

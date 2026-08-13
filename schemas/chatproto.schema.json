@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.zettlab.com/chatproto/attachment-v1.schema.json",
+  "title": "Zettlab Chat Attachment Protocol v1",
+  "description": "Authoritative additive contract for generic chat attachment events, actions, acknowledgements, and history snapshots.",
+  "oneOf": [
+    { "$ref": "#/$defs/AttachmentUpsertEvent" },
+    { "$ref": "#/$defs/AttachmentActionMessage" },
+    { "$ref": "#/$defs/AttachmentActionAckEvent" }
+  ],
+  "$defs": {
+    "JSONObject": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "ChatAttachmentActionSpec": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "style": { "type": "string", "enum": ["primary", "secondary", "destructive"] },
+        "requires_confirm": { "type": "boolean" },
+        "disabled": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "ChatAttachmentResolution": {
+      "type": "object",
+      "required": ["action_id", "at"],
+      "properties": {
+        "action_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "at": { "type": "integer", "minimum": 1, "description": "Unix epoch milliseconds" },
+        "result": { "$ref": "#/$defs/JSONObject" }
+      },
+      "additionalProperties": true
+    },
+    "ChatAttachmentWire": {
+      "type": "object",
+      "required": ["id", "kind", "v", "state", "payload"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "v": { "type": "integer", "minimum": 1 },
+        "state": { "type": "string", "enum": ["active", "resolved", "expired", "failed"] },
+        "payload": { "$ref": "#/$defs/JSONObject" },
+        "actions": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/ChatAttachmentActionSpec" }
+        },
+        "resolution": { "$ref": "#/$defs/ChatAttachmentResolution" },
+        "expires_at": { "type": "integer", "minimum": 1, "description": "Unix epoch milliseconds" },
+        "dedup_key": { "type": "string", "maxLength": 1024 },
+        "fallback_text": { "type": "string", "maxLength": 4096 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "resolved" } }, "required": ["state"] },
+          "then": { "required": ["resolution"] }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "AttachmentUpsertData": {
+      "type": "object",
+      "required": ["attachment"],
+      "properties": {
+        "attachment": { "$ref": "#/$defs/ChatAttachmentWire" }
+      },
+      "additionalProperties": true
+    },
+    "AttachmentActionData": {
+      "type": "object",
+      "required": ["attachment_id", "action_id", "action_token"],
+      "properties": {
+        "attachment_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "action_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "action_token": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "turn_id": { "type": "string", "maxLength": 256 },
+        "payload": { "$ref": "#/$defs/JSONObject" }
+      },
+      "additionalProperties": true
+    },
+    "AttachmentActionAckData": {
+      "type": "object",
+      "required": ["attachment_id", "action_token", "accepted"],
+      "properties": {
+        "attachment_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "action_token": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "accepted": { "type": "boolean" },
+        "duplicate": { "type": "boolean" },
+        "error": { "type": "string", "maxLength": 4096 }
+      },
+      "additionalProperties": true
+    },
+    "AttachmentUpsertEvent": {
+      "type": "object",
+      "required": ["type", "ts", "data"],
+      "properties": {
+        "type": { "const": "attachment.upsert" },
+        "turn_id": { "type": "string" },
+        "seq": { "type": "integer" },
+        "ts": { "type": "integer" },
+        "backend": { "type": "string" },
+        "data": { "$ref": "#/$defs/AttachmentUpsertData" }
+      },
+      "additionalProperties": true
+    },
+    "AttachmentActionMessage": {
+      "type": "object",
+      "required": ["type", "data"],
+      "properties": {
+        "type": { "const": "attachment.action" },
+        "data": { "$ref": "#/$defs/AttachmentActionData" }
+      },
+      "additionalProperties": true
+    },
+    "AttachmentActionAckEvent": {
+      "type": "object",
+      "required": ["type", "ts", "data"],
+      "properties": {
+        "type": { "const": "attachment.action.ack" },
+        "turn_id": { "type": "string" },
+        "seq": { "type": "integer" },
+        "ts": { "type": "integer" },
+        "backend": { "type": "string" },
+        "data": { "$ref": "#/$defs/AttachmentActionAckData" }
+      },
+      "additionalProperties": true
+    },
+    "ChatAttachmentsHistory": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ChatAttachmentWire" }
+    }
+  }
+}

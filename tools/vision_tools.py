@@ -1335,6 +1335,27 @@ async def vision_analyze_tool(
         # Detect vision capability errors — give the model a clear message
         # so it can inform the user instead of a cryptic API error.
         err_str = str(e).lower()
+        # A content-moderation refusal is NOT a vision failure: the gateway (or
+        # provider) LOOKED at the image and REFUSED it. It must terminate the
+        # turn — the caller re-attaches the image inline so the main-model call is
+        # refused too and the model never runs — instead of being swallowed into a
+        # benign "couldn't see it" note that lets the model answer around it.
+        # Keyed on the refusal envelope only, never on generic vision errors.
+        if any(hint in err_str for hint in (
+            "moderation_input_blocked", "content_policy_violation",
+            "content_policy", "内容不合规",
+        )):
+            result = {
+                "success": False,
+                "moderation_blocked": True,
+                "error": error_msg,
+                "analysis": "内容不合规",
+            }
+            debug_call_data["error"] = error_msg
+            _debug.log_call("vision_analyze_tool", debug_call_data)
+            _debug.save()
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
         if any(hint in err_str for hint in (
             "402", "insufficient", "payment required", "credits", "billing",
         )):

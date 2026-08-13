@@ -1380,6 +1380,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
+        if name == "search_memory":
+            # memory.citations 采集：所有工具执行路径的结果汇聚点（并行路径）。
+            from agent.agent_runtime_helpers import collect_memory_citations
+            collect_memory_citations(agent, function_result)
+        elif name == "memory":
+            # memory.saved 采集（写方向透明化，并行路径）。
+            from agent.agent_runtime_helpers import collect_memory_saves
+            collect_memory_saves(agent, args, function_result)
+
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -2007,6 +2016,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         middleware_trace=middleware_trace,
                     )
                 )
+                if function_name == "search_memory":
+                    # 生产主路径（registry 分派）的 memory.citations 采集挂点。
+                    from agent.agent_runtime_helpers import collect_memory_citations
+                    collect_memory_citations(agent, function_result)
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
                     agent,
@@ -2116,6 +2129,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
+
+        if function_name == "search_memory":
+            # memory.citations 采集：所有工具执行路径的结果汇聚点（串行路径）。
+            from agent.agent_runtime_helpers import collect_memory_citations
+            collect_memory_citations(agent, function_result)
+        elif function_name == "memory":
+            # memory.saved 采集（写方向透明化，串行路径）。
+            from agent.agent_runtime_helpers import collect_memory_saves
+            collect_memory_saves(agent, function_args, function_result)
 
         display_function_result = function_result
         function_result = maybe_persist_tool_result(

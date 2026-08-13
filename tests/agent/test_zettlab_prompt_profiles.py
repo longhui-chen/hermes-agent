@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import _build_onboarding_prompt_parts, build_system_prompt_parts
 from hermes_cli.config import ensure_hermes_home
 from hermes_cli.default_soul import (
     DEFAULT_SOUL_MD,
@@ -35,14 +35,45 @@ def _make_agent(**overrides):
     return SimpleNamespace(**base)
 
 
-def _stable_prompt(soul_text: str = "") -> str:
+def _stable_prompt(soul_text: str = "", **agent_overrides) -> str:
     with (
         patch("run_agent.load_soul_md", return_value=soul_text),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
-        return build_system_prompt_parts(_make_agent())["stable"]
+        return build_system_prompt_parts(_make_agent(**agent_overrides))["stable"]
+
+
+def test_onboarding_profile_uses_bounded_prompt():
+    soul = "[zettlab-onboarding-guide-v15]\n只进行简短初次见面引导。"
+    parts = _build_onboarding_prompt_parts(soul, "current onboarding step")
+
+    combined = "\n".join(parts.values())
+    assert soul in parts["stable"]
+    assert "current onboarding step" == parts["context"]
+    assert "conversation_protocol" not in combined
+    assert "zettlab_onboarding_turn_contract" in parts["volatile"]
+    assert len(combined) < 6000
+
+
+def test_onboarding_profile_routes_around_general_prompt_builder():
+    soul = "[zettlab-onboarding-guide-v15]\n只进行简短初次见面引导。"
+    fake_runtime = SimpleNamespace(load_soul_md=lambda _context_length: soul)
+    with (
+        patch("agent.system_prompt._ra", return_value=fake_runtime),
+        patch("agent.system_prompt._active_profile_name_for_prompt", return_value="onboarding"),
+    ):
+        parts = build_system_prompt_parts(
+            _make_agent(valid_tool_names=["terminal", "memory"]),
+            system_message="step=userName",
+        )
+
+    combined = "\n".join(parts.values())
+    assert soul in combined
+    assert "step=userName" in combined
+    assert "conversation_protocol" not in combined
+    assert len(combined) < 6000
 
 
 @pytest.mark.parametrize("profile", ["main", "memo", "default", "root", "writer"])
@@ -138,8 +169,12 @@ def test_zettlab_managed_startup_order_materializes_memo_once_flow(
     monkeypatch.setenv("ZET_AGENT_ID", "main")
     monkeypatch.setenv("HERMES_AGENT_LANG", "en")
 
+    # 命名 profile 的 home 必须显式存在：ensure_hermes_home() 不再为
+    # `<...>/profiles/<id>` 自动 mkdir（否则被删掉的 profile 会被空骨架复活，
+    # 见 hermes_cli/config.py 的守卫）。真机上这一步由 local-server 在拉起
+    # hermes 之前完成。两种启动顺序的差别只在于 SOUL.md 此时是否已经写好。
+    profile_home.mkdir(parents=True)
     if startup_order == "local-first":
-        profile_home.mkdir(parents=True)
         soul_path.write_text(memo_soul, encoding="utf-8")
 
     ensure_hermes_home()
@@ -327,6 +362,54 @@ def test_common_base_owns_agent_creation_routing(monkeypatch, lang, required):
 
     for text in required:
         assert text in stable
+
+
+@pytest.mark.parametrize(
+    ("lang", "required"),
+    [
+        (
+            "en",
+            (
+                "agent-creator` skill's CLI over raw shell",
+                "skill_view(name='agent-creator')",
+                "bypass path validation",
+            ),
+        ),
+        (
+            "zh",
+            (
+                "agent-creator` skill 的 CLI 而不是原生 shell",
+                "skill_view(name='agent-creator')",
+                "绕开路径校验",
+            ),
+        ),
+    ],
+)
+def test_workspace_and_device_ops_route_to_trusted_cli(monkeypatch, lang, required):
+    """Workspace/device work must reach the trusted CLI without the model
+    having to rediscover the skill from the index on its own."""
+    monkeypatch.setenv("HERMES_AGENT_LANG", lang)
+
+    stable = _stable_prompt(valid_tool_names=["skill_view"])
+
+    for text in required:
+        assert text in stable
+
+
+@pytest.mark.parametrize("lang", ["en", "zh"])
+def test_workspace_ops_rule_absent_without_skill_view(monkeypatch, lang):
+    """Narrow toolsets (`terminal`, `file`, `debugging`) ship no skill_view.
+
+    Telling those sessions to load agent-creator — while forbidding the shell
+    they do have — would strand ordinary file and diagnostic work, so the rule
+    must not be injected at all when the loader tool is missing.
+    """
+    monkeypatch.setenv("HERMES_AGENT_LANG", lang)
+
+    stable = _stable_prompt(valid_tool_names=["terminal", "read_file"])
+
+    assert "skill_view(name='agent-creator')" not in stable
+    assert "agent-creator` skill" not in stable
 
 
 def test_runtime_default_is_the_neutral_base():

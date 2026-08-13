@@ -1573,6 +1573,24 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
 
 
+def test_pending_system_prompt_is_persisted_after_session_row_creation():
+    agent = _FakeAgent()
+    agent._cached_system_prompt = None
+    agent._session_db = MagicMock()
+    agent._session_db.update_system_prompt.return_value = True
+
+    def _restore(_agent, _system_message, _history):
+        _agent._cached_system_prompt = "REBUILT-SYSTEM"
+        _agent._system_prompt_persist_pending = True
+
+    _build(agent, restore_or_build_system_prompt=_restore)
+
+    agent._session_db.update_system_prompt.assert_called_once_with(
+        agent.session_id, "REBUILT-SYSTEM"
+    )
+    assert agent._system_prompt_persist_pending is False
+
+
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
 #
 # A slow MCP server that connects after the agent's build-time tool snapshot

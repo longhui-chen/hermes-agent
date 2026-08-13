@@ -98,6 +98,17 @@ from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
+
+def _onboarding_fast_retry_delay(agent, status_code, is_rate_limited):
+    """Return the onboarding-only 502 retry delay, else ``None``."""
+    if (
+        getattr(agent, "_onboarding_fast_retry", False)
+        and status_code == 502
+        and not is_rate_limited
+    ):
+        return 0.25
+    return None
+
 logger = logging.getLogger(__name__)
 
 # Stable prefix of the local interrupt status string emitted when a turn is
@@ -848,6 +859,33 @@ def _append_api_system_instruction(
     api_kwargs["messages"] = patched
 
 
+def _compact_lightweight_api_messages(
+    agent: Any, api_messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep only the stable system policy and current structured user turn.
+
+    The onboarding service includes the complete GuideContextSnapshot in each
+    current user message. Durable SessionDB persistence still retains the full
+    UI transcript; this changes only the provider-bound copy.
+    """
+    if not getattr(agent, "_onboarding_lightweight", False):
+        return api_messages
+
+    system = next(
+        (msg for msg in api_messages if msg.get("role") == "system"), None
+    )
+    current_user = next(
+        (msg for msg in reversed(api_messages) if msg.get("role") == "user"),
+        None,
+    )
+    compacted: List[Dict[str, Any]] = []
+    if system is not None:
+        compacted.append(system)
+    if current_user is not None:
+        compacted.append(current_user)
+    return compacted or api_messages
+
+
 def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
     """Inject the Plan decision protocol into the API-only system message.
 
@@ -1392,8 +1430,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            updated = agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+            agent._system_prompt_persist_pending = updated is False
         except Exception as exc:
+            agent._system_prompt_persist_pending = True
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
                 "%s. Subsequent turns will rebuild the system prompt and "
@@ -1774,6 +1816,41 @@ def _purge_refused_rows_from_session_db(agent, messages: List[Dict], kept: int) 
                 "content refusal: failed to delete persisted message row %s: %s",
                 row_id, exc,
             )
+
+
+def _turn_has_tool_moderation_block(messages: List[Dict], start_idx: int) -> bool:
+    """Whether a tool result appended this iteration signals an image
+    moderation refusal.
+
+    A text-only main model cannot see images, so a refused image is described
+    by the ``vision_analyze`` auxiliary tool. When the moderation gateway
+    blocks that image the tool returns ``{"moderation_blocked": true}`` instead
+    of a description. That result must TERMINATE the turn — never be fed back
+    to the main model, which would otherwise answer around the "内容不合规"
+    tool output and leak a reply for a refused image. (Native-vision models
+    already terminate: the re-embedded inline image is blocked on the next main
+    call. This closes the same hole for the text-only/legacy path.)
+    """
+    for msg in messages[start_idx:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or "moderation_blocked" not in content:
+            continue
+        try:
+            payload = json.loads(content)
+        except (ValueError, TypeError):
+            # A guardrail observation may have been appended, so the content no
+            # longer parses as bare JSON — fall back to a substring match.
+            if (
+                '"moderation_blocked": true' in content
+                or '"moderation_blocked":true' in content
+            ):
+                return True
+            continue
+        if isinstance(payload, dict) and payload.get("moderation_blocked") is True:
+            return True
+    return False
 
 
 def _content_policy_blocked_result(
@@ -2660,6 +2737,8 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        api_messages = _compact_lightweight_api_messages(agent, api_messages)
+
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -3312,6 +3391,19 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
+                    _started = getattr(agent, "_onboarding_upstream_started_mono", None)
+                    if (
+                        getattr(agent, "_onboarding_lightweight", False)
+                        and isinstance(_started, (int, float))
+                        and not getattr(agent, "_onboarding_ttft_logged", False)
+                    ):
+                        agent._onboarding_ttft_logged = True
+                        logger.info(
+                            "onboarding lightweight upstream first delta: "
+                            "session=%s ttft_ms=%d",
+                            agent.session_id or "none",
+                            int((time.monotonic() - _started) * 1000),
+                        )
 
                 _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
@@ -3349,6 +3441,23 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    if getattr(agent, "_onboarding_lightweight", False):
+                        _upstream_started = time.monotonic()
+                        agent._onboarding_upstream_started_mono = _upstream_started
+                        agent._onboarding_ttft_logged = False
+                        _received = getattr(agent, "_onboarding_received_mono", None)
+                        logger.info(
+                            "onboarding lightweight upstream request: "
+                            "session=%s preflight_ms=%d messages=%d tools=%d "
+                            "approx_tokens=%d",
+                            agent.session_id or "none",
+                            int((_upstream_started - _received) * 1000)
+                            if isinstance(_received, (int, float))
+                            else -1,
+                            len(next_api_kwargs.get("messages") or []),
+                            len(next_api_kwargs.get("tools") or []),
+                            approx_tokens,
+                        )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -4933,6 +5042,11 @@ def run_conversation(
                     approx_tokens=approx_tokens,
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
+                    # Verifiable gateway origin: a content-policy block on the
+                    # ai-proxy route is the Zettlab moderation gateway's verdict
+                    # (compliance, no failover) even on its generic code="400"
+                    # shape — a custom endpoint is on a different base_url.
+                    via_moderation_gateway=_is_zettlab_ai_proxy_route(agent),
                 )
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
@@ -6684,6 +6798,15 @@ def run_conversation(
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                onboarding_retry_delay = _onboarding_fast_retry_delay(
+                    agent, status_code, is_rate_limited
+                )
+                if onboarding_retry_delay is not None:
+                    # Onboarding gets exactly one fast retry (the agent factory
+                    # caps max_retries at two).  Normal Agent traffic keeps the
+                    # existing adaptive backoff unchanged.
+                    wait_time = onboarding_retry_delay
+                    _backoff_policy = "onboarding_fast_502"
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
@@ -7506,7 +7629,49 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _pre_tool_msg_count = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # An image-moderation refusal surfaced by a tool result must END
+                # the turn as a content-policy block — never be fed back to the
+                # model. vision_analyze (the text-only-model image path) returns
+                # {"moderation_blocked": true} when the gateway refuses an image;
+                # feeding that to the main model lets it answer around the
+                # "内容不合规" tool output and leak a reply for a refused image.
+                # Terminate with the same result shape as the native-vision path
+                # so the App hides the image and renders the compliance notice.
+                if _turn_has_tool_moderation_block(messages, _pre_tool_msg_count):
+                    _kept_messages = _transcript_without_refused_turn(
+                        messages, user_message, current_turn_user_idx
+                    )
+                    _purge_refused_rows_from_session_db(
+                        agent, messages, len(_kept_messages)
+                    )
+                    agent._persist_session(_kept_messages, conversation_history)
+                    logger.warning(
+                        "%svision_analyze moderation block → terminating turn as "
+                        "content_policy_blocked (refused image not fed to model)",
+                        agent.log_prefix,
+                    )
+                    _policy_response = (
+                        "⚠️  The model provider's safety filter blocked this request "
+                        "(not a Hermes/gateway failure).\n\n"
+                        "Provider message: 内容不合规\n\n"
+                        f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                    )
+                    return _content_policy_blocked_result(
+                        _kept_messages,
+                        api_call_count,
+                        final_response=_policy_response,
+                        error_detail="image content refused by moderation gateway",
+                        provider_error={
+                            "code": "content_blocked",
+                            "reason": FailoverReason.content_policy_blocked.value,
+                            "retryable": False,
+                            "recoverable": False,
+                            "provider_message": "内容不合规",
+                        },
+                    )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

@@ -523,22 +523,83 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="anthropic", model="claude-x")
         assert normalized_provider_error_code(result) == "content_blocked"
 
-    def test_content_policy_failover_opt_out(self, monkeypatch):
-        # Compliance deployments must not fail over to a second model: every
-        # cloud model sits behind the same gateway (identical verdict, one more
-        # billed moderation call), and a user-configured custom model does not
-        # sit behind it at all.
-        e = MockAPIError(
+    def test_content_policy_failover_split_by_source(self, monkeypatch):
+        # A content-policy block suppresses failover only when it is VERIFIABLY
+        # the Zettlab moderation gateway — either the gateway's own unambiguous
+        # code moderation_input_blocked, or a verifiable ai-proxy origin
+        # (via_moderation_gateway=True, which also covers the generic code="400"
+        # shape). It is unconditional on the gateway side (not gated on the env
+        # switch). A general refusal, or the SAME generic tokens from a custom
+        # endpoint (no verifiable origin), stays failover-eligible unless a
+        # deployment opts out — never inferred from the refusal text alone.
+        by_code = MockAPIError(
             "内容不合规",
             status_code=400,
             body={"error": {"code": "moderation_input_blocked", "message": "内容不合规"}},
         )
+        # Gateway generic-code shape: code="400", no gateway code token.
+        generic = MockAPIError(
+            "内容不合规",
+            status_code=400,
+            body={"error": {"code": "400", "type": "content_policy_violation", "message": "内容不合规"}},
+        )
+        cyber = Exception(
+            "This content was flagged for possible cybersecurity risk."
+        )
+        # An UPSTREAM model's own safety refusal ALSO traverses the ai-proxy
+        # (via_moderation_gateway=True) but is not the gateway's verdict — it
+        # carries no gateway code/type, so it must stay failover-eligible.
+        upstream_safety = Exception(
+            "prompt was flagged by our safety system"
+        )
+        # content_policy_violation as the error.CODE (or in text), NOT the
+        # structured error.type — must not count as the gateway even on the
+        # ai-proxy route (the token is matched on the parsed type, not a substring).
+        cpv_in_code = MockAPIError(
+            "blocked",
+            status_code=400,
+            body={"error": {"code": "content_policy_violation", "message": "blocked"}},
+        )
 
-        monkeypatch.delenv("HERMES_CONTENT_POLICY_NO_FALLBACK", raising=False)
-        assert classify_api_error(e, provider="zettlab").should_fallback is True
+        def _setenv(val):
+            if val is None:
+                monkeypatch.delenv("HERMES_CONTENT_POLICY_NO_FALLBACK", raising=False)
+            else:
+                monkeypatch.setenv("HERMES_CONTENT_POLICY_NO_FALLBACK", val)
 
-        monkeypatch.setenv("HERMES_CONTENT_POLICY_NO_FALLBACK", "1")
-        assert classify_api_error(e, provider="zettlab").should_fallback is False
+        # Gateway by unambiguous code, or by verifiable ai-proxy origin PAIRED
+        # with the gateway's content_policy_violation type (generic code="400"
+        # shape): no failover regardless of the env switch.
+        for val in (None, "0", "1"):
+            _setenv(val)
+            assert classify_api_error(by_code, provider="zettlab").should_fallback is False
+            assert classify_api_error(
+                generic, provider="zettlab", via_moderation_gateway=True
+            ).should_fallback is False
+
+        # Failover-eligible by default: the SAME generic tokens off the gateway
+        # route (custom endpoint), a general provider refusal, AND an upstream
+        # model's safety refusal that merely traverses the ai-proxy…
+        _setenv(None)
+        assert classify_api_error(
+            generic, provider="custom", via_moderation_gateway=False
+        ).should_fallback is True
+        assert classify_api_error(cyber, provider="openai-codex").should_fallback is True
+        assert classify_api_error(
+            upstream_safety, provider="zettlab", via_moderation_gateway=True
+        ).should_fallback is True
+        assert classify_api_error(
+            cpv_in_code, provider="zettlab", via_moderation_gateway=True
+        ).should_fallback is True
+        # …and all are suppressed only when a deployment opts out globally.
+        _setenv("1")
+        assert classify_api_error(
+            generic, provider="custom", via_moderation_gateway=False
+        ).should_fallback is False
+        assert classify_api_error(cyber, provider="openai-codex").should_fallback is False
+        assert classify_api_error(
+            upstream_safety, provider="zettlab", via_moderation_gateway=True
+        ).should_fallback is False
 
     def test_404_model_not_found_still_works(self):
         # Regression guard: the new policy-block check must not swallow
