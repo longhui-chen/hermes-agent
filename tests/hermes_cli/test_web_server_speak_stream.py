@@ -116,6 +116,29 @@ def test_stream_installs_target_profile_secret_scope(stream_client, monkeypatch)
     assert seen == ["worker-stream-token"]
 
 
+def test_stream_current_profile_preserves_process_env(stream_client, monkeypatch):
+    from agent.secret_scope import get_secret
+
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "process-stream-token")
+    seen = []
+
+    class _EnvStreamer(_FakeStreamer):
+        def stream(self, text):
+            seen.append(get_secret("ZETTLAB_AGENT_ACTION_TOKEN"))
+            yield from super().stream(text)
+
+    streamer = _EnvStreamer([b"\x01\x02"])
+    _patch_provider(monkeypatch, streamer)
+
+    with stream_client.websocket_connect(_url()) as conn:
+        assert conn.receive_json()["type"] == "start"
+        conn.send_text(json.dumps({"text": "Hello current stream.", "done": True}))
+        assert conn.receive_bytes() == b"\x01\x02"
+        assert conn.receive_json() == {"type": "end"}
+
+    assert seen == ["process-stream-token"]
+
+
 
 
 
@@ -159,4 +182,3 @@ def test_split_text_respects_cap_and_preserves_content():
     joined = " ".join(pieces)
     for word in text.replace(".", "").split():
         assert word in joined
-
