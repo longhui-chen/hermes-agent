@@ -484,6 +484,56 @@ def _prepare_managed_execute_code_workspace(
     return uid
 
 
+def _managed_terminal_profile_tag(env: Mapping[str, str] | None) -> str:
+    """返回受管终端 HOME 的稳定 profile 后缀。"""
+
+    profile_id = Path(_managed_terminal_profile_scope(env)).name
+    if not profile_id or profile_id in {".", ".."}:
+        raise OSError("managed terminal profile identity is unavailable")
+    return f"-{profile_id}"
+
+
+def _link_profile_lark_cli_credentials(
+    home: Path,
+    env: Mapping[str, str] | None,
+    profile_tag: str,
+) -> None:
+    """把当前 profile 的 lark-cli 凭据目录软链到受管 HOME。"""
+
+    if not profile_tag:
+        return
+    profile_root = Path(_managed_terminal_profile_scope(env))
+    source_home = profile_root / "home"
+    try:
+        source_info = os.lstat(source_home)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+    trusted_profile_root = _validate_managed_root_directory_chain(profile_root)
+    trusted_source_home = _validate_managed_root_directory_chain(source_home)
+    if trusted_source_home.parent != trusted_profile_root:
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+    for relative in (Path(".lark-cli"), Path(".local") / "share" / "lark-cli"):
+        source = trusted_source_home / relative
+        if not source.is_dir():
+            continue
+        destination = home / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            if destination.resolve() == source.resolve():
+                continue
+            destination.unlink()
+        elif destination.exists():
+            try:
+                destination.rmdir()
+            except OSError as exc:
+                raise OSError(
+                    "managed terminal lark-cli credential directory is occupied"
+                ) from exc
+        os.symlink(source, destination)
+
+
 def _managed_terminal_home_path(
     env: Mapping[str, str] | None,
 ) -> Path:
@@ -513,7 +563,8 @@ def _managed_terminal_home_path(
         raise OSError("managed terminal home root is not trusted")
     os.chmod(_MANAGED_TERMINAL_HOME_ROOT, 0o711)
 
-    home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+    profile_tag = _managed_terminal_profile_tag(env)
+    home = _MANAGED_TERMINAL_HOME_ROOT / f"{uid}{profile_tag}"
     created = False
     try:
         os.mkdir(home, 0o700)
@@ -531,6 +582,7 @@ def _managed_terminal_home_path(
         or home_info.st_mode & 0o077
     ):
         raise OSError("managed terminal profile home is not trusted")
+    _link_profile_lark_cli_credentials(home, env, profile_tag)
 
     return home
 
@@ -673,13 +725,19 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
 
         killed = _terminate_managed_uid(uid)
         cgroup_removed = _remove_managed_terminal_cgroup(uid)
-        home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+        profile_tag = _managed_terminal_profile_tag(
+            {"HERMES_HOME": profile_home}
+        )
+        homes = (
+            _MANAGED_TERMINAL_HOME_ROOT / f"{uid}{profile_tag}",
+            _MANAGED_TERMINAL_HOME_ROOT / str(uid),
+        )
         removed = False
-        try:
-            info = os.lstat(home)
-        except FileNotFoundError:
-            pass
-        else:
+        for home in homes:
+            try:
+                info = os.lstat(home)
+            except FileNotFoundError:
+                continue
             if (
                 not stat.S_ISDIR(info.st_mode)
                 or info.st_uid != uid
@@ -1329,7 +1387,6 @@ def _managed_terminal_cwd(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return cwd
     home = _prepare_managed_terminal_home(env)
-    _wire_lark_cli_relay(env)
     try:
         _prepare_managed_profile_runtime(env)
     except OSError as exc:
