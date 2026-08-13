@@ -378,6 +378,16 @@ class TestZetAgentDeviceToolReachability:
         assert "app_host" in TOOLSETS["zettlab_apphost"]["tools"]
         assert "app_host" in resolve_toolset("hermes-zet-agent")
 
+    def test_device_meetings_alias_keeps_chat_and_cron_contracts_separate(self):
+        """Chat recovers the read-only bridge without changing Cron bindings."""
+        assert TOOLSETS["zettlab_device_meetings"]["tools"] == ["device_meetings"]
+        assert "device_meetings" in resolve_toolset("hermes-zet-agent")
+        assert "skill_operation" not in TOOLSETS["zettlab_device_meetings"]["tools"]
+        assert set(TOOLSETS["zettlab_skill_runtime"]["tools"]) == {
+            "skill_operation",
+            "device_meetings",
+        }
+
     def test_app_host_stays_off_shared_and_cron_real_paths(self):
         # Deliberate scoping, same rationale as call_agent: the App Host
         # credentials only exist in a zet_agent profile, and installing
