@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -186,6 +187,8 @@ def resolve_provider_secret(
     when omitted, ``hermes_cli.config.get_env_value`` is used directly.
     """
     value = str(config_value or "").strip()
+    if re.search(r"\${[^}]+}", value):
+        value = ""
     if value:
         return value
 

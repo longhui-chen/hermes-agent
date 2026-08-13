@@ -976,6 +976,8 @@ def _config_section(media_type: str) -> Dict[str, Any]:
 
 
 def base_url(media_type: str) -> str:
+    if media_type == "tts":
+        return tts_gateway_runtime()[0]
     explicit = str(get_secret("ZETTLAB_AI_PROXY_BASE_URL", "") or "").strip()
     configured = explicit or _config_section(media_type).get("base_url")
     if configured:
@@ -1095,7 +1097,24 @@ def invalidate_capability_cache() -> None:
         _capability_cache.clear()
 
 
-def action_headers() -> Dict[str, str]:
+def tts_gateway_runtime() -> tuple[str, Dict[str, str]]:
+    """Resolve one callback-bound URL/token pair for managed TTS."""
+    from tools.zettlab_tool_gateway import resolve_zettlab_tool_gateway
+
+    gateway = resolve_zettlab_tool_gateway("zettlab-tts")
+    if gateway is None:
+        raise ZettlabMediaError(
+            "Zettlab TTS requires a valid local-server callback and action token"
+        )
+    return (
+        f"{gateway.gateway_origin.rstrip('/')}/v1",
+        {ACTION_TOKEN_HEADER: gateway.token},
+    )
+
+
+def action_headers(media_type: Optional[str] = None) -> Dict[str, str]:
+    if media_type == "tts":
+        return tts_gateway_runtime()[1]
     token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     if not token:
         raise ZettlabMediaError("ZETTLAB_AGENT_ACTION_TOKEN is required for Zettlab generation")

@@ -667,12 +667,34 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     if resolve_zettlab_tool_gateway("zettlab-tts") is not None:
         openai_cfg = _get_provider_section(tts_config, "openai")
         if (
-            str(openai_cfg.get("api_key") or "").strip()
+            _resolved_tts_secret(openai_cfg.get("api_key"))
             or _resolve_profile_openai_audio_api_key()
         ):
             return "openai"
-        return "zettlab"
+        if _plugin_tts_provider_is_registered("zettlab"):
+            return "zettlab"
     return str(configured or DEFAULT_PROVIDER).lower().strip()
+
+
+def _resolved_tts_secret(value: Any) -> str:
+    """Return a concrete credential, rejecting unresolved config refs."""
+    resolved = str(value or "").strip()
+    if re.search(r"\${[^}]+}", resolved):
+        return ""
+    return resolved
+
+
+def _plugin_tts_provider_is_registered(name: str) -> bool:
+    """Return whether plugin discovery registered an enabled TTS backend."""
+    try:
+        from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        return get_provider(name) is not None
+    except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
+        logger.debug("tts plugin registration check failed for '%s': %s", name, exc)
+        return False
 
 
 @dataclass(frozen=True)
@@ -3470,7 +3492,7 @@ def _resolve_openai_audio_client_config(
     openai_cfg = (
         tts_config.get("openai") if isinstance(tts_config, dict) else None
     ) or {}
-    cfg_api_key = str(openai_cfg.get("api_key") or "").strip()
+    cfg_api_key = _resolved_tts_secret(openai_cfg.get("api_key"))
     cfg_base_url = str(openai_cfg.get("base_url") or "").strip()
     direct_api_key = _resolve_profile_openai_audio_api_key()
     raw_gateway_preference = tts_config.get("use_gateway")

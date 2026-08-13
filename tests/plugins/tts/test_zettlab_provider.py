@@ -49,13 +49,11 @@ def test_tts_capability_requires_complete_new_contract(monkeypatch):
     monkeypatch.setattr(media_client, "type_capability", lambda media_type: valid)
     monkeypatch.setattr(
         media_client,
-        "action_headers",
-        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
-    )
-    monkeypatch.setattr(
-        media_client,
-        "base_url",
-        lambda media_type: "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+        "tts_gateway_runtime",
+        lambda: (
+            "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+            {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        ),
     )
 
     provider = ZettlabTTSProvider()
@@ -122,13 +120,11 @@ def test_zettlab_provider_uses_capability_transport_contract(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(
         media_client,
-        "action_headers",
-        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
-    )
-    monkeypatch.setattr(
-        media_client,
-        "base_url",
-        lambda media_type: "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+        "tts_gateway_runtime",
+        lambda: (
+            "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+            {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        ),
     )
 
     def fake_generate(text, output_path, config, **kwargs):
@@ -170,10 +166,12 @@ def test_zettlab_provider_omits_speed_when_capability_disables_it(
     )
     monkeypatch.setattr(
         media_client,
-        "action_headers",
-        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        "tts_gateway_runtime",
+        lambda: (
+            "http://127.0.0.1:9090/v1",
+            {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        ),
     )
-    monkeypatch.setattr(media_client, "base_url", lambda media_type: "http://127.0.0.1:9090/v1")
     captured = {}
 
     def fake_generate(text, output_path, config, **kwargs):
@@ -216,13 +214,11 @@ def test_zettlab_provider_negotiates_supported_format(
     )
     monkeypatch.setattr(
         media_client,
-        "action_headers",
-        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
-    )
-    monkeypatch.setattr(
-        media_client,
-        "base_url",
-        lambda media_type: "http://127.0.0.1:9090/v1",
+        "tts_gateway_runtime",
+        lambda: (
+            "http://127.0.0.1:9090/v1",
+            {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        ),
     )
     captured = {}
 
@@ -263,10 +259,12 @@ def test_text_to_speech_auto_dispatches_to_zettlab_plugin(monkeypatch, tmp_path)
     monkeypatch.setattr(media_client, "type_capability", lambda media_type: capability)
     monkeypatch.setattr(
         media_client,
-        "action_headers",
-        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        "tts_gateway_runtime",
+        lambda: (
+            "http://127.0.0.1:9090/v1",
+            {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        ),
     )
-    monkeypatch.setattr(media_client, "base_url", lambda media_type: "http://127.0.0.1:9090/v1")
 
     def fake_generate(text, output_path, config, **kwargs):
         Path(output_path).write_bytes(b"audio")
@@ -306,10 +304,61 @@ def test_zettlab_tool_is_unavailable_when_capability_is_missing(monkeypatch):
     assert tts_tool.check_tts_requirements() is False
 
 
+def test_zettlab_default_respects_disabled_plugin(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tts_tool,
+        "resolve_zettlab_tool_gateway",
+        lambda vendor: SimpleNamespace(vendor="zettlab-tts"),
+    )
+    monkeypatch.setattr(tts_tool, "_resolve_profile_openai_audio_api_key", lambda: "")
+
+    assert tts_tool._get_provider({}) == "edge"
+
+
+def test_tts_gateway_runtime_uses_share_action_origin(monkeypatch):
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    monkeypatch.delenv("ZETTLAB_AI_PROXY_BASE_URL", raising=False)
+    monkeypatch.setenv(
+        "ZETTLAB_AGENT_SHARE_ACTION_URL",
+        "http://127.0.0.1:9430/api/v1/internal/action",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "same-origin-token")
+
+    base_url, headers = media_client.tts_gateway_runtime()
+
+    assert base_url == "http://127.0.0.1:9430/api/v1/ai-proxy/v1"
+    assert headers == {media_client.ACTION_TOKEN_HEADER: "same-origin-token"}
+
+
+def test_unresolved_openai_secret_ref_does_not_override_zettlab(monkeypatch):
+    tts_registry.register_provider(ZettlabTTSProvider())
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tts_tool,
+        "resolve_zettlab_tool_gateway",
+        lambda vendor: SimpleNamespace(vendor="zettlab-tts"),
+    )
+    monkeypatch.setattr(tts_tool, "_resolve_profile_openai_audio_api_key", lambda: "")
+
+    config = {"openai": {"api_key": "${env:OPENAI_API_KEY}"}}
+    assert tts_tool._get_provider(config) == "zettlab"
+    with pytest.raises(ValueError, match="Neither tts.openai.api_key"):
+        tts_tool._resolve_openai_audio_client_config(
+            {"provider": "openai", "use_gateway": False, **config}
+        )
+
+
 def test_zettlab_provider_is_unavailable_without_action_token(monkeypatch):
     monkeypatch.setattr(
         media_client,
-        "action_headers",
+        "tts_gateway_runtime",
         lambda: (_ for _ in ()).throw(
             media_client.ZettlabMediaError("action token is missing")
         ),
@@ -321,13 +370,11 @@ def test_zettlab_provider_is_unavailable_without_action_token(monkeypatch):
 def test_zettlab_provider_is_unavailable_without_supported_format(monkeypatch):
     monkeypatch.setattr(
         media_client,
-        "action_headers",
-        lambda: {media_client.ACTION_TOKEN_HEADER: "action-token"},
-    )
-    monkeypatch.setattr(
-        media_client,
-        "base_url",
-        lambda media_type: "http://127.0.0.1:9090/v1",
+        "tts_gateway_runtime",
+        lambda: (
+            "http://127.0.0.1:9090/v1",
+            {media_client.ACTION_TOKEN_HEADER: "action-token"},
+        ),
     )
     monkeypatch.setattr(media_client, "is_available", lambda media_type: True)
     monkeypatch.setattr(

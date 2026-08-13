@@ -264,6 +264,7 @@ def test_zettlab_tts_auto_selects_independent_provider(monkeypatch):
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
 
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    monkeypatch.setattr(tts_tool, "_plugin_tts_provider_is_registered", lambda _name: True)
     assert tts_tool._get_provider({}) == "zettlab"
     assert tts_tool._get_provider({"provider": "edge", "_provider_is_default": True}) == "zettlab"
     assert tts_tool._get_provider({"provider": "edge"}) == "edge"
@@ -573,6 +574,7 @@ def test_zettlab_tts_ignores_openai_gateway_toggle_for_provider_selection(
     tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
 
     tts_config = tts_tool._load_tts_config()
+    monkeypatch.setattr(tts_tool, "_plugin_tts_provider_is_registered", lambda _name: True)
     assert tts_tool._get_provider(tts_config) == "zettlab"
 
 

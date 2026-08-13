@@ -44,8 +44,7 @@ class ZettlabTTSProvider(TTSProvider):
 
     def is_available(self) -> bool:
         try:
-            media_client.action_headers()
-            media_client.base_url("tts")
+            media_client.tts_gateway_runtime()
         except Exception:
             return False
         if not media_client.is_available("tts"):
@@ -133,7 +132,8 @@ class ZettlabTTSProvider(TTSProvider):
                 f"Zettlab TTS model {model_id!r} has no default voice capability"
             )
 
-        token = media_client.action_headers()[media_client.ACTION_TOKEN_HEADER]
+        gateway_base_url, gateway_headers = media_client.tts_gateway_runtime()
+        token = gateway_headers[media_client.ACTION_TOKEN_HEADER]
         from tools.tts_tool import _generate_openai_tts
 
         http_client = httpx.Client(
@@ -156,7 +156,7 @@ class ZettlabTTSProvider(TTSProvider):
                 str(output),
                 {},
                 api_key=token,
-                base_url=media_client.base_url("tts"),
+                base_url=gateway_base_url,
                 model=model_id,
                 voice=selected_voice,
                 speed=(speed if model_capability.get("supports_speed") is True else None),
