@@ -16,11 +16,9 @@ _READ_TIMEOUT_SECONDS = 120.0
 _WRITE_TIMEOUT_SECONDS = 30.0
 _POOL_TIMEOUT_SECONDS = 5.0
 _FORMAT_SUFFIXES = {
-    "aac": ".aac",
     "flac": ".flac",
     "mp3": ".mp3",
     "opus": ".ogg",
-    "pcm": ".pcm",
     "wav": ".wav",
 }
 
@@ -149,9 +147,7 @@ class ZettlabTTSProvider(TTSProvider):
             follow_redirects=False,
         )
         output = Path(output_path)
-        expected_suffix = _FORMAT_SUFFIXES.get(
-            requested_format, f".{requested_format}"
-        )
+        expected_suffix = _FORMAT_SUFFIXES[requested_format]
         if output.suffix.lower() != expected_suffix:
             output = output.with_suffix(expected_suffix)
         try:

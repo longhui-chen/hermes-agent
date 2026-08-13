@@ -1624,14 +1624,10 @@ def _tts_response_format_from_path(output_path: str) -> str:
     """Pick an OpenAI-compatible TTS response format from the output extension."""
     if output_path.endswith(".ogg"):
         return "opus"
-    if output_path.endswith(".aac"):
-        return "aac"
     if output_path.endswith(".wav"):
         return "wav"
     if output_path.endswith(".flac"):
         return "flac"
-    if output_path.endswith(".pcm"):
-        return "pcm"
     return "mp3"
 
 

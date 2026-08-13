@@ -195,8 +195,7 @@ def test_zettlab_provider_omits_speed_when_capability_disables_it(
         (["mp3"], "mp3", ".mp3"),
         (["opus"], "opus", ".ogg"),
         (["wav"], "wav", ".wav"),
-        (["aac"], "aac", ".aac"),
-        (["pcm"], "pcm", ".pcm"),
+        (["flac"], "flac", ".flac"),
     ],
 )
 def test_zettlab_provider_negotiates_supported_format(
@@ -338,7 +337,7 @@ def test_zettlab_provider_is_unavailable_without_supported_format(monkeypatch):
             "public-default",
             {
                 **_tts_capability()["models"][1],
-                "formats": ["unsupported"],
+                "formats": ["aac", "pcm"],
             },
         ),
     )
