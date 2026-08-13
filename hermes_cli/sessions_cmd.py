@@ -47,7 +47,7 @@ def _size_delta_label(saved_mb):
     return _m()._size_delta_label(saved_mb)
 
 
-def importable_transcript_messages(rows, *, now=None):
+def importable_transcript_messages(rows):
     """Keep only what the runtime-import contract accepts, in source order.
 
     ``hermes_state._normalize_import_messages`` rejects anything that is not a
@@ -60,22 +60,32 @@ def importable_transcript_messages(rows, *, now=None):
 
     Rows are dict-like with ``role`` / ``content`` / ``timestamp``.
     """
-    import time as _t
-
-    fallback = _t.time() if now is None else now
     kept = []
     for row in rows:
         if row["role"] not in ("user", "assistant"):
             continue
-        content = (row["content"] or "").strip()
+        content = row["content"]
+        if not isinstance(content, str):
+            continue
+        content = content.strip()
         if not content:
             continue
         kept.append({
             "role": row["role"],
             "content": content,
-            "created_at": float(row["timestamp"] or fallback),
+            # Missing legacy timestamps must not make the payload hash depend
+            # on retry time. Unix epoch is valid under the import contract and
+            # gives the same source transcript the same receipt forever.
+            "created_at": float(row["timestamp"] or 0.0),
         })
     return kept
+
+
+def _open_session_db():
+    """Open the active profile store (a seam for CLI dispatcher tests)."""
+    from hermes_state import SessionDB
+
+    return SessionDB()
 
 
 def _confirm_prompt(prompt: str) -> bool:
@@ -256,9 +266,7 @@ def cmd_sessions(args, sessions_parser=None):
         return 1
 
     try:
-        from hermes_state import SessionDB
-
-        db = SessionDB()
+        db = _open_session_db()
     except Exception as e:
         print(f"Error: Could not open session database: {e}")
         return
@@ -947,10 +955,18 @@ def cmd_sessions(args, sessions_parser=None):
         # this against — so report what was skipped rather than pretending the
         # copy was faithful.
         import hashlib
-        import sqlite3
-        import time as _time
-
-        from hermes_state import RUNTIME_IMPORT_MAX_CHUNK_MESSAGES
+        from hermes_cli.profiles import (
+            get_profile_dir,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+        from hermes_state import (
+            RUNTIME_IMPORT_MAX_CHUNK_MESSAGES,
+            RUNTIME_IMPORT_MAX_CONTENT_CHARS,
+            RUNTIME_IMPORT_MAX_MESSAGES,
+            RUNTIME_IMPORT_MAX_STAGED_BYTES,
+            SessionDB,
+        )
 
         def _fail(message: str) -> None:
             if getattr(args, "json", False):
@@ -958,39 +974,78 @@ def cmd_sessions(args, sessions_parser=None):
             else:
                 print(f"Error: {message}", file=sys.stderr)
 
-        source_profile = args.source_profile
-        # Profiles are siblings: HERMES_HOME is <root>/profiles/<name> when the
-        # command runs under -p, so the source lives next door.
-        home = Path(get_hermes_home())
-        source_db = (
-            home.parent / source_profile / "state.db"
-            if home.parent.name == "profiles"
-            else home / "profiles" / source_profile / "state.db"
-        )
+        try:
+            source_profile = normalize_profile_name(args.source_profile)
+            validate_profile_name(source_profile)
+        except ValueError as exc:
+            _fail(str(exc))
+            return 1
+
+        source_db = get_profile_dir(source_profile) / "state.db"
         if not source_db.exists():
             _fail(f"source profile has no session store at {source_db}")
             return 1
 
-        # Read-only URI: never open another profile's live store for writing.
-        src = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
-        src.row_factory = sqlite3.Row
+        # Canonical read-only store: this keeps structured-content decoding and
+        # SQLite connection policy aligned with normal Hermes history reads.
+        src = SessionDB(source_db, read_only=True)
         try:
-            session_row = src.execute(
-                "SELECT id, title FROM sessions WHERE id = ?", (args.source_session,)
+            session_row = src._conn.execute(
+                "SELECT id, title, model_history_cutoff_message_id "
+                "FROM sessions WHERE id = ?",
+                (args.source_session,),
             ).fetchone()
             if session_row is None:
                 _fail(f"source session {args.source_session!r} not found")
                 return 1
-            rows = src.execute(
-                "SELECT role, content, timestamp FROM messages "
-                "WHERE session_id = ? ORDER BY id",
+            total_rows = src._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
                 (args.source_session,),
-            ).fetchall()
+            ).fetchone()[0]
+            cursor = src._conn.execute(
+                "SELECT role, content, timestamp FROM messages "
+                "WHERE session_id = ? AND active = 1 AND llm_visible = 1 "
+                "AND id > ? AND role IN ('user', 'assistant') ORDER BY id",
+                (
+                    args.source_session,
+                    int(session_row["model_history_cutoff_message_id"] or 0),
+                ),
+            )
+            messages = []
+            content_bytes = 0
+            while True:
+                rows = cursor.fetchmany(RUNTIME_IMPORT_MAX_CHUNK_MESSAGES)
+                if not rows:
+                    break
+                decoded = []
+                for row in rows:
+                    item = dict(row)
+                    item["content"] = SessionDB._decode_content(item["content"])
+                    decoded.append(item)
+                for message in importable_transcript_messages(decoded):
+                    if len(message["content"]) > RUNTIME_IMPORT_MAX_CONTENT_CHARS:
+                        _fail(
+                            "source transcript contains a message exceeding "
+                            f"{RUNTIME_IMPORT_MAX_CONTENT_CHARS} characters"
+                        )
+                        return 1
+                    messages.append(message)
+                    if len(messages) > RUNTIME_IMPORT_MAX_MESSAGES:
+                        _fail(
+                            "source transcript exceeds the import limit of "
+                            f"{RUNTIME_IMPORT_MAX_MESSAGES} messages"
+                        )
+                        return 1
+                    content_bytes += len(message["content"].encode("utf-8"))
+                    if content_bytes > RUNTIME_IMPORT_MAX_STAGED_BYTES:
+                        _fail(
+                            "source transcript exceeds the staged import limit of "
+                            f"{RUNTIME_IMPORT_MAX_STAGED_BYTES} bytes"
+                        )
+                        return 1
         finally:
             src.close()
 
-        total_rows = len(rows)
-        messages = importable_transcript_messages(rows, now=_time.time())
         if not messages:
             _fail(
                 f"nothing importable in {args.source_session!r}: "
@@ -1004,6 +1059,12 @@ def cmd_sessions(args, sessions_parser=None):
         import_id = "fork-" + hashlib.sha256(pair.encode("utf-8")).hexdigest()[:32]
         canonical = _json.dumps(messages, ensure_ascii=False, sort_keys=True,
                                 separators=(",", ":"))
+        if len(canonical.encode("utf-8")) > RUNTIME_IMPORT_MAX_STAGED_BYTES:
+            _fail(
+                "source transcript exceeds the staged import limit of "
+                f"{RUNTIME_IMPORT_MAX_STAGED_BYTES} bytes"
+            )
+            return 1
         payload_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         title = args.title or session_row["title"]
 

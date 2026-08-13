@@ -17,8 +17,14 @@ import pytest
 from hermes_cli.sessions_cmd import cmd_sessions, importable_transcript_messages
 
 
-def row(role, content, timestamp=1_700_000_000.0):
-    return {"role": role, "content": content, "timestamp": timestamp}
+def row(role, content, timestamp=1_700_000_000.0, *, active=1, llm_visible=1):
+    return {
+        "role": role,
+        "content": content,
+        "timestamp": timestamp,
+        "active": active,
+        "llm_visible": llm_visible,
+    }
 
 
 class TestImportableTranscriptMessages:
@@ -53,26 +59,45 @@ class TestImportableTranscriptMessages:
         assert len(kept) == 1
         assert kept[0]["content"] == "here is the result"
 
-    def test_substitutes_now_for_a_missing_timestamp(self):
-        kept = importable_transcript_messages([row("user", "hi", timestamp=None)], now=42.0)
-        assert kept[0]["created_at"] == 42.0
+    def test_uses_a_stable_sentinel_for_a_missing_timestamp(self):
+        kept = importable_transcript_messages([row("user", "hi", timestamp=None)])
+        assert kept[0]["created_at"] == 0.0
+
+    def test_drops_structured_content_after_decoding(self):
+        kept = importable_transcript_messages([
+            row("user", [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]),
+            row("assistant", "text survives"),
+        ])
+        assert [message["content"] for message in kept] == ["text survives"]
 
 
 def _seed_source_profile(db_path, session_id, rows):
     """Write a minimal source transcript — only the columns the fork reads."""
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, "
+        "model_history_cutoff_message_id INTEGER NOT NULL DEFAULT 0)"
+    )
     conn.execute(
         "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "session_id TEXT, role TEXT, content TEXT, timestamp REAL)"
+        "session_id TEXT, role TEXT, content TEXT, timestamp REAL, "
+        "active INTEGER NOT NULL DEFAULT 1, llm_visible INTEGER NOT NULL DEFAULT 1)"
     )
     conn.execute("INSERT INTO sessions (id, title) VALUES (?, ?)",
                  (session_id, "app build"))
     for r in rows:
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) "
-            "VALUES (?, ?, ?, ?)",
-            (session_id, r["role"], r["content"], r["timestamp"]),
+            "INSERT INTO messages "
+            "(session_id, role, content, timestamp, active, llm_visible) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                r["role"],
+                r["content"],
+                r["timestamp"],
+                r.get("active", 1),
+                r.get("llm_visible", 1),
+            ),
         )
     conn.commit()
     conn.close()
@@ -87,6 +112,10 @@ def forked(tmp_path, monkeypatch, capsys):
     (profiles / "source").mkdir(parents=True)
     (profiles / "target").mkdir(parents=True)
     monkeypatch.setattr(cli_main, "get_hermes_home", lambda: str(profiles / "target"))
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: tmp_path if name == "default" else profiles / name,
+    )
 
     source_session = "zettlab:u:source:gen1"
     _seed_source_profile(profiles / "source" / "state.db", source_session, [
@@ -107,10 +136,10 @@ def forked(tmp_path, monkeypatch, capsys):
             committed["count"] += 1
             return {"replayed": committed["count"] > 1}
 
-    def run(target_session="zettlab:u:target:fork1"):
+    def run(target_session="zettlab:u:target:fork1", source_profile="source"):
         args = types.SimpleNamespace(
             sessions_action="import-transcript",
-            source_profile="source",
+            source_profile=source_profile,
             source_session=source_session,
             target_session=target_session,
             title=None,
@@ -125,18 +154,17 @@ def forked(tmp_path, monkeypatch, capsys):
 def cmd_sessions_with_db(args, db):
     """Invoke the dispatcher with an injected store.
 
-    ``cmd_sessions`` does ``from hermes_state import SessionDB`` inside its own
-    body, so the substitution has to happen on the real ``hermes_state`` module
-    — patching an attribute on ``sessions_cmd`` would never be consulted.
+    Source-profile reads still use the real read-only ``SessionDB``; only the
+    active target store is replaced.
     """
-    import hermes_state
+    from hermes_cli import sessions_cmd
 
-    original = hermes_state.SessionDB
-    hermes_state.SessionDB = lambda *a, **k: db
+    original = sessions_cmd._open_session_db
+    sessions_cmd._open_session_db = lambda: db
     try:
         return cmd_sessions(args)
     finally:
-        hermes_state.SessionDB = original
+        sessions_cmd._open_session_db = original
 
 
 class TestForkAcrossProfiles:
@@ -167,3 +195,86 @@ class TestForkAcrossProfiles:
         forked.run(target_session="zettlab:u:target:fork1")
         forked.run(target_session="zettlab:u:target:fork2")
         assert forked.staged[0]["import_id"] != forked.staged[-1]["import_id"]
+
+    def test_filters_rewound_hidden_and_pre_cutoff_rows(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli import main as cli_main
+
+        profiles = tmp_path / "profiles"
+        (profiles / "source").mkdir(parents=True)
+        (profiles / "target").mkdir(parents=True)
+        monkeypatch.setattr(cli_main, "get_hermes_home", lambda: str(profiles / "target"))
+        monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: profiles / name)
+        session_id = "zettlab:u:source:filtered"
+        source_db = profiles / "source" / "state.db"
+        _seed_source_profile(source_db, session_id, [
+            row("user", "compressed old text"),
+            row("assistant", "rewound text", active=0),
+            row("user", "hidden control text", llm_visible=0),
+            row("assistant", "current visible text"),
+        ])
+        conn = sqlite3.connect(source_db)
+        conn.execute(
+            "UPDATE sessions SET model_history_cutoff_message_id = 1 WHERE id = ?",
+            (session_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        staged = []
+
+        class FakeDB:
+            def stage_completed_transcript_import(self, **kwargs):
+                staged.extend(kwargs["messages"])
+
+            def commit_completed_transcript_import(self, _import_id):
+                return {"replayed": False}
+
+        args = types.SimpleNamespace(
+            sessions_action="import-transcript",
+            source_profile="source",
+            source_session=session_id,
+            target_session="zettlab:u:target:filtered",
+            title=None,
+            json=True,
+        )
+        assert cmd_sessions_with_db(args, FakeDB()) == 0
+        assert [message["content"] for message in staged] == ["current visible text"]
+        assert json.loads(capsys.readouterr().out)["skipped"] == 3
+
+    def test_resolves_the_builtin_default_profile_at_the_root(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli import main as cli_main
+
+        target = tmp_path / "profiles" / "target"
+        target.mkdir(parents=True)
+        monkeypatch.setattr(cli_main, "get_hermes_home", lambda: str(target))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir",
+            lambda name: tmp_path if name == "default" else tmp_path / "profiles" / name,
+        )
+        session_id = "zettlab:u:default:gen"
+        _seed_source_profile(tmp_path / "state.db", session_id, [row("user", "from default")])
+        staged = []
+
+        class FakeDB:
+            def stage_completed_transcript_import(self, **kwargs):
+                staged.extend(kwargs["messages"])
+
+            def commit_completed_transcript_import(self, _import_id):
+                return {"replayed": False}
+
+        args = types.SimpleNamespace(
+            sessions_action="import-transcript",
+            source_profile="default",
+            source_session=session_id,
+            target_session="zettlab:u:target:default",
+            title=None,
+            json=True,
+        )
+        assert cmd_sessions_with_db(args, FakeDB()) == 0
+        assert staged[0]["content"] == "from default"
+        assert json.loads(capsys.readouterr().out)["ok"] is True
+
+    def test_rejects_a_source_profile_path_traversal(self, forked):
+        result = forked.run(source_profile="../source")
+        assert result["ok"] is False
+        assert "Invalid profile name" in result["error"]
