@@ -1367,8 +1367,10 @@ def _patch_skill(
     if err:
         return {"success": False, "error": err}
 
-    # If patching SKILL.md, validate frontmatter is still intact
-    if not file_path:
+    # Resolve semantics from the canonical target, not from how the caller
+    # spelled it: file_path="SKILL.md" and the omitted default target the same
+    # file and must cross the same reserved-topic/frontmatter boundary.
+    if target == skill_dir / "SKILL.md":
         err = _validate_skill_frontmatter_name(name, new_content)
         if err:
             return {

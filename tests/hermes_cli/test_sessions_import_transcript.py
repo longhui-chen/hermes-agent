@@ -278,3 +278,100 @@ class TestForkAcrossProfiles:
         result = forked.run(source_profile="../source")
         assert result["ok"] is False
         assert "Invalid profile name" in result["error"]
+
+    def test_partial_retry_uses_the_frozen_source_message_ids(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli import main as cli_main
+        from hermes_state import SessionDB
+
+        profiles = tmp_path / "profiles"
+        source_dir = profiles / "source"
+        target_dir = profiles / "target"
+        source_dir.mkdir(parents=True)
+        target_dir.mkdir(parents=True)
+        monkeypatch.setattr(cli_main, "get_hermes_home", lambda: str(target_dir))
+        monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: profiles / name)
+        session_id = "zettlab:u:source:frozen"
+        _seed_source_profile(
+            source_dir / "state.db",
+            session_id,
+            [row("user", f"message-{index}") for index in range(201)],
+        )
+        target_db = SessionDB(target_dir / "state.db")
+        args = types.SimpleNamespace(
+            sessions_action="import-transcript",
+            source_profile="source",
+            source_session=session_id,
+            target_session="zettlab:u:target:frozen",
+            title=None,
+            json=True,
+        )
+
+        original_stage = target_db.stage_completed_transcript_import
+
+        def fail_second_chunk(**kwargs):
+            if kwargs["chunk_index"] == 1:
+                raise RuntimeError("simulated interruption")
+            return original_stage(**kwargs)
+
+        target_db.stage_completed_transcript_import = fail_second_chunk
+        assert cmd_sessions_with_db(args, target_db) == 1
+        capsys.readouterr()
+
+        source = sqlite3.connect(source_dir / "state.db")
+        source.execute("UPDATE messages SET active = 0 WHERE id = 1")
+        source.execute(
+            "UPDATE sessions SET model_history_cutoff_message_id = 201 WHERE id = ?",
+            (session_id,),
+        )
+        source.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (session_id, "user", "late-message", 1_700_000_100.0),
+        )
+        source.commit()
+        source.close()
+
+        target_db.stage_completed_transcript_import = original_stage
+        assert cmd_sessions_with_db(args, target_db) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["imported"] == 201
+        assert result["replayed"] is False
+        assert [message["content"] for message in target_db.get_messages(args.target_session)][0] == "message-0"
+        assert all(
+            message["content"] != "late-message"
+            for message in target_db.get_messages(args.target_session)
+        )
+        target_db.close()
+
+    def test_completed_retry_replays_receipt_without_reopening_changed_source(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli import main as cli_main
+        from hermes_state import SessionDB
+
+        profiles = tmp_path / "profiles"
+        source_dir = profiles / "source"
+        target_dir = profiles / "target"
+        source_dir.mkdir(parents=True)
+        target_dir.mkdir(parents=True)
+        monkeypatch.setattr(cli_main, "get_hermes_home", lambda: str(target_dir))
+        monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: profiles / name)
+        session_id = "zettlab:u:source:receipt"
+        source_db = source_dir / "state.db"
+        _seed_source_profile(source_db, session_id, [row("user", "original")])
+        target_db = SessionDB(target_dir / "state.db")
+        args = types.SimpleNamespace(
+            sessions_action="import-transcript",
+            source_profile="source",
+            source_session=session_id,
+            target_session="zettlab:u:target:receipt",
+            title=None,
+            json=True,
+        )
+
+        assert cmd_sessions_with_db(args, target_db) == 0
+        capsys.readouterr()
+        source_db.unlink()
+
+        assert cmd_sessions_with_db(args, target_db) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["replayed"] is True
+        assert result["imported"] == 1
+        target_db.close()

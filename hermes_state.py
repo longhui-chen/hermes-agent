@@ -7153,6 +7153,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).rowcount
         )
 
+    def get_completed_transcript_import_snapshot(
+        self, import_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the frozen CLI source selection or completed receipt."""
+        _validate_runtime_import_identifier("import_id", import_id)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT status, expected_message_count, source_message_ids_json, "
+                "source_total_rows FROM runtime_imports WHERE import_id = ?",
+                (import_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        source_message_ids = None
+        if row["source_message_ids_json"]:
+            parsed = json.loads(row["source_message_ids_json"])
+            if not isinstance(parsed, list) or not all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in parsed
+            ):
+                raise RuntimeImportConflict("stored source snapshot is invalid")
+            source_message_ids = parsed
+        return {
+            "status": row["status"],
+            "expected_message_count": row["expected_message_count"],
+            "source_message_ids": source_message_ids,
+            "source_total_rows": row["source_total_rows"],
+        }
+
     def stage_completed_transcript_import(
         self,
         *,
@@ -7165,6 +7194,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expected_message_count: int,
         chunk_index: int,
         messages: List[Dict[str, Any]],
+        source_message_ids: Optional[List[int]] = None,
+        source_total_rows: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Stage one bounded chunk without mutating the canonical transcript.
 
@@ -7195,6 +7226,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(
                 f"expected_message_count must be 1..{RUNTIME_IMPORT_MAX_MESSAGES}"
             )
+        source_message_ids_json = None
+        if source_message_ids is not None:
+            if (
+                not isinstance(source_message_ids, list)
+                or len(source_message_ids) != expected_message_count
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in source_message_ids
+                )
+                or len(set(source_message_ids)) != len(source_message_ids)
+            ):
+                raise ValueError(
+                    "source_message_ids must contain one unique positive integer "
+                    "per expected message"
+                )
+            source_message_ids_json = json.dumps(
+                source_message_ids, separators=(",", ":")
+            )
+        if source_total_rows is not None and (
+            not isinstance(source_total_rows, int)
+            or isinstance(source_total_rows, bool)
+            or source_total_rows < expected_message_count
+        ):
+            raise ValueError("source_total_rows must cover every expected message")
         if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
             raise ValueError("chunk_index must be a non-negative integer")
         normalized = self._normalize_import_messages(messages)
@@ -7216,7 +7271,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
             ).fetchone()
             metadata = (source, source_session_id, target_session_id,
-                        payload_sha256.lower(), expected_message_count)
+                        payload_sha256.lower(), expected_message_count,
+                        source_message_ids_json, source_total_rows)
             if row is None:
                 if chunk_index != 0:
                     raise RuntimeImportConflict("first chunk_index must be 0")
@@ -7236,10 +7292,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     """INSERT INTO runtime_imports
                        (import_id, source, source_session_id, target_session_id, title,
-                        payload_sha256, expected_message_count, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        payload_sha256, expected_message_count, source_message_ids_json,
+                        source_total_rows, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (import_id, source, source_session_id, target_session_id, title,
-                     payload_sha256.lower(), expected_message_count, now, now),
+                     payload_sha256.lower(), expected_message_count,
+                     source_message_ids_json, source_total_rows, now, now),
                 )
                 row = conn.execute(
                     "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
@@ -7280,7 +7338,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeImportConflict("target_session_id already exists")
             if tuple(row[k] for k in (
                 "source", "source_session_id", "target_session_id",
-                "payload_sha256", "expected_message_count"
+                "payload_sha256", "expected_message_count",
+                "source_message_ids_json", "source_total_rows"
             )) != metadata:
                 raise RuntimeImportConflict("import_id is already bound to different metadata")
             existing = conn.execute(
@@ -7441,6 +7500,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """UPDATE runtime_imports SET status = 'completed',
                    normalized_sha256 = ?, source_session_id = ?, title = NULL,
+                   source_message_ids_json = NULL,
                    completed_at = ?, updated_at = ?
                    WHERE import_id = ?""",
                 (normalized_sha,

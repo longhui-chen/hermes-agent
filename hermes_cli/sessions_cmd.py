@@ -70,14 +70,18 @@ def importable_transcript_messages(rows):
         content = content.strip()
         if not content:
             continue
-        kept.append({
+        kept_message = {
             "role": row["role"],
             "content": content,
             # Missing legacy timestamps must not make the payload hash depend
             # on retry time. Unix epoch is valid under the import contract and
             # gives the same source transcript the same receipt forever.
             "created_at": float(row["timestamp"] or 0.0),
-        })
+        }
+        source_id = row.get("id") if hasattr(row, "get") else None
+        if source_id is not None:
+            kept_message["source_id"] = str(source_id)
+        kept.append(kept_message)
     return kept
 
 
@@ -981,6 +985,40 @@ def cmd_sessions(args, sessions_parser=None):
             _fail(str(exc))
             return 1
 
+        # Same source + target always shares one receipt. Consult it before
+        # touching the live source: an earlier commit may have succeeded while
+        # its response was lost, and the source conversation may since have
+        # advanced, rewound, or compressed.
+        pair = f"{source_profile}\x00{args.source_session}\x00{args.target_session}"
+        import_id = "fork-" + hashlib.sha256(pair.encode("utf-8")).hexdigest()[:32]
+        snapshot_reader = getattr(db, "get_completed_transcript_import_snapshot", None)
+        existing_snapshot = snapshot_reader(import_id) if snapshot_reader else None
+        if existing_snapshot and existing_snapshot["status"] == "completed":
+            try:
+                committed = db.commit_completed_transcript_import(import_id)
+            except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the caller
+                _fail(f"{type(exc).__name__}: {exc}")
+                return 1
+            imported = int(committed.get("message_count") or existing_snapshot["expected_message_count"])
+            total_rows = existing_snapshot.get("source_total_rows")
+            result = {
+                "ok": True,
+                "target_session_id": args.target_session,
+                "source_session_id": args.source_session,
+                "imported": imported,
+                "skipped": max(int(total_rows or imported) - imported, 0),
+                "replayed": True,
+            }
+            if getattr(args, "json", False):
+                print(_json.dumps(result, ensure_ascii=False))
+            else:
+                print(
+                    f"Imported {result['imported']} message(s) into "
+                    f"{args.target_session} (skipped {result['skipped']} "
+                    f"tool/empty row(s))."
+                )
+            return 0
+
         source_db = get_profile_dir(source_profile) / "state.db"
         if not source_db.exists():
             _fail(f"source profile has no session store at {source_db}")
@@ -998,23 +1036,43 @@ def cmd_sessions(args, sessions_parser=None):
             if session_row is None:
                 _fail(f"source session {args.source_session!r} not found")
                 return 1
-            total_rows = src._conn.execute(
+            current_total_rows = src._conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE session_id = ?",
                 (args.source_session,),
             ).fetchone()[0]
-            cursor = src._conn.execute(
-                "SELECT role, content, timestamp FROM messages "
-                "WHERE session_id = ? AND active = 1 AND llm_visible = 1 "
-                "AND id > ? AND role IN ('user', 'assistant') ORDER BY id",
-                (
-                    args.source_session,
-                    int(session_row["model_history_cutoff_message_id"] or 0),
-                ),
-            )
+            frozen_ids = existing_snapshot.get("source_message_ids") if existing_snapshot else None
+            if frozen_ids:
+                source_rows = []
+                for start in range(0, len(frozen_ids), 500):
+                    batch = frozen_ids[start:start + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    source_rows.extend(src._conn.execute(
+                        "SELECT id, role, content, timestamp FROM messages "
+                        f"WHERE session_id = ? AND id IN ({placeholders}) ORDER BY id",
+                        (args.source_session, *batch),
+                    ).fetchall())
+                source_rows.sort(key=lambda row: row["id"])
+                cursor = iter(source_rows)
+                total_rows = int(existing_snapshot.get("source_total_rows") or current_total_rows)
+            else:
+                cursor = src._conn.execute(
+                    "SELECT id, role, content, timestamp FROM messages "
+                    "WHERE session_id = ? AND active = 1 AND llm_visible = 1 "
+                    "AND id > ? AND role IN ('user', 'assistant') ORDER BY id",
+                    (
+                        args.source_session,
+                        int(session_row["model_history_cutoff_message_id"] or 0),
+                    ),
+                )
+                total_rows = current_total_rows
             messages = []
             content_bytes = 0
             while True:
-                rows = cursor.fetchmany(RUNTIME_IMPORT_MAX_CHUNK_MESSAGES)
+                if hasattr(cursor, "fetchmany"):
+                    rows = cursor.fetchmany(RUNTIME_IMPORT_MAX_CHUNK_MESSAGES)
+                else:
+                    from itertools import islice
+                    rows = list(islice(cursor, RUNTIME_IMPORT_MAX_CHUNK_MESSAGES))
                 if not rows:
                     break
                 decoded = []
@@ -1043,6 +1101,9 @@ def cmd_sessions(args, sessions_parser=None):
                             f"{RUNTIME_IMPORT_MAX_STAGED_BYTES} bytes"
                         )
                         return 1
+            if frozen_ids and [int(message["source_id"]) for message in messages] != frozen_ids:
+                _fail("source transcript no longer contains the frozen import snapshot")
+                return 1
         finally:
             src.close()
 
@@ -1053,10 +1114,6 @@ def cmd_sessions(args, sessions_parser=None):
             )
             return 1
 
-        # Idempotency: same source + target must reuse one import_id so a retry
-        # replays the receipt instead of creating a second session.
-        pair = f"{source_profile}\x00{args.source_session}\x00{args.target_session}"
-        import_id = "fork-" + hashlib.sha256(pair.encode("utf-8")).hexdigest()[:32]
         canonical = _json.dumps(messages, ensure_ascii=False, sort_keys=True,
                                 separators=(",", ":"))
         if len(canonical.encode("utf-8")) > RUNTIME_IMPORT_MAX_STAGED_BYTES:
@@ -1067,6 +1124,7 @@ def cmd_sessions(args, sessions_parser=None):
             return 1
         payload_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         title = args.title or session_row["title"]
+        source_message_ids = [int(message["source_id"]) for message in messages]
 
         try:
             for chunk_index, start in enumerate(
@@ -1082,6 +1140,8 @@ def cmd_sessions(args, sessions_parser=None):
                     expected_message_count=len(messages),
                     chunk_index=chunk_index,
                     messages=messages[start:start + RUNTIME_IMPORT_MAX_CHUNK_MESSAGES],
+                    source_message_ids=source_message_ids,
+                    source_total_rows=total_rows,
                 )
             committed = db.commit_completed_transcript_import(import_id)
         except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the caller

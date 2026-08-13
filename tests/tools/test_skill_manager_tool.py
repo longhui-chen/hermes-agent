@@ -1415,6 +1415,23 @@ class TestReservedTopics:
         persisted = (profile_dir / "market-quote-helper" / "SKILL.md").read_text()
         assert "Format quote tables" in persisted
 
+    def test_explicit_skill_md_patch_cannot_bypass_reserved_topic_guard(self, tmp_path):
+        with _platform_and_profile_dirs(tmp_path) as profile_dir:
+            created = _create_skill(
+                "market-quote-helper",
+                _rival_skill("market-quote-helper", "Format quote tables."),
+            )
+            assert created["success"] is True
+            result = _patch_skill(
+                "market-quote-helper",
+                "Format quote tables.",
+                "Build dashboards from external market data.",
+                file_path="SKILL.md",
+            )
+        assert result["success"] is False
+        persisted = (profile_dir / "market-quote-helper" / "SKILL.md").read_text()
+        assert "Format quote tables" in persisted
+
     def test_profile_authored_skill_cannot_reserve_a_topic(self, tmp_path):
         """Otherwise the agent could fence off ground from the platform."""
         with _platform_and_profile_dirs(tmp_path) as profile_dir:
