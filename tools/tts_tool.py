@@ -3661,20 +3661,70 @@ class _SyncSentencePipeline:
         self._executor.shutdown(wait=True)
 
     @staticmethod
-    def _cleanup_private_temp_dir(path: Optional[str]) -> None:
-        """Remove a pipeline-owned directory without following replacement links."""
-        if not path:
+    def _cleanup_private_temp_dir(
+        path: Optional[str],
+        expected_dir_stat: Optional[os.stat_result],
+        dir_fd: int,
+        known_paths: tuple[Optional[str], ...],
+    ) -> None:
+        """Remove only known entries from the directory inode we created."""
+        if not path or expected_dir_stat is None:
             return
-        try:
-            shutil.rmtree(path)
-        except FileNotFoundError:
-            return
-        except OSError:
-            # rmtree refuses a top-level symlink instead of following it. If
-            # the provider swapped our private directory for one, remove only
-            # the link itself; os.unlink never traverses its target.
+
+        expected_identity = (expected_dir_stat.st_dev, expected_dir_stat.st_ino)
+
+        def _path_is_owned() -> bool:
             try:
-                os.unlink(path)
+                current = os.lstat(path)
+            except OSError:
+                return False
+            return stat.S_ISDIR(current.st_mode) and (
+                current.st_dev,
+                current.st_ino,
+            ) == expected_identity
+
+        names = {
+            os.path.basename(candidate)
+            for candidate in known_paths
+            if candidate and os.path.basename(candidate) not in {"", ".", ".."}
+        }
+        use_dir_fd = dir_fd >= 0 and all(
+            operation in os.supports_dir_fd
+            for operation in (os.stat, os.unlink, os.rmdir)
+        ) and os.stat in os.supports_follow_symlinks
+        try:
+            for name in names:
+                try:
+                    if use_dir_fd:
+                        entry_stat = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                        if stat.S_ISDIR(entry_stat.st_mode):
+                            os.rmdir(name, dir_fd=dir_fd)
+                        else:
+                            os.unlink(name, dir_fd=dir_fd)
+                    else:
+                        if not _path_is_owned():
+                            return
+                        entry_path = os.path.join(path, name)
+                        entry_stat = os.lstat(entry_path)
+                        if stat.S_ISDIR(entry_stat.st_mode):
+                            os.rmdir(entry_path)
+                        else:
+                            os.unlink(entry_path)
+                except OSError:
+                    pass
+        finally:
+            if dir_fd >= 0:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
+
+        # Never recurse through the mutable root path. Remove it only if it is
+        # still the exact directory inode we created and our known entries left
+        # it empty. An identity mismatch is deliberately leaked, not deleted.
+        if _path_is_owned():
+            try:
+                os.rmdir(path)
             except OSError:
                 pass
 
@@ -3682,10 +3732,28 @@ class _SyncSentencePipeline:
         if self._stop.is_set():
             return None
         synthesis_dir = None
+        synthesis_dir_stat = None
+        synthesis_dir_fd = -1
+        tmp_path = None
+        owned_output_path = None
         playback_dir = None
         playback_path = None
         try:
             synthesis_dir = tempfile.mkdtemp(prefix="hermes-tts-synthesis-")
+            synthesis_dir_stat = os.lstat(synthesis_dir)
+            directory_flags = os.O_RDONLY
+            directory_flags |= getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                opened_dir_fd = os.open(synthesis_dir, directory_flags)
+                try:
+                    synthesis_dir_stat = os.fstat(opened_dir_fd)
+                    synthesis_dir_fd = opened_dir_fd
+                except OSError:
+                    os.close(opened_dir_fd)
+                    raise
+            except OSError:
+                synthesis_dir_fd = -1
             fd, tmp_path = tempfile.mkstemp(dir=synthesis_dir, suffix=".mp3")
             os.close(fd)
             tmp_real_path = Path(os.path.realpath(tmp_path))
@@ -3754,11 +3822,23 @@ class _SyncSentencePipeline:
                 if source_fd >= 0:
                     os.close(source_fd)
 
-            self._cleanup_private_temp_dir(synthesis_dir)
+            self._cleanup_private_temp_dir(
+                synthesis_dir,
+                synthesis_dir_stat,
+                synthesis_dir_fd,
+                (tmp_path, owned_output_path),
+            )
+            synthesis_dir_fd = -1
             return _SyncAudioArtifact(playback_path, playback_dir)
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
-            self._cleanup_private_temp_dir(synthesis_dir)
+            self._cleanup_private_temp_dir(
+                synthesis_dir,
+                synthesis_dir_stat,
+                synthesis_dir_fd,
+                (tmp_path, owned_output_path),
+            )
+            synthesis_dir_fd = -1
             if playback_path or playback_dir:
                 _SyncAudioArtifact(playback_path or "", playback_dir or "").cleanup()
             return None

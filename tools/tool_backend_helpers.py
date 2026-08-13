@@ -149,10 +149,9 @@ def _scoped_credential(name: str) -> str:
     """
     try:
         from agent.secret_scope import get_secret
-
-        return (get_secret(name, "") or "").strip()
-    except Exception:  # pragma: no cover — secret_scope is in-repo
+    except ImportError:  # pragma: no cover — secret_scope is in-repo
         return (os.getenv(name, "") or "").strip()
+    return (get_secret(name, "") or "").strip()
 
 
 def resolve_provider_secret(
@@ -178,8 +177,9 @@ def resolve_provider_secret(
        add <provider_id>``). Skipped under an active multiplex turn, where
        only the profile scope is authoritative for credentials.
 
-    Never raises — credential resolution must not hard-fail on a pool or
-    config read; returns ``""`` when no key is found anywhere.
+    Returns ``""`` when no key is found. An unscoped read in multiplex mode
+    deliberately propagates ``UnscopedSecretError`` so callers fail closed
+    instead of borrowing another profile's process credential.
 
     ``env_getter`` lets callers supply their module-level ``get_env_value``
     wrapper (transcription_tools / tts_tool expose one that tests patch);

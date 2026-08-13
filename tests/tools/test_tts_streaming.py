@@ -1176,6 +1176,7 @@ def test_sync_pipeline_cleanup_does_not_follow_replaced_root(tmp_path):
 
     synthesis_dir = tmp_path / "hermes-tts-synthesis-owned"
     synthesis_dir.mkdir()
+    synthesis_dir_stat = os.lstat(synthesis_dir)
     victim_dir = tmp_path / "victim"
     victim_dir.mkdir()
     victim_file = victim_dir / "keep.txt"
@@ -1187,10 +1188,32 @@ def test_sync_pipeline_cleanup_does_not_follow_replaced_root(tmp_path):
     except OSError:
         pytest.skip("directory symlinks are unavailable on this platform")
 
-    tts_tool._SyncSentencePipeline._cleanup_private_temp_dir(str(synthesis_dir))
+    tts_tool._SyncSentencePipeline._cleanup_private_temp_dir(
+        str(synthesis_dir), synthesis_dir_stat, -1, ()
+    )
 
     assert victim_file.read_text(encoding="utf-8") == "keep me"
-    assert not synthesis_dir.is_symlink()
+    assert synthesis_dir.is_symlink()
+
+
+def test_sync_pipeline_cleanup_does_not_delete_replacement_directory(tmp_path):
+    from tools import tts_tool
+
+    synthesis_dir = tmp_path / "hermes-tts-synthesis-owned"
+    synthesis_dir.mkdir()
+    synthesis_dir_stat = os.lstat(synthesis_dir)
+    synthesis_dir.rmdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    marker = replacement / "keep.txt"
+    marker.write_text("keep me", encoding="utf-8")
+    replacement.rename(synthesis_dir)
+
+    tts_tool._SyncSentencePipeline._cleanup_private_temp_dir(
+        str(synthesis_dir), synthesis_dir_stat, -1, ()
+    )
+
+    assert (synthesis_dir / "keep.txt").read_text(encoding="utf-8") == "keep me"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="requires O_NOFOLLOW symlinks")

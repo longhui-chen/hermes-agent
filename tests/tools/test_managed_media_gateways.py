@@ -394,6 +394,23 @@ def test_zettlab_tts_direct_keys_are_isolated_by_profile(monkeypatch, tmp_path):
     assert profile_b_base_url == "https://profile-b.example/v1"
 
 
+def test_openai_tts_unscoped_multiplex_key_fails_closed(monkeypatch):
+    _install_fake_tools_package()
+    _install_fake_openai_module({})
+    monkeypatch.setenv("OPENAI_API_KEY", "other-profile-key")
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    from agent import secret_scope
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            tts_tool._resolve_profile_openai_audio_api_key()
+        assert tts_tool._has_openai_audio_backend({"provider": "openai"}) is False
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+
 def test_zettlab_tts_direct_opt_out_requires_direct_key(monkeypatch):
     _install_fake_tools_package()
     _install_fake_openai_module({})
