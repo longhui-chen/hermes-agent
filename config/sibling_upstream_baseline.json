@@ -2,5 +2,5 @@
   "_note": "sha256 of the upstream hermes-agent skill that zettlab-memo-setup was de-branded from. When an upstream sync changes hermes-agent, re-derive the sibling (mirror the change, keep it brand-clean) then run: python tools/check_sibling_debrand.py --update-baseline",
   "upstream": "skills/autonomous-ai-agents/hermes-agent",
   "sibling": "skills/autonomous-ai-agents/zettlab-memo-setup",
-  "upstream_sha256": "5945d89b7d519cc13a96e29a3dca0d7cfb05eae2989afd8af76febf25a991b87"
+  "upstream_sha256": "31b503d7d3bedae226eb6c9e9dd437ec5c5e340bfb15c6c5a8da301aaa4ddbb3"
 }

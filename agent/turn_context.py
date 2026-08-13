@@ -540,6 +540,15 @@ def build_turn_context(
     if conversation_history and not agent._todo_store.has_items():
         agent._hydrate_todo_store(conversation_history)
 
+    # 未确认的旧计划保护在新 turn 开始时过期（codex P1）：决策点语义允许用户
+    # 看了计划不确认就聊别的，此时保护继续挂着会让新任务的清单被旧骨架劫持。
+    try:
+        from agent.plan_seeding import expire_unconfirmed_plan_at_turn_start
+
+        expire_unconfirmed_plan_at_turn_start(agent)
+    except Exception:
+        pass
+
     # Hydrate per-session nudge counters from persisted history (issue #22357).
     if conversation_history and agent._user_turn_count == 0:
         prior_user_turns = sum(

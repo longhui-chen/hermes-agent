@@ -384,6 +384,10 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         # 把任何一头说成无条件的，模型都会把产物写到收不回来的地方。
         assert "相对路径没有稳定含义" in text
         assert "终端命令的锚点也不与文件工具共用" in text
+    # 播种衔接指令两版都在（清单由系统按计划骨架创建，模型只更新状态）。
+    for text in (auto, manual):
+        assert "系统已按计划骨架自动创建任务清单" in text
+        assert "不要整表重建" in text
 
 
 def test_workflow_addendum_workdir_alias_line_follows_capability(monkeypatch):

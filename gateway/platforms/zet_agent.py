@@ -375,14 +375,15 @@ _ZET_ADDENDUM_HEAD = """\
 
 # Plan-First section, auto-execute variant: App opted in (capability negotiation)
 # to render the plan card as a read-only preview and let the model carry the plan
-# out in the same turn.
+# out in the same turn（「不确定不阻塞」——计划卡是进度呈现，不是执行门槛）。
+# 任务清单已由播种机制按计划骨架自动创建，模型只更新状态、不自行另建清单。
 _ZET_PLAN_FIRST_AUTO = """\
 ## 计划先行（Plan-First）
 
 默认模式下，只有任务包含不可逆操作、大范围数据变更、对外发布/发送，或其它确实需要用户在执行前预审的高风险步骤时：
 1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
 2. 计划卡片只是给用户看的只读预览，展示后**不要停下、不要等用户确认、不要问用户是否执行**，直接在同一轮继续把计划执行下去。
-3. 执行阶段用 `todo` 工具逐步记录和更新进度，每完成一步立即把对应 todo 标记为 completed。
+3. 计划呈现时系统已按计划骨架自动创建任务清单（见 present_plan 之后的 todo 结果）。执行时用 `todo`（merge=true）逐项更新状态，每完成一步立即标记 completed；可以追加计划外任务，但不要整表重建清单。
 
 用户说"plan 模式"、"计划模式"、"先给计划"时，也按上述 App 计划卡片流程处理（展示计划后直接执行，不等确认）。
 不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
@@ -397,10 +398,10 @@ _ZET_PLAN_FIRST_AUTO = """\
 _ZET_PLAN_FIRST_MANUAL = """\
 ## 计划先行（Plan-First）
 
-面对复杂多步任务（涉及 3 个以上阶段、不可逆操作或大量数据变更）时：
+面对复杂多步任务（涉及 3 个以上阶段、不可逆操作、大量数据变更，或对外发布/发送）时：
 1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
 2. 计划卡片是给用户确认的预览，展示后**停下、等用户在确认卡上确认后再执行**；在收到用户确认前，不要执行计划里的任何实际操作（写文件、terminal、发送外部消息等有副作用的动作）。
-3. 收到用户确认后再逐步执行，用 `todo` 工具记录和更新进度，每完成一步立即把对应 todo 标记为 completed。
+3. 计划呈现时系统已按计划骨架自动创建任务清单。收到用户确认后逐步执行，用 `todo`（merge=true）逐项更新状态，每完成一步立即标记 completed；可以追加计划外任务，但不要整表重建清单。
 
 用户说"plan 模式"、"计划模式"、"先给计划"时，也按上述 App 计划卡片流程处理（展示计划后停下，等用户确认再执行）。
 不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
@@ -2551,25 +2552,30 @@ class ZetAgentAdapter(APIServerAdapter):
 
     @staticmethod
     def _make_plan_emit_cb(stream_q: Any, agent: Any):
-        """Return a sync ``(title, groups) -> None`` callback.
+        """Return a sync ``(title, groups, plan_id) -> None`` callback.
 
         Called by tool_executor when the agent invokes present_plan.
         Pushes a ``hermes.plan`` event onto the SSE extension lane.
         present_plan() returns an instruction to the agent immediately after,
         so this callback never blocks.
 
+        ``plan_id`` anchors the plan card to the todo items seeded from it
+        (each seeded item carries the same plan_id) so the App renders both as
+        one evolving card. Optional on the wire — old clients ignore it.
+
         ``auto_execute`` on the payload tells the App whether this is a
         read-only auto-execute card (agent keeps executing in the same turn) or
-        the legacy confirmation card (App gates execution on a user tap). It
+        the confirmation card (App gates execution on a user tap). It
         follows the resolved turn-level auto-execute flag (App capability opt-in
         > env kill-switch > default False/manual) regardless of whether the App
         requested plan mode or the model presented a plan on its own. Only a
         client that opted in (or the env kill-switch) turns it into the read-only
-        auto card; every other case stays the legacy confirmation card.
+        auto card; every other case stays the confirmation card.
         """
-        def _emit(title: str, groups: List[Dict[str, Any]]) -> None:
+        def _emit(title: str, groups: List[Dict[str, Any]], plan_id: str = "") -> None:
             payload = {
                 "type": "hermes.plan",
+                "plan_id": plan_id or "",
                 "title": title,
                 "groups": groups,
                 "auto_execute": bool(getattr(agent, "_zet_agent_plan_auto_execute", False)),

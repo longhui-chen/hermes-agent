@@ -16,6 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _content_has_image,
     _content_has_visible_payload,
     _extract_current_turn_reference_image,
     _normalize_multimodal_content,
@@ -68,6 +69,10 @@ class TestContentHasVisiblePayload:
 
     def test_list_with_image_only(self):
         assert _content_has_visible_payload([{"type": "image_url", "image_url": {"url": "x"}}])
+
+    def test_image_detection_ignores_text_only_content(self):
+        assert _content_has_image([{"type": "image_url", "image_url": {"url": "x"}}])
+        assert not _content_has_image([{"type": "text", "text": "hello"}])
 
 
 class TestCurrentTurnReferenceImage:
@@ -125,6 +130,35 @@ def adapter():
 
 class TestChatCompletionsMultimodalHTTP:
     @pytest.mark.asyncio
+    async def test_adapter_forwards_image_caption_provenance_to_agent(self, adapter):
+        image_payload = [
+            {"type": "text", "text": "Describe this."},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ]
+        agent = MagicMock()
+        agent.run_conversation.return_value = {
+            "final_response": "A cat.",
+            "messages": [],
+            "api_calls": 1,
+        }
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.session_id = None
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            await adapter._run_agent(
+                user_message=image_payload,
+                conversation_history=[],
+                trusted_user_message=image_payload,
+            )
+
+        agent.run_conversation.assert_called_once()
+        kwargs = agent.run_conversation.call_args.kwargs
+        assert kwargs["user_authored_message"] == image_payload
+        assert kwargs["user_message_has_image"] is True
+
+    @pytest.mark.asyncio
     async def test_inline_image_preserved_to_run_agent(self, adapter):
         """Multimodal user content reaches _run_agent as a list of parts."""
         image_payload = [
@@ -157,6 +191,7 @@ class TestChatCompletionsMultimodalHTTP:
 
             assert resp.status == 200, await resp.text()
             assert mock_run.captured["user_message"] == image_payload
+            assert mock_run.captured["trusted_user_message"] == image_payload
             assert mock_run.captured["current_turn_reference_image"] == ""
 
     @pytest.mark.asyncio
@@ -236,4 +271,3 @@ class TestResponsesMultimodalHTTP:
                 {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
             ]
             assert mock_run.captured["user_message"] == expected
-

@@ -46,6 +46,7 @@ import time
 import threading
 import uuid
 import warnings
+from contextvars import ContextVar, Token
 from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -164,6 +165,11 @@ from agent.context_compressor import (  # noqa: F401
     ContextCompressor,
 )
 from agent.retry_utils import jittered_backoff  # noqa: F401
+
+
+_provisional_stream_events: ContextVar[Optional[List[Callable[[], None]]]] = (
+    ContextVar("hermes_provisional_stream_events", default=None)
+)
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
     DEFAULT_AGENT_IDENTITY,
     build_skills_system_prompt,
@@ -6031,6 +6037,36 @@ class AIAgent:
             )
 
     @staticmethod
+    def _begin_provisional_stream() -> tuple[
+        Token[Optional[List[Callable[[], None]]]], List[Callable[[], None]]
+    ]:
+        """Buffer stream side effects until the provider response is trusted."""
+        events: List[Callable[[], None]] = []
+        return _provisional_stream_events.set(events), events
+
+    @staticmethod
+    def _end_provisional_stream(
+        token: Token[Optional[List[Callable[[], None]]]],
+    ) -> None:
+        _provisional_stream_events.reset(token)
+
+    @staticmethod
+    def _defer_provisional_stream_event(event: Callable[[], None]) -> bool:
+        events = _provisional_stream_events.get()
+        if events is None:
+            return False
+        events.append(event)
+        return True
+
+    @staticmethod
+    def _release_provisional_stream(events: List[Callable[[], None]]) -> None:
+        for event in events:
+            try:
+                event()
+            except Exception:
+                pass
+
+    @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:
         if not isinstance(text, str):
             return ""
@@ -6153,11 +6189,15 @@ class AIAgent:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
-        try:
+        def _deliver_codex_commentary() -> None:
             cb(visible, already_streamed=False)
             self._record_delivered_interim_text(visible)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+
+        if not self._defer_provisional_stream_event(_deliver_codex_commentary):
+            try:
+                _deliver_codex_commentary()
+            except Exception:
+                logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6200,15 +6240,19 @@ class AIAgent:
         ):
             return
         already_streamed = self._interim_content_was_streamed(visible)
-        try:
+        def _deliver_interim_message() -> None:
             cb(visible, already_streamed=already_streamed)
             if undelivered_parts:
                 for part in undelivered_parts:
                     self._record_delivered_interim_text(part)
             else:
                 self._record_delivered_interim_text(visible)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+
+        if not self._defer_provisional_stream_event(_deliver_interim_message):
+            try:
+                _deliver_interim_message()
+            except Exception:
+                logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).
@@ -6343,15 +6387,20 @@ class AIAgent:
         if not text:
             return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        if delivered:
-            self._record_streamed_assistant_text(text)
+
+        def _deliver_stream_delta() -> None:
+            delivered = False
+            for cb in callbacks:
+                try:
+                    cb(text)
+                    delivered = True
+                except Exception:
+                    pass
+            if delivered:
+                self._record_streamed_assistant_text(text)
+
+        if not self._defer_provisional_stream_event(_deliver_stream_delta):
+            _deliver_stream_delta()
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -6364,10 +6413,14 @@ class AIAgent:
             return
         cb = self.reasoning_callback
         if cb is not None:
-            try:
+            def _deliver_reasoning_delta() -> None:
                 cb(text)
-            except Exception:
-                pass
+
+            if not self._defer_provisional_stream_event(_deliver_reasoning_delta):
+                try:
+                    _deliver_reasoning_delta()
+                except Exception:
+                    pass
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
@@ -6379,10 +6432,14 @@ class AIAgent:
         """
         cb = self.tool_gen_callback
         if cb is not None:
-            try:
+            def _deliver_tool_gen_started() -> None:
                 cb(tool_name)
-            except Exception:
-                pass
+
+            if not self._defer_provisional_stream_event(_deliver_tool_gen_started):
+                try:
+                    _deliver_tool_gen_started()
+                except Exception:
+                    pass
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""
@@ -7749,6 +7806,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        user_authored_message: Optional[Any] = None,
+        user_message_has_image: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7840,6 +7899,8 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    user_authored_message=user_authored_message,
+                    user_message_has_image=user_message_has_image,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
