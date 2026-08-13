@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import json
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,17 @@ PLUGIN_PATH = (
 
 
 def _load_plugin():
+    # Import the leaf response-filter module without executing gateway/__init__.py,
+    # whose full runtime dependency graph is unrelated to this plugin unit test.
+    if "gateway.response_filters" not in sys.modules:
+        response_filters_path = PLUGIN_PATH.parents[2] / "gateway" / "response_filters.py"
+        response_filters_spec = importlib.util.spec_from_file_location(
+            "gateway.response_filters", response_filters_path
+        )
+        response_filters = importlib.util.module_from_spec(response_filters_spec)
+        assert response_filters_spec.loader is not None
+        response_filters_spec.loader.exec_module(response_filters)
+        sys.modules["gateway.response_filters"] = response_filters
     spec = importlib.util.spec_from_file_location(
         "creation_governor_plugin", PLUGIN_PATH
     )
@@ -135,6 +147,13 @@ def _decode_envelope(text):
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
 
 
+def _onboarding_welcome_marker(payload):
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"<!--zettlab-onboarding-welcome {encoded}-->"
+
+
 def test_onboarding_profile_skips_governor_checkpoint_entirely():
     plugin = _load_plugin()
     llm = _FakeLlm([_candidate()])
@@ -150,6 +169,109 @@ def test_onboarding_profile_skips_governor_checkpoint_entirely():
     assert result is None
     assert llm.calls == []
     assert plugin._session_states == {}
+
+
+def test_final_onboarding_welcome_emits_existing_cards_without_auxiliary_model(monkeypatch):
+    plugin = _load_plugin()
+    llm = _FakeLlm([])
+    context = _Context(llm)
+    emitted = []
+    context.emit_attachment = lambda attachment: emitted.append(attachment) or True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": ["feishu", "wecom"],
+            "channels_recommendable": ["feishu", "wecom"],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {
+                "title": "持续跟进产品进展",
+                "reason": "让变化中的进展保持更新。",
+                "proposalText": "要现在设置吗？",
+            },
+            "artifact": {
+                "title": "产品工作台",
+                "reason": "集中查看资料和进展。",
+                "artifactType": "app",
+            },
+        }
+    )
+
+    hook_context = plugin._on_pre_llm_call(
+        # Older mixed deployments may still route the final handoff through the
+        # onboarding profile; the explicit marker is the only allowed exception.
+        profile_name="onboarding",
+        session_id="welcome-session",
+        turn_id="turn-welcome",
+        user_message=f"Please welcome the user.\n{marker}",
+        conversation_history=[],
+    )
+    transformed = plugin._transform_llm_output(
+        session_id="welcome-session",
+        response_text="Frank，很高兴认识你。",
+        completed=True,
+    )
+
+    assert llm.calls == []
+    assert "final onboarding welcome" in hook_context["context"]
+    assert [attachment["kind"] for attachment in emitted] == [
+        "channel.connect",
+        "artifact.recommendation",
+    ]
+    assert emitted[0]["payload"] == {"channel_kind": "feishu"}
+    assert emitted[1]["payload"]["artifact_type"] == "app"
+    task = _decode_envelope(transformed)
+    assert task["creation_type"] == "task"
+    assert task["title"] == "持续跟进产品进展"
+    assert plugin._session_states[next(iter(plugin._session_states))]["last_proposal"]["proposal_id"] == task["proposal_id"]
+
+
+def test_onboarding_welcome_channel_is_omitted_when_inventory_has_no_supported_target(monkeypatch):
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    emitted = []
+    context.emit_attachment = lambda attachment: emitted.append(attachment) or True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": ["feishu"],
+            "channels_available": [],
+            "channels_recommendable": [],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {"title": "跟进进展", "reason": "持续更新。", "proposalText": "要设置吗？"},
+            "artifact": {"title": "工作台", "reason": "集中查看。", "artifactType": "app"},
+        }
+    )
+
+    plugin._on_pre_llm_call(session_id="no-channel", user_message=marker, conversation_history=[])
+    transformed = plugin._transform_llm_output(
+        session_id="no-channel", response_text="欢迎，随时可以开始。", completed=True
+    )
+
+    assert [attachment["kind"] for attachment in emitted] == ["artifact.recommendation"]
+    assert _decode_envelope(transformed)["creation_type"] == "task"
 
 
 def test_first_turn_and_every_third_turn_run_bounded_json_checks():

@@ -169,6 +169,68 @@ _RECOMMENDATION_RESPONSE_RE = re.compile(
     r"\[/creation_recommendation_response\]",
     re.DOTALL,
 )
+_ONBOARDING_WELCOME_RE = re.compile(
+    r"<!--zettlab-onboarding-welcome\s+([A-Za-z0-9_-]+)-->",
+)
+
+
+def _decode_onboarding_welcome_spec(user_message: str) -> dict[str, Any] | None:
+    """Decode the App-owned final-onboarding-turn marker.
+
+    This is intentionally strict and bounded.  It never runs a model and never
+    trusts the marker to name a channel; the channel target is resolved later
+    from local-server's region-aware live inventory.
+    """
+    match = _ONBOARDING_WELCOME_RE.search(str(user_message or ""))
+    if not match or len(match.group(1)) > 12_000:
+        return None
+    encoded = match.group(1)
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        if len(raw) > 8_000:
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or payload.get("type") != "zettlab_onboarding_welcome"
+    ):
+        return None
+    channel = payload.get("channel")
+    task = payload.get("task")
+    artifact = payload.get("artifact")
+    if (
+        not isinstance(channel, dict)
+        or not isinstance(task, dict)
+        or not isinstance(artifact, dict)
+    ):
+        return None
+    task_title = _text(task.get("title"), 80)
+    task_reason = _text(task.get("reason"), 400)
+    task_proposal = _text(task.get("proposalText"), 500)
+    artifact_title = _text(artifact.get("title"), 80)
+    artifact_reason = _text(artifact.get("reason"), 400)
+    if (
+        not task_title
+        or not task_reason
+        or not task_proposal
+        or not artifact_title
+        or not artifact_reason
+        or artifact.get("artifactType") != "app"
+    ):
+        return None
+    return {
+        "channel_requested": channel.get("requested") is True,
+        "task_title": task_title,
+        "task_reason": task_reason,
+        "task_proposal": task_proposal,
+        "artifact_title": artifact_title,
+        "artifact_reason": artifact_reason,
+    }
+
+
 def _text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
@@ -1406,10 +1468,20 @@ def _handle_previous_proposal_action(
 
 
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
+    raw_user_message = str(kwargs.get("user_message") or "")
+    # Marker is appended after the visible welcome instruction. Inspect a
+    # bounded tail before the onboarding-profile fast bypass: current App sends
+    # the final welcome from main, but older mixed deployments may still route
+    # that one turn through onboarding.
+    onboarding_welcome = _decode_onboarding_welcome_spec(raw_user_message[-16_000:])
     # Onboarding is a fixed, latency-sensitive state machine and never offers
     # reusable-object recommendations.  Skip the checkpoint before it mutates
-    # governor state or invokes its auxiliary model.
-    if _text(kwargs.get("profile_name"), 80).strip().lower() == "onboarding":
+    # governor state or invokes its auxiliary model.  The marked final welcome
+    # is the sole deterministic exception and never invokes the auxiliary model.
+    if (
+        _text(kwargs.get("profile_name"), 80).strip().lower() == "onboarding"
+        and onboarding_welcome is None
+    ):
         return None
 
     raw_session_id = _raw_session_key(kwargs)
@@ -1436,7 +1508,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         return None
     if suppression_reason:
         return None
-    user_message = _text(kwargs.get("user_message"), 2000)
+    user_message = _text(raw_user_message, 2000)
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
@@ -1444,6 +1516,42 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         state["last_user_message"] = user_message
         state["last_turn_id"] = _text(kwargs.get("turn_id"), 160)
         turn = int(state["turn"])
+
+    if onboarding_welcome is not None:
+        # The final welcome runs on the restored main profile, not the onboarding
+        # profile.  It is the sole exception to the ordinary auxiliary review:
+        # the App already supplied bounded localized copy, so no extra model call
+        # or Creation Governor reasoning is needed.
+        inventory = _connection_inventory(session_id, now)
+        source_turn_id = _text(kwargs.get("turn_id"), 160)
+        channel_target = ""
+        if onboarding_welcome["channel_requested"] and not inventory.get("channels_connected"):
+            recommendable = inventory.get("channels_recommendable")
+            if isinstance(recommendable, list):
+                # Prefer the region's most common first-party channel, but only
+                # when it exists in local-server's current supported inventory.
+                for candidate in ("feishu", "wecom", "wechat", "telegram", "slack", "discord"):
+                    if candidate in recommendable:
+                        channel_target = candidate
+                        break
+                if not channel_target and recommendable:
+                    channel_target = _text(recommendable[0], 80).lower()
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            state["onboarding_welcome"] = {
+                **onboarding_welcome,
+                "channel_target": channel_target,
+                "source_turn_id": source_turn_id,
+                "turn": turn,
+            }
+        availability_context = _channel_availability_context(inventory)
+        return _join_context(
+            availability_context,
+            "[Creation governor internal context: This is the final onboarding welcome. "
+            "Complete the personalized welcome normally. The system will attach bounded "
+            "recommendation cards after the reply; do not describe implementation details, "
+            "repeat card copy, or expose this block.]",
+        )
 
     if _is_creation_governor_self_query(user_message):
         return _join_context(_self_description_context())
@@ -1644,24 +1752,15 @@ def _recommendation_envelope(candidate: dict[str, Any]) -> str:
     )
 
 
-def _emit_recommendation_attachment(session_key: str, proposal: dict[str, Any]) -> bool:
-    """Deliver a channel/connector/artifact proposal as a structured attachment.
-
-    需求 6.2：wire 只带语义（kind/payload/action id），推荐卡文案由客户端
-    i18n 决定（artifact 的 title/reason 是模型按用户语言产出的内容字段）。
-    发射失败（无活跃流 / 老客户端链路）静默降级——推荐是锦上添花，绝不
-    进入正文文本通道。
-    """
-    ctx = _plugin_ctx
-    if ctx is None or not hasattr(ctx, "emit_attachment"):
-        return False
+def _build_recommendation_attachment(proposal: dict[str, Any]) -> dict[str, Any] | None:
+    """Project one proposal onto the existing attachment wire contract."""
     creation_type = proposal.get("creation_type")
     target = _text(proposal.get("target"), 80).lower()
     proposal_id = _text(proposal.get("proposal_id"), 80)
     if creation_type not in ATTACHMENT_DELIVERED_TYPES or not proposal_id:
-        return False
+        return None
     if creation_type in CONNECTION_TYPES and not target:
-        return False
+        return None
     attachment_id = f"cg-{proposal_id}"
     if creation_type == "channel":
         kind = "channel.connect"
@@ -1679,10 +1778,15 @@ def _emit_recommendation_attachment(session_key: str, proposal: dict[str, Any]) 
             "title": _text(proposal.get("suggested_name"), 80),
             "reason": _text(proposal.get("reason"), 400),
             "confidence": proposal.get("confidence"),
+            **(
+                {"artifact_type": _text(proposal.get("artifact_type"), 40)}
+                if _text(proposal.get("artifact_type"), 40)
+                else {}
+            ),
         }
         actions = [{"id": "dismiss"}, {"id": "accept", "style": "primary"}]
     expires_at = proposal.get("expires_at")
-    attachment = {
+    return {
         "id": attachment_id,
         "kind": kind,
         "v": 1,
@@ -1696,6 +1800,22 @@ def _emit_recommendation_attachment(session_key: str, proposal: dict[str, Any]) 
             else {}
         ),
     }
+
+
+def _emit_recommendation_attachment(session_key: str, proposal: dict[str, Any]) -> bool:
+    """Deliver a channel/connector/artifact proposal as a structured attachment.
+
+    需求 6.2：wire 只带语义（kind/payload/action id），推荐卡文案由客户端
+    i18n 决定（artifact 的 title/reason 是模型按用户语言产出的内容字段）。
+    发射失败（无活跃流 / 老客户端链路）静默降级——推荐是锦上添花，绝不
+    进入正文文本通道。
+    """
+    ctx = _plugin_ctx
+    if ctx is None or not hasattr(ctx, "emit_attachment"):
+        return False
+    attachment = _build_recommendation_attachment(proposal)
+    if attachment is None:
+        return False
     try:
         emitted = bool(ctx.emit_attachment(attachment))
     except Exception:
@@ -1703,7 +1823,7 @@ def _emit_recommendation_attachment(session_key: str, proposal: dict[str, Any]) 
         return False
     if emitted:
         with _state_lock:
-            _emitted_connection_proposals[attachment_id] = (
+            _emitted_connection_proposals[attachment["id"]] = (
                 session_key,
                 str(proposal.get("dedup_key") or ""),
             )
@@ -1745,6 +1865,83 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         "structured_output"
     ):
         return None
+    with _state_lock:
+        state = _state_locked(session_id, time.monotonic())
+        welcome = state.pop("onboarding_welcome", None)
+    if isinstance(welcome, dict):
+        if (
+            kwargs.get("failed")
+            or kwargs.get("interrupted")
+            or kwargs.get("completed") is False
+            or not response_text
+            or is_intentional_silence_response(response_text)
+        ):
+            return None
+        source_turn_id = _text(welcome.get("source_turn_id"), 160)
+        expires_at = time.time() + PROPOSAL_TTL_SECONDS
+        artifact = {
+            "creation_type": ARTIFACT_TYPE,
+            "artifact_type": "app",
+            "suggested_name": _text(welcome.get("artifact_title"), 80),
+            "reason": _text(welcome.get("artifact_reason"), 400),
+            "confidence": 1.0,
+            "dedup_key": _semantic_dedup_key(
+                "onboarding-app", ARTIFACT_TYPE, _text(welcome.get("artifact_title"), 80)
+            ),
+            "proposal_id": hashlib.sha256(
+                f"{session_id}|onboarding-app|{source_turn_id}".encode("utf-8")
+            ).hexdigest()[:32],
+            "expires_at": expires_at,
+            "source_turn_id": source_turn_id,
+        }
+        task = {
+            "creation_type": "task",
+            "suggested_name": _text(welcome.get("task_title"), 80),
+            "reason": _text(welcome.get("task_reason"), 400),
+            "proposal_text": _text(welcome.get("task_proposal"), 500),
+            "confidence": 1.0,
+            "dedup_key": _semantic_dedup_key(
+                "onboarding-task", "task", _text(welcome.get("task_title"), 80)
+            ),
+            "proposal_id": hashlib.sha256(
+                f"{session_id}|onboarding-task|{source_turn_id}".encode("utf-8")
+            ).hexdigest()[:32],
+            "expires_at": expires_at,
+            "evidence_turn_ids": [source_turn_id] if source_turn_id else [],
+            "source_turn_id": source_turn_id,
+        }
+        channel_target = _text(welcome.get("channel_target"), 80).lower()
+        channel_emitted = False
+        if channel_target:
+            channel = {
+                "creation_type": "channel",
+                "target": channel_target,
+                "suggested_name": channel_target,
+                "reason": "",
+                "confidence": 1.0,
+                "dedup_key": _semantic_dedup_key(channel_target, "channel", channel_target),
+                "proposal_id": hashlib.sha256(
+                    f"{session_id}|onboarding-channel|{channel_target}|{source_turn_id}".encode("utf-8")
+                ).hexdigest()[:32],
+                "expires_at": expires_at,
+                "source_turn_id": source_turn_id,
+            }
+            channel_emitted = _emit_recommendation_attachment(session_id, channel)
+        artifact_emitted = _emit_recommendation_attachment(session_id, artifact)
+        with _state_lock:
+            state = _state_locked(session_id, time.monotonic())
+            state["last_candidate"] = dict(task)
+            state["last_proposal"] = dict(task)
+            state["proposal_stage"] = "proposal_shown"
+            state["candidate_turn"] = -10_000
+            state["last_prompt_turn"] = int(state["turn"])
+            state["last_delivery_turn"] = int(state["turn"])
+        logger.info(
+            "onboarding welcome recommendations emitted channel=%s artifact=%s task=1",
+            channel_target if channel_emitted else "none",
+            "app" if artifact_emitted else "none",
+        )
+        return response_text + "\n\n" + _recommendation_envelope(task)
     if not response_text or is_intentional_silence_response(response_text):
         with _state_lock:
             state = _state_locked(session_id, time.monotonic())
