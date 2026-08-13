@@ -32,11 +32,8 @@ def stream_client(monkeypatch, _isolate_hermes_home):
             web_server.app.state.auth_required = previous_auth_required
 
 
-def _url(token: str | None = None, profile: str | None = None) -> str:
-    params = {"token": token or web_server._SESSION_TOKEN}
-    if profile:
-        params["profile"] = profile
-    return f"/api/audio/speak-stream?{urlencode(params)}"
+def _url(token: str | None = None) -> str:
+    return f"/api/audio/speak-stream?{urlencode({'token': token or web_server._SESSION_TOKEN})}"
 
 
 class _FakeStreamer:
@@ -77,104 +74,6 @@ def test_streams_pcm_frames_then_end(stream_client, monkeypatch):
         assert conn.receive_json() == {"type": "end"}
 
     assert streamer.requests == ["Hello there."]
-
-
-def test_stream_installs_target_profile_secret_scope(stream_client, monkeypatch):
-    from agent.secret_scope import current_secret_scope
-    from hermes_constants import get_hermes_home
-    from hermes_cli import profiles
-
-    default_home = get_hermes_home()
-    profiles_root = default_home / "profiles"
-    worker_home = profiles_root / "worker_beta"
-    worker_home.mkdir(parents=True)
-    (worker_home / "config.yaml").write_text("{}\n", encoding="utf-8")
-    (worker_home / ".env").write_text(
-        "ZETTLAB_AGENT_ACTION_TOKEN=worker-stream-token\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
-    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
-
-    seen = []
-
-    class _ScopedStreamer(_FakeStreamer):
-        def stream(self, text):
-            scope = current_secret_scope()
-            seen.append(scope["ZETTLAB_AGENT_ACTION_TOKEN"])
-            yield from super().stream(text)
-
-    streamer = _ScopedStreamer([b"\x01\x02"])
-    _patch_provider(monkeypatch, streamer)
-
-    with stream_client.websocket_connect(_url(profile="worker_beta")) as conn:
-        assert conn.receive_json()["type"] == "start"
-        conn.send_text(json.dumps({"text": "Hello scoped stream.", "done": True}))
-        assert conn.receive_bytes() == b"\x01\x02"
-        assert conn.receive_json() == {"type": "end"}
-
-    assert seen == ["worker-stream-token"]
-
-
-def test_stream_current_profile_preserves_process_env(stream_client, monkeypatch):
-    from agent.secret_scope import get_secret
-
-    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "process-stream-token")
-    seen = []
-
-    class _EnvStreamer(_FakeStreamer):
-        def stream(self, text):
-            seen.append(get_secret("ZETTLAB_AGENT_ACTION_TOKEN"))
-            yield from super().stream(text)
-
-    streamer = _EnvStreamer([b"\x01\x02"])
-    _patch_provider(monkeypatch, streamer)
-
-    with stream_client.websocket_connect(_url()) as conn:
-        assert conn.receive_json()["type"] == "start"
-        conn.send_text(json.dumps({"text": "Hello current stream.", "done": True}))
-        assert conn.receive_bytes() == b"\x01\x02"
-        assert conn.receive_json() == {"type": "end"}
-
-    assert seen == ["process-stream-token"]
-
-
-def test_stream_target_config_env_ref_does_not_expand_process_secret(
-    stream_client, monkeypatch
-):
-    from hermes_constants import get_hermes_home
-    from hermes_cli import profiles
-
-    default_home = get_hermes_home()
-    profiles_root = default_home / "profiles"
-    worker_home = profiles_root / "worker_beta"
-    worker_home.mkdir(parents=True)
-    (worker_home / "config.yaml").write_text(
-        "tts:\n  provider: openai\n  api_key: ${env:OPENAI_API_KEY}\n",
-        encoding="utf-8",
-    )
-    (worker_home / ".env").write_text("", encoding="utf-8")
-    monkeypatch.setenv("OPENAI_API_KEY", "dashboard-openai-key")
-    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
-    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
-
-    seen = {}
-    streamer = _FakeStreamer([b"\x01\x02"])
-
-    def resolve(cfg):
-        seen["api_key"] = cfg.get("api_key")
-        return streamer
-
-    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", resolve)
-    monkeypatch.setattr("tools.tts_tool._resolve_max_text_length", lambda *_args: 4000)
-
-    with stream_client.websocket_connect(_url(profile="worker_beta")) as conn:
-        assert conn.receive_json()["type"] == "start"
-        conn.send_text(json.dumps({"text": "Hello worker stream.", "done": True}))
-        assert conn.receive_bytes() == b"\x01\x02"
-        assert conn.receive_json() == {"type": "end"}
-
-    assert seen["api_key"] == "${env:OPENAI_API_KEY}"
 
 
 

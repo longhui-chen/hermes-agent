@@ -4517,7 +4517,11 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
         from tools.tts_tool import text_to_speech_tool
 
         def _speak_scoped():
-            with _tts_profile_scope(profile):
+            # Home-only scope (contextvar), NOT _profile_scope: synthesis
+            # blocks for the provider round-trip and only needs config/.env
+            # resolution, so the task-local override inside this worker
+            # thread is sufficient (same reasoning as the MCP probe scope).
+            with _config_profile_scope(profile):
                 return text_to_speech_tool(text)
 
         loop = asyncio.get_running_loop()
@@ -4640,7 +4644,7 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         from tools.tts_streaming import resolve_streaming_provider
         from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
 
-        with _tts_profile_scope(profile):
+        with _config_profile_scope(profile):
             cfg = _load_tts_config()
             streamer = resolve_streaming_provider(cfg)
             cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
@@ -4702,16 +4706,15 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                 yield from chunker.feed(delta)
 
         try:
-            with _tts_profile_scope(profile):
-                for sentence in _sentences():
-                    cleaned = _strip_markdown_for_tts(sentence)
-                    if not cleaned:
-                        continue
-                    for piece in _split_text_for_speak_stream(cleaned, cap):
-                        for chunk in streamer.stream(piece):
-                            if stop.is_set():
-                                return
-                            loop.call_soon_threadsafe(chunks.put_nowait, chunk)
+            for sentence in _sentences():
+                cleaned = _strip_markdown_for_tts(sentence)
+                if not cleaned:
+                    continue
+                for piece in _split_text_for_speak_stream(cleaned, cap):
+                    for chunk in streamer.stream(piece):
+                        if stop.is_set():
+                            return
+                        loop.call_soon_threadsafe(chunks.put_nowait, chunk)
         except Exception as exc:
             _log.warning("speak-stream synthesis failed: %s", exc)
         finally:
@@ -13708,39 +13711,6 @@ def _config_profile_scope(profile: Optional[str]):
         yield profile_dir
     finally:
         reset_hermes_home_override(token)
-
-
-@contextmanager
-def _tts_profile_scope(profile: Optional[str]):
-    """Install target-profile home and secret scopes for TTS workers."""
-    from agent.secret_scope import (
-        build_profile_secret_scope,
-        is_multiplex_active,
-        reset_secret_scope,
-        set_secret_scope,
-        strict_secret_scope,
-    )
-    from hermes_constants import get_hermes_home
-
-    requested = (profile or "").strip()
-    cross_profile = bool(requested and requested.lower() != "current")
-    with _config_profile_scope(profile) as profile_dir:
-        home = Path(profile_dir) if profile_dir is not None else get_hermes_home()
-        secrets = build_profile_secret_scope(home)
-        if cross_profile:
-            with strict_secret_scope(secrets):
-                yield home
-            return
-
-        if not is_multiplex_active():
-            yield home
-            return
-
-        token = set_secret_scope(secrets)
-        try:
-            yield home
-        finally:
-            reset_secret_scope(token)
 
 
 app.include_router(_skills_routes.router)

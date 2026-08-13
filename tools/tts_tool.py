@@ -281,7 +281,7 @@ def _default_output_dir_for_session(*, platform: str) -> Path:
         str(platform or "").strip().lower() != "zet_agent"
         or os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
     ):
-        output_dir = Path(_get_default_output_dir())
+        output_dir = Path(DEFAULT_OUTPUT_DIR)
         output_dir.mkdir(parents=True, exist_ok=True)
         return output_dir
 
@@ -4342,7 +4342,7 @@ if __name__ == "__main__":
     print(f"  MiniMax:    {minimax_status}")
     print(f"  Piper:      {'installed' if _check_piper_available() else 'not installed (pip install piper-tts)'}")
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
-    print(f"\n  Output dir: {_get_default_output_dir()}")
+    print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
 
     provider = _get_provider(config)
     print(f"  Configured provider: {provider}")

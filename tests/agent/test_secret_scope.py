@@ -80,23 +80,6 @@ class TestScopedSingleProfile:
         finally:
             ss.reset_secret_scope(token)
 
-    def test_strict_scope_does_not_fall_back_and_restores_outer_scope(
-        self, monkeypatch
-    ):
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-process-profile")
-        outer = ss.set_secret_scope({"OUTER_KEY": "outer"})
-        try:
-            with ss.strict_secret_scope({"ANTHROPIC_API_KEY": "sk-target"}):
-                assert ss.get_secret("ANTHROPIC_API_KEY") == "sk-target"
-                assert ss.get_secret("OPENAI_API_KEY") is None
-                assert ss.current_secret_scope() == {
-                    "ANTHROPIC_API_KEY": "sk-target"
-                }
-            assert ss.current_secret_scope() == {"OUTER_KEY": "outer"}
-            assert ss.get_secret("OPENAI_API_KEY") == "sk-process-profile"
-        finally:
-            ss.reset_secret_scope(outer)
-
     def test_multiplex_on_still_authoritative(self, monkeypatch):
         # The fallthrough is strictly multiplex-off behavior: turning
         # multiplexing on must restore scope-authoritative semantics.

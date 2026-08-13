@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import re
-from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Dict, Mapping, Optional
@@ -57,9 +56,6 @@ def is_multiplex_active() -> bool:
 _SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
     "_SECRET_SCOPE", default=None
 )
-_STRICT_SECRET_SCOPE: ContextVar[bool] = ContextVar(
-    "_STRICT_SECRET_SCOPE", default=False
-)
 
 
 class UnscopedSecretError(RuntimeError):
@@ -89,18 +85,6 @@ def reset_secret_scope(token: Token) -> None:
 def current_secret_scope() -> Optional[Mapping[str, str]]:
     """Return the active secret mapping, or None when no scope is installed."""
     return _SECRET_SCOPE.get()
-
-
-@contextmanager
-def strict_secret_scope(secrets: Mapping[str, str]):
-    """Install an authoritative context-local scope, even outside multiplexing."""
-    scope_token = _SECRET_SCOPE.set(secrets)
-    strict_token = _STRICT_SECRET_SCOPE.set(True)
-    try:
-        yield
-    finally:
-        _STRICT_SECRET_SCOPE.reset(strict_token)
-        _SECRET_SCOPE.reset(scope_token)
 
 
 # ── genuinely-global env vars (NOT per-profile secrets) ──────────────────
@@ -179,7 +163,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE or _STRICT_SECRET_SCOPE.get():
+        if _MULTIPLEX_ACTIVE:
             return default
         # Multiplex off: the scope is an overlay over the process environment,
         # not an isolation boundary — there is no other profile to leak from.
