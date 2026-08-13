@@ -1041,12 +1041,6 @@ def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
         pytest.skip("directory symlinks are unavailable on this platform")
     returned_paths = []
     played = []
-    real_mkstemp = tempfile.mkstemp
-
-    def controlled_mkstemp(*args, **kwargs):
-        kwargs["dir"] = real_dir
-        return real_mkstemp(*args, **kwargs)
-
     def fake_synth(text, output_path):
         del text
         with open(output_path, "wb") as output:
@@ -1055,7 +1049,7 @@ def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
         returned_paths.append(alias_path)
         return json.dumps({"success": True, "file_path": alias_path})
 
-    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", controlled_mkstemp)
+    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", lambda **_kwargs: str(real_dir))
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
     fake_vm = MagicMock()
     fake_vm.play_audio_file.side_effect = lambda path: played.append(
@@ -1085,36 +1079,36 @@ def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp
         alias_dir.symlink_to(real_dir, target_is_directory=True)
     except OSError:
         pytest.skip("directory symlinks are unavailable on this platform")
-    real_mkstemp = tempfile.mkstemp
-
-    def controlled_mkstemp(*args, **kwargs):
-        kwargs["dir"] = real_dir
-        return real_mkstemp(*args, **kwargs)
+    provider_paths = []
 
     def fake_synth(text, output_path):
         del text
         provider_path = Path(output_path).with_suffix(".wav")
         provider_path.write_bytes(b"provider audio")
+        provider_paths.append(provider_path)
         alias_path = alias_dir / provider_path.name
         return json.dumps({"success": True, "file_path": str(alias_path)})
 
-    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", controlled_mkstemp)
+    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", lambda **_kwargs: str(real_dir))
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
 
     pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    artifact = None
     try:
-        output_path = pipeline._synthesize_to_tmp("Canonical temporary path.")
-        assert output_path is not None
-        assert Path(output_path).parent == real_dir
+        artifact = pipeline._synthesize_to_tmp("Canonical temporary path.")
+        assert artifact is not None
+        assert Path(artifact.path).parent == Path(artifact.directory)
 
         alias_dir.unlink()
         alias_dir.symlink_to(decoy_dir, target_is_directory=True)
-        decoy_path = decoy_dir / Path(output_path).name
+        decoy_path = decoy_dir / provider_paths[0].name
         decoy_path.write_bytes(b"keep me")
 
-        Path(output_path).unlink()
+        artifact.cleanup()
         assert decoy_path.read_bytes() == b"keep me"
     finally:
+        if artifact is not None:
+            artifact.cleanup()
         pipeline.close()
 
 

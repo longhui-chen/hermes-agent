@@ -449,6 +449,31 @@ class TestProfileScopedAudio:
         assert seen["text"] == "hello"
         assert seen["scope"]["ZETTLAB_AGENT_ACTION_TOKEN"] == "worker-action-token"
 
+    def test_speak_missing_target_secret_does_not_fall_back_to_process_env(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        from agent.secret_scope import get_secret
+        from tools import tts_tool
+
+        worker_home = isolated_profiles["worker_beta"]
+        monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "dashboard-action-token")
+        seen = {}
+
+        def fake_tts(_text):
+            seen["token"] = get_secret("ZETTLAB_AGENT_ACTION_TOKEN")
+            audio_path = worker_home / "speech.mp3"
+            audio_path.write_bytes(b"audio")
+            return json.dumps({"success": True, "file_path": str(audio_path)})
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+        response = client.post(
+            "/api/audio/speak?profile=worker_beta",
+            json={"text": "hello"},
+        )
+
+        assert response.status_code == 200
+        assert seen["token"] is None
+
 
 
     def test_transcribe_runs_inside_target_profile_home(

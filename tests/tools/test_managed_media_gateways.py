@@ -415,6 +415,23 @@ def test_zettlab_tts_direct_opt_out_requires_direct_key(monkeypatch):
     assert tts_tool.check_tts_requirements() is False
 
 
+def test_openai_tts_forced_gateway_visibility_ignores_stale_direct_key(monkeypatch):
+    _install_fake_tools_package()
+    _install_fake_openai_module({})
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-direct-key")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    monkeypatch.setattr(
+        tts_tool,
+        "resolve_managed_tool_gateway",
+        lambda _capability: None,
+    )
+
+    assert tts_tool._has_openai_audio_backend(
+        {"provider": "openai", "use_gateway": True}
+    ) is False
+
+
 def test_zettlab_tts_visibility_is_rechecked_across_multiplex_profiles(monkeypatch):
     _install_fake_tools_package()
     _install_fake_openai_module({})

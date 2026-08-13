@@ -3525,20 +3525,11 @@ def _resolve_openai_audio_client_config(
 
 def _has_openai_audio_backend(tts_config: Optional[Dict[str, Any]] = None) -> bool:
     """Return whether the same credential path used by OpenAI TTS can run."""
-    if tts_config is None:
-        tts_config = _load_tts_config()
-    oai_config = (
-        tts_config.get("openai") if isinstance(tts_config, dict) else None
-    ) or {}
-    cfg_api_key = str(oai_config.get("api_key") or "").strip()
-    direct_api_key = _resolve_profile_openai_audio_api_key()
-    if isinstance(tts_config, dict) and _gateway_is_explicitly_disabled(tts_config):
-        return bool(cfg_api_key or direct_api_key)
-    return bool(
-        cfg_api_key
-        or direct_api_key
-        or resolve_managed_tool_gateway("openai-audio")
-    )
+    try:
+        _resolve_openai_audio_client_config(tts_config)
+        return True
+    except Exception:
+        return False
 
 
 # ===========================================================================
@@ -3594,6 +3585,22 @@ def _strip_markdown_for_tts(text: str) -> str:
     text = _EMOJI.sub(' ', text)
     text = _MD_EXCESS_NL.sub('\n\n', text)
     return text.strip()
+
+
+@dataclass(frozen=True)
+class _SyncAudioArtifact:
+    path: str
+    directory: str
+
+    def cleanup(self) -> None:
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(self.directory)
+        except OSError:
+            pass
 
 
 class _SyncSentencePipeline:
@@ -3653,15 +3660,36 @@ class _SyncSentencePipeline:
         self._player.join()
         self._executor.shutdown(wait=True)
 
-    def _synthesize_to_tmp(self, cleaned: str) -> Optional[str]:
+    @staticmethod
+    def _unlink_if_unchanged(path: Optional[str], expected: os.stat_result) -> None:
+        if not path:
+            return
+        try:
+            current = os.lstat(path)
+            if (
+                stat.S_ISREG(current.st_mode)
+                and (current.st_dev, current.st_ino)
+                == (expected.st_dev, expected.st_ino)
+            ):
+                os.unlink(path)
+        except OSError:
+            pass
+
+    def _synthesize_to_tmp(self, cleaned: str) -> Optional[_SyncAudioArtifact]:
         if self._stop.is_set():
             return None
+        synthesis_dir = None
         tmp_path = None
+        tmp_initial_stat = None
         owned_output_path = None
+        source_stat = None
+        playback_dir = None
         playback_path = None
         try:
-            fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+            synthesis_dir = tempfile.mkdtemp(prefix="hermes-tts-synthesis-")
+            fd, tmp_path = tempfile.mkstemp(dir=synthesis_dir, suffix=".mp3")
             os.close(fd)
+            tmp_initial_stat = os.lstat(tmp_path)
             tmp_real_path = Path(os.path.realpath(tmp_path))
             raw_result = text_to_speech_tool(text=cleaned, output_path=tmp_path)
             try:
@@ -3710,8 +3738,10 @@ class _SyncSentencePipeline:
                 ):
                     raise RuntimeError("TTS output changed during validation")
 
+                playback_dir = tempfile.mkdtemp(prefix="hermes-tts-playback-")
                 playback_fd, playback_path = tempfile.mkstemp(
-                    suffix=output_owned_path.suffix.lower()
+                    dir=playback_dir,
+                    suffix=output_owned_path.suffix.lower(),
                 )
                 try:
                     with os.fdopen(source_fd, "rb") as source:
@@ -3726,21 +3756,29 @@ class _SyncSentencePipeline:
                 if source_fd >= 0:
                     os.close(source_fd)
 
-            for owned_path in {tmp_path, owned_output_path}:
-                try:
-                    os.unlink(owned_path)
-                except OSError:
-                    pass
-            return playback_path
+            if same_path:
+                self._unlink_if_unchanged(tmp_path, source_stat)
+            else:
+                self._unlink_if_unchanged(tmp_path, tmp_initial_stat)
+                self._unlink_if_unchanged(owned_output_path, source_stat)
+            try:
+                os.rmdir(synthesis_dir)
+            except OSError:
+                pass
+            return _SyncAudioArtifact(playback_path, playback_dir)
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
-            for owned_path in {tmp_path, owned_output_path, playback_path}:
-                if not owned_path:
-                    continue
+            if tmp_initial_stat is not None:
+                self._unlink_if_unchanged(tmp_path, tmp_initial_stat)
+            if source_stat is not None:
+                self._unlink_if_unchanged(owned_output_path, source_stat)
+            if synthesis_dir:
                 try:
-                    os.unlink(owned_path)
+                    os.rmdir(synthesis_dir)
                 except OSError:
                     pass
+            if playback_path or playback_dir:
+                _SyncAudioArtifact(playback_path or "", playback_dir or "").cleanup()
             return None
 
     def _drain(self) -> None:
@@ -3749,22 +3787,19 @@ class _SyncSentencePipeline:
             if item is None:
                 return
             _sentence, future = item
-            tmp_path = None
+            artifact = None
             try:
-                tmp_path = future.result()
-                if (tmp_path and not self._stop.is_set()
-                        and os.path.isfile(tmp_path)
-                        and os.path.getsize(tmp_path) > 0):
+                artifact = future.result()
+                if (artifact and not self._stop.is_set()
+                        and os.path.isfile(artifact.path)
+                        and os.path.getsize(artifact.path) > 0):
                     from tools.voice_mode import play_audio_file
-                    play_audio_file(tmp_path)
+                    play_audio_file(artifact.path)
             except Exception as exc:
                 logger.warning("Sync per-sentence TTS failed: %s", exc)
             finally:
-                if tmp_path:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+                if artifact:
+                    artifact.cleanup()
 
 
 def stream_tts_to_speaker(
