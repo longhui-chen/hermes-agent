@@ -493,6 +493,40 @@ def _managed_terminal_profile_tag(env: Mapping[str, str] | None) -> str:
     return f"-{profile_id}"
 
 
+def _retire_occupied_credential_path(destination: Path) -> None:
+    """把挡住软链的实体挪开,而不是抛错把整台设备卡死。
+
+    受管 HOME 里出现真目录/真文件是常态,不是异常:软链只在本函数里建,而在它建成
+    之前跑过的任何一条命令(lark-cli 自己首当其冲)都会按 $HOME 直接创建
+    `~/.lark-cli`。一旦如此,后续每一轮都撞 rmdir 失败——原来这里直接抛
+    OSError,结果是**这台设备上所有 agent 的任何 lark-cli 相关脚本全部失败**,
+    而报错只有一句「credential directory is occupied」,既不说路径也不说怎么办。
+    2026-08-13 板 .212 实测:用户被卡在 onboarding 授权步,智能体只能回一句
+    「配置暂未推进」;同一坑 08-06 已经撞过一次、手工绕过没根治。
+
+    受管 HOME 是本模块自己造的、每 profile 独立的目录(见
+    _managed_terminal_home_path 的属主/权限校验),里面的残留没有保留价值,
+    但仍然改名留痕而不是删除——凭据类目录不该被静默销毁。
+    """
+
+    retired = destination.with_name(
+        f"{destination.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}"
+    )
+    suffix = 1
+    while retired.exists() or retired.is_symlink():
+        retired = destination.with_name(
+            f"{destination.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}-{suffix}"
+        )
+        suffix += 1
+    try:
+        destination.rename(retired)
+    except OSError as exc:
+        raise OSError(
+            "managed terminal lark-cli credential path is occupied and could not "
+            f"be moved aside: {destination}"
+        ) from exc
+
+
 def _link_profile_lark_cli_credentials(
     home: Path,
     env: Mapping[str, str] | None,
@@ -525,12 +559,7 @@ def _link_profile_lark_cli_credentials(
                 continue
             destination.unlink()
         elif destination.exists():
-            try:
-                destination.rmdir()
-            except OSError as exc:
-                raise OSError(
-                    "managed terminal lark-cli credential directory is occupied"
-                ) from exc
+            _retire_occupied_credential_path(destination)
         os.symlink(source, destination)
 
 
