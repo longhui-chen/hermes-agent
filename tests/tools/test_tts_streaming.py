@@ -6,6 +6,7 @@ synth path are all mocked. Covers the registry/resolver, provider availability,
 the chunked-streamer playback path, and the universal per-sentence sync fallback.
 """
 
+import json
 import os
 import queue
 import tempfile
@@ -848,6 +849,7 @@ def _timed_sync_run(monkeypatch, sentences, *, synth_s=0.12, play_s=0.12,
             fh.write(b"x" * 100)
         with lock:
             events.append(("synth", text, t0, time.monotonic() - origin))
+        return json.dumps({"success": True, "file_path": output_path})
 
     def fake_play(path):
         t0 = time.monotonic() - origin
@@ -936,6 +938,68 @@ def test_sync_pipeline_cleans_temp_files(monkeypatch):
     assert not leftovers, f"temp files not cleaned: {leftovers}"
 
 
+def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(monkeypatch):
+    from tools import tts_tool
+
+    placeholders = []
+    provider_outputs = []
+    played = []
+    real_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        placeholders.append(path)
+        return fd, path
+
+    def fake_synth(text, output_path):
+        del text
+        provider_path = os.path.splitext(output_path)[0] + ".opus"
+        with open(provider_path, "wb") as output:
+            output.write(b"opus")
+        provider_outputs.append(provider_path)
+        return json.dumps({"success": True, "file_path": provider_path})
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Provider-selected output format.")
+    pipeline.close()
+
+    assert played == provider_outputs
+    assert not [path for path in placeholders + provider_outputs if os.path.exists(path)]
+
+
+def test_sync_pipeline_rejects_unsuccessful_tool_result(monkeypatch):
+    from tools import tts_tool
+
+    placeholders = []
+    real_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        placeholders.append(path)
+        return fd, path
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(
+        tts_tool,
+        "text_to_speech_tool",
+        lambda **_kwargs: json.dumps({"success": False, "error": "quota exhausted"}),
+    )
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    try:
+        assert pipeline._synthesize_to_tmp("Rejected synthesis.") is None
+    finally:
+        pipeline.close()
+
+    assert not [path for path in placeholders if os.path.exists(path)]
+
+
 def test_sync_pipeline_propagates_profile_context(monkeypatch):
     from tools import tts_tool
 
@@ -946,6 +1010,7 @@ def test_sync_pipeline_propagates_profile_context(monkeypatch):
         seen.append((text, profile_marker.get()))
         with open(output_path, "wb") as output:
             output.write(b"mp3")
+        return json.dumps({"success": True, "file_path": output_path})
 
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
     fake_vm = MagicMock()

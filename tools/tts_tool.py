@@ -3666,8 +3666,28 @@ class _SyncSentencePipeline:
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
-            text_to_speech_tool(text=cleaned, output_path=tmp_path)
-            return tmp_path
+            raw_result = text_to_speech_tool(text=cleaned, output_path=tmp_path)
+            try:
+                result = json.loads(raw_result)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("TTS tool returned an invalid result") from exc
+            if not isinstance(result, dict) or result.get("success") is not True:
+                error = result.get("error") if isinstance(result, dict) else None
+                raise RuntimeError(error or "TTS tool reported synthesis failure")
+
+            output_path = result.get("file_path")
+            if not isinstance(output_path, str) or not output_path:
+                raise RuntimeError("TTS tool returned no output path")
+
+            same_path = os.path.normcase(os.path.abspath(output_path)) == os.path.normcase(
+                os.path.abspath(tmp_path)
+            )
+            if not same_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            return output_path
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
             if tmp_path:
