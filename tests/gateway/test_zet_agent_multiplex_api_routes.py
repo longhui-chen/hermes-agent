@@ -693,6 +693,10 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
     def fake_create_agent(**_kwargs):
         from agent.secret_scope import current_secret_scope
         from gateway.platforms.api_server import _api_request_profile
+        from gateway.platforms.zet_agent import (
+            _deep_memory_principal,
+            _deep_memory_subject,
+        )
         from hermes_constants import get_hermes_home
 
         scope = current_secret_scope()
@@ -700,6 +704,8 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
             get_hermes_home(),
             None if scope is None else scope.get("ZET_AGENT_ID"),
             _api_request_profile.get(),
+            _deep_memory_principal.get(),
+            _deep_memory_subject.get(),
         ))
         return FakeAgent()
 
@@ -714,11 +720,18 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
                 "model": "hermes-agent",
                 "messages": [{"role": "user", "content": "hello coder"}],
             },
-            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            headers={
+                "Authorization": "Bearer test-key-0123456789abcdef",
+                "X-Zettlab-Auth-Principal-Id": "iam:issuer:user:user-1",
+                "X-Zettlab-User-Id": "user-1",
+            },
         )
 
     assert response.status == 200
-    assert seen == [(profile_homes["coder"], "coder", "coder")]
+    assert seen == [(
+        profile_homes["coder"], "coder", "coder",
+        "iam:issuer:user:user-1", "user-1",
+    )]
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1064,53 @@ async def test_prefixed_runs_holds_profile_lease_until_background_task_finishes(
         assert run_id not in adapter._active_run_tasks
 
     assert adapter._active_profile_chat_runs(profile_homes["coder"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_runs_worker_keeps_account_metadata_separate_from_principal(
+    profile_homes,
+    monkeypatch,
+):
+    del profile_homes
+    started = threading.Event()
+    seen = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "runs-account"
+
+        def run_conversation(self, **_kwargs):
+            from gateway.session_context import get_session_env
+
+            seen["account"] = get_session_env("HERMES_SESSION_USER_ID", "")
+            started.set()
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/v1/runs",
+            json={"input": "hello", "session_id": "public-session"},
+            headers={
+                "Authorization": f"Bearer {TEST_API_KEY}",
+                "X-Zettlab-Account-Id": "account-1",
+                "X-Zettlab-Auth-Principal-Id": "iam:alice",
+            },
+        )
+        assert response.status == 202
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+    assert started.is_set()
+    assert seen["account"] == "account-1"
 
 
 @pytest.mark.asyncio

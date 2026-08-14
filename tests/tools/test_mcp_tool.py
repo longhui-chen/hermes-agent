@@ -572,6 +572,41 @@ class TestToolHandler:
             clear_session_vars(session_tokens)
             _servers.pop("zettlab_memo", None)
 
+    def test_managed_memo_metadata_uses_zet_account_not_session_owner_principal(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.zet_agent import ZetAgentAdapter, _zettlab_request_account_id
+        from gateway.session_context import clear_session_vars, pop_zettlab_auth_principal, push_zettlab_auth_principal
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("stored", is_error=False)
+        )
+        server = _make_mock_server("zettlab_memo", session=mock_session)
+        server._config = {}
+        _servers["zettlab_memo"] = server
+        adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+        account_token = _zettlab_request_account_id.set("account-1")
+        principal_token = push_zettlab_auth_principal("iam:alice")
+        session_tokens = adapter._bind_api_server_session(
+            chat_id="session-1",
+            session_key="zettlab:account-1:main:session-1",
+            session_id="session-1",
+            session_user_id="account-1",
+        )
+
+        try:
+            handler = _make_tool_handler("zettlab_memo", "memo_write", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"statement": "remember this"}))
+            assert result["result"] == "stored"
+            assert mock_session.call_tool.call_args.kwargs["meta"]["zettlab/account_id"] == "account-1"
+        finally:
+            clear_session_vars(session_tokens)
+            pop_zettlab_auth_principal(principal_token)
+            _zettlab_request_account_id.reset(account_token)
+            _servers.pop("zettlab_memo", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers

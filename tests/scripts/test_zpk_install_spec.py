@@ -49,6 +49,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # cannot lazy-install them (see module docstring).
 REQUIRED_ZPK_EXTRAS = {"anthropic", "zpk-runtime"}
 
+DEEP_MEMORY_RUNTIME_MODULES = {
+    "agent.agent_runtime_helpers": Path("agent/agent_runtime_helpers.py"),
+    "agent.memory_manager": Path("agent/memory_manager.py"),
+    "agent.prompt_builder": Path("agent/prompt_builder.py"),
+    "agent.system_prompt": Path("agent/system_prompt.py"),
+    "agent.tool_executor": Path("agent/tool_executor.py"),
+    "gateway.deep_memory_identity": Path("gateway/deep_memory_identity.py"),
+    "gateway.platforms.zet_agent": Path("gateway/platforms/zet_agent.py"),
+    "plugins.memory.zettlab_deep_memory": Path(
+        "plugins/memory/zettlab_deep_memory/__init__.py"
+    ),
+    "plugins.memory.zettlab_deep_memory.outbox": Path(
+        "plugins/memory/zettlab_deep_memory/outbox.py"
+    ),
+}
+
 
 def _zpk_install_spec() -> str:
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
@@ -158,6 +174,16 @@ def test_zpk_payload_checker_rejects_cached_project_wheel(
     installed.write_text("VALUE = 'cached'\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="wheel/source parity"):
         check_zpk_payload._check_project_source_parity()
+
+
+def test_zpk_payload_checker_covers_deep_memory_runtime() -> None:
+    from scripts.check_zpk_payload import PROJECT_RUNTIME_MODULES
+
+    missing = DEEP_MEMORY_RUNTIME_MODULES.items() - PROJECT_RUNTIME_MODULES.items()
+    assert not missing, (
+        "Deep Memory runtime modules are missing from the ZPK wheel/source "
+        f"parity guard: {sorted(missing)}"
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="ZPK Makefile is POSIX-only")

@@ -31,7 +31,20 @@ CORE_IMPORTS = [
 ]
 
 PROJECT_RUNTIME_MODULES = {
+    "agent.agent_runtime_helpers": Path("agent/agent_runtime_helpers.py"),
+    "agent.memory_manager": Path("agent/memory_manager.py"),
+    "agent.prompt_builder": Path("agent/prompt_builder.py"),
+    "agent.system_prompt": Path("agent/system_prompt.py"),
+    "agent.tool_executor": Path("agent/tool_executor.py"),
+    "gateway.deep_memory_identity": Path("gateway/deep_memory_identity.py"),
+    "gateway.platforms.zet_agent": Path("gateway/platforms/zet_agent.py"),
     "gateway.run": Path("gateway/run.py"),
+    "plugins.memory.zettlab_deep_memory": Path(
+        "plugins/memory/zettlab_deep_memory/__init__.py"
+    ),
+    "plugins.memory.zettlab_deep_memory.outbox": Path(
+        "plugins/memory/zettlab_deep_memory/outbox.py"
+    ),
     "tools.code_execution_tool": Path("tools/code_execution_tool.py"),
     "tools.environments.local": Path("tools/environments/local.py"),
     "tools.process_registry": Path("tools/process_registry.py"),

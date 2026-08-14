@@ -160,6 +160,9 @@ _BUSINESS_EXECUTION_TOKEN: ContextVar = ContextVar(
     "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
     default=_UNSET,
 )
+_ZETTLAB_AUTH_PRINCIPAL: ContextVar = ContextVar(
+    "ZETTLAB_AUTH_PRINCIPAL", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -379,6 +382,20 @@ def business_execution_token() -> str:
     if value is _UNSET or value is None:
         return ""
     return str(value).strip()
+
+
+def push_zettlab_auth_principal(value: str):
+    """Bind the Local Server-attested principal for one Zet HTTP request."""
+    return _ZETTLAB_AUTH_PRINCIPAL.set(str(value or "").strip())
+
+
+def pop_zettlab_auth_principal(token) -> None:
+    _ZETTLAB_AUTH_PRINCIPAL.reset(token)
+
+
+def zettlab_auth_principal() -> str:
+    value = _ZETTLAB_AUTH_PRINCIPAL.get()
+    return "" if value is _UNSET or value is None else str(value).strip()
 
 
 def set_current_session_id(session_id: str) -> None:

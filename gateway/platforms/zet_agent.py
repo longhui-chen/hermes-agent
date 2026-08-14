@@ -125,6 +125,7 @@ from gateway.platforms.api_server import (
     _strip_skill_display_token,
 )
 from gateway.platforms.base import SendResult
+from gateway.deep_memory_identity import bounded_identity_header as _bounded_identity_header
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -233,6 +234,12 @@ def _request_account_id(request: "web.Request") -> str:
         raise web.HTTPForbidden(reason="account identity mismatch")
     return value[:256]
 
+_deep_memory_principal: ContextVar[str] = ContextVar(
+    "zettlab_deep_memory_principal", default=""
+)
+_deep_memory_subject: ContextVar[str] = ContextVar(
+    "zettlab_deep_memory_subject", default=""
+)
 
 async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
     """Keep a cancelled request alive until its non-cancellable worker exits.
@@ -373,44 +380,38 @@ _ZET_ADDENDUM_HEAD = """\
 用户已经明确指定全部关键参数（频率、时间、目标、内容）时直接执行，无需再 clarify。
 信息查询、闲聊、回答问题不要 clarify。"""
 
-# Plan-First section, auto-execute variant: legacy App opted in (capability
-# negotiation) to render the plan card as a read-only preview and let the model
-# carry the plan out in the same turn. Kept for old-client compatibility only —
-# new Apps no longer opt in (decision-point semantics, 方案 §0/§4)。触发条件与
-# manual 版收敛为同一套（用户求计划 / 高风险），复杂非高风险任务直接走 todo。
+# Plan-First section, auto-execute variant: App opted in (capability negotiation)
+# to render the plan card as a read-only preview and let the model carry the plan
+# out in the same turn（「不确定不阻塞」——计划卡是进度呈现，不是执行门槛）。
+# 任务清单已由播种机制按计划骨架自动创建，模型只更新状态、不自行另建清单。
 _ZET_PLAN_FIRST_AUTO = """\
 ## 计划先行（Plan-First）
 
-只在以下两种情况调用 `present_plan`，把执行计划结构化呈现给用户（分组列出每步要做什么）：
-- 用户明确要计划（说"plan 模式"、"计划模式"、"先给计划"、"帮我计划"等）；
-- 任务包含不可逆操作、大范围数据变更、对外发布/发送等确实需要用户预审的高风险步骤。
+默认模式下，只有任务包含不可逆操作、大范围数据变更、对外发布/发送，或其它确实需要用户在执行前预审的高风险步骤时：
+1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
+2. 计划卡片只是给用户看的只读预览，展示后**不要停下、不要等用户确认、不要问用户是否执行**，直接在同一轮继续把计划执行下去。
+3. 计划呈现时系统已按计划骨架自动创建任务清单（见 present_plan 之后的 todo 结果）。执行时用 `todo`（merge=true）逐项更新状态，每完成一步立即标记 completed；可以追加计划外任务，但不要整表重建清单。
 
-计划卡片是只读预览，展示后**不要停下、不要等用户确认、不要问用户是否执行**，直接在同一轮继续把计划执行下去。
-计划呈现时系统已按计划骨架自动创建任务清单（见 present_plan 之后的 todo 结果）。执行时用 `todo`（merge=true）逐项更新状态，每完成一步立即标记 completed；可以追加计划外任务，但不要整表重建清单。
-
-复杂多步但非高风险的任务不需要 present_plan：直接执行，用 `todo` 工具跟踪进度即可。
-不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的计划卡片。
+用户说"plan 模式"、"计划模式"、"先给计划"时，也按上述 App 计划卡片流程处理（展示计划后直接执行，不等确认）。
+不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
 
 简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
 
-# Plan-First section, manual variant: the default (no auto-execute opt-in)。
-# 计划卡 = 决策点（方案 §0）：出现即停、等用户在卡上点「开始执行」。触发条件
-# 收敛为「用户求计划 / 高风险」两种——复杂非高风险任务不再弹计划卡（用户没请求
-# 审批就不打断），进度可视化由 todo 清单承担。Mirrors the global PLAN_SCHEMA
-# stop-and-wait contract；conversation_loop 的 _should_end_after_present_plan
-# 在代码层强制结束 turn，不依赖模型自觉。
+# Plan-First section, manual variant: no auto-execute opt-in (legacy confirm card,
+# and the safe default for any client that did not opt in). Mirrors the global
+# PLAN_SCHEMA stop-and-wait contract so a self-initiated present_plan (outside App
+# plan mode, where _should_end_after_present_plan does NOT halt the turn) cannot
+# run write/terminal/message side effects before the user confirms.
 _ZET_PLAN_FIRST_MANUAL = """\
 ## 计划先行（Plan-First）
 
-只在以下两种情况调用 `present_plan`，把执行计划结构化呈现给用户（分组列出每步要做什么）：
-- 用户明确要计划（说"plan 模式"、"计划模式"、"先给计划"、"帮我计划"等）——此时计划本身就是交付物，用户可能只想要计划而不执行；
-- 任务包含不可逆操作、大范围数据变更、对外发布/发送等确实需要用户预审的高风险步骤。
+面对复杂多步任务（涉及 3 个以上阶段、不可逆操作、大量数据变更，或对外发布/发送）时：
+1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
+2. 计划卡片是给用户确认的预览，展示后**停下、等用户在确认卡上确认后再执行**；在收到用户确认前，不要执行计划里的任何实际操作（写文件、terminal、发送外部消息等有副作用的动作）。
+3. 计划呈现时系统已按计划骨架自动创建任务清单。收到用户确认后逐步执行，用 `todo`（merge=true）逐项更新状态，每完成一步立即标记 completed；可以追加计划外任务，但不要整表重建清单。
 
-计划卡是决策点：展示后**停下、等用户确认后再执行**；收到用户确认前，不要执行计划里的任何实际操作（写文件、terminal、发送外部消息等有副作用的动作）。
-计划呈现时系统已按计划骨架自动创建任务清单（见 present_plan 之后的 todo 结果）。用户确认后执行时用 `todo`（merge=true）逐项更新状态，每完成一步立即标记 completed；可以追加计划外任务，但不要整表重建清单。
-
-复杂多步但非高风险的任务不需要 present_plan：直接执行，用 `todo` 工具跟踪进度即可。
-不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的计划卡。
+用户说"plan 模式"、"计划模式"、"先给计划"时，也按上述 App 计划卡片流程处理（展示计划后停下，等用户确认再执行）。
+不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
 
 简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
 
@@ -898,13 +899,61 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return bool(_delegation_advance_url())
 
-    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
-        """Bind local-server's browser scope capability for this API request.
+    async def _handle_with_zettlab_identity(self, request, handler):
+        """Bind authenticated Zet identities for one agent-serving API route.
 
-        The base handler creates the agent task while this context is active,
-        so ContextVar propagation carries the token into synchronous tool
-        workers without exposing it through process-global environment state.
+        Account identifies Memo's personal partition; principal owns the
+        SessionDB transcript and is Deep Memory's primary identity; subject
+        is Deep Memory's alternate stable identity.  Nothing request-supplied
+        is bound until the gateway token has been accepted.
         """
+        from gateway.session_context import (
+            pop_zettlab_auth_principal,
+            push_zettlab_auth_principal,
+        )
+
+        # Do not even bind request-supplied identity until the Zet gateway
+        # token has been accepted. The inherited handler repeats this cheap
+        # check as part of its admission/deadline reservation.
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        raw_principal = request.headers.get("X-Zettlab-Auth-Principal-Id", "")
+        principal = _bounded_identity_header(raw_principal)
+        if str(raw_principal or "").strip() and (
+            not principal
+            or len(principal) > 256
+            or any(ord(char) == 0x7F for char in principal)
+        ):
+            return web.json_response(
+                {"error": {"message": "Invalid auth principal", "type": "invalid_request_error"}},
+                status=400,
+            )
+        subject = _bounded_identity_header(
+            request.headers.get("X-Zettlab-User-Id", ""), max_bytes=512
+        )
+        if not principal or not subject:
+            logger.warning(
+                "[deep_memory] trusted request identity is incomplete "
+                "(principal_present=%s subject_present=%s)",
+                bool(principal),
+                bool(subject),
+            )
+        account_token = _zettlab_request_account_id.set(_request_account_id(request))
+        principal_token = push_zettlab_auth_principal(principal)
+        deep_principal_token = _deep_memory_principal.set(principal)
+        deep_subject_token = _deep_memory_subject.set(subject)
+        try:
+            return await handler(request)
+        finally:
+            _deep_memory_subject.reset(deep_subject_token)
+            _deep_memory_principal.reset(deep_principal_token)
+            pop_zettlab_auth_principal(principal_token)
+            _zettlab_request_account_id.reset(account_token)
+
+    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
+        """Bind browser capability and Zet identity for chat completions."""
         from gateway.session_context import (
             pop_zettlab_browser_session_token,
             push_zettlab_browser_session_token,
@@ -913,12 +962,20 @@ class ZetAgentAdapter(APIServerAdapter):
         token = push_zettlab_browser_session_token(
             request.headers.get("X-Zettlab-Browser-Session-Token", "")
         )
-        account_token = _zettlab_request_account_id.set(_request_account_id(request))
         try:
-            return await super()._handle_chat_completions(request)
+            return await self._handle_with_zettlab_identity(
+                request, super()._handle_chat_completions
+            )
         finally:
-            _zettlab_request_account_id.reset(account_token)
             pop_zettlab_browser_session_token(token)
+
+    async def _handle_responses(self, request: "web.Request") -> "web.Response":
+        return await self._handle_with_zettlab_identity(
+            request, super()._handle_responses
+        )
+
+    async def _handle_runs(self, request: "web.Request") -> "web.Response":
+        return await self._handle_with_zettlab_identity(request, super()._handle_runs)
 
     def _bind_turn_session_context(
         self,
@@ -959,6 +1016,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 chat_id=session_id,
                 chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
                 thread_id="",
+                # HERMES_SESSION_USER_ID reaches managed Memo MCP metadata;
+                # it is therefore always the personal account, never the
+                # transcript-owner principal.
                 user_id=_zettlab_request_account_id.get(),
                 user_name="",
                 session_key=session_key or session_id,
@@ -975,6 +1035,7 @@ class ZetAgentAdapter(APIServerAdapter):
         chat_id: str,
         session_key: str,
         session_id: str,
+        session_user_id: str = "",
     ) -> list:
         """Bind inherited API routes as Zet, without touching the parent.
 
@@ -988,7 +1049,11 @@ class ZetAgentAdapter(APIServerAdapter):
         return set_session_vars(
             platform="zet_agent",
             chat_id=chat_id,
-            user_id=_zettlab_request_account_id.get(),
+            # Zet's wrapper supplies the authenticated account explicitly
+            # because API-server execution runs in an executor that does not
+            # inherit the request ContextVars.  Principal ownership remains
+            # private to AIAgent's separate ``session_owner_id``.
+            user_id=session_user_id or _zettlab_request_account_id.get(),
             session_key=session_key,
             session_id=session_id,
             profile=str(_api_request_profile.get() or "main").strip() or "main",
@@ -996,6 +1061,10 @@ class ZetAgentAdapter(APIServerAdapter):
             cron_session="",
             exec_ask="1",
         )
+
+    def _api_run_session_context_user_id(self) -> str:
+        """Snapshot the authenticated account before a Runs worker starts."""
+        return str(_zettlab_request_account_id.get() or "").strip()
 
     @staticmethod
     def _public_session_id_for_current_profile(session_key: str) -> Optional[str]:
@@ -2877,6 +2946,18 @@ class ZetAgentAdapter(APIServerAdapter):
         # matches the turn's confirm/auto behaviour. Absent (async /v1/runs path,
         # or non-plan callers) → None → manual (safe default).
         agent_request_overrides = dict(request_overrides or {})
+        from gateway.session_context import zettlab_auth_principal
+
+        account_id = str(
+            agent_request_overrides.pop("_zettlab_session_context_account_id", "")
+            or _zettlab_request_account_id.get()
+            or ""
+        ).strip()
+        session_owner_id = str(
+            zettlab_auth_principal()
+            or agent_request_overrides.pop("_zettlab_auth_principal", "")
+            or ""
+        ).strip()
         plan_auto_execute = agent_request_overrides.pop(
             "_zet_plan_auto_execute", None
         )
@@ -3145,7 +3226,6 @@ class ZetAgentAdapter(APIServerAdapter):
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
             "platform": platform_key,
-            "user_id": _zettlab_request_account_id.get() or None,
             "stream_delta_callback": stream_delta_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
@@ -3155,6 +3235,14 @@ class ZetAgentAdapter(APIServerAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
             "request_overrides": agent_request_overrides or None,
+            # Generic user_id remains the authenticated account for managed
+            # Memo and legacy SessionDB migration.  Deep Memory gets its
+            # principal/subject through dedicated fields below; SessionDB
+            # ownership is separately principal-only.
+            "user_id": account_id or None,
+            "session_owner_id": session_owner_id or None,
+            "deep_memory_principal": _deep_memory_principal.get() or None,
+            "deep_memory_subject": _deep_memory_subject.get() or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -3185,7 +3273,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 str(model or ""),
                 str(runtime_kwargs.get("provider") or ""),
                 str(runtime_kwargs.get("base_url") or ""),
-                str(_zettlab_request_account_id.get() or ""),
+                account_id,
+                session_owner_id,
             )
             agent = self._cached_onboarding_agent(onboarding_cache_key)
         reused_onboarding_agent = agent is not None
@@ -3462,6 +3551,17 @@ class ZetAgentAdapter(APIServerAdapter):
         below is bound through approval's dedicated ContextVar. Neither scope
         is mirrored into process-global ``os.environ`` because HTTP turns overlap.
         """
+        from gateway.session_context import zettlab_auth_principal
+        request_overrides = dict(request_overrides or {})
+        # Capture before base _run_agent hops to its executor. The principal
+        # remains private request metadata, never a model argument.
+        principal = zettlab_auth_principal()
+        if principal:
+            request_overrides["_zettlab_auth_principal"] = principal
+        account_id = _zettlab_request_account_id.get()
+        if account_id:
+            request_overrides["_zettlab_session_context_account_id"] = account_id
+
         # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
         # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
         # 轮 _current_turn_id 做精确收尾——否则空 turn_id 收不了尾，写入轮的

@@ -80,6 +80,9 @@ _HERMES_CORE_TOOLS = [
     # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
     "list_my_channels",
     "send_channel_message",
+    # Read-only device meeting library bridge; exposed only when local-server
+    # injects the loopback callback URL and action token.
+    "device_meetings",
     # List the user's authorized business-data connectors (gated on zet_agent
     # env via check_fn). Has a zettlab_connectors catalog entry so the
     # non-configurable recovery walk keeps it reachable on the real path.
@@ -310,9 +313,28 @@ TOOLSETS = {
         "includes": []
     },
 
+    "zettlab_app_workspace": {
+        "description": "Edit a dedicated maintainer's bounded App Host workspace (zettlab)",
+        "tools": ["app_workspace"],
+        "includes": []
+    },
+
     "zettlab_skill_runtime": {
-        "description": "Run fixed App operations declared by the current Cron job's profile-local Skill",
-        "tools": ["skill_operation"],
+        "description": "Profile-local Agent application operations and device evidence reads",
+        "tools": ["skill_operation", "device_meetings"],
+        "includes": []
+    },
+
+    # Chat reachability alias for the read-only meeting bridge. Keep
+    # zettlab_skill_runtime unchanged because existing Cron jobs explicitly bind
+    # that broader toolset for skill_operation. The Zet Agent resolver recovers
+    # non-configurable toolsets only when every authored tool is present in its
+    # platform composite; skill_operation is intentionally Cron-only, so the
+    # broader entry cannot be recovered on Chat even though device_meetings is
+    # part of hermes-zet-agent.
+    "zettlab_device_meetings": {
+        "description": "Read-only access to meetings stored on the local Zettlab device",
+        "tools": ["device_meetings"],
         "includes": []
     },
 

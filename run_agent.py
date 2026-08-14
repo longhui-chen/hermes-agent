@@ -494,7 +494,10 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        session_owner_id: str = None,
         user_id_alt: str = None,
+        deep_memory_principal: str = None,
+        deep_memory_subject: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
@@ -581,7 +584,10 @@ class AIAgent:
             prefill_messages=prefill_messages,
             platform=platform,
             user_id=user_id,
+            session_owner_id=session_owner_id,
             user_id_alt=user_id_alt,
+            deep_memory_principal=deep_memory_principal,
+            deep_memory_subject=deep_memory_subject,
             user_name=user_name,
             chat_id=chat_id,
             chat_name=chat_name,
@@ -658,13 +664,29 @@ class AIAgent:
                     _init_model_config["yolo_mode"] = True
             except Exception:
                 pass
+            session_owner_id = str(getattr(self, "_session_owner_id", "") or "").strip()
+            account_id = str(self._user_id or "").strip()
+            if self.platform == "zet_agent" and session_owner_id and account_id:
+                # A legacy Zet row may be upgraded only by the authenticated
+                # request that proves both its former account and new principal.
+                # NULL and other-account rows deliberately remain untouched.
+                self._session_db.migrate_session_owner_from_account(
+                    self.session_id, account_id, session_owner_id
+                )
+            session_db_user_id = (
+                session_owner_id
+                if session_owner_id
+                else (None if self.platform == "zet_agent" else self._user_id or None)
+            )
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=source,
                 model=self.model,
                 model_config=_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                # Zet keeps account ownership in memory but persists only the
+                # authenticated principal. Missing principals fail closed as NULL.
+                user_id=session_db_user_id,
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,

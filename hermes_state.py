@@ -3090,6 +3090,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def migrate_session_owner_from_account(
+        self,
+        session_id: str,
+        expected_account_id: str,
+        owner_principal: str,
+    ) -> bool:
+        """Atomically upgrade one proven legacy Zet session owner.
+
+        The caller must have received both identities from the authenticated
+        Zet boundary.  This deliberately cannot infer ownership for NULL rows
+        or for a session belonging to another account.
+        """
+        if not session_id or not expected_account_id or not owner_principal:
+            return False
+
+        def _do(conn):
+            result = conn.execute(
+                "UPDATE sessions SET user_id = ? WHERE id = ? AND user_id = ?",
+                (owner_principal, session_id, expected_account_id),
+            )
+            return result.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
     def record_gateway_session_peer(
         self,
         session_id: str,
@@ -7136,7 +7160,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _completed_runtime_import_target_matches(conn, row) -> bool:
         target = conn.execute(
-            "SELECT model_config FROM sessions WHERE id = ?",
+            "SELECT model_config, user_id FROM sessions WHERE id = ?",
             (row["target_session_id"],),
         ).fetchone()
         if target is None:
@@ -7153,6 +7177,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return (
             metadata.get("import_id") == row["import_id"]
             and metadata.get("payload_sha256") == row["payload_sha256"]
+            and metadata.get("owner_principal", "") == row["owner_principal"]
+            and (target["user_id"] or "") == row["owner_principal"]
         )
 
     def discard_runtime_import_staging(self) -> int:
@@ -7163,6 +7189,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).rowcount
         )
 
+    def get_completed_transcript_import_snapshot(
+        self, import_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the frozen CLI source selection or completed receipt."""
+        _validate_runtime_import_identifier("import_id", import_id)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT status, expected_message_count, source_message_ids_json, "
+                "source_total_rows FROM runtime_imports WHERE import_id = ?",
+                (import_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        source_message_ids = None
+        if row["source_message_ids_json"]:
+            parsed = json.loads(row["source_message_ids_json"])
+            if not isinstance(parsed, list) or not all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in parsed
+            ):
+                raise RuntimeImportConflict("stored source snapshot is invalid")
+            source_message_ids = parsed
+        return {
+            "status": row["status"],
+            "expected_message_count": row["expected_message_count"],
+            "source_message_ids": source_message_ids,
+            "source_total_rows": row["source_total_rows"],
+        }
+
     def stage_completed_transcript_import(
         self,
         *,
@@ -7170,11 +7225,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         source: str,
         source_session_id: str,
         target_session_id: str,
+        owner_principal: str = "",
         title: Optional[str],
         payload_sha256: str,
         expected_message_count: int,
         chunk_index: int,
         messages: List[Dict[str, Any]],
+        source_message_ids: Optional[List[int]] = None,
+        source_total_rows: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Stage one bounded chunk without mutating the canonical transcript.
 
@@ -7183,6 +7241,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         have different canonical encodings. ``commit`` returns a separate
         server-computed ``normalized_sha256`` for the Hermes-normalized rows.
         """
+        owner_principal = str(owner_principal or "").strip()
         for field, value in (("import_id", import_id), ("source", source),
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
@@ -7192,6 +7251,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
             reject_portable_credentials(value, field=field)
+        if owner_principal:
+            _validate_runtime_import_identifier("owner_principal", owner_principal, max_length=256)
         if title is not None and not isinstance(title, str):
             raise ValueError("title must be text when provided")
         title = self.sanitize_title(title)
@@ -7205,6 +7266,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(
                 f"expected_message_count must be 1..{RUNTIME_IMPORT_MAX_MESSAGES}"
             )
+        source_message_ids_json = None
+        if source_message_ids is not None:
+            if (
+                not isinstance(source_message_ids, list)
+                or len(source_message_ids) != expected_message_count
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in source_message_ids
+                )
+                or len(set(source_message_ids)) != len(source_message_ids)
+            ):
+                raise ValueError(
+                    "source_message_ids must contain one unique positive integer "
+                    "per expected message"
+                )
+            source_message_ids_json = json.dumps(
+                source_message_ids, separators=(",", ":")
+            )
+        if source_total_rows is not None and (
+            not isinstance(source_total_rows, int)
+            or isinstance(source_total_rows, bool)
+            or source_total_rows < expected_message_count
+        ):
+            raise ValueError("source_total_rows must cover every expected message")
         if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
             raise ValueError("chunk_index must be a non-negative integer")
         normalized = self._normalize_import_messages(messages)
@@ -7225,8 +7310,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = conn.execute(
                 "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
             ).fetchone()
-            metadata = (source, source_session_id, target_session_id,
-                        payload_sha256.lower(), expected_message_count)
+            metadata = (source, source_session_id, target_session_id, owner_principal,
+                        payload_sha256.lower(), expected_message_count,
+                        source_message_ids_json, source_total_rows)
             if row is None:
                 if chunk_index != 0:
                     raise RuntimeImportConflict("first chunk_index must be 0")
@@ -7245,11 +7331,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                 conn.execute(
                     """INSERT INTO runtime_imports
-                       (import_id, source, source_session_id, target_session_id, title,
-                        payload_sha256, expected_message_count, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (import_id, source, source_session_id, target_session_id, title,
-                     payload_sha256.lower(), expected_message_count, now, now),
+                       (import_id, source, source_session_id, target_session_id, owner_principal, title,
+                        payload_sha256, expected_message_count, source_message_ids_json,
+                        source_total_rows, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (import_id, source, source_session_id, target_session_id, owner_principal, title,
+                     payload_sha256.lower(), expected_message_count,
+                     source_message_ids_json, source_total_rows, now, now),
                 )
                 row = conn.execute(
                     "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
@@ -7267,6 +7355,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["source"] == source
                     and source_session_matches
                     and row["target_session_id"] == target_session_id
+                    and row["owner_principal"] == owner_principal
                     and row["payload_sha256"] == payload_sha256.lower()
                     and row["expected_message_count"] == expected_message_count
                 )
@@ -7290,7 +7379,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeImportConflict("target_session_id already exists")
             if tuple(row[k] for k in (
                 "source", "source_session_id", "target_session_id",
-                "payload_sha256", "expected_message_count"
+                "owner_principal",
+                "payload_sha256", "expected_message_count",
+                "source_message_ids_json", "source_total_rows"
             )) != metadata:
                 raise RuntimeImportConflict("import_id is already bound to different metadata")
             existing = conn.execute(
@@ -7403,15 +7494,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         row["source_session_id"]
                     ),
                     "payload_sha256": row["payload_sha256"],
+                    "owner_principal": row["owner_principal"],
                 }
             })
             conn.execute(
                 """INSERT INTO sessions
-                   (id, source, model_config, started_at, ended_at, end_reason, title)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (id, source, model_config, started_at, ended_at, end_reason, title, user_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (row["target_session_id"], f"import:{row['source']}",
                  model_config, started_at, completed_at,
-                 "import_completed", title),
+                 "import_completed", title, row["owner_principal"] or None),
             )
             # Hash the exact normalized message sequence that becomes canonical
             # state. Staging-only source IDs and transport chunk boundaries must
@@ -7451,6 +7543,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """UPDATE runtime_imports SET status = 'completed',
                    normalized_sha256 = ?, source_session_id = ?, title = NULL,
+                   source_message_ids_json = NULL,
                    completed_at = ?, updated_at = ?
                    WHERE import_id = ?""",
                 (normalized_sha,

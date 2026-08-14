@@ -41,9 +41,33 @@ def request_agentcomputer_token(
 ) -> str:
     """Request one short-lived token; the server authenticates this exact PID."""
 
+    return _request_scoped_token(
+        agent_id, "agentcomputer", socket_path=socket_path
+    )
+
+
+def request_app_auto_refresh_token(
+    agent_id: str,
+    *,
+    socket_path: str | os.PathLike[str] | None = None,
+) -> str:
+    """Request the scope certifying an approved create-app-agent payload."""
+
+    return _request_scoped_token(
+        agent_id, "app-auto-refresh", socket_path=socket_path
+    )
+
+
+def _request_scoped_token(
+    agent_id: str,
+    purpose: str,
+    *,
+    socket_path: str | os.PathLike[str] | None = None,
+) -> str:
+
     normalized_agent_id = _normalize_agent_id(agent_id)
     payload = json.dumps(
-        {"agent_id": normalized_agent_id, "purpose": "agentcomputer"},
+        {"agent_id": normalized_agent_id, "purpose": purpose},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
