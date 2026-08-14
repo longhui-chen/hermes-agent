@@ -267,6 +267,11 @@ class SearchResult:
     warning: Optional[str] = None
     error: Optional[str] = None
     note: Optional[str] = None
+    # NAS search only: whether local-server confirmed the block was injected
+    # as chat preview cards. True/False = server reported (newer builds);
+    # None = unknown (old server / non-NAS search), omitted from to_dict so
+    # downstream card compensation can distinguish the two generations.
+    carded: Optional[bool] = None
 
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
@@ -332,6 +337,8 @@ class SearchResult:
             result["error"] = self.error
         if self.note:
             result["note"] = self.note
+        if self.carded is not None:
+            result["carded"] = self.carded
         return result
 
 
@@ -2172,6 +2179,39 @@ class ShellFileOperations(FileOperations):
                 return nas
         return result
 
+    def nas_search(self, pattern: str, limit: int = 60,
+                   semantic: bool = False, path_prefix: str = "") -> SearchResult:
+        """First-class NAS library search (search_files target='nas').
+
+        Same wire path as the empty-workspace fallback, but callable directly
+        so the model can search the user's NAS files/photos without first
+        running a doomed workspace search, can opt into the semantic
+        (image-embedding) leg for photo/visual queries, and can scope hits to
+        one folder via path_prefix (server validates it against SearchRoots;
+        older local-server builds ignore the field — unscoped results).
+        Unlike the fallback, unavailability and zero hits return a
+        SearchResult the model can act on instead of a silent None.
+        """
+        query = (pattern or "").strip()
+        if not query:
+            return SearchResult(total_count=0, error="Empty NAS search query.")
+        token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "")
+        if not token or not self._zettlab_agent_search_url():
+            return SearchResult(total_count=0, error=(
+                "NAS search is unavailable: this agent has no local-server "
+                "credential (not running on a Zettlab device?)."
+            ))
+        result = self._zettlab_nas_fallback(
+            query, limit, semantic=semantic, path_prefix=path_prefix)
+        if result is not None:
+            return result
+        return SearchResult(total_count=0, note=(
+            "No NAS files matched this query (or the device search service "
+            "did not respond). Try different keywords"
+            + ("" if semantic else ", or semantic=true for photo/visual queries")
+            + "."
+        ))
+
     @staticmethod
     def _zettlab_agent_search_url() -> Optional[str]:
         """Derive the NAS agent-search endpoint from ZET_CHAT_APPEND_URL.
@@ -2205,7 +2245,13 @@ class ShellFileOperations(FileOperations):
         api_server handler's metadata.turn_id). "" when local-server sent none."""
         return zettlab_turn_id()
 
-    def _zettlab_nas_fallback(self, pattern: str, limit: int) -> Optional[SearchResult]:
+    # When the server says the block was NOT carded (carded=false), the model
+    # must be able to present something — return this many paths at most.
+    _NAS_UNCARDED_LIST_CAP = 20
+
+    def _zettlab_nas_fallback(self, pattern: str, limit: int,
+                              semantic: bool = False,
+                              path_prefix: str = "") -> Optional[SearchResult]:
         """Query local-server NAS agent-search; returns None on any error.
 
         On a hit, local-server injects the matches as preview cards into this
@@ -2214,6 +2260,12 @@ class ShellFileOperations(FileOperations):
         filename/semantic-level hits (no line numbers / content), so listing them
         would (a) be misread as content matches and (b) duplicate the cards the
         user already sees.
+
+        Exception: newer local-server builds report ``carded`` in the response.
+        ``carded=false`` means NO card reached the chat (unattributed call or the
+        turn already ended) — then the paths ARE returned (capped) with a note
+        telling the model to list them briefly itself, because claiming "shown
+        above" would be a lie the user can see.
         """
         token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "")
         query = (pattern or "").strip()
@@ -2223,12 +2275,21 @@ class ShellFileOperations(FileOperations):
         # Default to name+content only (matches local-server's own default).
         # Semantic is opt-in: forcing it here would drag every empty-workspace
         # search behind the c-engine cold start (~30s) instead of returning the
-        # fast FTS hits.
-        body = json.dumps({
+        # fast FTS hits. nas_search passes semantic=True for photo/visual
+        # queries, which also needs the longer timeout for that cold start.
+        modes = ["name", "content"] + (["semantic"] if semantic else [])
+        payload_req = {
             "q": query,
-            "modes": ["name", "content"],
+            "modes": modes,
             "limit": min(max(int(limit or 50), 1), 200),
-        }).encode("utf-8")
+        }
+        # Folder scoping (newer local-server; older builds ignore the field).
+        # Omit when empty so the request body stays byte-identical for the
+        # common case.
+        prefix = str(path_prefix or "").strip()
+        if prefix:
+            payload_req["path_prefix"] = prefix
+        body = json.dumps(payload_req).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
             "X-Zettlab-Agent-Action-Token": token,
@@ -2248,7 +2309,7 @@ class ShellFileOperations(FileOperations):
             headers=headers,
         )
         try:
-            with urlopen_hardened(req, timeout=10) as resp:
+            with urlopen_hardened(req, timeout=45 if semantic else 10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             # Parse inside the try so any malformed reply (non-dict payload,
             # non-dict items, non-numeric total_count) degrades to None rather
@@ -2258,17 +2319,37 @@ class ShellFileOperations(FileOperations):
             data = payload.get("data")
             if not isinstance(data, dict):
                 return None
-            hits = sum(
-                1 for it in (data.get("items") or [])
+            item_paths = [
+                str(it.get("path") or it.get("filename"))
+                for it in (data.get("items") or [])
                 if isinstance(it, dict) and (it.get("path") or it.get("filename"))
-            )
+            ]
+            hits = len(item_paths)
             if not hits:
                 return None
             total = int(data.get("total_count") or hits)
+            carded = data.get("carded")
         except Exception:
             return None
+        if carded is False:
+            # The server confirmed no card reached the chat. "Shown above"
+            # would be a visible lie; hand the model the paths to list itself.
+            return SearchResult(
+                total_count=total,
+                files=item_paths[:self._NAS_UNCARDED_LIST_CAP],
+                carded=False,
+                note=(
+                    f"{hits} NAS file(s) matched but NO preview cards were shown "
+                    "in the chat (the call was not attributed to a live turn). "
+                    "Do NOT claim the results are displayed — briefly list the "
+                    "matched files (name + one-line reason) for the user instead."
+                ),
+            )
         return SearchResult(
             total_count=total,
+            # True = server confirmed; None (old server) = omitted, so the
+            # chat-side collector keeps its legacy derived-card compensation.
+            carded=(True if carded is True else None),
             note=(
                 f"{hits} NAS file(s) matched and were rendered as preview cards in "
                 "the chat — the user already sees them. Do not list, repeat, or "

@@ -300,3 +300,153 @@ def test_nas_fallback_uses_shared_hardened_transport():
     from tools.loopback_transport import urlopen_hardened as shared
 
     assert fo.urlopen_hardened is shared
+
+
+# --- nas_search first-class entry (target='nas') ------------------------------
+
+def test_nas_search_semantic_sends_semantic_mode_and_long_timeout(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    captured = {}
+    payload = {"data": {"items": [{"path": "/nas/bird.jpg"}], "total_count": 1}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
+        result = file_ops.nas_search("鸟", limit=60, semantic=True)
+
+    assert result.total_count == 1
+    sent = json.loads(captured["req"].data.decode("utf-8"))
+    assert sent["modes"] == ["name", "content", "semantic"]
+    # Semantic leg embeds on the device c-engine (~30s cold start): the
+    # fallback's 10s timeout would turn every first photo query into a miss.
+    assert captured["timeout"] == 45
+
+
+def test_nas_search_default_keeps_fast_modes(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    captured = {}
+    payload = {"data": {"items": [{"path": "/nas/a.pdf"}], "total_count": 1}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
+        file_ops.nas_search("report", limit=60)
+
+    sent = json.loads(captured["req"].data.decode("utf-8"))
+    assert sent["modes"] == ["name", "content"]
+    assert captured["timeout"] == 10
+
+
+def test_nas_search_unavailable_without_token(monkeypatch, file_ops):
+    """Unlike the fallback's silent None, the first-class entry must tell the
+    model WHY there are no results, without ever sending a request."""
+    monkeypatch.delenv("ZETTLAB_AGENT_ACTION_TOKEN", raising=False)
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", _APPEND_URL)
+    with patch("tools.file_operations.urlopen_hardened", side_effect=AssertionError("should not call")):
+        result = file_ops.nas_search("q")
+    assert result.total_count == 0
+    assert result.error and "unavailable" in result.error
+
+
+def test_nas_search_empty_query_is_error(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    result = file_ops.nas_search("   ")
+    assert result.error and "Empty" in result.error
+
+
+def test_nas_search_zero_hits_returns_note_not_none(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen({"data": {"items": []}})):
+        result = file_ops.nas_search("nothing", semantic=True)
+    assert isinstance(result, SearchResult)
+    assert result.total_count == 0
+    assert result.note and "matched" in result.note.lower()
+
+
+def test_nas_search_success_keeps_cards_note(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    payload = {"data": {"items": [{"path": "/nas/a.jpg"}, {"path": "/nas/b.jpg"}],
+                        "total_count": 2}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search("photos", semantic=True)
+    assert result.total_count == 2
+    assert result.note and "do not list" in result.note.lower()
+    assert result.files == []
+
+
+def test_nas_search_path_prefix_passthrough_and_omitted_when_empty(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    payload = {"data": {"items": [{"path": "/nas/v/a.mov"}], "total_count": 1}}
+
+    captured = {}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
+        file_ops.nas_search("mov", path_prefix="/volume1/subvol/data/Videos/quanzhou")
+    sent = json.loads(captured["req"].data.decode("utf-8"))
+    assert sent["path_prefix"] == "/volume1/subvol/data/Videos/quanzhou"
+
+    captured = {}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
+        file_ops.nas_search("mov")
+    # 旧 server 字节级兼容：不传就不出现该字段。
+    assert "path_prefix" not in json.loads(captured["req"].data.decode("utf-8"))
+
+
+def test_nas_search_carded_false_returns_paths_and_honest_note(monkeypatch, file_ops):
+    """server 报 carded=false = 没有任何卡片进聊天：必须回传路径清单 + 明确
+    禁止宣称"已展示在上方"，否则模型会对用户谎报。"""
+    _zettlab_env(monkeypatch)
+    payload = {"data": {"items": [{"path": f"/nas/{i}.jpg"} for i in range(25)],
+                        "total_count": 25, "carded": False}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search("鸟", semantic=True)
+    assert result.total_count == 25
+    assert len(result.files) == 20  # capped
+    assert result.note and "do not claim" in result.note.lower()
+
+
+def test_nas_search_carded_true_or_absent_keeps_cards_contract(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    for extra in ({}, {"carded": True}):
+        payload = {"data": {"items": [{"path": "/nas/a.jpg"}], "total_count": 1, **extra}}
+        with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+            result = file_ops.nas_search("q")
+        assert result.files == []
+        assert "do not list" in result.note.lower()
+
+
+def test_nas_search_carded_key_visibility_in_tool_output(monkeypatch, file_ops):
+    """to_dict 的 carded 键 = local-server 端 collector 的让位信号：
+    server 报 true/false → 键存在（collector 跳过 legacy 衍生卡，防双卡）；
+    老 server 无该字段 → 键缺失（collector 保留补偿行为）。"""
+    _zettlab_env(monkeypatch)
+    cases = [({"carded": True}, True), ({"carded": False}, False), ({}, None)]
+    for extra, want in cases:
+        payload = {"data": {"items": [{"path": "/nas/a.jpg"}], "total_count": 1, **extra}}
+        with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+            d = file_ops.nas_search("q").to_dict()
+        if want is None:
+            assert "carded" not in d
+        else:
+            assert d["carded"] is want
+
+
+# --- search_files target='nas' dispatch ---------------------------------------
+
+def test_search_tool_nas_target_dispatches_to_nas_search():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import search_tool
+
+    fake_ops = MagicMock()
+    fake_ops.nas_search.return_value = SearchResult(total_count=3, note="cards rendered")
+    with _patch("tools.file_tools._get_file_ops", return_value=fake_ops):
+        out = json.loads(search_tool("鸟", target="nas", limit=60,
+                                     semantic=True, path_prefix="/v/d",
+                                     task_id="t-nas-1"))
+    fake_ops.nas_search.assert_called_once_with(pattern="鸟", limit=60,
+                                                semantic=True, path_prefix="/v/d")
+    assert out["total_count"] == 3
+    assert out["note"] == "cards rendered"
+
+
+def test_search_tool_nas_target_unavailable_env_is_tool_error():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import search_tool
+
+    fake_ops = object()  # no nas_search attribute (upstream/non-Zettlab env)
+    with _patch("tools.file_tools._get_file_ops", return_value=fake_ops):
+        out = json.loads(search_tool("q", target="nas", task_id="t-nas-2"))
+    assert "error" in out and "not available" in out["error"]
