@@ -424,6 +424,47 @@ def test_nas_search_carded_key_visibility_in_tool_output(monkeypatch, file_ops):
             assert d["carded"] is want
 
 
+def test_implicit_fallback_uncarded_returns_count_only(monkeypatch, file_ops):
+    """隐式 workspace fallback 在 carded=false 时不得携带 NAS 路径（用户只是在
+    grep 工作区，不该把个人文件名灌进上下文）；显式 nas_search 才给清单。"""
+    _zettlab_env(monkeypatch)
+    payload = {"data": {"items": [{"path": f"/nas/{i}.jpg"} for i in range(5)],
+                        "total_count": 5, "carded": False}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops._zettlab_nas_fallback("q", 50)
+    assert result.files == []
+    assert "list the matched files" not in result.note.lower()
+    assert "do not claim" in result.note.lower()
+
+
+def test_nas_search_prefix_ignored_by_old_server_notes_unscoped(monkeypatch, file_ops):
+    """老 server（响应无 carded 键）会忽略 path_prefix：note 必须声明结果未按
+    文件夹收敛，不许让模型把全库计数当成文件夹内容汇报。"""
+    _zettlab_env(monkeypatch)
+    payload = {"data": {"items": [{"path": "/nas/a.mov"}], "total_count": 1}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search("mov", path_prefix="/volume1/subvol/data/v")
+    assert "ignored path_prefix" in result.note
+    # 新 server 确认 carded=true 时不加该提示（prefix 已生效）。
+    payload = {"data": {"items": [{"path": "/nas/a.mov"}], "total_count": 1, "carded": True}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search("mov", path_prefix="/volume1/subvol/data/v")
+    assert "ignored path_prefix" not in result.note
+
+
+def test_nas_side_effect_classification_and_dispatch_barrier():
+    from agent.tool_result_classification import tool_may_have_side_effect
+    from agent.tool_dispatch_helpers import _extract_parallel_scope_paths
+
+    assert tool_may_have_side_effect("search_files") is False
+    assert tool_may_have_side_effect("search_files", {"target": "nas"}) is True
+    assert tool_may_have_side_effect("search_files", '{"target": "nas"}') is True
+    assert tool_may_have_side_effect("search_files", {"target": "content"}) is False
+    # 空 scope = sequential barrier：nas 调用不得与其它读并发。
+    assert _extract_parallel_scope_paths("search_files", {"target": "nas"}) == []
+    assert _extract_parallel_scope_paths("search_files", {}) != []
+
+
 # --- search_files target='nas' dispatch ---------------------------------------
 
 def test_search_tool_nas_target_dispatches_to_nas_search():

@@ -2202,7 +2202,8 @@ class ShellFileOperations(FileOperations):
                 "credential (not running on a Zettlab device?)."
             ))
         result = self._zettlab_nas_fallback(
-            query, limit, semantic=semantic, path_prefix=path_prefix)
+            query, limit, semantic=semantic, path_prefix=path_prefix,
+            explicit=True)
         if result is not None:
             return result
         return SearchResult(total_count=0, note=(
@@ -2251,7 +2252,8 @@ class ShellFileOperations(FileOperations):
 
     def _zettlab_nas_fallback(self, pattern: str, limit: int,
                               semantic: bool = False,
-                              path_prefix: str = "") -> Optional[SearchResult]:
+                              path_prefix: str = "",
+                              explicit: bool = False) -> Optional[SearchResult]:
         """Query local-server NAS agent-search; returns None on any error.
 
         On a hit, local-server injects the matches as preview cards into this
@@ -2332,8 +2334,21 @@ class ShellFileOperations(FileOperations):
         except Exception:
             return None
         if carded is False:
-            # The server confirmed no card reached the chat. "Shown above"
-            # would be a visible lie; hand the model the paths to list itself.
+            # The server confirmed no card reached the chat; never claim
+            # "shown above". Paths go back only on an explicit NAS search —
+            # the implicit workspace fallback must not surface personal file
+            # names the user never asked about.
+            if not explicit:
+                return SearchResult(
+                    total_count=total,
+                    carded=False,
+                    note=(
+                        f"{hits} NAS file(s) matched but NO preview cards were "
+                        "shown in the chat. Do NOT claim results are displayed; "
+                        "offer an explicit NAS search (target='nas') if the user "
+                        "wants them."
+                    ),
+                )
             return SearchResult(
                 total_count=total,
                 files=item_paths[:self._NAS_UNCARDED_LIST_CAP],
@@ -2345,16 +2360,25 @@ class ShellFileOperations(FileOperations):
                     "matched files (name + one-line reason) for the user instead."
                 ),
             )
+        note = (
+            f"{hits} NAS file(s) matched and were rendered as preview cards in "
+            "the chat — the user already sees them. Do not list, repeat, or "
+            "describe these results; just continue with the user's request."
+        )
+        # No carded key in the reply = older local-server, which also ignores
+        # path_prefix: the count is library-wide, not folder-scoped. Say so
+        # instead of letting the model present it as the folder's contents.
+        if prefix and carded is None:
+            note += (
+                " NOTE: this device build ignored path_prefix — the results "
+                "cover the whole library, not only the requested folder."
+            )
         return SearchResult(
             total_count=total,
             # True = server confirmed; None (old server) = omitted, so the
             # chat-side collector keeps its legacy derived-card compensation.
             carded=(True if carded is True else None),
-            note=(
-                f"{hits} NAS file(s) matched and were rendered as preview cards in "
-                "the chat — the user already sees them. Do not list, repeat, or "
-                "describe these results; just continue with the user's request."
-            ),
+            note=note,
         )
 
     def _search_workspace(self, pattern: str, path: str = ".", target: str = "content",
