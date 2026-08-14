@@ -376,6 +376,54 @@ def test_zettlab_registry_respects_active_profile_disabled_policy(
     assert not (tmp_path / "blocked.mp3").exists()
 
 
+def test_zettlab_registry_respects_active_profile_enabled_policy(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_home = tmp_path / "profile-b"
+    profile_home.mkdir()
+    config_path = profile_home / "config.yaml"
+    config_path.write_text("plugins:\n  enabled: []\n", encoding="utf-8")
+    tts_registry.register_provider(ZettlabTTSProvider())
+    plugin_info = {
+        "key": "tts/zettlab",
+        "name": "zettlab",
+        "source": "user",
+        "enabled": True,
+    }
+    manager = SimpleNamespace(
+        list_plugins=lambda: [plugin_info]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered",
+        lambda *args, **kwargs: manager,
+    )
+    monkeypatch.setattr(
+        tts_tool,
+        "resolve_zettlab_tool_gateway",
+        lambda vendor: SimpleNamespace(vendor="zettlab-tts"),
+    )
+    monkeypatch.setattr(tts_tool, "_resolve_profile_openai_audio_api_key", lambda: "")
+
+    home_token = set_hermes_home_override(profile_home)
+    try:
+        assert tts_tool._get_provider({}) == "edge"
+
+        plugin_info["source"] = "bundled"
+        assert tts_tool._get_provider({}) == "zettlab"
+
+        plugin_info["source"] = "user"
+        config_path.write_text(
+            "plugins:\n  enabled:\n    - tts/zettlab\n",
+            encoding="utf-8",
+        )
+        assert tts_tool._get_provider({}) == "zettlab"
+    finally:
+        reset_hermes_home_override(home_token)
+
+
 def test_tts_gateway_runtime_uses_share_action_origin(monkeypatch):
     monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
     monkeypatch.delenv("ZETTLAB_AI_PROXY_BASE_URL", raising=False)

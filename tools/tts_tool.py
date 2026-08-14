@@ -728,20 +728,54 @@ def _plugin_tts_provider_is_registered(name: str) -> bool:
 
 
 def _plugin_tts_provider_is_enabled_for_profile(name: str) -> bool:
-    """Apply the active profile's explicit plugin deny-list at dispatch.
+    """Apply the active profile's plugin policy at dispatch.
 
     TTS providers are registered process-wide, while a multiplexed worker's
-    config and secret scope are profile-local. Rechecking the deny-list here
-    prevents one profile from reusing a backend that another profile caused
-    to be registered during process startup.
+    config and secret scope are profile-local. Rechecking the deny-list and,
+    for non-bundled plugins, the allow-list prevents one profile from reusing
+    a backend that another profile caused to be registered during startup.
     """
     key = str(name or "").strip().lower()
     if not key:
         return False
     try:
-        from hermes_cli.plugins import _get_disabled_plugins
+        from hermes_cli.plugins import (
+            _ensure_plugins_discovered,
+            _get_disabled_plugins,
+            _get_enabled_plugins,
+        )
 
         disabled = _get_disabled_plugins()
+        if key in disabled or f"tts/{key}" in disabled:
+            return False
+
+        manager = _ensure_plugins_discovered()
+        plugin_info = None
+        if manager is not None:
+            plugin_info = next(
+                (
+                    info
+                    for info in manager.list_plugins()
+                    if info.get("key") == f"tts/{key}"
+                ),
+                None,
+            )
+        if plugin_info is None:
+            # Direct registry users predate disk-plugin manifests. Preserve
+            # that public registry behavior; production disk plugins always
+            # have manager metadata and take the policy path below.
+            return True
+        if not plugin_info.get("enabled"):
+            return False
+        if plugin_info.get("source") == "bundled":
+            return True
+
+        enabled = _get_enabled_plugins()
+        plugin_key = str(plugin_info.get("key") or "").strip()
+        plugin_name = str(plugin_info.get("name") or "").strip()
+        return enabled is not None and (
+            plugin_key in enabled or plugin_name in enabled
+        )
     except Exception as exc:  # noqa: BLE001 — unreadable policy fails closed
         logger.warning(
             "tts plugin policy check failed for '%s': %s",
@@ -749,7 +783,6 @@ def _plugin_tts_provider_is_enabled_for_profile(name: str) -> bool:
             exc,
         )
         return False
-    return key not in disabled and f"tts/{key}" not in disabled
 
 
 @dataclass(frozen=True)
