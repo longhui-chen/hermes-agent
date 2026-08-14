@@ -21,8 +21,12 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.zet_agent import (
     ZetAgentAdapter,
     _api_request_profile,
+    _deep_memory_principal,
+    _deep_memory_subject,
     _onboarding_deepseek_fast_path,
+    _zettlab_request_account_id,
 )
+from gateway.session_context import pop_zettlab_auth_principal, push_zettlab_auth_principal
 
 
 def test_onboarding_deepseek_fast_path_sets_supported_wire_field():
@@ -177,13 +181,23 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
 
     public_session_id = "zettlab:userA:main:session-1"
     scoped_session_key = f"/profiles/main|{public_session_id}"
-    agent = adapter._create_agent(
-        session_id=public_session_id,
-        gateway_session_key=scoped_session_key,
-        requested_model="request/model",
-        requested_provider="request-provider",
-        model_options={"reasoning_effort": "high", "service_tier": "priority"},
-    )
+    account_token = _zettlab_request_account_id.set("account-1")
+    principal_token = push_zettlab_auth_principal("iam:alice")
+    deep_principal_token = _deep_memory_principal.set("iam:alice")
+    deep_subject_token = _deep_memory_subject.set("user-1")
+    try:
+        agent = adapter._create_agent(
+            session_id=public_session_id,
+            gateway_session_key=scoped_session_key,
+            requested_model="request/model",
+            requested_provider="request-provider",
+            model_options={"reasoning_effort": "high", "service_tier": "priority"},
+        )
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
 
     assert isinstance(agent, FakeAgent)
     assert captured["model"] == "request/model"
@@ -193,6 +207,10 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
     assert captured["profile_name"] == "main"
+    assert captured["user_id"] == "account-1"  # Memo and legacy SessionDB account
+    assert captured["session_owner_id"] == "iam:alice"  # SessionDB owner
+    assert captured["deep_memory_principal"] == "iam:alice"
+    assert captured["deep_memory_subject"] == "user-1"
 
 
 def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):

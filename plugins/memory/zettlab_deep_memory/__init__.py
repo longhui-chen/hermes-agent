@@ -169,8 +169,11 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
         self._base_url = raw_url.rstrip("/")
         self._action_token = token
         self._agent_id = str(get_secret("ZET_AGENT_ID", "") or "").strip()
-        self._user_id = str(kwargs.get("user_id") or "").strip()
-        self._user_id_alt = str(kwargs.get("user_id_alt") or "").strip()
+        # These are the authenticated Deep Memory principal/subject, not the
+        # generic platform account (which is intentionally still user_id for
+        # providers such as Memo and for legacy SessionDB row migration).
+        self._user_id = str(kwargs.get("deep_memory_principal") or "").strip()
+        self._user_id_alt = str(kwargs.get("deep_memory_subject") or "").strip()
         self._session_id = str(session_id or "").strip()
         self._shutdown.clear()
         self._mirror_wake.clear()

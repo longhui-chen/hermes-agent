@@ -60,6 +60,18 @@ def test_native_memory_is_mirrored_to_deep_memory():
     assert "memo_write is not exposed as a model tool" in prompt
 
 
+def test_provider_does_not_repurpose_generic_account_identity(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(provider, tmp_path, user_id="account-1", user_id_alt="user-1")
+    try:
+        assert provider._user_id == ""
+        assert provider._user_id_alt == ""
+    finally:
+        provider.shutdown()
+
+
 def test_builtin_memory_addition_is_mirrored_non_blocking(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "ZETTLAB_DEEP_MEMORY_URL",
@@ -71,8 +83,8 @@ def test_builtin_memory_addition_is_mirrored_non_blocking(monkeypatch, tmp_path)
     _initialize(
         provider,
         tmp_path,
-        user_id="iam:issuer:user-1",
-        user_id_alt="user-1",
+        deep_memory_principal="iam:issuer:user-1",
+        deep_memory_subject="user-1",
     )
     captured = {}
     completed = threading.Event()
@@ -122,7 +134,9 @@ def test_builtin_replace_and_remove_are_mirrored_through_memo_write(
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
-    _initialize(provider, tmp_path, user_id="user-1", user_id_alt="user-1")
+    _initialize(
+        provider, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+    )
     calls = []
     completed = threading.Event()
 
@@ -162,7 +176,9 @@ def test_prefetch_recall_uses_mcp_and_builds_provider_context(monkeypatch, tmp_p
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
-    _initialize(provider, tmp_path, user_id="user-1", user_id_alt="user-1")
+    _initialize(
+        provider, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+    )
     captured = []
     started = threading.Event()
 
@@ -196,7 +212,7 @@ def test_on_turn_start_prefetch_is_non_blocking(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
-    _initialize(provider, tmp_path, user_id="user-1")
+    _initialize(provider, tmp_path, deep_memory_principal="user-1")
     started = threading.Event()
     release = threading.Event()
 
@@ -220,7 +236,7 @@ def test_provider_rejects_non_loopback_url(monkeypatch):
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
     try:
-        provider.initialize("session-1", user_id="user-1")
+        provider.initialize("session-1", deep_memory_principal="user-1")
     except RuntimeError as exc:
         assert "loopback" in str(exc)
     else:
@@ -235,7 +251,7 @@ def test_provider_rejects_direct_model_memo_write(monkeypatch, tmp_path):
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     monkeypatch.setenv("ZET_AGENT_ID", "agent-1")
     provider = ZettlabDeepMemoryProvider()
-    _initialize(provider, tmp_path, user_id="user-1")
+    _initialize(provider, tmp_path, deep_memory_principal="user-1")
     called = False
 
     def fake_request(*_args, **_kwargs):
@@ -272,8 +288,8 @@ def test_tool_calls_use_authenticated_mcp_transport(monkeypatch, tmp_path):
     _initialize(
         provider,
         tmp_path,
-        user_id="iam:issuer:user-1",
-        user_id_alt="user-1",
+        deep_memory_principal="iam:issuer:user-1",
+        deep_memory_subject="user-1",
     )
     captured = {}
     completed = threading.Event()
@@ -350,8 +366,8 @@ def test_mcp_tool_error_is_not_treated_as_a_success(monkeypatch, caplog, tmp_pat
     _initialize(
         provider,
         tmp_path,
-        user_id="iam:issuer:user-1",
-        user_id_alt="user-1",
+        deep_memory_principal="iam:issuer:user-1",
+        deep_memory_subject="user-1",
     )
 
     class Response:
@@ -405,7 +421,9 @@ def test_transient_memo_write_failure_retries_with_stable_id(monkeypatch, tmp_pa
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
     provider._mirror_retry_delay = lambda _attempt: 0.01
-    _initialize(provider, tmp_path, user_id="user-1", user_id_alt="user-1")
+    _initialize(
+        provider, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+    )
     calls = []
     completed = threading.Event()
 
@@ -459,7 +477,9 @@ def test_pending_memo_write_is_recovered_after_provider_restart(monkeypatch, tmp
         raise TimeoutError("auxiliary model timed out")
 
     first._request = fail_request
-    _initialize(first, tmp_path, user_id="user-1", user_id_alt="user-1")
+    _initialize(
+        first, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+    )
     first.on_memory_write(
         "replace",
         "user",
@@ -497,7 +517,9 @@ def test_pending_memo_write_is_recovered_after_provider_restart(monkeypatch, tmp
         return {"status": "stored"}
 
     second._request = succeed_request
-    _initialize(second, tmp_path, user_id="user-1", user_id_alt="user-1")
+    _initialize(
+        second, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+    )
     assert delivered.wait(1.5)
     _wait_for(lambda: second._mirror_outbox.counts()["pending"] == 0)
     second.shutdown()
@@ -530,7 +552,9 @@ def test_structured_validation_failure_dead_letters_without_fallback(
         raise DeepMemoryMCPToolError("validation")
 
     provider._request = fail_validation
-    _initialize(provider, tmp_path, user_id="user-1", user_id_alt="user-1")
+    _initialize(
+        provider, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+    )
     provider.on_memory_write(
         "add",
         "user",
@@ -556,7 +580,9 @@ def test_outbox_avoids_wal_on_managed_sqlite(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
-    _initialize(provider, tmp_path, user_id="user-1", user_id_alt="user-1")
+    _initialize(
+        provider, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+    )
 
     with sqlite3.connect(provider._mirror_outbox.path) as connection:
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]

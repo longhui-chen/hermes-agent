@@ -8,7 +8,7 @@ from unittest.mock import patch
 SESSION_ID = "test-identity-flush"
 
 
-def _make_agent(session_db, session_id=SESSION_ID):
+def _make_agent(session_db, session_id=SESSION_ID, **identity_kwargs):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -21,6 +21,7 @@ def _make_agent(session_db, session_id=SESSION_ID):
             session_id=session_id,
             skip_context_files=True,
             skip_memory=True,
+            **identity_kwargs,
         )
     agent._ensure_db_session()
     return agent
@@ -31,6 +32,38 @@ def _contents(db, session_id=SESSION_ID):
 
 
 class TestIdentityFlush:
+    def test_zet_session_uses_principal_without_changing_memo_account(self):
+        """A proven legacy row upgrades before the normal session upsert."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                db.create_session(SESSION_ID, "zet_agent", user_id="account-1")
+                agent = _make_agent(
+                    db,
+                    platform="zet_agent",
+                    user_id="account-1",
+                    session_owner_id="iam:alice",
+                )
+
+                # `user_id` remains the memory-provider account argument;
+                # SessionDB ownership is independently upgraded to principal.
+                assert agent._user_id == "account-1"
+                assert agent._session_owner_id == "iam:alice"
+                assert db.get_session(SESSION_ID)["user_id"] == "iam:alice"
+
+                no_principal = _make_agent(
+                    db,
+                    session_id="unowned-zet-session",
+                    platform="zet_agent",
+                    user_id="account-1",
+                )
+                assert no_principal._user_id == "account-1"
+                assert db.get_session("unowned-zet-session")["user_id"] is None
+            finally:
+                db.close()
+
     def test_repair_shrunk_messages_below_history_length_still_persists_assistant(self):
         """When repair shortens messages below conversation_history, don't slice empty."""
         from hermes_state import SessionDB

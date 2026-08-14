@@ -2242,7 +2242,7 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     return env
 
 
-def build_agent_creator_runtime_env() -> dict[str, str]:
+def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[str, str]:
     """Build the minimal env for the trusted agent-creator preset runner.
 
     The action token is never read from process env or a profile ``.env``.
@@ -2251,7 +2251,10 @@ def build_agent_creator_runtime_env() -> dict[str, str]:
     broker. The direct runner then gives it to the CLI over a one-shot FD.
     """
 
-    from agent.credential_broker import request_agentcomputer_token
+    from agent.credential_broker import (
+        request_agentcomputer_token,
+        request_app_auto_refresh_token,
+    )
     from agent.secret_scope import current_secret_scope, is_multiplex_active
 
     scope = current_secret_scope()
@@ -2263,7 +2266,12 @@ def build_agent_creator_runtime_env() -> dict[str, str]:
     ).strip()
     if not agent_id:
         raise RuntimeError("agent creator profile identity unavailable")
-    token = request_agentcomputer_token(agent_id)
+    request_token = (
+        request_app_auto_refresh_token
+        if app_auto_refresh
+        else request_agentcomputer_token
+    )
+    token = request_token(agent_id)
     if (
         "\x00" in token
         or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES

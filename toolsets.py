@@ -313,6 +313,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "zettlab_app_workspace": {
+        "description": "Edit a dedicated maintainer's bounded App Host workspace (zettlab)",
+        "tools": ["app_workspace"],
+        "includes": []
+    },
+
     "zettlab_skill_runtime": {
         "description": "Profile-local Agent application operations and device evidence reads",
         "tools": ["skill_operation", "device_meetings"],

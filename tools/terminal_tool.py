@@ -4659,6 +4659,12 @@ _AGENT_CREATOR_RELATIVE_PATH = Path(
 _AGENT_CREATOR_MANIFEST_RELATIVE_PATH = Path(
     "skills/agent-creator/manifest.yaml"
 )
+_APP_AGENT_HELPER_RELATIVE_PATH = Path(
+    "skills/application-create/scripts/create_agent.py"
+)
+_APP_AGENT_HELPER_MANIFEST_RELATIVE_PATH = Path(
+    "skills/application-create/manifest.yaml"
+)
 _AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY = (
     "zettlab.agent_action_token_fd.v1"
 )
@@ -4675,6 +4681,35 @@ _AGENT_CREATOR_PAYLOAD_KEYS = frozenset({
     "user_entries",
     "memory_entries",
 })
+# create-app-agent (POST /api/v1/skill/app-agents) carries the app binding and
+# the schedule on top of the ordinary creation fields. Kept as a SEPARATE
+# allowlist on purpose: widening _AGENT_CREATOR_PAYLOAD_KEYS instead would let
+# the ordinary create channel smuggle an app binding or a cron job.
+#
+# "probe" is the capability-gate sentinel: the payload {"probe": true} makes
+# the script ask the server whether this device supports app-dedicated agents
+# at all, creating nothing. It rides the same subcommand, so it has to be in
+# the same allowlist — and it stays OUT of the ordinary-create allowlist, like
+# every other app-agent-only field.
+_AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS = _AGENT_CREATOR_PAYLOAD_KEYS | frozenset({
+    "app_slug",
+    "cron_job",
+    "probe",
+})
+# Which allowlist applies is keyed by the subcommand token that IS argv[1] of
+# the pinned, digest-verified script — the claim and the execution are the
+# same string, so a caller cannot claim one subcommand to unlock the other's
+# keys.
+#
+# Both creation subcommands require the same one-shot approval. A model-written
+# payload is not proof that the user accepted the hidden maintainer or its
+# schedule; binding the approval fingerprint to the exact argv/stdin is the
+# verifiable consent boundary. The read-only {"probe": true} sentinel is
+# exempted after payload validation below because it creates nothing.
+_AGENT_CREATOR_CREATE_SUBCOMMANDS = {
+    "create": (_AGENT_CREATOR_PAYLOAD_KEYS, "agent.create"),
+    "create-app-agent": (_AGENT_CREATOR_APP_AGENT_PAYLOAD_KEYS, "agent.create"),
+}
 _AGENTCOMPUTER_CLI_VALUE_FLAGS = {
     ("file", "list"): frozenset({"--path", "--offset", "--limit"}),
     ("file", "stat"): frozenset({"--path"}),
@@ -4794,9 +4829,10 @@ def _agent_creator_shell_guard_result(command: str) -> Optional[str]:
         "agent_creator_command_blocked",
         (
             "Agent Creator must run as one direct Python invocation of the "
-            "canonical presets script. Only preflight or create --payload "
-            "with a bounded JSON object is allowed; wrappers, non-canonical "
-            "paths, extra arguments, and shell operators are rejected."
+            "canonical presets script. Only preflight or "
+            "create/create-app-agent --payload with a bounded JSON object is "
+            "allowed; wrappers, non-canonical paths, extra arguments, and "
+            "shell operators are rejected."
         ),
     )
 
@@ -5215,13 +5251,16 @@ def _log_agent_creator_rejection(reason: str) -> None:
 
 
 def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
-    """Resolve only the fixed creator script below the pinned presets root."""
+    """Resolve one fixed creator helper below the pinned presets root."""
 
     anchor = _capture_connector_runtime_root()
     if anchor is None:
         return None
 
-    expected = _AGENT_CREATOR_RELATIVE_PATH
+    expected_paths = {
+        _AGENT_CREATOR_RELATIVE_PATH,
+        _APP_AGENT_HELPER_RELATIVE_PATH,
+    }
     relative: Optional[Path] = None
     for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
         if raw_path.startswith(prefix):
@@ -5229,8 +5268,8 @@ def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
             break
     else:
         supplied = Path(raw_path)
-        if raw_path == expected.as_posix():
-            relative = expected
+        if Path(raw_path) in expected_paths:
+            relative = Path(raw_path)
         elif not supplied.is_absolute():
             return None
         else:
@@ -5244,13 +5283,13 @@ def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
                 except ValueError:
                     continue
 
-    if relative is None or relative != expected or ".." in relative.parts:
+    if relative is None or relative not in expected_paths or ".." in relative.parts:
         return None
 
-    candidate = anchor.resolved_root / expected
+    candidate = anchor.resolved_root / relative
     try:
         resolved = candidate.resolve(strict=True)
-        if resolved.relative_to(anchor.resolved_root) != expected:
+        if resolved.relative_to(anchor.resolved_root) != relative:
             return None
     except (OSError, ValueError):
         return None
@@ -5297,7 +5336,13 @@ def _split_agent_creator_heredoc(
     return match.group("command").strip(), payload
 
 
-def _validate_agent_creator_payload(payload: str) -> str:
+def _validate_agent_creator_payload(
+    payload: str,
+    *,
+    allowed_keys: frozenset = _AGENT_CREATOR_PAYLOAD_KEYS,
+) -> str:
+    # The default is the NARROW ordinary-create allowlist: a call site that
+    # forgets to pass keys can only end up stricter, never wider.
     if len(payload.encode("utf-8")) > _AGENT_CREATOR_MAX_PAYLOAD_BYTES:
         raise ValueError("payload too large")
 
@@ -5311,7 +5356,7 @@ def _validate_agent_creator_payload(payload: str) -> str:
     if not isinstance(value, dict):
         raise ValueError("payload must be one JSON object")
     if any(
-        not isinstance(key, str) or key not in _AGENT_CREATOR_PAYLOAD_KEYS
+        not isinstance(key, str) or key not in allowed_keys
         for key in value
     ):
         raise ValueError("payload contains unsupported fields")
@@ -5404,27 +5449,56 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
         return None
 
     args = tokens[2:]
+    try:
+        script_relative = script.relative_to(
+            _CONNECTOR_RUNTIME_ROOT_ANCHOR.resolved_root
+        )
+    except (AttributeError, ValueError):
+        return None
+    if (
+        script_relative == _APP_AGENT_HELPER_RELATIVE_PATH
+        and (not args or args[0] != "create-app-agent")
+    ):
+        return None
     stdin_text: Optional[str] = None
     approval_operation: Optional[str] = None
     if args in (["preflight"], ["list"]):
         if heredoc_payload is not None:
             return None
-    elif len(args) == 3 and args[:2] == ["create", "--payload"]:
+    elif (
+        len(args) == 3
+        and args[1] == "--payload"
+        and args[0] in _AGENT_CREATOR_CREATE_SUBCOMMANDS
+    ):
+        allowed_keys, create_operation = _AGENT_CREATOR_CREATE_SUBCOMMANDS[args[0]]
         if args[2] == "-":
             if heredoc_payload is None:
                 return None
             try:
-                stdin_text = _validate_agent_creator_payload(heredoc_payload) + "\n"
+                stdin_text = _validate_agent_creator_payload(
+                    heredoc_payload, allowed_keys=allowed_keys
+                ) + "\n"
             except ValueError:
                 return None
         else:
             if heredoc_payload is not None:
                 return None
             try:
-                args[2] = _validate_agent_creator_payload(args[2])
+                args[2] = _validate_agent_creator_payload(
+                    args[2], allowed_keys=allowed_keys
+                )
             except ValueError:
                 return None
-        approval_operation = "agent.create"
+        approval_operation = create_operation
+        if args[0] == "create-app-agent":
+            try:
+                validated_payload = json.loads(
+                    stdin_text if stdin_text is not None else args[2]
+                )
+            except (TypeError, ValueError):
+                return None
+            if validated_payload == {"probe": True}:
+                approval_operation = None
     elif args and args[0] == "cli":
         cli_args = args[1:]
         try:
@@ -5633,10 +5707,23 @@ def _read_verified_agent_creator_script(
 
 def _agent_creator_manifest_supports_action_token_fd(
     anchor: _ConnectorRuntimeRootAnchor,
+    script: Path,
 ) -> bool:
     """Validate the preset ABI before acquiring or injecting a scoped token."""
 
-    manifest = anchor.resolved_root / _AGENT_CREATOR_MANIFEST_RELATIVE_PATH
+    try:
+        script_relative = script.relative_to(anchor.resolved_root)
+    except ValueError:
+        return False
+    if script_relative == _APP_AGENT_HELPER_RELATIVE_PATH:
+        manifest_relative = _APP_AGENT_HELPER_MANIFEST_RELATIVE_PATH
+        capability_field = "optional_runtime_capabilities"
+    elif script_relative == _AGENT_CREATOR_RELATIVE_PATH:
+        manifest_relative = _AGENT_CREATOR_MANIFEST_RELATIVE_PATH
+        capability_field = "runtime_capabilities"
+    else:
+        return False
+    manifest = anchor.resolved_root / manifest_relative
     if not _connector_runtime_path_is_trusted(
         manifest,
         anchor.resolved_root,
@@ -5664,7 +5751,7 @@ def _agent_creator_manifest_supports_action_token_fd(
         loaded = yaml.safe_load(raw.decode("utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError("manifest root must be a mapping")
-        capabilities = loaded.get("runtime_capabilities")
+        capabilities = loaded.get(capability_field)
         if (
             not isinstance(capabilities, list)
             or len(capabilities) > _AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES
@@ -5800,7 +5887,7 @@ def _run_agent_creator_command_if_allowed(
             direct=True,
         )
 
-    if not _agent_creator_manifest_supports_action_token_fd(anchor):
+    if not _agent_creator_manifest_supports_action_token_fd(anchor, script):
         return _agent_creator_blocked_result(
             "agent_creator_runtime_capability_unavailable",
             (
@@ -5813,7 +5900,11 @@ def _run_agent_creator_command_if_allowed(
     try:
         from tools.environments.local import build_agent_creator_runtime_env
 
-        creator_env = build_agent_creator_runtime_env()
+        creator_env = build_agent_creator_runtime_env(
+            app_auto_refresh=(
+                len(parsed.argv) >= 3 and parsed.argv[2] == "create-app-agent"
+            )
+        )
     except Exception:
         return _agent_creator_blocked_result(
             "agent_creator_scope_unavailable",

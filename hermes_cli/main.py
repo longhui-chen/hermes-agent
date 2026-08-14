@@ -12375,6 +12375,43 @@ def main():
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
+    sessions_import_transcript = sessions_subparsers.add_parser(
+        "import-transcript",
+        help="Copy another profile's conversation into this profile as a new session",
+        description=(
+            "Trusted Local Server operation. Fork a session across profiles: "
+            "read the source profile's "
+            "transcript read-only and publish the importable part of it as a "
+            "new session here. Only user/assistant messages carrying text "
+            "cross over — tool calls and in-flight state are rejected by the "
+            "import contract, because the target profile has its own toolset "
+            "and would otherwise be handed a history of calls it cannot make. "
+            "Idempotent on (source-session, target-session): re-running "
+            "returns the same result instead of duplicating the session."
+        ),
+    )
+    sessions_import_transcript.add_argument(
+        "--source-profile",
+        required=True,
+        help="Profile id to copy the session FROM (sibling under profiles/)",
+    )
+    sessions_import_transcript.add_argument(
+        "--source-session", required=True, help="Session id in the source profile"
+    )
+    sessions_import_transcript.add_argument(
+        "--target-session", required=True, help="Session id to create here"
+    )
+    sessions_import_transcript.add_argument(
+        "--owner-principal", required=True,
+        help="Local Server-attested owner principal; source and target must match it",
+    )
+    sessions_import_transcript.add_argument(
+        "--title", default=None, help="Title for the created session"
+    )
+    sessions_import_transcript.add_argument(
+        "--json", action="store_true", help="Emit a machine-readable result"
+    )
+
     sessions_rename = sessions_subparsers.add_parser(
         "rename", help="Set or change a session's title"
     )
