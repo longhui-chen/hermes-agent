@@ -21,6 +21,8 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.zet_agent import (
     ZetAgentAdapter,
     _api_request_profile,
+    _deep_memory_principal,
+    _deep_memory_subject,
     _onboarding_deepseek_fast_path,
     _zettlab_request_account_id,
 )
@@ -181,6 +183,8 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     scoped_session_key = f"/profiles/main|{public_session_id}"
     account_token = _zettlab_request_account_id.set("account-1")
     principal_token = push_zettlab_auth_principal("iam:alice")
+    deep_principal_token = _deep_memory_principal.set("iam:alice")
+    deep_subject_token = _deep_memory_subject.set("user-1")
     try:
         agent = adapter._create_agent(
             session_id=public_session_id,
@@ -190,6 +194,8 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
             model_options={"reasoning_effort": "high", "service_tier": "priority"},
         )
     finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
         pop_zettlab_auth_principal(principal_token)
         _zettlab_request_account_id.reset(account_token)
 
@@ -201,7 +207,8 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
     assert captured["profile_name"] == "main"
-    assert captured["user_id"] == "account-1"  # Memo partition
+    assert captured["user_id"] == "iam:alice"  # Deep Memory primary identity
+    assert captured["user_id_alt"] == "user-1"  # Deep Memory subject identity
     assert captured["session_owner_id"] == "iam:alice"  # SessionDB owner
 
 

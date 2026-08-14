@@ -325,6 +325,19 @@ TOOLSETS = {
         "includes": []
     },
 
+    # Chat reachability alias for the read-only meeting bridge. Keep
+    # zettlab_skill_runtime unchanged because existing Cron jobs explicitly bind
+    # that broader toolset for skill_operation. The Zet Agent resolver recovers
+    # non-configurable toolsets only when every authored tool is present in its
+    # platform composite; skill_operation is intentionally Cron-only, so the
+    # broader entry cannot be recovered on Chat even though device_meetings is
+    # part of hermes-zet-agent.
+    "zettlab_device_meetings": {
+        "description": "Read-only access to meetings stored on the local Zettlab device",
+        "tools": ["device_meetings"],
+        "includes": []
+    },
+
     # Same load-bearing pattern as zettlab_apphost above: without this catalog
     # entry the reverse-mapping in _get_platform_tools would silently drop the
     # tool from the zet_agent real path (see the zettlab_channels /

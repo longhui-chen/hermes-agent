@@ -6,6 +6,8 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.zet_agent import (
     ZetAgentAdapter,
+    _deep_memory_principal,
+    _deep_memory_subject,
     _request_account_id,
     _zettlab_request_account_id,
 )
@@ -102,7 +104,12 @@ async def test_chat_request_keeps_account_and_app_owner_principal_separate(monke
     seen = []
 
     async def base_handler(_self, _request):
-        seen.append((zettlab_auth_principal(), _zettlab_request_account_id.get()))
+        seen.append((
+            zettlab_auth_principal(),
+            _zettlab_request_account_id.get(),
+            _deep_memory_principal.get(),
+            _deep_memory_subject.get(),
+        ))
         return object()
 
     monkeypatch.setattr(APIServerAdapter, "_handle_chat_completions", base_handler)
@@ -110,11 +117,14 @@ async def test_chat_request_keeps_account_and_app_owner_principal_separate(monke
         "X-Zettlab-Auth-Principal-Id": "iam:alice",
         "X-Zettlab-Account-Id": "account-1",
         "X-Hermes-Session-Key": "zettlab:account-1:main:chat-1",
+        "X-Zettlab-User-Id": "user-1",
     })
     await adapter._handle_chat_completions(request)
-    assert seen == [("iam:alice", "account-1")]
+    assert seen == [("iam:alice", "account-1", "iam:alice", "user-1")]
     assert zettlab_auth_principal() == ""
     assert _zettlab_request_account_id.get() == ""
+    assert _deep_memory_principal.get() == ""
+    assert _deep_memory_subject.get() == ""
 
 
 @pytest.mark.asyncio
@@ -134,7 +144,12 @@ async def test_every_agent_route_binds_and_clears_account_and_principal(
     seen = []
 
     async def base_handler(_self, _request):
-        seen.append((zettlab_auth_principal(), _zettlab_request_account_id.get()))
+        seen.append((
+            zettlab_auth_principal(),
+            _zettlab_request_account_id.get(),
+            _deep_memory_principal.get(),
+            _deep_memory_subject.get(),
+        ))
         return object()
 
     monkeypatch.setattr(APIServerAdapter, base_route, base_handler)
@@ -142,12 +157,15 @@ async def test_every_agent_route_binds_and_clears_account_and_principal(
         "X-Zettlab-Auth-Principal-Id": "iam:alice",
         "X-Zettlab-Account-Id": "account-1",
         "X-Hermes-Session-Key": "zettlab:account-1:main:chat-1",
+        "X-Zettlab-User-Id": "user-1",
     })
 
     await getattr(adapter, route)(request)
-    assert seen == [("iam:alice", "account-1")]
+    assert seen == [("iam:alice", "account-1", "iam:alice", "user-1")]
     assert zettlab_auth_principal() == ""
     assert _zettlab_request_account_id.get() == ""
+    assert _deep_memory_principal.get() == ""
+    assert _deep_memory_subject.get() == ""
 
 
 @pytest.mark.asyncio
@@ -164,6 +182,31 @@ async def test_rejected_gateway_request_never_binds_identity(monkeypatch):
     assert response is rejected
     assert zettlab_auth_principal() == ""
     assert _zettlab_request_account_id.get() == ""
+    assert _deep_memory_principal.get() == ""
+    assert _deep_memory_subject.get() == ""
+
+
+@pytest.mark.asyncio
+async def test_invalid_session_owner_principal_is_rejected_before_binding(monkeypatch):
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    called = False
+
+    async def base_handler(_self, _request):
+        nonlocal called
+        called = True
+        return object()
+
+    monkeypatch.setattr(APIServerAdapter, "_handle_responses", base_handler)
+    response = await adapter._handle_responses(SimpleNamespace(headers={
+        "X-Zettlab-Auth-Principal-Id": "iam:alice\x7f",
+    }))
+
+    assert response.status == 400
+    assert called is False
+    assert zettlab_auth_principal() == ""
+    assert _zettlab_request_account_id.get() == ""
+    assert _deep_memory_principal.get() == ""
+    assert _deep_memory_subject.get() == ""
 
 
 @pytest.mark.asyncio

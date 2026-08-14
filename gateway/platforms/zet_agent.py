@@ -125,6 +125,7 @@ from gateway.platforms.api_server import (
     _strip_skill_display_token,
 )
 from gateway.platforms.base import SendResult
+from gateway.deep_memory_identity import bounded_identity_header as _bounded_identity_header
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -233,6 +234,12 @@ def _request_account_id(request: "web.Request") -> str:
         raise web.HTTPForbidden(reason="account identity mismatch")
     return value[:256]
 
+_deep_memory_principal: ContextVar[str] = ContextVar(
+    "zettlab_deep_memory_principal", default=""
+)
+_deep_memory_subject: ContextVar[str] = ContextVar(
+    "zettlab_deep_memory_subject", default=""
+)
 
 async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
     """Keep a cancelled request alive until its non-cancellable worker exits.
@@ -893,12 +900,12 @@ class ZetAgentAdapter(APIServerAdapter):
         return bool(_delegation_advance_url())
 
     async def _handle_with_zettlab_identity(self, request, handler):
-        """Bind authenticated Zet account/principal identity for one API route.
+        """Bind authenticated Zet identities for one agent-serving API route.
 
-        Base handlers authenticate before constructing an agent, so these
-        request-scoped values cannot affect agent or memory state before the
-        gateway token is accepted.  The account stays separate for Memo;
-        principal is passed only as the persistent SessionDB owner.
+        Account identifies Memo's personal partition; principal owns the
+        SessionDB transcript and is Deep Memory's primary identity; subject
+        is Deep Memory's alternate stable identity.  Nothing request-supplied
+        is bound until the gateway token has been accepted.
         """
         from gateway.session_context import (
             pop_zettlab_auth_principal,
@@ -912,20 +919,36 @@ class ZetAgentAdapter(APIServerAdapter):
         if auth_err:
             return auth_err
 
-        principal = str(request.headers.get("X-Zettlab-Auth-Principal-Id", "") or "").strip()
-        if principal and (
-            len(principal) > 256
-            or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in principal)
+        raw_principal = request.headers.get("X-Zettlab-Auth-Principal-Id", "")
+        principal = _bounded_identity_header(raw_principal)
+        if str(raw_principal or "").strip() and (
+            not principal
+            or len(principal) > 256
+            or any(ord(char) == 0x7F for char in principal)
         ):
             return web.json_response(
                 {"error": {"message": "Invalid auth principal", "type": "invalid_request_error"}},
                 status=400,
             )
+        subject = _bounded_identity_header(
+            request.headers.get("X-Zettlab-User-Id", ""), max_bytes=512
+        )
+        if not principal or not subject:
+            logger.warning(
+                "[deep_memory] trusted request identity is incomplete "
+                "(principal_present=%s subject_present=%s)",
+                bool(principal),
+                bool(subject),
+            )
         account_token = _zettlab_request_account_id.set(_request_account_id(request))
         principal_token = push_zettlab_auth_principal(principal)
+        deep_principal_token = _deep_memory_principal.set(principal)
+        deep_subject_token = _deep_memory_subject.set(subject)
         try:
             return await handler(request)
         finally:
+            _deep_memory_subject.reset(deep_subject_token)
+            _deep_memory_principal.reset(deep_principal_token)
             pop_zettlab_auth_principal(principal_token)
             _zettlab_request_account_id.reset(account_token)
 
@@ -3212,9 +3235,11 @@ class ZetAgentAdapter(APIServerAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
             "request_overrides": agent_request_overrides or None,
-            # `user_id` remains the Memo/account partition.  Transcript rows
-            # use the separate principal-only `session_owner_id`.
-            "user_id": account_id or None,
+            # Account stays in the managed Memo context metadata.  AIAgent's
+            # generic memory identity is the authenticated Deep Memory pair;
+            # SessionDB has its separate principal-only owner field.
+            "user_id": _deep_memory_principal.get(),
+            "user_id_alt": _deep_memory_subject.get(),
             "session_owner_id": session_owner_id or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
