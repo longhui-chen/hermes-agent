@@ -718,10 +718,38 @@ def _plugin_tts_provider_is_registered(name: str) -> bool:
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        return get_provider(name) is not None
+        return (
+            _plugin_tts_provider_is_enabled_for_profile(name)
+            and get_provider(name) is not None
+        )
     except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
         logger.debug("tts plugin registration check failed for '%s': %s", name, exc)
         return False
+
+
+def _plugin_tts_provider_is_enabled_for_profile(name: str) -> bool:
+    """Apply the active profile's explicit plugin deny-list at dispatch.
+
+    TTS providers are registered process-wide, while a multiplexed worker's
+    config and secret scope are profile-local. Rechecking the deny-list here
+    prevents one profile from reusing a backend that another profile caused
+    to be registered during process startup.
+    """
+    key = str(name or "").strip().lower()
+    if not key:
+        return False
+    try:
+        from hermes_cli.plugins import _get_disabled_plugins
+
+        disabled = _get_disabled_plugins()
+    except Exception as exc:  # noqa: BLE001 — unreadable policy fails closed
+        logger.warning(
+            "tts plugin policy check failed for '%s': %s",
+            key,
+            exc,
+        )
+        return False
+    return key not in disabled and f"tts/{key}" not in disabled
 
 
 @dataclass(frozen=True)
@@ -971,6 +999,8 @@ def _dispatch_to_plugin_provider(
     key = provider.lower().strip()
     if key in BUILTIN_TTS_PROVIDERS:
         return None
+    if not _plugin_tts_provider_is_enabled_for_profile(key):
+        return None
     # Defense in depth: command-provider check should already have
     # short-circuited the caller. If a same-name command config exists,
     # bail so the command path wins.
@@ -1036,6 +1066,8 @@ def _plugin_provider_is_voice_compatible(provider: str) -> bool:
         return False
     key = provider.lower().strip()
     if key in BUILTIN_TTS_PROVIDERS:
+        return False
+    if not _plugin_tts_provider_is_enabled_for_profile(key):
         return False
     try:
         from agent.tts_registry import get_provider
@@ -3540,6 +3572,8 @@ def check_tts_requirements() -> bool:
         from agent.tts_registry import get_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
+        if not _plugin_tts_provider_is_enabled_for_profile(provider):
+            return False
         _ensure_plugins_discovered()
         plugin = get_provider(provider)
         return bool(plugin and plugin.is_available())

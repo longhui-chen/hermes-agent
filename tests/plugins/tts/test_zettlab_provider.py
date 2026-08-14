@@ -326,6 +326,56 @@ def test_zettlab_default_respects_disabled_plugin(monkeypatch):
     assert tts_tool._get_provider({}) == "edge"
 
 
+def test_zettlab_registry_respects_active_profile_disabled_policy(
+    monkeypatch,
+    tmp_path,
+):
+    from agent import secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_home = tmp_path / "profile-b"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "plugins:\n  disabled:\n    - ${env:DISABLED_TTS_PLUGIN}\n",
+        encoding="utf-8",
+    )
+    tts_registry.register_provider(ZettlabTTSProvider())
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tts_tool,
+        "resolve_zettlab_tool_gateway",
+        lambda vendor: SimpleNamespace(vendor="zettlab-tts"),
+    )
+    monkeypatch.setattr(tts_tool, "_resolve_profile_openai_audio_api_key", lambda: "")
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    home_token = set_hermes_home_override(profile_home)
+    scope_token = secret_scope.set_secret_scope(
+        {"DISABLED_TTS_PLUGIN": "tts/zettlab"}
+    )
+    try:
+        assert tts_tool._get_provider({}) == "edge"
+        result = json.loads(
+            tts_tool.text_to_speech_tool(
+                "do not dispatch",
+                output_path=str(tmp_path / "blocked.mp3"),
+                provider="zettlab",
+            )
+        )
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert result["success"] is False
+    assert "not registered or available" in result["error"]
+    assert not (tmp_path / "blocked.mp3").exists()
+
+
 def test_tts_gateway_runtime_uses_share_action_origin(monkeypatch):
     monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
     monkeypatch.delenv("ZETTLAB_AI_PROXY_BASE_URL", raising=False)
