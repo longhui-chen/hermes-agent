@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import os
-import time
 
 import pytest
 
@@ -39,6 +38,19 @@ def test_inline_image_input_encodes_supported_local_file(tmp_path, monkeypatch, 
     )
 
     assert got == f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def test_inline_image_input_reads_local_file_without_file_worker(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "source.png"
+    image_path.write_bytes(PNG)
+
+    assert "_MediaFileWorker" not in vars(client)
+    assert "_FILE_WORKER" not in vars(client)
+    assert client.inline_image_input(str(image_path), None, _capability()) == (
+        f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
+    )
 
 
 def test_inline_image_input_accepts_file_url(tmp_path):
@@ -111,10 +123,10 @@ def test_inline_image_input_passes_https_url_without_network(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        client._FILE_WORKER,
-        "read",
+        client,
+        "_read_authorized_media_file",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("remote URL must not reach the file worker")
+            AssertionError("remote URL must not reach the local file reader")
         ),
     )
 
@@ -184,10 +196,10 @@ def test_inline_image_input_rejects_relative_path_before_read(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
-        client._FILE_WORKER,
-        "read",
+        client,
+        "_read_authorized_media_file",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("relative path must not reach file worker")
+            AssertionError("relative path must not reach the local file reader")
         ),
     )
 
@@ -208,10 +220,10 @@ def test_inline_image_input_rejects_nonlocal_terminal_backends(
     image_path.write_bytes(PNG)
     monkeypatch.setattr(file_tools, "_terminal_env_type_for_task", lambda _task_id: backend)
     monkeypatch.setattr(
-        client._FILE_WORKER,
-        "read",
+        client,
+        "_read_authorized_media_file",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("non-local path must not reach file worker")
+            AssertionError("non-local path must not reach the local file reader")
         ),
     )
 
@@ -235,10 +247,10 @@ def test_inline_image_input_rejects_registered_ssh_environment(tmp_path, monkeyp
     image_path = tmp_path / "source.png"
     image_path.write_bytes(PNG)
     monkeypatch.setattr(
-        client._FILE_WORKER,
-        "read",
+        client,
+        "_read_authorized_media_file",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("SSH path must not reach host file worker")
+            AssertionError("SSH path must not reach the local file reader")
         ),
     )
     with terminal_tool._env_lock:
@@ -279,40 +291,50 @@ def test_host_read_resolver_returns_canonical_target_and_identity(tmp_path, monk
     assert identity == (target_stat.st_dev, target_stat.st_ino)
 
 
-def test_inline_image_input_passes_read_context_to_worker(
+def test_inline_image_input_passes_read_context_to_resolver(
     tmp_path,
     monkeypatch,
 ):
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_constants import (
+        get_hermes_home_override,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
     from plugins import zettlab_media_client as client
+    from tools import file_tools
 
     image_path = tmp_path / "source.png"
     profile_home = tmp_path / "profile-home"
     image_path.write_bytes(PNG)
     seen = {}
+    resolve = file_tools.resolve_host_read_path_for_task
 
-    def read(
+    def resolve_with_context(
         source,
-        limit,
-        *,
-        deadline,
         task_id="default",
-        terminal_backend="local",
-        managed_hermes_roots=(),
-        hermes_home_override=None,
+        *,
+        terminal_backend=None,
+        managed_hermes_roots=None,
     ):
         seen.update(
             source=source,
-            limit=limit,
-            deadline=deadline,
             task_id=task_id,
             terminal_backend=terminal_backend,
             managed_hermes_roots=managed_hermes_roots,
-            hermes_home_override=hermes_home_override,
+            hermes_home_override=get_hermes_home_override(),
         )
-        return PNG
+        return resolve(
+            source,
+            task_id,
+            terminal_backend=terminal_backend,
+            managed_hermes_roots=managed_hermes_roots,
+        )
 
-    monkeypatch.setattr(client._FILE_WORKER, "read", read)
+    monkeypatch.setattr(
+        file_tools,
+        "resolve_host_read_path_for_task",
+        resolve_with_context,
+    )
 
     token = set_hermes_home_override(profile_home)
     try:
@@ -331,29 +353,6 @@ def test_inline_image_input_passes_read_context_to_worker(
     assert seen["terminal_backend"] == "local"
     assert seen["managed_hermes_roots"]
     assert seen["hermes_home_override"] == str(profile_home)
-
-
-def test_inline_image_parent_preflight_does_not_resolve_or_stat_path(
-    tmp_path,
-    monkeypatch,
-):
-    from plugins import zettlab_media_client as client
-    from tools import file_tools
-
-    image_path = tmp_path / "source.png"
-    image_path.write_bytes(PNG)
-    monkeypatch.setattr(
-        file_tools,
-        "resolve_host_read_path_for_task",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("path I/O must run only inside the spawned worker")
-        ),
-    )
-    monkeypatch.setattr(client._FILE_WORKER, "read", lambda *_args, **_kwargs: PNG)
-
-    got = client.inline_image_input(str(image_path), None, _capability())
-
-    assert got.startswith("data:image/png;base64,")
 
 
 def test_windows_reparse_component_is_rejected_before_canonical_resolution(
@@ -397,8 +396,8 @@ def test_inline_image_input_rejects_windows_network_and_device_paths_before_read
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
-        client._FILE_WORKER,
-        "read",
+        client,
+        "_read_authorized_media_file",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("unsafe Windows path must be rejected before file handling")
         ),
@@ -500,25 +499,17 @@ def test_inline_image_input_rejects_fifo_without_blocking(tmp_path):
     os.mkfifo(fifo_path)
 
     with pytest.raises(client.ZettlabMediaError, match="regular file"):
-        client._FILE_WORKER.read(
-            str(fifo_path),
-            1024,
-            deadline=time.monotonic() + 1,
-        )
+        client.inline_image_input(str(fifo_path), None, _capability())
 
 
-def test_inline_image_input_preserves_file_safety_guard_in_worker(tmp_path):
+def test_inline_image_input_preserves_file_safety_guard(tmp_path):
     from plugins import zettlab_media_client as client
 
     blocked_path = tmp_path / ".env"
     blocked_path.write_bytes(PNG)
 
-    with pytest.raises(ValueError, match="Access denied"):
-        client._FILE_WORKER.read(
-            str(blocked_path),
-            1024,
-            deadline=time.monotonic() + 1,
-        )
+    with pytest.raises(client.ZettlabMediaError, match="Access denied"):
+        client.inline_image_input(str(blocked_path), None, _capability())
 
 
 def test_inline_image_input_does_not_follow_symlink(tmp_path):
@@ -531,15 +522,11 @@ def test_inline_image_input_does_not_follow_symlink(tmp_path):
         symlink_path.symlink_to(target_path)
     except (NotImplementedError, OSError):
         pytest.skip("symlinks are unavailable")
-    with pytest.raises(ValueError, match="symbolic link"):
-        client._FILE_WORKER.read(
-            str(symlink_path),
-            1024,
-            deadline=time.monotonic() + 1,
-        )
+    with pytest.raises(client.ZettlabMediaError, match="symbolic link"):
+        client.inline_image_input(str(symlink_path), None, _capability())
 
 
-def test_media_file_worker_rejects_identity_changed_after_authorization(tmp_path):
+def test_direct_media_file_read_rejects_identity_changed_after_authorization(tmp_path):
     from plugins import zettlab_media_client as client
 
     authorized_path = tmp_path / "authorized.png"
@@ -553,148 +540,7 @@ def test_media_file_worker_rejects_identity_changed_after_authorization(tmp_path
             str(replacement_path),
             1024,
             (authorized_stat.st_dev, authorized_stat.st_ino),
-            bytearray(1024),
         )
-
-
-def test_media_file_worker_terminates_stalled_preflight_and_recovers(monkeypatch):
-    from plugins import zettlab_media_client as client
-
-    class FakeProcess:
-        def __init__(self, *, alive=True):
-            self.alive = alive
-            self.terminated = False
-
-        def is_alive(self):
-            return self.alive
-
-        def terminate(self):
-            self.terminated = True
-            self.alive = False
-
-        def join(self, timeout=None):
-            return None
-
-        def kill(self):
-            self.alive = False
-
-        def close(self):
-            return None
-
-    class FakeConnection:
-        def __init__(self, result=None):
-            self.result = result
-            self.closed = False
-
-        def poll(self, timeout):
-            if self.result is None:
-                time.sleep(timeout)
-                return False
-            return True
-
-        def recv(self):
-            return self.result
-
-        def close(self):
-            self.closed = True
-
-    stalled_process = FakeProcess()
-    stalled_connection = FakeConnection()
-    recovered_process = FakeProcess(alive=False)
-    recovered_connection = FakeConnection({"length": len(PNG)})
-    attempts = iter(
-        [
-            (stalled_process, stalled_connection, b""),
-            (recovered_process, recovered_connection, PNG),
-        ]
-    )
-    worker = client._MediaFileWorker()
-
-    def start_next_worker(
-        source,
-        limit,
-        task_id,
-        terminal_backend,
-        managed_hermes_roots,
-        hermes_home_override,
-        deadline,
-    ):
-        process, connection, payload = next(attempts)
-        worker._process = process
-        worker._connection = connection
-        worker._buffer = bytearray(limit)
-        worker._buffer[: len(payload)] = payload
-
-    monkeypatch.setattr(worker, "_ensure_started", start_next_worker)
-
-    started = time.monotonic()
-    with pytest.raises(client.ZettlabMediaDeadlineError, match="deadline exceeded"):
-        worker.read("/stalled/image.png", 1024, deadline=time.monotonic() + 0.05)
-    assert time.monotonic() - started < 0.15
-    assert stalled_process.terminated is True
-    assert stalled_connection.closed is True
-
-    assert worker.read("/recovered/image.png", 1024, deadline=time.monotonic() + 1) == PNG
-    worker.close()
-
-
-def test_media_file_worker_interrupt_terminates_read(monkeypatch):
-    from plugins import zettlab_media_client as client
-
-    class FakeProcess:
-        alive = True
-        terminated = False
-
-        def is_alive(self):
-            return self.alive
-
-        def terminate(self):
-            self.terminated = True
-            self.alive = False
-
-        def join(self, timeout=None):
-            return None
-
-        def kill(self):
-            self.alive = False
-
-        def close(self):
-            return None
-
-    class FakeConnection:
-        closed = False
-
-        def poll(self, timeout):
-            return False
-
-        def close(self):
-            self.closed = True
-
-    worker = client._MediaFileWorker()
-    process = FakeProcess()
-    connection = FakeConnection()
-
-    def start_worker(
-        source,
-        limit,
-        task_id,
-        terminal_backend,
-        managed_hermes_roots,
-        hermes_home_override,
-        deadline,
-    ):
-        worker._process = process
-        worker._connection = connection
-        worker._buffer = bytearray(limit)
-
-    monkeypatch.setattr(worker, "_ensure_started", start_worker)
-    monkeypatch.setattr(client, "is_interrupted", lambda: True)
-
-    with pytest.raises(client.ZettlabMediaError, match="interrupted"):
-        worker.read("/stalled/image.png", 1024, deadline=time.monotonic() + 1)
-
-    assert process.terminated is True
-    assert connection.closed is True
 
 
 def test_media_worker_parent_watch_uses_cross_platform_parent_sentinel(monkeypatch):
