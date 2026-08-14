@@ -591,6 +591,160 @@ def test_managed_console_output_blocks_private_page_and_closes(monkeypatch):
     assert actions == ["console", "close"]
 
 
+def test_managed_back_checks_landed_url_and_closes_private_page(monkeypatch):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        if action == "back":
+            return SimpleNamespace(
+                backend="desktop",
+                result=json.dumps({
+                    "success": True,
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                }),
+            )
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({"success": True, "closed": True}),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    monkeypatch.setattr(
+        browser_tool,
+        "_managed_page_safety_error",
+        lambda url: "Blocked private page" if url.startswith("http://169.254.") else None,
+    )
+
+    result = json.loads(browser_tool.browser_back())
+    assert result == {"success": False, "error": "Blocked private page"}
+    assert actions == ["back", "close"]
+
+
+def test_managed_back_preserves_public_result_schema(monkeypatch):
+    monkeypatch.setattr(
+        browser_tool,
+        "_route_browser_action",
+        lambda _action, _params=None: SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "url": "https://example.com/previous",
+                "title": "Previous",
+            }),
+        ),
+    )
+    monkeypatch.setattr(browser_tool, "_managed_page_safety_error", lambda _url: None)
+    monkeypatch.setattr(browser_tool, "_redact_browser_output", lambda value: value)
+
+    result = json.loads(browser_tool.browser_back())
+    assert result == {"success": True, "url": "https://example.com/previous"}
+
+
+@pytest.mark.parametrize("tool_call", [browser_tool.browser_back, browser_tool.browser_get_images])
+def test_managed_content_action_fails_closed_without_page_url(monkeypatch, tool_call):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        if action == "close":
+            return SimpleNamespace(
+                backend="desktop",
+                result=json.dumps({"success": True, "closed": True}),
+            )
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "images": [{"src": "https://example.com/secret.png"}],
+            }),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+
+    result = json.loads(tool_call())
+    assert result["success"] is False
+    assert result["code"] == "invalid_browser_router_response"
+    assert "secret.png" not in json.dumps(result)
+    assert actions[-1] == "close"
+
+
+def test_managed_get_images_checks_url_and_redacts_result(monkeypatch):
+    monkeypatch.setattr(
+        browser_tool,
+        "_route_browser_action",
+        lambda _action, _params=None: SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "url": "https://example.com/gallery",
+                "images": [
+                    {
+                        "src": "https://example.com/image.png?token=secret",
+                        "alt": "secret alt",
+                        "width": 640,
+                        "height": 480,
+                    },
+                    {"src": "data:image/png;base64,secret", "alt": "inline"},
+                ],
+                "count": 2,
+            }),
+        ),
+    )
+    monkeypatch.setattr(browser_tool, "_managed_page_safety_error", lambda _url: None)
+    monkeypatch.setattr(
+        browser_tool,
+        "_redact_browser_output",
+        lambda value: [{**value[0], "src": "redacted"}]
+        if isinstance(value, list)
+        else value,
+    )
+
+    result = json.loads(browser_tool.browser_get_images())
+    assert result == {
+        "success": True,
+        "images": [{
+            "src": "redacted",
+            "alt": "secret alt",
+            "width": 640,
+            "height": 480,
+        }],
+        "count": 1,
+    }
+
+
+def test_managed_get_images_does_not_return_private_page_content(monkeypatch):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        if action == "get_images":
+            return SimpleNamespace(
+                backend="desktop",
+                result=json.dumps({
+                    "success": True,
+                    "url": "http://127.0.0.1/internal",
+                    "images": [{"src": "http://127.0.0.1/secret.png"}],
+                }),
+            )
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({"success": True, "closed": True}),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    monkeypatch.setattr(
+        browser_tool,
+        "_managed_page_safety_error",
+        lambda url: "Blocked private page" if url.startswith("http://127.") else None,
+    )
+
+    result = json.loads(browser_tool.browser_get_images())
+    assert result == {"success": False, "error": "Blocked private page"}
+    assert "secret.png" not in json.dumps(result)
+    assert actions == ["get_images", "close"]
+
+
 def test_managed_snapshot_truncates_and_redacts_before_return(monkeypatch):
     monkeypatch.setattr(browser_tool, "SNAPSHOT_SUMMARIZE_THRESHOLD", 8)
     monkeypatch.setattr(browser_tool, "_truncate_snapshot", lambda _value: "trimmed-secret")
