@@ -91,7 +91,15 @@ def _validate_managed_root_directory_chain(directory: Path) -> Path:
             or info.st_uid != 0
             or info.st_mode & 0o022
         ):
-            raise OSError("managed profile directory chain is not trusted")
+            # 把「是哪一级、坏在哪」写进异常。只说 chain is not trusted 时,现场
+            # 完全看不出该修谁:08-14 板 .212 上是 <profile>/home 被 zls 的 lark-cli
+            # broker chown 成了沙箱 uid,导致该 agent 每条 terminal 命令全灭,
+            # 而板上的智能体自己把原因归到了「技能目录」,方向整个跑偏。
+            raise OSError(
+                "managed profile directory chain is not trusted: "
+                f"{component} (uid={info.st_uid} mode={stat.S_IMODE(info.st_mode):o}), "
+                f"每一级都必须 uid=0 且 group/other 不可写"
+            )
     return resolved
 
 
