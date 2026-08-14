@@ -265,13 +265,52 @@ def test_onboarding_welcome_channel_is_omitted_when_inventory_has_no_supported_t
         }
     )
 
-    plugin._on_pre_llm_call(session_id="no-channel", user_message=marker, conversation_history=[])
+    pre = plugin._on_pre_llm_call(
+        session_id="no-channel", user_message=marker, conversation_history=[]
+    )
     transformed = plugin._transform_llm_output(
         session_id="no-channel", response_text="欢迎，随时可以开始。", completed=True
     )
 
     assert [attachment["kind"] for attachment in emitted] == ["artifact.recommendation"]
     assert _decode_envelope(transformed)["creation_type"] == "task"
+    # 不发卡还不够：App 的 brief 是在拿到实时 inventory 之前写好的，已经命令模型
+    # 「引导用户点击本消息末尾的 IM 连接卡」。必须在同一轮显式否决，否则新用户
+    # 的第一条消息就指向一个永远不会出现的卡片。
+    assert "NO IM connection card will be attached this turn" in pre["context"]
+
+
+def test_onboarding_welcome_keeps_channel_promotion_when_target_exists(monkeypatch):
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    context.emit_attachment = lambda attachment: True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": ["feishu"],
+            "channels_recommendable": ["feishu"],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {"title": "跟进进展", "reason": "持续更新。", "proposalText": "要设置吗？"},
+        }
+    )
+
+    pre = plugin._on_pre_llm_call(
+        session_id="has-channel", user_message=marker, conversation_history=[]
+    )
+
+    assert "NO IM connection card" not in pre["context"]
 
 
 def test_onboarding_welcome_emits_real_agent_template_cards(monkeypatch):
