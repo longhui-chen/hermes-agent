@@ -666,7 +666,8 @@ def test_managed_content_action_fails_closed_without_page_url(monkeypatch, tool_
     assert result["success"] is False
     assert result["code"] == "invalid_browser_router_response"
     assert "secret.png" not in json.dumps(result)
-    assert actions[-1] == "close"
+    assert len(actions) == 1
+    assert "close" not in actions
 
 
 def test_managed_get_images_checks_url_and_redacts_result(monkeypatch):
@@ -684,6 +685,12 @@ def test_managed_get_images_checks_url_and_redacts_result(monkeypatch):
                         "alt": "secret alt",
                         "width": 640,
                         "height": 480,
+                    },
+                    {
+                        "src": "https://example.com/second.png",
+                        "alt": "second",
+                        "width": 320,
+                        "height": 240,
                     },
                     {"src": "data:image/png;base64,secret", "alt": "inline"},
                 ],

@@ -377,6 +377,10 @@ SNAPSHOT_SUMMARIZE_THRESHOLD = 15000
 # read_file paging and must not write unbounded bytes to disk.
 MAX_STORED_SNAPSHOT_CHARS = 2_000_000
 
+# Web Host already bounds image extraction; keep a second cheap tool-boundary
+# ceiling so a malformed or mismatched managed response cannot grow work here.
+MAX_MANAGED_PAGE_IMAGES = 512
+
 # Commands that legitimately return empty stdout (e.g. close, record).
 _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})
 
@@ -3622,7 +3626,6 @@ def browser_back(task_id: Optional[str] = None) -> str:
             )
         current_url = str(managed_payload.get("url") or "").strip()
         if not current_url:
-            _close_unsafe_managed_page()
             return json.dumps({
                 "success": False,
                 "code": "invalid_browser_router_response",
@@ -4414,7 +4417,6 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
             )
         current_url = str(managed_payload.get("url") or "").strip()
         if not current_url:
-            _close_unsafe_managed_page()
             return json.dumps({
                 "success": False,
                 "code": "invalid_browser_router_response",
@@ -4429,7 +4431,7 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         raw_images = managed_payload.get("images")
         images = []
         if isinstance(raw_images, list):
-            for image in raw_images[:512]:
+            for image in raw_images[:MAX_MANAGED_PAGE_IMAGES]:
                 if not isinstance(image, dict):
                     continue
                 src = image.get("src")
@@ -4440,10 +4442,13 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
                 ):
                     continue
                 images.append(image)
+        redacted_images = _redact_browser_output(images)
+        if not isinstance(redacted_images, list):
+            redacted_images = []
         response = {
             "success": True,
-            "images": _redact_browser_output(images),
-            "count": len(images),
+            "images": redacted_images,
+            "count": len(redacted_images),
         }
         return json.dumps(response, ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
