@@ -274,6 +274,73 @@ def test_onboarding_welcome_channel_is_omitted_when_inventory_has_no_supported_t
     assert _decode_envelope(transformed)["creation_type"] == "task"
 
 
+def test_onboarding_welcome_emits_real_agent_template_cards(monkeypatch):
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    emitted = []
+    context.emit_attachment = lambda attachment: emitted.append(attachment) or True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": [],
+            "channels_recommendable": [],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {"title": "跟进 SEO", "reason": "持续更新。", "proposalText": "要设置吗？"},
+            "agentTemplates": [
+                {
+                    "templateId": "cn/seo-advisor",
+                    "title": "SEO 顾问",
+                    "reason": "持续完成技术 SEO 审计和内容优化。",
+                },
+                {
+                    "templateId": "cn/competitor-analysis",
+                    "title": "竞品分析",
+                    "reason": "持续跟踪和比较竞品。",
+                },
+            ],
+        }
+    )
+
+    plugin._on_pre_llm_call(
+        session_id="agent-template-welcome",
+        turn_id="turn-template",
+        user_message=marker,
+        conversation_history=[],
+    )
+    transformed = plugin._transform_llm_output(
+        session_id="agent-template-welcome",
+        response_text="欢迎回来。",
+        completed=True,
+    )
+
+    assert [attachment["kind"] for attachment in emitted] == [
+        "agent-template.recommendation",
+        "agent-template.recommendation",
+    ]
+    assert emitted[0]["payload"] == {
+        "template_id": "cn/seo-advisor",
+        "title": "SEO 顾问",
+        "reason": "持续完成技术 SEO 审计和内容优化。",
+    }
+    assert emitted[0]["actions"] == [
+        {"id": "dismiss"},
+        {"id": "open", "style": "primary"},
+    ]
+    assert _decode_envelope(transformed)["creation_type"] == "task"
+
+
 def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     plugin = _load_plugin()
     none = _candidate(
