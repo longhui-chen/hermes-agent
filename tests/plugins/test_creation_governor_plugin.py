@@ -278,6 +278,10 @@ def test_onboarding_welcome_channel_is_omitted_when_inventory_has_no_supported_t
     # 「引导用户点击本消息末尾的 IM 连接卡」。必须在同一轮显式否决，否则新用户
     # 的第一条消息就指向一个永远不会出现的卡片。
     assert "NO IM connection card will be attached this turn" in pre["context"]
+    assert "do not tell them to tap a connection card" in pre["context"]
+    # 否决只针对「指向卡片」，不禁止解释 IM 的价值——那是 onboarding 需求本身，
+    # 没有卡片时依然成立。
+    assert "You may still briefly explain what connecting an IM channel would do" in pre["context"]
 
 
 def test_onboarding_welcome_keeps_channel_promotion_when_target_exists(monkeypatch):
