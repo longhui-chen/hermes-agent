@@ -3235,12 +3235,14 @@ class ZetAgentAdapter(APIServerAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
             "request_overrides": agent_request_overrides or None,
-            # Account stays in the managed Memo context metadata.  AIAgent's
-            # generic memory identity is the authenticated Deep Memory pair;
-            # SessionDB has its separate principal-only owner field.
-            "user_id": _deep_memory_principal.get(),
-            "user_id_alt": _deep_memory_subject.get(),
+            # Generic user_id remains the authenticated account for managed
+            # Memo and legacy SessionDB migration.  Deep Memory gets its
+            # principal/subject through dedicated fields below; SessionDB
+            # ownership is separately principal-only.
+            "user_id": account_id or None,
             "session_owner_id": session_owner_id or None,
+            "deep_memory_principal": _deep_memory_principal.get() or None,
+            "deep_memory_subject": _deep_memory_subject.get() or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier

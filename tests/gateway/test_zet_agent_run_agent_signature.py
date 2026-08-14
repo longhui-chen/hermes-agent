@@ -207,9 +207,10 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
     assert captured["profile_name"] == "main"
-    assert captured["user_id"] == "iam:alice"  # Deep Memory primary identity
-    assert captured["user_id_alt"] == "user-1"  # Deep Memory subject identity
+    assert captured["user_id"] == "account-1"  # Memo and legacy SessionDB account
     assert captured["session_owner_id"] == "iam:alice"  # SessionDB owner
+    assert captured["deep_memory_principal"] == "iam:alice"
+    assert captured["deep_memory_subject"] == "user-1"
 
 
 def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):
