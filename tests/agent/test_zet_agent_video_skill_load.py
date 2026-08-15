@@ -401,6 +401,171 @@ def test_plan_success_memory_authorization_matches_memory_tool_shape():
     })
 
 
+def test_plan_success_replace_authorization_matches_copied_helper_shape():
+    old_content = (
+        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
+        '{"s":{"daily":{"p":{"st":"daily_vlog"}}},"v":1}\n'
+        "-->"
+    )
+    new_content = (
+        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
+        '{"s":{"daily":{"p":{"st":"freestyle"}}},"v":1}\n'
+        "-->"
+    )
+    helper_operation = {
+        "action": "replace",
+        "content": new_content,
+        "old_text": old_content,
+        "target": "memory",
+    }
+    terminal_result = {
+        "output": json.dumps(
+            {"ok": True, "operations": [helper_operation]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    copied_helper_args = {"operations": [helper_operation]}
+    standard_memory_args = {
+        "target": "memory",
+        "operations": [{
+            "action": "replace",
+            "content": new_content,
+            "old_text": old_content,
+        }],
+    }
+
+    copied_digest = response_mode._canonical_memory_payload_sha256(
+        copied_helper_args
+    )
+    assert copied_digest == response_mode._canonical_memory_payload_sha256(
+        standard_memory_args
+    )
+    assert response_mode._memory_payload_hashes_from_terminal_result(
+        terminal_result
+    ) == frozenset({copied_digest})
+
+
+def test_trusted_video_plan_success_replace_commits_copied_helper_shape_flow(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = {
+        "memory": {
+            "memory_enabled": True,
+            "user_profile_enabled": True,
+            "memory_char_limit": 2200,
+            "user_char_limit": 1375,
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=config):
+        agent = _runtime_agent(
+            ("skill_view", "clarify", "todo", "terminal"),
+            enabled_toolsets=["hermes-zet-agent", "cronjob"],
+            skip_memory=False,
+        )
+
+    old_content = (
+        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
+        '{"s":{"daily":{"p":{"st":"daily_vlog"}}},"v":1}\n'
+        "-->"
+    )
+    new_content = (
+        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
+        '{"s":{"daily":{"p":{"st":"freestyle"}}},"v":1}\n'
+        "-->"
+    )
+    assert agent._memory_store.add("memory", old_content)["success"] is True
+    helper_operation = {
+        "action": "replace",
+        "content": new_content,
+        "old_text": old_content,
+        "target": "memory",
+    }
+    terminal_result = json.dumps(
+        {
+            "output": json.dumps(
+                {"ok": True, "operations": [helper_operation]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            "exit_code": 0,
+            "error": None,
+            "video_edit_runtime_direct": True,
+        },
+        ensure_ascii=False,
+    )
+    terminal_args = {
+        "command": (
+            "python3 \"$ZETTLAB_PRESETS_DIR/skills/"
+            "video-edit-workflow-mini/scripts/preference_resolver.py\" "
+            "plan-success --workflow-state /tmp/workflow_state.json"
+        ),
+        "timeout": 120,
+    }
+    receipt = response_mode._TrustedExecutionReceipt(
+        agent_id="agent-1",
+        action_token="action-secret",
+        hardware_execution_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        turn_id="trusted-memory-helper-copy",
+        session_id="session-1",
+    )
+
+    turn_tokens = set_turn_vars(turn_id="trusted-memory-helper-copy")
+    try:
+        task = response_mode._skill_direct_task_context(agent, "剪辑")
+        agent._zet_agent_skill_direct_task = task
+        agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
+            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+            task_sha256=task.task_sha256,
+            turn_identity=task.turn_identity,
+            allowed_tools=frozenset({"terminal"}),
+            execution_receipt=receipt,
+        )
+        agent._zet_agent_skill_direct_operation = None
+        monkeypatch.setattr(
+            response_mode,
+            "_video_edit_command_policy",
+            lambda _args: (True, True),
+        )
+
+        assert response_mode.trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args=terminal_args,
+        ) is None
+        response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="terminal",
+            function_args=terminal_args,
+            dispatch=lambda: terminal_result,
+        )
+        assert "memory" in response_mode.trusted_skill_allowed_tool_names(agent)
+
+        assistant_message = _tool_response(
+            "memory",
+            json.dumps(
+                {"operations": [helper_operation]},
+                ensure_ascii=False,
+            ),
+        ).choices[0].message
+        messages = []
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "trusted-memory-helper-copy-task",
+        )
+    finally:
+        clear_turn_vars(turn_tokens)
+
+    assert agent._memory_store.memory_entries == [new_content]
+    tool_result = next(message for message in messages if message["role"] == "tool")
+    assert json.loads(tool_result["content"])["success"] is True
+
+
 def test_trusted_video_response_exception_is_limited_to_memory(monkeypatch):
     agent = _agent(valid_tool_names={"skill_view", "todo"})
     monkeypatch.setattr(

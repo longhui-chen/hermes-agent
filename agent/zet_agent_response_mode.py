@@ -14,6 +14,7 @@ import stat
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1565,16 +1566,72 @@ def _recoverable_video_edit_command_format_error(
     return any(script_name in command for script_name in _VIDEO_EDIT_RUNTIME_SCRIPTS)
 
 
-def _canonical_memory_payload_sha256(function_args: Mapping[str, Any]) -> str:
-    if set(function_args) != {"operations", "target"}:
-        return ""
-    target = function_args.get("target")
+def _normalized_memory_payload(
+    function_args: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Canonicalize the memory schema or an exact helper-operation copy."""
+    fields = set(function_args)
+    if fields not in ({"operations", "target"}, {"operations"}):
+        return None
     operations = function_args.get("operations")
-    if target not in {"memory", "user"} or not isinstance(operations, list):
+    if not isinstance(operations, list) or not 1 <= len(operations) <= 4:
+        return None
+
+    has_top_level_target = "target" in function_args
+    target = function_args.get("target") if has_top_level_target else None
+    if has_top_level_target and target not in {"memory", "user"}:
+        return None
+
+    normalized_operations: list[dict[str, Any]] = []
+    for raw_operation in operations:
+        if not isinstance(raw_operation, dict):
+            return None
+        operation = dict(raw_operation)
+        operation_target = operation.pop("target", None)
+        if operation_target is not None:
+            if operation_target not in {"memory", "user"}:
+                return None
+            if target is None:
+                target = operation_target
+            elif operation_target != target:
+                return None
+        elif not has_top_level_target:
+            return None
+
+        action = operation.get("action")
+        if (
+            action not in {"add", "remove", "replace"}
+            or set(operation) - {"action", "content", "old_text"}
+        ):
+            return None
+        for field in ("content", "old_text"):
+            value = operation.get(field)
+            if value is not None and (
+                not isinstance(value, str) or len(value) > 16 * 1024
+            ):
+                return None
+        if action == "add" and not operation.get("content"):
+            return None
+        if action == "remove" and not operation.get("old_text"):
+            return None
+        if action == "replace" and not (
+            operation.get("content") and operation.get("old_text")
+        ):
+            return None
+        normalized_operations.append(operation)
+
+    if target not in {"memory", "user"}:
+        return None
+    return {"operations": normalized_operations, "target": target}
+
+
+def _canonical_memory_payload_sha256(function_args: Mapping[str, Any]) -> str:
+    normalized = _normalized_memory_payload(function_args)
+    if normalized is None:
         return ""
     try:
         canonical = json.dumps(
-            {"operations": operations, "target": target},
+            normalized,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -1887,7 +1944,7 @@ def trusted_skill_operation_execution_block_message(
     agent: Any,
     *,
     function_name: str,
-    function_args: Mapping[str, Any],
+    function_args: MutableMapping[str, Any],
 ) -> str | None:
     """Revalidate the final trusted-memory payload after execution middleware."""
     if (
@@ -1933,7 +1990,12 @@ def trusted_skill_operation_execution_block_message(
                 "task-local turn. The operation was revoked before writing."
             )
 
-        final_digest = _canonical_memory_payload_sha256(function_args)
+        normalized_args = _normalized_memory_payload(function_args)
+        final_digest = (
+            _canonical_memory_payload_sha256(normalized_args)
+            if normalized_args is not None
+            else ""
+        )
         if (
             operation.execution_claimed
             or not final_digest
@@ -1949,6 +2011,15 @@ def trusted_skill_operation_execution_block_message(
                 "authorization. The operation was revoked before writing."
             )
 
+        if normalized_args is None:
+            agent._zet_agent_skill_direct_operation = None
+            return (
+                "The trusted video-edit memory payload could not be normalized "
+                "for dispatch. The operation was revoked before writing."
+            )
+        function_args.clear()
+        function_args["operations"] = normalized_args["operations"]
+        function_args["target"] = normalized_args["target"]
         agent._zet_agent_skill_direct_operation = replace(
             operation,
             execution_claimed=True,
