@@ -766,6 +766,25 @@ def test_trusted_video_receipt_preserves_stable_and_lineage_sessions():
     assert captured["HERMES_EXECUTION_POLICY"] == "silent_automation"
 
 
+def test_trusted_video_receipt_rejects_legacy_hardware_token():
+    receipt = response_mode._TrustedExecutionReceipt(
+        agent_id="agent-1",
+        action_token="",
+        hardware_execution_token="b" * 64,
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        turn_id="video-legacy-isolation",
+        session_id="api-lineage-tip",
+        gateway_session_key="video-stable-session",
+        execution_policy="silent_automation",
+    )
+    token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
+    try:
+        assert response_mode.trusted_video_edit_runtime_receipt() == {}
+    finally:
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(token)
+
+
 @pytest.mark.parametrize(
     ("rewrite_result", "expected_scope"),
     [(False, True), (True, False)],
