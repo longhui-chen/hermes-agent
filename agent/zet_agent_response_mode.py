@@ -74,9 +74,9 @@ _VIDEO_FILE_SUFFIXES = (
 )
 _VIDEO_EDIT_CN_RE = re.compile(r"(?:视频)?(?:剪辑|剪片|剪成|成片)|做(?:个|一条)?\s*(?:vlog|视频)", re.IGNORECASE)
 _VIDEO_EDIT_EN_RE = re.compile(
-    r"(?:\b(?:edit|trim|cut|render)\b.{0,32}\b(?:video|clip|footage|movie|vlog)\b"
-    r"|\b(?:video|clip|footage|movie|vlog)\b.{0,32}\b(?:edit|trim|cut|render)\b"
-    r"|\bmake\b.{0,32}\b(?:video|vlog|movie)\b)",
+    r"(?:\b(?:edit|trim|cut|render)\b.{0,32}\b(?:videos?|clips?|footage|movies?|vlogs?)\b"
+    r"|\b(?:videos?|clips?|footage|movies?|vlogs?)\b.{0,32}\b(?:edit|trim|cut|render)\b"
+    r"|\bmake\b.{0,32}\b(?:videos?|vlogs?|movies?)\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _VIDEO_EDIT_CONTINUATION_CN_RE = re.compile(

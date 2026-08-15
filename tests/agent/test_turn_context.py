@@ -435,7 +435,12 @@ description: Trusted video-edit execution flow test
         agent._zet_agent_response_mode = "plan"
         ctx = _build(
             agent,
-            user_message="请把 [file: /data/input.mp4] 剪辑成 vlog 成片",
+            user_message=(
+                "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0028.MOV (42.5 MB)]\n"
+                "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0027.MOV (67.0 MB)]\n"
+                "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0029.MOV (85.5 MB)]\n\n"
+                "Edit these three Hangzhou Songcheng videos into a vertical vlog."
+            ),
             task_id="api-task",
         )
         assert agent._current_turn_id != "external-api-turn"
@@ -861,6 +866,22 @@ def test_short_natural_video_edit_commands_without_inline_asset_are_explicit_uni
         agent = _FakeAgent()
         reset_trusted_skill_execution(agent, unrelated)
         assert not agent._zet_agent_skill_direct_task.video_edit_applicable, unrelated
+
+
+def test_plural_english_video_attachments_activate_video_edit_scope_unit():
+    agent = _FakeAgent()
+    message = (
+        "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0028.MOV (42.5 MB)]\n"
+        "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0027.MOV (67.0 MB)]\n"
+        "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0029.MOV (85.5 MB)]\n\n"
+        "Edit these three Hangzhou Songcheng videos into a vertical vlog."
+    )
+
+    reset_trusted_skill_execution(agent, message)
+
+    task = agent._zet_agent_skill_direct_task
+    assert task.video_edit_applicable
+    assert task.video_edit_explicit
 
 
 def test_explicit_video_edit_transport_selection_mints_task_scope_unit():
