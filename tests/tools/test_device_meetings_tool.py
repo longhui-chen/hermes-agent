@@ -4,6 +4,8 @@ import json
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+import pytest
+
 from tools.device_meetings_tool import _available, device_meetings_tool
 
 
@@ -50,7 +52,7 @@ def test_device_meetings_profile_scope_flow_uses_scoped_credentials(monkeypatch)
 
     with mux_profile_scope(monkeypatch, scope, poison_environ=True):
         assert _available() is True
-        with patch("urllib.request.urlopen", open_):
+        with patch("tools.device_meetings_tool.urlopen_hardened", open_):
             result = device_meetings_tool({"action": "list", "limit": 1, "offset": 0})
 
     assert json.loads(result) == {"meetings": []}
@@ -89,7 +91,7 @@ def test_device_meetings_unwraps_local_server_envelope_and_bounds_args(monkeypat
         return Response()
 
     with mux_profile_scope(monkeypatch, scope):
-        with patch("urllib.request.urlopen", open_):
+        with patch("tools.device_meetings_tool.urlopen_hardened", open_):
             result = device_meetings_tool({"action": "list", "limit": 999, "offset": -4})
 
     assert json.loads(result) == {"meetings": [{"id": "m-1"}]}
@@ -123,7 +125,7 @@ def test_device_meetings_clamps_offset_to_bridge_limit(monkeypatch):
         return Response()
 
     with mux_profile_scope(monkeypatch, scope):
-        with patch("urllib.request.urlopen", open_):
+        with patch("tools.device_meetings_tool.urlopen_hardened", open_):
             device_meetings_tool({"action": "list", "offset": 999999})
 
     assert seen["url"].endswith("/api/v1/internal/meetings?limit=20&offset=100000")
@@ -157,7 +159,7 @@ def test_device_meetings_failures_are_stable_and_retry_transient_http(monkeypatc
         return Response()
 
     with mux_profile_scope(monkeypatch, scope):
-        with patch("urllib.request.urlopen", open_):
+        with patch("tools.device_meetings_tool.urlopen_hardened", open_):
             result = device_meetings_tool({"action": "list"})
 
     assert calls["count"] == 2
@@ -179,3 +181,33 @@ def test_device_meetings_rejects_credentials_in_base_url(monkeypatch):
     with mux_profile_scope(monkeypatch, scope):
         assert _available() is False
         assert json.loads(device_meetings_tool({"action": "list"}))["error"]["code"] == "unavailable"
+
+
+@pytest.mark.parametrize("bad_url", [
+    "https://127.0.0.1:9420/api/v1/internal/chat/append",
+    "http://192.168.1.10:9420/api/v1/internal/chat/append",
+    "http://evil.example/api/v1/internal/chat/append",
+    "http://127.attacker.example/api/v1/internal/chat/append",
+])
+def test_device_meetings_refuses_non_loopback_base_without_request(monkeypatch, bad_url):
+    from tests.tools._profile_scope import mux_profile_scope
+
+    scope = {
+        "ZET_CHAT_APPEND_URL": bad_url,
+        "ZETTLAB_AGENT_ACTION_TOKEN": "scoped-token",
+    }
+    with mux_profile_scope(monkeypatch, scope):
+        assert _available() is False
+        with patch(
+            "tools.device_meetings_tool.urlopen_hardened",
+            side_effect=AssertionError("must not send token"),
+        ):
+            result = device_meetings_tool({"action": "list"})
+    assert json.loads(result)["error"]["code"] == "unavailable"
+
+
+def test_device_meetings_uses_shared_hardened_transport():
+    from tools.device_meetings_tool import urlopen_hardened as local_transport
+    from tools.loopback_transport import urlopen_hardened as shared_transport
+
+    assert local_transport is shared_transport

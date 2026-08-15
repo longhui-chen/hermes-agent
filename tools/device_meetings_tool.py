@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.secret_scope import get_secret
+from tools.loopback_transport import is_trusted_loopback_http, urlopen_hardened
 from tools.registry import registry
 
 
@@ -70,8 +71,8 @@ def _base() -> str | None:
     except ValueError:
         return None
     if (
-        parts.scheme not in {"http", "https"}
-        or not parts.netloc
+        not parts.netloc
+        or not is_trusted_loopback_http(parts)
         or parts.username is not None
         or parts.password is not None
     ):
@@ -149,9 +150,7 @@ def _decode_response(raw: bytes) -> str:
 def _read_response(request: urllib.request.Request) -> str:
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            with urllib.request.urlopen(
-                request, timeout=_REQUEST_TIMEOUT_SECONDS
-            ) as response:
+            with urlopen_hardened(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
                 status = getattr(response, "status", 200)
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
             if len(raw) > _MAX_RESPONSE_BYTES:
