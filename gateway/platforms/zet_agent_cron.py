@@ -213,6 +213,129 @@ def _post_channel_chunk(url: str, token: str, kind: str, text: str, job_id: str)
     return f"channel:{kind} delivery failed: {detail or body[:200]}"
 
 
+_REFRESH_PERMIT_PATH = "/api/v1/internal/apps/refresh_permit"
+# How long a "this agent has no bound app" answer is trusted. Bindings change
+# rarely, but a profile can BECOME a maintainer's after app creation, so the
+# negative answer must expire rather than last the gateway's lifetime.
+_REFRESH_PERMIT_NEG_TTL = 600.0
+_REFRESH_PERMIT_TIMEOUT = 3.0
+_refresh_permit_neg_cache: dict = {}
+
+
+def _resolve_local_server_origin() -> str:
+    """Derive local-server's origin from ZET_CHAT_APPEND_URL (same derivation
+    as _resolve_channel_send_url, minus the path)."""
+    raw = _scoped_env("ZET_CHAT_APPEND_URL").strip()
+    if not raw:
+        return ""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+def _governor_refresh_defer(job: Optional[dict]) -> Optional[tuple]:
+    """Ask local-server whether this maintainer profile may refresh now.
+
+    Runs BEFORE an agent turn is spent: under memory pressure local-server's
+    governor answers defer with a retry interval, and the caller postpones
+    the job (defer_job) instead of running into a wall. Returns
+    (retry_seconds, reason) when the run should be deferred, None to run.
+
+    Fail-open everywhere — no token/URL, unreachable server, unparsable
+    answer all mean "run": the gate is an optimization for pressured
+    devices, never a dependency. An agent with no bound app (404) is cached
+    negatively so ordinary agents pay one lookup per TTL, not one per fire.
+    """
+    if not isinstance(job, dict) or not job.get("id"):
+        return None
+    token = _scoped_env("ZETTLAB_AGENT_ACTION_TOKEN").strip()
+    origin = _resolve_local_server_origin()
+    if not token or not origin:
+        return None
+    agent_key = _scoped_env("ZET_AGENT_ID").strip() or "?"
+    try:
+        import time as _time
+        cached = _refresh_permit_neg_cache.get(agent_key)
+        if cached and (_time.monotonic() - cached) < _REFRESH_PERMIT_NEG_TTL:
+            return None
+    except Exception:
+        pass
+    try:
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            origin + _REFRESH_PERMIT_PATH,
+            data=b"{}",
+            headers={_ACTION_TOKEN_HEADER: token, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_REFRESH_PERMIT_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                status = resp.status
+        except urllib.error.HTTPError as http_err:
+            body = ""
+            try:
+                body = http_err.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            status = http_err.code
+        if status == 404:
+            # Not a maintainer profile: nothing to gate, remember for a while.
+            import time as _time
+            _refresh_permit_neg_cache[agent_key] = _time.monotonic()
+            return None
+        if status != 200:
+            return None
+        parsed = json.loads(body)
+        if not isinstance(parsed, dict) or parsed.get("decision") != "defer":
+            return None
+        retry_s = parsed.get("retry_in_seconds") or 60
+        reason = str(parsed.get("reason") or "governor")
+        return (max(30.0, float(retry_s)), reason)
+    except Exception:
+        return None
+
+
+def _gate_run_one_job(orig_run_one_job, job, **kwargs):
+    """Governor refresh gate around one job firing.
+
+    On a defer decision the run is skipped entirely — no agent turn, no
+    output file, no chat card — and the next slot is pushed out via
+    defer_job. Returns True ("processed") for the skip; otherwise the
+    original firing body decides. Extracted so the gate is unit-testable
+    against a stub original.
+    """
+    defer_info = _governor_refresh_defer(job)
+    if defer_info is not None:
+        retry_s, reason = defer_info
+        try:
+            from cron.jobs import defer_job as _defer_job
+
+            deferred = _defer_job(
+                job["id"],
+                seconds=retry_s,
+                reason=f"governor:{reason}",
+            )
+            if deferred is None:
+                _dbg(
+                    f"governor defer: job {job.get('id')} vanished; "
+                    "slot folds away"
+                )
+        except Exception as defer_err:
+            # The gate decided but the push failed (lock/CAS contention).
+            # The slot is gone either way; the job fires at its natural next
+            # slot and the gate is asked again.
+            _dbg(
+                f"governor defer: defer_job failed for "
+                f"{job.get('id')}: {defer_err!r}"
+            )
+        return True  # processed: nothing ran, nothing to deliver
+    return orig_run_one_job(job, **kwargs)
+
+
 def _send_to_channel(kind: str, content: str, job_id: str):
     """Deliver a cron result to a bound IM channel via local-server. Returns an
     error string on failure, or None on success — the caller folds the error
@@ -841,6 +964,26 @@ def install() -> None:
             _dbg("install() patched run_job OK")
     except Exception as _e:
         _dbg(f"install() run_job patch FAILED: {_e!r}")
+
+    # ── governor refresh gate — defer BEFORE an agent turn is spent ────────
+    # run_one_job is the shared firing body for both the built-in ticker and
+    # an external provider's fire_due, so gating here covers every dispatch
+    # path. A deferral skips the whole run (no agent, no output file, no
+    # chat card — a postponed refresh is invisible by design) and pushes the
+    # next slot out; the already-advanced current slot folds away, so a
+    # month of deferrals is one catch-up run later, never a backlog burst.
+    try:
+        if not getattr(_sched.run_one_job, _PATCH_SENTINEL, False):
+            _orig_run_one_job = _sched.run_one_job
+
+            def _gated_run_one_job(job, **kwargs):
+                return _gate_run_one_job(_orig_run_one_job, job, **kwargs)
+
+            setattr(_gated_run_one_job, _PATCH_SENTINEL, True)
+            _sched.run_one_job = _gated_run_one_job
+            _dbg("install() patched run_one_job (governor gate) OK")
+    except Exception as _e:
+        _dbg(f"install() run_one_job patch FAILED: {_e!r}")
 
     # ── scheduler delivery patch — keep Zettlab-specific delivery out of
     # upstream cron/scheduler.py. App cron output is persisted below in

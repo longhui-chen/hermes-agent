@@ -1,0 +1,94 @@
+"""defer_job: the governor's postponement primitive.
+
+A deferral keeps the job scheduled (unlike pause), never pulls a future
+slot earlier, and records deferred_at / defer_reason / defer_count for
+observability. The scheduler's at-most-once advance means the deferred slot
+simply folds away — a lapsed deferral is one catch-up run, not a backlog.
+"""
+
+import pytest
+
+from cron import jobs
+
+
+@pytest.fixture
+def hermes_env(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "scripts").mkdir()
+    (home / "cron").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import importlib
+    import hermes_constants
+    import cron.jobs as jobs_mod
+    import cron.scheduler  # noqa: F401 - ensures sibling module init
+
+    importlib.reload(hermes_constants)
+    importlib.reload(jobs_mod)
+    return home
+
+
+@pytest.fixture
+def interval_job(hermes_env):
+    job = jobs.create_job(
+        name="refresh",
+        schedule="every 30m",
+        prompt="refresh the app data",
+        deliver="local",
+    )
+    assert job is not None
+    return job
+
+
+def test_defer_pushes_next_run_and_stays_scheduled(interval_job):
+    # The real deferral scenario: the slot is due (the scheduler's at-most-once
+    # advance already consumed it), and the gate pushes the next one out.
+    from cron.jobs import _hermes_now
+
+    due = _hermes_now().isoformat()
+    jobs.update_job(interval_job["id"], {"next_run_at": due})
+    deferred = jobs.defer_job(interval_job["id"], seconds=300, reason="governor:memory_pressure")
+    assert deferred is not None
+    assert deferred["enabled"] is True, "a deferred job is not paused"
+    assert deferred["state"] == "scheduled"
+    assert deferred["defer_reason"] == "governor:memory_pressure"
+    assert deferred["defer_count"] == 1
+    assert deferred["deferred_at"] is not None
+    assert deferred["next_run_at"] > due
+
+
+def test_defer_never_pulls_a_future_slot_earlier(interval_job):
+    far_future = "2099-01-01T00:00:00+00:00"
+    jobs.update_job(interval_job["id"], {"next_run_at": far_future})
+    deferred = jobs.defer_job(interval_job["id"], seconds=60, reason="x")
+    assert deferred["next_run_at"] == far_future
+    # The deferral is still recorded even when the schedule was not moved.
+    assert deferred["defer_count"] == 1
+
+
+def test_defer_counts_consecutive_deferrals(interval_job):
+    jobs.defer_job(interval_job["id"], seconds=60, reason="a")
+    deferred = jobs.defer_job(interval_job["id"], seconds=300, reason="b")
+    assert deferred["defer_count"] == 2
+    assert deferred["defer_reason"] == "b"
+
+
+def test_defer_requires_exactly_one_time_argument(interval_job):
+    with pytest.raises(ValueError):
+        jobs.defer_job(interval_job["id"], reason="x")
+    with pytest.raises(ValueError):
+        jobs.defer_job(interval_job["id"], seconds=60, until="2099-01-01T00:00:00+00:00")
+
+
+def test_defer_until_accepts_iso_timestamp(interval_job):
+    deferred = jobs.defer_job(
+        interval_job["id"],
+        until="2098-06-01T12:00:00+00:00",
+        reason="planned window",
+    )
+    assert deferred is not None
+    assert deferred["next_run_at"].startswith("2098-06-01T12:00:00")
+
+
+def test_defer_unknown_job_returns_none(hermes_env):
+    assert jobs.defer_job("no-such-job", seconds=60) is None
