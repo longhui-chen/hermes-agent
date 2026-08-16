@@ -1,62 +1,62 @@
-"""Unit tests for the sessions delete-agent filter (TB-20260814-012 延后项 2)."""
-
-from hermes_cli.sessions_cmd import _filter_agent_session_ids
-
-
-def test_filter_agent_session_ids_scopes_to_agent():
-    rows = [
-        {"id": "zettlab:alice:agent-a:one"},
-        {"id": "zettlab:alice:agent-a:two"},
-        {"id": "zettlab:alice:agent-b:one"},
-        # lookalike: tail contains ":agent-a:" but the agent segment is agent-b
-        {"id": "zettlab:alice:agent-b:tail:agent-a:lookalike"},
-        {"id": "20260430_cli_xyz"},  # non-zettlab prefix
-        {"id": "cron_job-aaa_20260508_073000"},  # cron shape
-    ]
-    got = _filter_agent_session_ids(rows, "agent-a")
-    assert got == ["zettlab:alice:agent-a:one", "zettlab:alice:agent-a:two"]
-
-
-def test_filter_agent_session_ids_cross_user_allowed():
-    rows = [{"id": "zettlab:bob:agent-a:abc"}]
-    assert _filter_agent_session_ids(rows, "agent-a") == ["zettlab:bob:agent-a:abc"]
-
-
-def test_filter_agent_session_ids_empty_agent_returns_nothing():
-    rows = [{"id": "zettlab:alice:agent-a:one"}]
-    assert _filter_agent_session_ids(rows, "") == []
+"""Tests for SessionDB.delete_sessions_for_agent (TB-20260814-012 延后项 2 + Codex P1)."""
 
 import sqlite3
 
-from hermes_cli.sessions_cmd import _collect_descendant_session_ids
+from hermes_state import SessionDB
 
 
-def test_collect_descendant_session_ids_walks_compression_chain():
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)")
-    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("zettlab:alice:agent-a:root", None))
-    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("20260518_120000_abc123", "zettlab:alice:agent-a:root"))
-    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("20260518_130000_def456", "20260518_120000_abc123"))
-    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("zettlab:alice:agent-b:other", None))
-
-    got = _collect_descendant_session_ids(conn, ["zettlab:alice:agent-a:root"], "agent-a")
-    assert set(got) == {
-        "zettlab:alice:agent-a:root",
-        "20260518_120000_abc123",
-        "20260518_130000_def456",
-    }
+def _seed(db_path, rows):
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    for sid, parent, archived in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, user_id, started_at, archived, parent_session_id)"
+            " VALUES (?, 'zettlab', 'alice', 100.0, ?, ?)",
+            (sid, archived, parent),
+        )
+    conn.commit()
+    conn.close()
 
 
-def test_collect_descendant_skips_other_agent_zettlab_child():
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)")
-    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("zettlab:alice:agent-a:root", None))
-    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("20260518_120000_abc123", "zettlab:alice:agent-a:root"))
-    # fork 到别的 agent 的 zettlab 子会话——不能误删。
-    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("zettlab:alice:agent-b:forked", "zettlab:alice:agent-a:root"))
+def test_delete_sessions_for_agent_deletes_roots_descendants_and_archived(tmp_path):
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [
+        ("zettlab:alice:agent-a:root", None, 0),
+        ("zettlab:alice:agent-a:archived", None, 1),
+        # 压缩 continuation（timestamp-hex，继承根所有权）及其下一级。
+        ("20260518_120000_abc123", "zettlab:alice:agent-a:root", 0),
+        ("20260518_130000_def456", "20260518_120000_abc123", 0),
+        # fork 到别的 agent 的子会话——不得误删。
+        ("zettlab:alice:agent-b:forked", "zettlab:alice:agent-a:root", 0),
+        # 别的 agent 的独立会话——不得删。
+        ("zettlab:alice:agent-b:other", None, 0),
+    ])
 
-    got = _collect_descendant_session_ids(conn, ["zettlab:alice:agent-a:root"], "agent-a")
-    assert set(got) == {"zettlab:alice:agent-a:root", "20260518_120000_abc123"}
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
 
+    assert deleted == 4  # root + archived + 2 级 continuation
+
+    conn = sqlite3.connect(db_path)
+    remaining = {r[0] for r in conn.execute("SELECT id FROM sessions")}
+    conn.close()
+    assert remaining == {"zettlab:alice:agent-b:forked", "zettlab:alice:agent-b:other"}
+
+
+def test_delete_sessions_for_agent_no_roots_returns_zero(tmp_path):
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [("zettlab:alice:agent-b:other", None, 0)])
+
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+    assert deleted == 0

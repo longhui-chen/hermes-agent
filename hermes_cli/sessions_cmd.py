@@ -155,61 +155,6 @@ def _confirm_prompt(prompt: str) -> bool:
         return False
 
 
-def _filter_agent_session_ids(rows, agent_id):
-    """Return the ids in rows that belong to agent_id.
-
-    Mirrors local-server's sessionBelongsToAgent shape: zettlab:<user>:<agent>:<rand>,
-    comparing the agent segment (parts[2]) to agent_id. A LIKE '%:<agent>:%' would
-    span ':' boundaries and wrongly match a lookalike tail, so split and compare
-    the exact segment. Device-wide: cross-user is allowed; only the agent segment
-    matters.
-    """
-    ids = []
-    for row in rows:
-        sid = str(row.get("id") or "")
-        parts = sid.split(":")
-        if sid.startswith("zettlab:") and len(parts) >= 4 and parts[2] == agent_id:
-            ids.append(sid)
-    return ids
-
-
-def _collect_descendant_session_ids(conn, root_ids, agent_id):
-    """Recursively collect every child along parent_session_id.
-
-    Compression continuations carry a timestamp-hex id (e.g. YYYYMMDD_HHMMSS_<hex>),
-    not the zettlab:<user>:<agent>:<rand> shape, so _filter_agent_session_ids misses
-    them; delete_sessions would then orphan (not delete) the continuation. Walk
-    parent_session_id so the whole chain is deleted instead of resurrecting old chat.
-
-    Safety: a zettlab: descendant whose agent segment differs from agent_id (reachable
-    via _handle_fork_session, which forks onto any resolved source session) must NOT be
-    deleted — re-check parts[2] == agent_id for zettlab: ids. Timestamp-hex ids carry
-    no independent owner, so they inherit the root's ownership and are collected.
-    """
-    seeds = {sid for sid in root_ids if sid}
-    found = set(seeds)
-    frontier = list(seeds)
-    while frontier:
-        ph = ",".join("?" * len(frontier))
-        cursor = conn.execute(
-            f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
-            frontier,
-        )
-        nxt = []
-        for row in cursor.fetchall():
-            sid = row["id"]
-            if sid in found:
-                continue
-            if sid.startswith("zettlab:"):
-                parts = sid.split(":")
-                if len(parts) < 4 or parts[2] != agent_id:
-                    continue
-            found.add(sid)
-            nxt.append(sid)
-        frontier = nxt
-    return list(found)
-
-
 def cmd_sessions(args, sessions_parser=None):
     import json as _json
 
@@ -957,40 +902,16 @@ def cmd_sessions(args, sessions_parser=None):
             print("Error: agent_id is required.")
             return 2
         sessions_dir = get_hermes_home() / "sessions"
-        ids: list = []
-        offset = 0
-        while True:
-            rows = db.list_sessions_rich(
-                limit=200,
-                offset=offset,
-                compact_rows=True,
-                project_compression_tips=False,
-                # 契约是"删除所有聊天"：归档会话、压缩 continuation、delegate 子会话
-                # 都要一并枚举，否则删压缩根会把 continuation 置为孤立根、旧聊天复活。
-                include_archived=True,
-                include_children=True,
-            )
-            if not rows:
-                break
-            ids.extend(_filter_agent_session_ids(rows, agent_id))
-            if len(rows) < 200:
-                break
-            offset += len(rows)
-        if ids:
-            # 沿 parent_session_id 递归收集 compression continuation（其 id 是
-            # timestamp-hex 形而非 zettlab 形，会被 _filter_agent_session_ids 漏掉；
-            # delete_sessions 会把漏掉的 continuation 置成孤立根、旧聊天复活）。
-            ids = _collect_descendant_session_ids(db._conn, ids, agent_id)
-        if not ids:
-            print(f"Deleted 0 session(s) for agent '{agent_id}'.")
-            return
         if not args.yes:
             if not _confirm_prompt(
-                f"Delete {len(ids)} chat session(s) for agent '{agent_id}'? [y/N] "
+                f"Delete all chat sessions for agent '{agent_id}'? [y/N] "
             ):
                 print("Cancelled.")
                 return
-        deleted = db.delete_sessions(ids, sessions_dir=sessions_dir)
+        # 原子收集 + 删除（Codex P1 finding 2）：枚举根、沿 parent_session_id 收集压缩
+        # continuation、删除都在 SessionDB.delete_sessions_for_agent 的同一个写事务里，
+        # 并发压缩产生的 continuation 不会被漏删成孤立根。
+        deleted = db.delete_sessions_for_agent(agent_id, sessions_dir=sessions_dir)
         print(f"Deleted {deleted} session(s) for agent '{agent_id}'.")
 
     elif action in ("prune", "archive"):

@@ -8935,6 +8935,74 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, sid)
         return count
 
+    def delete_sessions_for_agent(self, agent_id: str, sessions_dir: Optional[Path] = None) -> int:
+        """Delete every session belonging to *agent_id* (roots + descendants) atomically.
+
+        The descendant walk and the delete run in ONE write transaction, so a
+        compression that lands a new continuation mid-delete cannot be orphaned
+        (Codex P1 on TB-20260814-012). Roots are zettlab:<user>:<agent>:<rand>
+        rows matching parts[2] == agent_id. Descendants are walked recursively
+        along parent_session_id: a zettlab: descendant whose agent segment
+        differs is skipped (a fork can hang another agent's session under a
+        source session); a timestamp-hex continuation carries no independent
+        owner and inherits the root's ownership.
+        """
+        removed_ids: list = []
+        removed_delegate_ids: list = []
+
+        def _do(conn):
+            roots: list = []
+            cursor = conn.execute("SELECT id FROM sessions WHERE id LIKE 'zettlab:%'")
+            for row in cursor.fetchall():
+                sid = row["id"]
+                parts = sid.split(":")
+                if len(parts) >= 4 and parts[2] == agent_id:
+                    roots.append(sid)
+            if not roots:
+                return 0
+
+            found = set(roots)
+            frontier = list(roots)
+            while frontier:
+                ph = ",".join("?" * len(frontier))
+                cur = conn.execute(
+                    f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
+                    frontier,
+                )
+                nxt = []
+                for row in cur.fetchall():
+                    sid = row["id"]
+                    if sid in found:
+                        continue
+                    if sid.startswith("zettlab:"):
+                        p = sid.split(":")
+                        if len(p) < 4 or p[2] != agent_id:
+                            continue
+                    found.add(sid)
+                    nxt.append(sid)
+                frontier = nxt
+
+            all_ids = list(found)
+            ph = ",".join("?" * len(all_ids))
+            removed_delegate_ids.extend(_delete_delegate_children(conn, all_ids))
+            conn.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({ph})",
+                all_ids,
+            )
+            conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", all_ids)
+            conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", all_ids)
+            self._delete_unreferenced_system_prompts(conn)
+            removed_ids.extend(all_ids)
+            return len(all_ids)
+
+        count = self._execute_write(_do)
+        for sid in removed_delegate_ids:
+            self._remove_session_files(sessions_dir, sid)
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return count
+
     def count_empty_sessions(self) -> int:
         """Return the count of empty, non-active, non-archived sessions.
 
