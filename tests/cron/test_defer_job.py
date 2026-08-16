@@ -94,6 +94,29 @@ def test_defer_unknown_job_returns_none(hermes_env):
     assert jobs.defer_job("no-such-job", seconds=60) is None
 
 
+def test_mark_job_run_honors_deferred_until_watermark(interval_job):
+    # A user defers a job that is already claimed and running. When the run
+    # completes, mark_job_run must honor the defer watermark instead of
+    # recomputing the natural next slot and silently dropping the deferral.
+    from cron.jobs import _hermes_now
+    now = _hermes_now()
+    jobs.update_job(
+        interval_job["id"],
+        {
+            "next_run_at": now.isoformat(),
+            "fire_claim": {"at": now.isoformat(), "fire_at": now.isoformat()},
+            "in_flight_occurrence": {"scheduled_at": now.isoformat()},
+        },
+    )
+    deferred = jobs.defer_job(interval_job["id"], seconds=3600, reason="user")
+    assert deferred["deferred_until"] is not None
+
+    jobs.mark_job_run(interval_job["id"], success=True)
+    updated = jobs.resolve_job_ref(interval_job["id"])
+    # 3600s > the natural 30m interval, so the deferral is the later value.
+    assert updated["next_run_at"] == deferred["deferred_until"]
+
+
 def test_defer_clear_claim_terminates_occurrence_when_next_run_does_not_move(interval_job):
     # Regression: the governor's pre-execution gate consumes the occurrence
     # without running it. When the natural next slot is later than the retry

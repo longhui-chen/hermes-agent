@@ -2764,6 +2764,12 @@ def defer_job(
             "deferred_at": now_dt.isoformat(),
             "defer_reason": reason,
             "defer_count": int(job.get("defer_count") or 0) + 1,
+            # Persist the absolute defer watermark separately: mark_job_run
+            # recomputes next_run_at from the schedule on completion and would
+            # otherwise overwrite a long user deferral with the natural next
+            # slot. mark_job_run honors the later of the two and clears the
+            # watermark once it has passed.
+            "deferred_until": new_next,
         }
         if clear_claim:
             # The governor's pre-execution gate consumes the current occurrence
@@ -2911,6 +2917,20 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["next_run_at"] = compute_next_run(
                     job["schedule"], next_run_base, tz_name=job.get("timezone")
                 )
+                # A user deferral during this run is a "no earlier than"
+                # watermark: honor it over the natural next slot, then clear it
+                # once it has been consumed or has passed.
+                deferred_until = job.get("deferred_until")
+                if deferred_until is not None:
+                    deferred_dt = _parse_occurrence_instant(deferred_until)
+                    if deferred_dt is not None:
+                        computed_dt = _parse_occurrence_instant(job["next_run_at"])
+                        if computed_dt is None or deferred_dt > computed_dt:
+                            job["next_run_at"] = deferred_until
+                        else:
+                            job.pop("deferred_until", None)
+                    else:
+                        job.pop("deferred_until", None)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
