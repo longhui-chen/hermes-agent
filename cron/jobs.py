@@ -2718,41 +2718,45 @@ def defer_job(
     """
     if (seconds is None) == (until is None):
         raise ValueError("defer_job requires exactly one of seconds or until")
-    job = resolve_job_ref(job_id)
-    if not job:
-        return None
-    now_dt = _hermes_now()
-    if seconds is not None:
-        retry_dt = now_dt + timedelta(seconds=max(0.0, float(seconds)))
-    else:
-        try:
-            retry_dt = datetime.fromisoformat(str(until))
-        except ValueError:
-            raise ValueError("until must be an ISO-8601 timestamp") from None
-        if retry_dt.tzinfo is None:
-            retry_dt = retry_dt.replace(tzinfo=now_dt.tzinfo)
-    new_next = retry_dt.isoformat()
-    current = job.get("next_run_at")
-    if current:
-        try:
-            cur_dt = datetime.fromisoformat(str(current))
-            if cur_dt.tzinfo is None:
-                cur_dt = cur_dt.replace(tzinfo=now_dt.tzinfo)
-            if cur_dt > retry_dt:
-                # Never move a scheduled future slot earlier: a deferral is
-                # a postponement, not a run-now.
-                new_next = current
-        except ValueError:
-            pass
-    return update_job(
-        job["id"],
-        {
-            "next_run_at": new_next,
-            "deferred_at": now_dt.isoformat(),
-            "defer_reason": reason,
-            "defer_count": int(job.get("defer_count") or 0) + 1,
-        },
-    )
+    with _jobs_lock():
+        # Re-read and compute inside the lock: a defer decided against a stale
+        # snapshot would otherwise overwrite a newer next_run_at / defer_count
+        # written by the scheduler's advance, another defer, or a user edit.
+        job = resolve_job_ref(job_id)
+        if not job:
+            return None
+        now_dt = _hermes_now()
+        if seconds is not None:
+            retry_dt = now_dt + timedelta(seconds=max(0.0, float(seconds)))
+        else:
+            try:
+                retry_dt = datetime.fromisoformat(str(until))
+            except ValueError:
+                raise ValueError("until must be an ISO-8601 timestamp") from None
+            if retry_dt.tzinfo is None:
+                retry_dt = retry_dt.replace(tzinfo=now_dt.tzinfo)
+        new_next = retry_dt.isoformat()
+        current = job.get("next_run_at")
+        if current:
+            try:
+                cur_dt = datetime.fromisoformat(str(current))
+                if cur_dt.tzinfo is None:
+                    cur_dt = cur_dt.replace(tzinfo=now_dt.tzinfo)
+                if cur_dt > retry_dt:
+                    # Never move a scheduled future slot earlier: a deferral is
+                    # a postponement, not a run-now.
+                    new_next = current
+            except ValueError:
+                pass
+        return update_job(
+            job["id"],
+            {
+                "next_run_at": new_next,
+                "deferred_at": now_dt.isoformat(),
+                "defer_reason": reason,
+                "defer_count": int(job.get("defer_count") or 0) + 1,
+            },
+        )
 
 
 def remove_job(job_id: str) -> bool:

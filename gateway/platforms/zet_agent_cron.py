@@ -219,6 +219,10 @@ _REFRESH_PERMIT_PATH = "/api/v1/internal/apps/refresh_permit"
 # negative answer must expire rather than last the gateway's lifetime.
 _REFRESH_PERMIT_NEG_TTL = 600.0
 _REFRESH_PERMIT_TIMEOUT = 3.0
+# The permit answer is a tiny JSON decision; a larger body means local-server
+# is misbehaving or the request was misrouted, so fail open instead of buffering
+# an unbounded stream on a 2 GB device.
+_REFRESH_PERMIT_MAX_BODY = 8192
 _refresh_permit_neg_cache: dict = {}
 
 
@@ -273,19 +277,37 @@ def _governor_refresh_defer(job: Optional[dict]) -> Optional[tuple]:
         )
         try:
             with urllib.request.urlopen(req, timeout=_REFRESH_PERMIT_TIMEOUT) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+                cl = resp.headers.get("Content-Length")
+                if cl is not None:
+                    try:
+                        if int(cl) > _REFRESH_PERMIT_MAX_BODY:
+                            return None
+                    except ValueError:
+                        pass
+                raw = resp.read(_REFRESH_PERMIT_MAX_BODY + 1)
+                if len(raw) > _REFRESH_PERMIT_MAX_BODY:
+                    return None
+                body = raw.decode("utf-8", errors="replace")
                 status = resp.status
         except urllib.error.HTTPError as http_err:
             body = ""
             try:
-                body = http_err.read().decode("utf-8", errors="replace")
+                body = http_err.read(_REFRESH_PERMIT_MAX_BODY + 1).decode("utf-8", errors="replace")
             except Exception:
                 pass
             status = http_err.code
         if status == 404:
             # Not a maintainer profile: nothing to gate, remember for a while.
+            # Sweep expired entries on every 404 write and cap the dict so
+            # profile churn cannot grow this resident cache without bound.
             import time as _time
-            _refresh_permit_neg_cache[agent_key] = _time.monotonic()
+            now = _time.monotonic()
+            for k in [k for k, ts in _refresh_permit_neg_cache.items()
+                      if now - ts >= _REFRESH_PERMIT_NEG_TTL]:
+                _refresh_permit_neg_cache.pop(k, None)
+            _refresh_permit_neg_cache[agent_key] = now
+            while len(_refresh_permit_neg_cache) > 256:
+                _refresh_permit_neg_cache.pop(next(iter(_refresh_permit_neg_cache)), None)
             return None
         if status != 200:
             return None
@@ -332,6 +354,17 @@ def _gate_run_one_job(orig_run_one_job, job, **kwargs):
                 f"governor defer: defer_job failed for "
                 f"{job.get('id')}: {defer_err!r}"
             )
+        # The execution was already created (claimed) before the gate; a
+        # defer skips the run entirely, so terminalize it here or it stays
+        # claimed forever (the ledger only prunes terminal rows, and
+        # same-process recovery skips our own claimed rows).
+        execution_id = job.get("execution_id")
+        if execution_id:
+            try:
+                from cron.executions import finish_execution
+                finish_execution(execution_id, success=True, delivery_outcome="suppressed")
+            except Exception:
+                _dbg(f"governor defer: finish_execution failed for {execution_id!r}")
         return True  # processed: nothing ran, nothing to deliver
     return orig_run_one_job(job, **kwargs)
 

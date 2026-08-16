@@ -35,9 +35,12 @@ class _FakeResponse:
     def __init__(self, status, body):
         self.status = status
         self._body = body.encode("utf-8")
+        self.headers = {}
 
-    def read(self):
-        return self._body
+    def read(self, amt=None):
+        if amt is None:
+            return self._body
+        return self._body[:amt]
 
     def __enter__(self):
         return self
