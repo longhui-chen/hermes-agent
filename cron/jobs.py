@@ -2492,7 +2492,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_job(job_id: str, updates: Dict[str, Any], *, preserve_claim: bool = False) -> Optional[Dict[str, Any]]:
     """Update a job, optionally guarded by its server-owned edit revision.
 
     ``expected_revision`` is an optional compare-and-swap fence used by the
@@ -2625,11 +2625,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 key in updates and updates.get(key) != job.get(key)
                 for key in ("schedule", "timezone", "next_run_at", "enabled", "state")
             )
-            if trigger_identity_changed:
+            if trigger_identity_changed and not preserve_claim:
                 # A claim identifies the exact schedule occurrence that was
                 # active when it was created. User pause/resume/reschedule must
                 # invalidate that identity before a delayed provider retry can
-                # recover it.
+                # recover it. ``preserve_claim`` is set only by the defer path:
+                # a defer is a postponement, not a reschedule, so a still-firing
+                # occurrence must keep its claim instead of admitting a duplicate
+                # concurrent run.
                 updated["fire_claim"] = None
                 updated["in_flight_occurrence"] = None
 
@@ -2774,7 +2777,7 @@ def defer_job(
             # a duplicate concurrent run.
             updates["fire_claim"] = None
             updates["in_flight_occurrence"] = None
-        return update_job(job["id"], updates)
+        return update_job(job["id"], updates, preserve_claim=not clear_claim)
 
 
 def remove_job(job_id: str) -> bool:

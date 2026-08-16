@@ -239,6 +239,50 @@ def _resolve_local_server_origin() -> str:
     return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
 
 
+def _read_permit_body_bounded(resp, max_bytes: int) -> Optional[bytes]:
+    """Read a tiny permit response with a hard wall-clock deadline.
+
+    ``urlopen(timeout=...)`` sets a per-recv socket timeout, NOT a total
+    deadline: a server that drips one byte per window keeps recv from timing
+    out and can hold this cron worker open indefinitely. A worker thread does
+    the (possibly blocked) read while the caller waits on the deadline; on
+    expiry the response is closed, which unblocks the read (OSError) and we
+    fail open. Returns None on overrun/oversize/error.
+    """
+    import threading
+    result: dict = {}
+
+    def _read() -> None:
+        raw = b""
+        try:
+            while len(raw) <= max_bytes:
+                chunk = resp.read(min(4096, max_bytes + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw += chunk
+            result["raw"] = raw
+        except Exception as exc:  # fail-open boundary
+            result["err"] = exc
+
+    worker = threading.Thread(target=_read, daemon=True)
+    worker.start()
+    worker.join(_REFRESH_PERMIT_TIMEOUT)
+    if worker.is_alive():
+        # Deadline exceeded: close the response so the blocked read raises and
+        # the worker exits; fail open.
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return None
+    if "err" in result:
+        return None
+    raw = result.get("raw", b"")
+    if len(raw) > max_bytes:
+        return None
+    return raw
+
+
 def _governor_refresh_defer(job: Optional[dict]) -> Optional[tuple]:
     """Ask local-server whether this maintainer profile may refresh now.
 
@@ -284,29 +328,17 @@ def _governor_refresh_defer(job: Optional[dict]) -> Optional[tuple]:
                             return None
                     except ValueError:
                         pass
-                # urlopen's timeout is a per-recv socket timeout, NOT a total
-                # deadline: a server that drips one byte per window keeps recv
-                # from ever timing out and could hold this cron worker open for
-                # hours. Bound the whole read against a wall-clock deadline and
-                # fail open once it passes.
-                import time as _time
-                deadline = _time.monotonic() + _REFRESH_PERMIT_TIMEOUT
-                raw = b""
-                while len(raw) <= _REFRESH_PERMIT_MAX_BODY:
-                    if _time.monotonic() >= deadline:
-                        return None
-                    chunk = resp.read(min(4096, _REFRESH_PERMIT_MAX_BODY + 1 - len(raw)))
-                    if not chunk:
-                        break
-                    raw += chunk
-                if len(raw) > _REFRESH_PERMIT_MAX_BODY:
+                raw = _read_permit_body_bounded(resp, _REFRESH_PERMIT_MAX_BODY)
+                if raw is None:
                     return None
                 body = raw.decode("utf-8", errors="replace")
                 status = resp.status
         except urllib.error.HTTPError as http_err:
             body = ""
             try:
-                body = http_err.read(_REFRESH_PERMIT_MAX_BODY + 1).decode("utf-8", errors="replace")
+                raw = _read_permit_body_bounded(http_err, _REFRESH_PERMIT_MAX_BODY)
+                if raw is not None:
+                    body = raw.decode("utf-8", errors="replace")
             except Exception:
                 pass
             status = http_err.code

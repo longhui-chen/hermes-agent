@@ -118,18 +118,23 @@ def test_defer_clear_claim_terminates_occurrence_when_next_run_does_not_move(int
 
 
 def test_defer_preserves_claim_when_not_clearing(interval_job):
-    # The generic (user/API) defer must NOT clear a claim: a job may be
-    # genuinely firing, and clearing its claim would admit a duplicate
-    # concurrent run.
-    far_future = "2099-01-01T00:00:00+00:00"
-    jobs.update_job(interval_job["id"], {"next_run_at": far_future})
+    # The generic (user/API) defer must NOT clear a still-firing occurrence's
+    # claim, even when it moves next_run_at forward — that forward move would
+    # otherwise trip update_job's trigger-identity auto-clear and admit a
+    # duplicate concurrent run.
+    from cron.jobs import _hermes_now
+    near = _hermes_now().isoformat()
+    jobs.update_job(interval_job["id"], {"next_run_at": near})
     jobs.update_job(
         interval_job["id"],
         {
-            "fire_claim": {"at": far_future, "fire_at": far_future},
-            "in_flight_occurrence": {"scheduled_at": far_future},
+            "fire_claim": {"at": near, "fire_at": near},
+            "in_flight_occurrence": {"scheduled_at": near},
         },
     )
-    deferred = jobs.defer_job(interval_job["id"], seconds=60, reason="user")
+    # 3600s pushes next_run_at well past `near`, so trigger_identity_changed is
+    # True inside update_job; the claim must still survive.
+    deferred = jobs.defer_job(interval_job["id"], seconds=3600, reason="user")
+    assert deferred["next_run_at"] != near
     assert deferred.get("fire_claim") is not None
     assert deferred.get("in_flight_occurrence") is not None
