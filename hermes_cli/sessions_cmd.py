@@ -173,6 +173,28 @@ def _filter_agent_session_ids(rows, agent_id):
     return ids
 
 
+def _collect_descendant_session_ids(conn, root_ids):
+    """Recursively collect every child along parent_session_id.
+
+    Compression continuations carry a timestamp-hex id (e.g. YYYYMMDD_HHMMSS_<hex>),
+    not the zettlab:<user>:<agent>:<rand> shape, so _filter_agent_session_ids misses
+    them; delete_sessions would then orphan (not delete) the continuation. Walk
+    parent_session_id so the whole chain is deleted instead of resurrecting old chat.
+    """
+    seeds = {sid for sid in root_ids if sid}
+    found = set(seeds)
+    frontier = list(seeds)
+    while frontier:
+        ph = ",".join("?" * len(frontier))
+        cursor = conn.execute(
+            f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
+            frontier,
+        )
+        frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
+        found.update(frontier)
+    return list(found)
+
+
 def cmd_sessions(args, sessions_parser=None):
     import json as _json
 
@@ -939,6 +961,11 @@ def cmd_sessions(args, sessions_parser=None):
             if len(rows) < 200:
                 break
             offset += len(rows)
+        if ids:
+            # 沿 parent_session_id 递归收集 compression continuation（其 id 是
+            # timestamp-hex 形而非 zettlab 形，会被 _filter_agent_session_ids 漏掉；
+            # delete_sessions 会把漏掉的 continuation 置成孤立根、旧聊天复活）。
+            ids = _collect_descendant_session_ids(db._conn, ids)
         if not ids:
             print(f"Deleted 0 session(s) for agent '{agent_id}'.")
             return
