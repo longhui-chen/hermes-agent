@@ -928,6 +928,10 @@ def cmd_sessions(args, sessions_parser=None):
                 offset=offset,
                 compact_rows=True,
                 project_compression_tips=False,
+                # 契约是"删除所有聊天"：归档会话、压缩 continuation、delegate 子会话
+                # 都要一并枚举，否则删压缩根会把 continuation 置为孤立根、旧聊天复活。
+                include_archived=True,
+                include_children=True,
             )
             if not rows:
                 break
