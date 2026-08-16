@@ -94,6 +94,26 @@ def test_defer_unknown_job_returns_none(hermes_env):
     assert jobs.defer_job("no-such-job", seconds=60) is None
 
 
+def test_explicit_reschedule_clears_defer_watermark(interval_job):
+    from cron.jobs import _hermes_now
+    now = _hermes_now()
+    jobs.update_job(
+        interval_job["id"],
+        {
+            "next_run_at": now.isoformat(),
+            "fire_claim": {"at": now.isoformat(), "fire_at": now.isoformat()},
+            "in_flight_occurrence": {"scheduled_at": now.isoformat()},
+        },
+    )
+    deferred = jobs.defer_job(interval_job["id"], seconds=86400 * 365, reason="user")
+    assert deferred["deferred_until"] is not None
+
+    # A user explicitly reschedules: the far-future defer watermark must go, or
+    # the next completed run would snap next_run_at back out years.
+    updated = jobs.update_job(interval_job["id"], {"schedule": "every 1h"})
+    assert updated.get("deferred_until") is None
+
+
 def test_mark_job_run_honors_deferred_until_watermark(interval_job):
     # A user defers a job that is already claimed and running. When the run
     # completes, mark_job_run must honor the defer watermark instead of

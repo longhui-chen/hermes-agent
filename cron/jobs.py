@@ -2636,6 +2636,16 @@ def update_job(job_id: str, updates: Dict[str, Any], *, preserve_claim: bool = F
                 updated["fire_claim"] = None
                 updated["in_flight_occurrence"] = None
 
+            # A user's explicit schedule / pause / resume edit invalidates any
+            # pending defer watermark: the "no earlier than" target was computed
+            # against the old cadence. defer_job only changes next_run_at (not
+            # these fields), so it never trips this and keeps its own watermark.
+            if any(
+                key in updates and updates.get(key) != job.get(key)
+                for key in ("schedule", "timezone", "enabled", "state")
+            ):
+                updated.pop("deferred_until", None)
+
             # Never take a caller-provided revision. This is the single
             # mutation seam for user/job configuration edits, so advancing it
             # here makes a stale maintainer schedule update fail atomically.
