@@ -284,7 +284,21 @@ def _governor_refresh_defer(job: Optional[dict]) -> Optional[tuple]:
                             return None
                     except ValueError:
                         pass
-                raw = resp.read(_REFRESH_PERMIT_MAX_BODY + 1)
+                # urlopen's timeout is a per-recv socket timeout, NOT a total
+                # deadline: a server that drips one byte per window keeps recv
+                # from ever timing out and could hold this cron worker open for
+                # hours. Bound the whole read against a wall-clock deadline and
+                # fail open once it passes.
+                import time as _time
+                deadline = _time.monotonic() + _REFRESH_PERMIT_TIMEOUT
+                raw = b""
+                while len(raw) <= _REFRESH_PERMIT_MAX_BODY:
+                    if _time.monotonic() >= deadline:
+                        return None
+                    chunk = resp.read(min(4096, _REFRESH_PERMIT_MAX_BODY + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw += chunk
                 if len(raw) > _REFRESH_PERMIT_MAX_BODY:
                     return None
                 body = raw.decode("utf-8", errors="replace")
@@ -347,6 +361,11 @@ def _gate_run_one_job(orig_run_one_job, job, **kwargs):
                 job["id"],
                 seconds=retry_s,
                 reason=f"governor:{reason}",
+                # This gate consumed the occurrence without running it: the
+                # claim must be terminated here (not deferred to update_job's
+                # trigger-identity check, which is a no-op when next_run_at
+                # doesn't move).
+                clear_claim=True,
             )
             if deferred is None:
                 _dbg(

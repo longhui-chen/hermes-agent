@@ -36,11 +36,19 @@ class _FakeResponse:
         self.status = status
         self._body = body.encode("utf-8")
         self.headers = {}
+        self._pos = 0
 
     def read(self, amt=None):
+        # Behave like a real HTTP response: advance a cursor and return b"" at
+        # EOF, so the deadline-bounded read loop terminates instead of the mock
+        # re-returning the whole body forever.
         if amt is None:
-            return self._body
-        return self._body[:amt]
+            chunk = self._body[self._pos:]
+            self._pos = len(self._body)
+            return chunk
+        chunk = self._body[self._pos:self._pos + amt]
+        self._pos += len(chunk)
+        return chunk
 
     def __enter__(self):
         return self
@@ -116,7 +124,7 @@ def test_gate_run_one_job_skips_and_defers(monkeypatch):
 
     deferred_ids = []
 
-    def fake_defer(job_id, *, seconds=None, until=None, reason=None):
+    def fake_defer(job_id, *, seconds=None, until=None, reason=None, clear_claim=False):
         deferred_ids.append((job_id, seconds, reason))
         return {"id": job_id, "next_run_at": "2099-01-01T00:00:00+00:00"}
 
@@ -138,7 +146,7 @@ def test_gate_run_one_job_fails_open_on_defer_failure(monkeypatch):
     import gateway.platforms.zet_agent_cron as zac
     import cron.jobs as jobs_mod
 
-    def broken_defer(job_id, *, seconds=None, until=None, reason=None):
+    def broken_defer(job_id, *, seconds=None, until=None, reason=None, clear_claim=False):
         raise RuntimeError("jobs.json locked")
 
     monkeypatch.setattr(jobs_mod, "defer_job", broken_defer)
@@ -162,7 +170,7 @@ def test_gate_ignores_non_app_refresh_jobs(monkeypatch):
 
     deferred = []
 
-    def fake_defer(job_id, *, seconds=None, until=None, reason=None):
+    def fake_defer(job_id, *, seconds=None, until=None, reason=None, clear_claim=False):
         deferred.append(job_id)
         return {"id": job_id}
 

@@ -2704,6 +2704,7 @@ def defer_job(
     seconds: Optional[float] = None,
     until: Optional[str] = None,
     reason: Optional[str] = None,
+    clear_claim: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Postpone a scheduled job's next run without pausing it.
 
@@ -2755,24 +2756,25 @@ def defer_job(
                     new_next = current
             except ValueError:
                 pass
-        return update_job(
-            job["id"],
-            {
-                "next_run_at": new_next,
-                "deferred_at": now_dt.isoformat(),
-                "defer_reason": reason,
-                "defer_count": int(job.get("defer_count") or 0) + 1,
-                # A defer consumes the current occurrence. Clear its claim
-                # unconditionally: when next_run_at is unchanged (the natural next
-                # slot is already later than the retry point), update_job's
-                # trigger-identity check won't clear it, and a still-fresh claim
-                # would reject the next callback within the claim TTL — silently
-                # stopping the job. Explicit clear keeps the claim lifecycle tied
-                # to the occurrence, not to whether the schedule text moved.
-                "fire_claim": None,
-                "in_flight_occurrence": None,
-            },
-        )
+        updates: Dict[str, Any] = {
+            "next_run_at": new_next,
+            "deferred_at": now_dt.isoformat(),
+            "defer_reason": reason,
+            "defer_count": int(job.get("defer_count") or 0) + 1,
+        }
+        if clear_claim:
+            # The governor's pre-execution gate consumes the current occurrence
+            # WITHOUT running it, so the claim for that occurrence must be
+            # terminated here: when next_run_at is unchanged (the natural next
+            # slot is already later than the retry point), update_job's
+            # trigger-identity check won't clear it, and a still-fresh claim
+            # would reject the next callback within the claim TTL — silently
+            # stopping the job. The generic (user/API) defer must NOT do this:
+            # a job may be genuinely firing, and clearing its claim would admit
+            # a duplicate concurrent run.
+            updates["fire_claim"] = None
+            updates["in_flight_occurrence"] = None
+        return update_job(job["id"], updates)
 
 
 def remove_job(job_id: str) -> bool:

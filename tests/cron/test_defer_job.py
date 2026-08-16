@@ -94,11 +94,12 @@ def test_defer_unknown_job_returns_none(hermes_env):
     assert jobs.defer_job("no-such-job", seconds=60) is None
 
 
-def test_defer_clears_fire_claim_even_when_next_run_does_not_move(interval_job):
-    # Regression: a recurring job whose natural next slot is later than the
-    # retry point keeps next_run_at unchanged; update_job's trigger-identity
-    # check then wouldn't clear the claim, and a still-fresh claim would reject
-    # the next callback within the claim TTL, silently stopping the job.
+def test_defer_clear_claim_terminates_occurrence_when_next_run_does_not_move(interval_job):
+    # Regression: the governor's pre-execution gate consumes the occurrence
+    # without running it. When the natural next slot is later than the retry
+    # point, next_run_at stays unchanged, so update_job's trigger-identity check
+    # wouldn't clear the claim — and a still-fresh claim would reject the next
+    # callback within the claim TTL, silently stopping the job.
     far_future = "2099-01-01T00:00:00+00:00"
     # Set the schedule first (this clears any claim via the identity check),
     # then stamp a claim WITHOUT moving the schedule.
@@ -110,7 +111,25 @@ def test_defer_clears_fire_claim_even_when_next_run_does_not_move(interval_job):
             "in_flight_occurrence": {"scheduled_at": far_future},
         },
     )
-    deferred = jobs.defer_job(interval_job["id"], seconds=60, reason="governor")
+    deferred = jobs.defer_job(interval_job["id"], seconds=60, reason="governor", clear_claim=True)
     assert deferred["next_run_at"] == far_future  # schedule did not move
     assert deferred.get("fire_claim") is None
     assert deferred.get("in_flight_occurrence") is None
+
+
+def test_defer_preserves_claim_when_not_clearing(interval_job):
+    # The generic (user/API) defer must NOT clear a claim: a job may be
+    # genuinely firing, and clearing its claim would admit a duplicate
+    # concurrent run.
+    far_future = "2099-01-01T00:00:00+00:00"
+    jobs.update_job(interval_job["id"], {"next_run_at": far_future})
+    jobs.update_job(
+        interval_job["id"],
+        {
+            "fire_claim": {"at": far_future, "fire_at": far_future},
+            "in_flight_occurrence": {"scheduled_at": far_future},
+        },
+    )
+    deferred = jobs.defer_job(interval_job["id"], seconds=60, reason="user")
+    assert deferred.get("fire_claim") is not None
+    assert deferred.get("in_flight_occurrence") is not None

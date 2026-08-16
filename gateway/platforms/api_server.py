@@ -7060,7 +7060,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
-        "repeat", "enabled", "timezone", "output_language",
+        "repeat", "enabled", "timezone", "output_language", "source",
         # A server-owned optimistic-concurrency fence. Its only current
         # caller is local-server's dedicated-maintainer schedule bridge; it
         # is not persisted as a mutable job field.
