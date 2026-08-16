@@ -126,15 +126,15 @@ def test_gate_run_one_job_skips_and_defers(monkeypatch):
         raise AssertionError("a deferred job must never reach the firing body")
 
     monkeypatch.setattr(zac, "_governor_refresh_defer", lambda job: (60, "memory_pressure"))
-    assert zac._gate_run_one_job(original_body, {"id": "job-x"}) is True
+    assert zac._gate_run_one_job(original_body, {"id": "job-x", "source": "app_refresh"}) is True
     assert deferred_ids == [("job-x", 60, "governor:memory_pressure")]
 
     # No deferral decision → the original fires untouched.
     monkeypatch.setattr(zac, "_governor_refresh_defer", lambda job: None)
-    assert zac._gate_run_one_job(lambda job, **kwargs: False, {"id": "job-y"}) is False
+    assert zac._gate_run_one_job(lambda job, **kwargs: False, {"id": "job-y", "source": "app_refresh"}) is False
 
 
-def test_gate_run_one_job_survives_defer_failure(monkeypatch):
+def test_gate_run_one_job_fails_open_on_defer_failure(monkeypatch):
     import gateway.platforms.zet_agent_cron as zac
     import cron.jobs as jobs_mod
 
@@ -143,13 +143,39 @@ def test_gate_run_one_job_survives_defer_failure(monkeypatch):
 
     monkeypatch.setattr(jobs_mod, "defer_job", broken_defer)
 
+    fired = []
+
     def original_body(job, **kwargs):
-        raise AssertionError("a deferred job must never reach the firing body")
+        fired.append(job["id"])
+        return True
 
     monkeypatch.setattr(zac, "_governor_refresh_defer", lambda job: (60, "memory_pressure"))
-    # The push failed but the skip still holds: the slot is gone either way,
-    # the job returns at its natural next slot and asks again.
-    assert zac._gate_run_one_job(original_body, {"id": "job-z"}) is True
+    # The push failed → fail open: the original firing body runs so a one-shot
+    # is not silently lost to a stale next_run_at + reused dedup key.
+    assert zac._gate_run_one_job(original_body, {"id": "job-z", "source": "app_refresh"}) is True
+    assert fired == ["job-z"]
+
+
+def test_gate_ignores_non_app_refresh_jobs(monkeypatch):
+    import gateway.platforms.zet_agent_cron as zac
+    import cron.jobs as jobs_mod
+
+    deferred = []
+
+    def fake_defer(job_id, *, seconds=None, until=None, reason=None):
+        deferred.append(job_id)
+        return {"id": job_id}
+
+    monkeypatch.setattr(jobs_mod, "defer_job", fake_defer)
+    # A profile-level defer must never gate ordinary reminder/report cron jobs.
+    monkeypatch.setattr(zac, "_governor_refresh_defer", lambda job: (60, "memory_pressure"))
+
+    def original_body(job, **kwargs):
+        return "ran"
+
+    assert zac._gate_run_one_job(original_body, {"id": "reminder", "source": None}) == "ran"
+    assert zac._gate_run_one_job(original_body, {"id": "report"}) == "ran"
+    assert deferred == []
 
 
 def test_install_patches_run_one_job(tmp_path, monkeypatch):

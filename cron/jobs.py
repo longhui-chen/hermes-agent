@@ -2201,6 +2201,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     timezone: Optional[str] = None,
     output_language: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2299,6 +2300,10 @@ def create_job(
         if normalized_no_agent
         else validate_output_language_tag(output_language)
     )
+    # ``source`` is a caller-owned provenance marker (e.g. "app_refresh" for a
+    # maintainer's refresh job). It is persisted verbatim so a gate can scope
+    # itself to a specific job class instead of treating every job alike.
+    normalized_source = str(source).strip() if isinstance(source, str) and str(source).strip() else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -2400,6 +2405,8 @@ def create_job(
         job["attach_to_session"] = normalized_attach
     if normalized_output_language is not None:
         job["output_language"] = normalized_output_language
+    if normalized_source is not None:
+        job["source"] = normalized_source
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
@@ -2755,6 +2762,15 @@ def defer_job(
                 "deferred_at": now_dt.isoformat(),
                 "defer_reason": reason,
                 "defer_count": int(job.get("defer_count") or 0) + 1,
+                # A defer consumes the current occurrence. Clear its claim
+                # unconditionally: when next_run_at is unchanged (the natural next
+                # slot is already later than the retry point), update_job's
+                # trigger-identity check won't clear it, and a still-fresh claim
+                # would reject the next callback within the claim TTL — silently
+                # stopping the job. Explicit clear keeps the claim lifecycle tied
+                # to the occurrence, not to whether the schedule text moved.
+                "fire_claim": None,
+                "in_flight_occurrence": None,
             },
         )
 

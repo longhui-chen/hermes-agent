@@ -7290,6 +7290,7 @@ class APIServerAdapter(BasePlatformAdapter):
             timezone = body.get("timezone")
             output_language = body.get("output_language")
             origin = body.get("origin")
+            source = body.get("source")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -7331,6 +7332,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["timezone"] = timezone
             if output_language is not None:
                 kwargs["output_language"] = output_language
+            if source is not None:
+                kwargs["source"] = source
             if origin is not None:
                 kwargs["origin"] = origin
 

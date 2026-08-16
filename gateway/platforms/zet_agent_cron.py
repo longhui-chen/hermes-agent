@@ -330,6 +330,13 @@ def _gate_run_one_job(orig_run_one_job, job, **kwargs):
     original firing body decides. Extracted so the gate is unit-testable
     against a stub original.
     """
+    # Only the app-refresh job is governed. An AppDedicated profile can also
+    # host ordinary reminder/report cron jobs (created via the standard cronjob
+    # tool) that must never be postponed by a profile-level governor decision —
+    # a defer would silently skip time-sensitive one-shots. The refresh job is
+    # tagged ``source="app_refresh"`` by local-server at creation.
+    if not (isinstance(job, dict) and job.get("source") == "app_refresh"):
+        return orig_run_one_job(job, **kwargs)
     defer_info = _governor_refresh_defer(job)
     if defer_info is not None:
         retry_s, reason = defer_info
@@ -347,13 +354,16 @@ def _gate_run_one_job(orig_run_one_job, job, **kwargs):
                     "slot folds away"
                 )
         except Exception as defer_err:
-            # The gate decided but the push failed (lock/CAS contention).
-            # The slot is gone either way; the job fires at its natural next
-            # slot and the gate is asked again.
+            # The gate decided to defer but the push failed (lock/CAS contention
+            # or a transient jobs.json write error). Fail open: run the job via
+            # the original body — its execution was already claimed, so the run
+            # completes normally instead of losing a one-shot to a stale
+            # next_run_at + reused dedup key.
             _dbg(
                 f"governor defer: defer_job failed for "
-                f"{job.get('id')}: {defer_err!r}"
+                f"{job.get('id')}: {defer_err!r}; failing open"
             )
+            return orig_run_one_job(job, **kwargs)
         # The execution was already created (claimed) before the gate; a
         # defer skips the run entirely, so terminalize it here or it stays
         # claimed forever (the ledger only prunes terminal rows, and
