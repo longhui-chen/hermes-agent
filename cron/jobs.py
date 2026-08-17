@@ -491,7 +491,11 @@ def _jobs_lock():
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id", "revision"})
+# ADIC v1: app_slug/import_operation are server-stamped at creation only
+# (see _validate_app_slug); update_job must reject any attempt to change
+# them regardless of caller, not just rely on the HTTP handler's allowlist
+# omitting them.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "revision", "app_slug", "import_operation"})
 
 
 class JobRevisionConflict(ValueError):
@@ -2126,6 +2130,51 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+# ADIC v1 (App Data Import Contract): local-server stamps these two fields on
+# a dedicated maintainer's cron job at provision time — never accepted from a
+# request body, never editable via update_job (see _IMMUTABLE_JOB_FIELDS
+# below) — so cron/scheduler.py's end-of-run verdict can tell an
+# import-serving job apart from an ordinary reminder/report job on the same
+# profile. Mirrors zettlab-local-server's internal/apphost/slug.go
+# slugPattern exactly, since this value must already have passed that check
+# on the writer's side; a mismatch here means the writer sent garbage, not
+# that this pattern should be loosened to fit it.
+_APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
+# Bounded operation-name shape (dot allowed for names like "data.import").
+# Deliberately NOT pinned to the literal "data.import": cron/scheduler.py
+# does not read this field for its verdict (the turn-scoped import ledger
+# already only records data.import outcomes), so over-constraining it here
+# would just add a second field that can silently drift from the contract.
+_IMPORT_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _validate_app_slug(value: Any) -> Optional[str]:
+    """Validate ADIC v1's server-stamped app_slug. Absent is fine (ordinary
+    cron jobs have none); present-but-malformed is a bug on the writer's side
+    and must fail loudly rather than silently create a job that can never be
+    judged by its import outcomes."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _APP_SLUG_RE.fullmatch(value):
+        raise ValueError(
+            f"app_slug must match {_APP_SLUG_RE.pattern!r} (mirrors "
+            "local-server's apphost app-name slug format)"
+        )
+    return value
+
+
+def _validate_import_operation(value: Any) -> Optional[str]:
+    """Validate ADIC v1's server-stamped import_operation. See
+    _validate_app_slug for why malformed-but-present raises."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _IMPORT_OPERATION_RE.fullmatch(value):
+        raise ValueError(
+            f"import_operation must match {_IMPORT_OPERATION_RE.pattern!r}"
+        )
+    return value
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -2202,6 +2251,8 @@ def create_job(
     timezone: Optional[str] = None,
     output_language: Optional[str] = None,
     source: Optional[str] = None,
+    app_slug: Optional[str] = None,
+    import_operation: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2249,6 +2300,11 @@ def create_job(
         output_language: Optional canonical BCP 47 language tag captured when
                          an LLM creates an agent job. Direct/legacy callers may
                          omit it; script-only jobs ignore it.
+        app_slug: ADIC v1 — server-stamped app slug for a dedicated
+                  maintainer's import-tracked cron job (see _validate_app_slug).
+                  Never accept this from a model or an end-user-facing caller.
+        import_operation: ADIC v1 — server-stamped operation name paired with
+                  app_slug (see _validate_import_operation).
 
     Returns:
         The created job dict
@@ -2304,6 +2360,8 @@ def create_job(
     # maintainer's refresh job). It is persisted verbatim so a gate can scope
     # itself to a specific job class instead of treating every job alike.
     normalized_source = str(source).strip() if isinstance(source, str) and str(source).strip() else None
+    normalized_app_slug = _validate_app_slug(app_slug)
+    normalized_import_operation = _validate_import_operation(import_operation)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -2407,6 +2465,10 @@ def create_job(
         job["output_language"] = normalized_output_language
     if normalized_source is not None:
         job["source"] = normalized_source
+    if normalized_app_slug is not None:
+        job["app_slug"] = normalized_app_slug
+    if normalized_import_operation is not None:
+        job["import_operation"] = normalized_import_operation
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)

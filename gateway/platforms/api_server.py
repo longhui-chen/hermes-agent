@@ -7501,6 +7501,13 @@ class APIServerAdapter(BasePlatformAdapter):
             output_language = body.get("output_language")
             origin = body.get("origin")
             source = body.get("source")
+            # ADIC v1 (interface-freeze doc §7): server-stamped ONLY. Never
+            # add these to _UPDATE_ALLOWED_FIELDS — local-server's dedicated-
+            # maintainer bridge sets them once at provision time, and
+            # cron.jobs.create_job / update_job (_IMMUTABLE_JOB_FIELDS) are the
+            # actual enforcement point, not this handler.
+            app_slug = body.get("app_slug")
+            import_operation = body.get("import_operation")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -7546,6 +7553,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["source"] = source
             if origin is not None:
                 kwargs["origin"] = origin
+            if app_slug is not None:
+                kwargs["app_slug"] = app_slug
+            if import_operation is not None:
+                kwargs["import_operation"] = import_operation
 
             if _cron_job_requires_live_chat_authorization(skills):
                 return web.json_response(
