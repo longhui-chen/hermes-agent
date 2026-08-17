@@ -34,6 +34,17 @@ class _Client:
         return _Response()
 
 
+class _LaunchClient(_Client):
+    def post(self, url, **kwargs):
+        assert url == "http://127.0.0.1:8080/api/v1/internal/pc/action"
+        assert kwargs["json"] == {
+            "session_id": "zettlab:alice:agent-a:chat-1",
+            "action": "ui.launch",
+            "params": {"app": "Google Chrome"},
+        }
+        return _Response()
+
+
 def _configure(monkeypatch):
     values = {
         "ZETTLAB_BROWSER_ACTION_URL": "http://127.0.0.1:8080/api/v1/internal/browser/action",
@@ -61,6 +72,20 @@ def test_pc_ui_snapshot_uses_session_scoped_pc_action(monkeypatch):
     result = json.loads(module.pc_ui_tool({"action": "snapshot", "app": "Finder"}))
 
     assert result == {"success": True, "result": {"pid": 42, "window_id": 7}}
+
+
+def test_pc_ui_launches_an_exact_app_without_accepting_urls(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(module.requests, "Session", _LaunchClient)
+
+    result = json.loads(
+        module.pc_ui_tool({"action": "launch", "app": "Google Chrome"})
+    )
+
+    assert result["success"] is True
+    assert module._params(
+        {"app": "Google Chrome", "value": "https://example.com"}, "launch"
+    ) == {"app": "Google Chrome"}
 
 
 def test_pc_ui_rejects_unknown_or_incomplete_action_without_network(monkeypatch):
@@ -106,12 +131,14 @@ def test_pc_ui_schema_forbids_shell_paths_and_arbitrary_properties():
     assert "command" not in properties
     assert "path" not in properties
     assert "cdp" not in properties
+    assert "launch" in module.PC_UI_SCHEMA["parameters"]["properties"]["action"]["enum"]
 
 
 def test_zet_agent_prompt_requires_snapshot_first_for_local_apps():
     from gateway.platforms.zet_agent import _ZET_WORKDIR_SECTION
 
     assert "使用 `pc_ui`" in _ZET_WORKDIR_SECTION
+    assert "先用 `launch` 启动" in _ZET_WORKDIR_SECTION
     assert "必须先 `snapshot`" in _ZET_WORKDIR_SECTION
     assert "调用 `pc_node_status`" in _ZET_WORKDIR_SECTION
     assert "`connected=true` 且 `computer_use=false`" in _ZET_WORKDIR_SECTION

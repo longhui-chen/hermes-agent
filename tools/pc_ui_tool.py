@@ -15,13 +15,14 @@ from tools.registry import registry
 
 _MAX_RESPONSE_BYTES = 512 << 10
 _TIMEOUT_SECONDS = 35
-_ACTIONS = {"snapshot", "focus", "invoke", "set_value", "scroll", "keystroke"}
+_ACTIONS = {"launch", "snapshot", "focus", "invoke", "set_value", "scroll", "keystroke"}
 
 PC_UI_SCHEMA = {
     "name": "pc_ui",
     "description": (
         "Use semantic Computer Use on the connected desktop after the user approves it locally. "
-        "Start every app interaction with snapshot. Reuse only the pid, window_id and element "
+        "If the application has no visible window, launch it first. Start every interaction with snapshot once a window exists, and name the application exactly; "
+        "for example use Google Chrome rather than Browser or 浏览器. Reuse only the pid, window_id and element "
         "indices returned by that fresh snapshot; never invent selectors, paths, shell commands, "
         "scripts or CDP requests. Secure controls are hidden and sensitive actions may require "
         "another confirmation on the computer."
@@ -33,7 +34,7 @@ PC_UI_SCHEMA = {
             "app": {
                 "type": "string",
                 "maxLength": 256,
-                "description": "Visible application name. Required only for snapshot.",
+                "description": "Exact application name. Required for launch and snapshot.",
             },
             "pid": {"type": "integer", "minimum": 1},
             "window_id": {"type": "integer", "minimum": 1},
@@ -109,6 +110,7 @@ _check_pc_ui._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
     allowed = {
+        "launch": ("app",),
         "snapshot": ("app",),
         "focus": ("pid", "window_id"),
         "invoke": ("pid", "window_id", "element"),
@@ -117,6 +119,7 @@ def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
         "keystroke": ("pid", "window_id", "key"),
     }[action]
     required = {
+        "launch": {"app"},
         "snapshot": {"app"},
         "focus": {"pid", "window_id"},
         "invoke": {"pid", "window_id", "element"},
