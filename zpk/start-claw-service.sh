@@ -13,7 +13,9 @@ load_reconciled_env() {
             break
         fi
         case "$key" in
-            ZET_AGENT_KEY|ZET_AGENT_ENABLED|ZET_AGENT_HOST|ZET_AGENT_PORT|ZETTLAB_PRESETS_DIR)
+            ZET_AGENT_KEY|ZET_AGENT_ENABLED|ZET_AGENT_HOST|ZET_AGENT_PORT|ZETTLAB_PRESETS_DIR|\
+            HERMES_LANGFUSE_MODE|HERMES_LANGFUSE_BASE_URL|HERMES_LANGFUSE_ENV|\
+            HERMES_LANGFUSE_SAMPLE_RATE|HERMES_LANGFUSE_SN)
                 export "$key=$value"
                 ;;
             *)
@@ -28,6 +30,14 @@ load_reconciled_env() {
         exit 1
     fi
 }
+
+# Package-owned relay settings must come only from the protected EnvironmentFile.
+# Clear inherited and legacy unit values before the reconciled load.
+unset HERMES_LANGFUSE_MODE HERMES_LANGFUSE_BASE_URL HERMES_LANGFUSE_ENV
+unset HERMES_LANGFUSE_SAMPLE_RATE HERMES_LANGFUSE_SN
+unset HERMES_LANGFUSE_PUBLIC_KEY HERMES_LANGFUSE_SECRET_KEY
+unset LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY
+unset LANGFUSE_BASIC_AUTH LANGFUSE_OTEL_TRACES_EXPORT_PATH
 
 # Reconcile and load the shared runtime environment in one locked operation.
 # Package-owned fields use the generated values; persisted user fields only
