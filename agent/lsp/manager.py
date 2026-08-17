@@ -131,11 +131,19 @@ class _BackgroundLoop:
         self._thread = None
 
 
-class LSPService:
-    """The process-wide LSP service.
+#: 第二个 waiter 加入在飞 shutdown 时的等待上限。
+#: ⛔ 不许拍脑袋:照抄同文件既有的 shutdown 硬超时
+#: (``self._loop.run(self._shutdown_async(), timeout=10.0)``)—— 同一量纲。
+#: ⭐ 关键不是数字,而是它**有界**:H⑤ 把「第二个调用者快速失败」换成了
+#: 「加入等待」,若不设上限,那次改动就把 fast-fail 变成了永久挂起。
+_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 10.0
 
-    Created once via :meth:`create_from_config`; the
-    :func:`agent.lsp.get_service` accessor manages the singleton.
+
+class LSPService:
+    """One profile's LSP service.
+
+    Created once per profile via :meth:`create_from_config`; the
+    :func:`agent.lsp.get_service` accessor manages profile-local reuse.
     Most callers should use that accessor rather than constructing
     :class:`LSPService` directly.
     """
@@ -176,6 +184,12 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        self._retiring_clients: Dict[Tuple[str, str], LSPClient] = {}
+        self._cleanup_retry_clients: Dict[Tuple[str, str], LSPClient] = {}
+        self._cleanup_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+        self._shutdown_in_progress = False
+        #: 复用中的 shutdown task —— 见 ``_shutdown_async``。
+        self._shutdown_task = None
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
@@ -427,8 +441,8 @@ class LSPService:
         future, and emits a single eventlog WARNING so the user knows
         which server gave up.
 
-        ``exc`` is whatever exception the outer wrapper caught — used
-        only for logging, never re-raised.
+        ``exc`` 是外层捕获并用于日志的原始异常。子进程清理失败会显式抛出，
+        并保留 owner 供重试。
         """
         srv = find_server_for_file(file_path)
         if srv is None:
@@ -443,26 +457,152 @@ class LSPService:
         key = (srv.server_id, per_server_root)
         already_broken = key in self._broken
         self._broken.add(key)
-
-        # Kill any client we managed to spawn before the timeout.  The
-        # cancelled future never reached the broken-set add inside
-        # ``_get_or_spawn`` so the client may still be hanging in
-        # ``_clients`` with a half-initialized state.
-        with self._state_lock:
-            client = self._clients.pop(key, None)
-            self._last_used.pop(key, None)
-        if client is not None:
-            try:
-                # Fire-and-forget shutdown — give it a second to cleanup,
-                # but don't block.  We're already on a slow path.
-                self._loop.run(client.shutdown(), timeout=1.0)
-            except Exception:  # noqa: BLE001
-                pass
-
         if not already_broken:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
 
-    def shutdown(self) -> None:
+        # 先标记 retiring，shutdown 成功后再按精确对象 CAS 删除。
+        with self._state_lock:
+            client = self._clients.get(key)
+            cleanup_in_flight = (
+                client is not None
+                and self._retiring_clients.get(key) is client
+            )
+            if client is not None and not cleanup_in_flight:
+                self._retiring_clients[key] = client
+        if cleanup_in_flight:
+            raise RuntimeError(
+                f"LSP broken-client shutdown already in progress for {srv.server_id}"
+            )
+        if client is not None:
+            try:
+                self._loop.run(
+                    self._cleanup_client_with_barrier(key, client), timeout=1.0
+                )
+            except Exception as shutdown_exc:  # noqa: BLE001
+                with self._state_lock:
+                    cleanup_task = self._cleanup_tasks.get(key)
+                    cleanup_in_flight = (
+                        cleanup_task is not None and not cleanup_task.done()
+                    )
+                    if not cleanup_in_flight and self._clients.get(key) is client:
+                        self._cleanup_retry_clients[key] = client
+                    if (
+                        not cleanup_in_flight
+                        and self._retiring_clients.get(key) is client
+                    ):
+                        self._retiring_clients.pop(key, None)
+                raise RuntimeError(
+                    f"LSP broken-client shutdown failed for {srv.server_id}"
+                ) from shutdown_exc
+            with self._state_lock:
+                if self._clients.get(key) is client:
+                    self._clients.pop(key, None)
+                    self._last_used.pop(key, None)
+                    self._cleanup_retry_clients.pop(key, None)
+                if self._retiring_clients.get(key) is client:
+                    self._retiring_clients.pop(key, None)
+
+    @staticmethod
+    async def _shutdown_client_for_retry(client: LSPClient) -> None:
+        """严格关闭 client；失败时恢复仍活的 process handle 供下次重试。"""
+        process = getattr(client, "_proc", None)
+
+        def _restore_live_process() -> bool:
+            if process is None or getattr(process, "returncode", None) is not None:
+                return False
+            current = getattr(client, "_proc", None)
+            if current is not None and current is not process:
+                raise RuntimeError("LSP process ownership changed during shutdown")
+            client._proc = process
+            client._stopping = False
+            return True
+
+        try:
+            await client.shutdown()
+        except BaseException:
+            _restore_live_process()
+            raise
+        if _restore_live_process():
+            raise RuntimeError("LSP client shutdown returned while process is alive")
+
+    async def _cleanup_client_with_barrier(
+        self, key: Tuple[str, str], client: LSPClient
+    ) -> None:
+        """共享一次 cleanup；重复取消只延迟调用方，不释放 owner fence。"""
+        with self._state_lock:
+            task = self._cleanup_tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(self._shutdown_client_for_retry(client))
+            with self._state_lock:
+                existing = self._cleanup_tasks.get(key)
+                if existing is None:
+                    self._cleanup_tasks[key] = task
+                else:
+                    task.cancel()
+                    task = existing
+
+        cancelled = None
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+                continue
+
+        failure = None
+        if task.cancelled():
+            failure = asyncio.CancelledError()
+        else:
+            try:
+                failure = task.exception()
+            except BaseException as exc:  # noqa: BLE001
+                failure = exc
+        with self._state_lock:
+            if failure is not None:
+                if self._clients.get(key) is client:
+                    self._cleanup_retry_clients[key] = client
+            elif self._clients.get(key) is client:
+                self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+                self._cleanup_retry_clients.pop(key, None)
+            if self._cleanup_tasks.get(key) is task:
+                self._cleanup_tasks.pop(key, None)
+            if self._retiring_clients.get(key) is client:
+                self._retiring_clients.pop(key, None)
+        if failure is not None:
+            raise failure
+        if cancelled is not None:
+            raise cancelled
+
+    @staticmethod
+    def _install_process_cleanup_owner_fence(client: LSPClient) -> None:
+        """底层 cleanup 先清空句柄再失败时，恢复仍存活的 exact process。"""
+        cleanup = getattr(client, "_cleanup_process", None)
+        if not callable(cleanup) or getattr(
+            client, "_hermes_cleanup_owner_fenced", False
+        ):
+            return
+
+        async def _cleanup_with_owner_restore() -> None:
+            process = getattr(client, "_proc", None)
+            try:
+                await cleanup()
+            except BaseException:
+                if (
+                    process is not None
+                    and getattr(process, "returncode", None) is None
+                    and getattr(client, "_proc", None) is None
+                ):
+                    client._proc = process
+                    client._stopping = False
+                raise
+
+        client._cleanup_process = _cleanup_with_owner_restore
+        client._hermes_cleanup_owner_fenced = True
+
+    def shutdown(self, *, raise_on_error: bool = False) -> None:
         """Tear down all clients and stop the background loop."""
         if not self._enabled:
             return
@@ -470,6 +610,9 @@ class LSPService:
             self._loop.run(self._shutdown_async(), timeout=10.0)
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
+            if raise_on_error:
+                raise
+            return
         self._loop.stop()
         clear_cache()
 
@@ -554,6 +697,17 @@ class LSPService:
         if key in self._broken:
             return None
         with self._state_lock:
+            if self._shutdown_in_progress:
+                return None
+            retry_client = self._cleanup_retry_clients.get(key)
+            if (
+                key in self._retiring_clients
+                or (
+                    retry_client is not None
+                    and retry_client is self._clients.get(key)
+                )
+            ):
+                return None
             client = self._clients.get(key)
             if client is not None and client.is_running:
                 self._last_used[key] = time.time()
@@ -562,7 +716,7 @@ class LSPService:
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                return await asyncio.shield(spawning)
             except Exception:  # noqa: BLE001
                 return None
 
@@ -570,7 +724,18 @@ class LSPService:
         loop = asyncio.get_running_loop()
         spawn_future: asyncio.Future = loop.create_future()
         with self._state_lock:
-            self._spawning[key] = spawn_future
+            if self._shutdown_in_progress:
+                return None
+            existing_spawn = self._spawning.get(key)
+            if existing_spawn is not None:
+                spawn_future = existing_spawn
+            else:
+                self._spawning[key] = spawn_future
+        if existing_spawn is not None:
+            try:
+                return await asyncio.shield(existing_spawn)
+            except Exception:  # noqa: BLE001
+                return None
         try:
             ctx = ServerContext(
                 workspace_root=per_server_root,
@@ -598,22 +763,127 @@ class LSPService:
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
             )
+            with self._state_lock:
+                if self._shutdown_in_progress:
+                    spawn_future.set_result(None)
+                    return None
+                self._clients[key] = client
+            self._install_process_cleanup_owner_fence(client)
             try:
                 await client.start()
+            except asyncio.CancelledError:
+                with self._state_lock:
+                    cleanup_owned = (
+                        self._retiring_clients.get(key) is client
+                        or self._shutdown_in_progress
+                    )
+                    if not cleanup_owned and self._clients.get(key) is client:
+                        self._retiring_clients[key] = client
+                if cleanup_owned:
+                    if not spawn_future.done():
+                        spawn_future.set_result(None)
+                    raise
+                try:
+                    await self._cleanup_client_with_barrier(key, client)
+                except asyncio.CancelledError:
+                    with self._state_lock:
+                        cleanup_failed = self._cleanup_retry_clients.get(key) is client
+                    if not spawn_future.done():
+                        spawn_future.set_result(None)
+                    if cleanup_failed:
+                        raise RuntimeError(
+                            "LSP cancelled spawn cleanup failed"
+                        )
+                    raise
+                except BaseException as cleanup_exc:
+                    with self._state_lock:
+                        if self._clients.get(key) is client:
+                            self._cleanup_retry_clients[key] = client
+                        if self._retiring_clients.get(key) is client:
+                            self._retiring_clients.pop(key, None)
+                    if not spawn_future.done():
+                        spawn_future.set_result(None)
+                    raise RuntimeError(
+                        "LSP cancelled spawn cleanup failed"
+                    ) from cleanup_exc
+                with self._state_lock:
+                    if self._clients.get(key) is client:
+                        self._clients.pop(key, None)
+                        self._last_used.pop(key, None)
+                        self._cleanup_retry_clients.pop(key, None)
+                    if self._retiring_clients.get(key) is client:
+                        self._retiring_clients.pop(key, None)
+                if not spawn_future.done():
+                    spawn_future.set_result(None)
+                raise
             except Exception as e:  # noqa: BLE001
                 eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
                 self._broken.add(key)
-                spawn_future.set_result(None)
+                with self._state_lock:
+                    cleanup_owned = (
+                        self._retiring_clients.get(key) is client
+                        or self._shutdown_in_progress
+                    )
+                    if not cleanup_owned and self._clients.get(key) is client:
+                        self._retiring_clients[key] = client
+                if cleanup_owned:
+                    if not spawn_future.done():
+                        spawn_future.set_result(None)
+                    return None
+                try:
+                    await self._cleanup_client_with_barrier(key, client)
+                except BaseException as cleanup_exc:
+                    with self._state_lock:
+                        if self._clients.get(key) is client:
+                            self._cleanup_retry_clients[key] = client
+                        if self._retiring_clients.get(key) is client:
+                            self._retiring_clients.pop(key, None)
+                    if not spawn_future.done():
+                        spawn_future.set_result(None)
+                    raise RuntimeError("LSP spawn cleanup failed") from cleanup_exc
+                with self._state_lock:
+                    if self._clients.get(key) is client:
+                        self._clients.pop(key, None)
+                        self._last_used.pop(key, None)
+                        self._cleanup_retry_clients.pop(key, None)
+                    if self._retiring_clients.get(key) is client:
+                        self._retiring_clients.pop(key, None)
+                if not spawn_future.done():
+                    spawn_future.set_result(None)
                 return None
             with self._state_lock:
-                self._clients[key] = client
-                self._last_used[key] = time.time()
+                owner_current = (
+                    not self._shutdown_in_progress
+                    and self._clients.get(key) is client
+                )
+                if owner_current:
+                    self._last_used[key] = time.time()
+            if not owner_current:
+                try:
+                    await self._shutdown_client_for_retry(client)
+                except BaseException:
+                    with self._state_lock:
+                        if self._clients.get(key) is client:
+                            self._cleanup_retry_clients[key] = client
+                    if not spawn_future.done():
+                        spawn_future.set_result(None)
+                    raise
+                with self._state_lock:
+                    if self._clients.get(key) is client:
+                        self._clients.pop(key, None)
+                        self._last_used.pop(key, None)
+                        self._cleanup_retry_clients.pop(key, None)
+                if not spawn_future.done():
+                    spawn_future.set_result(None)
+                return None
             eventlog.log_active(srv.server_id, per_server_root)
-            spawn_future.set_result(client)
+            if not spawn_future.done():
+                spawn_future.set_result(client)
             return client
         finally:
             with self._state_lock:
-                self._spawning.pop(key, None)
+                if self._spawning.get(key) is spawn_future:
+                    self._spawning.pop(key, None)
 
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
@@ -643,44 +913,226 @@ class LSPService:
                 # A transient sweep error must not kill the reaper —
                 # otherwise one bad shutdown permanently re-opens the
                 # unbounded-accumulation leak this loop exists to fix.
-                logger.debug("LSP idle reaper sweep error: %s", e)
+                logger.warning("LSP idle reaper sweep error: %s", e, exc_info=True)
 
     async def _reap_idle_once(self) -> None:
         cutoff = time.time() - self._idle_timeout
         with self._state_lock:
-            idle_keys = [
-                key
-                for key in self._clients
-                if self._last_used.get(key, 0) < cutoff
+            snapshot = [
+                (key, client)
+                for key, client in self._clients.items()
+                if key not in self._retiring_clients
+                and key not in self._spawning
+                and self._last_used.get(key, 0) < cutoff
             ]
-            clients = [self._clients.pop(key) for key in idle_keys]
-            for key in idle_keys:
-                self._last_used.pop(key, None)
-        if clients:
-            eventlog.log_reaped(
-                [(c.server_id, c.workspace_root) for c in clients],
-                self._idle_timeout,
-            )
-            await asyncio.gather(
-                *(client.shutdown() for client in clients),
-                return_exceptions=True,
-            )
+            for key, client in snapshot:
+                self._retiring_clients[key] = client
+        if snapshot:
+            try:
+                results = await asyncio.gather(
+                    *(
+                        self._shutdown_client_for_retry(client)
+                        for _, client in snapshot
+                    ),
+                    return_exceptions=True,
+                )
+            except BaseException:
+                with self._state_lock:
+                    for key, client in snapshot:
+                        if self._clients.get(key) is client:
+                            self._cleanup_retry_clients[key] = client
+                        if self._retiring_clients.get(key) is client:
+                            self._retiring_clients.pop(key, None)
+                raise
+            released = []
+            failures = []
+            with self._state_lock:
+                for (key, client), result in zip(snapshot, results):
+                    if isinstance(result, BaseException):
+                        failures.append(result)
+                        if self._clients.get(key) is client:
+                            self._cleanup_retry_clients[key] = client
+                    elif self._clients.get(key) is client:
+                        self._clients.pop(key, None)
+                        self._last_used.pop(key, None)
+                        self._cleanup_retry_clients.pop(key, None)
+                        released.append(client)
+                    if self._retiring_clients.get(key) is client:
+                        self._retiring_clients.pop(key, None)
+            if released:
+                eventlog.log_reaped(
+                    [(c.server_id, c.workspace_root) for c in released],
+                    self._idle_timeout,
+                )
+            if failures:
+                raise RuntimeError(
+                    f"LSP idle reaper failed for {len(failures)} client(s)"
+                ) from failures[0]
 
     async def _shutdown_async(self) -> None:
+        """严格等待 shutdown owner；重复取消不能提前释放 fence。"""
+        # 🔴 **复用同一个 task,⛔ 不许每次调用都新建。**
+        # 外层是 10 秒硬超时(``self._loop.run(self._shutdown_async(), timeout=10.0)``):
+        #   ① 关闭超过 10 秒 ⇒ 外层 future 被取消,调用方拿到超时;
+        #   ② 但 worker 是 **shield 住的**,它继续跑到成功,而成功路径
+        #      **不重置** ``_shutdown_in_progress``(只有各异常路径重置);
+        #   ③ 下次 ``shutdown_service(raise_on_error=True)`` 新建第二个 worker,
+        #      一进 owner 就撞 ``RuntimeError("LSP shutdown already in progress")``。
+        # ⇒ **一次慢关闭 ⇒ 该 profile 后续 unload / reload 永久失败。**
+        # ⭐ 典型「一次性故障变永久降级」:闩上了,没有任何路径解得开。
+        # ⇒ 第二次调用**加入在飞的那一趟**。⛔ 不去动 ``_shutdown_in_progress``
+        # 的置位/归零 —— 那个闩在 owner 内部自洽,缺的是外面没人复用那一趟。
+        worker = self._shutdown_task
+        if worker is None or worker.done():
+            worker = asyncio.create_task(self._shutdown_async_owned())
+            self._shutdown_task = worker
+            worker.add_done_callback(self._clear_shutdown_task)
+        # 🔴 **本 PR 让这条无界等待【变得可达】⇒ 它不再是存量问题。**
+        #
+        # 改之前:第二个并发调用者会**自己新建**一个 worker,那个 worker 一进
+        # ``_shutdown_async_owned`` 就撞
+        # ``RuntimeError("LSP shutdown already in progress")`` ⇒ **快速失败**。
+        # 改之后(H⑤ 复用唯一 task):第二个调用者**加入在飞的那一趟**并
+        # ``await asyncio.shield(worker)`` ⇒ owner 卡住时,**原本快速失败的调用
+        # 现在会挂住**。⭐ 我把 fast-fail 换成了 join,而那个 join 是无界的。
+        #
+        # ⇒ 与 ``_cleanup_unpublished_adapter`` 的重入路径同解:等待有界,
+        # 超时**显式失败**;⛔ 不取消 owner(第二个 waiter 不拥有它),
+        # ⛔ 不清 ``_shutdown_task``(清了下次又会新建、重新撞闩)。
+        deadline = _SHUTDOWN_JOIN_TIMEOUT_SECONDS
+        cancelled = None
+        while True:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(worker), timeout=deadline
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"LSP shutdown still running after {deadline:.1f}s"
+                ) from None
+            except asyncio.CancelledError as exc:
+                if worker.cancelled():
+                    raise
+                if cancelled is None:
+                    cancelled = exc
+            else:
+                if cancelled is not None:
+                    raise cancelled
+                return result
+
+    def _clear_shutdown_task(self, task) -> None:
+        """任务收尾后解除复用引用 —— **但必须先把闩一起放掉**。
+
+        🔴 上一版只清引用。而 ``_shutdown_async_owned`` 的**成功路径刻意不重置**
+        ``_shutdown_in_progress``(语义是「已经关掉了」)⇒ 一旦首次 shutdown 超过
+        外层 10 秒期限、shield 住的 owner 随后**成功**结束:
+          · 闩留在 True
+          · 引用被这里清掉
+        ⇒ 下一次 profile unload 新建 owner,一进去就**稳定**撞
+        ``RuntimeError("LSP shutdown already in progress")`` ⇒ **该 profile 后续
+        卸载/重载永久失败**。⭐ 半条链:我复用了 task,却让它的可观察结果先蒸发。
+
+        ⇒ **成功完成时原子地把闩一起放掉**,再清引用。
+        ⛔ 失败/取消时不动闩 —— 那些路径 owner 自己已经重置过了,
+        再动一次会把「正在跑的另一趟」误判成空闲。
+        """
+        with self._state_lock:
+            if self._shutdown_task is not task:
+                return
+            self._shutdown_task = None
+            # 只有**干净完成**才放闩:异常与取消由 owner 自己的各分支负责。
+            if not task.cancelled() and task.exception() is None:
+                self._shutdown_in_progress = False
+
+    async def _shutdown_async_owned(self) -> None:
+        with self._state_lock:
+            if self._shutdown_in_progress:
+                raise RuntimeError("LSP shutdown already in progress")
+            self._shutdown_in_progress = True
         reaper = self._idle_reaper_task
         self._idle_reaper_task = None
-        if reaper is not None:
-            reaper.cancel()
-            await asyncio.gather(reaper, return_exceptions=True)
+        try:
+            if reaper is not None:
+                reaper.cancel()
+                await asyncio.gather(reaper, return_exceptions=True)
+        except BaseException:
+            with self._state_lock:
+                if reaper is not None and not reaper.done():
+                    self._idle_reaper_task = reaper
+                self._shutdown_in_progress = False
+            raise
         with self._state_lock:
-            clients = list(self._clients.values())
-            self._clients.clear()
+            spawning = list(self._spawning.values())
+        if spawning:
+            try:
+                await asyncio.gather(
+                    *(asyncio.shield(future) for future in spawning),
+                    return_exceptions=True,
+                )
+            except BaseException:
+                with self._state_lock:
+                    self._shutdown_in_progress = False
+                raise
+        with self._state_lock:
+            pending = [
+                (key, client)
+                for key, client in self._clients.items()
+                if self._retiring_clients.get(key) is client
+            ]
+            snapshot = [
+                (key, client)
+                for key, client in self._clients.items()
+                if self._retiring_clients.get(key) is not client
+            ]
+            for key, client in snapshot:
+                self._retiring_clients[key] = client
+        if pending:
+            with self._state_lock:
+                for key, client in snapshot:
+                    if self._retiring_clients.get(key) is client:
+                        self._retiring_clients.pop(key, None)
+                self._shutdown_in_progress = False
+            raise RuntimeError(
+                f"LSP shutdown already in progress for {len(pending)} client(s)"
+            )
+        try:
+            results = await asyncio.gather(
+                *(
+                    self._shutdown_client_for_retry(client)
+                    for _, client in snapshot
+                ),
+                return_exceptions=True,
+            )
+        except BaseException:
+            with self._state_lock:
+                for key, client in snapshot:
+                    if self._clients.get(key) is client:
+                        self._cleanup_retry_clients[key] = client
+                    if self._retiring_clients.get(key) is client:
+                        self._retiring_clients.pop(key, None)
+                self._shutdown_in_progress = False
+            raise
+        failures = []
+        with self._state_lock:
+            for (key, client), result in zip(snapshot, results):
+                if isinstance(result, BaseException):
+                    failures.append(result)
+                    if self._clients.get(key) is client:
+                        self._cleanup_retry_clients[key] = client
+                elif self._clients.get(key) is client:
+                    self._clients.pop(key, None)
+                    self._last_used.pop(key, None)
+                    self._cleanup_retry_clients.pop(key, None)
+                if self._retiring_clients.get(key) is client:
+                    self._retiring_clients.pop(key, None)
+            if failures:
+                self._shutdown_in_progress = False
+        if failures:
+            raise RuntimeError(
+                f"LSP shutdown failed for {len(failures)} client(s)"
+            ) from failures[0]
+        with self._state_lock:
             self._broken.clear()
-            self._last_used.clear()
-        await asyncio.gather(
-            *(c.shutdown() for c in clients),
-            return_exceptions=True,
-        )
 
     # ------------------------------------------------------------------
     # status / introspection (used by ``hermes lsp status``)

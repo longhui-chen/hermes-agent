@@ -1,14 +1,4 @@
-"""Regression tests: failed-connect path must call adapter.disconnect().
-
-When adapter.connect() returns False or raises, the adapter may have
-allocated resources (aiohttp.ClientSession, poll tasks, child
-subprocesses) before giving up. Without a defensive disconnect() call
-these leak and surface as "Unclosed client session" warnings at
-process exit (seen on the 2026-04-18 18:08:16 gateway restart).
-
-The fix: gateway/run.py wraps each adapter connect() with a safety-net
-call to _safe_adapter_disconnect() in the failure branches.
-"""
+"""覆盖有界进程退出 cleanup 与严格的未发布 adapter cleanup。"""
 
 import asyncio
 import logging
@@ -22,7 +12,7 @@ from gateway.run import GatewayRunner
 
 @pytest.fixture
 def bare_runner():
-    """A GatewayRunner shell that only needs to support _safe_adapter_disconnect."""
+    """构造只含 cleanup helper 所需状态的 GatewayRunner 外壳。"""
     return object.__new__(GatewayRunner)
 
 
@@ -86,3 +76,121 @@ async def test_safe_disconnect_detaches_cancellation_swallowing_disconnect(
         release.set()
         await asyncio.wait({operation}, timeout=0.2)
         await asyncio.wait_for(finished.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_strict_partial_cleanup_waits_for_cancellation_swallowing_worker(
+    bare_runner, monkeypatch
+):
+    """严格 cleanup 超时后必须等待真实 worker，且期间保留 retry owner。"""
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
+    entered = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stubborn_disconnect():
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+
+    adapter = MagicMock()
+    adapter.disconnect = AsyncMock(side_effect=stubborn_disconnect)
+    operation = asyncio.create_task(
+        bare_runner._cleanup_unpublished_adapter(adapter, Platform.FEISHU)
+    )
+    await entered.wait()
+    await cancellation_seen.wait()
+    assert not operation.done()
+    assert bare_runner._partial_adapter_cleanup_retry[("", Platform.FEISHU)] is adapter
+
+    release.set()
+    await operation
+    assert ("", Platform.FEISHU) not in bare_runner._partial_adapter_cleanup_retry
+
+
+@pytest.mark.asyncio
+async def test_partial_cleanup_failure_keeps_owner_and_retry_is_exact(bare_runner):
+    adapter = MagicMock()
+    adapter.disconnect = AsyncMock(
+        side_effect=[RuntimeError("old poller alive"), None]
+    )
+
+    with pytest.raises(RuntimeError, match="old poller alive"):
+        await bare_runner._cleanup_unpublished_adapter(adapter, Platform.FEISHU)
+    assert bare_runner._partial_adapter_cleanup_retry[("", Platform.FEISHU)] is adapter
+
+    await bare_runner._retry_unpublished_adapter_cleanup("", Platform.FEISHU)
+    assert adapter.disconnect.await_count == 2
+    assert ("", Platform.FEISHU) not in bare_runner._partial_adapter_cleanup_retry
+
+
+@pytest.mark.asyncio
+async def test_partial_cleanup_concurrent_callers_join_exact_task(
+    bare_runner, monkeypatch
+):
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_disconnect():
+        entered.set()
+        await release.wait()
+
+    adapter = MagicMock()
+    adapter.disconnect = AsyncMock(side_effect=blocked_disconnect)
+    first = asyncio.create_task(
+        bare_runner._cleanup_unpublished_adapter(adapter, Platform.FEISHU)
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        bare_runner._cleanup_unpublished_adapter(adapter, Platform.FEISHU)
+    )
+    second_joined = asyncio.Event()
+    asyncio.get_running_loop().call_soon(second_joined.set)
+    await second_joined.wait()
+    assert adapter.disconnect.await_count == 1
+    assert not first.done()
+    assert not second.done()
+
+    release.set()
+    await asyncio.gather(first, second)
+    assert adapter.disconnect.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_cleanup_follower_cancel_does_not_cancel_owner(bare_runner):
+    """follower 取消只能离开等待，不能取消第一个 cleanup owner。"""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_disconnect():
+        entered.set()
+        await release.wait()
+
+    adapter = MagicMock()
+    adapter.disconnect = AsyncMock(side_effect=blocked_disconnect)
+    first = asyncio.create_task(
+        bare_runner._cleanup_unpublished_adapter(adapter, Platform.FEISHU)
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        bare_runner._cleanup_unpublished_adapter(adapter, Platform.FEISHU)
+    )
+    follower_joined = asyncio.Event()
+    asyncio.get_running_loop().call_soon(follower_joined.set)
+    await follower_joined.wait()
+    cancellation_delivered = asyncio.Event()
+    second.cancel()
+    asyncio.get_running_loop().call_soon(cancellation_delivered.set)
+    await cancellation_delivered.wait()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+    assert not first.done()
+    assert adapter.disconnect.await_count == 1
+    release.set()
+    await first
+    assert ("", Platform.FEISHU) not in bare_runner._partial_adapter_cleanup_retry

@@ -31,19 +31,25 @@ from __future__ import annotations
 import atexit
 import logging
 import threading
-from typing import Optional
+from typing import Dict, Optional
 
 from agent.lsp.manager import LSPService
 
 logger = logging.getLogger("agent.lsp")
 
-_service: Optional[LSPService] = None
+_services: Dict[str, Optional[LSPService]] = {}
 _atexit_registered = False
 _service_lock = threading.Lock()
 
 
+def _profile_identity() -> str:
+    from hermes_constants import get_hermes_home
+
+    return str(get_hermes_home().resolve())
+
+
 def get_service() -> Optional[LSPService]:
-    """Return the process-wide LSP service singleton, or None when disabled.
+    """Return the current profile's LSP service, or None when disabled.
 
     The service is created lazily on first call.  ``None`` is returned
     when LSP is disabled in config, when no workspace can be detected,
@@ -54,13 +60,17 @@ def get_service() -> Optional[LSPService]:
     CLI or gateway session doesn't leak pyright/gopls/etc. processes
     when it terminates.
     """
-    global _service, _atexit_registered
-    if _service is not None:
-        return _service if _service.is_active() else None
+    global _atexit_registered
+    profile_identity = _profile_identity()
+    if profile_identity in _services:
+        service = _services[profile_identity]
+        return service if service is not None and service.is_active() else None
     with _service_lock:
-        if _service is not None:
-            return _service if _service.is_active() else None
-        _service = LSPService.create_from_config()
+        if profile_identity in _services:
+            service = _services[profile_identity]
+            return service if service is not None and service.is_active() else None
+        service = LSPService.create_from_config()
+        _services[profile_identity] = service
         if not _atexit_registered:
             # ``atexit`` handlers run in LIFO order on normal Python
             # exit and on SystemExit, but NOT on os._exit() or
@@ -74,23 +84,28 @@ def get_service() -> Optional[LSPService]:
             # stdout buffers drain.
             atexit.register(_atexit_shutdown)
             _atexit_registered = True
-    return _service if (_service is not None and _service.is_active()) else None
+    return service if (service is not None and service.is_active()) else None
 
 
-def shutdown_service() -> None:
+def shutdown_service(*, raise_on_error: bool = False) -> None:
     """Tear down the LSP service if one was started.
 
     Safe to call multiple times; safe to call when no service was created.
     """
-    global _service
+    profile_identity = _profile_identity()
     with _service_lock:
-        svc = _service
-        _service = None
+        svc = _services.get(profile_identity)
     if svc is not None:
         try:
-            svc.shutdown()
+            svc.shutdown(raise_on_error=raise_on_error)
         except Exception as e:  # noqa: BLE001
-            logger.debug("LSP shutdown error: %s", e)
+            logger.error("LSP shutdown error: %s", e, exc_info=True)
+            if raise_on_error:
+                raise
+            return
+        with _service_lock:
+            if _services.get(profile_identity) is svc:
+                _services.pop(profile_identity, None)
 
 
 def _atexit_shutdown() -> None:
@@ -98,7 +113,14 @@ def _atexit_shutdown() -> None:
     atexit fires the user has already seen the agent's final output —
     a noisy shutdown line on top of that is just clutter."""
     try:
-        shutdown_service()
+        with _service_lock:
+            services = [svc for svc in _services.values() if svc is not None]
+            _services.clear()
+        for service in services:
+            try:
+                service.shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("atexit LSP shutdown failed: %s", e)
     except Exception as e:  # noqa: BLE001
         logger.debug("atexit LSP shutdown failed: %s", e)
 
