@@ -232,6 +232,10 @@ class _SkillDirectScope:
         compare=False,
     )
     memory_payload_sha256: frozenset[str] = frozenset()
+    # (targetless operation digest, helper-captured target).  A provider may
+    # omit target while copying a helper operation into the memory call; the
+    # pair keeps that compatibility strictly bound to the helper result.
+    memory_payload_shape_authorizations: frozenset[tuple[str, str]] = frozenset()
     command_format_retries: int = 1
     policy_violation_retries: int = _VIDEO_EDIT_POLICY_VIOLATION_RETRIES
     policy_exhausted: bool = False
@@ -243,6 +247,11 @@ class _SkillDirectOperation:
     function_name: str
     may_authorize_memory: bool = False
     authorized_args_sha256: str = field(
+        default="",
+        repr=False,
+        compare=False,
+    )
+    authorized_memory_target: str = field(
         default="",
         repr=False,
         compare=False,
@@ -1568,6 +1577,8 @@ def _recoverable_video_edit_command_format_error(
 
 def _normalized_memory_payload(
     function_args: Mapping[str, Any],
+    *,
+    inferred_target: str | None = None,
 ) -> dict[str, Any] | None:
     """Canonicalize the memory schema or an exact helper-operation copy."""
     fields = set(function_args)
@@ -1581,6 +1592,10 @@ def _normalized_memory_payload(
     target = function_args.get("target") if has_top_level_target else None
     if has_top_level_target and target not in {"memory", "user"}:
         return None
+    if target is None and inferred_target not in {None, "memory", "user"}:
+        return None
+    if target is None:
+        target = inferred_target
 
     normalized_operations: list[dict[str, Any]] = []
     for raw_operation in operations:
@@ -1595,7 +1610,7 @@ def _normalized_memory_payload(
                 target = operation_target
             elif operation_target != target:
                 return None
-        elif not has_top_level_target:
+        elif not has_top_level_target and target is None:
             return None
 
         action = operation.get("action")
@@ -1632,6 +1647,42 @@ def _canonical_memory_payload_sha256(function_args: Mapping[str, Any]) -> str:
     try:
         canonical = json.dumps(
             normalized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonical_memory_shape_sha256(function_args: Mapping[str, Any]) -> str:
+    """Hash memory operations without their target field.
+
+    The resolver's helper emits target on each operation, while some model
+    providers copy only the operation body into the following ``memory`` call.
+    This alias is used only with a target captured from that exact helper
+    result; it is never sufficient on its own to authorize a write.
+    """
+    operations = function_args.get("operations")
+    if not isinstance(operations, list):
+        return ""
+    stripped: list[dict[str, Any]] = []
+    for raw_operation in operations:
+        if not isinstance(raw_operation, dict):
+            return ""
+        operation = dict(raw_operation)
+        operation.pop("target", None)
+        stripped.append(operation)
+    normalized = _normalized_memory_payload(
+        {"operations": stripped},
+        inferred_target="memory",
+    )
+    if normalized is None:
+        return ""
+    try:
+        canonical = json.dumps(
+            {"operations": normalized["operations"]},
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -1728,6 +1779,86 @@ def _memory_payload_hashes_from_terminal_result(
         if digest:
             hashes.add(digest)
     return frozenset(hashes)
+
+
+def _memory_payload_shape_authorizations_from_terminal_result(
+    result: Mapping[str, Any],
+) -> frozenset[tuple[str, str]]:
+    """Return targetless operation hashes bound to helper-captured targets."""
+    output = result.get("output")
+    if not isinstance(output, str) or len(output) > 64 * 1024:
+        return frozenset()
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError):
+        return frozenset()
+    operations = payload.get("operations") if isinstance(payload, dict) else None
+    if not isinstance(operations, list) or not 1 <= len(operations) <= 4:
+        return frozenset()
+
+    grouped: dict[str, list[dict[str, Any]]] = {"memory": [], "user": []}
+    for raw_operation in operations:
+        if not isinstance(raw_operation, dict):
+            return frozenset()
+        operation = dict(raw_operation)
+        target = operation.pop("target", None)
+        if target not in grouped:
+            return frozenset()
+        grouped[target].append(operation)
+
+    authorizations: set[tuple[str, str]] = set()
+    for target, target_operations in grouped.items():
+        if not target_operations:
+            continue
+        digest = _canonical_memory_shape_sha256(
+            {"operations": target_operations}
+        )
+        if digest:
+            authorizations.add((digest, target))
+    return frozenset(authorizations)
+
+
+def _memory_authorization_for_scope(
+    function_args: Mapping[str, Any],
+    scope: _SkillDirectScope,
+) -> tuple[str, str]:
+    """Resolve an exact memory digest and any target inferred from a helper."""
+    normalized = _normalized_memory_payload(function_args)
+    digest = (
+        _canonical_memory_payload_sha256(normalized)
+        if normalized is not None
+        else ""
+    )
+    if digest and digest in scope.memory_payload_sha256:
+        return digest, ""
+
+    # Do not infer a target when the model supplied one (including on an
+    # individual operation); an explicit mismatch must fail closed.
+    if normalized is not None:
+        return "", ""
+    shape_digest = _canonical_memory_shape_sha256(function_args)
+    if not shape_digest:
+        return "", ""
+    matches = [
+        (candidate_digest, target)
+        for candidate_digest, target in scope.memory_payload_shape_authorizations
+        if candidate_digest == shape_digest
+    ]
+    if len(matches) != 1:
+        return "", ""
+    _, target = matches[0]
+    inferred = _normalized_memory_payload(
+        function_args,
+        inferred_target=target,
+    )
+    inferred_digest = (
+        _canonical_memory_payload_sha256(inferred)
+        if inferred is not None
+        else ""
+    )
+    if not inferred_digest or inferred_digest not in scope.memory_payload_sha256:
+        return "", ""
+    return inferred_digest, target
 
 
 def trusted_skill_operation_block_message(
@@ -1838,6 +1969,7 @@ def trusted_skill_operation_block_message(
         operation_scope = scope
         may_authorize_memory = False
         authorized_args_sha256 = ""
+        authorized_memory_target = ""
         if allowed and function_name == "terminal":
             normalized_args = _normalized_registry_tool_args(
                 function_name,
@@ -1861,11 +1993,22 @@ def trusted_skill_operation_block_message(
                 and authorized_args_sha256
             )
         elif allowed and function_name == "memory":
-            memory_digest = _canonical_memory_payload_sha256(function_args)
-            allowed = bool(memory_digest and memory_digest in scope.memory_payload_sha256)
+            memory_digest, authorized_memory_target = _memory_authorization_for_scope(
+                function_args,
+                scope,
+            )
+            allowed = bool(memory_digest)
             if allowed:
                 authorized_args_sha256 = memory_digest
                 remaining = scope.memory_payload_sha256 - {memory_digest}
+                shape_authorizations = scope.memory_payload_shape_authorizations
+                shape_digest = _canonical_memory_shape_sha256(function_args)
+                if authorized_memory_target and shape_digest:
+                    shape_authorizations = frozenset(
+                        pair
+                        for pair in shape_authorizations
+                        if pair != (shape_digest, authorized_memory_target)
+                    )
                 allowed_tools = scope.allowed_tools
                 if not remaining:
                     allowed_tools = allowed_tools - {"memory"}
@@ -1873,6 +2016,7 @@ def trusted_skill_operation_block_message(
                     scope,
                     allowed_tools=allowed_tools,
                     memory_payload_sha256=remaining,
+                    memory_payload_shape_authorizations=shape_authorizations,
                 )
         if not allowed:
             agent._zet_agent_skill_direct_operation = None
@@ -1936,6 +2080,7 @@ def trusted_skill_operation_block_message(
             function_name=function_name,
             may_authorize_memory=may_authorize_memory,
             authorized_args_sha256=authorized_args_sha256,
+            authorized_memory_target=authorized_memory_target,
         )
         return None
 
@@ -1991,6 +2136,11 @@ def trusted_skill_operation_execution_block_message(
             )
 
         normalized_args = _normalized_memory_payload(function_args)
+        if normalized_args is None and operation.authorized_memory_target:
+            normalized_args = _normalized_memory_payload(
+                function_args,
+                inferred_target=operation.authorized_memory_target,
+            )
         final_digest = (
             _canonical_memory_payload_sha256(normalized_args)
             if normalized_args is not None
@@ -2263,6 +2413,15 @@ def _rearm_skill_direct_scope_after_success(
                 )
                 else frozenset()
             )
+            memory_shape_authorizations = (
+                _memory_payload_shape_authorizations_from_terminal_result(result)
+                if (
+                    successful
+                    and scope.relative_path == _VIDEO_EDIT_SKILL_PATH
+                    and operation.may_authorize_memory
+                )
+                else frozenset()
+            )
             allowed_tools = scope.allowed_tools - {"memory"}
             if memory_hashes:
                 allowed_tools = allowed_tools | {"memory"}
@@ -2270,6 +2429,7 @@ def _rearm_skill_direct_scope_after_success(
                 scope,
                 allowed_tools=allowed_tools,
                 memory_payload_sha256=memory_hashes,
+                memory_payload_shape_authorizations=memory_shape_authorizations,
                 command_format_retries=1,
                 policy_violation_retries=_VIDEO_EDIT_POLICY_VIOLATION_RETRIES,
                 policy_exhausted=False,

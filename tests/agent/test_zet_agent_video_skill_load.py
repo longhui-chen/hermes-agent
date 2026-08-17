@@ -446,6 +446,58 @@ def test_plan_success_replace_authorization_matches_copied_helper_shape():
     ) == frozenset({copied_digest})
 
 
+def test_targetless_memory_copy_is_bound_to_helper_target_and_exact_body():
+    operation = {
+        "action": "replace",
+        "content": "new preference",
+        "old_text": "old preference",
+        "target": "memory",
+    }
+    terminal_result = {
+        "output": json.dumps(
+            {"ok": True, "operations": [operation]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    helper_args = {"operations": [operation]}
+    targetless_args = {
+        "operations": [
+            {key: value for key, value in operation.items() if key != "target"}
+        ]
+    }
+    full_digest = response_mode._canonical_memory_payload_sha256(helper_args)
+    shape_authorizations = (
+        response_mode._memory_payload_shape_authorizations_from_terminal_result(
+            terminal_result
+        )
+    )
+    scope = response_mode._SkillDirectScope(
+        relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+        task_sha256="task",
+        turn_identity=("turn", object()),
+        allowed_tools=frozenset({"memory"}),
+        memory_payload_sha256=frozenset({full_digest}),
+        memory_payload_shape_authorizations=shape_authorizations,
+    )
+
+    assert response_mode._memory_authorization_for_scope(
+        targetless_args, scope
+    ) == (full_digest, "memory")
+    assert response_mode._memory_authorization_for_scope(
+        {
+            "operations": [
+                {"action": "replace", "content": "tampered", "old_text": "old preference"}
+            ]
+        },
+        scope,
+    ) == ("", "")
+    assert response_mode._memory_authorization_for_scope(
+        {**targetless_args, "target": "user"},
+        scope,
+    ) == ("", "")
+
+
 def test_trusted_video_plan_success_replace_commits_copied_helper_shape_flow(
     monkeypatch,
     tmp_path,
@@ -545,10 +597,16 @@ def test_trusted_video_plan_success_replace_commits_copied_helper_shape_flow(
         )
         assert "memory" in response_mode.trusted_skill_allowed_tool_names(agent)
 
+        # Some providers copy the helper operation but silently omit target.
+        # The trusted scope must recover that target only from the exact
+        # helper result, rather than treating an unscoped memory write as safe.
+        targetless_operation = {
+            key: value for key, value in helper_operation.items() if key != "target"
+        }
         assistant_message = _tool_response(
             "memory",
             json.dumps(
-                {"operations": [helper_operation]},
+                {"operations": [targetless_operation]},
                 ensure_ascii=False,
             ),
         ).choices[0].message
