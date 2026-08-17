@@ -872,9 +872,20 @@ def _mutation_operation_outcome(status, request_body, parsed):
     return _ok({"outcome": outcome, "operation_id": operation_id, "state": terminal, "operation": receipt})
 
 
-def _record_data_import_attempt(args, result_json):
-    """ADIC v1: log one app_operation(data.import) outcome to the active
-    turn-scoped ledger (see gateway.session_context.record_import_attempt).
+def _record_app_operation_attempt(args, result_json):
+    """ADIC v1: log every app_operation outcome, tagged with its operation
+    name, to the active turn-scoped ledger (see
+    gateway.session_context.record_import_attempt).
+
+    Deliberately NOT filtered to the literal "data.import" here: local-server
+    stamps job["import_operation"] with the APP's own declared write
+    operation name (e.g. "records.refresh" for a blueprint app), not a fixed
+    string. cron/scheduler.py does the name filtering at verdict time against
+    that per-job value. Pre-filtering by a hardcoded name here would silently
+    stop recording for any app whose write operation isn't literally named
+    "data.import" — every round would then read an empty ledger and judge
+    the job a hard failure, which is the mirror image of the bug this
+    workstream exists to fix (false success flipped into false failure).
 
     Every other action — including call(), whose app-level errors are
     deliberately surfaced as ok:true (two-layer status) so the interactive
@@ -884,7 +895,8 @@ def _record_data_import_attempt(args, result_json):
     """
     if str(args.get("action", "") or "").strip() != "app_operation":
         return
-    if str(args.get("app_operation", "") or "").strip() != "data.import":
+    operation = str(args.get("app_operation", "") or "").strip()
+    if not operation:
         return
     try:
         parsed = json.loads(result_json)
@@ -900,7 +912,9 @@ def _record_data_import_attempt(args, result_json):
             elif error is not None:
                 error_message = str(error)
         from gateway.session_context import record_import_attempt
-        record_import_attempt(ok=ok, error_code=error_code, error_message=error_message)
+        record_import_attempt(
+            operation=operation, ok=ok, error_code=error_code, error_message=error_message
+        )
     except Exception:
         # Bookkeeping must never break the tool response the model is
         # waiting on.
@@ -913,7 +927,7 @@ def app_host_tool(args, **_kw):
     # contract as list_my_channels).
     args = args or {}
     result = _app_host_tool_dispatch(args, **_kw)
-    _record_data_import_attempt(args, result)
+    _record_app_operation_attempt(args, result)
     return result
 
 

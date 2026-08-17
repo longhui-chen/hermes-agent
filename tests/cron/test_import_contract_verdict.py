@@ -6,8 +6,15 @@ maintenance job's `last_status` used to be "the agent didn't throw and said
 something" — completely blind to whether the app actually accepted the data
 (the Hangzhou 17:57 incident). For a job carrying `app_slug` (written by
 local-server at provision time, never by the model), cron must instead judge
-by this turn's `app_operation(data.import)` outcomes, read from the
-turn-scoped ledger in `gateway.session_context` right before `mark_job_run`.
+by this turn's `app_operation` outcomes, read from the turn-scoped ledger in
+`gateway.session_context` right before `mark_job_run`, filtered by the job's
+`import_operation` — the APP's own declared write-operation name (e.g.
+"records.refresh" for a blueprint app), not necessarily the literal
+"data.import". A first pass of this fix hardcoded the "data.import" name at
+the recording layer; that is a P0 mirror-image bug (see the
+"operation-name filtering" section below): any app whose write operation
+isn't literally named "data.import" would have nothing recorded and would
+fail EVERY round, regardless of whether the import actually worked.
 
 Jobs without `app_slug` (the overwhelming majority of cron jobs — reminders,
 watchdogs, digests) must be completely unaffected; that is `test_run_one_job.py`
@@ -25,7 +32,10 @@ def _patch_pipeline(monkeypatch, *, success=True, final="final response", error=
     """Same shape as tests/cron/test_run_one_job.py's helper, extended so
     fake_run_job can simulate the app_host tool recording into the
     turn-scoped ledger from *inside* the agent turn — exactly where the real
-    app_host_tool._record_data_import_attempt call happens.
+    app_host_tool._record_app_operation_attempt call happens. Each entry in
+    ``import_attempts`` is passed verbatim as kwargs to
+    gateway.session_context.record_import_attempt, so it must include
+    ``operation``.
     """
     calls = []
 
@@ -59,13 +69,16 @@ def _mark_call(calls):
 
 
 # --- app_slug jobs: judged purely by this turn's import ledger ---------------
+# These jobs never set import_operation, so the verdict falls back to the
+# original fixed name "data.import" (see the fallback test in the
+# operation-name-filtering section below for that behavior pinned explicitly).
 
 def test_app_slug_job_with_confirmed_import_is_ok(monkeypatch):
     """A confirmed data.import overrides even a soft-failure agent verdict —
     business effect wins over 'the agent produced a plausible reply'."""
     calls = _patch_pipeline(
         monkeypatch, success=True, final="更新完成",
-        import_attempts=[{"ok": True}],
+        import_attempts=[{"operation": "data.import", "ok": True}],
     )
 
     s.run_one_job({"id": "j-app-ok", "name": "weather sync", "app_slug": "hangzhou-weather-live"})
@@ -80,7 +93,7 @@ def test_app_slug_job_overrides_a_clean_looking_reply_when_import_was_rejected(m
     still record error with the app's rejection reason."""
     calls = _patch_pipeline(
         monkeypatch, success=True, final="已更新（其实没有）",
-        import_attempts=[{"ok": False, "error_code": "import_rejected",
+        import_attempts=[{"operation": "data.import", "ok": False, "error_code": "import_rejected",
                            "error_message": "湿度必须是 0-100 的整数"}],
     )
 
@@ -95,8 +108,8 @@ def test_app_slug_job_overrides_a_clean_looking_reply_when_import_was_rejected(m
 def test_app_slug_job_overrides_to_error_when_not_confirmed(monkeypatch):
     calls = _patch_pipeline(
         monkeypatch, success=True, final="done",
-        import_attempts=[{"ok": False, "error_code": "import_not_confirmed",
-                           "error_message": ""}],
+        import_attempts=[{"operation": "data.import", "ok": False,
+                           "error_code": "import_not_confirmed", "error_message": ""}],
     )
 
     s.run_one_job({"id": "j-app-unconfirmed", "name": "sync", "app_slug": "shenzhen-weather-live"})
@@ -129,8 +142,10 @@ def test_app_slug_job_uses_the_last_failed_attempt_reason(monkeypatch):
     calls = _patch_pipeline(
         monkeypatch, success=True, final="done",
         import_attempts=[
-            {"ok": False, "error_code": "import_rejected", "error_message": "first try: bad date"},
-            {"ok": False, "error_code": "import_rejected", "error_message": "second try: bad humidity"},
+            {"operation": "data.import", "ok": False, "error_code": "import_rejected",
+             "error_message": "first try: bad date"},
+            {"operation": "data.import", "ok": False, "error_code": "import_rejected",
+             "error_message": "second try: bad humidity"},
         ],
     )
 
@@ -147,8 +162,9 @@ def test_app_slug_job_any_confirmed_import_among_failures_is_still_ok(monkeypatc
     calls = _patch_pipeline(
         monkeypatch, success=True, final="done",
         import_attempts=[
-            {"ok": False, "error_code": "import_rejected", "error_message": "bad humidity"},
-            {"ok": True},
+            {"operation": "data.import", "ok": False, "error_code": "import_rejected",
+             "error_message": "bad humidity"},
+            {"operation": "data.import", "ok": True},
         ],
     )
 
@@ -156,6 +172,90 @@ def test_app_slug_job_any_confirmed_import_among_failures_is_still_ok(monkeypatc
 
     _, _, ok, err = _mark_call(calls)
     assert (ok, err) == (True, None)
+
+
+# --- operation-name filtering: import_operation is the app's own declared name
+# P0 (post-review): the first pass of this fix hardcoded "data.import" at the
+# RECORDING layer (tools/apphost_tool.py), so an app whose declared write
+# operation is named anything else — e.g. "records.refresh", the name a real
+# blueprint app uses per zettlab-local-server's
+# app_dedicated_create_flow_test.go — got nothing recorded, ever, and failed
+# every single round regardless of whether the import actually worked. The
+# fix: recording is unfiltered (any app_operation call lands in the ledger,
+# tagged with its name); filtering by job["import_operation"] happens ONLY at
+# verdict time, here in run_one_job.
+
+def test_verdict_matches_the_jobs_own_import_operation_name(monkeypatch):
+    """A confirmed call to the app's OWN declared operation name (not the
+    literal "data.import") must be judged ok."""
+    calls = _patch_pipeline(
+        monkeypatch, success=True, final="quality board refreshed",
+        import_attempts=[{"operation": "records.refresh", "ok": True}],
+    )
+
+    s.run_one_job({
+        "id": "j-custom-op-ok", "name": "quality board sync",
+        "app_slug": "quality-dashboard", "import_operation": "records.refresh",
+    })
+
+    _, jid, ok, err = _mark_call(calls)
+    assert (jid, ok, err) == ("j-custom-op-ok", True, None)
+
+
+def test_verdict_reports_failure_of_the_jobs_own_import_operation(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch, success=True, final="done",
+        import_attempts=[{"operation": "records.refresh", "ok": False,
+                           "error_code": "import_rejected", "error_message": "duplicate record_id"}],
+    )
+
+    s.run_one_job({
+        "id": "j-custom-op-rejected", "name": "quality board sync",
+        "app_slug": "quality-dashboard", "import_operation": "records.refresh",
+    })
+
+    _, jid, ok, err = _mark_call(calls)
+    assert (jid, ok) == ("j-custom-op-rejected", False)
+    assert err == "duplicate record_id"
+
+
+def test_read_only_operation_this_round_does_not_count_as_import_even_with_custom_name(monkeypatch):
+    """The agent only called the read operation (data.import_schema) this
+    round — never the job's declared write operation (records.refresh).
+    Proves two things at once: (1) reads never count as an import, (2) a
+    same-turn call to a DIFFERENT operation name doesn't accidentally satisfy
+    a job whose import_operation is something else."""
+    calls = _patch_pipeline(
+        monkeypatch, success=True, final="read the schema, did not write",
+        import_attempts=[{"operation": "data.import_schema", "ok": True}],
+    )
+
+    s.run_one_job({
+        "id": "j-custom-op-read-only", "name": "quality board sync",
+        "app_slug": "quality-dashboard", "import_operation": "records.refresh",
+    })
+
+    _, jid, ok, err = _mark_call(calls)
+    assert jid == "j-custom-op-read-only"
+    assert ok is False
+    assert err == "no import attempted in this run"
+
+
+def test_job_missing_import_operation_falls_back_to_data_import(monkeypatch):
+    """A job with app_slug but no import_operation (older provisioning path,
+    or any future path that omits it) must keep judging against the
+    original fixed name "data.import" — not silently stop judging."""
+    calls = _patch_pipeline(
+        monkeypatch, success=True, final="done",
+        import_attempts=[{"operation": "data.import", "ok": True}],
+    )
+
+    job = {"id": "j-fallback-name", "name": "sync", "app_slug": "hangzhou-weather-live"}
+    assert "import_operation" not in job
+    s.run_one_job(job)
+
+    _, jid, ok, err = _mark_call(calls)
+    assert (jid, ok, err) == ("j-fallback-name", True, None)
 
 
 # --- non-app_slug jobs: completely unaffected ---------------------------------
@@ -166,7 +266,8 @@ def test_job_without_app_slug_is_unaffected_by_import_ledger(monkeypatch):
     its run — the override is strictly gated on app_slug."""
     calls = _patch_pipeline(
         monkeypatch, success=True, final="ok",
-        import_attempts=[{"ok": False, "error_code": "import_rejected", "error_message": "n/a"}],
+        import_attempts=[{"operation": "data.import", "ok": False,
+                           "error_code": "import_rejected", "error_message": "n/a"}],
     )
 
     s.run_one_job({"id": "j-no-slug", "name": "reminder"})
@@ -189,7 +290,8 @@ def test_job_without_app_slug_and_no_imports_keeps_empty_response_soft_failure(m
 # --- ledger lifecycle: bounded to one job's turn, no cross-job leakage -------
 
 def test_ledger_is_popped_after_the_job_and_does_not_leak_to_the_next_read(monkeypatch):
-    _patch_pipeline(monkeypatch, success=True, final="done", import_attempts=[{"ok": True}])
+    _patch_pipeline(monkeypatch, success=True, final="done",
+                     import_attempts=[{"operation": "data.import", "ok": True}])
 
     s.run_one_job({"id": "j-leak-check", "name": "sync", "app_slug": "hangzhou-weather-live"})
 
@@ -206,7 +308,8 @@ def test_second_job_does_not_see_the_first_jobs_ledger(monkeypatch):
     def fake_run_job(job, *, defer_agent_teardown=None):
         from gateway.session_context import record_import_attempt
         if job["id"] == "first":
-            record_import_attempt(ok=False, error_code="import_rejected", error_message="boom")
+            record_import_attempt(operation="data.import", ok=False,
+                                   error_code="import_rejected", error_message="boom")
         # "second" never calls record_import_attempt — its ledger must be empty.
         calls.append(job["id"])
         return (True, "out", "done", None)
@@ -256,7 +359,8 @@ def test_scope_does_not_leak_when_run_job_raises(monkeypatch):
 
     def boom(job, *, defer_agent_teardown=None):
         from gateway.session_context import record_import_attempt
-        record_import_attempt(ok=False, error_code="transport_error", error_message="mid-run")
+        record_import_attempt(operation="data.import", ok=False,
+                               error_code="transport_error", error_message="mid-run")
         # Snapshot BEFORE raising: proves the scope was genuinely open (the
         # record above actually landed), not that it merely stayed empty by
         # coincidence of the ledger never having been pushed at all.
@@ -287,7 +391,7 @@ def test_scope_does_not_leak_when_interrupted_flag_skips_mark_job_run(monkeypatc
     job = {"id": "j-interrupted", "name": "sync", "app_slug": "app-a"}
     s._interrupted_job_ids.add(job["id"])
     calls = _patch_pipeline(monkeypatch, success=True, final="final response",
-                             import_attempts=[{"ok": True}])
+                             import_attempts=[{"operation": "data.import", "ok": True}])
 
     try:
         ok = s.run_one_job(job)
@@ -305,7 +409,8 @@ def test_no_ledger_scope_leaks_outside_run_one_job(monkeypatch):
     """Before and after driving a job through run_one_job, no scope is open —
     matching interactive turns, which never push one at all."""
     assert import_attempts_snapshot() == []
-    _patch_pipeline(monkeypatch, success=True, final="done", import_attempts=[{"ok": True}])
+    _patch_pipeline(monkeypatch, success=True, final="done",
+                     import_attempts=[{"operation": "data.import", "ok": True}])
     s.run_one_job({"id": "j-scope-check", "name": "sync", "app_slug": "app-a"})
     assert import_attempts_snapshot() == []
 
@@ -379,9 +484,10 @@ def test_app_slug_and_maintenance_key_both_apply_on_the_same_job(tmp_path):
         "name": "hangzhou weather sync",
         "prompt": _MAINTENANCE_PROMPT,
         "app_slug": "hangzhou-weather-live",
+        "import_operation": "data.import",
     }
     ok, marks, session_id = _run_via_real_run_job(
-        tmp_path, job, record_attempts=[{"ok": True}],
+        tmp_path, job, record_attempts=[{"operation": "data.import", "ok": True}],
     )
 
     assert ok is True
@@ -400,6 +506,7 @@ def test_app_slug_present_without_maintenance_key_verdict_still_applies(tmp_path
         "name": "sync",
         "prompt": "fetch today's forecast and import it",
         "app_slug": "hangzhou-weather-live",
+        "import_operation": "data.import",
     }
     ok, marks, session_id = _run_via_real_run_job(tmp_path, job, record_attempts=[])
 

@@ -141,11 +141,20 @@ def cron_attached_skills() -> tuple[str, ...]:
     return _CRON_ATTACHED_SKILLS.get()
 
 # ADIC v1 (App Data Import Contract): a bounded, task-local ledger of this
-# turn's app_host `app_operation(data.import)` outcomes. cron/scheduler.py
-# pushes a scope around one job's run_conversation call and reads the ledger
-# right before mark_job_run, so a cron verdict can tell "the app confirmed
-# the import" apart from "the agent produced a plausible reply". Not part of
-# _VAR_MAP: like _BUSINESS_EXECUTION_TOKEN, this must never mirror into
+# turn's app_host `app_operation(...)` outcomes, tagged with the operation
+# name. cron/scheduler.py pushes a scope around one job's run_conversation
+# call and reads the ledger right before mark_job_run, filtering by
+# job.get("import_operation") (the app's OWN declared write-operation name —
+# e.g. "records.refresh" for a blueprint app, not necessarily the literal
+# "data.import"), so a cron verdict can tell "the app confirmed the write
+# operation this job exists to run" apart from "the agent produced a
+# plausible reply". Every app_operation call is recorded here regardless of
+# name — read operations like data.import_schema included — because the
+# name-based filter at verdict time is what excludes them; pre-filtering by a
+# fixed name here would make every app whose write operation isn't literally
+# named "data.import" fail every single round (the mirror-image bug this
+# ledger exists to prevent: false failure instead of false success). Not part
+# of _VAR_MAP: like _BUSINESS_EXECUTION_TOKEN, this must never mirror into
 # os.environ or forward to generic terminal/plugin/model-driving subprocesses,
 # and it must stay absent (not merely empty) for interactive turns that never
 # push a scope, so app_host's call() two-layer status is completely untouched.
@@ -154,7 +163,7 @@ _IMPORT_ATTEMPTS_MAX = 64
 
 
 def push_import_attempts_scope() -> object:
-    """Open this turn's bounded data.import ledger and return its token."""
+    """Open this turn's bounded app_operation ledger and return its token."""
     return _IMPORT_ATTEMPTS.set([])
 
 
@@ -163,18 +172,24 @@ def pop_import_attempts_scope(token: object) -> None:
     _IMPORT_ATTEMPTS.reset(token)
 
 
-def record_import_attempt(*, ok: bool, error_code: str = "", error_message: str = "") -> None:
-    """Append one data.import outcome to the active ledger.
+def record_import_attempt(
+    *, operation: str, ok: bool, error_code: str = "", error_message: str = ""
+) -> None:
+    """Append one app_operation outcome to the active ledger.
 
-    No-op when no scope is open (every interactive turn, and any cron path
-    that never calls :func:`push_import_attempts_scope`) and once the ledger
-    hits its cap, so a runaway retry loop within one turn cannot grow this
-    unbounded on a memory-constrained device.
+    ``operation`` is the exact operation name the call was made with (e.g.
+    "data.import", "records.refresh", "data.import_schema") — cron's verdict
+    filters on it, it is not a hint. No-op when no scope is open (every
+    interactive turn, and any cron path that never calls
+    :func:`push_import_attempts_scope`) and once the ledger hits its cap, so
+    a runaway retry loop within one turn cannot grow this unbounded on a
+    memory-constrained device.
     """
     ledger = _IMPORT_ATTEMPTS.get()
     if ledger is _UNSET or ledger is None or len(ledger) >= _IMPORT_ATTEMPTS_MAX:
         return
     ledger.append({
+        "operation": str(operation or "").strip()[:128],
         "ok": bool(ok),
         "error_code": str(error_code or ""),
         "error_message": str(error_message or "")[:512],
@@ -182,7 +197,7 @@ def record_import_attempt(*, ok: bool, error_code: str = "", error_message: str 
 
 
 def import_attempts_snapshot() -> list:
-    """Return this turn's recorded data.import outcomes (oldest first)."""
+    """Return this turn's recorded app_operation outcomes (oldest first)."""
     ledger = _IMPORT_ATTEMPTS.get()
     return list(ledger) if isinstance(ledger, list) else []
 

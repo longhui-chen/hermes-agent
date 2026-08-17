@@ -4506,7 +4506,20 @@ def run_one_job(
         if job.get("app_slug"):
             from gateway.session_context import import_attempts_snapshot
 
-            _import_attempts = import_attempts_snapshot()
+            # import_operation is the APP's own declared write-operation name
+            # (e.g. "records.refresh" for a blueprint app), stamped per job by
+            # local-server — not necessarily the literal "data.import". Filter
+            # the ledger to that name so a read call (data.import_schema) or a
+            # different app's operation never counts as this job's import,
+            # and so an app whose write operation isn't literally named
+            # "data.import" isn't judged a hard failure every round. Jobs
+            # created before this field existed (or on any path that omits
+            # it) fall back to the original fixed name.
+            _target_operation = str(job.get("import_operation") or "data.import").strip()
+            _import_attempts = [
+                attempt for attempt in import_attempts_snapshot()
+                if attempt.get("operation") == _target_operation
+            ]
             if any(attempt.get("ok") for attempt in _import_attempts):
                 success, error = True, None
             elif _import_attempts:

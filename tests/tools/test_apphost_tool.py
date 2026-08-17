@@ -354,13 +354,22 @@ def test_app_operation_requires_capability_digest_before_sending(monkeypatch):
 
 
 # --- ADIC v1: turn-scoped data.import ledger ---------------------------------
-# app_host records app_operation(data.import) outcomes into a bounded,
-# turn-scoped ledger (gateway.session_context) that cron/scheduler.py reads
-# right before mark_job_run to judge success by whether data actually landed,
+# app_host records EVERY app_operation outcome, tagged with its operation
+# name, into a bounded, turn-scoped ledger (gateway.session_context) that
+# cron/scheduler.py reads right before mark_job_run to judge success by
+# whether the app's own declared write operation actually landed this round,
 # not by whether the agent produced a plausible reply. See
 # zettlab-local-docs/app-fullstack/2026-08-17-应用数据导入契约-ADIC-v1.md §4.5
-# and the paired interface-freeze doc §7-8. The call() two-layer status
-# (tested above) is a completely separate code path and must stay untouched.
+# and the paired interface-freeze doc §7-8. Recording is deliberately NOT
+# filtered to the literal "data.import" here — local-server stamps
+# job["import_operation"] with the app's own declared mutation name (e.g.
+# "records.refresh" for a blueprint app), and cron/scheduler.py does the name
+# filtering at verdict time against that per-job value. A read call like
+# data.import_schema IS recorded (see the test below) — it is excluded from
+# the verdict purely because its name never matches any job's
+# import_operation, not because this layer special-cases read calls. The
+# call() two-layer status (tested above) is a completely separate code path
+# and must stay untouched.
 
 _IMPORT_ARGS = {
     "action": "app_operation", "slug": "hangzhou-weather-live",
@@ -386,7 +395,9 @@ def test_data_import_success_is_recorded_in_active_ledger(monkeypatch):
         ledger = import_attempts_snapshot()
     finally:
         pop_import_attempts_scope(token)
-    assert ledger == [{"ok": True, "error_code": "", "error_message": ""}]
+    assert ledger == [{
+        "operation": "data.import", "ok": True, "error_code": "", "error_message": "",
+    }]
 
 
 def test_data_import_rejection_is_recorded_with_upstream_code(monkeypatch):
@@ -407,7 +418,7 @@ def test_data_import_rejection_is_recorded_with_upstream_code(monkeypatch):
     finally:
         pop_import_attempts_scope(token)
     assert ledger == [{
-        "ok": False, "error_code": "import_rejected",
+        "operation": "data.import", "ok": False, "error_code": "import_rejected",
         "error_message": "湿度必须是 0-100 的整数",
     }]
 
@@ -435,9 +446,15 @@ def test_data_import_not_confirmed_is_recorded_with_upstream_code(monkeypatch):
     assert ledger[0]["error_code"] == "import_not_confirmed"
 
 
-def test_data_import_schema_read_operation_is_not_recorded(monkeypatch):
-    """Only the data.import mutation is tracked — the paired data.import_schema
-    read must not pollute the ledger."""
+def test_data_import_schema_read_is_recorded_under_its_own_operation_name(monkeypatch):
+    """A read call (data.import_schema) IS recorded — this layer does not
+    special-case reads. It is kept out of a job's import verdict purely
+    because cron/scheduler.py filters the ledger by job["import_operation"],
+    and "data.import_schema" never equals that value. If this layer instead
+    pre-filtered by name, an app whose declared write operation isn't
+    literally "data.import" (e.g. "records.refresh") would never get
+    anything recorded and would fail every round — see the P0 this test
+    guards against in tests/cron/test_import_contract_verdict.py."""
     from gateway.session_context import (
         import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
     )
@@ -453,7 +470,9 @@ def test_data_import_schema_read_operation_is_not_recorded(monkeypatch):
         ledger = import_attempts_snapshot()
     finally:
         pop_import_attempts_scope(token)
-    assert ledger == []
+    assert ledger == [{
+        "operation": "data.import_schema", "ok": True, "error_code": "", "error_message": "",
+    }]
 
 
 def test_call_action_never_touches_the_import_ledger(monkeypatch):
