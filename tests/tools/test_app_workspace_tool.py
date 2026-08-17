@@ -65,7 +65,9 @@ def test_schema_is_fixed_workspace_surface_not_generic_host_access():
     props = APP_WORKSPACE_SCHEMA["parameters"]["properties"]
     assert set(props["action"]["enum"]) == {
         "status", "checkout", "read", "apply_patch", "build", "publish",
-        "discard", "maintainer_schedule_status",
+        "discard", "maintainer_schedule_status", "maintenance_tasks",
+        "create_maintenance_task", "update_maintenance_task",
+        "delete_maintenance_task", "maintenance_task_runs",
     }
     assert not {"command", "url", "host", "env", "shell", "directory"} & set(props)
     assert "relative" in props["path"]["description"]
@@ -79,6 +81,10 @@ def test_workspace_routes_and_wire_shapes(monkeypatch):
         ("build", {}, "POST", f"/{_SLUG}/workspace/build", {"expected_instance_id": _INSTANCE}, {"revision": 4}),
         ("publish", {"expected_revision": 4, "note": "Fix title"}, "POST", f"/{_SLUG}/workspace/publish", {"expected_instance_id": _INSTANCE, "expected_revision": 4, "note": "Fix title"}, {"version_id": "v2"}),
         ("maintainer_schedule_status", {}, "GET", f"/{_SLUG}/maintainer_schedule?expected_instance_id={_INSTANCE}", None, {"app_instance_id": _INSTANCE, "schedule": "0 9 * * *", "timezone": "Asia/Shanghai", "enabled": False, "schedule_revision": 4}),
+        ("maintenance_tasks", {}, "GET", f"/{_SLUG}/maintenance_tasks?expected_instance_id={_INSTANCE}", None, {"tasks": []}),
+        ("create_maintenance_task", {"name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data."}, "POST", f"/{_SLUG}/maintenance_tasks", {"expected_instance_id": _INSTANCE, "name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data."}, {"id": "job-2"}),
+        ("maintenance_task_runs", {"task_id": "job-2"}, "GET", f"/{_SLUG}/maintenance_tasks/job-2/runs?expected_instance_id={_INSTANCE}", None, {"occurrences": []}),
+        ("update_maintenance_task", {"task_id": "job-2", "expected_schedule_revision": 4, "name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data.", "enabled": False}, "PATCH", f"/{_SLUG}/maintenance_tasks/job-2", {"expected_instance_id": _INSTANCE, "expected_schedule_revision": 4, "name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data.", "enabled": False}, {"id": "job-2"}),
     ]
     with mux_profile_scope(monkeypatch, _SCOPE):
         for action, extra, method, path, expected_body, response in cases:
@@ -115,6 +121,12 @@ def test_apply_patch_encodes_text_as_server_byte_wire_and_discard_requires_204(m
         assert output == {"ok": True, "data": {}}
         assert seen["request"].method == "DELETE"
         assert seen["request"].full_url == _BASE + f"/{_SLUG}/workspace"
+        seen = {}
+        with patch("tools.app_workspace_tool._apphost._urlopen", _capture(seen, _Response(None, status=204, content_type=None))):
+            output = json.loads(app_workspace_tool(_args("delete_maintenance_task", task_id="job-2", expected_schedule_revision=4)))
+        assert output == {"ok": True, "data": {}}
+        assert seen["request"].method == "DELETE"
+        assert seen["request"].full_url == _BASE + f"/{_SLUG}/maintenance_tasks/job-2?expected_instance_id={_INSTANCE}&expected_schedule_revision=4"
 
 
 def test_workspace_rejects_generic_path_and_unused_fields_without_request(monkeypatch):

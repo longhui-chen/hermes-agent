@@ -3302,7 +3302,11 @@ def run_job(
     # (which carries cron_hint preamble, skill wrappers, etc).
     persist_prompt = _build_job_persist_prompt(job)
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # Only tasks stamped by Local Server's maintenance-task contract carry a
+    # task identity to App Host. Existing cron jobs retain their historical
+    # session form until explicitly recreated as bound maintenance tasks.
+    _cron_session_kind = "task_" if "maintenance-key=" in str(job.get("prompt") or "") else ""
+    _cron_session_id = f"cron_{_cron_session_kind}{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])

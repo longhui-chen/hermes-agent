@@ -2796,14 +2796,21 @@ def defer_job(
         return update_job(job["id"], updates, preserve_claim=not clear_claim)
 
 
-def remove_job(job_id: str) -> bool:
+def remove_job(job_id: str, expected_revision: Optional[int] = None) -> bool:
     """Remove a job by ID or name."""
+    if expected_revision is not None and (isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0):
+        raise ValueError("expected_revision must be a non-negative integer")
     job = resolve_job_ref(job_id)
     if not job:
         return False
     canonical_id = job["id"]
     with _jobs_lock():
         jobs = load_jobs()
+        current = next((item for item in jobs if item["id"] == canonical_id), None)
+        if current is None:
+            return False
+        if expected_revision is not None and _job_revision(current) != expected_revision:
+            raise JobRevisionConflict("job revision changed; read it again before deleting")
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:

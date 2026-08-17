@@ -1,8 +1,9 @@
-"""Narrow adapter for App Host's dedicated-maintainer workspace surface.
+"""Narrow adapter for an app's dedicated-maintainer workspace and task surface.
 
-This is intentionally not a terminal or filesystem bridge.  App Host owns the
-checkout, validates the dedicated maintainer binding, and exposes only the
-seven fixed workspace actions plus read-only maintainer schedule status.
+This is intentionally not a terminal, generic cron, or filesystem bridge.
+App Host owns the checkout, validates the dedicated maintainer binding, and
+allows maintenance tasks only for that current app instance.  Each task is
+bound to a declared app mutation capability rather than a raw URL or database.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ from tools.registry import registry
 
 _ACTIONS = frozenset({
     "status", "checkout", "read", "apply_patch", "build", "publish",
-    "discard", "maintainer_schedule_status",
+    "discard", "maintainer_schedule_status", "maintenance_tasks",
+    "create_maintenance_task", "update_maintenance_task",
+    "delete_maintenance_task", "maintenance_task_runs",
 })
 _MAX_RESPONSE_BYTES = 1024 * 1024
 # App Host accepts an 8 MiB patch, but a subsequent read serializes its
@@ -81,6 +84,16 @@ APP_WORKSPACE_SCHEMA = {
                 "type": "string",
                 "description": "For publish only: a concise user-facing description of this version change.",
             },
+            "name": {"type": "string", "description": "For create_maintenance_task: user-visible task name."},
+            "schedule": {"type": "string", "description": "For create_maintenance_task: recurring interval or cron expression."},
+            "timezone": {"type": "string", "description": "For create_maintenance_task: IANA timezone."},
+            "kind": {"type": "string", "enum": ["refresh", "summary"], "description": "For create_maintenance_task: the app-scoped maintenance kind."},
+            "app_operation": {"type": "string", "description": "For create_maintenance_task: declared app write operation, read from app_capabilities first."},
+            "capability_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "For create_maintenance_task: exact digest from app_capabilities for app_operation."},
+            "instruction": {"type": "string", "description": "For create_maintenance_task: concise user-approved collection or summary instruction."},
+            "task_id": {"type": "string", "description": "For update_maintenance_task, delete_maintenance_task, or maintenance_task_runs: the id returned by maintenance_tasks."},
+            "expected_schedule_revision": {"type": "integer", "minimum": 0, "description": "For update_maintenance_task: current schedule_revision returned by maintenance_tasks."},
+            "enabled": {"type": "boolean", "description": "For update_maintenance_task: whether this task should run."},
         },
         "required": ["action", "slug", "expected_instance_id"],
     },
@@ -124,6 +137,20 @@ def _required_revision(args: dict) -> int:
     return revision
 
 
+def _required_task_id(args: dict) -> str:
+    value = str(args.get("task_id", "") or "").strip()
+    if not value or len(value) > 256 or value in {".", ".."} or "/" in value or "\\" in value:
+        raise _apphost._BadRequest("task_id 必须来自当前应用的 maintenance_tasks")
+    return value
+
+
+def _required_schedule_revision(args: dict) -> int:
+    value = args.get("expected_schedule_revision")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _apphost._BadRequest("expected_schedule_revision 必须来自 maintenance_tasks")
+    return value
+
+
 def _only(args: dict, allowed: set[str]):
     unexpected = set(args) - allowed
     if unexpected:
@@ -146,6 +173,46 @@ def _build_request(args: dict):
         return "GET", f"/{quote(slug, safe='')}/maintainer_schedule?" + urlencode({
             "expected_instance_id": instance,
         }), None, _apphost._DEFAULT_TIMEOUT
+    if action == "maintenance_tasks":
+        _only(args, base_fields)
+        return "GET", f"/{quote(slug, safe='')}/maintenance_tasks?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
+    if action == "create_maintenance_task":
+        fields = base_fields | {"name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction"}
+        _only(args, fields)
+        required = ("name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction")
+        if any(not isinstance(args.get(key), str) or not str(args[key]).strip() for key in required):
+            raise _apphost._BadRequest("create_maintenance_task requires its declared task contract")
+        digest = str(args["capability_digest"]).lower()
+        if not _SHA256_RE.fullmatch(digest):
+            raise _apphost._BadRequest("capability_digest must come from app_capabilities")
+        return "POST", f"/{quote(slug, safe='')}/maintenance_tasks", {
+            "expected_instance_id": instance, "name": str(args["name"]).strip(), "schedule": str(args["schedule"]).strip(),
+            "timezone": str(args["timezone"]).strip(), "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(),
+            "capability_digest": digest, "instruction": str(args["instruction"]).strip(),
+        }, _apphost._DEFAULT_TIMEOUT
+    if action == "maintenance_task_runs":
+        _only(args, base_fields | {"task_id"})
+        return "GET", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}/runs?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
+    if action == "delete_maintenance_task":
+        _only(args, base_fields | {"task_id", "expected_schedule_revision"})
+        return "DELETE", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}?" + urlencode({
+            "expected_instance_id": instance, "expected_schedule_revision": _required_schedule_revision(args),
+        }), None, _apphost._DEFAULT_TIMEOUT
+    if action == "update_maintenance_task":
+        fields = base_fields | {"task_id", "expected_schedule_revision", "name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction", "enabled"}
+        _only(args, fields)
+        required = ("name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction")
+        if any(not isinstance(args.get(key), str) or not str(args[key]).strip() for key in required) or not isinstance(args.get("enabled"), bool):
+            raise _apphost._BadRequest("update_maintenance_task requires the complete task contract and enabled state")
+        digest = str(args["capability_digest"]).lower()
+        if not _SHA256_RE.fullmatch(digest):
+            raise _apphost._BadRequest("capability_digest must come from app_capabilities")
+        return "PATCH", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}", {
+            "expected_instance_id": instance, "expected_schedule_revision": _required_schedule_revision(args),
+            "name": str(args["name"]).strip(), "schedule": str(args["schedule"]).strip(), "timezone": str(args["timezone"]).strip(),
+            "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(), "capability_digest": digest,
+            "instruction": str(args["instruction"]).strip(), "enabled": args["enabled"],
+        }, _apphost._DEFAULT_TIMEOUT
     if action in {"checkout", "build", "discard"}:
         _only(args, base_fields)
         method = "DELETE" if action == "discard" else "POST"
@@ -228,6 +295,26 @@ def _schedule_response(parsed, *, expected_instance_id: str, is_status: bool):
     return parsed
 
 
+def _maintenance_task_response(parsed, *, action: str):
+    """Reject a partial success receipt before an Agent claims a task changed."""
+    if action == "maintenance_tasks":
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("tasks"), list):
+            return None
+        for task in parsed["tasks"]:
+            if not isinstance(task, dict) or not isinstance(task.get("id"), str) or not task["id"]:
+                return None
+        return parsed
+    if action in {"create_maintenance_task", "update_maintenance_task"}:
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("id"), str) or not parsed["id"]:
+            return None
+        return parsed
+    if action == "maintenance_task_runs":
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("occurrences"), list):
+            return None
+        return parsed
+    return parsed
+
+
 def app_workspace_tool(args, **_kw) -> str:
     args = args if isinstance(args, dict) else {}
     try:
@@ -267,7 +354,7 @@ def app_workspace_tool(args, **_kw) -> str:
     if len(raw) > _MAX_RESPONSE_BYTES:
         return _apphost._local_error("transport_error", "App Workspace 返回内容过大", status=status)
     action = args.get("action")
-    if action in {"apply_patch", "discard"}:
+    if action in {"apply_patch", "discard", "delete_maintenance_task"}:
         if status == 204 and not raw:
             return _apphost._ok({})
         return _apphost._local_error("outcome_unknown", "App Workspace 返回了非合同完成状态", status=status)
@@ -289,6 +376,11 @@ def app_workspace_tool(args, **_kw) -> str:
                 "maintainer schedule 返回了缺失或不匹配的实例/修订回执",
                 status=status,
             )
+        return _apphost._ok(checked)
+    if action in {"maintenance_tasks", "create_maintenance_task", "update_maintenance_task", "maintenance_task_runs"}:
+        checked = _maintenance_task_response(parsed, action=action)
+        if checked is None:
+            return _apphost._local_error("outcome_unknown", "maintenance task 返回了不完整的回执", status=status)
         return _apphost._ok(checked)
     return _apphost._ok(_normalize_read(parsed) if action == "read" else parsed)
 
