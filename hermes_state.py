@@ -194,6 +194,9 @@ def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
     )
 
 
+_AGENT_DELETE_BATCH = 200  # 远低于 SQLite 默认变量上限 999，并给 delegate 的 chunk+chunk 双倍留足余量。
+
+
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
@@ -215,9 +218,9 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     frontier = list(seeds)
     while frontier:
         nxt: list = []
-        # delegate 遍历也分批：frontier + frontier 两条 IN 会翻倍变量数，400 上限=800 < 999。
-        for i in range(0, len(frontier), 400):
-            chunk = frontier[i:i + 400]
+        # delegate 遍历也分批：frontier + frontier 两条 IN 会翻倍变量数，_AGENT_DELETE_BATCH 上限=2*_AGENT_DELETE_BATCH < 999。
+        for i in range(0, len(frontier), _AGENT_DELETE_BATCH):
+            chunk = frontier[i:i + _AGENT_DELETE_BATCH]
             ph = ",".join("?" * len(chunk))
             cursor = conn.execute(
                 f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
@@ -236,16 +239,18 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
 
 def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
     ids = _collect_delegate_child_ids(conn, parent_ids)
-    if ids:
-        ph = ",".join("?" * len(ids))
-        conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
+    # delegate cascade 的最终删除也分批：单根大量 delegate 时 ids 可能超 SQLite 变量上限（Codex P1）。
+    for i in range(0, len(ids), _AGENT_DELETE_BATCH):
+        chunk = ids[i:i + _AGENT_DELETE_BATCH]
+        ph = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
         # FK safety: orphan any untagged stragglers pointing at a doomed row.
         conn.execute(
             f"UPDATE sessions SET parent_session_id = NULL "
             f"WHERE parent_session_id IN ({ph})",
-            ids,
+            chunk,
         )
-        conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
+        conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
     return ids
 
 T = TypeVar("T")
@@ -8978,8 +8983,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             while frontier:
                 nxt = []
                 # lineage 遍历也分批：单层 frontier 仍可能超 SQLite 变量上限（Codex P1）。
-                for i in range(0, len(frontier), 400):
-                    chunk = frontier[i:i + 400]
+                for i in range(0, len(frontier), _AGENT_DELETE_BATCH):
+                    chunk = frontier[i:i + _AGENT_DELETE_BATCH]
                     ph = ",".join("?" * len(chunk))
                     cur = conn.execute(
                         f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
@@ -8999,8 +9004,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             all_ids = list(found)
             # 分批删除，避免单条 IN 列表随历史无界增长、触及 SQLite 变量上限（默认 999）。
-            for i in range(0, len(all_ids), 400):
-                chunk = all_ids[i:i + 400]
+            for i in range(0, len(all_ids), _AGENT_DELETE_BATCH):
+                chunk = all_ids[i:i + _AGENT_DELETE_BATCH]
                 ph = ",".join("?" * len(chunk))
                 removed_delegate_ids.extend(_delete_delegate_children(conn, chunk))
                 conn.execute(

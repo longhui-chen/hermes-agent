@@ -107,3 +107,43 @@ def test_delete_sessions_for_agent_handles_more_roots_than_batch(tmp_path):
     remaining = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     conn.close()
     assert remaining == 0
+
+
+def test_delete_sessions_for_agent_batches_delegate_cascade(tmp_path):
+    # 单根挂 600 个 delegate 子会话，并把 SQLite 变量上限压到 500：
+    # delegate cascade 的最终删除必须分批，否则单条 IN 会超限回滚（Codex P1）。
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        "INSERT INTO sessions (id, source, user_id, started_at, archived, parent_session_id, model_config)"
+        " VALUES (?, 'zettlab', 'alice', 100.0, 0, NULL, NULL)",
+        ("zettlab:alice:agent-a:root",),
+    )
+    for i in range(600):
+        conn.execute(
+            "INSERT INTO sessions (id, source, user_id, started_at, archived, parent_session_id, model_config)"
+            " VALUES (?, 'zettlab', 'alice', 100.0, 0, NULL, ?)",
+            (f"delegate-{i}", '{"_delegate_from": "zettlab:alice:agent-a:root"}'),
+        )
+    conn.commit()
+    conn.close()
+
+    pre = sqlite3.connect(db_path, isolation_level=None)
+    pre.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 500)
+
+    db = SessionDB(db_path=db_path, _preopened_connection=pre)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+
+    assert deleted == 1  # 根（600 delegate 经 cascade 删除，不计入 all_ids）
+
+    conn = sqlite3.connect(db_path)
+    remaining = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.close()
+    assert remaining == 0
