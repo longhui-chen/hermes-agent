@@ -20,7 +20,7 @@ from tools.registry import registry
 
 
 _ACTIONS = frozenset({
-    "status", "checkout", "read", "apply_patch", "build", "publish",
+    "status", "checkout", "list", "read", "apply_patch", "build", "publish",
     "discard", "maintainer_schedule_status", "maintenance_tasks",
     "create_maintenance_task", "update_maintenance_task",
     "delete_maintenance_task", "maintenance_task_runs",
@@ -39,11 +39,16 @@ APP_WORKSPACE_SCHEMA = {
     "name": "app_workspace",
     "description": (
         "Edit the current version of an app only through App Host's dedicated "
-        "maintainer workspace. This is a fixed checkout/read/replace/build/"
+        "maintainer workspace. This is a fixed checkout/list/read/replace/build/"
         "publish/discard surface, not a terminal, general filesystem, URL, or "
         "environment interface. Start with status, use its app_instance_id and "
         "revision as the required compare-and-swap values, and read a file "
-        "before replacing it with apply_patch."
+        "before replacing it with apply_patch. After checkout, use list to see "
+        "which files exist and read only paths it returned — never guess a "
+        "pathname. A generated app keeps its page source at static/index.html, "
+        "its server code in main.go and any schema in migrations/, but list is "
+        "the authority; a read that comes back absent means your path was "
+        "wrong, not that the app lacks that kind of source."
     ),
     "parameters": {
         "type": "object",
@@ -218,6 +223,9 @@ def _build_request(args: dict):
         method = "DELETE" if action == "discard" else "POST"
         path = root if action == "discard" else f"{root}/{action}"
         return method, path, {"expected_instance_id": instance}, _apphost._LONG_TIMEOUT if action == "build" else _apphost._DEFAULT_TIMEOUT
+    if action == "list":
+        _only(args, base_fields)
+        return "POST", root + "/list", {"expected_instance_id": instance}, _apphost._DEFAULT_TIMEOUT
     if action == "read":
         _only(args, base_fields | {"path"})
         return "POST", root + "/read", {

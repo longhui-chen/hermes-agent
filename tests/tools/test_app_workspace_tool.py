@@ -64,7 +64,7 @@ def _args(action, **extra):
 def test_schema_is_fixed_workspace_surface_not_generic_host_access():
     props = APP_WORKSPACE_SCHEMA["parameters"]["properties"]
     assert set(props["action"]["enum"]) == {
-        "status", "checkout", "read", "apply_patch", "build", "publish",
+        "status", "checkout", "list", "read", "apply_patch", "build", "publish",
         "discard", "maintainer_schedule_status", "maintenance_tasks",
         "create_maintenance_task", "update_maintenance_task",
         "delete_maintenance_task", "maintenance_task_runs",
@@ -73,10 +73,23 @@ def test_schema_is_fixed_workspace_surface_not_generic_host_access():
     assert "relative" in props["path"]["description"]
 
 
+def test_schema_tells_the_maintainer_to_list_before_reading():
+    # A maintainer asked to reword an app's page guessed seven pathnames, never
+    # tried static/index.html, and reported the app had no page source. The
+    # surface has to say out loud that listing is how you find a path, and that
+    # an absent file means a wrong guess rather than a missing capability.
+    description = APP_WORKSPACE_SCHEMA["description"]
+    assert "list" in description
+    assert "never guess a pathname" in description
+    assert "static/index.html" in description
+    assert "your path was wrong" in description
+
+
 def test_workspace_routes_and_wire_shapes(monkeypatch):
     cases = [
         ("status", {}, "GET", f"/{_SLUG}/workspace?expected_instance_id={_INSTANCE}", None, {"checked_out": False}),
         ("checkout", {}, "POST", f"/{_SLUG}/workspace/checkout", {"expected_instance_id": _INSTANCE}, {"checked_out": True}),
+        ("list", {}, "POST", f"/{_SLUG}/workspace/list", {"expected_instance_id": _INSTANCE}, {"files": [{"path": "main.go", "size": 12}, {"path": "static/index.html", "size": 5668}]}),
         ("read", {"path": "main.go"}, "POST", f"/{_SLUG}/workspace/read", {"expected_instance_id": _INSTANCE, "path": "main.go"}, {"path": "main.go", "content": base64.b64encode(b"package main").decode(), "sha256": _SHA}),
         ("build", {}, "POST", f"/{_SLUG}/workspace/build", {"expected_instance_id": _INSTANCE}, {"revision": 4}),
         ("publish", {"expected_revision": 4, "note": "Fix title"}, "POST", f"/{_SLUG}/workspace/publish", {"expected_instance_id": _INSTANCE, "expected_revision": 4, "note": "Fix title"}, {"version_id": "v2"}),
@@ -98,6 +111,10 @@ def test_workspace_routes_and_wire_shapes(monkeypatch):
             assert (json.loads(body) if body else None) == expected_body
             if action == "read":
                 assert output["data"]["content"] == "package main"
+            if action == "list":
+                # The nested page source must survive the round trip: it is the
+                # exact path the real maintainer never managed to guess.
+                assert [f["path"] for f in output["data"]["files"]] == ["main.go", "static/index.html"]
 
 
 def test_apply_patch_encodes_text_as_server_byte_wire_and_discard_requires_204(monkeypatch):
