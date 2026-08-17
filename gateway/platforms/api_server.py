@@ -7654,11 +7654,25 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            success = _cron_remove(job_id)
+            expected_revision = request.query.get("expected_revision")
+            if expected_revision is not None:
+                expected_revision = int(expected_revision)
+                if expected_revision < 0:
+                    raise ValueError("expected_revision must be a non-negative integer")
+            if expected_revision is None:
+                success = _cron_remove(job_id)
+            else:
+                success = _cron_remove(job_id, expected_revision=expected_revision)
             if not success:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"ok": True})
+        except _CronJobRevisionConflict as e:
+            return web.json_response(
+                {"error": str(e), "code": "revision_conflict"}, status=409
+            )
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response(
                 {"error": _boundary_error_text("cron api", e)}, status=500

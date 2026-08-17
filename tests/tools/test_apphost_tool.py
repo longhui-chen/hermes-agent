@@ -175,7 +175,7 @@ def test_request_forwards_only_task_local_execution_headers(monkeypatch):
         clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
     )
     seen = {}
-    session_tokens = set_session_vars(session_id="session-1")
+    session_tokens = set_session_vars(session_id="cron_task_abcdef123456_20260817_120000")
     turn_tokens = set_turn_vars(
         turn_id="turn-1", business_execution_token="a" * 64
     )
@@ -190,7 +190,8 @@ def test_request_forwards_only_task_local_execution_headers(monkeypatch):
     req = seen["req"]
     assert req.get_header("X-zettlab-business-execution-token") == "a" * 64
     assert req.get_header("X-hermes-turn-id") == "turn-1"
-    assert req.get_header("X-hermes-session-id") == "session-1"
+    assert req.get_header("X-hermes-session-id") == "cron_task_abcdef123456_20260817_120000"
+    assert req.get_header("X-zettlab-app-maintenance-task-id") == "abcdef123456"
 
 
 def test_business_execution_token_is_not_lost_when_turn_correlation_is_absent(monkeypatch):

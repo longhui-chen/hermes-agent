@@ -325,6 +325,13 @@ class TestJobCRUD:
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
 
+    def test_remove_job_rejects_stale_revision(self, tmp_cron_dir):
+        job = create_job(prompt="Temp job", schedule="30m")
+        update_job(job["id"], {"enabled": False, "expected_revision": job["revision"]})
+        with pytest.raises(JobRevisionConflict):
+            remove_job(job["id"], expected_revision=job["revision"])
+        assert get_job(job["id"]) is not None
+
 
     def test_auto_repeat_for_once(self, tmp_cron_dir):
         job = create_job(prompt="One-shot", schedule="1h")

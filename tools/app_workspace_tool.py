@@ -1,8 +1,9 @@
-"""Narrow adapter for App Host's dedicated-maintainer workspace surface.
+"""Narrow adapter for an app's dedicated-maintainer workspace and task surface.
 
-This is intentionally not a terminal or filesystem bridge.  App Host owns the
-checkout, validates the dedicated maintainer binding, and exposes only the
-seven fixed workspace actions plus read-only maintainer schedule status.
+This is intentionally not a terminal, generic cron, or filesystem bridge.
+App Host owns the checkout, validates the dedicated maintainer binding, and
+allows maintenance tasks only for that current app instance.  Each task is
+bound to a declared app mutation capability rather than a raw URL or database.
 """
 
 from __future__ import annotations
@@ -193,8 +194,10 @@ def _build_request(args: dict):
         _only(args, base_fields | {"task_id"})
         return "GET", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}/runs?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
     if action == "delete_maintenance_task":
-        _only(args, base_fields | {"task_id"})
-        return "DELETE", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
+        _only(args, base_fields | {"task_id", "expected_schedule_revision"})
+        return "DELETE", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}?" + urlencode({
+            "expected_instance_id": instance, "expected_schedule_revision": _required_schedule_revision(args),
+        }), None, _apphost._DEFAULT_TIMEOUT
     if action == "update_maintenance_task":
         fields = base_fields | {"task_id", "expected_schedule_revision", "name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction", "enabled"}
         _only(args, fields)

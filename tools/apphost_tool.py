@@ -527,6 +527,13 @@ def _execution_headers():
         headers["X-Hermes-Turn-Id"] = str(turn_id)
     if session_id:
         headers["X-Hermes-Session-Id"] = session_id
+    # Bound scheduler sessions are server-generated as
+    # cron_task_<job-id>_<UTC timestamp>.
+    # The task id is therefore derived from trusted execution context, never
+    # supplied by a model tool argument.
+    match = re.fullmatch(r"cron_task_([a-f0-9]{12})_\d{8}_\d{6}", session_id)
+    if match:
+        headers["X-Zettlab-App-Maintenance-Task-Id"] = match.group(1)
     return headers
 
 

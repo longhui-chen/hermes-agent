@@ -123,10 +123,10 @@ def test_apply_patch_encodes_text_as_server_byte_wire_and_discard_requires_204(m
         assert seen["request"].full_url == _BASE + f"/{_SLUG}/workspace"
         seen = {}
         with patch("tools.app_workspace_tool._apphost._urlopen", _capture(seen, _Response(None, status=204, content_type=None))):
-            output = json.loads(app_workspace_tool(_args("delete_maintenance_task", task_id="job-2")))
+            output = json.loads(app_workspace_tool(_args("delete_maintenance_task", task_id="job-2", expected_schedule_revision=4)))
         assert output == {"ok": True, "data": {}}
         assert seen["request"].method == "DELETE"
-        assert seen["request"].full_url == _BASE + f"/{_SLUG}/maintenance_tasks/job-2?expected_instance_id={_INSTANCE}"
+        assert seen["request"].full_url == _BASE + f"/{_SLUG}/maintenance_tasks/job-2?expected_instance_id={_INSTANCE}&expected_schedule_revision=4"
 
 
 def test_workspace_rejects_generic_path_and_unused_fields_without_request(monkeypatch):
