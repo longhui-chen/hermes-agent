@@ -49,11 +49,19 @@ def test_image_trusts_own_mime_over_photo_message_type():
 # ─── _build_media_placeholder ────────────────────────────────────────────────
 
 
-def test_placeholder_document_in_photo_message_is_not_an_image():
-    evt = _evt(["/c/product.png", "/c/brief.md"], ["image/png", "text/markdown"], MessageType.PHOTO)
+def test_placeholder_document_in_photo_message_is_not_an_image(tmp_path):
+    # ⚠️ 必须是**真实存在**的文件：可读性契约接线后，读不到的路径不再被写进
+    # 模型提示（那正是族 A 的现场）。本用例钉的是「文档不许被 PHOTO 消息类型
+    # 提升成 image」，与可读性无关 —— 只需把假路径换成真文件。
+    png = tmp_path / "product.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    md = tmp_path / "brief.md"
+    md.write_bytes(b"# brief")
+
+    evt = _evt([str(png), str(md)], ["image/png", "text/markdown"], MessageType.PHOTO)
     out = _build_media_placeholder(evt)
-    assert "[User sent an image: /c/product.png]" in out
-    assert "[User sent an image: /c/brief.md]" not in out
-    assert "[User sent a file: /c/brief.md]" in out
+    assert f"[User sent an image: {png}]" in out
+    assert f"[User sent an image: {md}]" not in out
+    assert f"[User sent a file: {md}]" in out
 
 
