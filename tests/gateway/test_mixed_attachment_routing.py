@@ -21,11 +21,18 @@ from types import SimpleNamespace
 
 from gateway.platforms.base import MessageType
 from gateway.run import (
-    _build_media_placeholder,
+    _build_media_placeholder as _bmp_async,
     _event_media_is_audio,
     _event_media_is_image,
     _event_media_is_video,
 )
+
+
+def _build_media_placeholder(_e):
+    # ⚠️ 签名**有意**改成 async;只改调用方式,断言逐字不变。
+    import asyncio
+
+    return asyncio.run(_bmp_async(_e))
 
 
 def _evt(media_urls, media_types, message_type):

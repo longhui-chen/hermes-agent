@@ -65,7 +65,13 @@ class TestAttachmentChainEndToEndForEveryEnvironment:
         ⚠️ 这正是上一轮 Modal 出事的形状:它悄悄落在「所有附件都不可用」那一侧,
         而**没有任何测试以 modal 走过这条链**,所以没人知道。
         """
-        from gateway.run import _build_media_placeholder
+        import asyncio as _asyncio
+        from gateway.run import _build_media_placeholder as _bmp_async
+
+        def _build_media_placeholder(_e):
+            # ⚠️ 签名**有意**改成 async(探测不许在事件循环上同步等待)。
+            # 只改**调用方式**,下面的断言逐字不变。
+            return _asyncio.run(_bmp_async(_e))
 
         src = cache_root / "report.pdf"
         src.write_bytes(b"%PDF-1.7 hello")
@@ -99,7 +105,13 @@ class TestAttachmentChainEndToEndForEveryEnvironment:
         ⭐ ``modal`` 在这份名单里是本轮新加的 —— 上一轮它被按 backend 名字
         无条件拒,而 ``tools/environments/modal.py`` 早已挂载并同步 cache。
         """
-        from gateway.run import _build_media_placeholder
+        import asyncio as _asyncio
+        from gateway.run import _build_media_placeholder as _bmp_async
+
+        def _build_media_placeholder(_e):
+            # ⚠️ 签名**有意**改成 async(探测不许在事件循环上同步等待)。
+            # 只改**调用方式**,下面的断言逐字不变。
+            return _asyncio.run(_bmp_async(_e))
 
         src = cache_root / "report.pdf"
         src.write_bytes(b"%PDF-1.7 hello")
@@ -119,7 +131,13 @@ class TestAttachmentChainEndToEndForEveryEnvironment:
 
     def test_a_genuinely_unreadable_file_is_refused_everywhere(self, cache_root, monkeypatch):
         """负对照:文件真的不存在时,⛔ 不许有任何环境放行(⇒ 上面的绿不是恒真)。"""
-        from gateway.run import _build_media_placeholder
+        import asyncio as _asyncio
+        from gateway.run import _build_media_placeholder as _bmp_async
+
+        def _build_media_placeholder(_e):
+            # ⚠️ 签名**有意**改成 async(探测不许在事件循环上同步等待)。
+            # 只改**调用方式**,下面的断言逐字不变。
+            return _asyncio.run(_bmp_async(_e))
 
         monkeypatch.setenv("TERMINAL_ENV", "local")
         out = _build_media_placeholder(
@@ -293,7 +311,13 @@ class TestRemoteUrlAttachmentsSkipLocalFileChecks:
     """
 
     def test_a_discord_cdn_url_is_not_run_through_local_file_checks(self, monkeypatch):
-        from gateway.run import _build_media_placeholder
+        import asyncio as _asyncio
+        from gateway.run import _build_media_placeholder as _bmp_async
+
+        def _build_media_placeholder(_e):
+            # ⚠️ 签名**有意**改成 async(探测不许在事件循环上同步等待)。
+            # 只改**调用方式**,下面的断言逐字不变。
+            return _asyncio.run(_bmp_async(_e))
 
         monkeypatch.setenv("TERMINAL_ENV", "local")
         url = "https://cdn.discordapp.com/attachments/1/2/photo.png"
@@ -307,7 +331,13 @@ class TestRemoteUrlAttachmentsSkipLocalFileChecks:
         "https://example.invalid/a.png",
     ])
     def test_other_remote_schemes_too(self, scheme_url, monkeypatch):
-        from gateway.run import _build_media_placeholder
+        import asyncio as _asyncio
+        from gateway.run import _build_media_placeholder as _bmp_async
+
+        def _build_media_placeholder(_e):
+            # ⚠️ 签名**有意**改成 async(探测不许在事件循环上同步等待)。
+            # 只改**调用方式**,下面的断言逐字不变。
+            return _asyncio.run(_bmp_async(_e))
 
         monkeypatch.setenv("TERMINAL_ENV", "local")
         assert "could not be read" not in _build_media_placeholder(
@@ -315,7 +345,13 @@ class TestRemoteUrlAttachmentsSkipLocalFileChecks:
 
     def test_local_paths_are_still_verified(self, cache_root, monkeypatch):
         """🔴 必须保持不变:本地路径仍走可读性校验(⛔ 判据不是恒放行)。"""
-        from gateway.run import _build_media_placeholder
+        import asyncio as _asyncio
+        from gateway.run import _build_media_placeholder as _bmp_async
+
+        def _build_media_placeholder(_e):
+            # ⚠️ 签名**有意**改成 async(探测不许在事件循环上同步等待)。
+            # 只改**调用方式**,下面的断言逐字不变。
+            return _asyncio.run(_bmp_async(_e))
 
         monkeypatch.setenv("TERMINAL_ENV", "local")
         out = _build_media_placeholder(

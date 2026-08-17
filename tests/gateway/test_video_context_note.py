@@ -53,4 +53,5 @@ async def test_video_attachment_adds_path_note_without_document_wording(tmp_path
     assert _clip in result
     assert "video analysis or media tool" in result
     assert "The user sent a document" not in result
-    assert _build_media_placeholder(event) == f"[User sent a video: {_clip}]"
+    # ⚠️ 签名**有意**改成 async;本用例本身就是协程 ⇒ 直接 await,断言逐字不变。
+    assert await _build_media_placeholder(event) == f"[User sent a video: {_clip}]"

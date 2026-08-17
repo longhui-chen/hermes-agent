@@ -20,7 +20,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.run import _build_media_placeholder
+from gateway.run import _build_media_placeholder as _build_media_placeholder_async
+
+
+def _build_media_placeholder(event):
+    """⚠️ 签名**有意**改成 async(探测不许在事件循环上同步等待)。
+
+    这里只改**调用方式**,下面每一条断言**逐字不变** —— 同样的输入
+    必须得到同样的输出。
+    """
+    import asyncio
+
+    return asyncio.run(_build_media_placeholder_async(event))
 
 
 @pytest.fixture

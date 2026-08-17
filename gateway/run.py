@@ -2838,7 +2838,7 @@ def _is_remote_media_ref(ref: str) -> bool:
     return scheme not in {"file"}
 
 
-def _build_media_placeholder(event) -> str:
+async def _build_media_placeholder(event) -> str:
     """Build a text placeholder for media-only events so they aren't dropped.
 
     When a photo/document is queued during active processing and later
@@ -2846,7 +2846,15 @@ def _build_media_placeholder(event) -> str:
     the media would be silently lost.  This builds a placeholder that
     the vision enrichment pipeline will replace with a real description.
     """
-    from gateway.model_readability import verify_artifact_readable
+    from gateway.model_readability import (
+        _MESSAGE_PROBE_BUDGET_S,
+        verify_artifact_readable_async,
+    )
+
+    # 🔴 **整条消息一个总预算,⛔ 不是每个附件各一份。**
+    # 否则 N 个异常附件 = N × deadline 的累计停顿(即使每个都已异步,
+    # 用户侧的这条消息仍然要等 N 倍)。预算耗尽后余下附件**直接降级**。
+    _probe_deadline = time.monotonic() + _MESSAGE_PROBE_BUDGET_S
 
     parts = []
     media_urls = getattr(event, "media_urls", None) or []
@@ -2885,7 +2893,8 @@ def _build_media_placeholder(event) -> str:
                 parts.append(f"[User sent a file: {agent_url}]")
             continue
 
-        receipt = verify_artifact_readable(url)
+        receipt = await verify_artifact_readable_async(
+            url, budget_s=max(0.0, _probe_deadline - time.monotonic()))
         if not receipt.ok:
             # 告诉模型「有这么个附件、但读不到、为什么」，
             # ⛔ 而不是给它一条读不到的路径让它去猜。
@@ -9811,7 +9820,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         log_context="Voice-busy-interrupt",
                     )
                 elif not _interrupt_text and _media_urls:
-                    _interrupt_text = _build_media_placeholder(event)
+                    _interrupt_text = await _build_media_placeholder(event)
                 running_agent.interrupt(_interrupt_text)
             except Exception:
                 pass  # don't let interrupt failure block the ack
@@ -16169,7 +16178,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_context="Voice-priority-interrupt",
                 )
             elif not _interrupt_text and _media_urls:
-                _interrupt_text = _build_media_placeholder(event)
+                _interrupt_text = await _build_media_placeholder(event)
             running_agent.interrupt(_interrupt_text)
             # NOTE: self._pending_messages was write-only (never consumed).
             # The actual interrupt message is delivered via adapter._pending_messages
@@ -26776,7 +26785,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not pending_text and _media_urls:
-                                    pending_text = _build_media_placeholder(_peek_event)
+                                    pending_text = await _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
                             agent.interrupt(pending_text)
                             _interrupt_detected.set()
@@ -27045,7 +27054,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not _bp_text and _bp_media_urls:
-                                    _bp_text = _build_media_placeholder(_bp_event)
+                                    _bp_text = await _build_media_placeholder(_bp_event)
                             logger.info(
                                 "Backup interrupt detected for session %s "
                                 "(monitor task state: %s)",
@@ -27147,7 +27156,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not _bp_text and _bp_media_urls:
-                                    _bp_text = _build_media_placeholder(_bp_event)
+                                    _bp_text = await _build_media_placeholder(_bp_event)
                             logger.info(
                                 "Backup interrupt detected for session %s "
                                 "(monitor task state: %s)",
@@ -27333,9 +27342,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata={"thread_id": source.thread_id} if source.thread_id else None,
                         )
                         if not pending:
-                            pending = _build_media_placeholder(pending_event)
+                            pending = await _build_media_placeholder(pending_event)
                     else:
-                        pending = _pending_text or _build_media_placeholder(pending_event)
+                        pending = _pending_text or await _build_media_placeholder(pending_event)
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 

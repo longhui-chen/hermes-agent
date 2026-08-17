@@ -7,10 +7,32 @@
 import asyncio
 import os
 import pathlib
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_probe_pool():
+    """⚠️ ``_probe_permits`` / ``_probe_pool`` 是**模块级全局**:上一条用例里被卡住的
+    worker 会攥着票不放,污染下一条。⭐ 这不是产品缺陷(卡死的探测本来就该让后续
+    请求快速降级),而是**测试隔离**问题 ⇒ 每条用例换一套全新的票和池。"""
+    import concurrent.futures
+    import threading as _t
+
+    import gateway.model_readability as mr
+
+    old_permits, old_pool = mr._probe_permits, mr._probe_pool
+    mr._probe_permits = _t.BoundedSemaphore(mr._PROBE_MAX_WORKERS)
+    mr._probe_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=mr._PROBE_MAX_WORKERS, thread_name_prefix="test-probe")
+    try:
+        yield
+    finally:
+        mr._probe_pool.shutdown(wait=False)
+        mr._probe_permits, mr._probe_pool = old_permits, old_pool
 
 
 # ═════════════════ A · 每次上传都要硬期限 ═════════════════
@@ -253,7 +275,7 @@ class TestReadabilityProbeCannotBlockTheEventLoop:
 
         monkeypatch.setattr(mr, "_PROBE_DEADLINE_S", 0.2)
         monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
-                            lambda *a, **k: time.sleep(30))
+                            lambda *a, **k: time.sleep(2))
         t0 = time.monotonic()
         r = mr.verify_artifact_readable("/mnt/dead-nfs/a.png")
         elapsed = time.monotonic() - t0
@@ -267,7 +289,7 @@ class TestReadabilityProbeCannotBlockTheEventLoop:
 
         monkeypatch.setattr(mr, "_PROBE_DEADLINE_S", 0.4)
         monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
-                            lambda *a, **k: time.sleep(30))
+                            lambda *a, **k: time.sleep(2))
         ticks = []
 
         async def _drive():
@@ -317,3 +339,147 @@ class TestReadabilityProbeCannotBlockTheEventLoop:
         pool = mr._get_probe_pool()
         assert pool is mr._get_probe_pool(), "每次新建线程池 = 无界增长"
         assert pool._max_workers == mr._PROBE_MAX_WORKERS
+
+
+# ═══════════ E · 第十二轮:探测的【同步等待】与【无界排队】 ═══════════
+
+class TestProbeWaitsAsynchronously:
+    """🔴 上一版只把**系统调用**丢进线程,却仍在事件循环上同步
+    ``Future.result(timeout=5)`` —— **有上限也照样是停顿**。
+    ``_build_media_placeholder()`` 逐个附件调用 ⇒ N 个异常附件 = N×deadline。
+    """
+
+    def test_the_loop_keeps_running_while_the_probe_is_stuck(self, monkeypatch):
+        """✅ **应该改变**:探测卡住时事件循环照跑,⛔ 不再整段停顿。"""
+        import gateway.model_readability as mr
+
+        monkeypatch.setattr(mr, "_PROBE_DEADLINE_S", 0.4)
+        monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
+                            lambda *a, **k: time.sleep(2))
+        ticks = []
+
+        async def _drive():
+            async def _ticker():
+                while True:
+                    ticks.append(1)
+                    await asyncio.sleep(0.02)
+
+            t = asyncio.create_task(_ticker())
+            await asyncio.sleep(0)
+            r = await mr.verify_artifact_readable_async("/mnt/dead/a.png")
+            t.cancel()
+            return r
+
+        r = asyncio.run(_drive())
+        assert r.ok is False and r.failure_code == "attachment_transfer_failed"
+        assert len(ticks) > 5, (
+            f"探测期间事件循环只跑了 {len(ticks)} 次 ⇒ 仍在同步等待,所有会话一起停"
+        )
+
+    def test_n_bad_attachments_do_not_multiply_the_stall(self, monkeypatch):
+        """✅ **应该改变**:整条消息共享一个预算,⛔ 不是每个附件各一份。"""
+        import gateway.model_readability as mr
+
+        monkeypatch.setattr(mr, "_PROBE_DEADLINE_S", 0.3)
+        monkeypatch.setattr(mr, "_MESSAGE_PROBE_BUDGET_S", 0.6)
+        monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
+                            lambda *a, **k: time.sleep(2))
+
+        async def _drive():
+            deadline = time.monotonic() + mr._MESSAGE_PROBE_BUDGET_S
+            t0 = time.monotonic()
+            out = []
+            for _ in range(6):                     # 6 个坏附件
+                out.append(await mr.verify_artifact_readable_async(
+                    "/mnt/dead/x.png",
+                    budget_s=max(0.0, deadline - time.monotonic())))
+            return out, time.monotonic() - t0
+
+        out, elapsed = asyncio.run(_drive())
+        assert all(r.ok is False for r in out)
+        assert elapsed < 6 * 0.3, (
+            f"6 个坏附件花了 {elapsed:.2f}s ⇒ 预算没共享,停顿仍随附件数线性增长"
+        )
+
+    def test_the_message_budget_is_a_multiple_of_the_per_file_one(self):
+        """⛔ 上限不许拍脑袋:整条消息预算必须由单附件预算推导。"""
+        import gateway.model_readability as mr
+
+        assert mr._MESSAGE_PROBE_BUDGET_S == mr._PROBE_DEADLINE_S * 2
+
+    def test_the_placeholder_builder_is_a_coroutine(self):
+        """⭐ 判据落在**生产入口**:它必须是协程,否则调用方只能同步等。"""
+        import inspect
+
+        from gateway.run import _build_media_placeholder
+
+        assert inspect.iscoroutinefunction(_build_media_placeholder)
+
+
+class TestProbeAdmissionIsBounded:
+    """🔴 四个 worker 全卡死后,后续附件仍会进 ``ThreadPoolExecutor`` 的**无界队列**
+    ⇒ 待处理 future / 参数 / 路径持续累积 ⇒ 约 2 GB 设备内存预算下最终 OOM。
+    """
+
+    def test_a_saturated_pool_rejects_instead_of_queueing(self, monkeypatch):
+        """✅ **应该改变**:饱和时**当场拒绝**,⛔ 不排队。"""
+        import gateway.model_readability as mr
+
+        monkeypatch.setattr(mr, "_PROBE_DEADLINE_S", 30.0)   # 期限不该是它退出的原因
+        released = threading.Event()
+        monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
+                            lambda *a, **k: released.wait(5))
+        try:
+            wedged = [mr._probe_submit(f"/mnt/dead/{i}", 1, None)
+                      for i in range(mr._PROBE_MAX_WORKERS)]
+            assert all(w is not None for w in wedged), "前 N 个应当都拿到票"
+            t0 = time.monotonic()
+            r = mr.verify_artifact_readable("/mnt/dead/extra.png")
+            elapsed = time.monotonic() - t0
+            assert elapsed < 1.0, f"饱和后仍等了 {elapsed:.1f}s ⇒ 排进了无界队列"
+            assert r.ok is False and "saturated" in (r.failure_detail or ""), (
+                f"饱和没有被当场拒绝:{r.failure_detail!r}"
+            )
+        finally:
+            released.set()
+            for w in wedged:
+                if w is not None:
+                    w.result(timeout=15)
+
+    def test_permits_come_back_when_the_mount_recovers(self, monkeypatch):
+        """⭐ **回收策略**:票在 worker 的 finally 里归还 ⇒ 挂载点一恢复就自愈,
+        ⛔ 不需要重建线程池(重建会把卡死线程变成无界增长)。"""
+        import gateway.model_readability as mr
+
+        released = threading.Event()
+        monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
+                            lambda *a, **k: released.wait(5))
+        wedged = [mr._probe_submit(f"/mnt/dead/{i}", 1, None)
+                  for i in range(mr._PROBE_MAX_WORKERS)]
+        assert mr._probe_submit("/x", 1, None) is None, "前置:此刻应当饱和"
+        released.set()
+        for w in wedged:
+            w.result(timeout=15)
+        again = mr._probe_submit("/y", 1, None)
+        assert again is not None, "挂载点恢复后票没有归还 ⇒ 探测永久停摆"
+        again.result(timeout=15)
+
+    def test_a_healthy_probe_still_returns_a_receipt(self, tmp_path, monkeypatch):
+        """🔴 **必须保持不变**:没饱和时正常文件的回执逐字不变。"""
+        import gateway.model_readability as mr
+
+        f = tmp_path / "ok.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"y" * 64)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        r = asyncio.run(mr.verify_artifact_readable_async(str(f)))
+        assert r.ok is True and r.model_path == str(f) and r.sha256 is None
+        assert "read_ok" in r.checks
+
+    def test_the_sync_entrypoint_still_works_for_non_loop_callers(self, tmp_path, monkeypatch):
+        """🔴 **必须保持不变**:CLI / 后台线程等本来就不在循环上的调用方不受影响。"""
+        import gateway.model_readability as mr
+
+        f = tmp_path / "ok2.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"z" * 64)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        assert mr.verify_artifact_readable(str(f)).ok is True

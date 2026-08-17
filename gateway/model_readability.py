@@ -49,6 +49,7 @@ Hermes 这一层的具体缺口：现在只把路径拼成一句 ``[file: <path>
 """
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import os
 import stat
@@ -174,10 +175,24 @@ def _fd_matches_path(fd: int, source_path: str) -> bool:
 # 卡住的 worker 各自只占一个 fd + 4 KiB 缓冲,4 个足够并发探测且把
 # 「卡死线程」封顶在 4。
 _PROBE_MAX_WORKERS = 4
+# 🔴 **准入必须有界,⛔ 不能靠线程池自己的无界工作队列排队。**
+# 四个 worker 全被失联挂载卡死后,后续每个附件仍会被 ``submit`` 进
+# ``ThreadPoolExecutor`` 的**无界队列**;超时分支既拒不掉、也移不走已排队的
+# work item ⇒ 待处理 future / 参数 / 路径持续累积 ⇒ 约 2 GB 的共享设备内存
+# 预算下最终 OOM。⇒ **提交前非阻塞拿票,拿不到就当场降级**。
+# ⭐ 回收策略:票在 worker 的 ``finally`` 里归还 —— 挂载点恢复、syscall 返回的
+#   那一刻票自动回来,**不需要重建线程池**(重建反而会把卡死线程变成无界增长)。
+#   永久卡死的挂载没有「可回收」这回事,那时**持续快速降级就是正确行为**。
+_probe_permits = threading.BoundedSemaphore(_PROBE_MAX_WORKERS)
 # ⛔ 期限不许拍脑袋:健康的本地探测是**亚毫秒**级(几个 syscall + 4 KiB 读),
 # 5s 已高出三个数量级;同时远低于任何用户可感知的发送预算 ⇒ 卡住时能立刻
 # 按 ``attachment_transfer_failed`` 降级,而不是把整个网关拖住。
 _PROBE_DEADLINE_S = 5.0
+# 🔴 **整条消息共享一个探测预算。** 单个附件的 ``_PROBE_DEADLINE_S`` 挡不住
+# 「一条消息挂 N 个异常附件」—— 那是 N 倍的累计停顿。⛔ 上限不许拍脑袋:
+# 取单附件预算的 2 倍 —— 正常一条消息里健康附件是亚毫秒级,2 倍足以覆盖
+# 「一两个坏附件 + 若干健康附件」,再多就该整条降级而不是让用户干等。
+_MESSAGE_PROBE_BUDGET_S = _PROBE_DEADLINE_S * 2
 _probe_pool_lock = threading.Lock()
 _probe_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
@@ -193,38 +208,97 @@ def _get_probe_pool() -> concurrent.futures.ThreadPoolExecutor:
         return _probe_pool
 
 
+def _probe_submit(source_path, max_bytes, runtime_id):
+    """拿票 + 提交。拿不到票返回 ``None``(调用方当场降级)。"""
+    if not _probe_permits.acquire(blocking=False):
+        return None
+
+    def _run():
+        try:
+            return _verify_artifact_readable_blocking(
+                source_path, max_bytes=max_bytes, runtime_id=runtime_id)
+        finally:
+            _probe_permits.release()
+
+    try:
+        return _get_probe_pool().submit(_run)
+    except Exception:
+        _probe_permits.release()
+        raise
+
+
+def _probe_saturated(source_path, env):
+    return _fail(str(source_path or ""), "attachment_transfer_failed",
+                 "readability probe saturated (unresponsive mount?)", [], env)
+
+
+def _probe_timed_out(source_path, env, budget):
+    return _fail(str(source_path or ""), "attachment_transfer_failed",
+                 f"readability probe exceeded {budget:.1f}s (unresponsive mount?)",
+                 [], env)
+
+
+def _probe_env(runtime_id):
+    return (runtime_id or os.environ.get("TERMINAL_ENV", "local")
+            or "local").strip().lower()
+
+
+async def verify_artifact_readable_async(
+    source_path: str,
+    *,
+    max_bytes: int = 512 * 1024 * 1024,
+    runtime_id: Optional[str] = None,
+    budget_s: Optional[float] = None,
+) -> ArtifactReceipt:
+    """⭐ **事件循环上的调用方必须用这个。**
+
+    🔴 上一版只把**系统调用**丢进线程,却仍在事件循环上同步
+    ``Future.result(timeout=…)`` —— **有上限也照样是停顿**。而
+    ``_build_media_placeholder()`` 会**逐个附件**调用 ⇒ 一条含 N 个异常附件的
+    消息让所有会话停顿约 N×deadline;四个 worker 都卡住后连**健康附件**也要
+    先等满一个 deadline 才失败。
+    ⇒ 这里改成 ``await``,并接受调用方传入的**整条消息共享**预算 ``budget_s``。
+    """
+    env = _probe_env(runtime_id)
+    budget = _PROBE_DEADLINE_S if budget_s is None else budget_s
+    if budget <= 0:
+        return _probe_timed_out(source_path, env, 0.0)
+    try:
+        future = _probe_submit(source_path, max_bytes, runtime_id)
+    except Exception as exc:
+        return _fail(str(source_path or ""), "attachment_transfer_failed",
+                     f"probe could not run: {exc!r}", [], env)
+    if future is None:
+        return _probe_saturated(source_path, env)
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(future), timeout=budget)
+    except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+        # ⛔ 不 cancel:worker 卡在 syscall 上,取消无效;票由它自己的 finally 归还。
+        return _probe_timed_out(source_path, env, budget)
+
+
 def verify_artifact_readable(
     source_path: str,
     *,
     max_bytes: int = 512 * 1024 * 1024,
     runtime_id: Optional[str] = None,
 ) -> ArtifactReceipt:
-    """证明这份 artifact 在 Hermes 的实际运行环境里可读。
+    """同步入口 —— ⛔ **不许从协程里调用**(有门钉住调用点全集)。
 
-    成功时 ``model_path`` 是**目标环境**中的路径；失败时它是 ``None`` ——
-    ⛔ 调用方不许在失败时退回用 ``source_path`` 拼提示，那正是本契约要消除的。
-
-    ⚠️ 阻塞的 ``lstat/open/fstat/read`` 全部在**隔离 worker** 里跑,超期按
-    ``attachment_transfer_failed`` 降级 —— ⛔ 不再把事件循环交给挂载点。
+    留给 CLI / 后台线程等本来就不在事件循环上的调用方。
     """
-    env_for_fail = (
-        runtime_id or os.environ.get("TERMINAL_ENV", "local") or "local"
-    ).strip().lower()
+    env = _probe_env(runtime_id)
     try:
-        future = _get_probe_pool().submit(
-            _verify_artifact_readable_blocking,
-            source_path, max_bytes=max_bytes, runtime_id=runtime_id,
-        )
+        future = _probe_submit(source_path, max_bytes, runtime_id)
+    except Exception as exc:
+        return _fail(str(source_path or ""), "attachment_transfer_failed",
+                     f"probe could not run: {exc!r}", [], env)
+    if future is None:
+        return _probe_saturated(source_path, env)
+    try:
         return future.result(timeout=_PROBE_DEADLINE_S)
     except concurrent.futures.TimeoutError:
-        # ⛔ ``future.cancel()`` 对已在跑的 worker 无效 —— 它卡在 syscall 上,
-        #   只能等挂载点自己回来。这里**不等**,直接降级;线程数由池封顶。
-        return _fail(str(source_path or ""), "attachment_transfer_failed",
-                     f"readability probe exceeded {_PROBE_DEADLINE_S:.0f}s "
-                     "(unresponsive mount?)", [], env_for_fail)
-    except Exception as exc:  # 池已关闭 / 提交失败 —— ⛔ 不许假装可读
-        return _fail(str(source_path or ""), "attachment_transfer_failed",
-                     f"probe could not run: {exc!r}", [], env_for_fail)
+        return _probe_timed_out(source_path, env, _PROBE_DEADLINE_S)
 
 
 def _verify_artifact_readable_blocking(
