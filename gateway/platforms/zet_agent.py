@@ -241,6 +241,14 @@ _deep_memory_subject: ContextVar[str] = ContextVar(
     "zettlab_deep_memory_subject", default=""
 )
 
+#: onboarding agent 关闭的硬期限。
+#: ⛔ 不许拍脑袋:与 ``gateway/run.py`` 的
+#: ``_ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT`` 同量纲的一个量级
+#: (关一个 agent 比断一个 adapter 重,给 6 倍余量)。
+#: ⭐ 关键是它**有界** —— 裸 barrier 会让 unload/reload 永久挂住。
+_ONBOARDING_CLOSE_TIMEOUT_SECONDS = 30.0
+
+
 async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
     """Keep a cancelled request alive until its non-cancellable worker exits.
 
@@ -351,6 +359,52 @@ def _approval_timeout_seconds() -> float:
 # reconnects ONLY this server so a connector-policy change is picked up
 # without bouncing any other MCP server the agent may have connected.
 ZETTLAB_CONNECTORS_SERVER_NAME = "zettlab_connectors"
+
+
+def _correlated_error_response(
+    operation: str,
+    code: str,
+    *,
+    status: int,
+    err_type: str,
+    exc_info: bool = True,
+    user_message: str,
+) -> "web.Response":
+    """记录完整异常，仅向调用方返回稳定、可追踪的安全错误。"""
+    correlation_id = uuid.uuid4().hex[:12]
+    logger.error(
+        "[zet_agent] %s failed (correlation_id=%s)",
+        operation,
+        correlation_id,
+        exc_info=exc_info,
+    )
+    return web.json_response(
+        _openai_error(
+            f"{user_message} If the "
+            f"problem persists, provide reference {correlation_id}.",
+            err_type=err_type,
+            code=code,
+        ),
+        status=status,
+    )
+
+
+def _reload_unavailable_response(
+    operation: str,
+    code: str,
+    *,
+    exc_info: bool = True,
+    user_message: str = "Runtime configuration could not be refreshed.",
+) -> "web.Response":
+    """记录完整异常，仅向调用方返回稳定、可追踪的重载错误。"""
+    return _correlated_error_response(
+        operation,
+        code,
+        status=500,
+        err_type="server_error",
+        exc_info=exc_info,
+        user_message=f"{user_message} Retry the request.",
+    )
 
 
 # Zettlab APP 平台的工作风格补丁。
@@ -590,6 +644,8 @@ class ZetAgentAdapter(APIServerAdapter):
         self._onboarding_agent_cache: "OrderedDict[tuple, tuple[Any, float]]" = (
             OrderedDict()
         )
+        self._onboarding_cleanup_retry_agents: Dict[int, tuple[str, Any]] = {}
+        self._onboarding_retiring_agents: Dict[int, tuple[str, Any]] = {}
         self._onboarding_agent_cache_cap = 8
         self._onboarding_agent_cache_ttl_seconds = 15 * 60
 
@@ -682,41 +738,206 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return self._api_key
 
+    @staticmethod
+    def _onboarding_profile_name(key: tuple) -> str:
+        return str(key[0]).strip().lower() if key else ""
+
+    def _claim_onboarding_owner_locked(self, profile_name: str, agent: Any) -> None:
+        owner_id = id(agent)
+        current = self._onboarding_retiring_agents.get(owner_id)
+        if current is not None:
+            if current[1] is agent:
+                raise RuntimeError("onboarding cache cleanup already in progress")
+            raise RuntimeError("onboarding cache ownership changed during cleanup")
+        self._onboarding_retiring_agents[owner_id] = (profile_name, agent)
+
+    def _claim_onboarding_owner(self, profile_name: str, agent: Any) -> None:
+        with self._onboarding_agent_cache_lock:
+            self._claim_onboarding_owner_locked(profile_name, agent)
+
+    def _finish_onboarding_owner(
+        self, profile_name: str, agent: Any, *, success: bool
+    ) -> None:
+        owner_id = id(agent)
+        with self._onboarding_agent_cache_lock:
+            retiring = self._onboarding_retiring_agents.get(owner_id)
+            if retiring is not None and retiring[1] is not agent:
+                raise RuntimeError("onboarding cache ownership changed during cleanup")
+            if success:
+                for cache_key, entry in list(self._onboarding_agent_cache.items()):
+                    if entry[0] is agent:
+                        self._onboarding_agent_cache.pop(cache_key, None)
+                pending = self._onboarding_cleanup_retry_agents.get(owner_id)
+                if pending is not None and pending[1] is agent:
+                    self._onboarding_cleanup_retry_agents.pop(owner_id, None)
+            else:
+                self._onboarding_cleanup_retry_agents[owner_id] = (
+                    profile_name,
+                    agent,
+                )
+            if retiring is not None and retiring[1] is agent:
+                self._onboarding_retiring_agents.pop(owner_id, None)
+
+    def _close_onboarding_owner(
+        self, profile_name: str, agent: Any, *, claimed: bool = False
+    ) -> None:
+        if not claimed:
+            self._claim_onboarding_owner(profile_name, agent)
+        try:
+            agent.close()
+        except BaseException:
+            self._finish_onboarding_owner(profile_name, agent, success=False)
+            raise
+        self._finish_onboarding_owner(profile_name, agent, success=True)
+
     def _cached_onboarding_agent(self, key: tuple) -> Optional[Any]:
         now = time.monotonic()
-        expired = []
+        profile_name = self._onboarding_profile_name(key)
+        self._retry_onboarding_cleanup(profile_name)
+        while True:
+            with self._onboarding_agent_cache_lock:
+                stale = None
+                for cache_key, (candidate, last_used) in self._onboarding_agent_cache.items():
+                    if (
+                        self._onboarding_profile_name(cache_key) == profile_name
+                        and now - last_used > self._onboarding_agent_cache_ttl_seconds
+                        and id(candidate) not in self._onboarding_retiring_agents
+                    ):
+                        stale = candidate
+                        self._claim_onboarding_owner_locked(profile_name, stale)
+                        break
+            if stale is None:
+                break
+            try:
+                self._close_onboarding_owner(profile_name, stale, claimed=True)
+            except Exception as exc:
+                logger.error("onboarding cache eviction close failed", exc_info=True)
+                raise RuntimeError(
+                    "onboarding cache eviction cleanup failed"
+                ) from exc
         with self._onboarding_agent_cache_lock:
-            for cache_key, (_, last_used) in list(self._onboarding_agent_cache.items()):
-                if now - last_used > self._onboarding_agent_cache_ttl_seconds:
-                    expired.append(self._onboarding_agent_cache.pop(cache_key)[0])
-            entry = self._onboarding_agent_cache.pop(key, None)
+            entry = self._onboarding_agent_cache.get(key)
+            if entry is not None and id(entry[0]) in self._onboarding_retiring_agents:
+                raise RuntimeError("onboarding cache cleanup already in progress")
+            self._onboarding_agent_cache.pop(key, None)
             if entry is not None:
                 agent, _ = entry
                 self._onboarding_agent_cache[key] = (agent, now)
             else:
                 agent = None
-        for stale in expired:
-            try:
-                stale.close()
-            except Exception:
-                logger.debug("onboarding cache eviction close failed", exc_info=True)
         return agent
 
-    def _cache_onboarding_agent(self, key: tuple, agent: Any) -> None:
-        evicted = []
-        with self._onboarding_agent_cache_lock:
-            replaced = self._onboarding_agent_cache.pop(key, None)
-            if replaced is not None and replaced[0] is not agent:
-                evicted.append(replaced[0])
-            self._onboarding_agent_cache[key] = (agent, time.monotonic())
-            while len(self._onboarding_agent_cache) > self._onboarding_agent_cache_cap:
-                _, (stale, _) = self._onboarding_agent_cache.popitem(last=False)
-                evicted.append(stale)
-        for stale in evicted:
+    def _retry_onboarding_cleanup(self, profile_name: str) -> None:
+        """重试尚未发布但首次 close 失败的 onboarding agent。"""
+        while True:
+            with self._onboarding_agent_cache_lock:
+                agent = None
+                for owner_profile, candidate in self._onboarding_cleanup_retry_agents.values():
+                    if owner_profile == profile_name:
+                        self._claim_onboarding_owner_locked(profile_name, candidate)
+                        agent = candidate
+                        break
+            if agent is None:
+                return
             try:
-                stale.close()
-            except Exception:
-                logger.debug("onboarding cache eviction close failed", exc_info=True)
+                self._close_onboarding_owner(profile_name, agent, claimed=True)
+            except Exception as exc:
+                logger.error(
+                    "onboarding incoming-agent cleanup retry failed",
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    "onboarding incoming-agent cleanup failed"
+                ) from exc
+
+    def _publish_onboarding_agent(self, key: tuple, agent: Any) -> None:
+        """发布新 owner；提交失败时严格回收未发布 agent。"""
+        profile_name = self._onboarding_profile_name(key)
+        try:
+            self._retry_onboarding_cleanup(profile_name)
+            self._cache_onboarding_agent(key, agent)
+        except BaseException as publish_exc:
+            try:
+                self._close_onboarding_owner(profile_name, agent)
+            except BaseException as cleanup_exc:
+                logger.error(
+                    "onboarding incoming-agent cleanup failed after cache publish failure",
+                    exc_info=(
+                        type(cleanup_exc), cleanup_exc, cleanup_exc.__traceback__
+                    ),
+                )
+                raise RuntimeError(
+                    "onboarding incoming-agent cleanup failed"
+                ) from cleanup_exc
+            raise publish_exc
+
+    def _close_onboarding_agents_for_profile(self, profile_name: str) -> int:
+        """逐 owner 关闭目标 profile 的 onboarding cache，失败项留待重试。"""
+        normalized = (profile_name or "").strip().lower()
+        self._retry_onboarding_cleanup(normalized)
+        closed = 0
+        while True:
+            with self._onboarding_agent_cache_lock:
+                candidate = None
+                for cache_key, (agent, _last_used) in self._onboarding_agent_cache.items():
+                    if (
+                        self._onboarding_profile_name(cache_key) == normalized
+                        and id(agent) not in self._onboarding_retiring_agents
+                    ):
+                        candidate = agent
+                        self._claim_onboarding_owner_locked(normalized, candidate)
+                        break
+            if candidate is None:
+                with self._onboarding_agent_cache_lock:
+                    if any(
+                        owner_profile == normalized
+                        for owner_profile, _agent in self._onboarding_retiring_agents.values()
+                    ):
+                        raise RuntimeError(
+                            "onboarding profile cleanup already in progress"
+                        )
+                return closed
+            try:
+                self._close_onboarding_owner(normalized, candidate, claimed=True)
+            except Exception as exc:
+                logger.error("onboarding profile-unload cleanup failed", exc_info=True)
+                raise RuntimeError(
+                    "onboarding profile-unload cleanup failed"
+                ) from exc
+            closed += 1
+
+    def _cache_onboarding_agent(self, key: tuple, agent: Any) -> None:
+        profile_name = self._onboarding_profile_name(key)
+        while True:
+            with self._onboarding_agent_cache_lock:
+                replaced = self._onboarding_agent_cache.get(key)
+                if replaced is not None and replaced[0] is agent:
+                    self._onboarding_agent_cache.pop(key, None)
+                    self._onboarding_agent_cache[key] = (agent, time.monotonic())
+                    return
+                if replaced is not None:
+                    candidate = replaced[0]
+                    candidate_profile = profile_name
+                elif len(self._onboarding_agent_cache) >= self._onboarding_agent_cache_cap:
+                    candidates = [
+                        (self._onboarding_profile_name(cache_key), entry[0])
+                        for cache_key, entry in self._onboarding_agent_cache.items()
+                        if id(entry[0]) not in self._onboarding_retiring_agents
+                    ]
+                    if not candidates:
+                        raise RuntimeError("onboarding cache cleanup already in progress")
+                    candidate_profile, candidate = candidates[0]
+                else:
+                    self._onboarding_agent_cache[key] = (agent, time.monotonic())
+                    return
+                self._claim_onboarding_owner_locked(candidate_profile, candidate)
+            try:
+                self._close_onboarding_owner(candidate_profile, candidate, claimed=True)
+            except Exception as exc:
+                logger.error("onboarding cache owner cleanup failed", exc_info=True)
+                raise RuntimeError(
+                    "onboarding cache owner cleanup failed"
+                ) from exc
 
     def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
         """Atomically enter a profile unless unload already owns its barrier."""
@@ -3061,7 +3282,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 except Exception:
                     pass
                 if required:
-                    raise _ProviderAuthResolutionError(str(exc)) from exc
+                    # ⛔ 只有**真的**是凭据/配置类失败才配这个标签 —— 上游
+                    # (`_resolve_request_runtime_agent_kwargs` /
+                    # `_resolve_runtime_agent_kwargs_for_provider`)现在只把
+                    # AuthError/ValueError 包成 RuntimeError,其余原样上抛。
+                    # 🔴 这里原来无条件包:内部 bug 会以 **HTTP 200** 当作
+                    # assistant 的回答送出「Provider authentication failed: …」
+                    # 并带内部路径。与 api_server 那处同形,兄弟点跟上。
+                    if isinstance(exc, RuntimeError):
+                        raise _ProviderAuthResolutionError(str(exc)) from exc
+                    raise
                 logger.debug(
                     "zet_agent provider-runtime refresh failed for provider=%s model=%s",
                     provider_name,
@@ -3288,7 +3518,7 @@ class ZetAgentAdapter(APIServerAdapter):
         if agent is None:
             agent = AIAgent(**agent_kwargs)
             if onboarding_cache_key is not None:
-                self._cache_onboarding_agent(onboarding_cache_key, agent)
+                self._publish_onboarding_agent(onboarding_cache_key, agent)
         else:
             # Request-scoped callbacks close over this response's stream queue.
             # Replace them on every reuse so a reconnect never writes into the
@@ -5189,11 +5419,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 approval_session_key_for_id,
                 resolve_gateway_approval,
             )
-        except Exception as exc:
-            logger.exception("[zet_agent] tools.approval import failed")
-            return web.json_response(
-                _openai_error(f"approval module unavailable: {exc}", err_type="server_error"),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "approval module import",
+                "approval_module_unavailable",
+                user_message="Approval handling is temporarily unavailable.",
             )
 
         protocol, protocol_err = self._delivery_protocol_fields(body)
@@ -6185,8 +6415,12 @@ class ZetAgentAdapter(APIServerAdapter):
 
             active = list_active_subagents(profile_home)
             async_records = list_async_delegations(profile_home)
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "delegation status",
+                "delegation_status_unavailable",
+                user_message="Delegation status is temporarily unavailable.",
+            )
         return web.json_response({"active": active, "async": async_records})
 
     async def _handle_delegation_cancel(self, request: "web.Request") -> "web.Response":
@@ -6202,8 +6436,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 delegation_id,
                 profile_home=self._delegation_control_scope(request),
             )
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "delegation cancel",
+                "delegation_cancel_unavailable",
+                user_message="The delegation could not be cancelled.",
+            )
         return web.json_response(
             {"delegation_id": delegation_id, "interrupted": bool(ok)},
             status=200 if ok else 404,
@@ -6222,8 +6460,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 subagent_id,
                 profile_home=self._delegation_control_scope(request),
             )
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "subagent interrupt",
+                "subagent_interrupt_unavailable",
+                user_message="The subagent could not be interrupted.",
+            )
         return web.json_response(
             {"subagent_id": subagent_id, "interrupted": bool(ok)},
             status=200 if ok else 404,
@@ -6344,17 +6586,43 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception as exc:
             from hermes_state import RuntimeImportConflict, RuntimeImportIncomplete
             if isinstance(exc, RuntimeImportConflict):
-                status, code = 409, "runtime_import_conflict"
-            elif isinstance(exc, RuntimeImportIncomplete):
-                status, code = 409, "runtime_import_incomplete"
-            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
-                status, code = 400, "invalid_runtime_import"
-            else:
-                logger.exception("[zet_agent] completed transcript import failed")
-                status, code = 500, "runtime_import_failed"
-            return web.json_response(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
-                status=status,
+                return _correlated_error_response(
+                    "completed transcript import conflict",
+                    "runtime_import_conflict",
+                    status=409,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The transcript conflicts with current session state. "
+                        "Refresh the session and retry the import."
+                    ),
+                )
+            if isinstance(exc, RuntimeImportIncomplete):
+                return _correlated_error_response(
+                    "incomplete transcript import",
+                    "runtime_import_incomplete",
+                    status=409,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The transcript import is incomplete. Upload all chunks "
+                        "and retry the commit."
+                    ),
+                )
+            if isinstance(exc, ValueError):
+                return _correlated_error_response(
+                    "invalid transcript import request",
+                    "invalid_runtime_import",
+                    status=400,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The transcript import request is invalid. Correct "
+                        "operation, IDs, payload_sha256, chunk metadata, and "
+                        "message fields, then retry."
+                    ),
+                )
+            return _reload_unavailable_response(
+                "completed transcript import",
+                "runtime_import_failed",
+                user_message="The transcript could not be imported.",
             )
         finally:
             self._end_runtime_import_operation(operation_key)
@@ -6409,17 +6677,42 @@ class ZetAgentAdapter(APIServerAdapter):
                 MemoryImportUnsupported,
             )
             if isinstance(exc, MemoryImportUnsupported):
-                status, code = 501, "memory_import_unsupported"
-            elif isinstance(exc, MemoryImportConflict):
-                status, code = 409, "memory_import_conflict"
-            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
-                status, code = 400, "invalid_memory_import"
-            else:
-                logger.exception("[zet_agent] curated memory import failed")
-                status, code = 500, "memory_import_failed"
-            return web.json_response(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
-                status=status,
+                return _correlated_error_response(
+                    "unsupported curated memory import",
+                    "memory_import_unsupported",
+                    status=501,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "Curated memory import is unavailable on this profile "
+                        "storage. Move the profile to supported local storage."
+                    ),
+                )
+            if isinstance(exc, MemoryImportConflict):
+                return _correlated_error_response(
+                    "conflicting curated memory import",
+                    "memory_import_conflict",
+                    status=409,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The profile memory state changed or is not safe to "
+                        "replace. Refresh the profile and retry."
+                    ),
+                )
+            if isinstance(exc, ValueError):
+                return _correlated_error_response(
+                    "invalid curated memory import request",
+                    "invalid_memory_import",
+                    status=400,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The memory import request is invalid. Correct mode, "
+                        "target, import_id, payload_sha256, and entries, then retry."
+                    ),
+                )
+            return _reload_unavailable_response(
+                "curated memory import",
+                "memory_import_failed",
+                user_message="The memory data could not be imported.",
             )
         finally:
             self._end_runtime_import_operation(operation_key)
@@ -6852,9 +7145,12 @@ class ZetAgentAdapter(APIServerAdapter):
             override_home = get_hermes_home_override()
             config_path = (Path(override_home) if override_home else _hermes_home) / "config.yaml"
             atomic_yaml_write(config_path, cfg)
-        except Exception as exc:
-            logger.warning("model-switch: config write failed: %s", exc)
-            return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "model switch config write",
+                "model_config_write_failed",
+                user_message="The model setting could not be saved.",
+            )
 
         # Identity note is handled by _run_agent's open-time compare, not here.
         logger.info(
@@ -7062,27 +7358,18 @@ class ZetAgentAdapter(APIServerAdapter):
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             from agent.skill_commands import scan_skill_commands
-        except Exception as exc:
-            logger.exception("[zet_agent] skills-reload: import failed")
-            return web.json_response(
-                _openai_error(
-                    f"skills reload modules unavailable: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "skills-reload import", "skills_reload_unavailable"
             )
 
         try:
             clear_skills_system_prompt_cache(clear_snapshot=True)
             skill_commands = scan_skill_commands()
             skills_total = len(skill_commands)
-        except Exception as exc:
-            logger.exception("[zet_agent] skills-reload failed")
-            return web.json_response(
-                _openai_error(
-                    f"skills reload failed: {exc}", err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "skills-reload scan", "skills_reload_unavailable"
             )
 
         # ZET-1139 — also push the invalidation through to existing sessions.
@@ -7101,26 +7388,20 @@ class ZetAgentAdapter(APIServerAdapter):
         #     whether we managed to drop the in-process cache too.
         gw = getattr(self, "gateway_runner", None)
         if gw is None:
-            logger.error("[zet_agent] skills-reload: no gateway_runner")
-            return web.json_response(
-                _openai_error(
-                    "skills reload incomplete: no gateway runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "skills-reload gateway lookup",
+                "skills_reload_unavailable",
+                exc_info=False,
             )
         if _request_value(request, "hermes_profile_home"):
             session_db = await self._ensure_session_db_async()
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:
-            logger.error("[zet_agent] skills-reload: no SessionDB on runner")
-            return web.json_response(
-                _openai_error(
-                    "skills reload incomplete: no session db on runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "skills-reload SessionDB lookup",
+                "skills_reload_unavailable",
+                exc_info=False,
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
@@ -7131,17 +7412,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 # a silent no-op AND the coroutine leaked into the JSON
                 # response (TypeError → 500) — ZET-1139 regression class.
                 db_rows_cleared = await db_rows_cleared
-        except Exception as exc:
-            logger.exception(
-                "[zet_agent] skills-reload: DB clear failed; "
-                "returning 500 so caller can fall back",
-            )
-            return web.json_response(
-                _openai_error(
-                    f"skills reload db clear failed: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "skills-reload DB clear", "skills_reload_unavailable"
             )
 
         invalidated = 0
@@ -7203,34 +7476,20 @@ class ZetAgentAdapter(APIServerAdapter):
 
         try:
             from tools.mcp_tool import reload_single_mcp_server
-        except Exception as exc:
-            logger.exception("[zet_agent] connectors-reload: import failed")
-            return web.json_response(
-                _openai_error(
-                    f"mcp reload module unavailable: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "connectors-reload import", "connector_reload_unavailable"
             )
 
         import asyncio
-        loop = asyncio.get_running_loop()
         try:
-            tools = await loop.run_in_executor(
-                None,
+            tools = await asyncio.to_thread(
                 reload_single_mcp_server,
                 ZETTLAB_CONNECTORS_SERVER_NAME,
             )
-        except Exception as exc:
-            logger.warning(
-                "[zet_agent] connectors-reload failed for server '%s': %s",
-                ZETTLAB_CONNECTORS_SERVER_NAME, exc,
-            )
-            return web.json_response(
-                _openai_error(
-                    f"connector reload failed: {exc}", err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "connectors-reload worker", "connector_reload_unavailable"
             )
 
         tools_total = len(tools or [])
@@ -7301,13 +7560,10 @@ class ZetAgentAdapter(APIServerAdapter):
 
         gw = getattr(self, "gateway_runner", None)
         if gw is None:
-            logger.error("[zet_agent] profile-reload: no gateway_runner")
-            return web.json_response(
-                _openai_error(
-                    "profile reload unavailable: no gateway runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "profile-reload gateway lookup",
+                "profile_reload_unavailable",
+                exc_info=False,
             )
 
         # Step 1 (CRITICAL): clear DB-stored prompts. Without this the
@@ -7321,13 +7577,10 @@ class ZetAgentAdapter(APIServerAdapter):
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:
-            logger.error("[zet_agent] profile-reload: no SessionDB on runner")
-            return web.json_response(
-                _openai_error(
-                    "profile reload unavailable: no session db on runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "profile-reload SessionDB lookup",
+                "profile_reload_unavailable",
+                exc_info=False,
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
@@ -7335,17 +7588,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 # Same AsyncSessionDB facade as skills-reload above: await or
                 # the clear silently no-ops and the coroutine breaks the JSON.
                 db_rows_cleared = await db_rows_cleared
-        except Exception as exc:
-            logger.exception(
-                "[zet_agent] profile-reload: DB clear failed; "
-                "returning 500 so local-server falls back to Stop",
-            )
-            return web.json_response(
-                _openai_error(
-                    f"profile reload db clear failed: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "profile-reload DB clear", "profile_reload_unavailable"
             )
 
         # Step 2 (FAIL-SOFT): drop in-process cached prompts so existing
@@ -7394,9 +7639,8 @@ class ZetAgentAdapter(APIServerAdapter):
     async def _handle_profile_unload(self, request: "web.Request") -> "web.Response":
         """POST /v1/profile/unload — release cached state for one profile.
 
-        local-server calls this before deleting the profile directory. The
-        endpoint is deliberately best-effort: it never deletes files and only
-        releases in-process caches owned by this adapter / runner.
+        local-server 会在删除 profile 目录前调用此接口。接口不删除文件，
+        但必须严格释放每个进程内 owner；任一清理失败都显式返回，供调用方重试。
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -7462,16 +7706,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner
                 )
-                logger.warning(
-                    "[zet_agent] profile-unload: goal callbacks did not drain",
-                    exc_info=True,
-                )
-                return web.json_response(
-                    _openai_error(
-                        "profile unload failed: goal callbacks could not be released",
-                        err_type="server_error",
-                    ),
-                    status=500,
+                return _reload_unavailable_response(
+                    "profile-unload goal callback cleanup",
+                    "profile_unload_unavailable",
+                    user_message="Profile goal activity could not be safely released.",
                 )
 
         # A callback that began just before invalidation can finish one last
@@ -7500,7 +7738,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 profile = _request_value(request, "hermes_profile")
                 unload = getattr(gw, "unload_profile_runtime", None)
                 if callable(unload):
-                    runtime_unload = await unload(profile)
+                    unload_kwargs = (
+                        {"profile_home": Path(profile_home)} if profile_home else {}
+                    )
+                    runtime_unload = await unload(profile, **unload_kwargs)
                 else:
                     runtime_unload = {
                         "evicted_sessions": gw.invalidate_all_cached_agents(),
@@ -7515,16 +7756,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner
                 )
-                logger.warning(
-                    "[zet_agent] profile-unload: runtime unload failed",
-                    exc_info=True,
-                )
-                return web.json_response(
-                    _openai_error(
-                        "profile unload failed: runtime state could not be released",
-                        err_type="server_error",
-                    ),
-                    status=500,
+                return _reload_unavailable_response(
+                    "profile-unload runtime cleanup",
+                    "profile_unload_unavailable",
+                    user_message="Profile runtime could not be safely released.",
                 )
 
         if runtime_unload.get("blocked"):
@@ -7593,73 +7828,92 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner
                 )
-                logger.warning(
-                    "[zet_agent] profile-unload: process identity cleanup failed",
-                    exc_info=True,
-                )
-                return web.json_response(
-                    _openai_error(
-                        "profile unload failed: managed processes could not be released",
-                        err_type="server_error",
-                    ),
-                    status=500,
+                return _reload_unavailable_response(
+                    "profile-unload process identity cleanup",
+                    "profile_unload_unavailable",
+                    user_message="Profile processes could not be safely released.",
                 )
 
         closed_session_db = False
         if profile_home:
-            db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
-            if db is not None:
-                if db is self._session_db:
-                    self._session_db = None
+            profile = _request_value(request, "hermes_profile") or ""
+            try:
+                # 🔴 **必须有硬期限。** ``_to_thread_with_completion_barrier``
+                # 刻意「取消后仍等 worker 结束」(它的 docstring 就是这么写的),
+                # 而 ``agent.close()`` 里的进程 / sandbox / browser / client 清理
+                # 一旦卡住 ⇒ **unload/reload 永久挂住**,后续请求还一直被 profile
+                # barrier 挡着。⭐「barrier 语义是不许提前放手」和「必须有上限」
+                # 不冲突:上限到了就**显式失败 + 保留可重试 owner**,
+                # ⛔ 不是偷偷放手。
+                # ⛔ 上限不许拍脑袋:沿用本文件既有的 adapter 断连量纲。
+                await asyncio.wait_for(
+                    _to_thread_with_completion_barrier(
+                        self._close_onboarding_agents_for_profile,
+                        profile,
+                    ),
+                    timeout=_ONBOARDING_CLOSE_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                return _reload_unavailable_response(
+                    "profile-unload onboarding cache cleanup",
+                    "profile_unload_unavailable",
+                    user_message=(
+                        "Profile onboarding state could not be safely released."
+                    ),
+                )
+            session_db_key = self._profile_home_key(profile_home)
 
-                async def _close_detached_session_db() -> None:
-                    close = getattr(db, "close", None)
-                    if not callable(close):
-                        return
-                    try:
-                        await _to_thread_with_completion_barrier(close)
-                    except Exception:
-                        logger.warning(
-                            "[zet_agent] profile-unload: SessionDB close failed",
-                            exc_info=True,
-                        )
-
-                discard_staging = getattr(db, "discard_runtime_import_staging", None)
-                if callable(discard_staging):
-                    try:
-                        await _to_thread_with_completion_barrier(discard_staging)
-                    except asyncio.CancelledError as cancelled:
-                        # The discard worker has finished before this branch is
-                        # entered. Close in a second completion barrier, then
-                        # release the profile barrier and preserve cancellation.
-                        try:
-                            await _close_detached_session_db()
-                        except asyncio.CancelledError:
-                            # A repeated cancellation is delivered only after
-                            # the close worker has completed.
-                            pass
-                        self._unblock_runtime_import_profile(
-                            profile_home, unload_barrier_owner
-                        )
-                        raise cancelled
-                    except Exception:
-                        # Unload remains best-effort, but always attempt to
-                        # remove unpublished external transcripts before the
-                        # DB leaves the background sweeper's cache.
-                        logger.warning(
-                            "[zet_agent] profile-unload: runtime import staging cleanup failed",
-                            exc_info=True,
-                        )
-                try:
-                    await _close_detached_session_db()
-                except asyncio.CancelledError:
-                    # _to_thread_with_completion_barrier has already observed
-                    # close completion, so it is now safe to release unload.
-                    self._unblock_runtime_import_profile(
-                        profile_home, unload_barrier_owner
+            def _close_owned_session_db() -> bool:
+                # 既有 init lock 同时保护打开、关闭和 owner 提交。
+                with self._session_db_init_lock:
+                    db = self._session_dbs.get(session_db_key)
+                    if db is None:
+                        return False
+                    discard_staging = getattr(
+                        db, "discard_runtime_import_staging", None
                     )
-                    raise
-                closed_session_db = True
+                    if callable(discard_staging):
+                        discard_staging()
+                    close = getattr(db, "close", None)
+                    if callable(close):
+                        close()
+                    if self._session_dbs.get(session_db_key) is not db:
+                        raise RuntimeError(
+                            "profile SessionDB ownership changed during unload"
+                        )
+                    self._session_dbs.pop(session_db_key, None)
+                    if self._session_db is db:
+                        self._session_db = None
+                    return True
+
+            try:
+                closed_session_db = await _to_thread_with_completion_barrier(
+                    _close_owned_session_db
+                )
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                return _reload_unavailable_response(
+                    "profile-unload SessionDB cleanup",
+                    "profile_unload_unavailable",
+                    user_message=(
+                        "Profile session data could not be safely released."
+                    ),
+                )
             # Goal callbacks/timers were invalidated and drained before
             # runtime teardown. Only the cached goal DB remains to close.
             if drv is not None:
@@ -7670,9 +7924,13 @@ class ZetAgentAdapter(APIServerAdapter):
                     # 上（codex P1）。
                     drv.close_goal_db_for_home(profile_home)
                 except Exception:
-                    logger.warning(
-                        "[zet_agent] profile-unload: goal timer cleanup failed",
-                        exc_info=True,
+                    self._unblock_runtime_import_profile(
+                        profile_home, unload_barrier_owner
+                    )
+                    return _reload_unavailable_response(
+                        "profile-unload goal database cleanup",
+                        "profile_unload_unavailable",
+                        user_message="Profile goal data could not be safely released.",
                     )
 
             self._drop_profile_local_model_caches(profile_home)

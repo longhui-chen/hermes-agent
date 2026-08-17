@@ -3,6 +3,7 @@ import logging
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -104,6 +105,289 @@ class TestCredentialFingerprint:
         b = GatewayRunner._adapter_credential_fingerprint(_B())
         assert a is not None and b is not None
         assert a != b
+
+
+@pytest.mark.asyncio
+async def test_unloading_one_profile_does_not_cancel_shared_startup_caller(
+    monkeypatch, tmp_path
+):
+    """profile operation 必须有独立 owner，不能把整个 gateway startup 当 owner。"""
+    import gateway.pairing as pairing
+    import gateway.status as status
+    import hermes_cli.profiles as profiles
+
+    runner = _multiplex_profile_runner()
+    runner.adapters = {}
+    runner._failed_platforms = {}
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = set()
+    runner._profile_adapter_operations = {}
+    runner._partial_adapter_cleanup_retry = {}
+    runner._partial_adapter_cleanup_tasks = {}
+    runner._retiring_adapter_cleanups = {}
+    runner._published_adapter_cleanup_retry = {}
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+    runner._adapter_credential_claim = lambda *_args: None
+    runner._adapter_listener_claim = lambda *_args: None
+    runner._configure_profile_adapter = lambda *_args: None
+    runner.pairing_store = object()
+    runner.pairing_stores = {
+        "default": object(),
+        "coder": object(),
+        "writer": object(),
+    }
+    coder_entered = asyncio.Event()
+    coder_cleanup_entered = asyncio.Event()
+    release_coder_cleanup = asyncio.Event()
+    writer_connected = asyncio.Event()
+
+    class _Adapter:
+        def __init__(self, profile_name):
+            self.profile_name = profile_name
+
+        async def disconnect(self):
+            if self.profile_name == "coder":
+                coder_cleanup_entered.set()
+                await release_coder_cleanup.wait()
+
+    coder = _Adapter("coder")
+    writer = _Adapter("writer")
+    adapters = iter((coder, writer))
+    configs = iter(
+        (
+            GatewayConfig(
+                multiplex_profiles=True,
+                platforms={
+                    Platform.FEISHU: PlatformConfig(enabled=True, token="coder")
+                },
+            ),
+            GatewayConfig(
+                multiplex_profiles=True,
+                platforms={
+                    Platform.FEISHU: PlatformConfig(enabled=True, token="writer")
+                },
+            ),
+        )
+    )
+
+    async def connect(adapter, _platform):
+        if adapter is coder:
+            coder_entered.set()
+            await asyncio.Event().wait()
+        writer_connected.set()
+        return True
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        profiles,
+        "profiles_to_serve",
+        lambda **_kwargs: [
+            ("coder", tmp_path / "coder"),
+            ("writer", tmp_path / "writer"),
+        ],
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: next(configs))
+    monkeypatch.setattr(runner, "_create_adapter", lambda *_args: next(adapters))
+    monkeypatch.setattr(runner, "_connect_initial_adapter_with_timeout", connect)
+    monkeypatch.setattr(status, "write_runtime_status", lambda **_kwargs: None)
+    monkeypatch.setattr(pairing, "PairingStore", lambda **_kwargs: object())
+
+    startup = asyncio.create_task(runner._start_secondary_profile_adapters())
+    await coder_entered.wait()
+    runner._profile_runtime_unload_retry.add("coder")
+    drain = asyncio.create_task(runner._drain_profile_adapter_operations("coder"))
+    try:
+        await coder_cleanup_entered.wait()
+        assert not startup.done()
+        release_coder_cleanup.set()
+        await drain
+        assert await startup == 1
+        assert writer_connected.is_set()
+        assert runner._profile_adapters["writer"][Platform.FEISHU] is writer
+    finally:
+        release_coder_cleanup.set()
+        for task in (startup, drain):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(startup, drain, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_secondary_startup_cleanup_failure_is_explicit_after_siblings_start(
+    monkeypatch, tmp_path
+):
+    """一个 profile cleanup 失败要穿透 caller，但不能阻断兄弟 profile。"""
+    import gateway.status as status
+    import hermes_cli.profiles as profiles
+
+    runner = _multiplex_profile_runner()
+    runner.adapters = {}
+    runner._failed_platforms = {}
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = set()
+    runner._profile_adapter_operations = {}
+    runner._partial_adapter_cleanup_retry = {}
+    runner._partial_adapter_cleanup_tasks = {}
+    runner._retiring_adapter_cleanups = {}
+    runner._published_adapter_cleanup_retry = {}
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+    runner._adapter_credential_claim = lambda *_args: None
+    runner._adapter_listener_claim = lambda *_args: None
+    runner._configure_profile_adapter = lambda *_args: None
+    runner.pairing_store = object()
+    runner.pairing_stores = {
+        "default": object(),
+        "coder": object(),
+        "writer": object(),
+    }
+
+    class _Adapter:
+        def __init__(self, profile_name):
+            self.profile_name = profile_name
+
+        async def disconnect(self):
+            if self.profile_name == "coder":
+                raise RuntimeError("coder cleanup failed")
+
+    coder = _Adapter("coder")
+    writer = _Adapter("writer")
+    adapters = iter((coder, writer))
+    configs = iter(
+        GatewayConfig(
+            multiplex_profiles=True,
+            platforms={
+                Platform.FEISHU: PlatformConfig(enabled=True, token=name)
+            },
+        )
+        for name in ("coder", "writer")
+    )
+
+    async def connect(adapter, _platform):
+        return adapter is writer
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        profiles,
+        "profiles_to_serve",
+        lambda **_kwargs: [
+            ("coder", tmp_path / "coder"),
+            ("writer", tmp_path / "writer"),
+        ],
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: next(configs))
+    monkeypatch.setattr(runner, "_create_adapter", lambda *_args: next(adapters))
+    monkeypatch.setattr(runner, "_connect_initial_adapter_with_timeout", connect)
+    monkeypatch.setattr(status, "write_runtime_status", lambda **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="secondary profile cleanup failed"):
+        await runner._start_secondary_profile_adapters()
+
+    assert runner._partial_adapter_cleanup_retry[
+        ("coder", Platform.FEISHU)
+    ] is coder
+    assert runner._profile_adapters["writer"][Platform.FEISHU] is writer
+
+
+@pytest.mark.asyncio
+async def test_profile_start_retries_partial_owner_when_platform_is_disabled(
+    monkeypatch, tmp_path
+):
+    """配置删除 pending owner 后，启动仍要先完成它的 cleanup。"""
+    runner = _multiplex_profile_runner()
+    runner._partial_adapter_cleanup_retry = {}
+    runner._partial_adapter_cleanup_tasks = {}
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = set()
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+    stale = SimpleNamespace(disconnect=AsyncMock())
+    sibling = object()
+    runner._profile_adapters["coder"] = {Platform.SLACK: sibling}
+    runner._partial_adapter_cleanup_retry[("coder", Platform.FEISHU)] = stale
+
+    @contextmanager
+    def profile_scope(_home):
+        yield
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", profile_scope)
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config",
+        lambda: GatewayConfig(
+            multiplex_profiles=True,
+            platforms={Platform.FEISHU: PlatformConfig(enabled=False)},
+        ),
+    )
+
+    assert (
+        await runner._start_one_profile_adapters_owned(
+            "coder", tmp_path / "profiles" / "coder", {}
+        )
+        == 0
+    )
+    stale.disconnect.assert_awaited_once()
+    assert runner._partial_adapter_cleanup_retry == {}
+    assert runner._profile_adapters["coder"][Platform.SLACK] is sibling
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["load", "policy", "port"])
+async def test_partial_cleanup_precedes_new_profile_validation(
+    monkeypatch, tmp_path, failure_mode
+):
+    """旧 owner cleanup 不得被新配置的任一校验错误挡住。"""
+    runner = _multiplex_profile_runner()
+    runner._partial_adapter_cleanup_retry = {}
+    runner._partial_adapter_cleanup_tasks = {}
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = set()
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+    stale = SimpleNamespace(disconnect=AsyncMock())
+    sibling = object()
+    runner._profile_adapters["coder"] = {Platform.SLACK: sibling}
+    runner._partial_adapter_cleanup_retry[("coder", Platform.FEISHU)] = stale
+
+    @contextmanager
+    def profile_scope(_home):
+        yield
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", profile_scope)
+    if failure_mode == "load":
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config",
+            lambda: (_ for _ in ()).throw(RuntimeError("config broken")),
+        )
+        expected = RuntimeError
+    elif failure_mode == "policy":
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config",
+            lambda: GatewayConfig(multiplex_profiles=True),
+        )
+        monkeypatch.setattr(
+            gateway_run, "_own_policy_open_startup_violation", lambda _cfg: "dm_policy"
+        )
+        expected = gateway_run.MultiplexConfigError
+    else:
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config",
+            lambda: GatewayConfig(
+                multiplex_profiles=True,
+                platforms={
+                    Platform.DISCORD: PlatformConfig(enabled=True, token="token")
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_run, "_own_policy_open_startup_violation", lambda _cfg: None
+        )
+        monkeypatch.setattr(gateway_run, "_platform_binds_port", lambda *_args: True)
+        expected = gateway_run.SecondaryPortBindingConfigError
+
+    with pytest.raises(expected):
+        await runner._start_one_profile_adapters_owned(
+            "coder", tmp_path / "profiles" / "coder", {}
+        )
+    stale.disconnect.assert_awaited_once()
+    assert runner._partial_adapter_cleanup_retry == {}
+    assert runner._profile_adapters["coder"][Platform.SLACK] is sibling
 
 
 class TestProfileMessageHandler:
@@ -235,9 +519,293 @@ class TestSecondaryProfileFatalRecovery:
         tasks = list(runner._background_tasks)
         assert len(tasks) == 1
         await tasks[0]
-        assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
+        assert (
+            runner._profile_adapters.get("reviewer", {}).get(Platform.DISCORD)
+            is replacement
+        )
         assert scoped_homes
         assert all(path == Path("/profiles/reviewer") for path in scoped_homes)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("startup_phase", [False, True], ids=["running", "startup"])
+    async def test_secondary_fatal_disconnect_failure_keeps_exact_owner(
+        self, startup_phase
+    ):
+        runner = _secondary_recovery_runner(running=not startup_phase)
+        runner._startup_restore_in_progress = startup_phase
+        stale = _SecondaryRecoveryAdapter()
+        stale.disconnect = AsyncMock(side_effect=RuntimeError("old poller alive"))
+        runner._profile_adapters["reviewer"] = {Platform.DISCORD: stale}
+        retry_started = asyncio.Event()
+        release_retry = asyncio.Event()
+
+        async def retry(profile_name, platform):
+            assert (profile_name, platform) == ("reviewer", Platform.DISCORD)
+            retry_started.set()
+            await release_retry.wait()
+
+        runner._run_secondary_profile_reconnect = retry
+
+        with pytest.raises(RuntimeError, match="old poller alive"):
+            await runner._handle_profile_adapter_fatal_error(
+                "reviewer", Platform.DISCORD, stale
+            )
+
+        assert runner._profile_adapters["reviewer"][Platform.DISCORD] is stale
+        assert "reviewer" in runner._profile_failed_platforms
+        retry_task = runner._profile_failed_platforms["reviewer"][Platform.DISCORD]
+        assert not retry_task.done()
+        await retry_started.wait()
+        release_retry.set()
+        await retry_task
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("connect_mode", ["false", "raise"])
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    async def test_secondary_startup_retryable_failure_retries_after_window(
+        self, monkeypatch, connect_mode, cleanup_fails
+    ):
+        """startup 窗口的首轮 retryable 失败必须走到下一轮真实 connect。"""
+        runner = _secondary_recovery_runner(running=False)
+        runner._startup_restore_in_progress = True
+        first = _SecondaryRecoveryAdapter()
+        replacement = _SecondaryRecoveryAdapter()
+        adapters = iter((first, replacement))
+        runner._profile_failed_platforms["reviewer"] = {}
+        _install_secondary_reconnect_context(monkeypatch, runner, replacement)
+        monkeypatch.setattr(
+            runner,
+            "_create_adapter",
+            lambda _platform, _config: next(adapters),
+        )
+        connect_calls = 0
+        cleanup_calls = 0
+
+        async def connect(adapter, _platform, *, is_reconnect=False):
+            nonlocal connect_calls
+            assert is_reconnect is True
+            connect_calls += 1
+            if connect_calls == 1:
+                if connect_mode == "raise":
+                    raise RuntimeError("retryable connect failed")
+                return False
+            adapter.connected = True
+            return True
+
+        async def disconnect():
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            first.disconnected = True
+            if cleanup_fails and cleanup_calls == 1:
+                raise RuntimeError("retryable cleanup failed")
+
+        first.disconnect = disconnect
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", connect)
+
+        async def advance_startup_window(_delay):
+            # 让首轮失败先观察到 startup flag，再确定性地进入运行态。
+            runner._running = True
+
+        monkeypatch.setattr(gateway_run, "_reconnect_backoff", lambda _attempt: 0)
+        monkeypatch.setattr(gateway_run.asyncio, "sleep", advance_startup_window)
+
+        task = asyncio.create_task(
+            runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
+        )
+        runner._profile_failed_platforms["reviewer"][Platform.DISCORD] = task
+        await task
+
+        assert connect_calls == 2
+        assert cleanup_calls == (2 if cleanup_fails else 1)
+        assert first.disconnected is True
+        assert (
+            runner._profile_adapters.get("reviewer", {}).get(Platform.DISCORD)
+            is replacement
+        )
+        assert runner._profile_failed_platforms == {}
+
+    @pytest.mark.asyncio
+    async def test_secondary_startup_success_publishes_replacement(self, monkeypatch):
+        """startup restore 仍在进行时，首次成功的 replacement 必须登记 owner。"""
+        runner = _secondary_recovery_runner(running=False)
+        runner._startup_restore_in_progress = True
+        replacement = _SecondaryRecoveryAdapter()
+        runner._profile_failed_platforms["reviewer"] = {}
+        _install_secondary_reconnect_context(monkeypatch, runner, replacement)
+        monkeypatch.setattr(
+            runner, "_create_adapter", lambda _platform, _config: replacement
+        )
+
+        async def connect(_adapter, _platform, *, is_reconnect=False):
+            assert is_reconnect is True
+            return True
+
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", connect)
+
+        task = asyncio.create_task(
+            runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
+        )
+        runner._profile_failed_platforms["reviewer"][Platform.DISCORD] = task
+        await task
+
+        assert (
+            runner._profile_adapters.get("reviewer", {}).get(Platform.DISCORD)
+            is replacement
+        )
+        assert replacement.disconnected is False
+        assert runner._profile_failed_platforms == {}
+
+    @pytest.mark.asyncio
+    async def test_secondary_startup_shutdown_event_never_publishes(self, monkeypatch):
+        """shutdown 与 startup flag 同时存在时，connect 返回也不能重新发布。"""
+        runner = _secondary_recovery_runner(running=False)
+        runner._startup_restore_in_progress = True
+        runner._shutdown_event = asyncio.Event()
+        replacement = _SecondaryRecoveryAdapter()
+        runner._profile_failed_platforms["reviewer"] = {}
+        _install_secondary_reconnect_context(monkeypatch, runner, replacement)
+        monkeypatch.setattr(
+            runner, "_create_adapter", lambda _platform, _config: replacement
+        )
+
+        async def connect(_adapter, _platform, *, is_reconnect=False):
+            assert is_reconnect is True
+            runner._shutdown_event.set()
+            return True
+
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", connect)
+
+        task = asyncio.create_task(
+            runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
+        )
+        runner._profile_failed_platforms["reviewer"][Platform.DISCORD] = task
+        await task
+
+        assert (
+            runner._profile_adapters.get("reviewer", {}).get(Platform.DISCORD)
+            is not replacement
+        )
+        assert replacement.disconnected is True
+        assert runner._profile_failed_platforms == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("startup_phase", [False, True], ids=["running", "startup"])
+    async def test_nonretryable_secondary_fatal_retries_cleanup_only(
+        self, startup_phase
+    ):
+        """secondary 认证 fatal 只重试 cleanup，不得偷偷进入业务重连。"""
+        runner = _secondary_recovery_runner()
+        runner._running = not startup_phase
+        runner._startup_restore_in_progress = startup_phase
+        stale = _SecondaryRecoveryAdapter(retryable=False)
+        runner._profile_adapters["reviewer"] = {Platform.DISCORD: stale}
+        retry_entered = asyncio.Event()
+        release_retry = asyncio.Event()
+        calls = 0
+
+        async def disconnect():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("old poller alive")
+            retry_entered.set()
+            await release_retry.wait()
+
+        stale.disconnect = disconnect
+        try:
+            with pytest.raises(RuntimeError, match="old poller alive"):
+                await runner._handle_profile_adapter_fatal_error(
+                    "reviewer", Platform.DISCORD, stale
+                )
+            key = ("reviewer", Platform.DISCORD)
+            assert key in runner._published_adapter_cleanup_tasks
+            retry_task = runner._published_adapter_cleanup_tasks[key]
+            await retry_entered.wait()
+            assert runner._profile_adapters["reviewer"][Platform.DISCORD] is stale
+            assert runner._profile_failed_platforms == {}
+            assert not retry_task.done()
+
+            release_retry.set()
+            await retry_task
+            assert runner._profile_adapters["reviewer"] == {}
+            assert runner._profile_failed_platforms == {}
+        finally:
+            runner._running = False
+            release_retry.set()
+            tasks = list(
+                getattr(runner, "_published_adapter_cleanup_tasks", {}).values()
+            )
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_nonretryable_secondary_fatal_cleanup_success_never_reconnects(self):
+        """首次 cleanup 成功也不能把认证 fatal 误送进 replacement 队列。"""
+        runner = _secondary_recovery_runner()
+        stale = _SecondaryRecoveryAdapter(retryable=False)
+        runner._profile_adapters["reviewer"] = {Platform.DISCORD: stale}
+
+        await runner._handle_profile_adapter_fatal_error(
+            "reviewer", Platform.DISCORD, stale
+        )
+
+        assert stale.disconnected is True
+        assert runner._profile_adapters["reviewer"] == {}
+        assert runner._profile_failed_platforms == {}
+        assert runner._background_tasks == set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("connect_mode", ["false", "raise"])
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    async def test_secondary_reconnect_terminal_error_only_retries_cleanup(
+        self, monkeypatch, connect_mode, cleanup_fails
+    ):
+        """terminal reconnect 的四种失败组合都不得创建第二个 adapter。"""
+        runner = _secondary_recovery_runner()
+        terminal = _SecondaryRecoveryAdapter(retryable=False)
+        terminal.has_fatal_error = True
+        runner._profile_failed_platforms["reviewer"] = {}
+        _install_secondary_reconnect_context(monkeypatch, runner, terminal)
+        connect_calls = 0
+        cleanup_calls = 0
+
+        def create_adapter(_platform, _config):
+            return terminal
+
+        async def connect(_adapter, _platform, *, is_reconnect=False):
+            nonlocal connect_calls
+            connect_calls += 1
+            if connect_calls == 2:
+                runner._running = False
+            if connect_mode == "raise":
+                raise RuntimeError("terminal connect error")
+            return False
+
+        async def disconnect():
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            if cleanup_fails and cleanup_calls == 1:
+                raise RuntimeError("terminal cleanup failed")
+            terminal.disconnected = True
+
+        terminal.disconnect = disconnect
+        monkeypatch.setattr(runner, "_create_adapter", create_adapter)
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", connect)
+        monkeypatch.setattr(gateway_run, "_reconnect_backoff", lambda _attempt: 0)
+        monkeypatch.setattr(gateway_run.asyncio, "sleep", AsyncMock())
+
+        task = asyncio.create_task(
+            runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
+        )
+        runner._profile_failed_platforms["reviewer"][Platform.DISCORD] = task
+        await task
+
+        assert connect_calls == 1
+        assert cleanup_calls == (2 if cleanup_fails else 1)
+        assert terminal.disconnected is True
+        assert runner._profile_failed_platforms == {}
 
 
     @pytest.mark.asyncio

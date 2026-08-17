@@ -1,0 +1,319 @@
+"""第十一轮 4 条 P1 —— 全部驱动**生产入口**,⛔ 不测判据函数本身。
+
+⭐ 每条都配了「删掉调用点」逆改:门若仍绿,说明它测的是 helper 而不是
+生产控制流 —— 那种门是**出生即空转**。
+"""
+
+import asyncio
+import os
+import pathlib
+import time
+from types import SimpleNamespace
+
+import pytest
+
+
+# ═════════════════ A · 每次上传都要硬期限 ═════════════════
+
+class TestArtifactUploadHasAHardDeadline:
+    """🔴 ``_ARTIFACT_RETRY_BUDGET_S`` 只限制**重试前的 sleep**,⛔ 不限制上传本身;
+    而 Feishu 等适配器最终经**无超时**的 ``_run_blocking()`` 等 SDK。
+    notifier **串行**处理订阅 ⇒ 一次卡死阻断该 profile **后续所有**任务完成通知。
+    """
+
+    @staticmethod
+    def _mixin(monkeypatch, send_impl, deadline=0.15):
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+        m = GatewayKanbanWatchersMixin.__new__(GatewayKanbanWatchersMixin)
+        monkeypatch.setattr(
+            GatewayKanbanWatchersMixin, "_ARTIFACT_UPLOAD_TIMEOUT_S", deadline,
+            raising=False)
+        calls = []
+
+        async def _send(*, adapter, chat_id, metadata, path):
+            calls.append(path)
+            return await send_impl(len(calls))
+
+        m._send_one_artifact = _send
+        return m, calls
+
+    def test_a_hung_upload_does_not_block_the_queue(self, monkeypatch):
+        """✅ **应该改变**:上传永不返回 ⇒ 期限到了放弃,交付队列继续走。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+        async def _never(_n):
+            await asyncio.Event().wait()
+
+        m, calls = self._mixin(monkeypatch, _never)
+
+        async def _drive():
+            t0 = time.monotonic()
+            ok = await GatewayKanbanWatchersMixin._upload_artifact_with_retry(
+                m, adapter=object(), chat_id="c", metadata={}, path="/x/a.png",
+                budget=[8.0])
+            return ok, time.monotonic() - t0
+
+        ok, elapsed = asyncio.run(_drive())
+        assert elapsed < 5.0, f"仍在无限等待({elapsed:.1f}s)⇒ 该 profile 后续通知全被堵住"
+        assert ok is False, "卡死的上传不能报成功"
+        assert len(calls) == 1, (
+            f"超时后又重传了({len(calls)} 次)⇒ 上传非幂等,**用户会收到重复文件**"
+        )
+
+    def test_a_fast_success_is_unchanged(self, monkeypatch):
+        """🔴 **必须保持不变**:正常上传一次成功,⛔ 不许被期限改写。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+        async def _ok(_n):
+            return SimpleNamespace(success=True, error=None, retryable=False)
+
+        m, calls = self._mixin(monkeypatch, _ok)
+        ok = asyncio.run(GatewayKanbanWatchersMixin._upload_artifact_with_retry(
+            m, adapter=object(), chat_id="c", metadata={}, path="/x/a.png",
+            budget=[8.0]))
+        assert ok is True and len(calls) == 1
+
+    def test_a_retryable_failure_still_retries(self, monkeypatch):
+        """🔴 **必须保持不变**:瞬时故障仍然重试 —— 期限⛔不许把重试一起砍掉。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+        async def _flaky(n):
+            if n == 1:
+                return SimpleNamespace(success=False, error="ConnectionResetError: x",
+                                       retryable=True)
+            return SimpleNamespace(success=True, error=None, retryable=False)
+
+        m, calls = self._mixin(monkeypatch, _flaky)
+        ok = asyncio.run(GatewayKanbanWatchersMixin._upload_artifact_with_retry(
+            m, adapter=object(), chat_id="c", metadata={}, path="/x/a.png",
+            budget=[8.0]))
+        assert ok is True, "瞬时故障后的重试被砍掉了"
+        assert len(calls) == 2, f"重试没发生(调用 {len(calls)} 次)"
+
+    def test_the_deadline_is_far_above_the_retry_budget(self):
+        """⛔ 期限不许拍脑袋:必须远大于**等待**预算,否则会掐断正常的大文件上传。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin as G
+
+        assert G._ARTIFACT_UPLOAD_TIMEOUT_S > G._ARTIFACT_RETRY_BUDGET_S * 5
+
+
+# ═════════════════ B · exc_info 绕过脱敏 ═════════════════
+
+class TestArtifactLoggingDoesNotLeakCredentials:
+    """🔴 ``safe_exc`` 的 docstring 自己写着「⛔ 挡不住 ``exc_info=True``」并把那一面
+    标为**开集**。logging 在 ``exc_info=True`` 下会**重新格式化原始异常对象**
+    ⇒ 完整签名 URL / userinfo / query token 落进 ``agent.log`` ——
+    一次附件上传失败就把渠道凭据**持久化**了。
+    """
+
+    SECRETY = ("403, message='Forbidden', "
+               "url='https://user:hunter2@cdn.example.com/f?token=TOPSECRET' "
+               "/Users/x/.secret/token.json")
+
+    def test_safe_traceback_strips_every_credential_shape(self):
+        from gateway.platforms.base import safe_traceback
+
+        try:
+            raise ValueError(self.SECRETY)
+        except ValueError as exc:
+            out = safe_traceback(exc)
+        for leak in ("TOPSECRET", "hunter2", "user:hunter2", "/Users/x/.secret"):
+            assert leak not in out, f"仍然泄漏 {leak!r}:{out[:200]}"
+
+    def test_safe_traceback_stays_diagnosable(self):
+        """🔴 **必须保持不变**:脱敏 ≠ 丢掉可定位性(⛔ 别砍成一句「操作失败」)。"""
+        from gateway.platforms.base import safe_traceback
+
+        try:
+            raise ValueError(self.SECRETY)
+        except ValueError as exc:
+            out = safe_traceback(exc)
+        assert out.startswith("ValueError:"), "异常类型名丢了 ⇒ 分不清超时和未授权"
+        assert "cdn.example.com" in out, "host 也被抹了 ⇒ 定位不到是哪个渠道"
+        assert "test_round11_p1_fixes.py" in out, "调用栈没了 ⇒ 排查无从下手"
+
+    def test_the_delivery_call_sites_no_longer_pass_exc_info(self):
+        """⭐ 判据落在**生产调用点**:凭据真正流过的那三处。"""
+        src = pathlib.Path("gateway/kanban_watchers.py").read_text()
+        assert "exc_info=True" not in src, (
+            "kanban 交付路径仍在用 exc_info=True ⇒ logging 会重新格式化原始异常,"
+            "把签名 URL 写进 agent.log"
+        )
+        assert src.count("safe_traceback(") >= 3, "脱敏 traceback 没接到调用点上"
+
+    def test_safe_exc_itself_is_untouched(self):
+        """🔴 **必须保持不变**:⛔ 不许顺手改 ``safe_exc`` 的行为(它遍地在用)。"""
+        from gateway.platforms.base import safe_exc
+
+        try:
+            raise ValueError(self.SECRETY)
+        except ValueError as exc:
+            one = safe_exc(exc)
+        assert "\n" not in one, "safe_exc 必须仍是**一行**"
+        assert one.startswith("ValueError:") and "TOPSECRET" not in one
+
+
+# ═════════════════ C · 取消后的 MCP cleanup 有硬期限 ═════════════════
+
+class TestCancelledMcpCleanupIsBounded:
+    """🔴 上一版**无条件**吞掉每一次后续取消 ⇒ discovery cleanup 赖在 MCP loop 里,
+    **profile reload/unload 再也收不回 transport 和子进程**。
+    ⚠️ 它是**独立于**所有外层 deadline 的旁路 —— 外面加多少超时都罩不住。
+    """
+
+    def test_a_cleanup_that_never_finishes_stops_swallowing_cancels(self, monkeypatch):
+        """✅ **应该改变**:窗口耗尽后取消真正传播出去。
+
+        🔴 **这道门第一版出生即空转。** 它在 ``asyncio.run()`` **返回之后**才断言
+        ``task.done()`` —— 而关闭事件循环会把 pending task 一律取消 ⇒ 那条断言
+        **恒真**,把 ``if False:`` 的逆改也判成了绿。
+        ⭐ 判据必须在**循环还活着的时候**取样。
+        """
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setattr(mcp_tool, "_MCP_CANCEL_REAP_SECONDS", 0.2)
+
+        async def _drive():
+            async def _never():
+                await asyncio.Event().wait()
+
+            task = asyncio.ensure_future(
+                mcp_tool._await_cleanup_until_complete(_never()))
+            await asyncio.sleep(0.02)
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            while not task.done() and loop.time() - t0 < 3.0:
+                task.cancel()                     # 反复取消 —— 模拟外层不断催
+                await asyncio.sleep(0.02)
+            # ⭐ 在**循环仍然活着**时取样,⛔ 不许等 asyncio.run 收尾后再问
+            sample = (task.done(), loop.time() - t0)
+            if not task.done():
+                task.cancel()
+            # ⛔ 收尾也要有界:否则缺陷版本会让整个 pytest 挂死,
+            #   红在「超时」而不是红在**断言**上。
+            await asyncio.wait({task}, timeout=1.0)
+            return sample
+
+        done, elapsed = asyncio.run(_drive())
+        assert done, (
+            f"{elapsed:.1f}s 内反复取消都被吞掉 ⇒ discovery cleanup 赖在 MCP loop 里,"
+            "profile reload/unload 永久收不回 transport 和子进程"
+        )
+        assert elapsed >= 0.1, "根本没等到窗口 ⇒ 期限没生效,barrier 语义被破坏"
+
+    def test_a_cleanup_that_finishes_normally_returns_its_value(self):
+        """🔴 **必须保持不变**:没人取消时,原样返回 worker 的结果。"""
+        import tools.mcp_tool as mcp_tool
+
+        async def _drive():
+            async def _work():
+                await asyncio.sleep(0)
+                return "done"
+
+            return await mcp_tool._await_cleanup_until_complete(_work())
+
+        assert asyncio.run(_drive()) == "done"
+
+    def test_cancels_inside_the_window_are_still_swallowed(self, monkeypatch):
+        """🔴 **必须保持不变**:窗口内仍然吞取消 —— 这正是 barrier 的意义,
+        ⛔ 不许提前放手让 transport 半死不活。"""
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setattr(mcp_tool, "_MCP_CANCEL_REAP_SECONDS", 30.0)
+
+        async def _drive():
+            async def _slow():
+                await asyncio.sleep(0.15)
+                return "finished-anyway"
+
+            task = asyncio.ensure_future(
+                mcp_tool._await_cleanup_until_complete(_slow()))
+            await asyncio.sleep(0.02)
+            task.cancel()                          # 窗口内的取消必须被吞掉
+            return await asyncio.gather(task, return_exceptions=True)
+
+        [res] = asyncio.run(_drive())
+        assert res == "finished-anyway", (
+            f"窗口内的取消没被吞掉({res!r})⇒ transport 会被半路丢下"
+        )
+
+
+# ═════════════════ D · 可读性探测离开事件循环 ═════════════════
+
+class TestReadabilityProbeCannotBlockTheEventLoop:
+    """🔴 ``O_NONBLOCK`` 只对 FIFO/设备有效,**对普通文件不提供任何墙钟上限**。
+    ``_build_media_placeholder()`` 在事件循环上**同步**调用它
+    ⇒ 一条挂在失联 NFS/FUSE 上的附件能**堵住所有会话**。
+    """
+
+    def test_a_hanging_probe_degrades_instead_of_hanging(self, monkeypatch):
+        """✅ **应该改变**:探测卡死 ⇒ 期限内按 ``attachment_transfer_failed`` 降级。"""
+        import gateway.model_readability as mr
+
+        monkeypatch.setattr(mr, "_PROBE_DEADLINE_S", 0.2)
+        monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
+                            lambda *a, **k: time.sleep(30))
+        t0 = time.monotonic()
+        r = mr.verify_artifact_readable("/mnt/dead-nfs/a.png")
+        elapsed = time.monotonic() - t0
+        assert elapsed < 3.0, f"探测仍会把事件循环堵 {elapsed:.1f}s ⇒ 所有会话一起卡"
+        assert r.ok is False and r.failure_code == "attachment_transfer_failed"
+        assert r.model_path is None, "失败时 ⛔ 不许给出 model_path"
+
+    def test_the_event_loop_keeps_ticking_while_the_probe_hangs(self, monkeypatch):
+        """⭐ 直接钉「不堵事件循环」这个不变量本身。"""
+        import gateway.model_readability as mr
+
+        monkeypatch.setattr(mr, "_PROBE_DEADLINE_S", 0.4)
+        monkeypatch.setattr(mr, "_verify_artifact_readable_blocking",
+                            lambda *a, **k: time.sleep(30))
+        ticks = []
+
+        async def _drive():
+            async def _ticker():
+                while True:
+                    ticks.append(1)
+                    await asyncio.sleep(0.02)
+
+            t = asyncio.create_task(_ticker())
+            await asyncio.sleep(0)
+            await asyncio.to_thread(mr.verify_artifact_readable, "/mnt/dead/a.png")
+            t.cancel()
+
+        asyncio.run(_drive())
+        assert len(ticks) > 3, f"探测期间事件循环只跑了 {len(ticks)} 次 ⇒ 仍在被堵"
+
+    def test_a_healthy_file_still_gets_a_full_receipt(self, tmp_path, monkeypatch):
+        """🔴 **必须保持不变**:正常文件的回执逐字不变(⛔ 不许被降级路径污染)。"""
+        import gateway.model_readability as mr
+
+        f = tmp_path / "ok.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 100)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        r = mr.verify_artifact_readable(str(f))
+        assert r.ok is True, f"正常文件被判失败:{r}"
+        assert r.model_path == str(f)
+        assert r.size == f.stat().st_size
+        assert r.sha256 is None, "⛔ 仍然不许塞前缀摘要冒充 sha256"
+        assert "read_ok" in r.checks and "regular_file" in r.checks
+
+    def test_existing_failure_codes_are_unchanged(self, tmp_path, monkeypatch):
+        """🔴 **必须保持不变**:既有的每个失败码逐条不变。"""
+        import gateway.model_readability as mr
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        assert mr.verify_artifact_readable("").failure_code == "attachment_delivery_failed"
+        assert mr.verify_artifact_readable(
+            str(tmp_path / "nope.png")).failure_code == "attachment_expired"
+        empty = tmp_path / "empty.png"; empty.write_bytes(b"")
+        assert mr.verify_artifact_readable(str(empty)).failure_code == "attachment_expired"
+
+    def test_the_worker_pool_is_bounded(self):
+        """⛔ 线程不许无界增长:每条卡死的附件都留一个线程就是第二处无界。"""
+        import gateway.model_readability as mr
+
+        assert 0 < mr._PROBE_MAX_WORKERS <= 8
+        pool = mr._get_probe_pool()
+        assert pool is mr._get_probe_pool(), "每次新建线程池 = 无界增长"
+        assert pool._max_workers == mr._PROBE_MAX_WORKERS

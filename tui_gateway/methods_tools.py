@@ -82,6 +82,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("reload.mcp")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     session = _sessions.get(params.get("session_id", ""))
     try:
@@ -129,11 +130,18 @@ def _(rid, params: dict) -> dict:
                     str(params.get("session_id") or ""),
                     request_id=f"reload-mcp-{rid}",
                 )
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host reload_mcp failed: {exc}")
+            except Exception:
+                logger.exception(
+                    "compute-host MCP reload failed (request_id=%s)", rid
+                )
+                return _err(
+                    rid,
+                    5019,
+                    f"MCP tools could not be refreshed; retry and provide reference {rid} if it persists.",
+                )
             return _ok(rid, {"status": "reloaded", "turn_isolation": True, "host_ack": ack})
 
-        from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools
+        from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_profile
 
         def _refresh_session_agent() -> None:
             """Rebuild THIS session's cached tool snapshot from the live
@@ -156,13 +164,16 @@ def _(rid, params: dict) -> dict:
                     quiet_mode=True,
                 )
             except Exception as _exc:
-                logger.warning(
-                    "Failed to refresh cached agent tools after /reload-mcp: %s",
-                    _exc,
+                logger.exception(
+                    "Failed to refresh cached agent tools after /reload-mcp "
+                    "(request_id=%s)",
+                    rid,
                 )
             _emit("session.info", params.get("session_id", ""), _session_info(agent, session))
 
-        global _mcp_reload_gen, _mcp_reload_loaded_rev
+        from hermes_constants import get_hermes_home
+
+        profile_identity = str(get_hermes_home().resolve())
 
         # The revision the CALLER is asking to load (the mcp_rev its poll
         # observed). Empty on legacy clients and manual /reload-mcp — those
@@ -179,11 +190,9 @@ def _(rid, params: dict) -> dict:
             reload racing a config edit): re-hash after discovery and repeat
             until the hash is stable, so the generation we mark completed
             always reflects the config that was actually loaded."""
-            global _mcp_reload_gen, _mcp_reload_loaded_rev
-
             loaded = _compute_mcp_rev()
             for _ in range(_MCP_RELOAD_MAX_PASSES):
-                shutdown_mcp_servers()
+                shutdown_mcp_profile()
                 discover_mcp_tools()
                 after = _compute_mcp_rev()
                 if after == loaded:
@@ -191,8 +200,10 @@ def _(rid, params: dict) -> dict:
                 loaded = after
 
             _refresh_session_agent()
-            _mcp_reload_loaded_rev = loaded
-            _mcp_reload_gen += 1
+            _mcp_reload_loaded_rev_by_profile[profile_identity] = loaded
+            _mcp_reload_gen_by_profile[profile_identity] = (
+                _mcp_reload_gen_by_profile.get(profile_identity, 0) + 1
+            )
 
         # Serialize reloads. The LEADER (won the non-blocking acquire) runs the
         # full reload. A FOLLOWER (lock busy) snapshots the generation, waits,
@@ -211,13 +222,25 @@ def _(rid, params: dict) -> dict:
             finally:
                 _mcp_reload_lock.release()
 
-            return _finish_reload(rid, params, coalesced=False)
+            return _finish_reload(
+                rid,
+                params,
+                coalesced=False,
+                loaded_rev=_mcp_reload_loaded_rev_by_profile.get(
+                    profile_identity, ""
+                ),
+            )
 
-        gen_before = _mcp_reload_gen
+        gen_before = _mcp_reload_gen_by_profile.get(profile_identity, 0)
 
         with _mcp_reload_lock:
-            leader_completed = _mcp_reload_gen > gen_before
-            rev_satisfied = not req_rev or req_rev == _mcp_reload_loaded_rev
+            leader_completed = (
+                _mcp_reload_gen_by_profile.get(profile_identity, 0) > gen_before
+            )
+            loaded_rev = _mcp_reload_loaded_rev_by_profile.get(
+                profile_identity, ""
+            )
+            rev_satisfied = not req_rev or req_rev == loaded_rev
 
             if leader_completed and rev_satisfied:
                 _refresh_session_agent()
@@ -226,9 +249,21 @@ def _(rid, params: dict) -> dict:
                 _do_full_reload()
                 coalesced = False
 
-        return _finish_reload(rid, params, coalesced=coalesced)
-    except Exception as e:
-        return _err(rid, 5015, str(e))
+        return _finish_reload(
+            rid,
+            params,
+            coalesced=coalesced,
+            loaded_rev=_mcp_reload_loaded_rev_by_profile.get(
+                profile_identity, ""
+            ),
+        )
+    except Exception:
+        logger.exception("MCP reload failed (request_id=%s)", rid)
+        return _err(
+            rid,
+            5015,
+            f"MCP tools could not be refreshed; retry and provide reference {rid} if it persists.",
+        )
 
 
 @method("reload.env")
@@ -248,8 +283,35 @@ def _(rid, params: dict) -> dict:
 
         count = reload_env()
         return _ok(rid, {"updated": int(count)})
-    except Exception as e:
-        return _err(rid, 5015, str(e))
+    except Exception as exc:
+        if isinstance(exc, FileNotFoundError):
+            error_code = "ENV_RELOAD_FILE_NOT_FOUND"
+            message = "Environment settings were not found. Create them, then retry."
+        elif isinstance(exc, PermissionError):
+            error_code = "ENV_RELOAD_PERMISSION_DENIED"
+            message = "Hermes cannot read the environment settings. Fix their permissions, then retry."
+        elif isinstance(exc, KeyError):
+            error_code = "ENV_RELOAD_CONFIG_MISSING"
+            message = "Required environment settings are missing. Add them, then retry."
+        elif isinstance(exc, (SyntaxError, ValueError, UnicodeError)):
+            error_code = "ENV_RELOAD_INVALID_CONFIG"
+            message = "Environment settings contain invalid syntax. Fix them, then retry."
+        elif isinstance(exc, OSError):
+            error_code = "ENV_RELOAD_IO_ERROR"
+            message = "Environment settings could not be read. Check storage availability, then retry."
+        else:
+            error_code = "ENV_RELOAD_FAILED"
+            message = "Environment settings could not be reloaded. Retry the operation."
+        logger.exception(
+            "Environment reload failed (error_code=%s request_id=%s)",
+            error_code,
+            rid,
+        )
+        return _err(
+            rid,
+            5015,
+            f"{error_code}: {message} Provide reference {rid} if it persists.",
+        )
 
 
 @method("commands.catalog")
