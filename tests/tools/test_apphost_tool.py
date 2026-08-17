@@ -353,18 +353,63 @@ def test_app_operation_requires_capability_digest_before_sending(monkeypatch):
 
 
 def test_publish_operation_is_passed_through_unchanged(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+    )
+
     seen = {}
     operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "user_confirmed_auto", "maintenance": {"schedule": "0 9 * * *"}}
-    with mux_profile_scope(monkeypatch, _scope()), patch(
-        "tools.apphost_tool._urlopen",
-        _capture_urlopen(seen, {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}),
-    ):
+    session_tokens = set_session_vars(session_id="session-1")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="e" * 64
+    )
+    try:
+        with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+            "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
+        ) as mint, patch(
+            "tools.apphost_tool._urlopen",
+            _capture_urlopen(seen, {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}),
+        ):
+            out = json.loads(app_host_tool({
+                "action": "publish", "mode": "install", "source_subdir": "runs/app",
+                "data_refresh": "user_confirmed_auto", "operation": operation,
+            }))
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+    assert out["ok"] is True
+    mint.assert_called_once_with("main")
+    assert json.loads(seen["req"].data)["operation"] == operation
+    assert seen["req"].get_header("X-zettlab-agent-action-token") == "a" * 64
+
+
+def test_auto_publish_requires_an_active_user_turn_before_minting_scope(monkeypatch):
+    operation = {"operation_id": "op-1", "data_refresh": "user_confirmed_auto"}
+    with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+        "tools.apphost_tool.request_app_auto_refresh_token"
+    ) as mint, patch("tools.apphost_tool._urlopen") as open_request:
         out = json.loads(app_host_tool({
             "action": "publish", "mode": "install", "source_subdir": "runs/app",
             "data_refresh": "user_confirmed_auto", "operation": operation,
         }))
-    assert out["ok"] is True
-    assert json.loads(seen["req"].data)["operation"] == operation
+    assert out["ok"] is False
+    assert out["error"]["code"] == "automatic_maintenance_unavailable"
+    assert out["status"] == 0
+    mint.assert_not_called()
+    open_request.assert_not_called()
+
+
+def test_auto_publish_without_operation_is_rejected_before_credentials_or_network(monkeypatch):
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool.request_app_auto_refresh_token", side_effect=AssertionError("scope must not be minted")
+    ), patch("tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "user_confirmed_auto",
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
 
 
 def test_operation_enabled_publish_202_returns_verified_pending_receipt(monkeypatch):
@@ -398,16 +443,28 @@ def test_operation_enabled_publish_200_returns_verified_terminal_receipt(monkeyp
 
 
 def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+    )
+
     seen = {}
     operation = {"operation_id": "op-reload", "data_refresh": "user_confirmed_auto"}
     response = {"operation": {"operation_id": "op-reload", "terminal": "succeeded"}}
-    with mux_profile_scope(monkeypatch, _scope()), patch(
-        "tools.apphost_tool._urlopen", _capture_urlopen(seen, response)
-    ):
-        out = json.loads(app_host_tool({
-            "action": "publish", "mode": "reload", "source_subdir": "runs/app",
-            "operation": operation,
-        }))
+    session_tokens = set_session_vars(session_id="session-1")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="e" * 64
+    )
+    try:
+        with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+            "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
+        ), patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, response)):
+            out = json.loads(app_host_tool({
+                "action": "publish", "mode": "reload", "source_subdir": "runs/app",
+                "operation": operation,
+            }))
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
     assert out["ok"] is True
     assert json.loads(seen["req"].data) == {
         "mode": "reload", "source_subdir": "runs/app",
@@ -1670,10 +1727,8 @@ def test_install_rejects_values_outside_the_enum(monkeypatch, value):
 
 
 @pytest.mark.parametrize(
-    "value", ["static", "external_unconfirmed", "user_confirmed_auto", "user_declined"])
+    "value", ["static", "external_unconfirmed", "user_declined"])
 def test_install_forwards_every_accepted_answer(monkeypatch, value):
-    captured = {}
-
     seen = {}
 
     with mux_profile_scope(monkeypatch, _scope()):
