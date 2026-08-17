@@ -210,8 +210,8 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "enum": list(_DATA_REFRESH_CHOICES),
                 "description": (
-                    "Required for both install paths: publish(mode=install) "
-                    "and legacy action=install. Does this app's data "
+                    "Required for publish(mode=install), and recorded by "
+                    "legacy action=install for non-automatic apps. Does this app's data "
                     "need to keep refreshing on its own? "
                     "static = the user types the data in themselves (ledger, "
                     "to-do, notes) and nothing outside the device changes it. "
@@ -219,8 +219,8 @@ APP_HOST_SCHEMA = {
                     "the device could not ask for refresh consent because the "
                     "optional capability was unavailable. "
                     "user_confirmed_auto = the data comes from outside and the "
-                    "user agreed to a schedule — you must finish configuring it "
-                    "before reporting done. "
+                    "user agreed to a schedule — it requires publish(mode=install) "
+                    "with a complete operation; legacy install is forbidden. "
                     "user_declined = you asked and the user said no. "
                     "Answer from what the user actually said, not from what the "
                     "app could get away with: an app that shows prices, weather "
@@ -632,6 +632,11 @@ def _build_request(action, args):
                 "install 需要 data_refresh 参数（"
                 + "/".join(_DATA_REFRESH_CHOICES)
                 + "）：这个应用的数据要不要自己持续更新？照用户说过的话答"
+            )
+        if data_refresh == "user_confirmed_auto":
+            raise _BadRequest(
+                "legacy install 不能启用 user_confirmed_auto；请使用 "
+                "publish(mode=install) 并提供完整 operation，才能原子创建维护者和定时任务"
             )
         body = {
             "staging_dir": _require_staging_dir(args),
