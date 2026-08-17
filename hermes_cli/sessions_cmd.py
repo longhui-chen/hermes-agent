@@ -155,6 +155,24 @@ def _confirm_prompt(prompt: str) -> bool:
         return False
 
 
+def _filter_agent_session_ids(rows, agent_id):
+    """Return the ids in rows that belong to agent_id.
+
+    Mirrors local-server's sessionBelongsToAgent shape: zettlab:<user>:<agent>:<rand>,
+    comparing the agent segment (parts[2]) to agent_id. A LIKE '%:<agent>:%' would
+    span ':' boundaries and wrongly match a lookalike tail, so split and compare
+    the exact segment. Device-wide: cross-user is allowed; only the agent segment
+    matters.
+    """
+    ids = []
+    for row in rows:
+        sid = str(row.get("id") or "")
+        parts = sid.split(":")
+        if sid.startswith("zettlab:") and len(parts) >= 4 and parts[2] == agent_id:
+            ids.append(sid)
+    return ids
+
+
 def cmd_sessions(args, sessions_parser=None):
     import json as _json
 
@@ -891,6 +909,43 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"Deleted session '{resolved_session_id}'.")
         else:
             print(f"Session '{args.session_id}' not found.")
+
+    elif action == "delete-agent":
+        # local-server 用 HERMES_HOME 指向根库调用本命令：只删根库 state.db 里属于该
+        # agent 的 zettlab 会话（profile 库随 profile 目录删除，不在此列）。会话 ID 形如
+        # zettlab:<user>:<agent>:<rand>，按 parts[2] 匹配 agent_id（设备级跨用户允许，
+        # 与 local-server 的 sessionBelongsToAgent 语义一致）。
+        agent_id = str(getattr(args, "agent_id", "") or "").strip()
+        if not agent_id:
+            print("Error: agent_id is required.")
+            return 2
+        sessions_dir = get_hermes_home() / "sessions"
+        ids: list = []
+        offset = 0
+        while True:
+            rows = db.list_sessions_rich(
+                limit=200,
+                offset=offset,
+                compact_rows=True,
+                project_compression_tips=False,
+            )
+            if not rows:
+                break
+            ids.extend(_filter_agent_session_ids(rows, agent_id))
+            if len(rows) < 200:
+                break
+            offset += len(rows)
+        if not ids:
+            print(f"Deleted 0 session(s) for agent '{agent_id}'.")
+            return
+        if not args.yes:
+            if not _confirm_prompt(
+                f"Delete {len(ids)} chat session(s) for agent '{agent_id}'? [y/N] "
+            ):
+                print("Cancelled.")
+                return
+        deleted = db.delete_sessions(ids, sessions_dir=sessions_dir)
+        print(f"Deleted {deleted} session(s) for agent '{agent_id}'.")
 
     elif action in ("prune", "archive"):
         from hermes_cli.session_filters import (
