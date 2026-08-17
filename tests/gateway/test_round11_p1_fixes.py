@@ -691,3 +691,95 @@ class TestMultiplexDiscoveryCoversEveryProfile:
                             lambda **kw: started.append(kw.get("thread_name")))
         assert gr._spawn_mcp_discovery(logger=gr.logger, multiplex=False) is None
         assert started == ["mcp-discovery"], f"单 profile 路径变了:{started}"
+
+
+class TestNoUndefinedNameOnLinesThisPrTouched:
+    """⭐ 把「跑不到的分支里引用了作用域外的名字」变成结构性拦截。
+
+    🔴 本轮实证:``gateway/run.py`` 的 drain 超时分支引用了本作用域**不存在**的
+    ``profile_name`` ⇒ 一触发就 ``NameError``,把「drain 超时」伪装成内部异常。
+    是我在本 PR 引入的,而**那条分支平时驱动不到** —— 单靠测试覆盖抓不住。
+
+    ## 作用域(⛔ 不许扩成全仓)
+    只看**本 PR 新增/改动的行**。全仓 F821 有 272 条,绝大多数是上游存量
+    (整文件缺 import),⛔ 不归本轮。
+
+    ## 唯一豁免 + 它自己的验证
+    ``tui_gateway/methods_tools.py`` 的 handler body **按设计**被 rebind 到
+    ``server.py`` 的 globals(``_m.register(sys.modules[__name__])``)⇒ F821
+    对它必然误报。⛔ 豁免不是白给:下面**实查**那些名字真的在 ``server.py`` 里。
+    ⚠️ 我第一次查时用 ``^name *[=(]`` 正则,漏掉了带类型注解的
+    ``_mcp_reload_gen_by_profile: dict[str, int] = {}`` ⇒ **差点报出一条假 P1**。
+    """
+
+    _REBIND_EXEMPT = "tui_gateway/methods_tools.py"
+
+    @staticmethod
+    def _changed_lines():
+        import collections
+        import re
+        import subprocess
+
+        mb = subprocess.run(["git", "merge-base", "origin/main", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+        files = [f for f in subprocess.run(["git", "diff", "--name-only", f"{mb}..HEAD"],
+                                           capture_output=True, text=True).stdout.split()
+                 if f.endswith(".py") and not f.startswith("tests/")]
+        added = collections.defaultdict(set)
+        cur = None
+        for ln in subprocess.run(["git", "diff", "-U0", f"{mb}..HEAD", "--"] + files,
+                                 capture_output=True, text=True).stdout.split("\n"):
+            if ln.startswith("+++ b/"):
+                cur = ln[6:]
+            elif ln.startswith("@@") and cur:
+                m = re.search(r"\+(\d+)(?:,(\d+))?", ln)
+                if m:
+                    st, n = int(m.group(1)), int(m.group(2) or 1)
+                    added[cur].update(range(st, st + n))
+        return files, added
+
+    def test_no_f821_on_lines_this_pr_changed(self):
+        import json
+        import shutil
+        import subprocess
+
+        if shutil.which("ruff") is None and not pathlib.Path(".venv/bin/ruff").exists():
+            pytest.skip("ruff 不可用 —— ⛔ 这是按设计的自跳过,不是「过了」")
+        files, added = self._changed_lines()
+        assert files and any(added.values()), "量具坏了:一行改动都没找到"
+        ruff = ".venv/bin/ruff" if pathlib.Path(".venv/bin/ruff").exists() else "ruff"
+        out = subprocess.run([ruff, "check", "--select", "F821", "--no-cache",
+                              "--output-format", "json"] + files,
+                             capture_output=True, text=True).stdout
+        hits = json.loads(out)
+        assert hits, "F821 一条都没有 ⇒ 量具可疑(仓里已知有上游存量)"
+        mine = []
+        for h in hits:
+            rel = h["filename"].split("hermes-rh-fix-20260816/")[-1]
+            if rel == self._REBIND_EXEMPT:
+                continue
+            if h["location"]["row"] in added.get(rel, set()):
+                mine.append(f"{rel}:{h['location']['row']} {h['message']}")
+        assert not mine, "本 PR 改动行上的未定义名字(运行到就是 NameError):\n" + "\n".join(mine)
+
+    def test_the_only_exemption_is_actually_rebound(self):
+        """⛔ 豁免不许白给:被豁免文件依赖的名字必须真的在 rebind 目标里。"""
+        server = pathlib.Path("tui_gateway/server.py").read_text()
+        assert "_m.register(sys.modules[__name__])" in server, (
+            "rebind 机制没了 ⇒ 这条豁免立刻失效,必须重新判定"
+        )
+        import ast
+
+        tree = ast.parse(server)
+        top = set()
+        for n in tree.body:
+            if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+                top.add(n.target.id)
+            elif isinstance(n, ast.Assign):
+                top |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                top.add(n.name)
+        # ⚠️ 必须认得**带类型注解**的定义 —— 我第一次查漏的正是这一种。
+        for name in ("_mcp_reload_gen_by_profile", "_mcp_reload_loaded_rev_by_profile",
+                     "_finish_reload", "logger"):
+            assert name in top, f"{name} 不在 server.py 模块层 ⇒ 豁免掩盖了真缺陷"
