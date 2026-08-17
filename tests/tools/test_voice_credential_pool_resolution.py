@@ -129,6 +129,22 @@ class TestConfigPrecedence:
                 == "cfg-key"
             )
 
+    def test_unresolved_config_ref_falls_through_to_env(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "env-key")
+        with patch(
+            "agent.credential_pool.load_pool",
+            return_value=_fake_pool("pool-key"),
+        ) as load_pool:
+            assert (
+                resolve_provider_secret(
+                    "MISTRAL_API_KEY",
+                    "mistral",
+                    config_value="${env:MISTRAL_API_KEY}",
+                )
+                == "env-key"
+            )
+        load_pool.assert_not_called()
+
 
 class TestMultiplexScope:
     """Under multiplexing the profile scope is authoritative — no pool borrow."""

@@ -961,7 +961,8 @@ def _config_section(media_type: str) -> Dict[str, Any]:
         from hermes_cli.config import load_config
 
         cfg = load_config()
-        section = cfg.get(f"{media_type}_gen") if isinstance(cfg, dict) else None
+        config_key = "tts" if media_type == "tts" else f"{media_type}_gen"
+        section = cfg.get(config_key) if isinstance(cfg, dict) else None
         if not isinstance(section, dict):
             return {}
         zettlab = section.get("zettlab")
@@ -975,6 +976,8 @@ def _config_section(media_type: str) -> Dict[str, Any]:
 
 
 def base_url(media_type: str) -> str:
+    if media_type == "tts":
+        return tts_gateway_runtime()[0]
     explicit = str(get_secret("ZETTLAB_AI_PROXY_BASE_URL", "") or "").strip()
     configured = explicit or _config_section(media_type).get("base_url")
     if configured:
@@ -1094,10 +1097,27 @@ def invalidate_capability_cache() -> None:
         _capability_cache.clear()
 
 
-def action_headers() -> Dict[str, str]:
+def tts_gateway_runtime() -> tuple[str, Dict[str, str]]:
+    """Resolve one callback-bound URL/token pair for managed TTS."""
+    from tools.zettlab_tool_gateway import resolve_zettlab_tool_gateway
+
+    gateway = resolve_zettlab_tool_gateway("zettlab-tts")
+    if gateway is None:
+        raise ZettlabMediaError(
+            "Zettlab TTS requires a valid local-server callback and action token"
+        )
+    return (
+        f"{gateway.gateway_origin.rstrip('/')}/v1",
+        {ACTION_TOKEN_HEADER: gateway.token},
+    )
+
+
+def action_headers(media_type: Optional[str] = None) -> Dict[str, str]:
+    if media_type == "tts":
+        return tts_gateway_runtime()[1]
     token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     if not token:
-        raise ZettlabMediaError("ZETTLAB_AGENT_ACTION_TOKEN is required for media generation")
+        raise ZettlabMediaError("ZETTLAB_AGENT_ACTION_TOKEN is required for Zettlab generation")
     return {ACTION_TOKEN_HEADER: token}
 
 
@@ -1320,6 +1340,8 @@ def type_capability(media_type: str) -> Dict[str, Any]:
 
 def list_models(media_type: str) -> List[Dict[str, Any]]:
     section = type_capability(media_type)
+    if media_type == "tts" and _validated_tts_model_ids(section) is None:
+        return []
     if section.get("enabled") is False:
         return []
     models = section.get("models")
@@ -1330,7 +1352,8 @@ def list_models(media_type: str) -> List[Dict[str, Any]]:
         if not isinstance(model, dict) or not isinstance(model.get("id"), str):
             continue
         normalized = dict(model)
-        normalized["modalities"] = supported_modalities(section, model)
+        if media_type != "tts":
+            normalized["modalities"] = supported_modalities(section, model)
         out.append(normalized)
     return out
 
@@ -1377,18 +1400,23 @@ def _resolve_model_from_section(
     section: Dict[str, Any],
     requested: Optional[str] = None,
 ) -> Optional[str]:
-    if section.get("enabled") is False:
+    if media_type == "tts":
+        model_ids = _validated_tts_model_ids(section)
+        if model_ids is None:
+            return None
+    elif section.get("enabled") is False:
         return None
     gateway_default = section.get("default_model")
     models = section.get("models")
     if isinstance(models, list):
-        model_ids = [
-            model.get("id").strip()
-            for model in models
-            if isinstance(model, dict)
-            and isinstance(model.get("id"), str)
-            and model.get("id").strip()
-        ]
+        if media_type != "tts":
+            model_ids = [
+                model.get("id").strip()
+                for model in models
+                if isinstance(model, dict)
+                and isinstance(model.get("id"), str)
+                and model.get("id").strip()
+            ]
         explicit = str(requested or "").strip()
         if explicit:
             return explicit if explicit in model_ids else None
@@ -1408,6 +1436,49 @@ def _resolve_model_from_section(
     return None
 
 
+def _validated_tts_model_ids(section: Dict[str, Any]) -> Optional[List[str]]:
+    """Validate the complete v1 TTS capability contract.
+
+    TTS has no legacy list-first fallback: a partially published catalog must
+    disable the managed provider instead of making the device guess a model,
+    voice, or response format.
+    """
+    if section.get("enabled") is not True:
+        return None
+    models = section.get("models")
+    if not isinstance(models, list) or not models:
+        return None
+
+    model_ids: List[str] = []
+    for model in models:
+        if not isinstance(model, dict):
+            return None
+        model_id = model.get("id")
+        formats = model.get("formats")
+        default_voice = model.get("default_voice")
+        supports_speed = model.get("supports_speed")
+        if not isinstance(model_id, str) or not model_id.strip():
+            return None
+        normalized_id = model_id.strip()
+        if normalized_id in model_ids:
+            return None
+        if (
+            not isinstance(formats, list)
+            or not formats
+            or any(not isinstance(value, str) or not value.strip() for value in formats)
+            or not isinstance(default_voice, str)
+            or not default_voice.strip()
+            or not isinstance(supports_speed, bool)
+        ):
+            return None
+        model_ids.append(normalized_id)
+
+    default = section.get("default_model")
+    if not isinstance(default, str) or default.strip() not in model_ids:
+        return None
+    return model_ids
+
+
 def is_available(media_type: str) -> bool:
     try:
         section = type_capability(media_type)
@@ -1424,6 +1495,8 @@ def is_available(media_type: str) -> bool:
             media_type,
         )
         return False
+    if media_type == "tts":
+        return _resolve_model_from_section("tts", section) is not None
     models = section.get("models")
     return (
         bool(section.get("enabled"))

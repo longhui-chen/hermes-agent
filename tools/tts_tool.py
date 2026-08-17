@@ -45,12 +45,14 @@ import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Any, Iterator, Optional
@@ -58,8 +60,24 @@ from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+# Internal cancellation signal for synchronous providers invoked by the
+# conversational sentence pipeline. Keeping this context-local avoids adding a
+# model-visible tool parameter while still letting a provider abort its active
+# transport when the user barges in.
+_TTS_CANCEL_EVENT: ContextVar[Optional[threading.Event]] = ContextVar(
+    "_TTS_CANCEL_EVENT",
+    default=None,
+)
+
+
+def _current_tts_cancel_event() -> Optional[threading.Event]:
+    return _TTS_CANCEL_EVENT.get()
+
+
 def get_env_value(name, default=None):
     """Read env values through the live config module.
 
@@ -91,6 +109,7 @@ def _resolve_provider_key(env_var: str, provider_id: str) -> str:
     return resolve_provider_secret(env_var, provider_id, env_getter=get_env_value)
 
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.zettlab_tool_gateway import resolve_zettlab_tool_gateway
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
@@ -98,6 +117,11 @@ from tools.tool_backend_helpers import (
     resolve_openai_audio_api_key,
 )
 from tools.xai_http import hermes_xai_user_agent
+
+
+def _resolve_profile_openai_audio_api_key() -> str:
+    """Resolve OpenAI audio credentials from the active profile scope."""
+    return str(resolve_openai_audio_api_key() or "").strip()
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- providers are imported only when actually used to avoid
@@ -211,11 +235,6 @@ DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
-# The managed OpenAI audio gateway (Nous portal proxy) only proxies these speech
-# models. A user's tts.openai.model set for *direct* OpenAI (e.g. "tts-1-hd")
-# is rejected with a 400 "Unsupported managed OpenAI speech model", so it must be
-# coerced to a supported model when routing through the gateway.
-MANAGED_OPENAI_TTS_MODELS = frozenset({"gpt-4o-mini-tts"})
 DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
@@ -257,12 +276,46 @@ GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
 TTS_RESPONSE_BODY_LIMIT_BYTES = 16 * 1024 * 1024
 TTS_RESPONSE_BODY_CHUNK_BYTES = 64 * 1024
-
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
     return str(get_hermes_dir("cache/audio", "audio_cache"))
 
 DEFAULT_OUTPUT_DIR = _get_default_output_dir()
+
+
+def _default_output_dir_for_session(*, platform: str) -> Path:
+    """Resolve the per-call default without leaking another profile's root.
+
+    Managed Zettlab turns expose a profile-scoped semantic Agent output root.
+    TTS audio is a user-visible artifact there, not an internal Hermes cache
+    entry. Other platforms retain the historical cache behavior because their
+    delivery adapters consume the returned ``MEDIA:`` path directly.
+    """
+
+    if (
+        str(platform or "").strip().lower() != "zet_agent"
+        or os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+    ):
+        output_dir = Path(DEFAULT_OUTPUT_DIR)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
+
+    try:
+        from tools.runtime_workdir import agent_output_dir
+
+        output_root = agent_output_dir()
+    except Exception:
+        output_root = None
+    if not output_root:
+        raise RuntimeError(
+            "Managed Zettlab Agent output is unavailable: "
+            "ZET_AGENT_OUTPUT_DIR must name an existing directory"
+        )
+
+    # local-server owns profile/session scoping and injects the final existing
+    # product directory. Hermes must not invent another artifact root or
+    # recreate a missing platform-owned directory.
+    return Path(output_root)
 
 # ---------------------------------------------------------------------------
 # Per-provider input-character limits (from official provider docs).
@@ -315,6 +368,8 @@ def _config_bool(value: Any, default: bool = False) -> bool:
 
 
 def _response_has_explicit_stream(response: Any) -> bool:
+    if _response_has_explicit_iter_bytes(response):
+        return True
     iter_content = getattr(response, "iter_content", None)
     if not callable(iter_content):
         return False
@@ -322,6 +377,18 @@ def _response_has_explicit_stream(response: Any) -> bool:
     if response_type.__module__.startswith("requests."):
         return True
     return "iter_content" in vars(response_type)
+
+
+def _response_has_explicit_iter_bytes(response: Any) -> bool:
+    iter_bytes = getattr(response, "iter_bytes", None)
+    if not callable(iter_bytes):
+        return False
+    response_type = type(response)
+    return (
+        "iter_bytes" in vars(response)
+        or "iter_bytes" in vars(response_type)
+        or response_type.__module__.startswith(("httpx", "openai"))
+    )
 
 
 def _close_response(response: Any) -> None:
@@ -344,7 +411,10 @@ def _read_tts_response_bytes(
     chunks: list[bytes] = []
     total = 0
     try:
-        if _response_has_explicit_stream(response):
+        iter_bytes = getattr(response, "iter_bytes", None)
+        if _response_has_explicit_iter_bytes(response):
+            iterator = iter_bytes(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
+        elif _response_has_explicit_stream(response):
             iterator = response.iter_content(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
         else:
             content = vars(response).get("content", getattr(type(response), "content", b""))
@@ -395,10 +465,91 @@ def _write_tts_response_to_file(
     *,
     label: str,
     limit: Optional[int] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
-    audio_bytes = _read_tts_response_bytes(response, label=label, limit=limit)
-    with open(output_path, "wb") as f:
-        f.write(audio_bytes)
+    """Stage a bounded response beside the target, then atomically publish it."""
+    limit = TTS_RESPONSE_BODY_LIMIT_BYTES if limit is None else limit
+    target = Path(output_path)
+    partial_id = str(uuid.uuid4()).replace("-", "")
+    partial = target.with_name(f".{target.name}.{partial_id}.part")
+    total = 0
+
+    def _raise_if_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            _close_response(response)
+            raise RuntimeError(f"{label} request cancelled")
+
+    _raise_if_cancelled()
+
+    headers = getattr(response, "headers", None)
+    content_length = None
+    if headers is not None:
+        try:
+            raw_length = headers.get("content-length") or headers.get("Content-Length")
+            content_length = (
+                int(raw_length)
+                if isinstance(raw_length, (str, int))
+                else None
+            )
+        except (TypeError, ValueError):
+            content_length = None
+    if content_length is not None and content_length > limit:
+        _close_response(response)
+        raise RuntimeError(f"{label} response exceeds {limit} bytes")
+
+    try:
+        iter_bytes = getattr(response, "iter_bytes", None)
+        iter_content = getattr(response, "iter_content", None)
+        if _response_has_explicit_iter_bytes(response):
+            iterator = iter_bytes(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
+        elif _response_has_explicit_stream(response):
+            iterator = iter_content(chunk_size=TTS_RESPONSE_BODY_CHUNK_BYTES)
+        else:
+            content = vars(response).get(
+                "content", getattr(type(response), "content", None)
+            )
+            if isinstance(content, str):
+                content = content.encode("utf-8", errors="replace")
+            iterator = (
+                iter((bytes(content),))
+                if isinstance(content, (bytes, bytearray))
+                else None
+            )
+
+        if iterator is None:
+            stream_to_file = getattr(response, "stream_to_file", None)
+            if not callable(stream_to_file):
+                raise RuntimeError(f"{label} response is not streamable")
+            _raise_if_cancelled()
+            stream_to_file(str(partial))
+            _raise_if_cancelled()
+            total = partial.stat().st_size
+            if total > limit:
+                raise RuntimeError(f"{label} response exceeds {limit} bytes")
+        else:
+            with partial.open("wb") as output:
+                for chunk in iterator:
+                    _raise_if_cancelled()
+                    if not chunk:
+                        continue
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8", errors="replace")
+                    chunk = bytes(chunk)
+                    total += len(chunk)
+                    if total > limit:
+                        raise RuntimeError(f"{label} response exceeds {limit} bytes")
+                    output.write(chunk)
+
+        _raise_if_cancelled()
+        os.replace(partial, target)
+    except Exception:
+        try:
+            partial.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        _close_response(response)
 
 # Final fallback when provider isn't recognised at all.
 FALLBACK_MAX_TEXT_LENGTH = 4000
@@ -466,6 +617,13 @@ def _resolve_max_text_length(
 # ===========================================================================
 # Config loader -- reads tts: section from ~/.hermes/config.yaml
 # ===========================================================================
+def _gateway_is_explicitly_disabled(tts_config: Dict[str, Any]) -> bool:
+    value = tts_config.get("use_gateway")
+    return value is False or (
+        isinstance(value, str) and value.strip().lower() == "false"
+    )
+
+
 def _load_tts_config() -> Dict[str, Any]:
     """
     Load TTS configuration from ~/.hermes/config.yaml.
@@ -474,9 +632,44 @@ def _load_tts_config() -> Dict[str, Any]:
     for any missing fields.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config, read_raw_config
+        from hermes_cli.managed_scope import load_managed_config
         config = load_config()
-        return config.get("tts") or {}
+        tts_config = config.get("tts") or {}
+        if not isinstance(tts_config, dict):
+            return {}
+        # load_config deep-merges DEFAULT_CONFIG, whose provider is "edge".
+        # Preserve whether that value actually came from the user's file so a
+        # Zettlab session can replace only the default—not an explicit choice.
+        raw_config = read_raw_config()
+        raw_tts = raw_config.get("tts") if isinstance(raw_config, dict) else None
+        raw_provider = raw_tts.get("provider") if isinstance(raw_tts, dict) else None
+        # The provider picker writes ``use_gateway: false`` together with a
+        # direct provider choice. ``save_config`` may then strip
+        # ``provider: edge`` because Edge is the schema default, but it keeps
+        # this non-default opt-out. Treat it as explicit intent only when the
+        # effective config still contains the same opt-out; a managed override
+        # must continue to win.
+        raw_gateway_opt_out = (
+            _gateway_is_explicitly_disabled(raw_tts)
+            if isinstance(raw_tts, dict)
+            else False
+        )
+        effective_gateway_opt_out = _gateway_is_explicitly_disabled(tts_config)
+        managed_config = load_managed_config()
+        managed_tts = (
+            managed_config.get("tts") if isinstance(managed_config, dict) else None
+        )
+        managed_provider = (
+            managed_tts.get("provider") if isinstance(managed_tts, dict) else None
+        )
+        provider_is_explicit = any(
+            isinstance(value, str) and value.strip()
+            for value in (raw_provider, managed_provider)
+        ) or (raw_gateway_opt_out and effective_gateway_opt_out)
+        if not provider_is_explicit:
+            tts_config["_provider_is_default"] = True
+        return tts_config
     except ImportError:
         logger.debug("hermes_cli.config not available, using default TTS config")
         return {}
@@ -486,13 +679,110 @@ def _load_tts_config() -> Dict[str, Any]:
 
 
 def _get_provider(tts_config: Dict[str, Any]) -> str:
-    """Get the explicitly configured TTS provider or the free default.
+    """Get the explicitly configured TTS provider or the environment default.
 
     Inference credentials do not imply consent to paid speech generation.
-    Users opt into cloud TTS by setting ``tts.provider`` (normally through
-    ``hermes tools``); otherwise the historical Edge backend remains active.
+    A Zettlab device is different: local-server injects a per-agent capability
+    specifically for managed tools, so an otherwise-unconfigured built-in TTS
+    uses that product path. Explicit user configuration always wins; outside a
+    Zettlab session the historical free Edge backend remains active.
     """
-    return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+    configured = tts_config.get("provider")
+    provider_is_default = tts_config.get("_provider_is_default") is True
+    if configured and not provider_is_default:
+        return str(configured).lower().strip()
+    if resolve_zettlab_tool_gateway("zettlab-tts") is not None:
+        openai_cfg = _get_provider_section(tts_config, "openai")
+        if (
+            _resolved_tts_secret(openai_cfg.get("api_key"))
+            or _resolve_profile_openai_audio_api_key()
+        ):
+            return "openai"
+        if _plugin_tts_provider_is_registered("zettlab"):
+            return "zettlab"
+    return str(configured or DEFAULT_PROVIDER).lower().strip()
+
+
+def _resolved_tts_secret(value: Any) -> str:
+    """Return a concrete credential, rejecting unresolved config refs."""
+    resolved = str(value or "").strip()
+    if re.search(r"\${[^}]+}", resolved):
+        return ""
+    return resolved
+
+
+def _plugin_tts_provider_is_registered(name: str) -> bool:
+    """Return whether plugin discovery registered an enabled TTS backend."""
+    try:
+        from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        return (
+            _plugin_tts_provider_is_enabled_for_profile(name)
+            and get_provider(name) is not None
+        )
+    except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
+        logger.debug("tts plugin registration check failed for '%s': %s", name, exc)
+        return False
+
+
+def _plugin_tts_provider_is_enabled_for_profile(name: str) -> bool:
+    """Apply the active profile's plugin policy at dispatch.
+
+    TTS providers are registered process-wide, while a multiplexed worker's
+    config and secret scope are profile-local. Rechecking the deny-list and,
+    for non-bundled plugins, the allow-list prevents one profile from reusing
+    a backend that another profile caused to be registered during startup.
+    """
+    key = str(name or "").strip().lower()
+    if not key:
+        return False
+    try:
+        from hermes_cli.plugins import (
+            _ensure_plugins_discovered,
+            _get_disabled_plugins,
+            _get_enabled_plugins,
+        )
+
+        disabled = _get_disabled_plugins()
+        if key in disabled or f"tts/{key}" in disabled:
+            return False
+
+        manager = _ensure_plugins_discovered()
+        plugin_info = None
+        if manager is not None:
+            plugin_info = next(
+                (
+                    info
+                    for info in manager.list_plugins()
+                    if info.get("key") == f"tts/{key}"
+                ),
+                None,
+            )
+        if plugin_info is None:
+            # Direct registry users predate disk-plugin manifests. Preserve
+            # that public registry behavior; production disk plugins always
+            # have manager metadata and take the policy path below.
+            return True
+        if not plugin_info.get("enabled"):
+            return False
+        if plugin_info.get("source") == "bundled":
+            return True
+
+        enabled = _get_enabled_plugins()
+        plugin_key = str(plugin_info.get("key") or "").strip()
+        plugin_name = str(plugin_info.get("name") or "").strip()
+        return enabled is not None and (
+            plugin_key in enabled or plugin_name in enabled
+        )
+    except Exception as exc:  # noqa: BLE001 — unreadable policy fails closed
+        logger.warning(
+            "tts plugin policy check failed for '%s': %s",
+            key,
+            exc,
+        )
+        return False
 
 
 @dataclass(frozen=True)
@@ -731,7 +1021,7 @@ def _dispatch_to_plugin_provider(
        a refactor of the caller can't silently break the invariant.
     3. Plugin dispatch fires only when ``provider`` matches a registered
        :class:`TTSProvider` whose ``name`` equals the configured value.
-       Unknown names return None (caller falls through to Edge default).
+       Unknown names return None for the caller's existing fallback policy.
 
     Plugin exceptions are caught and re-raised — the outer
     ``text_to_speech_tool`` try/except converts them to the standard
@@ -741,6 +1031,8 @@ def _dispatch_to_plugin_provider(
         return None
     key = provider.lower().strip()
     if key in BUILTIN_TTS_PROVIDERS:
+        return None
+    if not _plugin_tts_provider_is_enabled_for_profile(key):
         return None
     # Defense in depth: command-provider check should already have
     # short-circuited the caller. If a same-name command config exists,
@@ -774,11 +1066,10 @@ def _dispatch_to_plugin_provider(
     voice = tts_config.get("voice") if isinstance(tts_config, dict) else None
     model = tts_config.get("model") if isinstance(tts_config, dict) else None
     speed = tts_config.get("speed") if isinstance(tts_config, dict) else None
-    fmt = (
-        tts_config.get("output_format", DEFAULT_COMMAND_TTS_OUTPUT_FORMAT)
-        if isinstance(tts_config, dict)
-        else DEFAULT_COMMAND_TTS_OUTPUT_FORMAT
+    configured_format = (
+        tts_config.get("output_format") if isinstance(tts_config, dict) else None
     )
+    fmt = configured_format or _tts_response_format_from_path(output_path)
 
     logger.info(
         "Generating speech with plugin TTS provider '%s'...", key,
@@ -809,9 +1100,13 @@ def _plugin_provider_is_voice_compatible(provider: str) -> bool:
     key = provider.lower().strip()
     if key in BUILTIN_TTS_PROVIDERS:
         return False
+    if not _plugin_tts_provider_is_enabled_for_profile(key):
+        return False
     try:
         from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
 
+        _ensure_plugins_discovered()
         plugin_provider = get_provider(key)
         if plugin_provider is None:
             return False
@@ -1467,6 +1762,10 @@ def _generate_openai_tts(
     voice: Optional[str] = None,
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
+    stream_response: bool = False,
+    client_kwargs: Optional[Dict[str, Any]] = None,
+    label: str = "OpenAI TTS",
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     """Generate audio via the OpenAI ``audio.speech.create`` SDK shape.
 
@@ -1492,60 +1791,106 @@ def _generate_openai_tts(
             truthy; omitted otherwise so ``tts-1``/``tts-1-hd`` and strict
             OpenAI-compatible servers that reject unknown kwargs are
             unaffected.
+        stream_response: Use the SDK streaming response context so the bounded
+            file sink sees bytes as they arrive.
+        client_kwargs: Optional already-resolved OpenAI client transport args.
+        label: Provider label used in bounded-response errors.
+        cancel_event: Internal conversational cancellation signal. When set,
+            close the active transport so a barge-in does not leave a managed
+            request running until its read timeout.
 
     Returns:
         Path to the saved audio file.
     """
+    # ``tts.openai: null`` in YAML yields None — coalesce so .get() is safe.
+    oai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
+    config_base_url = oai_config.get("base_url")
+
     # Only resolve the OpenAI auth chain when the caller didn't pass explicit
     # credentials. OpenAI-compatible backends (DeepInfra) pass api_key /
     # base_url / model / voice through and never hit the managed-gateway path.
+    # The resolver keeps credentials and endpoints paired. An explicit caller
+    # (for example DeepInfra or the Zettlab plugin) passes both arguments and
+    # skips this path; profile config still honors ``use_gateway: true`` over
+    # stale direct credentials and endpoints left by a previous selection.
     fallback_base: Optional[str] = None
     is_managed = False
     explicit_base_url = base_url is not None
     if api_key is None:
-        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
+        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config(
+            tts_config
+        )
 
-    # ``tts.openai: null`` in YAML yields None — coalesce so .get() is safe.
-    oai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
     if model is None:
         model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
     if voice is None:
         voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
-    config_base_url = oai_config.get("base_url")
     if base_url is None:
-        # Config override wins over the auth-chain fallback (restores the
-        # pre-refactor precedence, where tts.openai.base_url beat the resolved
-        # default); the auth-chain value is the last-resort default. An
-        # explicit base_url arg from an OpenAI-compatible caller (DeepInfra)
-        # skips this block entirely and always wins.
-        base_url = config_base_url or fallback_base or DEFAULT_OPENAI_BASE_URL
+        # Managed credentials must stay paired with the managed endpoint.
+        # Direct resolution already folds config/env base URLs into fallback.
+        base_url = fallback_base or config_base_url or DEFAULT_OPENAI_BASE_URL
     if speed is None:
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
     language = oai_config.get("language")
 
-    # The managed OpenAI audio gateway only proxies MANAGED_OPENAI_TTS_MODELS.
-    # A model set for direct OpenAI (e.g. "tts-1-hd") 400s there with
-    # "Unsupported managed OpenAI speech model", so coerce it — unless the user
-    # redirected base_url to their own endpoint, in which case respect it.
+    managed_model = DEFAULT_OPENAI_MODEL if is_managed else None
+    managed_contract_active = bool(is_managed and not explicit_base_url)
+    # Managed gateways expose one product model. A model set for direct OpenAI
+    # would be rejected there, so coerce it unless the user explicitly
+    # redirected base_url to their own endpoint.
     if (
-        is_managed
-        and not explicit_base_url
-        and not config_base_url
-        and model not in MANAGED_OPENAI_TTS_MODELS
+        managed_contract_active
+        and model != managed_model
     ):
         logger.warning(
-            "TTS: managed OpenAI audio gateway does not support model %r; "
-            "falling back to %s. Set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY "
-            "to use %r directly.",
-            model, DEFAULT_OPENAI_MODEL, model,
+            "TTS: managed audio gateway requires model %r; replacing %r",
+            managed_model, model,
         )
-        model = DEFAULT_OPENAI_MODEL
-
+        model = managed_model
     response_format = _tts_response_format_from_path(output_path)
 
     OpenAIClient = _import_openai_client()
-    client = OpenAIClient(api_key=api_key, base_url=base_url)
+    client = OpenAIClient(api_key=api_key, base_url=base_url, **(client_kwargs or {}))
+    close_lock = threading.Lock()
+    close_complete = False
+    cancel_watch_done = threading.Event()
+
+    def _close_client_once() -> None:
+        nonlocal close_complete
+        with close_lock:
+            if close_complete:
+                return
+            close_complete = True
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    cancel_watcher: Optional[threading.Thread] = None
+    if cancel_event is not None:
+        if cancel_event.is_set():
+            _close_client_once()
+            raise RuntimeError(f"{label} request cancelled")
+
+        def _close_on_cancel() -> None:
+            while not cancel_watch_done.wait(0.05):
+                if cancel_event.is_set():
+                    try:
+                        _close_client_once()
+                    except Exception:
+                        logger.debug(
+                            "%s client close failed during cancellation",
+                            label,
+                            exc_info=True,
+                        )
+                    return
+
+        cancel_watcher = threading.Thread(
+            target=_close_on_cancel,
+            name="tts-openai-cancel",
+            daemon=True,
+        )
+        cancel_watcher.start()
     try:
         create_kwargs: Dict[str, Any] = {
             "model": model,
@@ -1560,14 +1905,33 @@ def _generate_openai_tts(
             create_kwargs["instructions"] = instructions
         if language:
             create_kwargs["extra_body"] = {"lang_code": language}
-        response = client.audio.speech.create(**create_kwargs)
-
-        response.stream_to_file(output_path)
+        if managed_contract_active or stream_response:
+            # ``audio.speech.create`` may eagerly buffer the entire binary
+            # response before our bounded file sink sees it. Managed audio
+            # must use the SDK's streaming response so the 16 MiB limit is
+            # enforced while bytes arrive from local-server.
+            with client.audio.speech.with_streaming_response.create(
+                **create_kwargs
+            ) as response:
+                _write_tts_response_to_file(
+                    response,
+                    output_path,
+                    label=label,
+                    cancel_event=cancel_event,
+                )
+        else:
+            response = client.audio.speech.create(**create_kwargs)
+            # Preserve the direct-provider contract. The bounded atomic sink
+            # is a managed-gateway guard; applying its 16 MiB product limit to
+            # a user's direct OpenAI-compatible endpoint would be an unrelated
+            # behavior change.
+            response.stream_to_file(output_path)
         return output_path
     finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()
+        cancel_watch_done.set()
+        _close_client_once()
+        if cancel_watcher is not None:
+            cancel_watcher.join(timeout=0.2)
 
 
 # ===========================================================================
@@ -2794,11 +3158,14 @@ def text_to_speech_tool(
 
     On messaging platforms, the returned MEDIA:<path> tag is intercepted
     by the send pipeline and delivered as a native voice message.
-    In CLI mode, the file is saved to ~/voice-memos/.
+    In managed Zettlab mode, the file is saved to the current Agent session's
+    product output directory. Other platforms keep the Hermes audio cache.
 
     Args:
         text: The text to convert to speech.
-        output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
+        output_path: Optional custom save path. Managed Zettlab sessions default
+            to the current Agent output bucket; other platforms use the Hermes
+            audio cache.
         speed: Optional playback speed multiplier (0.25-4.0). Overrides config.yaml.
         instructions: Optional voice-design guidance (tone, emotion, pacing,
             accent, whispering). Forwarded to the OpenAI backend
@@ -2907,14 +3274,19 @@ def text_to_speech_tool(
             }, ensure_ascii=False)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir = _default_output_dir_for_session(platform=platform)
+        except RuntimeError as exc:
+            return tool_error(f"TTS output unavailable: {exc}", success=False)
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and (
+            provider in {"openai", "elevenlabs", "mistral", "gemini"}
+            or _plugin_provider_is_voice_compatible(provider)
+        ):
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -2934,19 +3306,20 @@ def text_to_speech_tool(
             )
 
         # Plugin-registered TTS backend (issue #30398). Fires when the
-        # configured provider is neither a built-in nor a command-type
-        # entry, AND a plugin is registered under that name. The walrus
-        # binds `_plugin_path` only when the dispatcher returns a path
-        # (i.e. a plugin was actually found); a None return falls
-        # through to the built-in elif chain so unknown names hit the
-        # Edge TTS default at the bottom. The dispatcher itself enforces
-        # built-ins-always-win + command-wins-over-plugin defensively.
+        # configured provider is neither a built-in nor a command-type entry,
+        # and a plugin is registered under that name. Preserve the historical
+        # unknown-provider fallback below; only the bundled managed provider
+        # is fail-closed because silently routing it elsewhere would violate
+        # the Zettlab capability contract.
         elif provider not in BUILTIN_TTS_PROVIDERS and (
             _plugin_path := _dispatch_to_plugin_provider(
                 text, file_str, provider, tts_config,
             )
         ) is not None:
             file_str = _plugin_path
+
+        elif provider == "zettlab":
+            raise ValueError("Zettlab TTS provider is not registered or available")
 
         elif provider == "elevenlabs":
             try:
@@ -3106,7 +3479,7 @@ def text_to_speech_tool(
             # (mirrors the command-provider opt-in). Plugins that
             # already write Opus skip the ffmpeg conversion.
             plugin_voice_compatible = _plugin_provider_is_voice_compatible(provider)
-            if plugin_voice_compatible:
+            if want_opus and plugin_voice_compatible:
                 if not file_str.endswith(".ogg"):
                     opus_path = _convert_to_opus(file_str)
                     if opus_path:
@@ -3190,7 +3563,7 @@ def check_tts_requirements() -> bool:
             _import_openai_client()
         except ImportError:
             return False
-        return _has_openai_audio_backend()
+        return _has_openai_audio_backend(tts_config)
     if provider == "deepinfra":
         try:
             _import_openai_client()
@@ -3232,6 +3605,8 @@ def check_tts_requirements() -> bool:
         from agent.tts_registry import get_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
+        if not _plugin_tts_provider_is_enabled_for_profile(provider):
+            return False
         _ensure_plugins_discovered()
         plugin = get_provider(provider)
         return bool(plugin and plugin.is_available())
@@ -3239,30 +3614,53 @@ def check_tts_requirements() -> bool:
         return False
 
 
-def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
-    """Return ``(api_key, base_url, is_managed)`` for the OpenAI audio client.
+check_tts_requirements._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
-    ``is_managed`` is True when the config resolves to the Nous managed audio
-    gateway (a restricted proxy), so callers can coerce the request to what the
-    gateway supports. When ``tts.use_gateway`` is set the gateway is preferred
-    even if direct OpenAI credentials are present.
 
-    Resolution order (mirrors the STT resolver):
-    1. ``tts.openai.api_key`` / ``tts.openai.base_url`` from ``config.yaml``
-    2. ``VOICE_TOOLS_OPENAI_KEY`` / ``OPENAI_API_KEY`` environment variables
-       (still honoring ``tts.openai.base_url`` when set)
-    3. Managed OpenAI audio tool gateway
+def _resolve_openai_audio_client_config(
+    tts_config: Optional[Dict[str, Any]] = None,
+) -> tuple[str, str, bool]:
+    """Return ``(api_key, base_url, is_managed)`` for OpenAI audio.
+
+    Preserve upstream's config/env/credential-pool resolution before falling
+    back to the Nous managed audio gateway. Zettlab is a separate TTS provider
+    and never enters this resolver.
     """
-    tts_config = _load_tts_config()
-    openai_cfg = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
-    cfg_api_key = openai_cfg.get("api_key") or ""
-    cfg_base_url = openai_cfg.get("base_url") or ""
-    if cfg_api_key and not prefers_gateway("tts"):
-        return cfg_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+    if tts_config is None:
+        tts_config = _load_tts_config()
+    openai_cfg = (
+        tts_config.get("openai") if isinstance(tts_config, dict) else None
+    ) or {}
+    cfg_api_key = _resolved_tts_secret(openai_cfg.get("api_key"))
+    cfg_base_url = str(openai_cfg.get("base_url") or "").strip()
+    direct_api_key = _resolve_profile_openai_audio_api_key()
+    raw_gateway_preference = tts_config.get("use_gateway")
+    gateway_preferred = (
+        prefers_gateway("tts")
+        if raw_gateway_preference is None
+        else is_truthy_value(raw_gateway_preference, default=False)
+    )
 
-    direct_api_key = resolve_openai_audio_api_key()
-    if direct_api_key and not prefers_gateway("tts"):
-        return direct_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+    def direct_base_url() -> str:
+        # OPENAI_BASE_URL remains part of the direct OpenAI-compatible TTS
+        # contract. ``get_env_value`` is profile-scoped under multiplexing,
+        # so this cannot borrow another profile's endpoint.
+        env_base_url = str(get_env_value("OPENAI_BASE_URL") or "").strip()
+        return cfg_base_url or env_base_url or DEFAULT_OPENAI_BASE_URL
+
+    if _gateway_is_explicitly_disabled(tts_config):
+        selected_key = cfg_api_key or direct_api_key
+        if selected_key:
+            return selected_key, direct_base_url(), False
+        raise ValueError(
+            "Neither tts.openai.api_key in config nor "
+            "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
+        )
+
+    if cfg_api_key and not gateway_preferred:
+        return cfg_api_key, direct_base_url(), False
+    if direct_api_key and not gateway_preferred:
+        return direct_api_key, direct_base_url(), False
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:
@@ -3270,7 +3668,7 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
             "Neither tts.openai.api_key in config nor "
             "VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
         )
-        if managed_nous_tools_enabled() or prefers_gateway("tts"):
+        if managed_nous_tools_enabled() or gateway_preferred:
             message += (
                 ". "
                 + nous_tool_gateway_unavailable_message(
@@ -3286,12 +3684,13 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
     )
 
 
-def _has_openai_audio_backend() -> bool:
-    """Return True when OpenAI audio can use config/env credentials or the managed gateway."""
-    openai_cfg = (_load_tts_config().get("openai") or {})
-    if openai_cfg.get("api_key"):
+def _has_openai_audio_backend(tts_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether the same credential path used by OpenAI TTS can run."""
+    try:
+        _resolve_openai_audio_client_config(tts_config)
         return True
-    return bool(resolve_openai_audio_api_key() or resolve_managed_tool_gateway("openai-audio"))
+    except Exception:
+        return False
 
 
 # ===========================================================================
@@ -3349,6 +3748,22 @@ def _strip_markdown_for_tts(text: str) -> str:
     return text.strip()
 
 
+@dataclass(frozen=True)
+class _SyncAudioArtifact:
+    path: str
+    directory: str
+
+    def cleanup(self) -> None:
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(self.directory)
+        except OSError:
+            pass
+
+
 class _SyncSentencePipeline:
     """Overlap per-sentence synthesis with playback for non-streaming providers.
 
@@ -3390,7 +3805,14 @@ class _SyncSentencePipeline:
         """Queue one sentence. Blocks only when the lookahead bound is full."""
         if self._stop.is_set():
             return
-        future = self._executor.submit(self._synthesize_to_tmp, cleaned)
+        # ThreadPoolExecutor does not inherit ContextVars. Capture the active
+        # profile secret/session scope for each queued sentence.
+        context = copy_context()
+        future = self._executor.submit(
+            context.run,
+            self._synthesize_to_tmp,
+            cleaned,
+        )
         self._queue.put((cleaned, future))
 
     def close(self) -> None:
@@ -3399,22 +3821,194 @@ class _SyncSentencePipeline:
         self._player.join()
         self._executor.shutdown(wait=True)
 
-    def _synthesize_to_tmp(self, cleaned: str) -> Optional[str]:
-        if self._stop.is_set():
-            return None
-        tmp_path = None
+    @staticmethod
+    def _cleanup_private_temp_dir(
+        path: Optional[str],
+        expected_dir_stat: Optional[os.stat_result],
+        dir_fd: int,
+        known_paths: tuple[Optional[str], ...],
+    ) -> None:
+        """Remove only known entries from the directory inode we created."""
+        if not path or expected_dir_stat is None:
+            return
+
+        expected_identity = (expected_dir_stat.st_dev, expected_dir_stat.st_ino)
+
+        def _path_is_owned() -> bool:
+            try:
+                current = os.lstat(path)
+            except OSError:
+                return False
+            return stat.S_ISDIR(current.st_mode) and (
+                current.st_dev,
+                current.st_ino,
+            ) == expected_identity
+
+        names = {
+            os.path.basename(candidate)
+            for candidate in known_paths
+            if candidate and os.path.basename(candidate) not in {"", ".", ".."}
+        }
+        use_dir_fd = dir_fd >= 0 and all(
+            operation in os.supports_dir_fd
+            for operation in (os.stat, os.unlink, os.rmdir)
+        ) and os.stat in os.supports_follow_symlinks
         try:
-            fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            text_to_speech_tool(text=cleaned, output_path=tmp_path)
-            return tmp_path
-        except Exception as exc:
-            logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
-            if tmp_path:
+            for name in names:
                 try:
-                    os.unlink(tmp_path)
+                    if use_dir_fd:
+                        entry_stat = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                        if stat.S_ISDIR(entry_stat.st_mode):
+                            os.rmdir(name, dir_fd=dir_fd)
+                        else:
+                            os.unlink(name, dir_fd=dir_fd)
+                    else:
+                        if not _path_is_owned():
+                            return
+                        entry_path = os.path.join(path, name)
+                        entry_stat = os.lstat(entry_path)
+                        if stat.S_ISDIR(entry_stat.st_mode):
+                            os.rmdir(entry_path)
+                        else:
+                            os.unlink(entry_path)
                 except OSError:
                     pass
+        finally:
+            if dir_fd >= 0:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
+
+        # Never recurse through the mutable root path. Remove it only if it is
+        # still the exact directory inode we created and our known entries left
+        # it empty. An identity mismatch is deliberately leaked, not deleted.
+        if _path_is_owned():
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+
+    def _synthesize_to_tmp(self, cleaned: str) -> Optional[_SyncAudioArtifact]:
+        if self._stop.is_set():
+            return None
+        synthesis_dir = None
+        synthesis_dir_stat = None
+        synthesis_dir_fd = -1
+        tmp_path = None
+        owned_output_path = None
+        playback_dir = None
+        playback_path = None
+        try:
+            synthesis_dir = tempfile.mkdtemp(prefix="hermes-tts-synthesis-")
+            synthesis_dir_stat = os.lstat(synthesis_dir)
+            directory_flags = os.O_RDONLY
+            directory_flags |= getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                opened_dir_fd = os.open(synthesis_dir, directory_flags)
+                try:
+                    synthesis_dir_stat = os.fstat(opened_dir_fd)
+                    synthesis_dir_fd = opened_dir_fd
+                except OSError:
+                    os.close(opened_dir_fd)
+                    raise
+            except OSError:
+                synthesis_dir_fd = -1
+            fd, tmp_path = tempfile.mkstemp(dir=synthesis_dir, suffix=".mp3")
+            os.close(fd)
+            tmp_real_path = Path(os.path.realpath(tmp_path))
+            cancel_token = _TTS_CANCEL_EVENT.set(self._stop)
+            try:
+                raw_result = text_to_speech_tool(
+                    text=cleaned,
+                    output_path=tmp_path,
+                )
+            finally:
+                _TTS_CANCEL_EVENT.reset(cancel_token)
+            try:
+                result = json.loads(raw_result)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("TTS tool returned an invalid result") from exc
+            if not isinstance(result, dict) or result.get("success") is not True:
+                error = result.get("error") if isinstance(result, dict) else None
+                raise RuntimeError(error or "TTS tool reported synthesis failure")
+
+            output_path = result.get("file_path")
+            if not isinstance(output_path, str) or not output_path:
+                raise RuntimeError("TTS tool returned no output path")
+
+            output = Path(output_path)
+            output_owned_path = Path(os.path.realpath(output.parent)) / output.name
+            same_path = os.path.normcase(str(output_owned_path)) == os.path.normcase(
+                str(tmp_real_path)
+            )
+            same_stem_output = (
+                os.path.normcase(str(output_owned_path.parent))
+                == os.path.normcase(str(tmp_real_path.parent))
+                and os.path.normcase(output_owned_path.stem)
+                == os.path.normcase(tmp_real_path.stem)
+                and output_owned_path.suffix.lower().lstrip(".")
+                in COMMAND_TTS_OUTPUT_FORMATS
+            )
+            if not same_path and not same_stem_output:
+                raise RuntimeError("TTS tool returned an unowned output path")
+
+            owned_output_path = str(output_owned_path)
+            source_stat = os.lstat(owned_output_path)
+            if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size <= 0:
+                raise RuntimeError("TTS tool returned an invalid output file")
+
+            open_flags = os.O_RDONLY
+            open_flags |= getattr(os, "O_BINARY", 0)
+            open_flags |= getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(owned_output_path, open_flags)
+            try:
+                opened_stat = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or (opened_stat.st_dev, opened_stat.st_ino)
+                    != (source_stat.st_dev, source_stat.st_ino)
+                ):
+                    raise RuntimeError("TTS output changed during validation")
+
+                playback_dir = tempfile.mkdtemp(prefix="hermes-tts-playback-")
+                playback_fd, playback_path = tempfile.mkstemp(
+                    dir=playback_dir,
+                    suffix=output_owned_path.suffix.lower(),
+                )
+                try:
+                    with os.fdopen(source_fd, "rb") as source:
+                        source_fd = -1
+                        with os.fdopen(playback_fd, "wb") as playback:
+                            playback_fd = -1
+                            shutil.copyfileobj(source, playback)
+                finally:
+                    if playback_fd >= 0:
+                        os.close(playback_fd)
+            finally:
+                if source_fd >= 0:
+                    os.close(source_fd)
+
+            self._cleanup_private_temp_dir(
+                synthesis_dir,
+                synthesis_dir_stat,
+                synthesis_dir_fd,
+                (tmp_path, owned_output_path),
+            )
+            synthesis_dir_fd = -1
+            return _SyncAudioArtifact(playback_path, playback_dir)
+        except Exception as exc:
+            logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
+            self._cleanup_private_temp_dir(
+                synthesis_dir,
+                synthesis_dir_stat,
+                synthesis_dir_fd,
+                (tmp_path, owned_output_path),
+            )
+            synthesis_dir_fd = -1
+            if playback_path or playback_dir:
+                _SyncAudioArtifact(playback_path or "", playback_dir or "").cleanup()
             return None
 
     def _drain(self) -> None:
@@ -3423,22 +4017,19 @@ class _SyncSentencePipeline:
             if item is None:
                 return
             _sentence, future = item
-            tmp_path = None
+            artifact = None
             try:
-                tmp_path = future.result()
-                if (tmp_path and not self._stop.is_set()
-                        and os.path.isfile(tmp_path)
-                        and os.path.getsize(tmp_path) > 0):
+                artifact = future.result()
+                if (artifact and not self._stop.is_set()
+                        and os.path.isfile(artifact.path)
+                        and os.path.getsize(artifact.path) > 0):
                     from tools.voice_mode import play_audio_file
-                    play_audio_file(tmp_path)
+                    play_audio_file(artifact.path)
             except Exception as exc:
                 logger.warning("Sync per-sentence TTS failed: %s", exc)
             finally:
-                if tmp_path:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+                if artifact:
+                    artifact.cleanup()
 
 
 def stream_tts_to_speaker(
@@ -3710,9 +4301,10 @@ def stream_tts_to_speaker(
             _prefetch_sem.acquire()
             chunk_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=_CHUNK_QUEUE_MAX)
             _audio_queue.put(chunk_queue)
+            context = copy_context()
             t = threading.Thread(
-                target=_consume_to_queue,
-                args=(audio_iter, chunk_queue),
+                target=context.run,
+                args=(_consume_to_queue, audio_iter, chunk_queue),
                 daemon=True,
             )
             _prefetch_threads.append(t)
@@ -3882,7 +4474,7 @@ if __name__ == "__main__":
     print(f"  OpenAI:     {'installed' if _check(_import_openai_client, 'oai') else 'not installed'}")
     print(
         "    API Key:  "
-        f"{'set' if resolve_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
+        f"{'set' if _resolve_profile_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
     )
     config = _load_tts_config()
     try:
@@ -3919,7 +4511,12 @@ TTS_SCHEMA = {
             },
             "output_path": {
                 "type": "string",
-                "description": f"Optional custom file path to save the audio. Defaults to {display_hermes_home()}/audio_cache/<timestamp>.mp3"
+                "description": (
+                    "Optional custom file path to save the audio. Managed "
+                    "Zettlab sessions default to the current Agent's product "
+                    "output bucket; other platforms default to "
+                    f"{display_hermes_home()}/audio_cache/<timestamp>.mp3"
+                )
             },
             "speed": {
                 "type": "number",
