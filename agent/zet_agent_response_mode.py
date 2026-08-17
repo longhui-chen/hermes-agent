@@ -1580,12 +1580,32 @@ def _normalized_memory_payload(
     *,
     inferred_target: str | None = None,
 ) -> dict[str, Any] | None:
-    """Canonicalize the memory schema or an exact helper-operation copy."""
+    """Canonicalize either official memory-tool shape.
+
+    The built-in memory tool accepts both a batch ``operations`` shape and a
+    single-operation ``action`` shape.  The resolver always returns a batch,
+    so both forms are reduced to the same canonical representation before
+    authorization.  Missing targets are only filled by the exact helper
+    operation authorization passed by the caller.
+    """
     fields = set(function_args)
-    if fields not in ({"operations", "target"}, {"operations"}):
+    if "operations" in fields:
+        if fields - {"operations", "target"}:
+            return None
+        raw_operations = function_args.get("operations")
+    elif "action" in fields:
+        if fields - {"action", "content", "old_text", "target"}:
+            return None
+        raw_operations = [
+            {
+                field: function_args[field]
+                for field in ("action", "content", "old_text")
+                if field in function_args
+            }
+        ]
+    else:
         return None
-    operations = function_args.get("operations")
-    if not isinstance(operations, list) or not 1 <= len(operations) <= 4:
+    if not isinstance(raw_operations, list) or not 1 <= len(raw_operations) <= 4:
         return None
 
     has_top_level_target = "target" in function_args
@@ -1598,7 +1618,7 @@ def _normalized_memory_payload(
         target = inferred_target
 
     normalized_operations: list[dict[str, Any]] = []
-    for raw_operation in operations:
+    for raw_operation in raw_operations:
         if not isinstance(raw_operation, dict):
             return None
         operation = dict(raw_operation)
@@ -1664,7 +1684,23 @@ def _canonical_memory_shape_sha256(function_args: Mapping[str, Any]) -> str:
     This alias is used only with a target captured from that exact helper
     result; it is never sufficient on its own to authorize a write.
     """
-    operations = function_args.get("operations")
+    fields = set(function_args)
+    if "operations" in fields:
+        if fields - {"operations", "target"}:
+            return ""
+        operations = function_args.get("operations")
+    elif "action" in fields:
+        if fields - {"action", "content", "old_text", "target"}:
+            return ""
+        operations = [
+            {
+                field: function_args[field]
+                for field in ("action", "content", "old_text")
+                if field in function_args
+            }
+        ]
+    else:
+        return ""
     if not isinstance(operations, list):
         return ""
     stripped: list[dict[str, Any]] = []

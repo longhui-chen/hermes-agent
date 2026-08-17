@@ -446,6 +446,88 @@ def test_plan_success_replace_authorization_matches_copied_helper_shape():
     ) == frozenset({copied_digest})
 
 
+def test_plan_success_single_memory_operation_matches_helper_batch_shape():
+    content = (
+        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
+        '{"s":{"daily":{"p":{"st":"freestyle"}}},"v":1}\n'
+        "-->"
+    )
+    operation = {
+        "action": "replace",
+        "content": content,
+        "old_text": content,
+        "target": "memory",
+    }
+    terminal_result = {
+        "output": json.dumps(
+            {"ok": True, "operations": [operation]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    batch_args = {"operations": [operation]}
+    single_args = {
+        key: value for key, value in operation.items() if key != "operations"
+    }
+
+    digest = response_mode._canonical_memory_payload_sha256(batch_args)
+    assert response_mode._canonical_memory_payload_sha256(single_args) == digest
+    assert response_mode._memory_payload_hashes_from_terminal_result(
+        terminal_result
+    ) == frozenset({digest})
+    assert response_mode._memory_authorization_for_scope(
+        single_args,
+        response_mode._SkillDirectScope(
+            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+            task_sha256="task",
+            turn_identity=("turn", object()),
+            allowed_tools=frozenset({"memory"}),
+            memory_payload_sha256=frozenset({digest}),
+        ),
+    ) == (digest, "")
+
+
+def test_targetless_single_memory_operation_infers_only_helper_target():
+    operation = {
+        "action": "replace",
+        "content": "new preference",
+        "old_text": "old preference",
+        "target": "memory",
+    }
+    terminal_result = {
+        "output": json.dumps(
+            {"ok": True, "operations": [operation]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    targetless_args = {
+        key: value for key, value in operation.items() if key != "target"
+    }
+    digest = response_mode._canonical_memory_payload_sha256(
+        {"operations": [operation]}
+    )
+    scope = response_mode._SkillDirectScope(
+        relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+        task_sha256="task",
+        turn_identity=("turn", object()),
+        allowed_tools=frozenset({"memory"}),
+        memory_payload_sha256=frozenset({digest}),
+        memory_payload_shape_authorizations=(
+            response_mode._memory_payload_shape_authorizations_from_terminal_result(
+                terminal_result
+            )
+        ),
+    )
+
+    assert response_mode._memory_authorization_for_scope(
+        targetless_args, scope
+    ) == (digest, "memory")
+    assert response_mode._memory_authorization_for_scope(
+        {**targetless_args, "target": "user"}, scope
+    ) == ("", "")
+
+
 def test_targetless_memory_copy_is_bound_to_helper_target_and_exact_body():
     operation = {
         "action": "replace",
@@ -498,7 +580,7 @@ def test_targetless_memory_copy_is_bound_to_helper_target_and_exact_body():
     ) == ("", "")
 
 
-def test_trusted_video_plan_success_replace_commits_copied_helper_shape_flow(
+def test_trusted_video_plan_success_replace_commits_copied_single_operation_flow(
     monkeypatch,
     tmp_path,
 ):
@@ -597,18 +679,16 @@ def test_trusted_video_plan_success_replace_commits_copied_helper_shape_flow(
         )
         assert "memory" in response_mode.trusted_skill_allowed_tool_names(agent)
 
-        # Some providers copy the helper operation but silently omit target.
-        # The trusted scope must recover that target only from the exact
-        # helper result, rather than treating an unscoped memory write as safe.
+        # Some providers copy the helper operation into the official single-op
+        # memory shape but silently omit target. The trusted scope must recover
+        # that target only from the exact helper result, rather than treating
+        # an unscoped memory write as safe.
         targetless_operation = {
             key: value for key, value in helper_operation.items() if key != "target"
         }
         assistant_message = _tool_response(
             "memory",
-            json.dumps(
-                {"operations": [targetless_operation]},
-                ensure_ascii=False,
-            ),
+            json.dumps(targetless_operation, ensure_ascii=False),
         ).choices[0].message
         messages = []
         agent._execute_tool_calls_sequential(
