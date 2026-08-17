@@ -491,7 +491,11 @@ def _jobs_lock():
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id", "revision"})
+# ADIC v1: app_slug/import_operation are server-stamped at creation only
+# (see _validate_app_slug); update_job must reject any attempt to change
+# them regardless of caller, not just rely on the HTTP handler's allowlist
+# omitting them.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "revision", "app_slug", "import_operation"})
 
 
 class JobRevisionConflict(ValueError):
@@ -2126,6 +2130,57 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+# ADIC v1 (App Data Import Contract): local-server stamps these two fields on
+# a dedicated maintainer's cron job at provision time — never accepted from a
+# request body, never editable via update_job (see _IMMUTABLE_JOB_FIELDS
+# below) — so cron/scheduler.py's end-of-run verdict can tell an
+# import-serving job apart from an ordinary reminder/report job on the same
+# profile.
+#
+# Deliberately NOT the app-slug business format (local-server's
+# internal/apphost/slug.go slugPattern): the format rule belongs to whoever
+# creates apps, not to this storage layer. Duplicating it here would give the
+# contract two sources of truth — the moment local-server legitimately widens
+# its own rule, every job it provisions for a slug outside OUR copy of the
+# rule fails create_job with a 400, which fails the app's entire publish
+# transaction. Validate only what this layer actually needs as the field's
+# custodian: a safe, bounded opaque string that cannot corrupt jobs.json or
+# smuggle a path/newline into it. Same reasoning already applied to
+# import_operation not being pinned to the literal "data.import".
+_MAX_APP_SLUG_LENGTH = 128
+_MAX_IMPORT_OPERATION_LENGTH = 128
+
+
+def _validate_opaque_job_token(value: Any, *, field: str, max_length: int) -> Optional[str]:
+    """Safety-only bound for a server-stamped opaque string field: non-empty,
+    length-capped, no control characters (incl. newlines — jobs.json is
+    line-oriented JSON in places and logs embed this value verbatim), no path
+    separators (this value never becomes a filesystem path component today,
+    but a future caller treating it as one must not inherit a traversal
+    payload from here). Absent is fine; present-but-unsafe fails loudly
+    rather than silently creating a job that can never be judged."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    text = value.strip()
+    if not text or len(text) > max_length:
+        raise ValueError(f"{field} must be 1-{max_length} characters")
+    if any(ord(ch) < 0x20 for ch in text) or "/" in text or "\\" in text:
+        raise ValueError(f"{field} must not contain control characters or path separators")
+    return text
+
+
+def _validate_app_slug(value: Any) -> Optional[str]:
+    return _validate_opaque_job_token(value, field="app_slug", max_length=_MAX_APP_SLUG_LENGTH)
+
+
+def _validate_import_operation(value: Any) -> Optional[str]:
+    return _validate_opaque_job_token(
+        value, field="import_operation", max_length=_MAX_IMPORT_OPERATION_LENGTH
+    )
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -2202,6 +2257,8 @@ def create_job(
     timezone: Optional[str] = None,
     output_language: Optional[str] = None,
     source: Optional[str] = None,
+    app_slug: Optional[str] = None,
+    import_operation: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2249,6 +2306,11 @@ def create_job(
         output_language: Optional canonical BCP 47 language tag captured when
                          an LLM creates an agent job. Direct/legacy callers may
                          omit it; script-only jobs ignore it.
+        app_slug: ADIC v1 — server-stamped app slug for a dedicated
+                  maintainer's import-tracked cron job (see _validate_app_slug).
+                  Never accept this from a model or an end-user-facing caller.
+        import_operation: ADIC v1 — server-stamped operation name paired with
+                  app_slug (see _validate_import_operation).
 
     Returns:
         The created job dict
@@ -2304,6 +2366,8 @@ def create_job(
     # maintainer's refresh job). It is persisted verbatim so a gate can scope
     # itself to a specific job class instead of treating every job alike.
     normalized_source = str(source).strip() if isinstance(source, str) and str(source).strip() else None
+    normalized_app_slug = _validate_app_slug(app_slug)
+    normalized_import_operation = _validate_import_operation(import_operation)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -2407,6 +2471,10 @@ def create_job(
         job["output_language"] = normalized_output_language
     if normalized_source is not None:
         job["source"] = normalized_source
+    if normalized_app_slug is not None:
+        job["app_slug"] = normalized_app_slug
+    if normalized_import_operation is not None:
+        job["import_operation"] = normalized_import_operation
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)

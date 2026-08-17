@@ -353,6 +353,161 @@ def test_app_operation_requires_capability_digest_before_sending(monkeypatch):
     open_request.assert_not_called()
 
 
+# --- ADIC v1: turn-scoped data.import ledger ---------------------------------
+# app_host records EVERY app_operation outcome, tagged with its operation
+# name, into a bounded, turn-scoped ledger (gateway.session_context) that
+# cron/scheduler.py reads right before mark_job_run to judge success by
+# whether the app's own declared write operation actually landed this round,
+# not by whether the agent produced a plausible reply. See
+# zettlab-local-docs/app-fullstack/2026-08-17-应用数据导入契约-ADIC-v1.md §4.5
+# and the paired interface-freeze doc §7-8. Recording is deliberately NOT
+# filtered to the literal "data.import" here — local-server stamps
+# job["import_operation"] with the app's own declared mutation name (e.g.
+# "records.refresh" for a blueprint app), and cron/scheduler.py does the name
+# filtering at verdict time against that per-job value. A read call like
+# data.import_schema IS recorded (see the test below) — it is excluded from
+# the verdict purely because its name never matches any job's
+# import_operation, not because this layer special-cases read calls. The
+# call() two-layer status (tested above) is a completely separate code path
+# and must stay untouched.
+
+_IMPORT_ARGS = {
+    "action": "app_operation", "slug": "hangzhou-weather-live",
+    "app_operation": "data.import",
+    "payload": {"daily": [{"forecast_date": "2026-08-18"}]},
+    "capability_digest": "b" * 64,
+}
+
+
+def test_data_import_success_is_recorded_in_active_ledger(monkeypatch):
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _capture_urlopen({}, {"import_receipt": {"committed": True}}),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is True
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import", "ok": True, "error_code": "", "error_message": "",
+    }]
+
+
+def test_data_import_rejection_is_recorded_with_upstream_code(monkeypatch):
+    upstream = {"code": "import_rejected", "message": "湿度必须是 0-100 的整数"}
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _http_error(400, json.dumps(upstream).encode("utf-8")),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is False and out["error"]["code"] == "import_rejected"
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import", "ok": False, "error_code": "import_rejected",
+        "error_message": "湿度必须是 0-100 的整数",
+    }]
+
+
+def test_data_import_not_confirmed_is_recorded_with_upstream_code(monkeypatch):
+    """502 import_not_confirmed (2xx from the app but no valid receipt) must
+    be distinguishable from import_rejected in the ledger, per the interface
+    freeze's error-code table (§4)."""
+    upstream = {"code": "import_not_confirmed", "message": "app answered without a receipt"}
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _http_error(502, json.dumps(upstream).encode("utf-8")),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is False and out["error"]["code"] == "import_not_confirmed"
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger[0]["error_code"] == "import_not_confirmed"
+
+
+def test_data_import_schema_read_is_recorded_under_its_own_operation_name(monkeypatch):
+    """A read call (data.import_schema) IS recorded — this layer does not
+    special-case reads. It is kept out of a job's import verdict purely
+    because cron/scheduler.py filters the ledger by job["import_operation"],
+    and "data.import_schema" never equals that value. If this layer instead
+    pre-filtered by name, an app whose declared write operation isn't
+    literally "data.import" (e.g. "records.refresh") would never get
+    anything recorded and would fail every round — see the P0 this test
+    guards against in tests/cron/test_import_contract_verdict.py."""
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, {"daily_forecast": {}})):
+                app_host_tool({
+                    "action": "app_operation", "slug": "app1",
+                    "app_operation": "data.import_schema", "payload": {},
+                    "capability_digest": "c" * 64,
+                })
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import_schema", "ok": True, "error_code": "", "error_message": "",
+    }]
+
+
+def test_call_action_never_touches_the_import_ledger(monkeypatch):
+    """The legacy call() two-layer status (app-level 400/500 arrives as
+    ok:true) must never be mistaken for a data.import outcome."""
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        payload = {"status": 500, "content_type": "application/json", "body": {"error": "boom"}}
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, payload)):
+                out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+        assert out["ok"] is True
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == []
+
+
+def test_data_import_outside_a_pushed_scope_is_a_silent_noop(monkeypatch):
+    """Interactive turns never push a ledger scope. Recording must not raise
+    and must not fabricate a ledger visible to a later reader."""
+    from gateway.session_context import import_attempts_snapshot
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch(
+            "tools.apphost_tool._urlopen",
+            _capture_urlopen({}, {"import_receipt": {"committed": True}}),
+        ):
+            out = json.loads(app_host_tool(_IMPORT_ARGS))
+    assert out["ok"] is True
+    assert import_attempts_snapshot() == []
+
+
 def test_publish_operation_is_passed_through_unchanged(monkeypatch):
     from gateway.session_context import (
         clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
