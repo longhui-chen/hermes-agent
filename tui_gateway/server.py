@@ -12840,8 +12840,11 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     text_queue: queue.Queue = queue.Queue()
     stop = threading.Event()
     done = threading.Event()
+    tts_context = contextvars.copy_context()
     threading.Thread(
-        target=stream_tts_to_speaker, args=(text_queue, stop, done), daemon=True
+        target=tts_context.run,
+        args=(stream_tts_to_speaker, text_queue, stop, done),
+        daemon=True,
     ).start()
 
     global _tts_stream_state

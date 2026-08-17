@@ -47,6 +47,7 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.tool_result_classification import tool_may_have_side_effect
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -1299,7 +1300,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
-            # Tool was cancelled (interrupt) or thread didn't return
+            # Tool was cancelled (interrupt) or thread didn't return. The
+            # worker may have completed its request server-side already:
+            # effect-capable tools get an explicit unknown disposition.
+            effect_disposition = (
+                "unknown" if tool_may_have_side_effect(name, args) else "none"
+            )
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
                 _emit_terminal_post_tool_call(
@@ -1530,12 +1536,20 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
     already emit a result for every call_id.
     """
     for tc in tool_calls:
-        name = getattr(getattr(tc, "function", None), "name", "") or "tool"
+        fn = getattr(tc, "function", None)
+        name = getattr(fn, "name", "") or "tool"
+        # The in-flight call may have already executed server-side (e.g. a
+        # NAS search that injected chat cards): effect-capable → unknown.
+        disposition = (
+            "unknown"
+            if tool_may_have_side_effect(name, getattr(fn, "arguments", None))
+            else "none"
+        )
         messages.append(make_tool_result_message(
             name,
             f"[Tool execution cancelled — {name} was skipped due to {reason}]",
             getattr(tc, "id", "") or "",
-            effect_disposition="none",
+            effect_disposition=disposition,
         ))
 
 

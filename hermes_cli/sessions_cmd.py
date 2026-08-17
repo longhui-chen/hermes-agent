@@ -892,6 +892,28 @@ def cmd_sessions(args, sessions_parser=None):
         else:
             print(f"Session '{args.session_id}' not found.")
 
+    elif action == "delete-agent":
+        # local-server 用 HERMES_HOME 指向根库调用本命令：只删根库 state.db 里属于该
+        # agent 的 zettlab 会话（profile 库随 profile 目录删除，不在此列）。会话 ID 形如
+        # zettlab:<user>:<agent>:<rand>，按 parts[2] 匹配 agent_id（设备级跨用户允许，
+        # 与 local-server 的 sessionBelongsToAgent 语义一致）。
+        agent_id = str(getattr(args, "agent_id", "") or "").strip()
+        if not agent_id:
+            print("Error: agent_id is required.")
+            return 2
+        sessions_dir = get_hermes_home() / "sessions"
+        if not args.yes:
+            if not _confirm_prompt(
+                f"Delete all chat sessions for agent '{agent_id}'? [y/N] "
+            ):
+                print("Cancelled.")
+                return
+        # 原子收集 + 删除（Codex P1 finding 2）：枚举根、沿 parent_session_id 收集压缩
+        # continuation、删除都在 SessionDB.delete_sessions_for_agent 的同一个写事务里，
+        # 并发压缩产生的 continuation 不会被漏删成孤立根。
+        deleted = db.delete_sessions_for_agent(agent_id, sessions_dir=sessions_dir)
+        print(f"Deleted {deleted} session(s) for agent '{agent_id}'.")
+
     elif action in ("prune", "archive"):
         from hermes_cli.session_filters import (
             build_prune_filters,

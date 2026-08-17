@@ -12242,6 +12242,14 @@ def main():
         "--yes", "-y", action="store_true", help="Skip confirmation"
     )
 
+    sessions_delete_agent = sessions_subparsers.add_parser(
+        "delete-agent", help="Delete every chat session belonging to a local agent"
+    )
+    sessions_delete_agent.add_argument("agent_id", help="Local agent ID")
+    sessions_delete_agent.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation"
+    )
+
     sessions_prune = sessions_subparsers.add_parser(
         "prune",
         help="Delete old sessions (filterable by time window, source, title, ...)",

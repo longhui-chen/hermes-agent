@@ -29,6 +29,21 @@ HERMES_LANGFUSE_BASE_URL=https://cloud.langfuse.com   # or your self-hosted URL
 Without the SDK or credentials the hooks no-op silently — the plugin fails
 open.
 
+## Zettlab device relay mode
+
+Packaged Zettlab devices do not hold Langfuse project credentials. The local
+server injects only:
+
+```bash
+HERMES_LANGFUSE_MODE=relay
+HERMES_LANGFUSE_BASE_URL=http://127.0.0.1:19092
+```
+
+Relay mode accepts only a numeric loopback HTTP URL and ignores all public or
+secret key environment variables. The SDK sends OTLP protobuf to the local
+relay, which replaces its non-privileged placeholder authorization with the
+device's short-lived IoT authorization.
+
 ## Verify
 
 ```bash
