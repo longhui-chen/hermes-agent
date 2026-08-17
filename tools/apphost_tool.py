@@ -22,9 +22,11 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote, urlsplit
 
+from agent.credential_broker import request_app_auto_refresh_token
 from agent.secret_scope import get_secret
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
+_AGENT_ID_SECRET = "ZET_AGENT_ID"
 _DEFAULT_TIMEOUT = 30.0
 # install/reload need headroom over the server's own pipeline (Start alone is
 # capped at 30s, selfCheck adds 5s), and the stakes are asymmetric: the server
@@ -388,6 +390,10 @@ class _BadRequest(ValueError):
     """Model-facing validation error (message is safe to return verbatim)."""
 
 
+class _AutoRefreshScopeUnavailable(ValueError):
+    """The automatic-maintenance capability was not minted or is unsafe to use."""
+
+
 def _require_slug(args):
     slug = str(args.get("slug", "") or "").strip()
     if not slug:
@@ -524,6 +530,48 @@ def _execution_headers():
     return headers
 
 
+def _auto_refresh_scope_token(action, body, execution_headers):
+    """Mint the one-shot scope for a user-confirmed App Host operation.
+
+    ``user_confirmed_auto`` is durable user intent in the immutable operation;
+    the execution headers bind this particular publication to the active user
+    turn.  The model never receives the resulting bearer: it is sent once to
+    App Host, which claims it against the operation fingerprint before it can
+    provision the maintainer and cron job.
+    """
+    if action != "publish" or not isinstance(body, dict):
+        return None
+    operation = body.get("operation")
+    if not isinstance(operation, dict) or operation.get("data_refresh") != "user_confirmed_auto":
+        return None
+
+    required_execution_headers = {
+        "X-Zettlab-Business-Execution-Token",
+        "X-Hermes-Turn-Id",
+        "X-Hermes-Session-Id",
+    }
+    if not required_execution_headers.issubset(execution_headers):
+        raise _AutoRefreshScopeUnavailable(
+            "自动维护只能在当前已验证的用户会话中发布；未发送发布请求"
+        )
+    agent_id = _secret(_AGENT_ID_SECRET)
+    if not agent_id:
+        raise _AutoRefreshScopeUnavailable(
+            "当前 Agent 身份不可用，无法授权自动维护；未发送发布请求"
+        )
+    try:
+        token = request_app_auto_refresh_token(agent_id)
+    except Exception:
+        raise _AutoRefreshScopeUnavailable(
+            "自动维护授权暂不可用；未发送发布请求"
+        ) from None
+    if re.fullmatch(r"[0-9a-f]{64}", token or "") is None:
+        raise _AutoRefreshScopeUnavailable(
+            "自动维护授权无效；未发送发布请求"
+        )
+    return token
+
+
 def _build_request(action, args):
     """Return (method, path, body_dict_or_None, timeout) for an HTTP action."""
     timeout = _DEFAULT_TIMEOUT
@@ -619,6 +667,10 @@ def _build_request(action, args):
             # source of truth, so callers never need to duplicate it for reload.
             body["data_refresh"] = operation_data_refresh
             body["operation"] = operation
+        elif body.get("data_refresh") == "user_confirmed_auto":
+            raise _BadRequest(
+                "自动维护必须通过 publish 提供完整 operation，才能原子创建维护者和定时任务"
+            )
         return "POST", "/publish", body, _LONG_TIMEOUT
     if action == "install":
         if args.get("operation") is not None:
@@ -826,8 +878,16 @@ def app_host_tool(args, **_kw):
 
     try:
         method, path, body, timeout = _build_request(action, args)
+        execution_headers = _execution_headers()
+        scoped_auto_refresh_token = _auto_refresh_scope_token(
+            action, body, execution_headers
+        )
     except _BadRequest as exc:
         return _local_error("invalid_request", str(exc), status=_STATUS_NOT_SENT)
+    except _AutoRefreshScopeUnavailable as exc:
+        return _local_error(
+            "automatic_maintenance_unavailable", str(exc), status=_STATUS_NOT_SENT
+        )
 
     base = _base_url()
     token = _secret("ZETTLAB_AGENT_ACTION_TOKEN")
@@ -839,8 +899,11 @@ def app_host_tool(args, **_kw):
         )
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-    headers = {_ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
-    headers.update(_execution_headers())
+    headers = {
+        _ACTION_TOKEN_HEADER: scoped_auto_refresh_token or token,
+        "Accept": "application/json",
+    }
+    headers.update(execution_headers)
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
