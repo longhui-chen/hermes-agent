@@ -2024,7 +2024,7 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
 
 def _inject_context_hermes_home(env: dict) -> None:
-    """把 context-local 的 Hermes home 覆盖桥接进子进程环境。
+    """把 context-local 的 profile-scoped 环境桥接进子进程环境。
 
     ⚠️ 这里**曾经**是一个 ``except Exception: pass``。它把三件性质完全不同的事
     压成了同一个"静默通过",其中最毒的一件是:连 ``from hermes_constants import``
@@ -2045,22 +2045,18 @@ def _inject_context_hermes_home(env: dict) -> None:
        ⭐ 爆炸半径很窄:只有 pin 存在(多 profile 会话)才可能触发,单 profile 走 ①。
     """
     try:
-        from hermes_constants import get_hermes_home_override
+        from hermes_constants import apply_context_profile_scoped_env
     except ImportError:
         # ② 机制不可用:先留下能定位的日志,再上抛 —— ⛔ 不许静默继续。
         logger.error(
-            "profile pin unavailable: cannot import get_hermes_home_override; "
+            "profile pin unavailable: cannot import apply_context_profile_scoped_env; "
             "a child process may be pointed at another profile's credential store",
             exc_info=True,
         )
         raise
 
     # ③ 取 pin 若抛异常,**不接住** —— fail closed 好过指向别人的凭据库。
-    value = get_hermes_home_override()
-    if not value:
-        # ① 无 pin:静默返回。
-        return
-    env["HERMES_HOME"] = value
+    apply_context_profile_scoped_env(env)
 
 
 def _inject_session_context_env(env: dict) -> None:
@@ -2145,10 +2141,10 @@ MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
 })
 PROFILE_PUBLIC_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    # Platform-owned, profile-scoped filesystem capability. Unlike connector
-    # and action tokens this value is safe for model-authored shell commands,
-    # and skills use it as the conventional location for mutable state.
+    # 平台拥有的、按 profile 隔离的路径能力。它们不是 bearer token，终端和
+    # skills 需要随当前 profile 重注入，绝不能从上一个 shell snapshot 继承。
     "ZET_AGENT_OUTPUT_DIR",
+    "WECOM_CLI_CONFIG_DIR",
 })
 _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
 _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
@@ -2176,6 +2172,21 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
     """
     for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
         env.pop(key, None)
+
+    # WECOM_CLI_CONFIG_DIR 不是 profile .env 里的 bearer 值，而是已经由
+    # _inject_context_hermes_home 钉住的当前 HERMES_HOME 派生出的路径。无论
+    # 前台、背景还是 PTY spawn，都必须先丢掉 snapshot 的旧值再从当前 profile
+    # 重建；没有当前 profile 时宁可不注入，不能复用别人的凭据目录。
+    try:
+        from hermes_constants import apply_context_profile_scoped_env
+    except ImportError:
+        logger.error(
+            "profile-scoped WECOM_CLI_CONFIG_DIR injection is unavailable",
+            exc_info=True,
+        )
+        raise
+    apply_context_profile_scoped_env(env)
+
     if not inject:
         return
 
@@ -2188,7 +2199,7 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
         scope = None
         multiplex_active = True
 
-    for key in PROFILE_PUBLIC_RUNTIME_ENV_KEYS:
+    for key in PROFILE_PUBLIC_RUNTIME_ENV_KEYS - {"WECOM_CLI_CONFIG_DIR"}:
         if scope is not None:
             raw_value = scope.get(key)
         elif not multiplex_active:
@@ -3376,6 +3387,23 @@ class LocalEnvironment(BaseEnvironment):
         """
         exports = super()._snapshot_ephemeral_env_exports()
         public_env: dict[str, str] = {}
+        _inject_context_hermes_home(public_env)
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            multiplex_active = is_multiplex_active()
+        except ImportError:
+            logger.error(
+                "profile-scoped WECOM_CLI_CONFIG_DIR snapshot injection is unavailable",
+                exc_info=True,
+            )
+            raise
+        if "HERMES_HOME" not in public_env and not multiplex_active:
+            profile_home = str(self.env.get("HERMES_HOME") or "").strip()
+            if profile_home:
+                from hermes_constants import apply_profile_scoped_env
+
+                apply_profile_scoped_env(public_env, profile_home)
         _apply_profile_secret_scope_env(public_env, inject=True)
         for key in sorted(PROFILE_PUBLIC_RUNTIME_ENV_KEYS):
             value = public_env.get(key)

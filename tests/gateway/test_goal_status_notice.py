@@ -75,7 +75,11 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
             "chat_id": "parent-channel",
             "content": "✓ Goal achieved: done",
             "reply_to": None,
-            "metadata": {"thread_id": "thread-123"},
+            # goal 状态播报是系统通知,不是对某条用户消息的回复 ⇒ 必须带
+            # non_conversational,下游(飞书)据此决定不把它渲染成引用/话题。
+            # ⚠️ 这里保持【全等】断言:再多塞任何字段都应该让这条红,
+            # ⛔ 不许改成"包含"式断言把未来的意外新增放过去。
+            "metadata": {"thread_id": "thread-123", "non_conversational": True},
         }
     ]
 

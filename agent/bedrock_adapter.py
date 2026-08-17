@@ -66,11 +66,21 @@ def _require_boto3():
     try:
         import boto3
     except ImportError:
-        raise ImportError(
+        # 🔴 必须声明面向用户:这两条消息里**只有安装/升级命令是用户唯一能照做的
+        # 事**。错误归属判据的第 ③ 问是「异常类定义在我们的包或内建里 ⇒ 文本是
+        # 我们写的 ⇒ 收」—— 内建 ``ImportError`` 正好命中,于是这条指引会被压成
+        # 「服务内部异常」,Bedrock 对这类部署**完全不可用且用户无法自行恢复**。
+        # ⛔ 不放宽全体内部异常,只在**抛出点**登记:这正是
+        # ``USER_ACTIONABLE_ATTR`` 契约存在的理由。
+        from agent.error_classifier import USER_ACTIONABLE_ATTR
+
+        exc = ImportError(
             "The 'boto3' package is required for the AWS Bedrock provider. "
             "Install it with: pip install boto3\n"
             "Or install Hermes with Bedrock support: pip install -e '.[bedrock]'"
         )
+        setattr(exc, USER_ACTIONABLE_ATTR, True)
+        raise exc
     # converse() / converse_stream() were added in boto3 1.34.59.
     # When Hermes is installed editable into system Python, the system boto3
     # (e.g. Ubuntu 24.04 ships 1.34.46) may take precedence over the venv
@@ -80,11 +90,18 @@ def _require_boto3():
     except (AttributeError, ValueError):
         return boto3  # can't parse — don't block on version check
     if version < _MIN_BOTO3_VERSION:
-        raise RuntimeError(
+        # 同上:升级命令是用户唯一能照做的事,⛔ 不许被收成「服务内部异常」。
+        # ⚠️ 这条尤其要紧 —— 上面的注释写着 Ubuntu 24.04 的系统 boto3(1.34.46)
+        # 会盖过 venv 里的 pin,是**一类正常部署**都会撞上的。
+        from agent.error_classifier import USER_ACTIONABLE_ATTR
+
+        exc = RuntimeError(
             f"boto3 {boto3.__version__} does not support converse_stream "
             f"(minimum 1.34.59 required). Upgrade with: "
             f"pip install --upgrade boto3"
         )
+        setattr(exc, USER_ACTIONABLE_ATTR, True)
+        raise exc
     return boto3
 
 

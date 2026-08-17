@@ -7,6 +7,7 @@ existing connect path.
 """
 
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -129,6 +130,7 @@ class TestLazyFirstUseConnect:
             session=mock_session,
             _rpc_lock=MagicMock(),
             _pending_call_context=None,
+            _config={},
         )
         connected._rpc_lock.__aenter__ = AsyncMock(return_value=None)
         connected._rpc_lock.__aexit__ = AsyncMock(return_value=None)
@@ -256,7 +258,7 @@ class TestLazyFirstUseConnect:
         assert "playwright" not in mcp._lazy_server_fingerprints
         assert "playwright" not in mcp._lazy_server_tool_names
 
-    def test_lazy_connect_deregisters_phantom_cached_tools(self):
+    def test_lazy_connect_deregisters_phantom_cached_tools(self, tmp_path):
         # Stale-cache reconciliation: the cached manifest advertised tool X,
         # but the live server only registers tool Y → X must be deregistered
         # after the first-use connect so the model stops seeing a phantom.
@@ -285,7 +287,12 @@ class TestLazyFirstUseConnect:
              patch.object(registry, "deregister") as mock_dereg:
             assert mcp._ensure_lazy_server_connected("playwright") is True
 
-        mock_dereg.assert_called_once_with("mcp_playwright_tool_x")
+        mock_dereg.assert_called_once_with(
+            "mcp_playwright_tool_x",
+            generation_profile=os.path.normcase(
+                os.path.abspath(str(tmp_path / "hermes_test"))
+            ),
+        )
 
     def test_lazy_connect_failure_records_cooldown(self):
         mcp._lazy_server_configs["playwright"] = {"command": "npx", "lazy": True}

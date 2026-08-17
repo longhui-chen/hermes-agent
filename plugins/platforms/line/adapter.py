@@ -937,8 +937,20 @@ class LineAdapter(BasePlatformAdapter):
     async def _handle_webhook(self, request) -> Any:
         from aiohttp import web
 
-        # Body cap defends against memory-exhaustion via crafted Content-Length
-        # (aiohttp's client_max_size only applies to certain body modes).
+        # Body cap defends against memory-exhaustion via crafted Content-Length.
+        #
+        # ⚠️ 括号里原本写着「aiohttp's client_max_size only applies to certain body
+        # modes」—— **实查 aiohttp 3.14.1 源码,这句话不成立**,已删。
+        # ``web_request.py`` 里每一条 body 读取路径都受 ``client_max_size`` 约束:
+        #   · ``read()``      :702-705  每读一块就查累计字节,超限抛 413
+        #   · ``text()``      :711      → ``read()``
+        #   · ``json()``      :716      → ``text()`` → ``read()``
+        #   · ``multipart()`` :723-729  把 cap 传给 ``MultipartReader``
+        #   · ``post()``      :754/:800 multipart 分支 · :819 urlencoded 分支 → ``read()``
+        # 唯一前提是 cap 非零(``if self._client_max_size``);本适配器传的是
+        # ``WEBHOOK_BODY_MAX_BYTES``(1 MiB,常量),⛔ 不可配成 0。
+        # ⇒ 下面这道显式检查是**冗余的第二道**,保留无害(它也挡住 cap 之内、
+        #   但仍超过本适配器自定上限的体),⛔ 但它不是唯一防线。
         try:
             body = await request.read()
         except Exception as exc:

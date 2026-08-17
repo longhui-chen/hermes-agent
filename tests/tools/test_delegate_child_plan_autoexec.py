@@ -106,4 +106,14 @@ class TestPresentPlanNoCallbackAutoExecute(unittest.TestCase):
             callback=None,
             auto_execute=False,
         )
-        self.assertIn("reply to confirm", out)
+        # ⛔ 旧断言钉的是具体措辞 `"reply to confirm"` —— 那是**实现细节**，不是
+        # 契约。它把一句「面向用户的第一人称英文话术」钉成了必须存在，于是
+        # ZET-3140（中文会话蹦英文）一改文案这条就脆断，反过来逼人把英文话术
+        # 加回去。契约是**语义**：这条分支必须告诉模型「要等用户确认、确认前
+        # 不许执行」，至于用什么词说不归测试管。
+        lowered = out.lower()
+        self.assertIn("confirm", lowered)
+        self.assertTrue(
+            any(marker in lowered for marker in ("do not", "don't", "before")),
+            f"默认分支缺少「确认前不要执行」的约束语义：{out!r}",
+        )

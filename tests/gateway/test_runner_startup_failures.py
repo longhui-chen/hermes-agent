@@ -243,6 +243,23 @@ async def test_start_gateway_schedules_mcp_discovery_after_runner_start(monkeypa
     )
     monkeypatch.setattr("gateway.run.GatewayRunner", _RunningRunner)
     monkeypatch.setattr("gateway.run._start_cron_ticker", lambda *args, **kwargs: None)
+    # start_gateway 现在通过 hermes_cli.mcp_startup.start_background_mcp_discovery
+    # 起 discovery（本分支从"直调 tools.mcp_tool.discover_mcp_tools"改过来的，
+    # 为的是 per-profile 隔离）。那条路在起线程前会先问
+    # _has_configured_mcp_servers()；本用例的 HERMES_HOME 是空的 tmp_path，
+    # 于是它直接 return、线程根本不起，下面的 stub 永远不会被调到。
+    # ⇒ 这不是被测行为的一部分，放行它，让用例继续验它真正关心的
+    #   「discovery 排在 runner.start 之后 / 不阻塞 gateway 就绪」。
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup._has_configured_mcp_servers", lambda: True
+    )
+    # discovery 的 started/thread 是【模块级】状态：同文件里前一条用例跑完会
+    # 留下 started=True，start_background_mcp_discovery 于是走
+    # `if started: ... return`，本用例的线程压根不起（单独跑绿、连跑红）。
+    # 重置方式照抄 tests/test_tui_gateway_server.py:704 的既有做法。
+    monkeypatch.setattr("hermes_cli.mcp_startup._mcp_discovery_started", False)
+    monkeypatch.setattr("hermes_cli.mcp_startup._mcp_discovery_thread", None)
+    monkeypatch.setattr("hermes_cli.mcp_startup._mcp_discovery_by_profile", {})
     monkeypatch.setitem(
         sys.modules,
         "tools.mcp_tool",
@@ -321,6 +338,23 @@ async def test_start_gateway_does_not_wait_for_slow_mcp_discovery(monkeypatch, t
     )
     monkeypatch.setattr("gateway.run.GatewayRunner", _RunningRunner)
     monkeypatch.setattr("gateway.run._start_cron_ticker", lambda *args, **kwargs: None)
+    # start_gateway 现在通过 hermes_cli.mcp_startup.start_background_mcp_discovery
+    # 起 discovery（本分支从"直调 tools.mcp_tool.discover_mcp_tools"改过来的，
+    # 为的是 per-profile 隔离）。那条路在起线程前会先问
+    # _has_configured_mcp_servers()；本用例的 HERMES_HOME 是空的 tmp_path，
+    # 于是它直接 return、线程根本不起，下面的 stub 永远不会被调到。
+    # ⇒ 这不是被测行为的一部分，放行它，让用例继续验它真正关心的
+    #   「discovery 排在 runner.start 之后 / 不阻塞 gateway 就绪」。
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup._has_configured_mcp_servers", lambda: True
+    )
+    # discovery 的 started/thread 是【模块级】状态：同文件里前一条用例跑完会
+    # 留下 started=True，start_background_mcp_discovery 于是走
+    # `if started: ... return`，本用例的线程压根不起（单独跑绿、连跑红）。
+    # 重置方式照抄 tests/test_tui_gateway_server.py:704 的既有做法。
+    monkeypatch.setattr("hermes_cli.mcp_startup._mcp_discovery_started", False)
+    monkeypatch.setattr("hermes_cli.mcp_startup._mcp_discovery_thread", None)
+    monkeypatch.setattr("hermes_cli.mcp_startup._mcp_discovery_by_profile", {})
     monkeypatch.setitem(
         sys.modules,
         "tools.mcp_tool",

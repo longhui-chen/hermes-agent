@@ -1132,6 +1132,35 @@ class EmailAdapter(BasePlatformAdapter):
         logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
         return msg_id
 
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """把单张本地图片作为 MIME 附件发出（RH 复审第五轮 P1）。
+
+        🔴 原先 Email **只**覆写了 ``send_multiple_images``,没有单张版本。
+        任何逐张投递的调用方（kanban 交付物）都会落到
+        ``BasePlatformAdapter.send_image_file`` 的兜底 —— 那条只发一句
+        「native image send unavailable」的**文本提示**,而且发送成功
+        ⇒ 调用方把它记成**投递成功**。用户既没拿到图,也没被告知。
+
+        ⭐ 照抄同类的 ``send_document``:Email 在 MIME 层面本来就不区分
+        图片和文档,两者都是 ``_send_email_with_attachment`` 的一次附件。
+        ⛔ 不自造第二条发送路径。
+        """
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            **kwargs,
+        )
+
     async def send_document(
         self,
         chat_id: str,
