@@ -1913,6 +1913,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        defer_job as _cron_defer,
         job_occurrence_projection as _cron_occurrence_projection,
     )
     _CRON_AVAILABLE = True
@@ -1926,6 +1927,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_defer = None
     _cron_occurrence_projection = None
 
 
@@ -2692,6 +2694,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
+            ("POST", "/api/jobs/{job_id}/defer", self._handle_defer_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
@@ -3476,6 +3479,7 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_delete("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_delete_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/pause", self._profile_handler(self._handle_pause_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/resume", self._profile_handler(self._handle_resume_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/defer", self._profile_handler(self._handle_defer_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
         if _CRON_AVAILABLE:
             router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
@@ -7056,7 +7060,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
-        "repeat", "enabled", "timezone", "output_language",
+        "repeat", "enabled", "timezone", "output_language", "source",
         # A server-owned optimistic-concurrency fence. Its only current
         # caller is local-server's dedicated-maintainer schedule bridge; it
         # is not persisted as a mutable job field.
@@ -7286,6 +7290,7 @@ class APIServerAdapter(BasePlatformAdapter):
             timezone = body.get("timezone")
             output_language = body.get("output_language")
             origin = body.get("origin")
+            source = body.get("source")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -7327,6 +7332,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["timezone"] = timezone
             if output_language is not None:
                 kwargs["output_language"] = output_language
+            if source is not None:
+                kwargs["source"] = source
             if origin is not None:
                 kwargs["origin"] = origin
 
@@ -7476,6 +7483,52 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_defer_job(self, request: "web.Request") -> "web.Response":
+        """POST /api/jobs/{job_id}/defer — postpone a job's next run.
+
+        Body: {"seconds": 300} or {"until": "<ISO-8601>"}, optional "reason".
+        Unlike pause, the job stays enabled and keeps its cadence: the next
+        slot moves out to the later of its current slot and the retry point,
+        and the deferral is recorded (deferred_at / defer_reason /
+        defer_count). Used by the app-refresh governor so deferred maintainer
+        refreshes resume on their own instead of staying paused.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
+        seconds = body.get("seconds")
+        until = body.get("until")
+        reason = body.get("reason")
+        if seconds is None and until is None:
+            return web.json_response({"error": "provide seconds or until"}, status=400)
+        try:
+            job = _cron_defer(
+                job_id,
+                seconds=float(seconds) if seconds is not None else None,
+                until=str(until) if until is not None else None,
+                reason=str(reason) if reason else None,
+            )
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+            _notify_cron_provider_jobs_changed()
+            return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
