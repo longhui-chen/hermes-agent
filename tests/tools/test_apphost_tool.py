@@ -1800,6 +1800,16 @@ def test_publish_install_carries_stable_session_key(monkeypatch):
     assert body["session_id"] == _SESSION_KEY
 
 
+def test_publish_install_uses_current_session_build_when_path_is_omitted(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
+    body = _routed_body(monkeypatch, {
+        "action": "publish", "mode": "install", "data_refresh": "static",
+    })
+    assert body["mode"] == "install"
+    assert "source_subdir" not in body
+    assert body["session_id"] == _SESSION_KEY
+
+
 def test_publish_reload_never_rewrites_creation_provenance(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
     body = _routed_body(monkeypatch, {
