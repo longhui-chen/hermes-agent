@@ -41,6 +41,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import (
     FailoverReason,
     classify_api_error,
+    client_safe_error_text as _client_safe_error_text,
     content_policy_fallback_disabled,
 )
 from agent.iteration_budget import IterationBudget
@@ -6569,8 +6570,20 @@ def run_conversation(
                 #
                 # 只跳过「尝试 fallback」这一步，后面的终止/上报路径要照常走：
                 # 这一轮必须以内容拦截结束，而不是悄悄中止。
+                # internal_error 同理:代码里抛出的 AttributeError/NameError
+                # 换个备用模型一样会抛,fallback 只会多烧一次调用,并且先
+                # 打出「trying fallback...」——用户以为在恢复,其实是我们自己
+                # 的 bug。分类器已经把它的 should_fallback 留为 False。
+                #
+                # ⛔ 故意只列这两个 reason,而不是笼统写「should_fallback 为
+                # False 就不 fallback」:auth / timeout 等也有 should_fallback
+                # 为 False 的分支,它们换 provider 是有意义的,一并拦掉会弄坏
+                # 现有的恢复路径。作用域刚好等于缺陷。
                 _policy_no_fallback = (
-                    classified.reason == FailoverReason.content_policy_blocked
+                    classified.reason in {
+                        FailoverReason.content_policy_blocked,
+                        FailoverReason.internal_error,
+                    }
                     and not classified.should_fallback
                 )
                 if is_client_error:
@@ -6633,7 +6646,19 @@ def run_conversation(
                     # returned ``error`` field and downstream consumers deliver
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
-                    _nonretryable_summary = agent._summarize_api_error(api_error)
+                    # Same reason the Cloudflare collapse above exists, one
+                    # source further in: for `internal_error` this summary is
+                    # *our* exception text — attribute names, class names,
+                    # file paths — and it flows into `_emit_status`,
+                    # `final_response` and `error`, all of which reach the
+                    # client (chat/completions renders `final_response`).
+                    # Routed through the single safe-text helper so no outbound
+                    # field can be forgotten; the raw text is already logged.
+                    _nonretryable_summary = _client_safe_error_text(
+                        classified,
+                        agent._summarize_api_error(api_error),
+                        error=api_error,
+                    )
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "

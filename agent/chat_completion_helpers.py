@@ -1142,7 +1142,15 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         from agent.response_format import response_format_requires_structured_output
 
         if response_format_requires_structured_output((agent.request_overrides or {}).get("response_format")):
-            raise ValueError("response_format is not supported by the Anthropic Messages transport.")
+            # 🔴 **必须是专用类型。** HTTP 边界已改成 ``isinstance(e,
+            # ResponseFormatValidationError)`` 才回 400;普通 ``ValueError`` 会掉进
+            # 内部错误分支 ⇒ 原本**可操作的 400**退化成「服务内部异常」的 500。
+            # ⭐ 上一轮我收窄了 catch,却**没把所有 raise 点跟上** —— 兄弟调用点。
+            from agent.response_format import ResponseFormatValidationError
+
+            raise ResponseFormatValidationError(
+                "response_format is not supported by the Anthropic Messages transport."
+            )
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)

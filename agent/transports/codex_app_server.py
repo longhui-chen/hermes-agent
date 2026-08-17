@@ -137,10 +137,8 @@ class CodexAppServerClient:
         # so without this the child's HERMES_HOME (stale process-global) and its
         # HOME (override's profile home) would split. Mirrors the terminal spawn
         # paths (_inject_context_hermes_home in tools/environments/local.py).
-        from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
-        _override = get_hermes_home_override()
-        if _override:
-            spawn_env["HERMES_HOME"] = _override
+        from hermes_constants import apply_context_profile_scoped_env, apply_subprocess_home_env
+        apply_context_profile_scoped_env(spawn_env)
         # Route through the shared subprocess HOME contract. On a host with a
         # real HOME this is a no-op (auto mode keeps it), so codex's shell tool
         # subprocesses — gh/git/npm/aws — still find the user's real ~/.config,
