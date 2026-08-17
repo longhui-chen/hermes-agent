@@ -111,7 +111,12 @@ class TestCredentialFingerprint:
 async def test_unloading_one_profile_does_not_cancel_shared_startup_caller(
     monkeypatch, tmp_path
 ):
-    """profile operation 必须有独立 owner，不能把整个 gateway startup 当 owner。"""
+    """⚠️ 夹具值从 0 改成 5.0:``0`` 是我在**加硬期限之前**写的
+    「让等待变平凡」的值;期限落地后 ``0`` 表示**立刻超时**(fail-fast 语义,
+    由下面 ``test_zero_timeout_means_fail_fast`` 单独钉住)。
+    本用例钉的是**取消与属主**,与超时无关 ⇒ 断言逐字不变,只换夹具值。
+
+    profile operation 必须有独立 owner，不能把整个 gateway startup 当 owner。"""
     import gateway.pairing as pairing
     import gateway.status as status
     import hermes_cli.profiles as profiles
@@ -126,7 +131,7 @@ async def test_unloading_one_profile_does_not_cancel_shared_startup_caller(
     runner._partial_adapter_cleanup_tasks = {}
     runner._retiring_adapter_cleanups = {}
     runner._published_adapter_cleanup_retry = {}
-    runner._adapter_disconnect_timeout_secs = lambda: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 5.0
     runner._adapter_credential_claim = lambda *_args: None
     runner._adapter_listener_claim = lambda *_args: None
     runner._configure_profile_adapter = lambda *_args: None
@@ -230,7 +235,7 @@ async def test_secondary_startup_cleanup_failure_is_explicit_after_siblings_star
     runner._partial_adapter_cleanup_tasks = {}
     runner._retiring_adapter_cleanups = {}
     runner._published_adapter_cleanup_retry = {}
-    runner._adapter_disconnect_timeout_secs = lambda: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 5.0
     runner._adapter_credential_claim = lambda *_args: None
     runner._adapter_listener_claim = lambda *_args: None
     runner._configure_profile_adapter = lambda *_args: None
@@ -298,7 +303,7 @@ async def test_profile_start_retries_partial_owner_when_platform_is_disabled(
     runner._partial_adapter_cleanup_tasks = {}
     runner._profile_runtime_unloads = {}
     runner._profile_runtime_unload_retry = set()
-    runner._adapter_disconnect_timeout_secs = lambda: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 5.0
     stale = SimpleNamespace(disconnect=AsyncMock())
     sibling = object()
     runner._profile_adapters["coder"] = {Platform.SLACK: sibling}
@@ -339,7 +344,7 @@ async def test_partial_cleanup_precedes_new_profile_validation(
     runner._partial_adapter_cleanup_tasks = {}
     runner._profile_runtime_unloads = {}
     runner._profile_runtime_unload_retry = set()
-    runner._adapter_disconnect_timeout_secs = lambda: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 5.0
     stale = SimpleNamespace(disconnect=AsyncMock())
     sibling = object()
     runner._profile_adapters["coder"] = {Platform.SLACK: sibling}

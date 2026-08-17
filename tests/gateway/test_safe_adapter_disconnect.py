@@ -79,10 +79,19 @@ async def test_safe_disconnect_detaches_cancellation_swallowing_disconnect(
 
 
 @pytest.mark.asyncio
-async def test_strict_partial_cleanup_waits_for_cancellation_swallowing_worker(
+async def test_strict_partial_cleanup_reaps_within_a_window_then_surfaces(
     bare_runner, monkeypatch
 ):
-    """严格 cleanup 超时后必须等待真实 worker，且期间保留 retry owner。"""
+    """超时后有**收尸窗口**;窗口耗尽仍未结束 ⇒ 显式失败并**保留 retry owner**。
+
+    🔴 **这条测试的上一版把 bug 钉成了契约。** 它断言「超时后必须**等到**真实
+    worker」—— 而那正是本 PR 判定为缺陷的无界 shield:worker 忽略取消
+    (transport / 子进程卡住)时会**永久挂住** profile 卸载乃至整个网关重启。
+    ⭐ 判据:「它钉的是**需求**,还是**当时的实现行为**?」这里是后者 ⇒ 改测试。
+
+    🔴 **必须保持不变的那一半**:retry owner 在失败后**仍然保留**,
+    ⛔ 不许因为「不等了」就把它丢掉(丢了就没人重试)。
+    """
     monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
     entered = asyncio.Event()
     cancellation_seen = asyncio.Event()
@@ -103,11 +112,40 @@ async def test_strict_partial_cleanup_waits_for_cancellation_swallowing_worker(
     )
     await entered.wait()
     await cancellation_seen.wait()
-    assert not operation.done()
     assert bare_runner._partial_adapter_cleanup_retry[("", Platform.FEISHU)] is adapter
 
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(operation, timeout=5.0)
+    assert bare_runner._partial_adapter_cleanup_retry[("", Platform.FEISHU)] is adapter, (
+        "收尸窗口耗尽后把 retry owner 丢了 ⇒ 再也没人重试这次断连"
+    )
     release.set()
-    await operation
+
+
+@pytest.mark.asyncio
+async def test_strict_partial_cleanup_commits_when_the_worker_finishes_in_time(
+    bare_runner, monkeypatch
+):
+    """🔴 **必须保持不变**:worker 在窗口内结束 ⇒ 干净收口、retry 账销掉。"""
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "1.0")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def polite_disconnect():
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            release.set()          # 收到取消就收工 —— ⛔ 不吞取消死等
+
+    adapter = MagicMock()
+    adapter.disconnect = AsyncMock(side_effect=polite_disconnect)
+    operation = asyncio.create_task(
+        bare_runner._cleanup_unpublished_adapter(adapter, Platform.FEISHU)
+    )
+    await entered.wait()
+    release.set()
+    await asyncio.wait_for(operation, timeout=5.0)
     assert ("", Platform.FEISHU) not in bare_runner._partial_adapter_cleanup_retry
 
 
