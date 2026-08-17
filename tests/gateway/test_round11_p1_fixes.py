@@ -483,3 +483,211 @@ class TestProbeAdmissionIsBounded:
         f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"z" * 64)
         monkeypatch.setenv("TERMINAL_ENV", "local")
         assert mr.verify_artifact_readable(str(f)).ok is True
+
+
+# ═══════════ F · 第十三轮:LSP owner 期限 · detached owner · multiplex discovery ═══════════
+
+class TestLspOwnerHasItsOwnDeadline:
+    """🔴 LSP 那一族的**第四个位置**。调用方 ``self._loop.run(..., timeout=1.0)``
+    只取消 waiter,owner task 照跑;barrier 捕获取消后又 shield **同一个** task
+    ⇒ ``_cleanup_tasks`` / ``_retiring_clients`` 永不结算 ⇒ 后续 unload/reload
+    持续报 already-in-progress,子进程也回收不掉。
+    """
+
+    def test_a_wedged_shutdown_is_force_terminated(self):
+        """✅ **应该改变**:owner 内期限耗尽 ⇒ **真的把进程杀掉**,⛔ 不是「不等了」。"""
+        from agent.lsp.manager import LSPService
+
+        killed = []
+
+        class _Proc:
+            returncode = None
+            def terminate(self): killed.append("terminate")
+            def kill(self): killed.append("kill")
+
+        class _Client:
+            def __init__(self): self._proc = _Proc(); self._stopping = True
+            async def shutdown(self): await asyncio.Event().wait()
+
+        c = _Client()
+
+        async def _drive():
+            with pytest.raises(asyncio.TimeoutError):
+                await LSPService._shutdown_client_for_retry(c)
+
+        import agent.lsp.manager as m
+        old = m._CLIENT_SHUTDOWN_TIMEOUT_S
+        m._CLIENT_SHUTDOWN_TIMEOUT_S = 0.1
+        try:
+            asyncio.run(_drive())
+        finally:
+            m._CLIENT_SHUTDOWN_TIMEOUT_S = old
+        assert killed, "期限耗尽却没有终止进程 ⇒ 子进程留下来,回收不掉"
+        assert c._stopping is False, "🔴 必须保留**可重试**状态,⛔ 不能把 client 判死"
+
+    def test_a_fast_shutdown_is_unchanged(self):
+        """🔴 **必须保持不变**:正常关闭路径逐字不变(不杀进程、不抛异常)。"""
+        from agent.lsp.manager import LSPService
+
+        killed = []
+
+        class _Proc:
+            returncode = 0
+            def terminate(self): killed.append(1)
+            def kill(self): killed.append(1)
+
+        class _Client:
+            def __init__(self): self._proc = _Proc(); self._stopping = True
+            async def shutdown(self): return None
+
+        asyncio.run(LSPService._shutdown_client_for_retry(_Client()))
+        assert not killed, "正常路径不该动进程"
+
+    def test_a_failing_shutdown_still_restores_the_process(self):
+        """🔴 **必须保持不变**:非超时失败仍然恢复活着的 process handle。"""
+        from agent.lsp.manager import LSPService
+
+        class _Proc:
+            returncode = None
+            def terminate(self): raise AssertionError("非超时失败不该强杀")
+            def kill(self): raise AssertionError("非超时失败不该强杀")
+
+        class _Client:
+            def __init__(self): self._proc = _Proc(); self._stopping = True
+            async def shutdown(self): raise RuntimeError("boom")
+
+        c = _Client()
+
+        async def _drive():
+            with pytest.raises(RuntimeError):
+                await LSPService._shutdown_client_for_retry(c)
+
+        asyncio.run(_drive())
+        assert c._stopping is False, "失败后没恢复可重试状态"
+
+    def test_the_owner_deadline_matches_the_in_file_precedent(self):
+        """⛔ 上限不许拍脑袋:与本文件 ``LSPClient.stop`` 的 join 同量纲。"""
+        import agent.lsp.manager as m
+
+        assert m._CLIENT_SHUTDOWN_TIMEOUT_S == 2.0
+        assert m._CLEANUP_BARRIER_TIMEOUT_S > m._CLIENT_SHUTDOWN_TIMEOUT_S, (
+            "barrier 窗口必须**大于** owner 期限,否则会在 owner 正常收尾前就放手"
+        )
+
+
+class TestDetachedUploadOwnerIsTracked:
+    """🔴 ``wait_for`` 超时**只取消协程**,停不掉适配器 ``_run_blocking()`` 已提交
+    到 executor 的线程。⇒ 连续任务先占满 SDK worker,之后把上传持续堆进**无界队列**。
+    """
+
+    @staticmethod
+    def _mixin(monkeypatch, send_impl, deadline=0.1):
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin as G
+
+        m = G.__new__(G)
+        monkeypatch.setattr(G, "_ARTIFACT_UPLOAD_TIMEOUT_S", deadline, raising=False)
+        calls = []
+
+        async def _send(*, adapter, chat_id, metadata, path):
+            calls.append(path)
+            return await send_impl(len(calls))
+
+        m._send_one_artifact = _send
+        return m, calls
+
+    def test_a_timed_out_upload_records_its_owner(self, monkeypatch):
+        """✅ **应该改变**:超时后 owner 被登记下来(⛔ 不是「不等了就忘了」)。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin as G
+
+        async def _never(_n):
+            await asyncio.Event().wait()
+
+        m, _ = self._mixin(monkeypatch, _never)
+        asyncio.run(G._upload_artifact_with_retry(
+            m, adapter=object(), chat_id="c", metadata={}, path="/x/a.png",
+            budget=[8.0]))
+        assert m._detached_uploads(), "迟到上传的 owner 没被保存 ⇒ 无法拒绝同类新上传"
+
+    def test_a_second_upload_of_the_same_file_is_refused(self, monkeypatch):
+        """✅ **应该改变**:owner 未结束前拒绝同类新上传,⛔ 不排队。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin as G
+
+        async def _never(_n):
+            await asyncio.Event().wait()
+
+        m, calls = self._mixin(monkeypatch, _never)
+        ad = object()
+
+        async def _drive():
+            await G._upload_artifact_with_retry(
+                m, adapter=ad, chat_id="c", metadata={}, path="/x/a.png", budget=[8.0])
+            return await G._upload_artifact_with_retry(
+                m, adapter=ad, chat_id="c", metadata={}, path="/x/a.png", budget=[8.0])
+
+        second = asyncio.run(_drive())
+        assert second is False
+        assert len(calls) == 1, (
+            f"同一附件被重复提交 {len(calls)} 次 ⇒ 队列堆积 + 用户可能收到两份"
+        )
+
+    def test_the_owner_table_is_an_instance_attribute(self):
+        """🔴 **必须保持不变**:⛔ 不许挂到类上(会跨 runner 共享)。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin as G
+
+        assert not hasattr(G, "_detached_upload_owners")
+        a, b = G.__new__(G), G.__new__(G)
+        a._detached_uploads()["k"] = object()
+        assert b._detached_uploads() == {}, "owner 表被跨实例共享了"
+
+    def test_a_normal_upload_is_unchanged(self, monkeypatch):
+        """🔴 **必须保持不变**:成功路径不留任何 owner 账。"""
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin as G
+
+        async def _ok(_n):
+            return SimpleNamespace(success=True, error=None, retryable=False)
+
+        m, calls = self._mixin(monkeypatch, _ok)
+        ok = asyncio.run(G._upload_artifact_with_retry(
+            m, adapter=object(), chat_id="c", metadata={}, path="/x/a.png", budget=[8.0]))
+        assert ok is True and len(calls) == 1
+        assert m._detached_uploads() == {}, "成功路径不该留账"
+
+
+class TestMultiplexDiscoveryCoversEveryProfile:
+    """🔴 **半条链**:状态改成了 profile-scoped,启动侧还是单 profile
+    ⇒ 除启动时那个 profile 外,其余 profile 的 MCP 工具**一个都不注册**。
+    """
+
+    def test_discovery_starts_once_per_served_profile(self, monkeypatch, tmp_path):
+        import gateway.run as gr
+
+        homes = {n: tmp_path / n for n in ("default", "b", "c")}
+        for h in homes.values():
+            h.mkdir()
+        started = []
+        monkeypatch.setattr("hermes_cli.mcp_startup.start_background_mcp_discovery",
+                            lambda **kw: started.append(kw.get("thread_name")))
+        monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve",
+                            lambda multiplex: [(n, h) for n, h in homes.items()])
+        monkeypatch.setattr("hermes_cli.profiles.get_profile_dir",
+                            lambda n: homes.get(n, tmp_path / n))
+        monkeypatch.setattr(gr, "_multiplex_active_profile_name", lambda: "default")
+        monkeypatch.setattr(gr, "_profile_runtime_scope",
+                            lambda home: __import__("contextlib").nullcontext())
+
+        gr._spawn_mcp_discovery(logger=gr.logger, multiplex=True)
+        assert len(started) == 3, f"只为 {len(started)} 个 profile 起了 discovery,应为 3"
+        assert started[0].endswith("default"), "active profile 应当最先就绪(既有行为)"
+        assert gr._mcp_discovery_homes and len(gr._mcp_discovery_homes) == 3, (
+            "⭐ 谁跟踪:已启动的 profile 没有被登记"
+        )
+
+    def test_single_profile_mode_is_unchanged(self, monkeypatch):
+        """🔴 **必须保持不变**:非 multiplex 仍然只起一次、且返回 None。"""
+        import gateway.run as gr
+
+        started = []
+        monkeypatch.setattr("hermes_cli.mcp_startup.start_background_mcp_discovery",
+                            lambda **kw: started.append(kw.get("thread_name")))
+        assert gr._spawn_mcp_discovery(logger=gr.logger, multiplex=False) is None
+        assert started == ["mcp-discovery"], f"单 profile 路径变了:{started}"

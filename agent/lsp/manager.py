@@ -139,6 +139,24 @@ class _BackgroundLoop:
 _SHUTDOWN_JOIN_TIMEOUT_SECONDS = 10.0
 
 
+#: ⛔ 不拍脑袋:与 ``LSPClient.stop`` 的 ``self._thread.join(timeout=2.0)`` 同量纲。
+_CLIENT_SHUTDOWN_TIMEOUT_S = 2.0
+#: barrier 侧的收尸窗口 —— 与 ``_SHUTDOWN_JOIN_TIMEOUT_SECONDS`` 同族,取其零头。
+_CLEANUP_BARRIER_TIMEOUT_S = 5.0
+
+
+def _force_terminate_lsp_process(process) -> None:
+    """owner 期限耗尽后**真的把进程杀掉** —— ⛔ 「调用方不等了」不算回收。"""
+    if process is None or getattr(process, "returncode", None) is not None:
+        return
+    for step in ("terminate", "kill"):
+        try:
+            getattr(process, step)()
+            return
+        except (ProcessLookupError, OSError, AttributeError):
+            continue
+
+
 class LSPService:
     """One profile's LSP service.
 
@@ -518,7 +536,23 @@ class LSPService:
             return True
 
         try:
-            await client.shutdown()
+            # 🔴 **期限必须设在 owner 内,⛔ 不能靠调用方超时。**
+            # 唯一调用链是 ``_mark_broken_for_file`` 的
+            # ``self._loop.run(..., timeout=1.0)`` —— 那个超时**只取消 waiter**,
+            # owner task 照样跑;而 ``_cleanup_client_with_barrier`` 捕获取消后
+            # 又去 shield **同一个** task ⇒ ``_cleanup_tasks`` / ``_retiring_clients``
+            # 永远结算不了 ⇒ 后续 unload/reload 持续报 already-in-progress,
+            # 子进程也回收不掉。
+            # ⛔ 上限不许拍脑袋:沿用本文件既有的 client 级关闭量纲
+            #   ``LSPClient.stop`` 的 ``join(timeout=2.0)``。
+            await asyncio.wait_for(client.shutdown(),
+                                   timeout=_CLIENT_SHUTDOWN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # 期限耗尽 ⇒ **强制终止进程**,并保留可重试状态。
+            # ⛔ 不是「不等了」——那样进程会留下来。
+            _force_terminate_lsp_process(process)
+            _restore_live_process()
+            raise
         except BaseException:
             _restore_live_process()
             raise
@@ -542,6 +576,7 @@ class LSPService:
                     task = existing
 
         cancelled = None
+        deadline = None
         while True:
             try:
                 await asyncio.shield(task)
@@ -549,6 +584,19 @@ class LSPService:
             except asyncio.CancelledError as exc:
                 if cancelled is None:
                     cancelled = exc
+                # 🔴 **重入的 shield 也要有窗口。** owner 现在自带硬期限,
+                # 但若它本身被卡在不可取消的地方,这里会无限重新 shield。
+                # 窗口耗尽 ⇒ 让取消传播出去,由上层继续推进;
+                # ⛔ 不清 ``_cleanup_tasks``(清了下次又新建、重新撞闩)。
+                loop = asyncio.get_running_loop()
+                if deadline is None:
+                    deadline = loop.time() + _CLEANUP_BARRIER_TIMEOUT_S
+                if loop.time() >= deadline:
+                    logger.error(
+                        "LSP cleanup barrier 超过 %.0fs 仍未结算 —— 停止重入 shield",
+                        _CLEANUP_BARRIER_TIMEOUT_S,
+                    )
+                    raise
                 continue
 
         failure = None

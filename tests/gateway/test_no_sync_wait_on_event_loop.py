@@ -287,3 +287,133 @@ class TestTheRegistryItselfStaysHonest:
         """⭐ ``_LOOP_SYNC_WAIT_KNOWN`` 是**待办清单**,⛔ 不是结论。"""
         assert all("存量" in v or "启动期" in v or "关停期" in v
                    for v in _LOOP_SYNC_WAIT_KNOWN.values())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 维度二 ⭐ **「设了 timeout」≠「等待被限住」**
+#
+# cancel **停不掉**两类东西:①被 ``shield`` 包住的 task ②已提交给 executor 的线程。
+# ⇒ 门要问的不是「有没有 timeout」,而是:**超时耗尽后,底层工作真的会停吗?**
+#
+# ## 分格(⛔ 不许读成「全部收口」)
+#
+# * **D2a(闭集)**:``while`` 循环 + ``except CancelledError`` 里的**裸 shield**
+#   —— 取消停不掉 shielded task,循环会**重新 shield 同一个** ⇒ 永不结算。
+#   纯语法可判定,全仓扫描,**9 条逐条登记**。
+#   ⚠️ 本判据第一版**只看 ``except`` 处理器内部**,而 ``lsp/manager.py:547`` 的
+#   shield 在 ``try:`` 里、靠 ``except…: continue`` 回环 ⇒ **抓不住自己的触发案例**。
+#   已改成「看整个循环」。
+# * **D2b(⚠️ 开集,明说)**:``wait_for`` 罩着的是不是「我方能取消的工作」。
+#   实测:1-hop 词法只找得到 **9/123** 个 ``wait_for`` 站点,而本轮 kanban 那条
+#   隔着**两层调用**(``_send_one_artifact`` → adapter → ``_run_blocking``)
+#   ⇒ 需要跨调用判定,**做不成闭集**。⛔ 本门不声称覆盖发现面。
+#   ⇒ 退而求其次:对**已登记**的 detached 站点强制「超时分支必须保存 owner」。
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: D2a 登记表:键 = ``(路径, 函数名, 行内片段)``,值 = **owner 自己有没有独立硬期限**。
+_REENTRANT_SHIELD_OK: dict[tuple[str, str], str] = {
+    ("agent/lsp/manager.py", "_cleanup_client_with_barrier"):
+        "owner ``_shutdown_client_for_retry`` 内有 _CLIENT_SHUTDOWN_TIMEOUT_S,"
+        "耗尽后强杀进程;barrier 侧另有 _CLEANUP_BARRIER_TIMEOUT_S 窗口 —— 本轮修",
+    ("tools/mcp_tool.py", "_await_cleanup_until_complete"):
+        "有 _MCP_CANCEL_REAP_SECONDS 窗口,耗尽后让取消传播 —— 前一轮修",
+    ("gateway/platforms/api_server.py", "_run_in_executor_with_completion_barrier"):
+        "⚠️ 存量,owner 侧未逐条追 ⇒ 标已知风险,⛔ 不是判定为安全",
+    ("gateway/platforms/zet_agent.py", "_to_thread_with_completion_barrier"):
+        "⚠️ 存量;唯一新增调用点(onboarding 关闭)已由外层 wait_for 兜住",
+    ("gateway/run.py", "_track_profile_adapter_operation"):
+        "⚠️ 存量,owner 侧未逐条追 ⇒ 标已知风险",
+    ("gateway/run.py", "_run_in_executor_with_context_completion_barrier"):
+        "⚠️ 存量,owner 侧未逐条追 ⇒ 标已知风险",
+    ("hermes_cli/web_server.py", "_to_thread_with_completion_barrier"):
+        "⚠️ 存量,owner 侧未逐条追 ⇒ 标已知风险",
+    ("tools/mcp_tool.py", "_run_blocking_cleanup_with_completion_barrier"):
+        "⚠️ 存量,owner 侧未逐条追 ⇒ 标已知风险",
+    ("tools/mcp_tool.py", "_tracked_lifecycle_until_complete"):
+        "有 lifecycle_completed.wait(timeout=_MCP_CANCEL_REAP_SECONDS) —— 前一轮修",
+}
+
+
+def _scan_reentrant_shields():
+    """D2a:循环里(带取消处理器)的裸 ``shield`` —— ⭐ 看**整个循环**,
+    ⛔ 不是只看 ``except`` 处理器内部。"""
+    found = []
+    for path in _production_files():
+        try:
+            tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for loop in ast.walk(fn):
+                if not isinstance(loop, (ast.While, ast.For)):
+                    continue
+                if not any(isinstance(h, ast.ExceptHandler) and h.type
+                           and "CancelledError" in ast.unparse(h.type)
+                           for h in ast.walk(loop)):
+                    continue
+                guarded = {id(x)
+                           for w in ast.walk(loop)
+                           if isinstance(w, ast.Call)
+                           and getattr(w.func, "attr", None) == "wait_for"
+                           for x in ast.walk(w)}
+                for n in ast.walk(loop):
+                    if id(n) in guarded:
+                        continue
+                    if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "shield":
+                        found.append((path, fn.name, n.lineno))
+    return found
+
+
+class TestD2aReentrantShield:
+    def test_every_reentrant_shield_is_registered(self):
+        found = _scan_reentrant_shields()
+        assert found, "探针一个都没扫到 ⇒ 量具坏了"
+        missing = [f for f in found if (f[0], f[1]) not in _REENTRANT_SHIELD_OK]
+        assert not missing, (
+            "以下是「取消停不掉」的重入 shield —— 循环会重新 shield 同一个 task,\n"
+            "调用方超时**只取消 waiter**,owner 照跑 ⇒ 状态永不结算:\n"
+            + "\n".join(f"  {p}:{ln} {fn}" for p, fn, ln in missing)
+        )
+
+    def test_the_probe_catches_the_try_block_shape(self):
+        """⭐ **抓得住自己的触发案例**:``lsp/manager.py:547`` 的 shield 在
+        ``try:`` 里、靠 ``except…: continue`` 回环 —— 第一版判据看不见它。"""
+        found = _scan_reentrant_shields()
+        assert ("agent/lsp/manager.py", "_cleanup_client_with_barrier") in {
+            (p, fn) for p, fn, _ in found}, (
+            "判据又缩回「只看 except 处理器内部」了 ⇒ 抓不住 try-块形态"
+        )
+
+    def test_registry_has_no_zombies(self):
+        live = {(p, fn) for p, fn, _ in _scan_reentrant_shields()}
+        stale = [k for k in _REENTRANT_SHIELD_OK if k not in live]
+        assert not stale, f"登记表僵尸条目(代码已不存在):{stale}"
+
+
+class TestD2bDetachedOwnersAreTracked:
+    """D2b(开集里能闭的那一半):**已登记**的 detached 站点,超时分支必须保存 owner。"""
+
+    _DETACHED_SITES = {
+        ("gateway/kanban_watchers.py", "_upload_artifact_with_retry"):
+            "_send_one_artifact 最终经适配器的 _run_blocking() 落到线程池 —— "
+            "wait_for 超时只取消协程,线程照跑",
+    }
+
+    def test_each_registered_site_saves_its_owner_on_timeout(self):
+        import inspect
+
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin as G
+
+        src = inspect.getsource(G._upload_artifact_with_retry)
+        i = src.index("except asyncio.TimeoutError:")
+        window = src[i:i + 500]
+        assert "owners[okey] = owner" in window, (
+            "超时分支没有保存 owner ⇒ 无法拒绝同类新上传,"
+            "连续任务会把上传堆进无界 executor 队列"
+        )
+
+    def test_the_open_half_is_declared(self):
+        doc = pathlib.Path(__file__).read_text(encoding="utf-8")
+        assert "D2b" in doc and "做不成闭集" in doc, "开集声明被删了"

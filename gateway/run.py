@@ -2043,12 +2043,37 @@ def _spawn_mcp_discovery(*, logger, multiplex: bool):
         start_background_mcp_discovery(logger=logger, thread_name="mcp-discovery")
         return None
 
-    from hermes_cli.profiles import get_profile_dir
+    from hermes_cli.profiles import get_profile_dir, profiles_to_serve
 
-    profile_home = get_profile_dir(_multiplex_active_profile_name() or "default")
-    with _profile_runtime_scope(profile_home):
-        start_background_mcp_discovery(logger=logger, thread_name="mcp-discovery")
-    return profile_home
+    # 🔴 **半条链**:本 PR 把 ``_servers`` / ``_mcp_tool_handlers`` / lazy schema
+    # cache 全部改成了 **profile-scoped**(那是对的),但**启动侧还是单 profile**
+    # ⇒ 除启动时选中的那个 profile 外,其余 profile 配置的 MCP 工具**一个都不会注册**,
+    # 用户通常只能手动 ``/reload-mcp`` 才恢复。
+    # ⇒ 三格都要答:**谁启动**(下面逐 profile)· **谁跟踪**(``_mcp_discovery_homes``)
+    #   · **谁回收**(profile unload 时由 ``clear_profile_generation`` 那条链销账)。
+    active = _multiplex_active_profile_name() or "default"
+    # ⚠️ ``profiles_to_serve`` 返回的是 **(name, Path) 元组**,⛔ 不是名字列表 ——
+    #   我第一版按名字用,会整条走进 except 兜底、**静默**退化成单 profile。
+    #   ⭐ 实查签名才发现:``(multiplex: bool) -> List[Tuple[str, Path]]``。
+    try:
+        pairs = [(str(n), h) for n, h in profiles_to_serve(multiplex=True)]
+    except Exception:
+        logger.warning("multiplex profile 列表取不到 —— 退回只为 active profile 启动 discovery")
+        pairs = []
+    if not pairs:
+        pairs = [(active, get_profile_dir(active))]
+    # active 先跑,其余按序 —— 保持既有「启动时那个 profile 最先就绪」的行为。
+    pairs.sort(key=lambda kv: kv[0] != active)
+
+    started: list = []
+    for name, home in pairs:
+        with _profile_runtime_scope(home):
+            start_background_mcp_discovery(
+                logger=logger, thread_name=f"mcp-discovery-{name}")
+        started.append(home)
+    # ⭐ **谁跟踪**:登记已启动的 profile,供 reload / 诊断消费。
+    globals()["_mcp_discovery_homes"] = tuple(started)
+    return started[0] if started else get_profile_dir(active)
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":

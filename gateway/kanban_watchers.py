@@ -1158,6 +1158,14 @@ class GatewayKanbanWatchersMixin:
     # **等待**,单次上传要能容纳一个真实的大附件传输,故取其一个数量级以上;
     # 与 gateway 侧 ``_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS``(30s)同阶。
     _ARTIFACT_UPLOAD_TIMEOUT_S = 120.0
+    #: 🔴 **``wait_for`` 超时只取消协程,停不掉已提交到 executor 的线程。**
+    #: 适配器的 ``_run_blocking()`` 把 SDK 调用丢进线程池;超时后我们不等了,
+    #: **那个线程还在跑**。连续任务会先占满 SDK 的 worker,之后把上传持续堆进
+    #: **无界 executor 队列** ⇒ 2 GB 设备预算下 OOM;而且附件可能在「失败提示」
+    #: 之后**迟到送达**。
+    #: ⇒ 超时时把 owner **登记下来**,同一 (chat, 文件) 在 owner 结束前
+    #:   **拒绝同类新上传**(⛔ 不是排队,是当场判失败)。
+    _MAX_DETACHED_UPLOADS = 4
     #: 图片扩展名 —— 只用来选对上传 API，⛔ 不再用于批量分组(见下)。
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
     _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -1209,6 +1217,14 @@ class GatewayKanbanWatchersMixin:
         return await adapter.send_document(
             chat_id=chat_id, file_path=path, metadata=metadata)
 
+    def _detached_uploads(self):
+        """迟到上传的 owner 表 —— **实例属性**,⛔ 不放类上(会跨 runner 共享)。"""
+        table = getattr(self, "_detached_upload_owners", None)
+        if table is None:
+            table = {}
+            self._detached_upload_owners = table
+        return table
+
     async def _upload_artifact_with_retry(
         self, *, adapter, chat_id, metadata, path: str, budget: List[float],
     ) -> bool:
@@ -1255,12 +1271,39 @@ class GatewayKanbanWatchersMixin:
                 # 任务完成通知和附件交付。
                 # ⛔ 超时后**不重传** —— 上传非幂等,重传 = 用户收到重复文件
                 # (与上面「超时优先于可重试」同一条判据)。
-                res = await asyncio.wait_for(
+                owners = self._detached_uploads()
+                okey = (id(adapter), str(chat_id), os.path.basename(path))
+                stale = [k for k, t in owners.items() if t.done()]
+                for k in stale:
+                    owners.pop(k, None)          # ⭐ 迟到任务结束即销账
+                if okey in owners:
+                    logger.error(
+                        "kanban notifier: 同一附件的上一趟上传仍在 executor 里跑 —— "
+                        "⛔ 拒绝重复提交(避免重复送达 + 队列堆积): %s",
+                        os.path.basename(path),
+                    )
+                    return False
+                if len(owners) >= self._MAX_DETACHED_UPLOADS:
+                    logger.error(
+                        "kanban notifier: 已有 %d 个迟到上传未结束 —— ⛔ 拒绝新上传",
+                        len(owners),
+                    )
+                    return False
+
+                owner = asyncio.ensure_future(
                     self._send_one_artifact(
                         adapter=adapter, chat_id=chat_id,
-                        metadata=metadata, path=path),
-                    timeout=self._ARTIFACT_UPLOAD_TIMEOUT_S,
-                )
+                        metadata=metadata, path=path))
+                try:
+                    res = await asyncio.wait_for(
+                        asyncio.shield(owner),
+                        timeout=self._ARTIFACT_UPLOAD_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    # ⭐ **保存 owner**:``wait_for`` 停不掉底层线程,
+                    #   至少要知道它还在,并据此拒绝同类新上传。
+                    owners[okey] = owner
+                    raise
                 # ⭐ ⛔ **不写专门的 ``except asyncio.TimeoutError``。**
                 # 逆改实证:Python 3.11 里 ``asyncio.TimeoutError`` 就是内建
                 # ``TimeoutError``,会落进下面的通用 ``except Exception``,
