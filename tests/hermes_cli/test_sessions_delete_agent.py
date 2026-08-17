@@ -1,27 +1,149 @@
-"""Unit tests for the sessions delete-agent filter (TB-20260814-012 延后项 2)."""
+"""Tests for SessionDB.delete_sessions_for_agent (TB-20260814-012 延后项 2 + Codex P1)."""
 
-from hermes_cli.sessions_cmd import _filter_agent_session_ids
+import sqlite3
 
-
-def test_filter_agent_session_ids_scopes_to_agent():
-    rows = [
-        {"id": "zettlab:alice:agent-a:one"},
-        {"id": "zettlab:alice:agent-a:two"},
-        {"id": "zettlab:alice:agent-b:one"},
-        # lookalike: tail contains ":agent-a:" but the agent segment is agent-b
-        {"id": "zettlab:alice:agent-b:tail:agent-a:lookalike"},
-        {"id": "20260430_cli_xyz"},  # non-zettlab prefix
-        {"id": "cron_job-aaa_20260508_073000"},  # cron shape
-    ]
-    got = _filter_agent_session_ids(rows, "agent-a")
-    assert got == ["zettlab:alice:agent-a:one", "zettlab:alice:agent-a:two"]
+from hermes_state import SessionDB
 
 
-def test_filter_agent_session_ids_cross_user_allowed():
-    rows = [{"id": "zettlab:bob:agent-a:abc"}]
-    assert _filter_agent_session_ids(rows, "agent-a") == ["zettlab:bob:agent-a:abc"]
+def _seed(db_path, rows):
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    for sid, parent, archived in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, user_id, started_at, archived, parent_session_id)"
+            " VALUES (?, 'zettlab', 'alice', 100.0, ?, ?)",
+            (sid, archived, parent),
+        )
+    conn.commit()
+    conn.close()
 
 
-def test_filter_agent_session_ids_empty_agent_returns_nothing():
-    rows = [{"id": "zettlab:alice:agent-a:one"}]
-    assert _filter_agent_session_ids(rows, "") == []
+def test_delete_sessions_for_agent_deletes_roots_descendants_and_archived(tmp_path):
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [
+        ("zettlab:alice:agent-a:root", None, 0),
+        ("zettlab:alice:agent-a:archived", None, 1),
+        # 压缩 continuation（timestamp-hex，继承根所有权）及其下一级。
+        ("20260518_120000_abc123", "zettlab:alice:agent-a:root", 0),
+        ("20260518_130000_def456", "20260518_120000_abc123", 0),
+        # fork 到别的 agent 的子会话——不得误删。
+        ("zettlab:alice:agent-b:forked", "zettlab:alice:agent-a:root", 0),
+        # 别的 agent 的独立会话——不得删。
+        ("zettlab:alice:agent-b:other", None, 0),
+    ])
+
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+
+    assert deleted == 4  # root + archived + 2 级 continuation
+
+    conn = sqlite3.connect(db_path)
+    remaining = {r[0] for r in conn.execute("SELECT id FROM sessions")}
+    conn.close()
+    assert remaining == {"zettlab:alice:agent-b:forked", "zettlab:alice:agent-b:other"}
+
+
+def test_delete_sessions_for_agent_no_roots_returns_zero(tmp_path):
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [("zettlab:alice:agent-b:other", None, 0)])
+
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+    assert deleted == 0
+
+
+def test_delete_sessions_for_agent_ignores_uppercase_prefix(tmp_path):
+    # SQLite 的 LIKE 默认大小写不敏感，会误选 ZETTLAB: 大写前缀的同名会话；
+    # 根查询改用 GLOB（大小写敏感）+ startswith 检查后必须跳过（Codex P1）。
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [
+        ("zettlab:alice:agent-a:root", None, 0),
+        ("ZETTLAB:alice:agent-a:UPPER", None, 0),
+    ])
+
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+
+    assert deleted == 1  # 只删小写 zettlab 根
+
+    conn = sqlite3.connect(db_path)
+    remaining = {r[0] for r in conn.execute("SELECT id FROM sessions")}
+    conn.close()
+    assert remaining == {"ZETTLAB:alice:agent-a:UPPER"}
+
+
+def test_delete_sessions_for_agent_handles_more_roots_than_batch(tmp_path):
+    # 401 个根会话跨过 400 的分批边界：lineage 遍历与最终删除都必须分批执行，
+    # 否则单条 IN 会超过 SQLite 变量上限（Codex P1）。
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [(f"zettlab:alice:agent-a:r{i}", None, 0) for i in range(401)])
+
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+
+    assert deleted == 401
+
+    conn = sqlite3.connect(db_path)
+    remaining = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.close()
+    assert remaining == 0
+
+
+def test_delete_sessions_for_agent_batches_delegate_cascade(tmp_path):
+    # 单根挂 600 个 delegate 子会话，并把 SQLite 变量上限压到 500：
+    # delegate cascade 的最终删除必须分批，否则单条 IN 会超限回滚（Codex P1）。
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        "INSERT INTO sessions (id, source, user_id, started_at, archived, parent_session_id, model_config)"
+        " VALUES (?, 'zettlab', 'alice', 100.0, 0, NULL, NULL)",
+        ("zettlab:alice:agent-a:root",),
+    )
+    for i in range(600):
+        conn.execute(
+            "INSERT INTO sessions (id, source, user_id, started_at, archived, parent_session_id, model_config)"
+            " VALUES (?, 'zettlab', 'alice', 100.0, 0, NULL, ?)",
+            (f"delegate-{i}", '{"_delegate_from": "zettlab:alice:agent-a:root"}'),
+        )
+    conn.commit()
+    conn.close()
+
+    pre = sqlite3.connect(db_path, isolation_level=None)
+    pre.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 500)
+
+    db = SessionDB(db_path=db_path, _preopened_connection=pre)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+
+    assert deleted == 1  # 根（600 delegate 经 cascade 删除，不计入 all_ids）
+
+    conn = sqlite3.connect(db_path)
+    remaining = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.close()
+    assert remaining == 0
