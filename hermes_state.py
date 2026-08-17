@@ -214,14 +214,22 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     found: set[str] = set(seeds)
     frontier = list(seeds)
     while frontier:
-        ph = ",".join("?" * len(frontier))
-        cursor = conn.execute(
-            f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
-            f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
-            frontier + frontier,
-        )
-        frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
-        found.update(frontier)
+        nxt: list = []
+        # delegate 遍历也分批：frontier + frontier 两条 IN 会翻倍变量数，400 上限=800 < 999。
+        for i in range(0, len(frontier), 400):
+            chunk = frontier[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            cursor = conn.execute(
+                f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
+                f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
+                chunk + chunk,
+            )
+            for row in cursor:
+                sid = row["id"]
+                if sid not in found:
+                    found.add(sid)
+                    nxt.append(sid)
+        frontier = nxt
     # Return only the discovered children — never the parents themselves.
     return [sid for sid in found if sid not in seeds]
 
@@ -8968,22 +8976,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             found = set(roots)
             frontier = list(roots)
             while frontier:
-                ph = ",".join("?" * len(frontier))
-                cur = conn.execute(
-                    f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
-                    frontier,
-                )
                 nxt = []
-                for row in cur.fetchall():
-                    sid = row["id"]
-                    if sid in found:
-                        continue
-                    if sid.startswith("zettlab:"):
-                        p = sid.split(":")
-                        if len(p) < 4 or p[2] != agent_id:
+                # lineage 遍历也分批：单层 frontier 仍可能超 SQLite 变量上限（Codex P1）。
+                for i in range(0, len(frontier), 400):
+                    chunk = frontier[i:i + 400]
+                    ph = ",".join("?" * len(chunk))
+                    cur = conn.execute(
+                        f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
+                        chunk,
+                    )
+                    for row in cur:
+                        sid = row["id"]
+                        if sid in found:
                             continue
-                    found.add(sid)
-                    nxt.append(sid)
+                        if sid.startswith("zettlab:"):
+                            p = sid.split(":")
+                            if len(p) < 4 or p[2] != agent_id:
+                                continue
+                        found.add(sid)
+                        nxt.append(sid)
                 frontier = nxt
 
             all_ids = list(found)

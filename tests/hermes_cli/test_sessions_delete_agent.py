@@ -85,3 +85,25 @@ def test_delete_sessions_for_agent_ignores_uppercase_prefix(tmp_path):
     remaining = {r[0] for r in conn.execute("SELECT id FROM sessions")}
     conn.close()
     assert remaining == {"ZETTLAB:alice:agent-a:UPPER"}
+
+
+def test_delete_sessions_for_agent_handles_more_roots_than_batch(tmp_path):
+    # 401 个根会话跨过 400 的分批边界：lineage 遍历与最终删除都必须分批执行，
+    # 否则单条 IN 会超过 SQLite 变量上限（Codex P1）。
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [(f"zettlab:alice:agent-a:r{i}", None, 0) for i in range(401)])
+
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+
+    assert deleted == 401
+
+    conn = sqlite3.connect(db_path)
+    remaining = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    conn.close()
+    assert remaining == 0
