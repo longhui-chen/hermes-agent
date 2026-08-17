@@ -14,6 +14,8 @@ watchdogs, digests) must be completely unaffected; that is `test_run_one_job.py`
 today and stays that way (see the added `..._app_slug_absent_is_unaffected`
 tests here as an explicit regression pin).
 """
+from unittest.mock import MagicMock, patch
+
 import cron.scheduler as s
 from gateway.session_context import import_attempts_snapshot
 
@@ -306,3 +308,120 @@ def test_no_ledger_scope_leaks_outside_run_one_job(monkeypatch):
     _patch_pipeline(monkeypatch, success=True, final="done", import_attempts=[{"ok": True}])
     s.run_one_job({"id": "j-scope-check", "name": "sync", "app_slug": "app-a"})
     assert import_attempts_snapshot() == []
+
+
+# --- semantic coexistence with main's maintenance-task session-id branch -----
+# Zero textual conflicts on rebase (327a609e03) only proves the two patches
+# don't physically overlap in the source — it does not prove they cooperate
+# on the same job. Main's branch (cron/scheduler.py:run_job, ~3308) picks a
+# `cron_task_<id>_<ts>` session id — which _execution_headers then turns into
+# an `X-Zettlab-App-Maintenance-Task-Id` header — whenever the job's prompt
+# contains `maintenance-key=`. Ours picks the verdict based on `app_slug`. A
+# real local-server-provisioned refresh maintenance task carries BOTH markers
+# at once (the prompt is server-rendered and always has maintenance-key=; the
+# app_slug is server-stamped on the same job). These tests drive run_one_job
+# through the REAL run_job (only the AIAgent/SessionDB/provider boundary is
+# mocked, unlike _patch_pipeline above which replaces run_job wholesale), so
+# main's session-id branch and our ledger-based verdict both actually run on
+# one job, one call — not two independently-mocked halves that merely don't
+# collide on disk.
+
+def _run_via_real_run_job(tmp_path, job, *, run_conversation_result="final reply",
+                           record_attempts=()):
+    """Drive job through run_one_job -> the real run_job, mocked only at the
+    external boundary (LLM/session-db/provider). Returns
+    (ok, mark_calls, session_id_passed_to_AIAgent)."""
+    marks = []
+
+    def fake_run_conversation(prompt, **kwargs):
+        from gateway.session_context import record_import_attempt
+        for attempt in record_attempts:
+            record_import_attempt(**attempt)
+        return {"final_response": run_conversation_result}
+
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_state.SessionDB", return_value=MagicMock()), \
+         patch(
+             "hermes_cli.runtime_provider.resolve_runtime_provider",
+             return_value={
+                 "api_key": "test-key", "base_url": "https://example.invalid/v1",
+                 "provider": "openrouter", "api_mode": "chat_completions",
+             },
+         ), \
+         patch("run_agent.AIAgent") as mock_agent_cls, \
+         patch.object(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt"), \
+         patch.object(s, "_deliver_result", lambda *a, **k: None), \
+         patch.object(
+             s, "mark_job_run",
+             lambda jid, ok, err=None, delivery_error=None, **_kw: marks.append((jid, ok, err)),
+         ):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent_cls.return_value = mock_agent
+
+        ok = s.run_one_job(job)
+        session_id = mock_agent_cls.call_args.kwargs["session_id"]
+
+    return ok, marks, session_id
+
+
+_MAINTENANCE_PROMPT = "fetch today's forecast maintenance-key=abc123 and import it"
+
+
+def test_app_slug_and_maintenance_key_both_apply_on_the_same_job(tmp_path):
+    """The real-world case: both markers present. main's session-kind branch
+    AND our import-ledger verdict must both fire on this one run."""
+    job = {
+        "id": "coexist-both",
+        "name": "hangzhou weather sync",
+        "prompt": _MAINTENANCE_PROMPT,
+        "app_slug": "hangzhou-weather-live",
+    }
+    ok, marks, session_id = _run_via_real_run_job(
+        tmp_path, job, record_attempts=[{"ok": True}],
+    )
+
+    assert ok is True
+    # main's branch: session id is the cron_task_<id>_<ts> form.
+    assert session_id.startswith("cron_task_coexist-both_")
+    # our branch: verdict came from the import ledger, not "agent replied".
+    assert marks == [("coexist-both", True, None)]
+
+
+def test_app_slug_present_without_maintenance_key_verdict_still_applies(tmp_path):
+    """app_slug alone (no maintenance-key= in the prompt): our verdict must
+    still fire — it does not depend on main's session-kind marker — while
+    the session id stays in the plain (non-task) form."""
+    job = {
+        "id": "coexist-slug-only",
+        "name": "sync",
+        "prompt": "fetch today's forecast and import it",
+        "app_slug": "hangzhou-weather-live",
+    }
+    ok, marks, session_id = _run_via_real_run_job(tmp_path, job, record_attempts=[])
+
+    assert not session_id.startswith("cron_task_")
+    assert session_id.startswith("cron_coexist-slug-only_")
+    # zero import attempts + app_slug present -> our hard-error branch,
+    # despite the agent having replied non-emptily.
+    assert marks == [("coexist-slug-only", False, "no import attempted in this run")]
+
+
+def test_maintenance_key_present_without_app_slug_verdict_does_not_apply(tmp_path):
+    """maintenance-key= alone (no app_slug on the job): main's session-kind
+    branch still fires — it does not depend on our field — but our verdict
+    override must NOT engage; the job is judged by the ordinary agent-reply
+    rule, unaffected by there being zero import attempts."""
+    job = {
+        "id": "coexist-key-only",
+        "name": "some other bound task",
+        "prompt": _MAINTENANCE_PROMPT,
+    }
+    ok, marks, session_id = _run_via_real_run_job(tmp_path, job, record_attempts=[])
+
+    assert session_id.startswith("cron_task_coexist-key-only_")
+    # Ordinary success: agent replied non-emptily, no app_slug to override it.
+    assert marks == [("coexist-key-only", True, None)]
