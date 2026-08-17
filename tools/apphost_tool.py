@@ -202,10 +202,9 @@ APP_HOST_SCHEMA = {
             "source_subdir": {
                 "type": "string",
                 "description": (
-                    "Required for publish: relative path below the current "
-                    "agent output root (note: that root does NOT include the "
-                    "per-session subdirectory the system prompt appends). "
-                    "Never an absolute path."
+                    "Legacy publish override only. Leave omitted for a new "
+                    "application: App Host publishes the sole verified build "
+                    "from the current session automatically."
                 ),
             },
             "data_refresh": {
@@ -435,7 +434,7 @@ def _require_source_subdir(args):
     """
     source_subdir = str(args.get("source_subdir", "") or "").strip()
     if not source_subdir:
-        raise _BadRequest("publish 需要提供 source_subdir 参数")
+        return ""
     if len(source_subdir) > _MAX_SOURCE_SUBDIR_CHARS:
         raise _BadRequest("source_subdir 过长")
     if any(ch in source_subdir for ch in ("\x00", "\n", "\r", "\\")):
@@ -638,10 +637,10 @@ def _build_request(action, args):
         mode = str(args.get("mode", "") or "").strip()
         if mode not in _PUBLISH_MODES:
             raise _BadRequest("publish 需要 mode 参数（install/reload）")
-        body = {
-            "mode": mode,
-            "source_subdir": _require_source_subdir(args),
-        }
+        body = {"mode": mode}
+        source_subdir = _require_source_subdir(args)
+        if source_subdir:
+            body["source_subdir"] = source_subdir
         note = str(args.get("note", "") or "").strip()
         if note:
             body["note"] = note
