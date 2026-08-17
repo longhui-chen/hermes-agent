@@ -37,6 +37,17 @@ def test_secret_scan_accepts_relay_source_and_empty_assignment(tmp_path):
     assert _module().scan_tree(tmp_path) == []
 
 
+def test_secret_scan_accepts_schema_objects_and_known_oauthlib_example(tmp_path):
+    (tmp_path / "discovery.json").write_text(
+        '{"public_key":{"description":"Schema field metadata"}}\n'
+    )
+    (tmp_path / "oauthlib_example.py").write_text(
+        "Authorization: Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW\n"
+    )
+
+    assert _module().scan_tree(tmp_path) == []
+
+
 def test_secret_scan_rejects_basic_headers_and_common_config_suffixes(tmp_path):
     (tmp_path / "runtime.env").write_text("LANGFUSE_BASIC_AUTH=Basic YTpi\n")
     (tmp_path / "otel.properties").write_text(

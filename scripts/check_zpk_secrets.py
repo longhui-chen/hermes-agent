@@ -33,11 +33,16 @@ BINARY_RULES = (
         ),
     ),
 )
+SAFE_BINARY_MATCHES = {
+    "static-basic-auth": {
+        b"Authorization: Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW",
+    },
+}
 CONFIG_ASSIGNMENT = re.compile(
     rb"(?im)(?:^|[{,])\s*(?:export\s+)?[\"']?"
     rb"(?:HERMES_LANGFUSE_(?:PUBLIC|SECRET)_KEY|LANGFUSE_(?:PUBLIC|SECRET)_KEY|"
     rb"LANGFUSE_BASIC_AUTH|public_key|secret_key|ingestion_key)[\"']?\s*[:=]\s*"
-    rb"(?![\"']{2}\s*(?:[,}#]|$)|null\b)\S+"
+    rb"(?![\"']{2}\s*(?:[,}#]|$)|null\b|[{\[])\S+"
 )
 MAX_FINDINGS = 50
 
@@ -48,7 +53,8 @@ def _scan_stream(handle: BinaryIO, *, config_like: bool) -> set[str]:
     while chunk := handle.read(CHUNK_BYTES):
         data = previous + chunk
         for name, pattern in BINARY_RULES:
-            if pattern.search(data):
+            safe_matches = SAFE_BINARY_MATCHES.get(name, set())
+            if any(match.group(0) not in safe_matches for match in pattern.finditer(data)):
                 findings.add(name)
         if config_like and CONFIG_ASSIGNMENT.search(data):
             findings.add("nonempty-monitoring-key-assignment")
