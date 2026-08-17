@@ -282,6 +282,11 @@ def _extract_parallel_scope_paths(
     if tool_name not in _PATH_SCOPED_TOOLS:
         return []
 
+    # NAS search injects chat preview cards via local-server (side effect,
+    # not a workspace read): empty scope → sequential barrier.
+    if tool_name == "search_files" and (function_args.get("target") or "") == "nas":
+        return []
+
     raw_paths: List[str] = []
     if tool_name == "patch" and (function_args.get("mode") or "replace") == "patch":
         raw_paths.extend(_extract_file_mutation_targets(tool_name, function_args))

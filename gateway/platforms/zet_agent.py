@@ -2953,9 +2953,16 @@ class ZetAgentAdapter(APIServerAdapter):
             or _zettlab_request_account_id.get()
             or ""
         ).strip()
+        # Always strip the private principal metadata from request_overrides
+        # before it can reach the AIAgent (and the LLM request body). Reading
+        # the ContextVar first and only popping inside an `or` short-circuits
+        # the pop whenever the ContextVar is truthy, which leaks
+        # `_zettlab_auth_principal` into the OpenAI SDK call and crashes the
+        # turn with `TypeError: unexpected keyword argument`.
+        principal_override = agent_request_overrides.pop("_zettlab_auth_principal", "")
         session_owner_id = str(
             zettlab_auth_principal()
-            or agent_request_overrides.pop("_zettlab_auth_principal", "")
+            or principal_override
             or ""
         ).strip()
         plan_auto_execute = agent_request_overrides.pop(

@@ -15878,6 +15878,36 @@ def test_tts_stream_begin_and_stop_lifecycle(monkeypatch):
         assert server._tts_stream_state is None
 
 
+def test_tts_stream_begin_propagates_profile_context(monkeypatch):
+    from contextvars import ContextVar
+
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    profile_marker: ContextVar[str] = ContextVar(
+        "tts_profile_marker",
+        default="missing",
+    )
+    seen = {}
+    observed = threading.Event()
+
+    def scoped_stream(_text_queue, _stop, done, **_kwargs):
+        seen["profile"] = profile_marker.get()
+        observed.set()
+        done.set()
+
+    sys.modules["tools.tts_tool"].stream_tts_to_speaker = scoped_stream
+    token = profile_marker.set("profile-a")
+    try:
+        assert server._tts_stream_begin() is not None
+        assert observed.wait(1)
+    finally:
+        profile_marker.reset(token)
+        server._tts_stream_stop(user_barge=False)
+
+    assert seen["profile"] == "profile-a"
+
+
 def test_tts_stream_begin_barges_in_on_previous_pipeline(monkeypatch):
     """A new turn's pipeline stops the previous turn's speech (one speaker)."""
     monkeypatch.setenv("HERMES_VOICE_TTS", "1")
