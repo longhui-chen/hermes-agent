@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import tools.skills_tool as skills_tool_module
 from tools.skills_tool import (
     _skill_view_with_bump,
     reset_skill_view_dedup,
@@ -87,6 +88,33 @@ class TestSkillViewDedup:
         r1 = json.loads(_skill_view_with_bump(args, task_id=None))
         r2 = json.loads(_skill_view_with_bump(args, task_id=None))
         assert "Step one" in r2.get("content", "")
+
+    def test_attested_trusted_view_is_not_deduped(self, skills_home, monkeypatch):
+        skill_path = skills_home / "skills" / "demo-dedup-skill" / "SKILL.md"
+        calls = 0
+
+        def _attested_view(name, file_path=None, task_id=None):
+            nonlocal calls
+            calls += 1
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": name,
+                    "content": "trusted instructions",
+                    "_source_path": str(skill_path),
+                    "_zet_agent_trusted_skill_attestation": f"proof-{calls}",
+                }
+            )
+
+        monkeypatch.setattr(skills_tool_module, "skill_view", _attested_view)
+
+        first = _view("demo-dedup-skill")
+        second = _view("demo-dedup-skill")
+
+        assert calls == 2
+        assert first["_zet_agent_trusted_skill_attestation"] == "proof-1"
+        assert second["_zet_agent_trusted_skill_attestation"] == "proof-2"
+        assert second.get("dedup") is None
 
     def test_compression_hook_importable(self):
         # conversation_compression imports this lazily; keep the seam stable.

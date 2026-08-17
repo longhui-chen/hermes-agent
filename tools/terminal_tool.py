@@ -6159,97 +6159,6 @@ def _run_camera_runtime_command_if_allowed(
             "camera_runtime_direct": True,
         }, ensure_ascii=False)
 
-
-def _run_printer3d_runtime_command_if_allowed(
-    command: str,
-    *,
-    cwd: str,
-    timeout: int,
-) -> Optional[str]:
-    parsed = _parse_printer3d_runtime_command(command)
-    if parsed is None:
-        return _printer3d_runtime_shell_guard_result(command)
-    if not _ensure_sensitive_runtime_boundary():
-        return json.dumps({
-            "output": "",
-            "exit_code": -1,
-            "error": "3D-printer runtime process memory boundary is unavailable",
-            "printer3d_runtime_direct": True,
-        }, ensure_ascii=False)
-
-    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
-    script = Path(parsed.argv[1])
-    expected_digest: Optional[str] = None
-    try:
-        expected_digest = anchor.file_digests.get(script.relative_to(anchor.resolved_root).as_posix())
-        identities_match = (
-            anchor is not None
-            and expected_digest is not None
-            and _path_identity(anchor.resolved_root) == parsed.root_identity
-            and _path_identity(script) == parsed.script_identity
-            and _connector_runtime_path_is_trusted(
-                script,
-                anchor.resolved_root,
-                expected_root_identity=parsed.root_identity,
-            )
-            and _printer3d_runtime_manifest_allows(anchor, script.name)
-        )
-    except (OSError, AttributeError):
-        identities_match = False
-    if not identities_match:
-        return json.dumps({
-            "output": "",
-            "exit_code": -1,
-            "error": "3D-printer runtime package identity or capability is unavailable",
-            "printer3d_runtime_direct": True,
-        }, ensure_ascii=False)
-
-    try:
-        script_bytes = _read_connector_runtime_script_bytes(
-            script,
-            expected_identity=parsed.script_identity,
-            expected_digest=expected_digest,
-        )
-        from tools.environments.local import build_printer3d_runtime_env
-        from tools.trusted_direct_runner import run_trusted_python_script
-
-        trusted_env = build_printer3d_runtime_env()
-        trusted_secrets = {
-            key: trusted_env.pop(key)
-            for key in ("ZETTLAB_AGENT_ACTION_TOKEN", "ZETTLAB_BUSINESS_EXECUTION_TOKEN")
-        }
-        secret_values = list(trusted_secrets.values())
-        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-        completed = run_trusted_python_script(
-            script=script,
-            argv=parsed.argv[1:],
-            cwd=Path(run_cwd),
-            base_env={},
-            injected_env=trusted_env,
-            injected_secrets=trusted_secrets,
-            timeout=max(1, min(timeout, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS)),
-            secret_values=secret_values,
-            script_bytes=script_bytes,
-            stdlib_only=True,
-        )
-        payload = json.loads(_connector_runtime_result_json(
-            command=command,
-            output=completed.output,
-            returncode=completed.returncode,
-            secret_values=secret_values,
-            timed_out=completed.timed_out,
-        ))
-        payload.pop("connector_runtime_direct", None)
-        payload["printer3d_runtime_direct"] = True
-        return json.dumps(payload, ensure_ascii=False)
-    except Exception as exc:
-        return json.dumps({
-            "output": "",
-            "exit_code": -1,
-            "error": f"3D-printer runtime execution failed: {type(exc).__name__}",
-            "printer3d_runtime_direct": True,
-        }, ensure_ascii=False)
-
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
     script = Path(parsed.argv[1])
     expected_digest: Optional[str] = None
@@ -6326,6 +6235,102 @@ def _run_printer3d_runtime_command_if_allowed(
             "exit_code": -1,
             "error": f"Camera runtime execution failed: {type(exc).__name__}",
             "camera_runtime_direct": True,
+        }, ensure_ascii=False)
+
+
+def _run_printer3d_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_printer3d_runtime_command(command)
+    if parsed is None:
+        return _printer3d_runtime_shell_guard_result(command)
+    if not _ensure_sensitive_runtime_boundary():
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "3D-printer runtime process memory boundary is unavailable",
+            "printer3d_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(parsed.argv[1])
+    expected_digest: Optional[str] = None
+    try:
+        expected_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
+        identities_match = (
+            anchor is not None
+            and expected_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+            and _printer3d_runtime_manifest_allows(anchor, script.name)
+        )
+    except (OSError, AttributeError):
+        identities_match = False
+    if not identities_match:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "3D-printer runtime package identity or capability is unavailable",
+            "printer3d_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=expected_digest,
+        )
+        from tools.environments.local import build_printer3d_runtime_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        trusted_env = build_printer3d_runtime_env()
+        trusted_secrets = {
+            key: trusted_env.pop(key)
+            for key in (
+                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+            )
+        }
+        secret_values = list(trusted_secrets.values())
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=Path(run_cwd),
+            base_env={},
+            injected_env=trusted_env,
+            injected_secrets=trusted_secrets,
+            timeout=max(1, min(timeout, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            secret_values=secret_values,
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+        payload = json.loads(_connector_runtime_result_json(
+            command=command,
+            output=completed.output,
+            returncode=completed.returncode,
+            secret_values=secret_values,
+            timed_out=completed.timed_out,
+        ))
+        payload.pop("connector_runtime_direct", None)
+        payload["printer3d_runtime_direct"] = True
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"3D-printer runtime execution failed: {type(exc).__name__}",
+            "printer3d_runtime_direct": True,
         }, ensure_ascii=False)
 
 

@@ -1255,8 +1255,445 @@ def test_transport_skill_selection_is_separate_from_user_text_flow():
         clear_turn_vars(turn_tokens)
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("拍一张快照", True),
+        ("请帮我拍张快照", True),
+        ("获取当前快照", True),
+        ("返回当前最新的一张图片", False),
+        ("总结“拍一张快照”这句话", False),
+        ("把这张图片压缩一下", False),
+    ],
+)
+def test_camera_shortcut_only_accepts_bounded_snapshot_intent(message, expected):
+    agent = _FakeAgent()
+
+    task = response_mode._skill_direct_task_context(agent, message)
+
+    assert task.camera_applicable is expected
+    assert not task.camera_explicit
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "看下摄像头下现在有多少人",
+        "获取摄像头最新画面并统计人数",
+        "分析摄像头当前画面有没有人",
+        "count the people in the current camera frame",
+    ],
+)
+def test_camera_analysis_intent_uses_camera_scope(message):
+    task = response_mode._skill_direct_task_context(_FakeAgent(), message)
+
+    assert task.camera_applicable
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "按顺序检查摄像头、3D 打印机、电脑和网络位置的连接状态",
+        "检查一下摄像头是否可用",
+        "check camera connection status",
+    ],
+)
+def test_camera_inventory_intent_uses_list_only_scope(message):
+    task = response_mode._skill_direct_task_context(_FakeAgent(), message)
+
+    assert task.camera_applicable
+    assert task.camera_inventory_only
+
+
+def test_broad_hardware_inventory_grants_camera_list_and_printer_read():
+    task = response_mode._skill_direct_task_context(
+        _FakeAgent(),
+        "检查下当前已连接的硬件状态",
+    )
+
+    assert task.camera_applicable
+    assert task.camera_inventory_only
+    assert task.printer3d_applicable
+
+
+def test_specific_pc_inventory_does_not_grant_camera_or_printer_scope():
+    task = response_mode._skill_direct_task_context(
+        _FakeAgent(),
+        "查看硬件连接中的电脑",
+    )
+
+    assert not task.camera_applicable
+    assert not task.printer3d_applicable
+
+
+def test_camera_media_intent_is_not_inventory_only():
+    task = response_mode._skill_direct_task_context(
+        _FakeAgent(),
+        "获取摄像头最新画面并统计人数",
+    )
+
+    assert task.camera_applicable
+    assert not task.camera_inventory_only
+
+
+def test_camera_inventory_command_policy_allows_list_but_blocks_capture(
+    monkeypatch,
+):
+    def camera_argv(args):
+        command = str(args.get("command") or "")
+        if command.endswith(" list"):
+            return ["python3", "camera_connector.py", "list"]
+        if " snap --camera-id " in command:
+            return [
+                "python3",
+                "camera_connector.py",
+                "snap",
+                "--camera-id",
+                command.rsplit(" ", 1)[-1],
+            ]
+        return None
+
+    monkeypatch.setattr(response_mode, "_camera_runtime_argv", camera_argv)
+    assert response_mode._camera_command_policy(
+        {"command": "python3 camera_connector.py list"},
+        inventory_only=True,
+    )
+    assert not response_mode._camera_command_policy(
+        {
+            "command": (
+                "python3 camera_connector.py snap --camera-id cam_front"
+            )
+        },
+        camera_ids=frozenset({"cam_front"}),
+        inventory_only=True,
+    )
+
+
+def test_unrelated_people_count_does_not_use_camera_scope():
+    task = response_mode._skill_direct_task_context(
+        _FakeAgent(),
+        "统计这份文档里提到了多少人",
+    )
+
+    assert not task.camera_applicable
+
+
+def test_camera_continuation_requires_same_session_recent_snapshot():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    response_mode._CAMERA_RESUME_SESSIONS.clear()
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:camera-continuation",
+        session_id="zettlab:user:main:camera-continuation",
+    )
+    first_turn = set_turn_vars(turn_id="camera-source-turn")
+    try:
+        turn_identity = response_mode._current_skill_direct_turn_identity()
+        assert turn_identity is not None
+        response_mode._remember_camera_resume_locked(
+            turn_identity=turn_identity,
+            now=response_mode.time.monotonic(),
+        )
+    finally:
+        clear_turn_vars(first_turn)
+
+    continuation_turn = set_turn_vars(turn_id="camera-continuation-turn")
+    try:
+        task = response_mode._skill_direct_task_context(
+            _FakeAgent(),
+            "再获取下最新的画面，统计下当前画面有多少个人",
+        )
+        assert task.camera_applicable
+    finally:
+        clear_turn_vars(continuation_turn)
+        clear_session_vars(session_tokens)
+
+    other_session_tokens = set_session_vars(
+        session_key="zettlab:user:main:other-session",
+        session_id="zettlab:user:main:other-session",
+    )
+    other_turn = set_turn_vars(turn_id="camera-other-turn")
+    try:
+        task = response_mode._skill_direct_task_context(
+            _FakeAgent(),
+            "再获取下最新的画面，统计下当前画面有多少个人",
+        )
+        assert not task.camera_applicable
+    finally:
+        clear_turn_vars(other_turn)
+        clear_session_vars(other_session_tokens)
+        response_mode._CAMERA_RESUME_SESSIONS.clear()
+
+
+def test_camera_transport_selection_authorizes_ambiguous_display_text():
+    agent = _FakeAgent()
+
+    task = response_mode._skill_direct_task_context(
+        agent,
+        "返回当前最新的一张图片",
+        explicit_skill_slug="camsnap",
+    )
+
+    assert task.camera_applicable
+    assert task.camera_explicit
+
+
+def test_camera_list_result_extracts_response_bounded_valid_id_snapshot():
+    result = {
+        "output": json.dumps(
+            {
+                "data": {
+                    "action": "list",
+                    "status": "ok",
+                    "cameras": [
+                        {"camera_id": "cam_front", "name": "Front"},
+                        {"camera_id": "cam_back", "name": "Back"},
+                    ],
+                }
+            }
+        )
+    }
+
+    assert response_mode._camera_ids_from_terminal_result(result) == {
+        "cam_front",
+        "cam_back",
+    }
+    invalid = {
+        "output": json.dumps(
+            {
+                "data": {
+                    "action": "list",
+                    "status": "ok",
+                    "cameras": [{"camera_id": "../../secret"}],
+                }
+            }
+        )
+    }
+    assert response_mode._camera_ids_from_terminal_result(invalid) is None
+    many_cameras = {
+        "output": json.dumps(
+            {
+                "data": {
+                    "action": "list",
+                    "status": "ok",
+                    "cameras": [
+                        {"camera_id": f"cam_{index}"}
+                        for index in range(128)
+                    ],
+                }
+            }
+        )
+    }
+    assert len(response_mode._camera_ids_from_terminal_result(many_cameras) or ()) == 128
+    oversized_output = {"output": "x" * (1024 * 1024 + 1)}
+    assert response_mode._camera_ids_from_terminal_result(oversized_output) is None
+
+
+def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path):
+    from agent import secret_scope as secret_scope_module
+
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    frame = output_root / "current.jpg"
+    frame.write_bytes(b"jpeg")
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"jpeg")
+    symlink = output_root / "linked.jpg"
+    symlink.symlink_to(outside)
+    scope_token = secret_scope_module.set_secret_scope(
+        {"ZET_AGENT_OUTPUT_DIR": str(output_root)}
+    )
+    try:
+        result = {
+            "output": json.dumps(
+                {
+                    "data": {
+                        "action": "snap",
+                        "status": "ok",
+                        "attachment_path": str(frame),
+                    }
+                }
+            )
+        }
+        assert response_mode._camera_attachment_path_from_terminal_result(
+            result
+        ) == str(frame.resolve())
+        assert response_mode._trusted_camera_attachment_path(str(outside)) is None
+        assert response_mode._trusted_camera_attachment_path(str(symlink)) is None
+    finally:
+        secret_scope_module.reset_secret_scope(scope_token)
+
+
+def test_camera_vision_scope_is_bound_to_exact_current_attachment(monkeypatch):
+    turn_tokens = set_turn_vars(turn_id="camera-vision-turn")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        task = response_mode._skill_direct_task_context(
+            agent,
+            "获取摄像头最新画面并统计人数",
+        )
+        exact_path = "/trusted/output/current.jpg"
+        monkeypatch.setattr(
+            response_mode,
+            "_trusted_camera_attachment_path",
+            lambda raw_path: str(raw_path) if raw_path == exact_path else None,
+        )
+        scope = response_mode._SkillDirectScope(
+            relative_path=response_mode._CAMERA_SKILL_PATH,
+            task_sha256=task.task_sha256,
+            turn_identity=task.turn_identity,
+            allowed_tools=frozenset({"terminal", "vision_analyze"}),
+            execution_receipt=response_mode._TrustedExecutionReceipt(
+                agent_id="main",
+                action_token="action-token",
+                business_execution_token="business-token",
+                turn_id="camera-vision-turn",
+                session_id="camera-session",
+            ),
+            camera_attachment_paths=frozenset({exact_path}),
+        )
+        agent._zet_agent_skill_direct_task = task
+        agent._zet_agent_skill_direct_scope = scope
+        agent._zet_agent_skill_direct_operation = None
+        args = {
+            "image_url": exact_path,
+            "question": "统计画面中清晰可见的人数。",
+        }
+
+        assert trusted_skill_operation_block_message(
+            agent,
+            function_name="vision_analyze",
+            function_args=args,
+        ) is None
+        result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="vision_analyze",
+            function_args=args,
+            dispatch=lambda: '{"people": 3}',
+        )
+        assert result == '{"people": 3}'
+        assert trusted_skill_allowed_tool_names(agent) == frozenset()
+
+        agent._zet_agent_skill_direct_scope = scope
+        blocked = trusted_skill_operation_block_message(
+            agent,
+            function_name="vision_analyze",
+            function_args={
+                "image_url": "/trusted/output/older.jpg",
+                "question": "统计人数",
+            },
+        )
+        assert blocked is not None
+        assert "blocked before execution" in blocked
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_types"),
+    [
+        ("帮我连接下摄像头", ("camera",)),
+        ("添加一台 3D 打印机和一个电脑节点", ("printer3d", "pc_node")),
+        ("发现附近可以连接的硬件设备", ("camera", "printer3d", "pc_node")),
+        ("Connect a camera and a 3D printer", ("camera", "printer3d")),
+        ("解释一下“帮我连接摄像头”这句话", ()),
+        ("摄像头连接失败了", ()),
+        ("查看摄像头", ()),
+        ("查看下硬件连接中的电脑", ()),
+        ("查看硬件连接中的电脑有哪些文件", ()),
+        ("查看已连接的电脑", ()),
+        ("Show connected computers", ()),
+        ("Show the computer connection status", ()),
+        ("帮我重新连接电脑", ("pc_node",)),
+    ],
+)
+def test_hardware_enrollment_fallback_is_bounded(message, expected_types):
+    assert response_mode._hardware_enrollment_requested_types(message) == expected_types
+
+
+def test_hardware_enrollment_fallback_emits_canonical_secret_free_intent():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    response = response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="帮我连接下摄像头",
+        response_text=(
+            "请前往设置页。\n\n"
+            "```zettlab-hardware-enrollment-intent\n"
+            '{"schema_version":"1","kind":"hardware",'
+            '"requested_types":["camera"],"discovery_requested":true,'
+            '"host":"192.0.2.1"}\n```'
+        ),
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    )
+
+    assert response.count("```zettlab-hardware-enrollment-intent") == 1
+    assert '"requested_types": [\n    "camera"\n  ]' in response
+    assert "192.0.2.1" not in response
+    assert '"host"' not in response
+
+
+def test_hardware_status_turn_strips_model_authored_enrollment_card():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    response = response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="按顺序检查所有已连接硬件的状态",
+        response_text=(
+            "摄像头在线，打印机当前会话未授权。\n\n"
+            "```zettlab-hardware-enrollment-intent\n"
+            '{"schema_version":"1","kind":"hardware",'
+            '"requested_types":["camera","printer3d","pc_node"],'
+            '"discovery_requested":true}\n```'
+        ),
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    )
+
+    assert response == "摄像头在线，打印机当前会话未授权。"
+
+
+def test_hardware_enrollment_fallback_ignores_non_app_and_failed_turns():
+    agent = _FakeAgent()
+    agent.platform = "telegram"
+    original = "请前往设置页。"
+
+    assert response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="帮我连接下摄像头",
+        response_text=original,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    ) == original
+    agent.platform = "zet_agent"
+    assert response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="帮我连接下摄像头",
+        response_text=original,
+        completed=False,
+        failed=True,
+        interrupted=False,
+        structured_output=False,
+    ) == original
+
+
+@pytest.mark.parametrize(
+    ("message", "explicit_skill_slug"),
+    [
+        ("拍一张快照", ""),
+        ("返回当前最新的一张图片", "camsnap"),
+    ],
+)
 def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, message, explicit_skill_slug
 ):
     from agent import secret_scope as secret_scope_module
     from gateway.session_context import clear_session_vars, set_session_vars
@@ -1282,10 +1719,25 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
     assert snapshot is not None
     monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
     monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+    def _camera_argv(args):
+        command = str(args.get("command") or "")
+        if command.endswith(" list"):
+            return ["python3", "camera_connector.py", "list"]
+        if " snap --camera-id " in command:
+            return [
+                "python3",
+                "camera_connector.py",
+                "snap",
+                "--camera-id",
+                command.rsplit(" ", 1)[-1],
+            ]
+        return None
+
+    monkeypatch.setattr(response_mode, "_camera_runtime_argv", _camera_argv)
     monkeypatch.setattr(
         response_mode,
-        "_camera_runtime_argv",
-        lambda _args: ["python3", "camera_connector.py", "list"],
+        "_trusted_camera_attachment_path",
+        lambda raw_path: str(raw_path) if raw_path else None,
     )
 
     secret_token = secret_scope_module.set_secret_scope(
@@ -1308,23 +1760,45 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
 
         agent = _FakeAgent()
         agent.platform = "zet_agent"
-        reset_trusted_skill_execution(agent, "查看下我的摄像头")
+        reset_trusted_skill_execution(
+            agent,
+            message,
+            explicit_skill_slug=explicit_skill_slug,
+        )
         result = skills_tool_module.skill_view("camsnap")
         assert apply_trusted_skill_execution(
             agent,
             function_name="skill_view",
             function_result=result,
         )
-        assert trusted_skill_allowed_tool_names(agent) == {"terminal"}
+        assert trusted_skill_allowed_tool_names(agent) == {
+            "terminal",
+            "vision_analyze",
+        }
+        policy_error = trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args={
+                "command": "true",
+                "workdir": "agent_output",
+            },
+        )
+        assert policy_error is not None
+        assert "command-policy error" in policy_error
+
+        list_args = {
+            "command": "python3 camera_connector.py list",
+            "workdir": "agent_output",
+        }
         assert trusted_skill_operation_block_message(
             agent,
             function_name="terminal",
-            function_args={"command": "python3 camera_connector.py list"},
+            function_args=list_args,
         ) is None
         with pytest.raises(PermissionError):
             build_camera_runtime_env()
 
-        def _dispatch():
+        def _frozen_camera_env():
             frozen = build_camera_runtime_env()
             assert frozen == {
                 "ZET_AGENT_ID": "main",
@@ -1334,9 +1808,25 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
                 "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
                 "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",
             }
+
+        def _dispatch_list():
+            _frozen_camera_env()
             return json.dumps(
                 {
-                    "output": "",
+                    "output": json.dumps(
+                        {
+                            "data": {
+                                "action": "list",
+                                "status": "ok",
+                                "cameras": [
+                                    {
+                                        "camera_id": "cam_front",
+                                        "name": "Front camera",
+                                    }
+                                ],
+                            }
+                        }
+                    ),
                     "exit_code": 0,
                     "camera_runtime_direct": True,
                 }
@@ -1345,9 +1835,73 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
         response_mode.dispatch_trusted_skill_operation(
             agent,
             function_name="terminal",
-            function_args={"command": "python3 camera_connector.py list"},
-            dispatch=_dispatch,
+            function_args=list_args,
+            dispatch=_dispatch_list,
         )
+
+        invented_error = trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args={
+                "command": "python3 camera_connector.py snap --camera-id 2",
+                "workdir": "agent_output",
+            },
+        )
+        assert invented_error is not None
+        assert "camera_id returned by that list" in invented_error
+
+        snap_args = {
+            "command": (
+                "python3 camera_connector.py snap --camera-id cam_front"
+            ),
+            "workdir": "agent_output",
+        }
+        assert trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args=snap_args,
+        ) is None
+
+        def _dispatch_snap():
+            _frozen_camera_env()
+            return json.dumps(
+                {
+                    "output": json.dumps(
+                        {
+                            "data": {
+                                "action": "snap",
+                                "status": "ok",
+                                "camera_id": "cam_front",
+                                "attachment_path": "/trusted/output/current.jpg",
+                            }
+                        }
+                    ),
+                    "exit_code": 0,
+                    "camera_runtime_direct": True,
+                }
+            )
+
+        response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="terminal",
+            function_args=snap_args,
+            dispatch=_dispatch_snap,
+        )
+        vision_args = {
+            "image_url": "/trusted/output/current.jpg",
+            "question": "统计画面中清晰可见的人数。",
+        }
+        assert trusted_skill_operation_block_message(
+            agent,
+            function_name="vision_analyze",
+            function_args=vision_args,
+        ) is None
+        assert response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="vision_analyze",
+            function_args=vision_args,
+            dispatch=lambda: '{"people": 2}',
+        ) == '{"people": 2}'
         with pytest.raises(PermissionError):
             build_camera_runtime_env()
     finally:
@@ -1355,6 +1909,89 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
         secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_camsnap_repeat_view_mints_fresh_scope_for_next_turn(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "presets"
+    video_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    camera_dir = presets_dir / "skills" / "camsnap"
+    video_dir.mkdir(parents=True)
+    camera_dir.mkdir(parents=True)
+    video_bytes = b"# trusted video edit skill\n"
+    camera_bytes = b"# trusted camsnap skill\n"
+    (video_dir / "SKILL.md").write_bytes(video_bytes)
+    (camera_dir / "SKILL.md").write_bytes(camera_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=video_bytes,
+        monkeypatch=monkeypatch,
+        extra_files={"skills/camsnap/SKILL.md": camera_bytes},
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+    monkeypatch.setattr(
+        response_mode,
+        "_camera_runtime_argv",
+        lambda _args: ["python3", "camera_connector.py", "list"],
+    )
+    monkeypatch.setattr(
+        response_mode,
+        "_capture_trusted_execution_receipt",
+        lambda turn_identity: response_mode._TrustedExecutionReceipt(
+            agent_id="main",
+            action_token="action-token",
+            business_execution_token="business-token",
+            turn_id=turn_identity[0],
+            session_id="stable-camera-session",
+        ),
+    )
+
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    task_id = "stable-camera-session"
+    skills_tool_module.reset_skill_view_dedup(task_id)
+    attestations = []
+    try:
+        for turn_id in ("camera-turn-1", "camera-turn-2"):
+            turn_tokens = set_turn_vars(turn_id=turn_id)
+            try:
+                reset_trusted_skill_execution(
+                    agent,
+                    "查看摄像头最新快照",
+                    explicit_skill_slug="camsnap",
+                )
+                result = skills_tool_module._skill_view_with_bump(
+                    {"name": "camsnap"},
+                    task_id=task_id,
+                )
+                payload = json.loads(result)
+                assert payload.get("dedup") is None
+                attestations.append(
+                    payload[response_mode._ATTESTATION_FIELD]
+                )
+                assert apply_trusted_skill_execution(
+                    agent,
+                    function_name="skill_view",
+                    function_result=result,
+                )
+                assert trusted_skill_operation_block_message(
+                    agent,
+                    function_name="terminal",
+                    function_args={
+                        "command": "python3 camera_connector.py list"
+                    },
+                ) is None
+            finally:
+                clear_turn_vars(turn_tokens)
+    finally:
+        skills_tool_module.reset_skill_view_dedup(task_id)
+
+    assert len(set(attestations)) == 2
 
 
 def test_camsnap_skill_cannot_activate_for_unrelated_task_flow(

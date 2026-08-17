@@ -326,6 +326,21 @@ TOOLSETS = {
         "includes": []
     },
 
+    "zettlab_pc": {
+        "description": "Use locally approved files and semantic Computer Use on the connected desktop",
+        "tools": ["pc_node_status", "pc_file", "pc_ui"],
+        "includes": []
+    },
+
+    # Load-bearing catalog entry for the same reverse-mapping path as
+    # zettlab_apphost/zettlab_pc. Without it, hermes-zet-agent contains the
+    # tool statically but _get_platform_tools drops it before model assembly.
+    "zettlab_ssh": {
+        "description": "Use SSH connections trusted for the current Agent and Chat",
+        "tools": ["ssh_control"],
+        "includes": []
+    },
+
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
@@ -541,7 +556,7 @@ TOOLSETS = {
         # tools are scoped to the active generated-app profile and must not be
         # advertised by messaging or Cron platforms.
         "tools": _HERMES_CORE_TOOLS + [
-            "call_agent", "app_host", "app_data", "desktop_pet_creator"
+            "call_agent", "app_host", "app_data", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "ssh_control"
         ],
         "includes": []
     },

@@ -15,6 +15,7 @@ PROTECTED_TREES = (
     "optional-skills",
     "plugins",
     "skills",
+    "tools",
     "venv",
 )
 IGNORED_DIRECTORY_NAMES = {
@@ -71,7 +72,9 @@ def find_missing_runtime_paths(source_root: Path, stage_root: Path) -> list[Path
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage_root", type=Path, help="staged hermes-agent payload root")
+    parser.add_argument(
+        "stage_root", type=Path, help="staged hermes-agent payload root"
+    )
     parser.add_argument(
         "--source-root",
         type=Path,
