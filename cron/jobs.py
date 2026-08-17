@@ -2135,44 +2135,50 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
 # request body, never editable via update_job (see _IMMUTABLE_JOB_FIELDS
 # below) — so cron/scheduler.py's end-of-run verdict can tell an
 # import-serving job apart from an ordinary reminder/report job on the same
-# profile. Mirrors zettlab-local-server's internal/apphost/slug.go
-# slugPattern exactly, since this value must already have passed that check
-# on the writer's side; a mismatch here means the writer sent garbage, not
-# that this pattern should be loosened to fit it.
-_APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
-# Bounded operation-name shape (dot allowed for names like "data.import").
-# Deliberately NOT pinned to the literal "data.import": cron/scheduler.py
-# does not read this field for its verdict (the turn-scoped import ledger
-# already only records data.import outcomes), so over-constraining it here
-# would just add a second field that can silently drift from the contract.
-_IMPORT_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# profile.
+#
+# Deliberately NOT the app-slug business format (local-server's
+# internal/apphost/slug.go slugPattern): the format rule belongs to whoever
+# creates apps, not to this storage layer. Duplicating it here would give the
+# contract two sources of truth — the moment local-server legitimately widens
+# its own rule, every job it provisions for a slug outside OUR copy of the
+# rule fails create_job with a 400, which fails the app's entire publish
+# transaction. Validate only what this layer actually needs as the field's
+# custodian: a safe, bounded opaque string that cannot corrupt jobs.json or
+# smuggle a path/newline into it. Same reasoning already applied to
+# import_operation not being pinned to the literal "data.import".
+_MAX_APP_SLUG_LENGTH = 128
+_MAX_IMPORT_OPERATION_LENGTH = 128
+
+
+def _validate_opaque_job_token(value: Any, *, field: str, max_length: int) -> Optional[str]:
+    """Safety-only bound for a server-stamped opaque string field: non-empty,
+    length-capped, no control characters (incl. newlines — jobs.json is
+    line-oriented JSON in places and logs embed this value verbatim), no path
+    separators (this value never becomes a filesystem path component today,
+    but a future caller treating it as one must not inherit a traversal
+    payload from here). Absent is fine; present-but-unsafe fails loudly
+    rather than silently creating a job that can never be judged."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    text = value.strip()
+    if not text or len(text) > max_length:
+        raise ValueError(f"{field} must be 1-{max_length} characters")
+    if any(ord(ch) < 0x20 for ch in text) or "/" in text or "\\" in text:
+        raise ValueError(f"{field} must not contain control characters or path separators")
+    return text
 
 
 def _validate_app_slug(value: Any) -> Optional[str]:
-    """Validate ADIC v1's server-stamped app_slug. Absent is fine (ordinary
-    cron jobs have none); present-but-malformed is a bug on the writer's side
-    and must fail loudly rather than silently create a job that can never be
-    judged by its import outcomes."""
-    if value is None:
-        return None
-    if not isinstance(value, str) or not _APP_SLUG_RE.fullmatch(value):
-        raise ValueError(
-            f"app_slug must match {_APP_SLUG_RE.pattern!r} (mirrors "
-            "local-server's apphost app-name slug format)"
-        )
-    return value
+    return _validate_opaque_job_token(value, field="app_slug", max_length=_MAX_APP_SLUG_LENGTH)
 
 
 def _validate_import_operation(value: Any) -> Optional[str]:
-    """Validate ADIC v1's server-stamped import_operation. See
-    _validate_app_slug for why malformed-but-present raises."""
-    if value is None:
-        return None
-    if not isinstance(value, str) or not _IMPORT_OPERATION_RE.fullmatch(value):
-        raise ValueError(
-            f"import_operation must match {_IMPORT_OPERATION_RE.pattern!r}"
-        )
-    return value
+    return _validate_opaque_job_token(
+        value, field="import_operation", max_length=_MAX_IMPORT_OPERATION_LENGTH
+    )
 
 
 def _compute_provider_model_snapshots(

@@ -90,17 +90,67 @@ async def test_app_slug_persisted_via_http_actually_drives_run_one_job_verdict(m
 
 
 @pytest.mark.asyncio
-async def test_malformed_app_slug_is_rejected_not_silently_dropped():
+async def test_empty_app_slug_is_rejected_not_silently_dropped():
     """A garbage app_slug from a misbehaving writer must fail loudly (400),
     not silently create a job that can never be judged by its import
     outcomes — that would recreate the exact silent-failure bug this
-    workstream exists to close."""
+    workstream exists to close. This layer's bound is safety-only (see the
+    module docstring), so the case worth testing here is genuinely unsafe —
+    not merely "doesn't look like a slug"."""
+    app = _make_jobs_api_app()
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/jobs", json={**_CREATE_BODY, "app_slug": ""})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_overlong_app_slug_is_rejected():
+    app = _make_jobs_api_app()
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/jobs", json={**_CREATE_BODY, "app_slug": "x" * 129})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_app_slug_with_embedded_newline_is_rejected():
     app = _make_jobs_api_app()
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post("/api/jobs", json={
-            **_CREATE_BODY, "app_slug": "Not A Valid Slug!!",
+            **_CREATE_BODY, "app_slug": "weather\ninjected-line",
         })
         assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_app_slug_with_path_separator_is_rejected():
+    app = _make_jobs_api_app()
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/jobs", json={
+            **_CREATE_BODY, "app_slug": "weather/../secrets",
+        })
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_app_slug_outside_local_servers_own_slug_format_is_still_accepted():
+    """The whole point of the safety-only bound: a value that would fail
+    local-server's own apphost slug pattern (^[a-z][a-z0-9-]{2,31}$) —
+    uppercase, spaces, underscores, or just longer than 32 chars — must NOT
+    400 here. This layer stores the value and runs truthy checks on it; it
+    does not get to veto a slug local-server considers (or later widens to
+    consider) valid. Regression pin for the exact mistake this field's
+    validation made on its first pass: copying local-server's business
+    format instead of only bounding what this layer needs as custodian."""
+    app = _make_jobs_api_app()
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/jobs", json={
+            **_CREATE_BODY, "app_slug": "Hangzhou_Weather LIVE v2 (beta)",
+        })
+        assert resp.status == 200
+        created = (await resp.json())["job"]
+
+    on_disk = get_job_raw(created["id"])
+    assert on_disk["app_slug"] == "Hangzhou_Weather LIVE v2 (beta)"
 
 
 @pytest.mark.asyncio
