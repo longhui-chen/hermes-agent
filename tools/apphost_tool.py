@@ -872,11 +872,52 @@ def _mutation_operation_outcome(status, request_body, parsed):
     return _ok({"outcome": outcome, "operation_id": operation_id, "state": terminal, "operation": receipt})
 
 
+def _record_data_import_attempt(args, result_json):
+    """ADIC v1: log one app_operation(data.import) outcome to the active
+    turn-scoped ledger (see gateway.session_context.record_import_attempt).
+
+    Every other action — including call(), whose app-level errors are
+    deliberately surfaced as ok:true (two-layer status) so the interactive
+    model can self-correct — is left completely untouched by this function.
+    Outside a cron run no scope is open, so this is a no-op: interactive
+    behavior does not change at all.
+    """
+    if str(args.get("action", "") or "").strip() != "app_operation":
+        return
+    if str(args.get("app_operation", "") or "").strip() != "data.import":
+        return
+    try:
+        parsed = json.loads(result_json)
+        if not isinstance(parsed, dict):
+            return
+        ok = parsed.get("ok") is True
+        error_code, error_message = "", ""
+        if not ok:
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                error_code = str(error.get("code", "") or "")
+                error_message = str(error.get("message", "") or "")
+            elif error is not None:
+                error_message = str(error)
+        from gateway.session_context import record_import_attempt
+        record_import_attempt(ok=ok, error_code=error_code, error_message=error_message)
+    except Exception:
+        # Bookkeeping must never break the tool response the model is
+        # waiting on.
+        pass
+
+
 def app_host_tool(args, **_kw):
     # Tool handlers must return a STRING (json-encoded) — a raw dict reaches
     # the model provider as non-string content and gets rejected (same
     # contract as list_my_channels).
     args = args or {}
+    result = _app_host_tool_dispatch(args, **_kw)
+    _record_data_import_attempt(args, result)
+    return result
+
+
+def _app_host_tool_dispatch(args, **_kw):
     action = str(args.get("action", "") or "").strip()
 
     if action == "build_env":

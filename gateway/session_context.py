@@ -140,6 +140,52 @@ def cron_attached_skills() -> tuple[str, ...]:
     """Return the immutable Skill names authorized for this Cron task."""
     return _CRON_ATTACHED_SKILLS.get()
 
+# ADIC v1 (App Data Import Contract): a bounded, task-local ledger of this
+# turn's app_host `app_operation(data.import)` outcomes. cron/scheduler.py
+# pushes a scope around one job's run_conversation call and reads the ledger
+# right before mark_job_run, so a cron verdict can tell "the app confirmed
+# the import" apart from "the agent produced a plausible reply". Not part of
+# _VAR_MAP: like _BUSINESS_EXECUTION_TOKEN, this must never mirror into
+# os.environ or forward to generic terminal/plugin/model-driving subprocesses,
+# and it must stay absent (not merely empty) for interactive turns that never
+# push a scope, so app_host's call() two-layer status is completely untouched.
+_IMPORT_ATTEMPTS: ContextVar = ContextVar("HERMES_IMPORT_ATTEMPTS", default=_UNSET)
+_IMPORT_ATTEMPTS_MAX = 64
+
+
+def push_import_attempts_scope() -> object:
+    """Open this turn's bounded data.import ledger and return its token."""
+    return _IMPORT_ATTEMPTS.set([])
+
+
+def pop_import_attempts_scope(token: object) -> None:
+    """Close the ledger opened by :func:`push_import_attempts_scope`."""
+    _IMPORT_ATTEMPTS.reset(token)
+
+
+def record_import_attempt(*, ok: bool, error_code: str = "", error_message: str = "") -> None:
+    """Append one data.import outcome to the active ledger.
+
+    No-op when no scope is open (every interactive turn, and any cron path
+    that never calls :func:`push_import_attempts_scope`) and once the ledger
+    hits its cap, so a runaway retry loop within one turn cannot grow this
+    unbounded on a memory-constrained device.
+    """
+    ledger = _IMPORT_ATTEMPTS.get()
+    if ledger is _UNSET or ledger is None or len(ledger) >= _IMPORT_ATTEMPTS_MAX:
+        return
+    ledger.append({
+        "ok": bool(ok),
+        "error_code": str(error_code or ""),
+        "error_message": str(error_message or "")[:512],
+    })
+
+
+def import_attempts_snapshot() -> list:
+    """Return this turn's recorded data.import outcomes (oldest first)."""
+    ledger = _IMPORT_ATTEMPTS.get()
+    return list(ledger) if isinstance(ledger, list) else []
+
 # Current chat turn and its structured plan-review receipt. These values are
 # consumed by skill subprocesses, so they must follow the same task-local
 # ContextVar -> child-process bridge as HERMES_SESSION_* rather than using the
