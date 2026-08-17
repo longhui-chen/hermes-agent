@@ -8952,9 +8952,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             roots: list = []
-            cursor = conn.execute("SELECT id FROM sessions WHERE id LIKE 'zettlab:%'")
-            for row in cursor.fetchall():
+            # GLOB 是大小写敏感的（LIKE 默认不敏感，会误选 ZETTLAB: 前缀的非 Zettlab 会话）；
+            # 惰性迭代 cursor，不 fetchall 全库。
+            cursor = conn.execute("SELECT id FROM sessions WHERE id GLOB 'zettlab:*'")
+            for row in cursor:
                 sid = row["id"]
+                if not sid.startswith("zettlab:"):
+                    continue
                 parts = sid.split(":")
                 if len(parts) >= 4 and parts[2] == agent_id:
                     roots.append(sid)
@@ -8983,15 +8987,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 frontier = nxt
 
             all_ids = list(found)
-            ph = ",".join("?" * len(all_ids))
-            removed_delegate_ids.extend(_delete_delegate_children(conn, all_ids))
-            conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({ph})",
-                all_ids,
-            )
-            conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", all_ids)
-            conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", all_ids)
+            # 分批删除，避免单条 IN 列表随历史无界增长、触及 SQLite 变量上限（默认 999）。
+            for i in range(0, len(all_ids), 400):
+                chunk = all_ids[i:i + 400]
+                ph = ",".join("?" * len(chunk))
+                removed_delegate_ids.extend(_delete_delegate_children(conn, chunk))
+                conn.execute(
+                    f"UPDATE sessions SET parent_session_id = NULL "
+                    f"WHERE parent_session_id IN ({ph})",
+                    chunk,
+                )
+                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(all_ids)
             return len(all_ids)

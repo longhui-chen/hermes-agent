@@ -60,3 +60,28 @@ def test_delete_sessions_for_agent_no_roots_returns_zero(tmp_path):
     finally:
         db.close()
     assert deleted == 0
+
+
+def test_delete_sessions_for_agent_ignores_uppercase_prefix(tmp_path):
+    # SQLite 的 LIKE 默认大小写不敏感，会误选 ZETTLAB: 大写前缀的同名会话；
+    # 根查询改用 GLOB（大小写敏感）+ startswith 检查后必须跳过（Codex P1）。
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    _seed(db_path, [
+        ("zettlab:alice:agent-a:root", None, 0),
+        ("ZETTLAB:alice:agent-a:UPPER", None, 0),
+    ])
+
+    db = SessionDB(db_path=db_path)
+    try:
+        deleted = db.delete_sessions_for_agent("agent-a")
+    finally:
+        db.close()
+
+    assert deleted == 1  # 只删小写 zettlab 根
+
+    conn = sqlite3.connect(db_path)
+    remaining = {r[0] for r in conn.execute("SELECT id FROM sessions")}
+    conn.close()
+    assert remaining == {"ZETTLAB:alice:agent-a:UPPER"}
