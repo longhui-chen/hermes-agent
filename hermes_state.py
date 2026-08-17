@@ -9003,18 +9003,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 frontier = nxt
 
             all_ids = list(found)
-            # 分批删除，避免单条 IN 列表随历史无界增长、触及 SQLite 变量上限（默认 999）。
-            for i in range(0, len(all_ids), _AGENT_DELETE_BATCH):
-                chunk = all_ids[i:i + _AGENT_DELETE_BATCH]
-                ph = ",".join("?" * len(chunk))
-                removed_delegate_ids.extend(_delete_delegate_children(conn, chunk))
-                conn.execute(
-                    f"UPDATE sessions SET parent_session_id = NULL "
-                    f"WHERE parent_session_id IN ({ph})",
-                    chunk,
-                )
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
+            # 一次收集全部 delegate 后代（避免对无索引 _delegate_from 每批重复全表扫描），
+            # 再统一分批删除 delegate + 主 lineage，避免单条 IN 超 SQLite 变量上限（Codex P1）。
+            delegate_ids = _collect_delegate_child_ids(conn, all_ids)
+            removed_delegate_ids.extend(delegate_ids)
+            for ids in (delegate_ids, all_ids):
+                for i in range(0, len(ids), _AGENT_DELETE_BATCH):
+                    chunk = ids[i:i + _AGENT_DELETE_BATCH]
+                    ph = ",".join("?" * len(chunk))
+                    conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
+                    conn.execute(
+                        f"UPDATE sessions SET parent_session_id = NULL "
+                        f"WHERE parent_session_id IN ({ph})",
+                        chunk,
+                    )
+                    conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(all_ids)
             return len(all_ids)
