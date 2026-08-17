@@ -24,18 +24,27 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
-def _make_source() -> SessionSource:
+@pytest.fixture(autouse=True)
+def _completed_discovery(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.mcp_discovery_in_flight",
+        lambda: False,
+    )
+
+
+def _make_source(profile: str | None = None) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
         user_id="u1",
         chat_id="c1",
         user_name="tester",
         chat_type="dm",
+        profile=profile,
     )
 
 
-def _make_event() -> MessageEvent:
-    return MessageEvent(text="/reload-mcp", source=_make_source(), message_id="m1")
+def _make_event(profile: str | None = None) -> MessageEvent:
+    return MessageEvent(text="/reload-mcp", source=_make_source(profile), message_id="m1")
 
 
 def _make_runner_with_cached_agents(num_agents: int = 2):
@@ -66,6 +75,7 @@ def _make_runner_with_cached_agents(num_agents: int = 2):
     # Build N fake cached agents with stale `tools` + `valid_tool_names`.
     runner._agent_cache = OrderedDict()
     runner._agent_cache_lock = threading.Lock()
+    runner._running_agents = {}
     for i in range(num_agents):
         stale_tool = {
             "type": "function",
@@ -77,7 +87,10 @@ def _make_runner_with_cached_agents(num_agents: int = 2):
             enabled_toolsets=None,
             disabled_toolsets=None,
         )
-        runner._agent_cache[f"session-{i}"] = (agent, f"sig-{i}")
+        runner._agent_cache[f"agent:main:telegram:dm:session-{i}"] = (
+            agent,
+            f"sig-{i}",
+        )
 
     return runner
 
@@ -106,7 +119,7 @@ async def test_reload_mcp_refreshes_cached_agent_tools():
     ]
 
     with (
-        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.shutdown_mcp_profile"),
         patch("tools.mcp_tool.discover_mcp_tools", return_value=["HassTurnOn", "HassTurnOff"]),
         patch.dict("tools.mcp_tool._servers", {"homeassistant": object()}, clear=True),
         patch("model_tools.get_tool_definitions", return_value=fresh_tool_defs),
@@ -136,7 +149,7 @@ async def test_reload_mcp_handles_empty_agent_cache():
     assert len(runner._agent_cache) == 0
 
     with (
-        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.shutdown_mcp_profile"),
         patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
         patch.dict("tools.mcp_tool._servers", {}, clear=True),
         patch("model_tools.get_tool_definitions", return_value=[]),
@@ -147,13 +160,27 @@ async def test_reload_mcp_handles_empty_agent_cache():
 
 
 @pytest.mark.asyncio
+async def test_reload_mcp_failure_is_actionable_without_internal_error_details():
+    runner = _make_runner_with_cached_agents(num_agents=0)
+
+    with patch(
+        "tools.mcp_tool.shutdown_mcp_profile",
+        side_effect=RuntimeError("/private/profile/a/wecom-cli-config"),
+    ):
+        result = await runner._execute_mcp_reload(_make_event())
+
+    assert "参考号" in result
+    assert "/private/profile" not in result
+
+
+@pytest.mark.asyncio
 async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     """If a cached agent was built with enabled_toolsets=["safe"], the
     refresh must pass that same list to get_tool_definitions so the agent
     doesn't silently gain disabled tools after a reload."""
     runner = _make_runner_with_cached_agents(num_agents=1)
     # Override the toolsets on the cached agent.
-    agent, _sig = runner._agent_cache["session-0"]
+    agent, _sig = runner._agent_cache["agent:main:telegram:dm:session-0"]
     agent.enabled_toolsets = ["safe"]
     agent.disabled_toolsets = ["terminal"]
 
@@ -164,7 +191,7 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
         return [{"type": "function", "function": {"name": "refreshed"}}]
 
     with (
-        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.shutdown_mcp_profile"),
         patch("tools.mcp_tool.discover_mcp_tools", return_value=["refreshed"]),
         patch.dict("tools.mcp_tool._servers", {"homeassistant": object()}, clear=True),
         patch("model_tools.get_tool_definitions", side_effect=_capture_get_tool_definitions),
@@ -174,3 +201,79 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
     assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_keeps_profile_context_in_executor(tmp_path):
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    runner = _make_runner_with_cached_agents(num_agents=0)
+    profile_home = tmp_path / "profiles" / "a"
+    seen = []
+
+    def scoped_shutdown():
+        seen.append(("shutdown", get_hermes_home()))
+
+    def scoped_discover():
+        seen.append(("discover", get_hermes_home()))
+        return []
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        with (
+            patch("tools.mcp_tool.shutdown_mcp_profile", side_effect=scoped_shutdown),
+            patch("tools.mcp_tool.discover_mcp_tools", side_effect=scoped_discover),
+            patch.dict("tools.mcp_tool._servers", {}, clear=True),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+        ):
+            await runner._execute_mcp_reload(_make_event())
+    finally:
+        reset_hermes_home_override(token)
+
+    assert seen == [
+        ("shutdown", profile_home),
+        ("discover", profile_home),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_only_refreshes_the_requesting_profile_and_waits_for_turn_boundary():
+    runner = _make_runner_with_cached_agents(num_agents=0)
+
+    def _agent(name):
+        tool = {"type": "function", "function": {"name": name}}
+        return SimpleNamespace(
+            tools=[tool],
+            valid_tool_names={name},
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+        )
+
+    idle_a = _agent("old_a")
+    running_a = _agent("running_a")
+    idle_b = _agent("old_b")
+    runner._agent_cache.update(
+        {
+            "agent:a:telegram:dm:1": (idle_a, "sig-a"),
+            "agent:a:telegram:dm:2": (running_a, "sig-a-running"),
+            "agent:b:telegram:dm:1": (idle_b, "sig-b"),
+        }
+    )
+    runner._running_agents["agent:a:telegram:dm:2"] = running_a
+    fresh = [{"type": "function", "function": {"name": "fresh_a"}}]
+
+    with (
+        patch("tools.mcp_tool.shutdown_mcp_profile"),
+        patch("tools.mcp_tool.discover_mcp_tools", return_value=["fresh_a"]),
+        patch.dict("tools.mcp_tool._servers", {"a-server": object()}, clear=True),
+        patch("model_tools.get_tool_definitions", return_value=fresh),
+    ):
+        await runner._execute_mcp_reload(_make_event("a"))
+
+    assert idle_a.tools == fresh
+    assert running_a.valid_tool_names == {"running_a"}
+    assert idle_b.valid_tool_names == {"old_b"}

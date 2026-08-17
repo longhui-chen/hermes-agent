@@ -148,7 +148,19 @@ def _lookup_scoped_tool_defs_cache(
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
-            registry._generation,
+            # 🔴 **必须用 ``cache_generation()``,⛔ 不是裸 ``_generation``。**
+            # ``_bump_generation(profile)`` 在**具名 profile** 上只递增
+            # ``_profile_generations[profile]`` 就 return,**根本不动全局
+            # ``_generation``**(见 tools/registry.py)。single-profile 进程里
+            # MCP 注册/注销/schema 刷新全走那条分支 ⇒ 这个 key 一动不动
+            # ⇒ ``tools/list_changed`` 或用户显式 ``/reload-mcp`` 之后
+            # ``refresh_agent_mcp_tools()`` **再次命中旧缓存**,新增/删除/变更的
+            # 工具**不会出现在当前 Agent 上**,得等一次无关的全局注册、配置文件
+            # 变化或**进程重启**才恢复。
+            # ⭐ 半条链:本 PR 加了 ``_profile_generations`` + ``cache_generation()``,
+            #   却漏了这个消费者 —— 兄弟调用点(其余三处已经在用了:
+            #   agent/tool_executor.py · gateway/run.py · tools/mcp_tool.py)。
+            registry.cache_generation(),
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
