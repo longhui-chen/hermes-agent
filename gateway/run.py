@@ -7193,9 +7193,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     asyncio.shield(worker), timeout=drain_deadline
                 )
             except asyncio.TimeoutError:
+                # 🔴 上一版引用了本作用域**不存在**的 ``profile_name`` ⇒ 超时分支
+                # 一触发就 ``NameError``,把「drain 超时」伪装成内部异常
+                # (指错方向 + 真因被吞)。⭐ 是我在本 PR 引入的,而这条分支平时
+                # 驱动不到 —— **跑不到的分支 = 没被验证的承诺**。
+                # ⇒ 只用本作用域**真实存在**的信息。
                 raise TimeoutError(
-                    f"adapter operations for {profile_name or 'default'} still "
-                    f"draining after {drain_deadline:.1f}s"
+                    f"{len(tasks)} adapter operation(s) still draining after "
+                    f"{drain_deadline:.1f}s"
                 ) from None
             except asyncio.CancelledError as exc:
                 if worker.cancelled():
