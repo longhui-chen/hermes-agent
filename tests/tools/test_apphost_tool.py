@@ -452,6 +452,20 @@ def test_legacy_mutations_reject_workflow_operation_before_secret_or_network(mon
     assert hint in out["error"]["message"]
 
 
+def test_legacy_install_rejects_auto_refresh_before_secret_or_network(monkeypatch):
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")
+    ):
+        out = json.loads(app_host_tool({
+            "action": "install", "slug": "weather", "staging_dir": "/tmp/stage",
+            "data_refresh": "user_confirmed_auto",
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    assert "publish(mode=install)" in out["error"]["message"]
+
+
 @pytest.mark.parametrize("response", [
     {}, {"operation": {}},
     {"operation": {"operation_id": "op-other", "terminal": "pending"}},
@@ -1582,7 +1596,7 @@ def test_publish_reload_never_rewrites_creation_provenance(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "data_refresh", ["static", "external_unconfirmed", "user_confirmed_auto", "user_declined"]
+    "data_refresh", ["static", "external_unconfirmed", "user_declined"]
 )
 def test_legacy_install_carries_session_key_and_data_refresh(monkeypatch, data_refresh):
     monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
