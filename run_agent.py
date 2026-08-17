@@ -150,7 +150,7 @@ from tools.browser_tool import cleanup_browser
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import is_trivial_prompt
-from agent.error_classifier import normalized_provider_error_code, FailoverReason
+from agent.error_classifier import normalized_provider_error_code, FailoverReason, client_safe_error_text
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
 from agent.session_activity import ActivityProvenance
@@ -2716,7 +2716,10 @@ class AIAgent:
     def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
         """Build the safe, structured provider-error payload for chat surfaces."""
         payload: Dict[str, Any] = {
-            "code": normalized_provider_error_code(classified),
+            # ⭐ 带上 error:码和文案必须用同一个判据(见 is_our_own_failure)。
+            # ⛔ 不传的话,本地 RuntimeError("… timed out: /volume1/…") 会拿到
+            # provider_network_error,界面劝用户「检查网络后重试」——重试无用。
+            "code": normalized_provider_error_code(classified, error=error),
             "reason": classified.reason.value,
         }
         if classified.provider:
@@ -2732,6 +2735,16 @@ class AIAgent:
         if classified.provider_error_code:
             payload["provider_error_code"] = classified.provider_error_code
         message = classified.message or self._summarize_api_error(error)
+        # This payload calls itself "safe" (see the docstring) and is handed to
+        # chat surfaces.  For an upstream failure `message` is the provider's
+        # own text — useful, safe to pass through.  For an internal_error it is
+        # *our* exception string (class names, attribute names, file paths).
+        #
+        # Routed through the shared helper rather than rewritten here: the same
+        # collapse is needed on `final_response` / `error` / status lines in
+        # conversation_loop, and a second copy of the rule is a second source of
+        # truth — which is precisely how the first fix left those three leaking.
+        message = client_safe_error_text(classified, message, error=error)
         if message:
             payload["provider_message"] = message[:500]
         payload["retryable"] = bool(classified.retryable)

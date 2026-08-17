@@ -13,10 +13,36 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import NamedTuple
+
+from gateway.platforms.base import safe_exc, safe_traceback
+
+
+class ArtifactFailure(NamedTuple):
+    """一个交付物送不到 —— ``path`` 是它，``reason`` 是**为什么**。
+
+    ⭐ 三种成因给用户的话完全不同,压成一个 ``List[str]`` 就只能说出
+    三者的最小公约数（原先是「文件仍在设备上，可稍后重新获取」——
+    对 ``missing`` 是**假的**）。
+    """
+
+    path: str
+    reason: str
+
+
+#: reason ⇒ 给用户的一句话。⛔ 每种成因各自可行动。
+_ARTIFACT_FAILURE_TEXT = {
+    # ⛔ 不说「仍在设备上」—— 它已经不在了
+    "missing": "{n} 个附件在设备上已找不到，任务可能已清理它们。",
+    # 🔴 ⛔ 一个 basename 都不许回显:回显等于向聊天对方**确认这个路径存在**。
+    "policy_blocked": "{n} 个附件因安全策略未发送。",
+    "upload_failed": "{n} 个附件未能送达：{names}。文件仍在设备上，可稍后重新获取。",
+}
+from typing import Any, Callable, List, Optional
 
 from agent.i18n import t
 
@@ -274,12 +300,12 @@ class GatewayKanbanWatchersMixin:
                             logger.debug(
                                 "kanban notifier: read-only subscription probe failed "
                                 "for board %s (%s); falling back to writable open",
-                                slug, exc,
+                                slug, safe_exc(exc),
                             )
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
-                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+                            logger.debug("kanban notifier: cannot open board %s: %s", slug, safe_exc(exc))
                             continue
                         try:
                             # `connect()` runs the schema + idempotent migration
@@ -348,7 +374,7 @@ class GatewayKanbanWatchersMixin:
                                     # all other subscriptions in this tick.
                                     logger.warning(
                                         "kanban notifier: subscription for %s on board %s failed: %s",
-                                        sub.get("task_id"), slug, sub_exc,
+                                        sub.get("task_id"), slug, safe_exc(sub_exc),
                                     )
                         finally:
                             conn.close()
@@ -557,7 +583,7 @@ class GatewayKanbanWatchersMixin:
                             # we never spam attachments on retries.
                             if kind == "completed":
                                 try:
-                                    await self._deliver_kanban_artifacts(
+                                    _failed_artifacts = await self._deliver_kanban_artifacts(
                                         adapter=adapter,
                                         chat_id=sub["chat_id"],
                                         metadata=metadata,
@@ -565,9 +591,28 @@ class GatewayKanbanWatchersMixin:
                                         task=task,
                                     )
                                 except Exception as art_exc:
-                                    logger.debug(
+                                    # ⛔ 原先这里是 logger.debug（默认不输出）——
+                                    # 附件整批投递炸了，线上一个字都看不到。
+                                    # ⛔ 也必须是 ArtifactFailure —— 裸字符串
+                                    # 会让下游 ``f.path`` / ``f.reason`` 炸,
+                                    # 而这里正是**异常路径**,再崩一次就彻底没声音了。
+                                    _failed_artifacts = [
+                                        ArtifactFailure("<delivery raised>", "upload_failed")]
+                                    logger.error(
                                         "kanban notifier: artifact delivery for %s failed: %s",
-                                        sub["task_id"], art_exc,
+                                        sub["task_id"], safe_traceback(art_exc),
+                                    )
+                                if _failed_artifacts:
+                                    # 🔴 用户刚收到「任务完成」，却拿不到文件。
+                                    # ⛔ 不能沉默：他会以为文件根本没生成，
+                                    # 回头把整个任务重跑一遍。
+                                    # ⚠️ 只发**一条汇总**，⛔ 不是每个文件一条。
+                                    await self._notify_artifact_delivery_failure(
+                                        adapter=adapter,
+                                        chat_id=sub["chat_id"],
+                                        metadata=metadata,
+                                        task_id=sub["task_id"],
+                                        failed=_failed_artifacts,
                                     )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
@@ -578,7 +623,7 @@ class GatewayKanbanWatchersMixin:
                                 "kanban notifier: send failed for %s on %s "
                                 "(attempt %d/%d): %s",
                                 sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
+                                MAX_SEND_FAILURES, safe_exc(exc),
                             )
                             if fails >= MAX_SEND_FAILURES:
                                 logger.warning(
@@ -669,7 +714,7 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wake self-post failed "
                                     "for %s (attempt %d/%d): %s",
                                     sub["task_id"], fails,
-                                    MAX_SEND_FAILURES, _wk_err, exc_info=True,
+                                    MAX_SEND_FAILURES, safe_traceback(_wk_err),
                                 )
                                 if fails >= MAX_SEND_FAILURES:
                                     logger.warning(
@@ -768,14 +813,14 @@ class GatewayKanbanWatchersMixin:
                                 # in normal logs instead of silently no-op'ing.
                                 logger.warning(
                                     "kanban notifier: wakeup injection failed for %s: %s",
-                                    sub["task_id"], _wk_err, exc_info=True,
+                                    sub["task_id"], safe_traceback(_wk_err),
                                 )
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
             except Exception as exc:
-                logger.warning("kanban notifier tick failed: %s", exc)
+                logger.warning("kanban notifier tick failed: %s", safe_exc(exc))
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
@@ -841,6 +886,74 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
+    async def _notify_artifact_delivery_failure(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        metadata: dict,
+        task_id: str,
+        failed: List[str],
+    ) -> None:
+        """告诉用户「任务完成了，但这几个文件没送到」。
+
+        ⭐ 判据是「不写它用户会不会做错事」——**会**:他刚收到「任务完成」,
+        看不到附件就会认为**文件没生成**,于是把整个任务重跑一遍。
+        ⇒ 这条属于「错误必须可行动」,⛔ 不在「别堆文案」要砍的范围里。
+
+        ⛔ 只发**一条汇总**,⛔ 不是每个文件一条 —— 一次失败往往是整批失败
+        (鉴权过期/超限),逐条发就是刷屏。
+        ⛔ 这条自己失败时**不再往上抛**:文本通知已经送达,若因为这条提示
+        失败就让整个事件重试,用户会**再收到一遍「任务完成」**。
+        """
+        # 🔴 按 reason 分组 —— ⛔ 不再一句话通吃。
+        # ``missing`` 说「仍在设备上」是**假的**;``policy_blocked`` 回显
+        # basename 等于向对方确认路径存在。⭐ 与 wecom/weixin 那条
+        # 「成因决定建议」是同一把尺。
+        by_reason: dict[str, List[ArtifactFailure]] = {}
+        for f in failed:
+            by_reason.setdefault(getattr(f, "reason", "upload_failed"), []).append(f)
+
+        lines: List[str] = []
+        for reason in ("upload_failed", "missing", "policy_blocked"):
+            group = by_reason.get(reason)
+            if not group:
+                continue
+            tmpl = _ARTIFACT_FAILURE_TEXT.get(
+                reason, _ARTIFACT_FAILURE_TEXT["upload_failed"])
+            names = ""
+            if "{names}" in tmpl:
+                # ⛔ 只有 upload_failed 才列名字:那些文件确实还在设备上,
+                # 用户需要知道找哪几个。另两类⛔ 不列。
+                names = ", ".join(os.path.basename(f.path) for f in group[:5])
+                if len(group) > 5:
+                    names += f" 等 {len(group)} 个"
+            lines.append(tmpl.format(n=len(group), names=names))
+        try:
+            res = await adapter.send(
+                chat_id=chat_id,
+                content="⚠️ 任务已完成，但 " + "".join(lines),
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.error(
+                "kanban notifier: 连「附件未送达」的提示都没发出去 "
+                "(task=%s, %d 个附件): %s",
+                task_id, len(failed), safe_exc(exc),
+            )
+            return
+        # 🔴 判据是 ``SendResult.success``,⛔ 不是「没抛异常」。
+        # 讽刺的是:这个函数正是为了修「三个上传点丢掉返回值」而写的,
+        # 而我在它自己身上又犯了同一个错 —— 平台**拒收**(不抛异常、返回
+        # success=False)时它静默返回,用户既没拿到附件、也没被告知。
+        # ⭐ 修一类缺陷时,新写的代码要先过一遍同一条判据。
+        if getattr(res, "success", True) is False:
+            logger.error(
+                "kanban notifier: 「附件未送达」提示被平台拒收 "
+                "(task=%s, %d 个附件): %s",
+                task_id, len(failed), getattr(res, "error", None) or "unknown",
+            )
+
     async def _deliver_kanban_artifacts(
         self,
         *,
@@ -849,8 +962,17 @@ class GatewayKanbanWatchersMixin:
         metadata: dict,
         event_payload: Optional[dict],
         task,
-    ) -> None:
+    ) -> List[str]:
         """Upload artifact files referenced by a completed kanban task.
+
+        返回**未能送达**的路径清单（空 = 全部送达）。
+
+        🔴 为什么返回清单而不是像文本通知那样 ``raise``:
+        同一函数 ``:540`` 的先例是「``SendResult.success is False`` ⇒ raise ⇒
+        游标不推进 ⇒ 整个事件重试」。附件这里**⛔ 不能照抄**——完成文本
+        **已经发出去了**,整体重试会让用户**再收到一遍"任务完成"**。
+        ⇒ 差异是刻意的:附件失败不回滚事件,但必须①被检出 ②可诊断
+        ③让用户知道少了什么(否则他会以为文件没生成,回头重跑整个任务)。
 
         Workers passing ``kanban_complete(artifacts=[...])`` ship absolute
         file paths through the completion event so downstream humans get
@@ -862,93 +984,362 @@ class GatewayKanbanWatchersMixin:
           2. ``event_payload['summary']`` (truncated first line)
           3. ``task.result`` (legacy fallback)
 
-        Files are deduplicated, missing files are silently skipped (the
-        path may have been mentioned for reference only), and delivery
-        errors are logged but do not break the notifier loop.
+        路径去重按**声明 identity**（已展开的原路径）做，⛔ 不是"存在的才去重"
+        —— 后者会让同一个缺失交付物声明两次被计成两个失败。
+        **显式声明**的交付物若缺失 / 被安全策略拒绝 / 上传失败，都会带**各自的
+        原因**回到调用方；只有自由文本里扫出来的路径才可以静默忽略（它可能
+        只是顺口提到）。投递错误只降级为消息级失败，⛔ 不打断 notifier 循环。
         """
-        from pathlib import Path as _Path
-
         candidates: list[str] = []
         seen: set[str] = set()
+        # ZET-2473：从自由文本里扫出来、但 producer 没有显式声明的路径。
+        # 只用于记日志，⛔ 不投递。
+        unclaimed: list[str] = []
 
-        def _add(path: str) -> None:
+        # 🔴 producer **显式声明**了、却拿不到的交付物（RH 复审第五轮 P1）。
+        # 原先 `_add` 在 `isfile=False` 时直接 return、安全过滤也静默丢弃 ⇒
+        # 用户只看到「任务完成」,既没有文件、也没有失败提示,会以为文件
+        # 根本没生成然后把整个任务重跑一遍。
+        # ⭐ 又一次「空列表二义」:candidates 为空分不清「没声明」和「声明了但没了」。
+        # ⚠️ 作用域上界:只有 **claimed**（显式 artifacts 列表）才登记;
+        #    自由文本扫出来的路径本来就允许是「顺手提到的引用」,⛔ 不许报。
+        # 🔴 三种「送不到」是**三件不同的事**,⛔ 不许压成一个 List[str]:
+        #   · missing        文件不在了 —— ⛔ 不能说「文件仍在设备上」
+        #   · policy_blocked 安全策略拒绝 —— ⛔ 连 basename 都不许回显给聊天
+        #                    （回显等于向对方确认「这个路径存在」）
+        #   · upload_failed  平台没收 —— 文件确实还在设备上,可稍后重取
+        # ⭐ 又一次「一个载体承担多个语义」。
+        undeliverable: list[ArtifactFailure] = []
+
+        def _add(path: str, *, claimed: bool) -> None:
             if not path:
                 return
             expanded = os.path.expanduser(path)
+            # 🔴 去重按**声明 identity**,⛔ 不是"存在才记" ——
+            # 原先 seen 只在 isfile 之后写入,同一个缺失路径声明两次会被
+            # 计成两个失败,给用户的数量直接说错。
             if expanded in seen:
                 return
-            if not os.path.isfile(expanded):
-                return
             seen.add(expanded)
-            candidates.append(expanded)
+            if not os.path.isfile(expanded):
+                if claimed:
+                    undeliverable.append(ArtifactFailure(expanded, "missing"))
+                return
+            (candidates if claimed else unclaimed).append(expanded)
 
-        # 1. Explicit artifacts list in payload.
+        # 1. Explicit artifacts list in payload —— 唯一会被投递的一路。
         if isinstance(event_payload, dict):
-            raw = event_payload.get("artifacts")
+            # ⭐ 用生产方导出的常量，⛔ 不写字面量：这一跳两端各自都有测试
+            # 钉住，唯一的漂移方式就是「一端改了 key、另一端没跟上」。共用常量
+            # 让改名必然同时影响两端 —— 把可能漂移变成结构上不可能。
+            from hermes_cli.kanban_db import COMPLETED_EVENT_ARTIFACTS_KEY
+
+            raw = event_payload.get(COMPLETED_EVENT_ARTIFACTS_KEY)
             if isinstance(raw, (list, tuple)):
                 for item in raw:
                     if isinstance(item, str):
-                        _add(item)
+                        _add(item, claimed=True)
 
             # 2. Paths embedded in the payload summary.
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
                 paths, _ = adapter.extract_local_files(summary)
                 for p in paths:
-                    _add(p)
+                    _add(p, claimed=False)
 
         # 3. Legacy: paths embedded in task.result.
         if task is not None and getattr(task, "result", None):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
             for p in paths:
-                _add(p)
+                _add(p, claimed=False)
+
+        # ZET-2473：②③ 这两路是从**自由文本里扫出所有本地路径**，代码无从区分
+        # 「用户交付物」和「agent 顺手读过的内部状态文件」。现场实证：用户被
+        # .card_data.json / *_state.json / *_index.json 等九个内部文件刷屏，
+        # 零个真交付物。
+        # ⛔ 不许用扩展名 / 文件名黑名单收紧 —— 那是**开集**：不能黑 .json（真
+        # 交付物也可能是 JSON），黑 *_state.json / *_index.json 则换个命名
+        # （meta.json、cache.json）就漏。
+        # 闭集只有一个：**producer 显式声明**。prompt_builder 已把
+        # kanban_complete(artifacts=[...]) 定为 top-level 契约，所以这两路降级
+        # 为只记日志 —— 万一真有「模型没声明却确实产出了交付物」的场景，日志会
+        # 把它暴露出来，可以去推动 producer 补声明，而不是继续刷屏。
+        if unclaimed:
+            logger.info(
+                "kanban notifier: task %s has %d unclaimed path(s) in "
+                "summary/result; not delivered (producer must declare them via "
+                "kanban_complete(artifacts=[...]))",
+                getattr(task, "id", "?"),
+                len(unclaimed),
+            )
+            logger.debug(
+                "kanban notifier: unclaimed basenames = %s",
+                [os.path.basename(p) for p in unclaimed],
+            )
 
         if not candidates:
-            return
+            return list(undeliverable)
 
         from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        # 🔴 ``filter_local_delivery_paths`` 返回的是**规范化后**的路径
+        # （符号链接被解析成 target）。原先我拿它跟**原始**路径做字符串差集 ⇒
+        # 一个合法的符号链接:target 被成功上传,alias 却同时进了失败清单,
+        # 用户收到自相矛盾的「附件未送达」。
+        # ⭐ 判据必须是 **canonical identity**,⛔ 不是字符串是否相等。
+        _accepted = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        _accepted_ids = set()
+        for p_ in _accepted:
+            try:
+                _accepted_ids.add(os.path.realpath(p_))
+            except OSError:
+                _accepted_ids.add(p_)
+        _rejected = []
+        for p_ in candidates:
+            try:
+                canon = os.path.realpath(p_)
+            except OSError:
+                canon = p_
+            if canon not in _accepted_ids and p_ not in set(_accepted):
+                _rejected.append(p_)
+        candidates = _accepted
+        if _rejected:
+            # ⛔ 只记条数与 task,⛔ 不记 basename —— 见下方 basename 回显说明。
+            logger.warning(
+                "kanban notifier: %d 个已声明交付物被投递安全过滤拒绝 (task %s)",
+                len(_rejected), getattr(task, "id", "?"),
+            )
+            undeliverable.extend(
+                ArtifactFailure(p_, "policy_blocked") for p_ in _rejected)
         if not candidates:
-            return
+            return list(undeliverable)
 
-        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        # 这条投递路径原先**只在失败时记日志**，成功投递零留痕 —— ZET-2473 查不
+        # 出来自哪一路，根源就是它。补上条数与 task 关联。
+        # ⛔ 文件名不进 info 级：可能带用户内容，且对判断毫无帮助，只增加泄漏面。
+        # 要看文件名请开 debug（只打 basename）。
+        logger.info(
+            "kanban notifier: delivering %d declared artifact(s) for task %s",
+            len(candidates),
+            getattr(task, "id", "?"),
+        )
+        logger.debug(
+            "kanban notifier: declared basenames = %s",
+            [os.path.basename(p) for p in candidates],
+        )
 
-        from urllib.parse import quote as _quote
+        failed: List[ArtifactFailure] = list(undeliverable)
+        # ⭐ 预算是**整批共享**的一个可变累加器,⛔ 不是墙钟 deadline。
+        # 危害是「退避把 tick 睡死」⇒ 判据就该是「一共睡了多久」;
+        # 挂在墙钟上会顺带把**上传本身耗时**也算进来,于是大文件传得慢
+        # 就等于取消了后面所有文件的重试 —— 判据和危害没对齐。
+        budget = [self._ARTIFACT_RETRY_BUDGET_S]
 
-        # Partition images so they ride a single send_multiple_images call
-        # on platforms that support batch image uploads (Signal/Slack RPCs).
-        image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
-        other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
+        for path in candidates:
+            if await self._upload_artifact_with_retry(
+                adapter=adapter, chat_id=chat_id, metadata=metadata,
+                path=path, budget=budget,
+            ):
+                continue
+            failed.append(ArtifactFailure(path, "upload_failed"))
 
-        if image_paths:
-            try:
-                batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(
-                    chat_id=chat_id, images=batch, metadata=metadata,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "kanban notifier: image batch upload failed: %s", exc,
-                )
+        return failed
 
-        for path in other_paths:
-            ext = _Path(path).suffix.lower()
-            try:
-                if ext in _VIDEO_EXTS:
-                    await adapter.send_video(
-                        chat_id=chat_id, video_path=path, metadata=metadata,
-                    )
+    #: 交付物上传的重试次数。⛔ 不照抄 ``_send_with_retry`` 的默认值 ——
+    #: 这里跑在 notifier tick 里，**串行**挡着别的订阅(``:560`` 直接 await)，
+    #: 退避多久就是别人等多久。⭐ 参数按这个约束定，⛔ 不按「别处写了几」。
+    _ARTIFACT_MAX_RETRIES = 2
+    _ARTIFACT_RETRY_BASE_DELAY = 1.0
+    #: 整批交付物**共享**的退避总预算(秒)。
+    #: ⭐ 只有 per-file 上限而没有总预算 = 20 个文件各退避 3 秒 ⇒ 一个 tick
+    #: 被拖住一分钟。「无上限的重试」在小设备上是整机级问题的同一形状。
+    _ARTIFACT_RETRY_BUDGET_S = 8.0
+    # ⛔ 不许拍脑袋:取本文件既有的「一次交付」量纲 —— 重试总预算 8s 覆盖的是
+    # **等待**,单次上传要能容纳一个真实的大附件传输,故取其一个数量级以上;
+    # 与 gateway 侧 ``_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS``(30s)同阶。
+    _ARTIFACT_UPLOAD_TIMEOUT_S = 120.0
+    #: 图片扩展名 —— 只用来选对上传 API，⛔ 不再用于批量分组(见下)。
+    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+    _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+
+    async def _send_one_artifact(self, *, adapter, chat_id, metadata, path):
+        """按类型选上传 API。返回适配器的原始结果。
+
+        🔴 图片这里**逐张** ``send_image_file``，⛔ 不用 ``send_multiple_images``。
+        原因不是风格偏好，是**失败可观测性**:
+          · ``send_multiple_images`` 在基类与 7 个 adapter 上都声明 ``-> None``，
+            feishu 返回 ``bool``;
+          · 于是 ``getattr(res, "success", True) is not False`` 对**全部 8 个**
+            恒为 ``True`` —— 平台拒收(超限/鉴权过期)时 ``failed`` 是空的，
+            用户收到「任务完成」而图片永远缺失，链路上一层报警都没有。
+          · ⚠️ 上一版我在这里写了注释声称「判据是 SendResult.success」——
+            **那是假闭集**:判据写对了，可这条路上根本没有 SendResult。
+            ⭐ 假闭集比没有门更坏，它让人以为这一面守住了。
+
+        ⛔ 为什么不给 ``send_multiple_images`` 加返回值(那才是根治):
+        ``base.py:6368/6416`` 把它的返回值当**真值**用
+        (``_consume_feishu_batch_quote(meta, image_sent)``)。今天 7 个
+        adapter 返回 ``None``(falsy)、feishu 返回 ``bool`` —— 改成返回
+        ``SendResult`` 会让那 7 个从 falsy 变成 truthy，**行为当场翻转**。
+        ⇒ 改动作用域必须刚好等于缺陷:缺陷在 kanban 这一个调用点上。
+
+        代价:用户看到 N 条图片消息而不是一个相册。⭐ 这里是**交付物投递**，
+        「拿到文件」压倒「排版好看」;而且失败时能精确说出是哪几张没送到。
+        """
+        ext = Path(path).suffix.lower()
+        # 🔴 音频先问**基座** —— ⛔ 不再用本文件自造的扩展名表。
+        # ``should_send_media_as_audio``(base.py) 是仓内**已有**的共用分派层,
+        # cron/scheduler、run.py 的两条路径、base 自己都在用;唯独我这条
+        # kanban 路径自己造了第二套 ⇒ 同一个 .mp3 交付物,走对话发出去是语音、
+        # 走 kanban 发出去是文件。⭐ 而且 Telegram 的特殊规则（只有 is_voice
+        # 才发语音气泡）我这套完全没有。
+        from gateway.platforms.base import should_send_media_as_audio
+
+        if should_send_media_as_audio(
+            getattr(adapter, "platform", None), ext, is_voice=False
+        ):
+            return await adapter.send_voice(
+                chat_id=chat_id, audio_path=path, metadata=metadata)
+        if ext in self._IMAGE_EXTS:
+            return await adapter.send_image_file(
+                chat_id=chat_id, image_path=path, metadata=metadata)
+        if ext in self._VIDEO_EXTS:
+            return await adapter.send_video(
+                chat_id=chat_id, video_path=path, metadata=metadata)
+        return await adapter.send_document(
+            chat_id=chat_id, file_path=path, metadata=metadata)
+
+    async def _upload_artifact_with_retry(
+        self, *, adapter, chat_id, metadata, path: str, budget: List[float],
+    ) -> bool:
+        """上传一个交付物，瞬时故障下重试。返回是否送达。
+
+        ⭐ 退避照抄 ``BasePlatformAdapter._send_with_retry``
+        (``base.py:5256-5265``):服务端给的 ``retry_after`` 优先且只认一次，
+        否则 ``base * 2**(n-1) + jitter``。⛔ 不自造第二套。
+
+        三处**刻意的偏离**，各有理由:
+          ① 次数与总预算更小 —— 见 ``_ARTIFACT_MAX_RETRIES`` 上的注释。
+          ② ⛔ **超时不重试**。照抄先例那条判据:超时时请求**可能已经送达**，
+             重传会让用户收到**两份**同样的文件。
+          ③ 没有「降级成纯文本」那一路 —— 文件发不出去就是发不出去，
+             循环结束即失败,由调用方汇总告诉用户。
+        """
+        from gateway.platforms.base import BasePlatformAdapter
+
+        server_retry_after: Optional[float] = None
+        for attempt in range(self._ARTIFACT_MAX_RETRIES + 1):
+            if attempt:
+                if server_retry_after is not None:
+                    delay = server_retry_after + random.uniform(0, 1)
+                    server_retry_after = None
                 else:
-                    await adapter.send_document(
-                        chat_id=chat_id, file_path=path, metadata=metadata,
+                    delay = (self._ARTIFACT_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                             + random.uniform(0, 1))
+                # ⭐ 总预算是**整批共享**的:预算花完就不再等，直接判失败。
+                # ⛔ 不许「反正只剩一点，睡完再说」—— 那正是无上限。
+                if delay > budget[0]:
+                    logger.warning(
+                        "kanban notifier: 交付物重试预算用尽，放弃 %s",
+                        os.path.basename(path),
                     )
-            except Exception as exc:
-                logger.warning(
-                    "kanban notifier: artifact upload (%s) failed: %s",
-                    path, exc,
+                    return False
+                budget[0] -= delay
+                await asyncio.sleep(delay)
+
+            try:
+                # 🔴 **每次上传都要硬期限。** ``_ARTIFACT_RETRY_BUDGET_S`` 只
+                # 限制**重试前的 sleep**,⛔ 不限制上传本身;而 Feishu 等适配器
+                # 最终经**无超时**的 ``_run_blocking()`` 等 SDK。notifier 是
+                # **串行**处理订阅的 ⇒ 一次卡死会阻断该 profile **后续所有**
+                # 任务完成通知和附件交付。
+                # ⛔ 超时后**不重传** —— 上传非幂等,重传 = 用户收到重复文件
+                # (与上面「超时优先于可重试」同一条判据)。
+                res = await asyncio.wait_for(
+                    self._send_one_artifact(
+                        adapter=adapter, chat_id=chat_id,
+                        metadata=metadata, path=path),
+                    timeout=self._ARTIFACT_UPLOAD_TIMEOUT_S,
                 )
+                # ⭐ ⛔ **不写专门的 ``except asyncio.TimeoutError``。**
+                # 逆改实证:Python 3.11 里 ``asyncio.TimeoutError`` 就是内建
+                # ``TimeoutError``,会落进下面的通用 ``except Exception``,
+                # 而那里 ``_is_timeout_error`` **已经**判死不重传(与 SDK 自报
+                # 超时同一条路)。删掉专门分支后门仍绿 ⇒ 它**不承重**。
+                # 承重的只有上面这个 ``wait_for``(删掉它门会挂死)。
+            except Exception as exc:
+                # 🔴 ``_is_retryable_error`` 匹配的是 ``connectionreset`` /
+                # ``connecterror`` 这类**异常类名**(无空格),⛔ 不是人类可读
+                # 的消息文本 —— ``str(ConnectionResetError("connection reset"))``
+                # 是 ``"connection reset"``,带空格,**匹配不上**。
+                # ⇒ 必须把类名拼进来,与适配器填 ``SendResult.error`` 的做法一致。
+                # ⭐ 「传 str(exc) 就能判」这个前提我原本没查,实查才发现是错的。
+                err = f"{type(exc).__name__}: {exc}"
+                # 🔴 **超时必须先判,且优先级高于「可重试」。**
+                #
+                # ``ConnectionError("Read timed out")`` 这类异常里,``err`` **同时**
+                # 含 ``ConnectionError``(类名 ⇒ ``_is_retryable_error`` 为真)和
+                # 超时文本。上一版这条分支**只问了 ``_is_retryable_error``**,于是
+                # 同一个**非幂等**的附件被再次上传 ⇒ **用户收到重复文件**。
+                #
+                # ⭐ 「照抄」三问 —— 先例是下面的 ``SendResult`` 分支(:1288):
+                #   ① 先例每个分支做什么:先算 ``transient``(retryable ∪
+                #      _is_retryable_error),**再用 ``_is_timeout_error`` 把它压回
+                #      False**,注释写着「超时:可能已送达 ⇒ ⛔ 不重传,否则用户
+                #      收到两份」。
+                #   ② 我这个分支做什么:同序 —— 先超时判死,再问可重试。
+                #   ③ 差异:先例还有 ``res.retryable``(平台显式给的),异常分支
+                #      拿不到那个字段 ⇒ 少这一项,其余逐字相同。
+                # ⛔ 没有自造第二套判据。
+                if BasePlatformAdapter._is_timeout_error(err):
+                    logger.warning(
+                        "kanban notifier: artifact upload (%s) 超时 —— 可能**已经**"
+                        "送达,⛔ 不重传以免用户收到两份: %s",
+                        os.path.basename(path), safe_exc(exc),
+                    )
+                    return False
+                if not BasePlatformAdapter._is_retryable_error(err):
+                    logger.warning(
+                        "kanban notifier: artifact upload (%s) failed: %s", path, safe_exc(exc))
+                    return False
+                logger.warning(
+                    "kanban notifier: artifact upload (%s) 瞬时失败 "
+                    "(第 %d/%d 次): %s",
+                    os.path.basename(path), attempt + 1,
+                    self._ARTIFACT_MAX_RETRIES + 1, safe_exc(exc),
+                )
+                continue
+
+            # ⛔ 判据是 ``SendResult.success``,不是「没抛异常」。
+            # 适配器返回 ``None`` 的沿用旧契约(无异常即送达),与 ``:540``
+            # 文本通知那条判据逐字一致。
+            if getattr(res, "success", True) is not False:
+                if attempt:
+                    logger.info(
+                        "kanban notifier: %s 第 %d 次重试后送达",
+                        os.path.basename(path), attempt)
+                return True
+
+            err = getattr(res, "error", None) or "unknown"
+            retry_after = getattr(res, "retry_after", None)
+            if retry_after is not None:
+                server_retry_after = float(retry_after)
+            transient = (
+                bool(getattr(res, "retryable", False))
+                or BasePlatformAdapter._is_retryable_error(err)
+            )
+            # ② 超时:可能已送达 ⇒ ⛔ 不重传,否则用户收到两份。
+            if BasePlatformAdapter._is_timeout_error(err):
+                transient = False
+            logger.warning(
+                "kanban notifier: artifact (%s) rejected by platform "
+                "(第 %d/%d 次, transient=%s): %s",
+                path, attempt + 1, self._ARTIFACT_MAX_RETRIES + 1, transient, err,
+            )
+            if not transient:
+                return False
+
+        return False
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
@@ -985,7 +1376,7 @@ class GatewayKanbanWatchersMixin:
         try:
             cfg = _load_config()
         except Exception as exc:
-            logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
+            logger.warning("kanban dispatcher: cannot load config (%s); disabled", safe_exc(exc))
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         if not kanban_cfg.get("dispatch_in_gateway", True):
@@ -1349,7 +1740,7 @@ class GatewayKanbanWatchersMixin:
                 from hermes_cli import kanban_decompose as _decomp
             except Exception as exc:  # pragma: no cover
                 logger.warning(
-                    "kanban auto-decompose: import failed (%s); skipping", exc,
+                    "kanban auto-decompose: import failed (%s); skipping", safe_exc(exc),
                 )
                 return 0
             try:
@@ -1374,7 +1765,7 @@ class GatewayKanbanWatchersMixin:
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
-                            slug, exc,
+                            slug, safe_exc(exc),
                         )
                         triage_ids = []
                     for tid in triage_ids:

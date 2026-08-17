@@ -188,9 +188,17 @@ def present_plan_with_meta(
             "confirm: start carrying out the plan now in this same turn. Do "
             "NOT wait for a reply — just proceed."
         ), None
+    # ⛔ 这里只能放**给模型看的指令**，不许放面向用户的话术（ZET-3140）。
+    # 旧文案是第一人称、直接对用户说话的英文句子（"…before I proceed."，还带
+    # "go" / "confirm" 这种示例回复词），模型会把它原样复述出去 —— 中文会话里
+    # 就蹦英文。另外三条分支附的都是祈使式内部指令，模型不会念给用户。
+    # ⚠️ 砍的作用域**刚好等于**「英文用户话术」：原句同时承担「需要用户确认」
+    # 这个语义，那部分必须原样保留，否则计划会不等确认就被执行。
     return (
         plan_text
-        + "\n\nReview the plan above and reply to confirm (e.g. \"go\" / \"confirm\") before I proceed."
+        + "\n\nThis plan is awaiting the user's confirmation. Ask them to "
+        "confirm it, phrased in the language of the conversation, and do NOT "
+        "start executing any item until they do."
     ), None
 
 
