@@ -225,6 +225,78 @@ def test_second_job_does_not_see_the_first_jobs_ledger(monkeypatch):
     assert marks["second"] == (False, "no import attempted in this run")
 
 
+# --- scope lifecycle on non-happy paths ---------------------------------------
+# The finally in run_one_job is supposed to guarantee the ledger scope never
+# leaks regardless of how the function exits. These exercise the three ways
+# team-lead flagged: an early return before the scope is even pushed (claim
+# rejected), an exception unwinding through the outer handler after the scope
+# was pushed, and the interrupted-flag short-circuit that skips mark_job_run
+# but still runs the function to its normal end.
+
+def test_scope_does_not_leak_when_claim_dispatch_fails(monkeypatch):
+    """claim_dispatch() rejecting the job returns True immediately, BEFORE
+    mark_execution_running / push_import_attempts_scope ever run — the token
+    stays None. The finally's `is not None` guard must not raise, and no
+    scope must be left open for a later reader."""
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: False)
+
+    ok = s.run_one_job({"id": "j-claim-rejected", "name": "sync", "app_slug": "app-a"})
+
+    assert ok is True
+    assert import_attempts_snapshot() == []
+
+
+def test_scope_does_not_leak_when_run_job_raises(monkeypatch):
+    """An exception inside run_job unwinds through the outer `except
+    BaseException` (which records the failure via mark_job_run); the ledger
+    scope pushed earlier in the try must still be popped by the finally."""
+    seen_mid_run = []
+
+    def boom(job, *, defer_agent_teardown=None):
+        from gateway.session_context import record_import_attempt
+        record_import_attempt(ok=False, error_code="transport_error", error_message="mid-run")
+        # Snapshot BEFORE raising: proves the scope was genuinely open (the
+        # record above actually landed), not that it merely stayed empty by
+        # coincidence of the ledger never having been pushed at all.
+        seen_mid_run.append(import_attempts_snapshot())
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(s, "run_job", boom)
+    marks = []
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None, **_kwargs: marks.append((jid, ok, err)),
+    )
+
+    ok = s.run_one_job({"id": "j-run-job-raises", "name": "sync", "app_slug": "app-a"})
+
+    assert ok is False
+    assert marks == [("j-run-job-raises", False, "kaboom")]
+    assert len(seen_mid_run[0]) == 1 and seen_mid_run[0][0]["error_code"] == "transport_error"
+    # Popped despite the raise, not merely empty by coincidence.
+    assert import_attempts_snapshot() == []
+
+
+def test_scope_does_not_leak_when_interrupted_flag_skips_mark_job_run(monkeypatch):
+    """The shutdown path already wrote the authoritative status for this run
+    (see test_shutdown_interrupt.py); run_one_job's own mark_job_run write is
+    suppressed. The ledger scope must still be pushed AND popped normally
+    around that suppressed write — it is not a function-level early return."""
+    job = {"id": "j-interrupted", "name": "sync", "app_slug": "app-a"}
+    s._interrupted_job_ids.add(job["id"])
+    calls = _patch_pipeline(monkeypatch, success=True, final="final response",
+                             import_attempts=[{"ok": True}])
+
+    try:
+        ok = s.run_one_job(job)
+    finally:
+        s._interrupted_job_ids.discard(job["id"])
+
+    assert ok is True
+    assert not any(c[0] == "mark" for c in calls)  # suppressed by the interrupted flag
+    assert import_attempts_snapshot() == []
+
+
 # --- interactive/non-cron paths: no scope, nothing to override ---------------
 
 def test_no_ledger_scope_leaks_outside_run_one_job(monkeypatch):
