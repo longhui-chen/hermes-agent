@@ -90,7 +90,13 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from agent.browser_content_evidence import project_browser_content_evidence
 from agent.browser_state_preview import project_browser_state_preview
+from agent.error_classifier import (
+    INTERNAL_ERROR_USER_TEXT,
+    error_text_is_ours,
+)
+from agent.response_format import ResponseFormatValidationError
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
 from gateway.platforms.base import (
@@ -98,6 +104,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     is_network_accessible,
+    safe_exc,
     validate_media_delivery_path,
 )
 from gateway.readiness import collect_runtime_readiness
@@ -295,11 +302,28 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
     explicit provider/model so an API caller can use the same authenticated
     provider catalog as the TUI without mutating config.yaml.
     """
-    from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error, _get_model_config
+    from hermes_cli.runtime_provider import (
+        AuthError,
+        resolve_runtime_provider,
+        format_runtime_provider_error,
+        _get_model_config,
+    )
 
     try:
         runtime = resolve_runtime_provider(requested=provider, target_model=target_model)
-    except Exception as exc:
+    except (AuthError, ValueError) as exc:
+        # ⛔ 只包这两类 —— 它们是 runtime_provider **有意**抛出的、面向用户的
+        # 失败(凭据 / 未知 provider),``format_runtime_provider_error`` 也只
+        # 认得 ``AuthError``,其余一律 ``str(error)`` 原样返回。
+        #
+        # 🔴 上一版这里是 ``except Exception``。于是一个内部 ``AttributeError``
+        # 被格式化成字符串、包成 ``RuntimeError``、再被上层包成
+        # ``_ProviderAuthResolutionError``,最后以 **HTTP 200** 作为 assistant
+        # 的回答送到用户面前:「⚠️ Provider authentication failed: 'X' object
+        # has no attribute 'y' … /volume1/private/config.yaml」。
+        # ⭐ 我先前判定「代码在此之前已认定是 auth 失败,不属于本缺陷」——
+        #    那个前提是错的:是**这个 catch 自己**把一切都变成了 auth 失败。
+        # 其余异常照原样往上抛,由 HTTP 边界的 _boundary_error_text 收口。
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()
@@ -740,6 +764,179 @@ _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 _CURRENT_TURN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 _CURRENT_TURN_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_API_MEDIA_PROBE_MAX_DATA_HEADER = 128
+_API_MEDIA_PROBE_MAX_IMAGE_SAMPLES = 8
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 入站媒体观测点 —— **真正的入口**在这里,⛔ 不在 platform adapter
+# ═══════════════════════════════════════════════════════════════════════
+#
+# 🔴 实测推翻的前提(2026-08-17 21:32–21:36,cloud-gt002):
+#    我把探针挂在 ``BasePlatformAdapter.handle_message``,理由是
+#    ``RelayAdapter`` 继承了它。代码在、进程是新槽、门全绿、逆改全红 ——
+#    **真实流量里一次都没执行**。
+#    ⭐ 板端根本不走 Python platform adapter,走的是**这条 HTTP 端点**
+#      (同窗口 access log 有 ``POST /p/main/v1/chat/completions 200``)。
+#    ⇒ **「继承了」推不出「会被执行」**。判据必须是「它实际被谁调用」,
+#      ⛔ 不是「结构上它在调用链里」。
+#
+# ⭐ 本探针**每个请求都出声**(哪怕没有任何媒体、哪怕 JSON 都没解开)。
+#    为什么:上一版对纯文本**保持沉默**,于是「没有那行」有两种成因 ——
+#    「没有媒体」和「根本没被执行」—— 混在一起就什么都判不了。
+#    ⇒ 判据从「有没有那行」换成「``seq`` 有没有前进」:
+#      seq 停着不动 = 没被执行;seq 前进而 media=0 = 执行了、请求里真没媒体。
+#    ⭐ 这是**唯一**能把「量具没跑」和「被测对象是空的」分开的形状。
+_API_MEDIA_PROBE = "[API-MEDIA-INGRESS]"
+_API_MEDIA_PROBE_SEQ = itertools.count(1)
+
+
+def _probe_describe_image_ref(url_value: Any) -> str:
+    """把一条图片引用压成**不含内容**的形状描述。
+
+    ⛔ 一个字符的 URL / base64 都不出;只出:固定 scheme、已知 data MIME 或
+       ``other``、payload **字节数**(数字不是内容)。
+    ⭐ 这正是 LS 侧 ``model input data url missing`` 的镜像判据:
+       它说「我没送出去」,这里能证明「我确实一个都没收到 / 收到了但形状不对」。
+    """
+    if not isinstance(url_value, str) or not url_value:
+        return "empty"
+    if url_value[:5].lower() == "data:":
+        comma = url_value.find(",", 5, 5 + _API_MEDIA_PROBE_MAX_DATA_HEADER)
+        if comma < 0:
+            return "data:malformed"
+        header = url_value[5:comma]
+        pieces = header.split(";")
+        mime = pieces[0].lower()
+        label = mime if mime in _CURRENT_TURN_IMAGE_MIMES else "other"
+        b64 = any(piece.lower() == "base64" for piece in pieces[1:])
+        return f"data:{label};{'b64' if b64 else 'raw'};{len(url_value) - comma - 1}b"
+    if url_value[:8].lower() == "https://":
+        return "https"
+    if url_value[:7].lower() == "http://":
+        return "http"
+    return "other"
+
+
+def _probe_profile_id(profile: Any) -> str:
+    """Keep the route profile correlatable without writing client path text."""
+    if not isinstance(profile, str) or not profile:
+        return "-"
+    return hashlib.sha256(profile.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _log_api_media_ingress(
+    request: Any, body: Any, *, outcome: str = "", profile: str = "",
+) -> None:
+    """记录**每一次** chat/completions 请求里到底带了什么媒体。
+
+    ⛔ 不出:URL 值、base64 内容、鉴权头、消息正文。
+    ✅ 出:条数、part 类型分布、图片引用的**形状**、固定的不支持类型类别。
+
+    ⚠️ ``file`` / ``input_file`` / ``input_audio`` 这三类在本端点是**直接 400**
+       的(见 ``_normalize_multimodal_content``:file 抛
+       ``unsupported_content_type``,audio 落到最后那条 unknown 分支)。
+       ⇒ 它们出现在 ``unsupported=[…]`` 里就等于**当场定位**了
+       「文件/音频发不进来」的归属:⛔ 不是链路丢了,是这个端点不收。
+
+    ⛔ 本函数永不向调用方抛异常(把请求处理弄挂不可接受),也⛔ 不静默:
+       自己坏了打 ``[API-MEDIA-INGRESS-ERR]``。
+    """
+    seq = next(_API_MEDIA_PROBE_SEQ)
+    try:
+        counts = {"text": 0, "image": 0, "file": 0, "other": 0}
+        unsupported: List[str] = []
+        img_shapes: List[str] = []
+        img_more = 0
+        n_msgs = 0
+        parts_more = 0
+        # 🔴 探针盲区补丁(2026-08-17 实证):**文件根本不是 part**。
+        #    LS 的 `internal/backend/hermes/chat.go` 逐字写着:
+        #      "{type:image_url,...}; non-image media (files) are appended to the
+        #       user text as a line \"[file: <url>]\" since hermes' Chat
+        #       Completions endpoint does not (today) expose a file content part"
+        #    ⇒ 只按 part 类型枚举,文件消息在探针眼里和纯文本**长得一模一样**,
+        #      正好落在最要紧的那一格上。⇒ 数 `[file: ` 出现次数。
+        #    ⛔ 只出**计数**,⛔ 一个字符的路径都不出(路径会泄漏 HERMES_HOME 布局)。
+        file_notes = 0
+        content_shapes: List[str] = []
+
+        def _count_file_notes(text: Any) -> None:
+            nonlocal file_notes
+            if isinstance(text, str):
+                file_notes += text.count("[file: ")
+
+        messages = (body or {}).get("messages") if isinstance(body, dict) else None
+        if isinstance(messages, list):
+            n_msgs = len(messages)
+            current = next(
+                (msg for msg in reversed(messages)
+                 if isinstance(msg, dict) and msg.get("role") == "user"),
+                None,
+            )
+            if current is not None:
+                content = current.get("content")
+                if not isinstance(content, list):
+                    # ⭐ 非图片消息 LS 送的是**纯字符串** content(不是 parts 数组)——
+                    #    这一支以前整个不统计,文件行就是在这里被漏掉的。
+                    content_shapes.append("str" if isinstance(content, str) else "?")
+                    _count_file_notes(content)
+                else:
+                    content_shapes.append("list")
+                    parts = content[:MAX_CONTENT_LIST_SIZE]
+                    parts_more = len(content) - len(parts)
+                    for part in parts:
+                        if isinstance(part, str):
+                            counts["text"] += 1
+                            continue
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = str(part.get("type") or "").strip().lower()
+                        if ptype in _TEXT_PART_TYPES:
+                            counts["text"] += 1
+                            _count_file_notes(part.get("text"))
+                        elif ptype in _IMAGE_PART_TYPES:
+                            counts["image"] += 1
+                            ref = part.get("image_url")
+                            if isinstance(ref, dict):
+                                ref = ref.get("url")
+                            if len(img_shapes) < _API_MEDIA_PROBE_MAX_IMAGE_SAMPLES:
+                                img_shapes.append(_probe_describe_image_ref(ref))
+                            else:
+                                img_more += 1
+                        elif ptype in _FILE_PART_TYPES:
+                            counts["file"] += 1
+                            unsupported.append(ptype)
+                        else:
+                            counts["other"] += 1
+                            unsupported.append("input_audio" if ptype == "input_audio" else "other")
+
+        if outcome:
+            verdict = outcome
+        elif unsupported:
+            verdict = "has_unsupported"
+        elif counts["image"] and file_notes:
+            verdict = "image_and_filenote"
+        elif counts["image"]:
+            verdict = "image_only"
+        elif file_notes:
+            # ⭐ 文件走的是文本行,⛔ 不是 part —— 这一格以前会被误判成 no_media。
+            verdict = "filenote_only"
+        else:
+            verdict = "no_media"
+
+        logger.info(
+            "%s seq=%d id=%x-%04x profile=%s msgs=%d shapes=[%s] parts_more=%d text=%d image=%d "
+            "filepart=%d other=%d filenote=%d img=[%s] img_more=%d unsupported=[%s] verdict=%s",
+            _API_MEDIA_PROBE, seq, os.getpid(), seq & 0xFFFF,
+            _probe_profile_id(profile), n_msgs, ",".join(content_shapes), parts_more,
+            counts["text"], counts["image"], counts["file"], counts["other"],
+            file_notes,
+            ",".join(img_shapes), img_more, ",".join(sorted(set(unsupported))), verdict,
+        )
+    except Exception as exc:
+        # ⛔ 不裸 `%s` 异常 —— 请求体里可能带 data URL / 令牌,异常消息会回显。
+        logger.warning("[API-MEDIA-INGRESS-ERR] seq=%d %s", seq, safe_exc(exc))
 
 
 def _normalize_multimodal_content(content: Any) -> Any:
@@ -873,6 +1070,14 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _IMAGE_PART_TYPES:
                     return True
     return False
+
+
+def _content_has_image(content: Any) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _IMAGE_PART_TYPES
+        for part in content
+    )
 
 
 def _extract_current_turn_reference_image(content: Any) -> str:
@@ -1074,6 +1279,26 @@ def _tool_completion_payload(
         browser_state = None
     if browser_state is not None:
         payload["browserState"] = browser_state
+
+    try:
+        browser_content_evidence = project_browser_content_evidence(
+            function_name,
+            decoded,
+            browser_session_id=(
+                ui_hint.get("browser_session_id") if ui_hint is not None else None
+            ),
+        )
+    except Exception:
+        # Evidence is optional presentation data. Projection failure must not
+        # change the model-facing result or the tool lifecycle event.
+        logger.warning(
+            "[api_server] browser content evidence projection failed for tool=%s",
+            function_name,
+            exc_info=True,
+        )
+        browser_content_evidence = None
+    if browser_content_evidence is not None:
+        payload["browserContentEvidence"] = browser_content_evidence
 
     if function_name in {"image_generate", "video_generate"}:
         artifact_output: Dict[str, Any] = {}
@@ -1642,11 +1867,90 @@ def _resolve_media_to_data_urls(text: str) -> str:
 
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
-    """Redact API-bound error text before it crosses the HTTP boundary."""
+    """Redact API-bound error text before it crosses the HTTP boundary.
+
+    ⛔ 这一层只做凭据脱敏,**不猜文本来源**。上一版在这里额外抹掉「绝对路径」
+    和「Python 属性错误措辞」,两个判据都挑错了维度:
+
+    · 措辞是开集 —— 认得 ``'X' object has no attribute 'y'``,就认不得
+      ``KeyError`` / ``NameError`` / ``module 'x' has no attribute 'y'``,
+      补一个漏下一个。
+    · 「以 ``/`` 开头、两段以上」分不开**主机文件系统路径**和**上游 URL /
+      HTTP 路由**:实测把
+      ``... at https://api.example.com/v1/chat/completions``
+      改成了 ``... at https:/<path>``,把 provider 自己的解释改坏了。
+
+    ⇒ 真正的判据在**捕获点**(``_boundary_error_text``):有没有上游证据。
+    """
     redacted = redact_sensitive_text(str(value), force=True)
     if limit is not None:
         return redacted[:limit]
     return redacted
+
+
+def _internal_error_text(operation: str, exc: BaseException) -> str:
+    """Log the original, return only a stable, traceable, safe line.
+
+    照抄仓内先例 ``zet_agent._correlated_error_response``:完整异常 + 关联 ID 进
+    日志,响应只给用户能拿去问支持的编号。⛔ 抹掉而不记录 = 把可诊断性也砍掉。
+    """
+    correlation_id = uuid.uuid4().hex[:12]
+    # ``exc_info=exc`` 而不是 ``True``:后者取的是「当前正在处理的异常」,
+    # 在 except 块之外调用会记成 ``NoneType: None`` —— 文案照样安全,但
+    # traceback 没了,而这份 traceback 是编号唯一能兑现的东西。
+    logger.error(
+        "[api_server] %s failed (correlation_id=%s)", operation, correlation_id,
+        exc_info=exc,
+    )
+    return f"{INTERNAL_ERROR_USER_TEXT}。如果问题持续,请提供参考编号 {correlation_id}。"
+
+
+def _boundary_error_text(
+    operation: str,
+    exc: BaseException,
+    *,
+    message: Any = None,
+    limit: int | None = None,
+) -> str:
+    """给客户端的文本:先判「这个失败到底是谁的」,再决定说什么。
+
+    ⭐ 判据是**有没有上游证据**(HTTP 状态码 / 响应体 / 已知传输类型名 /
+    网络 errno),⛔ 不是「这个异常叫什么名字」—— 后者是开集,枚举了
+    ``ValueError``/``TypeError`` 就会漏 ``AttributeError``,补上又漏
+    ``NameError``。四样证据一样都没有 ⇒ 它只可能来自我们自己的代码。
+
+    · 我们自己的 bug → 原始异常带 traceback + 关联 ID 进日志,客户端只拿到
+      安全文案和编号。用户照着「上游模型服务错误 · 请稍后重试」重试一百次
+      也不会好,那条提示本身就是缺陷。
+    · 上游失败 → provider 的解释**逐字透传**(只做凭据脱敏)。告诉用户等
+      30 秒 / 换个模型 / 去充值的正是它,抹掉比泄漏更糟。
+
+    ⚠️ ⛔ **这里问的是 ``error_text_is_ours``,⛔ 不是
+    ``classify_api_error(...).reason``,也⛔ 不是 ``has_upstream_evidence``**。
+
+    · 用 ``.reason``(第一版):分类流水线**按恢复策略**排序,文本模式匹配在
+      第 4 步、证据检查在第 8 步。本地的
+      ``RuntimeError("agent step timed out: /volume1/private/…")`` 先撞上
+      timeout 模式就被当成上游失败原样出屏。
+    · 用 ``has_upstream_evidence``(第二版):它**沿 cause 链**取证,回答的是
+      「这次失败能不能重试」。于是
+      ``raise RuntimeError("… /volume1/private/config.yaml") from ConnectionError``
+      继承到「上游证据」,内部路径照样推给了每一个接本边界的 HTTP/SSE 客户端。
+
+    ⭐ 两版栽在同一句话上:**「可不可以重试」证明不了「这段文本是谁写的」。**
+    展示只认后者 ⇒ 复用 ``error_text_is_ours``,与聊天出站路径**同一个实现**
+    (⛔ 同一个问题不许两处各写一套判据 —— 漂移就是这么来的)。
+    """
+    try:
+        internal = error_text_is_ours(exc)
+    except Exception:  # noqa: BLE001 — 判据自身失败时站保守侧:当作我们的 bug
+        logger.debug(
+            "[api_server] evidence check raised on %s", type(exc).__name__, exc_info=True
+        )
+        internal = True
+    if internal:
+        return _internal_error_text(operation, exc)
+    return _redact_api_error_text(exc if message is None else message, limit=limit)
 
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
@@ -1931,10 +2235,12 @@ try:
         get_job as _cron_get,
         create_job as _cron_create,
         update_job as _cron_update,
+        JobRevisionConflict as _CronJobRevisionConflict,
         remove_job as _cron_remove,
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        defer_job as _cron_defer,
         job_occurrence_projection as _cron_occurrence_projection,
     )
     _CRON_AVAILABLE = True
@@ -1943,10 +2249,12 @@ except ImportError:
     _cron_get = None
     _cron_create = None
     _cron_update = None
+    _CronJobRevisionConflict = RuntimeError
     _cron_remove = None
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_defer = None
     _cron_occurrence_projection = None
 
 
@@ -2037,6 +2345,17 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # ⭐ 与上面那把 key **同源**地记下属主:``_get_scoped_secret`` 是在属主
+        # profile 的 scope 里跑的,此刻的 ``get_hermes_home()`` 就是属主的 home。
+        # 不带 ``/p/<profile>/`` 前缀的请求由这个 listener 的 key 鉴权,就必须在
+        # **同一个** profile 的 scope 里执行 —— 见 ``_profile_scope``。
+        # ⛔ 绝不从 ``os.environ`` 猜(``ZET_AGENT_ID`` 与这把 key 毫无关系)。
+        try:
+            from hermes_constants import get_hermes_home as _get_owner_home
+
+            self._owner_home = _get_owner_home()
+        except Exception:  # noqa: BLE001 — 取不到就退回旧行为,⛔ 不因此拒服务
+            self._owner_home = None
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -2623,8 +2942,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return _PROFILE_REJECTED
         return profile
 
-    @staticmethod
-    def _profile_scope(profile: Optional[str]):
+    # ⚠️ 从 ``@staticmethod`` 改成实例方法:属主(``_owner_home``)是**构造期**
+    # 捕获在实例上的,静态方法里拿不到 self。四个调用点全是
+    # ``self._profile_scope(...)``,⛔ 无外部直调。
+    def _profile_scope(self, profile: Optional[str]):
         """Enter the multiplex profile runtime scope, or a no-op when unset.
 
         When no ``/p/<profile>/`` prefix was given AND multiplexing is active,
@@ -2640,10 +2961,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 from agent.secret_scope import is_multiplex_active
 
                 if is_multiplex_active():
+                    import os as _os
+
                     from gateway.run import _profile_runtime_scope
                     from hermes_constants import get_hermes_home
 
-                    return _profile_runtime_scope(get_hermes_home())
+                    # 🔴 上面写的是「进 DEFAULT profile 的 scope」，但 get_hermes_home()
+                    # 返回的是**网关目录**，不是 profiles/<default>。二者不同，后果不对称：
+                    # 子进程 HOME 由 hermes_constants._profile_home_path 派生成 {pin}/home
+                    # 且**要求该目录存在**；网关目录下没有 home/ ⇒ 派生失败 ⇒ HOME 根本不注入
+                    # ⇒ lark-cli 回落 ~ 找不到 config.json ⇒ 报「未绑定」⇒ 助手转去 config bind
+                    # ⇒ 那条只认 .env 明文 ⇒ exit 3。整条症状由这一处的目录取错引出。
+                    # ⇒ 按 docstring 的原意取**默认档案目录**；取不到才退回原值（⛔ 不 fail closed：
+                    #    不带前缀的单档案部署是合法的，不能被这条改动搞挂）。
+                    # 🔴🔴 **信任边界。上一版从进程环境猜归属,是跨 profile 越权口子。**
+                    # ``_expected_api_key()`` 把 ``None`` 和 ``"default"`` 当同一档、
+                    # 校验 **default listener 的 key**,而这里却按进程级
+                    # ``ZET_AGENT_ID``(缺省 ``main``)选运行时目录 ⇒ 只要
+                    # ``profiles/main/home`` 存在,**持 default key 的普通请求就在
+                    # ``main`` 的 secret / session / MCP scope 里执行**。凭据与数据双向越界。
+                    # ⭐ 判据换成与 key **同源**的那一面:构造期捕获的属主 home。
+                    # ⛔ 不用 ``get_profile_dir("default")`` —— 那是按名字再猜一次。
+                    pin = get_hermes_home()
+                    recovered = False
+                    owner = getattr(self, "_owner_home", None)
+                    if owner and _os.path.isdir(_os.path.join(str(owner), "home")):
+                        pin = owner
+                        recovered = True
+                    # ⭐ 无条件留痕：这条分支此前完全不可观测，"是不是走了这里"只能靠推断。
+                    # 字段选择服务于定位：pin 是什么、它的 home/ 在不在（HOME 能否被派生）。
+                    try:
+                        logger.warning(
+                            "[profile-scope] unscoped request under multiplex: profile=%r "
+                            "recovered_from_default=%s pin=%s pin_home_exists=%s",
+                            profile,
+                            recovered,
+                            pin,
+                            _os.path.isdir(_os.path.join(str(pin), "home")),
+                        )
+                    except Exception:
+                        pass
+                    return _profile_runtime_scope(pin)
             except Exception:
                 pass
             return nullcontext()
@@ -2718,6 +3076,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
+            ("POST", "/api/jobs/{job_id}/defer", self._handle_defer_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
@@ -3506,6 +3865,7 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_delete("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_delete_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/pause", self._profile_handler(self._handle_pause_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/resume", self._profile_handler(self._handle_resume_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/defer", self._profile_handler(self._handle_defer_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
         if _CRON_AVAILABLE:
             router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
@@ -4002,7 +4362,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Surface as the typed provider-auth failure so
                     # _run_agent()/_handle_runs() return the controlled
                     # response shape instead of a raw 500.
-                    raise _ProviderAuthResolutionError(str(exc)) from exc
+                    #
+                    # ⛔ 只有**真的**是凭据 / 配置类失败才配这个标签。其余的
+                    # (我们自己的 bug)照原样抛,交给 HTTP 边界收口 ——
+                    # 否则内部异常文本会以 HTTP 200 当作 assistant 的回答出现。
+                    if isinstance(exc, RuntimeError):
+                        raise _ProviderAuthResolutionError(str(exc)) from exc
+                    raise
                 logger.debug(
                     "api_server provider-runtime refresh failed for provider=%s model=%s",
                     provider_name,
@@ -5010,19 +5376,33 @@ class APIServerAdapter(BasePlatformAdapter):
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
         history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-            route=route,
-            session_model=session_model,
-            requested_runtime=runtime_request.get("requested") or {},
-            route_source=runtime_request.get("route_source") or "global",
-            confirmed_runtime_lock=lock_active,
-            **agent_overrides,
-        )
+        # ⛔ 这里原来**一个 catch 都没有**:``_run_agent`` 抛错时 aiohttp 直接
+        # 回一个纯文本 ``500 Server got itself in trouble`` —— 没有 JSON、
+        # 没有可行动提示、没有参考编号,客户端连解析都解析不了。
+        # 流式的兄弟路径(``…/chat/stream``)一直是接住的,这条没跟上。
+        try:
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                route=route,
+                session_model=session_model,
+                requested_runtime=runtime_request.get("requested") or {},
+                route_source=runtime_request.get("route_source") or "global",
+                confirmed_runtime_lock=lock_active,
+                **agent_overrides,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[api_server] session chat failed for %s", session_id)
+            return web.json_response(
+                _openai_error(
+                    _boundary_error_text("session chat", exc),
+                    err_type="server_error",
+                ),
+                status=500,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -5227,7 +5607,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
-                await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+                await queue.put(_event_payload("error", {
+                    "message": _boundary_error_text("session chat stream", exc),
+                }))
             finally:
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
@@ -5384,10 +5766,21 @@ class APIServerAdapter(BasePlatformAdapter):
             return limited
 
         # Parse request body
+        _probe_profile = ""
+        try:
+            _probe_profile = str(request.match_info.get("profile", "") or "")
+        except Exception:
+            _probe_profile = ""
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
+            # ⭐ 解不开也要出声 —— 否则「没有那行」又会有两种成因。
+            _log_api_media_ingress(request, None, outcome="bad_json", profile=_probe_profile)
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        # ⭐ 入站媒体观测点:**每个请求都记一行**,seq 单调递增。
+        #    这是本端点真正的入口 —— 板端走的就是它,⛔ 不是 platform adapter。
+        _log_api_media_ingress(request, body, profile=_probe_profile)
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -5802,40 +6195,66 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except ValueError as e:
-                if "response_format" in str(e):
+                # ⭐ 判据是**类型**,⛔ 不是文本形状。
+                # 前两版分别用过「文本里含 response_format」和「以它开头」——
+                # 都挡不住 `_run_agent` 内部一条恰好提到该词的 ValueError
+                # (RH 实测:"response_format resolver crashed at /volume1/…"
+                #  被当成 400 请求校验错误、内部路径原样回显)。
+                # 现在只认 agent.response_format 有意抛出的那个子类;它仍继承
+                # ValueError,所以其余调用点行为不变。
+                if isinstance(e, ResponseFormatValidationError):
                     return web.json_response(
                         _openai_error(str(e), param="response_format"),
                         status=400,
                     )
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
         else:
             try:
                 result, usage = await _compute_completion()
             except ValueError as e:
-                if "response_format" in str(e):
+                # ⭐ 判据是**类型**,⛔ 不是文本形状。
+                # 前两版分别用过「文本里含 response_format」和「以它开头」——
+                # 都挡不住 `_run_agent` 内部一条恰好提到该词的 ValueError
+                # (RH 实测:"response_format resolver crashed at /volume1/…"
+                #  被当成 400 请求校验错误、内部路径原样回显)。
+                # 现在只认 agent.response_format 有意抛出的那个子类;它仍继承
+                # ValueError,所以其余调用点行为不变。
+                if isinstance(e, ResponseFormatValidationError):
                     return web.json_response(
                         _openai_error(str(e), param="response_format"),
                         status=400,
                     )
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
 
@@ -6045,7 +6464,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 result = {
                     "completed": False,
                     "failed": True,
-                    "error": str(exc),
+                    "error": _boundary_error_text("chat completions stream", exc),
                 }
             result_dict = result if isinstance(result, dict) else {}
             completed = bool(result_dict.get("completed", True))
@@ -6584,7 +7003,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
-                agent_error = _redact_api_error_text(e)
+                agent_error = _boundary_error_text("streaming responses", e)
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -6751,13 +7170,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # BadRequestError, AuthenticationError).  Emit a response.failed
             # event and properly terminate the SSE stream so the client doesn't
             # get a TransferEncodingError from incomplete chunked encoding.
-            import traceback as _tb
             _persist_incomplete_if_needed()
-            agent_error = _redact_api_error_text(_tb.format_exc())
+            # ⛔ 这里原来送的是 `traceback.format_exc()` —— 整条堆栈直接进客户端。
+            # 上游失败时 provider 的解释仍然逐字送达,自己的 bug 只送编号。
+            agent_error = _boundary_error_text("responses stream", _exc, limit=500)
             try:
                 failed_env = _envelope("failed")
                 failed_env["output"] = list(emitted_items)
-                failed_env["error"] = {"message": _redact_api_error_text(_exc, limit=500), "type": "server_error"}
+                failed_env["error"] = {"message": agent_error, "type": "server_error"}
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -7012,7 +7432,10 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("responses", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
         else:
@@ -7021,7 +7444,10 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("responses", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
 
@@ -7136,7 +7562,11 @@ class APIServerAdapter(BasePlatformAdapter):
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
-        "repeat", "enabled", "timezone", "output_language",
+        "repeat", "enabled", "timezone", "output_language", "source",
+        # A server-owned optimistic-concurrency fence. Its only current
+        # caller is local-server's dedicated-maintainer schedule bridge; it
+        # is not persisted as a mutable job field.
+        "expected_revision",
     }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
@@ -7285,7 +7715,9 @@ class APIServerAdapter(BasePlatformAdapter):
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_list_job_occurrences(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/occurrences — real runs plus bounded future previews."""
@@ -7341,7 +7773,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_create_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs — create a new cron job."""
@@ -7362,6 +7796,14 @@ class APIServerAdapter(BasePlatformAdapter):
             timezone = body.get("timezone")
             output_language = body.get("output_language")
             origin = body.get("origin")
+            source = body.get("source")
+            # ADIC v1 (interface-freeze doc §7): server-stamped ONLY. Never
+            # add these to _UPDATE_ALLOWED_FIELDS — local-server's dedicated-
+            # maintainer bridge sets them once at provision time, and
+            # cron.jobs.create_job / update_job (_IMMUTABLE_JOB_FIELDS) are the
+            # actual enforcement point, not this handler.
+            app_slug = body.get("app_slug")
+            import_operation = body.get("import_operation")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -7403,8 +7845,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["timezone"] = timezone
             if output_language is not None:
                 kwargs["output_language"] = output_language
+            if source is not None:
+                kwargs["source"] = source
             if origin is not None:
                 kwargs["origin"] = origin
+            if app_slug is not None:
+                kwargs["app_slug"] = app_slug
+            if import_operation is not None:
+                kwargs["import_operation"] = import_operation
 
             if _cron_job_requires_live_chat_authorization(skills):
                 return web.json_response(
@@ -7417,7 +7865,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_get_job(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/{job_id} — get a single cron job."""
@@ -7436,7 +7886,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} — update a cron job."""
@@ -7486,10 +7938,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except _CronJobRevisionConflict as e:
+            return web.json_response(
+                {"error": str(e), "code": "revision_conflict"}, status=409
+            )
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_delete_job(self, request: "web.Request") -> "web.Response":
         """DELETE /api/jobs/{job_id} — delete a cron job."""
@@ -7503,13 +7961,29 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            success = _cron_remove(job_id)
+            expected_revision = request.query.get("expected_revision")
+            if expected_revision is not None:
+                expected_revision = int(expected_revision)
+                if expected_revision < 0:
+                    raise ValueError("expected_revision must be a non-negative integer")
+            if expected_revision is None:
+                success = _cron_remove(job_id)
+            else:
+                success = _cron_remove(job_id, expected_revision=expected_revision)
             if not success:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"ok": True})
+        except _CronJobRevisionConflict as e:
+            return web.json_response(
+                {"error": str(e), "code": "revision_conflict"}, status=409
+            )
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_pause_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/pause — pause a cron job."""
@@ -7529,7 +8003,9 @@ class APIServerAdapter(BasePlatformAdapter):
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_resume_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/resume — resume a paused cron job."""
@@ -7548,6 +8024,54 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except Exception as e:
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
+
+    async def _handle_defer_job(self, request: "web.Request") -> "web.Response":
+        """POST /api/jobs/{job_id}/defer — postpone a job's next run.
+
+        Body: {"seconds": 300} or {"until": "<ISO-8601>"}, optional "reason".
+        Unlike pause, the job stays enabled and keeps its cadence: the next
+        slot moves out to the later of its current slot and the retry point,
+        and the deferral is recorded (deferred_at / defer_reason /
+        defer_count). Used by the app-refresh governor so deferred maintainer
+        refreshes resume on their own instead of staying paused.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
+        seconds = body.get("seconds")
+        until = body.get("until")
+        reason = body.get("reason")
+        if seconds is None and until is None:
+            return web.json_response({"error": "provide seconds or until"}, status=400)
+        try:
+            job = _cron_defer(
+                job_id,
+                seconds=float(seconds) if seconds is not None else None,
+                until=str(until) if until is not None else None,
+                reason=str(reason) if reason else None,
+            )
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+            _notify_cron_provider_jobs_changed()
+            return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -7571,7 +8095,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
         """POST /api/cron/fire — Chronos managed-cron fire webhook (NAS → agent).
@@ -8044,6 +8570,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        session_user_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -8067,9 +8594,20 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            user_id=session_user_id,
             async_delivery=False,
             cron_session="",
         )
+
+    def _api_run_session_context_user_id(self) -> str:
+        """Capture a platform's public session-metadata user before handoff.
+
+        ``/v1/runs`` has a task and executor lifecycle of its own, so it
+        cannot rely on request ContextVars surviving to the worker.  The base
+        platform has no separate public identity; platform overrides may
+        supply one without changing the private session-owner argument.
+        """
+        return ""
 
     async def _run_agent(
         self,
@@ -8133,6 +8671,16 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        session_user_id = str((request_overrides or {}).get("_zettlab_auth_principal") or "").strip()
+        # Zet's authenticated account is separate from its private transcript
+        # owner principal.  ``run_in_executor`` does not inherit ContextVars,
+        # so the Zet wrapper supplies this internal context-only value before
+        # the hop.  Other API-server callers keep their existing principal
+        # binding unchanged.
+        session_context_user_id = str(
+            (request_overrides or {}).get("_zettlab_session_context_account_id")
+            or session_user_id
+        ).strip()
 
         def _run():
             from gateway.session_context import (
@@ -8148,6 +8696,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    session_user_id=session_context_user_id,
                 )
                 agent = None
                 # turn_id is request-scoped correlation for NAS fallback and
@@ -8203,10 +8752,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
                     _publish_turn_process_ownership(agent, effective_task_id)
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if _content_has_image(user_message):
+                        conversation_kwargs.update(
+                            user_authored_message=(
+                                trusted_user_message
+                                if trusted_user_message is not None
+                                else user_message
+                            ),
+                            user_message_has_image=True,
+                        )
                     result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                        **conversation_kwargs,
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -8605,6 +9166,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        run_session_context_user_id = self._api_run_session_context_user_id()
         profile_run_key = self._claim_admitted_profile_run()
 
         def _release_profile_run() -> None:
@@ -8635,6 +9197,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         chat_id=session_id or "",
                         session_key=gateway_session_key or session_id or "",
                         session_id=session_id or "",
+                        session_user_id=run_session_context_user_id,
                     )
                     try:
                         agent = self._create_agent(
@@ -8722,6 +9285,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                session_user_id=run_session_context_user_id,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             if run_cancelled.is_set():
@@ -8739,11 +9303,17 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            conversation_kwargs = {
+                                "user_message": user_message,
+                                "conversation_history": conversation_history,
+                                "task_id": effective_task_id,
+                            }
+                            if _content_has_image(user_message):
+                                conversation_kwargs.update(
+                                    user_authored_message=user_message,
+                                    user_message_has_image=True,
+                                )
+                            r = agent.run_conversation(**conversation_kwargs)
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later
@@ -8873,10 +9443,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
+                run_error = _boundary_error_text("run", exc)
                 self._set_run_status(
                     run_id,
                     "failed",
-                    error=_redact_api_error_text(exc),
+                    error=run_error,
                     last_event="run.failed",
                 )
                 try:
@@ -8884,7 +9455,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
+                        "error": run_error,
                     })
                 except Exception:
                     pass
@@ -9056,7 +9627,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
-            return web.json_response(_openai_error(str(exc)), status=500)
+            return web.json_response(
+                _openai_error(_boundary_error_text("approval resolution", exc)),
+                status=500,
+            )
 
         if resolved <= 0:
             return web.json_response(

@@ -8,13 +8,25 @@ only renders as a voice bubble when explicitly flagged) and via
 """
 
 from types import SimpleNamespace
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.run import GatewayRunner
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    FeishuQuoteLease,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.run import (
+    GatewayRunner,
+    _non_conversational_metadata,
+    _non_conversational_reply_to,
+)
 from gateway.session import SessionSource, build_session_key
 
 
@@ -33,6 +45,27 @@ class _MediaRoutingAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id):
         return {"id": chat_id, "type": "dm"}
+
+
+class _FeishuMediaRoutingAdapter(_MediaRoutingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.platform = Platform.FEISHU
+
+
+def _feishu_event(message_id="om-question"):
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc-group",
+        chat_type="group",
+        thread_id="om-old-root",
+    )
+    return MessageEvent(
+        text="请处理",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id=message_id,
+    )
 
 
 def _event(thread_id=None):
@@ -81,6 +114,225 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
         metadata={"notify": True},
     )
     adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_feishu_text_reply_consumes_quote_before_attachment(tmp_path, monkeypatch):
+    adapter = _FeishuMediaRoutingAdapter()
+    event = _feishu_event()
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter._message_handler = AsyncMock(return_value=f"已整理\nMEDIA:{media_file}")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text"))
+    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert "reply_to_message_id" in adapter.send.await_args.kwargs["metadata"]
+    assert "reply_to_message_id" not in adapter.send_document.await_args.kwargs["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_base_delivery_observes_quote_consumed_by_earlier_turn_send(
+    tmp_path, monkeypatch
+):
+    adapter = _FeishuMediaRoutingAdapter()
+    event = _feishu_event()
+    lease = FeishuQuoteLease("om-question")
+    event.source._feishu_quote_lease = lease
+    lease.consume(
+        {"reply_to_message_id": "om-question"},
+        SendResult(success=True, message_id="interim"),
+    )
+    adapter._message_handler = AsyncMock(return_value="最终答案")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert "reply_to_message_id" not in adapter.send.await_args.kwargs["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_media_only_reply_quotes_first_attachment(tmp_path, monkeypatch):
+    adapter = _FeishuMediaRoutingAdapter()
+    event = _feishu_event()
+    first = _allowed_media_path(tmp_path, monkeypatch, "first.pdf")
+    second = _allowed_media_path(tmp_path, monkeypatch, "second.pdf")
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{first}\nMEDIA:{second}")
+    adapter.send_document = AsyncMock(side_effect=[
+        SendResult(success=True, message_id="doc-1"),
+        SendResult(success=True, message_id="doc-2"),
+    ])
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    calls = adapter.send_document.await_args_list
+    assert calls[0].kwargs["metadata"]["reply_to_message_id"] == "om-question"
+    assert "reply_to_message_id" not in calls[1].kwargs["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_media_only_reply_keeps_quote_until_attachment_succeeds(tmp_path, monkeypatch):
+    adapter = _FeishuMediaRoutingAdapter()
+    event = _feishu_event()
+    first = _allowed_media_path(tmp_path, monkeypatch, "first.pdf")
+    second = _allowed_media_path(tmp_path, monkeypatch, "second.pdf")
+    third = _allowed_media_path(tmp_path, monkeypatch, "third.pdf")
+    adapter._message_handler = AsyncMock(
+        return_value=f"MEDIA:{first}\nMEDIA:{second}\nMEDIA:{third}"
+    )
+    adapter.send_document = AsyncMock(side_effect=[
+        SendResult(success=False, error="temporary"),
+        SendResult(success=True, message_id="doc-2"),
+        SendResult(success=True, message_id="doc-3"),
+    ])
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    calls = adapter.send_document.await_args_list
+    assert calls[0].kwargs["metadata"]["reply_to_message_id"] == "om-question"
+    assert calls[1].kwargs["metadata"]["reply_to_message_id"] == "om-question"
+    assert "reply_to_message_id" not in calls[2].kwargs["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_base_image_batch_releases_failed_reservation_without_returning_result():
+    adapter = _FeishuMediaRoutingAdapter()
+    lease = FeishuQuoteLease("om-question")
+    metadata = {
+        "reply_to_message_id": "om-question",
+        "_feishu_quote_lease": lease,
+    }
+    adapter.send_image = AsyncMock(side_effect=[
+        RuntimeError("temporary"),
+        SendResult(success=True, message_id="image-2"),
+        SendResult(success=True, message_id="image-3"),
+    ])
+
+    result = await adapter.send_multiple_images(
+        "oc-group",
+        [("https://example.com/1.png", ""),
+         ("https://example.com/2.png", ""),
+         ("https://example.com/3.png", "")],
+        metadata=metadata,
+    )
+
+    first, second, third = adapter.send_image.await_args_list
+    assert result is None
+    assert first.kwargs["metadata"]["reply_to_message_id"] == "om-question"
+    assert second.kwargs["metadata"]["reply_to_message_id"] == "om-question"
+    assert "reply_to_message_id" not in third.kwargs["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_voice_is_flat_and_text_keeps_quote(tmp_path, monkeypatch):
+    adapter = _FeishuMediaRoutingAdapter()
+    event = _feishu_event()
+    event.message_type = MessageType.VOICE
+    adapter._message_handler = AsyncMock(return_value="文字答案")
+    adapter._should_auto_tts_for_chat = lambda _chat_id: True
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text"))
+    adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
+    audio_path = tmp_path / "reply.mp3"
+    audio_path.write_bytes(b"audio")
+    monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
+    monkeypatch.setattr(
+        "tools.tts_tool.text_to_speech_tool",
+        lambda **_kwargs: json.dumps({"file_path": str(audio_path)}),
+    )
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert "reply_to_message_id" not in adapter.play_tts.await_args.kwargs["metadata"]
+    assert "reply_to_message_id" in adapter.send.await_args.kwargs["metadata"]
+
+
+def test_slack_and_telegram_reply_routing_is_unchanged():
+    from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
+
+    for platform, chat_type, thread_id in (
+        (Platform.SLACK, "channel", "thread-1"),
+        (Platform.TELEGRAM, "dm", "topic-1"),
+    ):
+        source = SessionSource(
+            platform=platform,
+            chat_id="chat-1",
+            chat_type=chat_type,
+            thread_id=thread_id,
+            message_id="msg-1",
+        )
+        event = MessageEvent(text="hi", source=source, message_id="msg-1")
+        metadata = _thread_metadata_for_source(source, "msg-1")
+        assert "reply_to_message_id" not in metadata
+        assert _reply_anchor_for_event(event) == "msg-1"
+
+
+def test_non_conversational_feishu_sends_are_flat_without_changing_thread_route():
+    lease = FeishuQuoteLease("om-question")
+    metadata = {
+        "thread_id": "om-root",
+        "reply_to_message_id": "om-question",
+        "_feishu_quote_lease": lease,
+        "notify": True,
+    }
+
+    assert _non_conversational_metadata(
+        metadata, platform=Platform.FEISHU
+    ) == {"thread_id": "om-root", "notify": True}
+    assert _non_conversational_reply_to(
+        "om-question", platform=Platform.FEISHU
+    ) is None
+
+
+def test_non_conversational_slack_and_telegram_routing_is_unchanged():
+    for platform in (Platform.SLACK, Platform.TELEGRAM):
+        metadata = {"thread_id": "thread-1", "notify": True}
+        assert _non_conversational_metadata(
+            metadata, platform=platform
+        ) is metadata
+        assert _non_conversational_reply_to(
+            "message-1", platform=platform
+        ) == "message-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "chat_type", "thread_id", "expected"),
+    [
+        (Platform.SLACK, "channel", "thread-1", {"thread_id": "thread-1", "notify": True}),
+        (
+            Platform.TELEGRAM,
+            "dm",
+            "topic-1",
+            {
+                "thread_id": "topic-1",
+                "telegram_dm_topic_reply_fallback": True,
+                "direct_messages_topic_id": "topic-1",
+                "telegram_reply_to_message_id": "msg-1",
+                "notify": True,
+            },
+        ),
+    ],
+)
+async def test_other_platform_media_metadata_stays_unchanged(
+    platform, chat_type, thread_id, expected, tmp_path, monkeypatch
+):
+    adapter = _MediaRoutingAdapter()
+    adapter.platform = platform
+    source = SessionSource(
+        platform=platform,
+        chat_id="chat-1",
+        chat_type=chat_type,
+        thread_id=thread_id,
+        message_id="msg-1",
+    )
+    event = MessageEvent(text="file", source=source, message_id="msg-1")
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
+    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.send_document.await_args.kwargs["metadata"] == expected
 
 
 def _fake_runner(thread_meta):

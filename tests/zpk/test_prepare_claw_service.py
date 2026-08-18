@@ -92,6 +92,13 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
         encoding="utf-8"
     )
     prepare_source = _use_fixture_data_dir(prepare_source, data_dir)
+    legacy_data_dir = tmp_path / "legacy-claw-data"
+    legacy_assignment = 'LEGACY_DATA_DIR="/zettos/main/apps/com.zettlab.claw/data"'
+    assert legacy_assignment in prepare_source
+    prepare_source = prepare_source.replace(
+        legacy_assignment,
+        f"LEGACY_DATA_DIR={shlex.quote(str(legacy_data_dir))}",
+    )
     protected_root = protected_presets_root or tmp_path
     for assignment in (
         'SUBVOLUME_ZETTLAB_PRESETS_ROOT="/volume1/subvol/agents/zettlab-presets"',
@@ -928,6 +935,100 @@ def test_prepare_claw_service_filters_package_assignments_in_cr_only_env(
     assert b"GATEWAY_MULTIPLEX_PROFILES=" not in env_bytes
 
 
+def test_prepare_claw_service_removes_legacy_langfuse_credentials(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    env_path.parent.mkdir(parents=True)
+    legacy_data = tmp_path / "legacy-claw-data"
+    paths = [
+        env_path,
+        hermes_home / ".env",
+        hermes_home / "profiles" / "main" / ".env",
+        legacy_data / "secrets" / "zettlab-claw.env",
+        legacy_data / "hermes_home" / ".env",
+        legacy_data / "hermes_home" / "profiles" / "legacy" / ".env",
+    ]
+    body = (
+        "SAFE_VALUE=keep\n"
+        "HERMES_LANGFUSE_MODE=relay\n"
+        "HERMES_LANGFUSE_BASE_URL=http://127.0.0.1:19092\n"
+        "HERMES_LANGFUSE_PUBLIC_KEY=legacy-public\n"
+        "HERMES_LANGFUSE_SECRET_KEY=legacy-secret\n"
+        "LANGFUSE_PUBLIC_KEY=legacy-global-public\n"
+        "LANGFUSE_SECRET_KEY=legacy-global-secret\n"
+        "LANGFUSE_BASIC_AUTH='Basic YTpi'\n"
+        "LANGFUSE_OTEL_TRACES_EXPORT_PATH=wrong/path\n"
+    )
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    for path in paths:
+        env_text = path.read_text(encoding="utf-8")
+        assert "SAFE_VALUE=keep" in env_text
+        assert "HERMES_LANGFUSE_MODE=relay" in env_text
+        assert "HERMES_LANGFUSE_BASE_URL=http://127.0.0.1:19092" in env_text
+        assert "LANGFUSE_PUBLIC_KEY" not in env_text
+        assert "LANGFUSE_SECRET_KEY" not in env_text
+        assert "LANGFUSE_BASIC_AUTH" not in env_text
+        assert "LANGFUSE_OTEL_TRACES_EXPORT_PATH" not in env_text
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_prepare_claw_service_refuses_symlinked_langfuse_env(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside.env"
+    original = "LANGFUSE_SECRET_KEY=must-not-be-followed\n"
+    outside.write_text(original, encoding="utf-8")
+    (hermes_home / ".env").symlink_to(outside)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run(
+            [str(app_root / "prepare-claw-service.sh")],
+            check=True,
+            cwd=str(app_root),
+            env=_script_env(),
+        )
+
+    assert outside.read_text(encoding="utf-8") == original
+
+
+def test_prepare_claw_service_refuses_symlinked_profile_langfuse_env(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    profile = hermes_home / "profiles" / "main"
+    profile.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-profile.env"
+    original = "LANGFUSE_SECRET_KEY=must-not-be-followed\n"
+    outside.write_text(original, encoding="utf-8")
+    (profile / ".env").symlink_to(outside)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run(
+            [str(app_root / "prepare-claw-service.sh")],
+            check=True,
+            cwd=str(app_root),
+            env=_script_env(),
+        )
+
+    assert outside.read_text(encoding="utf-8") == original
+
+
 def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
     tmp_path: Path,
 ):
@@ -1212,6 +1313,12 @@ def test_start_claw_service_loads_reconciled_env_without_overriding_explicit(
         "HERMES_MANAGED_GATEWAY=0\n"
         "HERMES_MANAGED_CGROUP_ROOT=/stale/cgroup\n"
         "HERMES_MANAGED_CGROUP_UNIT=stale.service\n"
+        "HERMES_LANGFUSE_MODE=relay\n"
+        "HERMES_LANGFUSE_BASE_URL=http://127.0.0.1:19092\n"
+        "HERMES_LANGFUSE_PUBLIC_KEY=legacy-public\n"
+        "HERMES_LANGFUSE_SECRET_KEY=legacy-secret\n"
+        "LANGFUSE_PUBLIC_KEY=legacy-global-public\n"
+        "LANGFUSE_SECRET_KEY=legacy-global-secret\n"
         'CUSTOM_SAFE="keep "\'me\'\n'
         r"CUSTOM_UNQUOTED=one\ two" "\n"
         r'CUSTOM_DOUBLE="literal\nvalue"' "\n",
@@ -1252,6 +1359,12 @@ Path({str(gateway_log)!r}).write_text(
         "lazy_target": os.environ.get("HERMES_LAZY_INSTALL_TARGET"),
         "presets": os.environ.get("ZETTLAB_PRESETS_DIR"),
         "presets_override": os.environ.get("ZETTLAB_CLAW_PRESETS_DIR"),
+        "langfuse_mode": os.environ.get("HERMES_LANGFUSE_MODE"),
+        "langfuse_base_url": os.environ.get("HERMES_LANGFUSE_BASE_URL"),
+        "langfuse_public": os.environ.get("HERMES_LANGFUSE_PUBLIC_KEY"),
+        "langfuse_secret": os.environ.get("HERMES_LANGFUSE_SECRET_KEY"),
+        "langfuse_global_public": os.environ.get("LANGFUSE_PUBLIC_KEY"),
+        "langfuse_global_secret": os.environ.get("LANGFUSE_SECRET_KEY"),
     }}),
     encoding="utf-8",
 )
@@ -1273,6 +1386,10 @@ Path({str(gateway_log)!r}).write_text(
         "HERMES_BUNDLED_LOCALES": "/stale/locales",
         "HERMES_LAZY_INSTALL_TARGET": "/stale/lazy-packages",
         "ZETTLAB_CLAW_PRESETS_DIR": str(explicit_presets),
+        "HERMES_LANGFUSE_PUBLIC_KEY": "operator-public",
+        "HERMES_LANGFUSE_SECRET_KEY": "operator-secret",
+        "LANGFUSE_PUBLIC_KEY": "operator-global-public",
+        "LANGFUSE_SECRET_KEY": "operator-global-secret",
     }
     if with_explicit_override:
         overrides["HERMES_MANAGED_DIR"] = str(explicit_managed)
@@ -1309,6 +1426,12 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["lazy_target"] == str(hermes_home.parent / "lazy-packages")
     assert gateway_env["presets"] == str(explicit_presets)
     assert gateway_env["presets_override"] is None
+    assert gateway_env["langfuse_mode"] == "relay"
+    assert gateway_env["langfuse_base_url"] == "http://127.0.0.1:19092"
+    assert gateway_env["langfuse_public"] is None
+    assert gateway_env["langfuse_secret"] is None
+    assert gateway_env["langfuse_global_public"] is None
+    assert gateway_env["langfuse_global_secret"] is None
     env_text = env_path.read_text(encoding="utf-8")
     for removed in (
         "GATEWAY_MULTIPLEX_PROFILES=",
@@ -1321,6 +1444,10 @@ Path({str(gateway_log)!r}).write_text(
         "HERMES_BUNDLED_LOCALES=",
         "HERMES_LAZY_INSTALL_TARGET=",
         "ZETTLAB_CLAW_PRESETS_DIR=",
+        "HERMES_LANGFUSE_PUBLIC_KEY=",
+        "HERMES_LANGFUSE_SECRET_KEY=",
+        "LANGFUSE_PUBLIC_KEY=",
+        "LANGFUSE_SECRET_KEY=",
     ):
         assert removed not in env_text
     assert not (app_root / "hermes-invocations.jsonl").exists()

@@ -156,6 +156,31 @@ class TestCacheImageFromUrl:
         assert mock_client.stream.call_count == 2
         mock_sleep.assert_called_once()
 
+    @pytest.mark.parametrize("headers", [
+        {"content-length": "11"},
+        {},
+    ])
+    def test_explicit_size_cap_rejects_declared_or_streamed_oversize(
+        self, _mock_safe, tmp_path, monkeypatch, headers,
+    ):
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        response = _make_stream_response(b"\xff\xd8\xff" + b"x" * 8)
+        response.headers = headers
+        mock_client = _make_stream_client(responses=[response])
+
+        async def run():
+            with patch("httpx.AsyncClient", return_value=mock_client):
+                from gateway.platforms.base import cache_image_from_url
+                await cache_image_from_url(
+                    "http://example.com/img.jpg",
+                    ext=".jpg",
+                    retries=0,
+                    max_bytes=10,
+                )
+
+        with pytest.raises(ValueError, match="11 bytes > 10 bytes"):
+            asyncio.run(run())
+
 
 class TestCacheImageFromUrlConnectGuard:
     def test_blocks_private_dns_answer_at_connect_time(self, tmp_path, monkeypatch):
@@ -556,4 +581,3 @@ class TestMattermostSendUrlAsFile:
         adapter.send.assert_called_once()
         text_arg = adapter.send.call_args[0][1]
         assert "http://cdn.example.com/img.png" in text_arg
-

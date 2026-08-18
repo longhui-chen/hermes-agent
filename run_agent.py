@@ -46,6 +46,7 @@ import time
 import threading
 import uuid
 import warnings
+from contextvars import ContextVar, Token
 from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -149,7 +150,7 @@ from tools.browser_tool import cleanup_browser
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import is_trivial_prompt
-from agent.error_classifier import normalized_provider_error_code, FailoverReason
+from agent.error_classifier import normalized_provider_error_code, FailoverReason, client_safe_error_text
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
 from agent.session_activity import ActivityProvenance
@@ -164,6 +165,11 @@ from agent.context_compressor import (  # noqa: F401
     ContextCompressor,
 )
 from agent.retry_utils import jittered_backoff  # noqa: F401
+
+
+_provisional_stream_events: ContextVar[Optional[List[Callable[[], None]]]] = (
+    ContextVar("hermes_provisional_stream_events", default=None)
+)
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
     DEFAULT_AGENT_IDENTITY,
     build_skills_system_prompt,
@@ -449,6 +455,7 @@ class AIAgent:
         tool_delay: float = None,  # Deprecated: accepted for compatibility, ignored
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
+        skip_tool_loading: bool = False,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
@@ -487,13 +494,17 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        session_owner_id: str = None,
         user_id_alt: str = None,
+        deep_memory_principal: str = None,
+        deep_memory_subject: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        profile_name: str = None,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
@@ -534,6 +545,7 @@ class AIAgent:
             max_iterations=max_iterations,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            skip_tool_loading=skip_tool_loading,
             save_trajectories=save_trajectories,
             verbose_logging=verbose_logging,
             quiet_mode=quiet_mode,
@@ -572,13 +584,17 @@ class AIAgent:
             prefill_messages=prefill_messages,
             platform=platform,
             user_id=user_id,
+            session_owner_id=session_owner_id,
             user_id_alt=user_id_alt,
+            deep_memory_principal=deep_memory_principal,
+            deep_memory_subject=deep_memory_subject,
             user_name=user_name,
             chat_id=chat_id,
             chat_name=chat_name,
             chat_type=chat_type,
             thread_id=thread_id,
             gateway_session_key=gateway_session_key,
+            profile_name=profile_name,
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
@@ -648,13 +664,29 @@ class AIAgent:
                     _init_model_config["yolo_mode"] = True
             except Exception:
                 pass
+            session_owner_id = str(getattr(self, "_session_owner_id", "") or "").strip()
+            account_id = str(self._user_id or "").strip()
+            if self.platform == "zet_agent" and session_owner_id and account_id:
+                # A legacy Zet row may be upgraded only by the authenticated
+                # request that proves both its former account and new principal.
+                # NULL and other-account rows deliberately remain untouched.
+                self._session_db.migrate_session_owner_from_account(
+                    self.session_id, account_id, session_owner_id
+                )
+            session_db_user_id = (
+                session_owner_id
+                if session_owner_id
+                else (None if self.platform == "zet_agent" else self._user_id or None)
+            )
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=source,
                 model=self.model,
                 model_config=_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                # Zet keeps account ownership in memory but persists only the
+                # authenticated principal. Missing principals fail closed as NULL.
+                user_id=session_db_user_id,
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,
@@ -2684,7 +2716,10 @@ class AIAgent:
     def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
         """Build the safe, structured provider-error payload for chat surfaces."""
         payload: Dict[str, Any] = {
-            "code": normalized_provider_error_code(classified),
+            # ⭐ 带上 error:码和文案必须用同一个判据(见 is_our_own_failure)。
+            # ⛔ 不传的话,本地 RuntimeError("… timed out: /volume1/…") 会拿到
+            # provider_network_error,界面劝用户「检查网络后重试」——重试无用。
+            "code": normalized_provider_error_code(classified, error=error),
             "reason": classified.reason.value,
         }
         if classified.provider:
@@ -2700,6 +2735,16 @@ class AIAgent:
         if classified.provider_error_code:
             payload["provider_error_code"] = classified.provider_error_code
         message = classified.message or self._summarize_api_error(error)
+        # This payload calls itself "safe" (see the docstring) and is handed to
+        # chat surfaces.  For an upstream failure `message` is the provider's
+        # own text — useful, safe to pass through.  For an internal_error it is
+        # *our* exception string (class names, attribute names, file paths).
+        #
+        # Routed through the shared helper rather than rewritten here: the same
+        # collapse is needed on `final_response` / `error` / status lines in
+        # conversation_loop, and a second copy of the rule is a second source of
+        # truth — which is precisely how the first fix left those three leaking.
+        message = client_safe_error_text(classified, message, error=error)
         if message:
             payload["provider_message"] = message[:500]
         payload["retryable"] = bool(classified.retryable)
@@ -6027,6 +6072,36 @@ class AIAgent:
             )
 
     @staticmethod
+    def _begin_provisional_stream() -> tuple[
+        Token[Optional[List[Callable[[], None]]]], List[Callable[[], None]]
+    ]:
+        """Buffer stream side effects until the provider response is trusted."""
+        events: List[Callable[[], None]] = []
+        return _provisional_stream_events.set(events), events
+
+    @staticmethod
+    def _end_provisional_stream(
+        token: Token[Optional[List[Callable[[], None]]]],
+    ) -> None:
+        _provisional_stream_events.reset(token)
+
+    @staticmethod
+    def _defer_provisional_stream_event(event: Callable[[], None]) -> bool:
+        events = _provisional_stream_events.get()
+        if events is None:
+            return False
+        events.append(event)
+        return True
+
+    @staticmethod
+    def _release_provisional_stream(events: List[Callable[[], None]]) -> None:
+        for event in events:
+            try:
+                event()
+            except Exception:
+                pass
+
+    @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:
         if not isinstance(text, str):
             return ""
@@ -6149,11 +6224,15 @@ class AIAgent:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
-        try:
+        def _deliver_codex_commentary() -> None:
             cb(visible, already_streamed=False)
             self._record_delivered_interim_text(visible)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+
+        if not self._defer_provisional_stream_event(_deliver_codex_commentary):
+            try:
+                _deliver_codex_commentary()
+            except Exception:
+                logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6196,15 +6275,19 @@ class AIAgent:
         ):
             return
         already_streamed = self._interim_content_was_streamed(visible)
-        try:
+        def _deliver_interim_message() -> None:
             cb(visible, already_streamed=already_streamed)
             if undelivered_parts:
                 for part in undelivered_parts:
                     self._record_delivered_interim_text(part)
             else:
                 self._record_delivered_interim_text(visible)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+
+        if not self._defer_provisional_stream_event(_deliver_interim_message):
+            try:
+                _deliver_interim_message()
+            except Exception:
+                logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).
@@ -6339,15 +6422,20 @@ class AIAgent:
         if not text:
             return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        if delivered:
-            self._record_streamed_assistant_text(text)
+
+        def _deliver_stream_delta() -> None:
+            delivered = False
+            for cb in callbacks:
+                try:
+                    cb(text)
+                    delivered = True
+                except Exception:
+                    pass
+            if delivered:
+                self._record_streamed_assistant_text(text)
+
+        if not self._defer_provisional_stream_event(_deliver_stream_delta):
+            _deliver_stream_delta()
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -6360,10 +6448,14 @@ class AIAgent:
             return
         cb = self.reasoning_callback
         if cb is not None:
-            try:
+            def _deliver_reasoning_delta() -> None:
                 cb(text)
-            except Exception:
-                pass
+
+            if not self._defer_provisional_stream_event(_deliver_reasoning_delta):
+                try:
+                    _deliver_reasoning_delta()
+                except Exception:
+                    pass
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
@@ -6375,10 +6467,14 @@ class AIAgent:
         """
         cb = self.tool_gen_callback
         if cb is not None:
-            try:
+            def _deliver_tool_gen_started() -> None:
                 cb(tool_name)
-            except Exception:
-                pass
+
+            if not self._defer_provisional_stream_event(_deliver_tool_gen_started):
+                try:
+                    _deliver_tool_gen_started()
+                except Exception:
+                    pass
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""
@@ -7745,6 +7841,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        user_authored_message: Optional[Any] = None,
+        user_message_has_image: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7836,6 +7934,8 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    user_authored_message=user_authored_message,
+                    user_message_has_image=user_message_has_image,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:

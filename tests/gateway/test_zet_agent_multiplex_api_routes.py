@@ -6,6 +6,7 @@ import queue
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -90,6 +91,36 @@ def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapte
         "/p/{profile}/v1/sessions/{session_id}/interrupt",
         adapter._profile_handler(adapter._handle_session_interrupt),
     )
+
+
+@pytest.mark.asyncio
+async def test_connectors_reload_returns_stable_error_without_internal_details(
+    monkeypatch,
+):
+    import tools.mcp_tool as mcp_tool
+
+    adapter = _make_adapter()
+    app = web.Application()
+    app.router.add_post("/v1/connectors/reload", adapter._handle_connectors_reload)
+    monkeypatch.setattr(
+        mcp_tool,
+        "reload_single_mcp_server",
+        lambda _name: (_ for _ in ()).throw(
+            RuntimeError("/private/profile/a/wecom-cli-config")
+        ),
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/v1/connectors/reload",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        body = await response.json()
+
+    assert response.status == 500
+    assert body["error"]["code"] == "connector_reload_unavailable"
+    assert "reference" in body["error"]["message"]
+    assert "/private/profile" not in body["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -693,6 +724,10 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
     def fake_create_agent(**_kwargs):
         from agent.secret_scope import current_secret_scope
         from gateway.platforms.api_server import _api_request_profile
+        from gateway.platforms.zet_agent import (
+            _deep_memory_principal,
+            _deep_memory_subject,
+        )
         from hermes_constants import get_hermes_home
 
         scope = current_secret_scope()
@@ -700,6 +735,8 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
             get_hermes_home(),
             None if scope is None else scope.get("ZET_AGENT_ID"),
             _api_request_profile.get(),
+            _deep_memory_principal.get(),
+            _deep_memory_subject.get(),
         ))
         return FakeAgent()
 
@@ -714,11 +751,18 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
                 "model": "hermes-agent",
                 "messages": [{"role": "user", "content": "hello coder"}],
             },
-            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            headers={
+                "Authorization": "Bearer test-key-0123456789abcdef",
+                "X-Zettlab-Auth-Principal-Id": "iam:issuer:user:user-1",
+                "X-Zettlab-User-Id": "user-1",
+            },
         )
 
     assert response.status == 200
-    assert seen == [(profile_homes["coder"], "coder", "coder")]
+    assert seen == [(
+        profile_homes["coder"], "coder", "coder",
+        "iam:issuer:user:user-1", "user-1",
+    )]
 
 
 @pytest.mark.asyncio
@@ -832,8 +876,8 @@ async def test_prefixed_profile_unload_calls_targeted_runner(profile_homes):
     calls = []
 
     class FakeRunner:
-        async def unload_profile_runtime(self, profile):
-            calls.append(profile)
+        async def unload_profile_runtime(self, profile, **kwargs):
+            calls.append((profile, kwargs["profile_home"]))
             return {"evicted_sessions": 2, "disconnected_adapters": 1}
 
     adapter = _make_adapter()
@@ -849,7 +893,7 @@ async def test_prefixed_profile_unload_calls_targeted_runner(profile_homes):
         data = await resp.json()
 
     assert resp.status == 200
-    assert calls == ["coder"]
+    assert calls == [("coder", profile_homes["coder"])]
     assert data["evicted_sessions"] == 2
     assert data["disconnected_adapters"] == 1
 
@@ -857,7 +901,7 @@ async def test_prefixed_profile_unload_calls_targeted_runner(profile_homes):
 @pytest.mark.asyncio
 async def test_prefixed_profile_unload_blocks_active_sessions(profile_homes):
     class FakeRunner:
-        async def unload_profile_runtime(self, profile):
+        async def unload_profile_runtime(self, profile, **_kwargs):
             return {
                 "blocked": True,
                 "active_sessions": 1,
@@ -1054,6 +1098,53 @@ async def test_prefixed_runs_holds_profile_lease_until_background_task_finishes(
 
 
 @pytest.mark.asyncio
+async def test_runs_worker_keeps_account_metadata_separate_from_principal(
+    profile_homes,
+    monkeypatch,
+):
+    del profile_homes
+    started = threading.Event()
+    seen = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "runs-account"
+
+        def run_conversation(self, **_kwargs):
+            from gateway.session_context import get_session_env
+
+            seen["account"] = get_session_env("HERMES_SESSION_USER_ID", "")
+            started.set()
+            return {"final_response": "done", "completed": True}
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/v1/runs",
+            json={"input": "hello", "session_id": "public-session"},
+            headers={
+                "Authorization": f"Bearer {TEST_API_KEY}",
+                "X-Zettlab-Account-Id": "account-1",
+                "X-Zettlab-Auth-Principal-Id": "iam:alice",
+            },
+        )
+        assert response.status == 202
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+    assert started.is_set()
+    assert seen["account"] == "account-1"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_runs_worker_keeps_profile_lease_until_thread_exits(
     profile_homes,
     monkeypatch,
@@ -1215,7 +1306,7 @@ async def test_profile_unload_barrier_rejects_new_agent_request_during_teardown(
     release_unload = asyncio.Event()
 
     class FakeRunner:
-        async def unload_profile_runtime(self, profile):
+        async def unload_profile_runtime(self, profile, **_kwargs):
             assert profile == "coder"
             unload_entered.set()
             await release_unload.wait()
@@ -1345,6 +1436,524 @@ async def test_gateway_profile_unload_blocks_pending_sentinel():
 
     assert result["blocked"] is True
     assert result["active_sessions"] == 1
+
+
+def test_default_profile_unload_fence_covers_all_entry_aliases():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._profile_runtime_unloads = {"default": object()}
+    runner._profile_runtime_unload_retry = set()
+    for alias in ("", "default", "main"):
+        assert runner._profile_runtime_unload_blocked(alias) is True
+
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = {"main"}
+    for alias in ("", "default", "main"):
+        assert runner._profile_runtime_unload_blocked(alias) is True
+    assert runner._profile_runtime_unload_blocked("coder") is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_profile_unload_cleans_exact_profile_mcp_and_lsp(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+    from hermes_constants import get_hermes_home
+    import agent.lsp as lsp
+    import hermes_cli.mcp_startup as mcp_startup
+    import tools.mcp_tool as mcp_tool
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner._profile_adapters = {}
+    runner._sessions = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner._evict_cached_agents_for_profile = lambda _profile: 0
+
+    async def _run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    runner._run_in_executor_with_context = _run_inline
+    old_home = tmp_path / "profiles" / "coder-v1"
+    seen = []
+    monkeypatch.setattr(
+        mcp_tool,
+        "shutdown_mcp_profile",
+        lambda: seen.append(("mcp", get_hermes_home())),
+    )
+    monkeypatch.setattr(
+        lsp,
+        "shutdown_service",
+        lambda **kwargs: seen.append(("lsp", get_hermes_home(), kwargs)),
+    )
+    monkeypatch.setattr(
+        mcp_startup,
+        "clear_mcp_discovery_profile",
+        lambda home: seen.append(("discovery", Path(home))),
+    )
+
+    result = await runner.unload_profile_runtime(
+        "coder",
+        profile_home=old_home,
+    )
+
+    assert result == {"evicted_sessions": 0, "disconnected_adapters": 0}
+    assert seen == [
+        ("mcp", old_home),
+        ("discovery", old_home),
+        ("lsp", old_home, {"raise_on_error": True}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_profile_unload_cancellation_waits_for_cleanup_worker(
+    tmp_path, monkeypatch
+):
+    """取消 unload 请求不能让不可取消的 MCP cleanup 脱离 barrier。"""
+    from gateway.run import GatewayRunner
+    import tools.mcp_tool as mcp_tool
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner._profile_adapters = {}
+    runner._sessions = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner._evict_cached_agents_for_profile = lambda _profile: 0
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_shutdown():
+        entered.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_profile", blocked_shutdown)
+    task = asyncio.create_task(
+        runner.unload_profile_runtime(
+            "coder", profile_home=tmp_path / "profiles" / "coder"
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert runner._profile_runtime_unloads.get("coder") is not None
+        with pytest.raises(RuntimeError, match="rejected during unload"):
+            await runner._start_one_profile_adapters(
+                "coder", tmp_path / "profiles" / "coder", {}
+            )
+        task.cancel()
+        first_cancel_delivered = asyncio.Event()
+        asyncio.get_running_loop().call_soon(first_cancel_delivered.set)
+        await first_cancel_delivered.wait()
+        assert not task.done()
+        task.cancel()
+        second_cancel_delivered = asyncio.Event()
+        asyncio.get_running_loop().call_soon(second_cancel_delivered.set)
+        await second_cancel_delivered.wait()
+        assert not task.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert runner._profile_runtime_unload_retry == {"coder"}
+    finally:
+        release.set()
+        runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_profile_unload_waits_for_prefence_startup_cleanup(
+    tmp_path, monkeypatch
+):
+    """真实 startup 在 fence 前进入 connect，取消后必须先清理再卸载。"""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.run import GatewayRunner
+    import agent.lsp as lsp
+    import hermes_cli.mcp_startup as mcp_startup
+    import tools.mcp_tool as mcp_tool
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._running_agents = {}
+    runner._profile_adapters = {}
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = set()
+    runner._profile_adapter_operations = {}
+    runner._partial_adapter_cleanup_retry = {}
+    runner._partial_adapter_cleanup_tasks = {}
+    runner._retiring_adapter_cleanups = {}
+    runner._published_adapter_cleanup_retry = {}
+    runner._sessions = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner._evict_cached_agents_for_profile = lambda _profile: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+    entered = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    class _Adapter:
+        async def disconnect(self):
+            cleanup_entered.set()
+            await release_cleanup.wait()
+
+    adapter = _Adapter()
+
+    profile_cfg = GatewayConfig(multiplex_profiles=True)
+    profile_cfg.platforms = {
+        Platform.FEISHU: PlatformConfig(enabled=True, token="profile-token")
+    }
+
+    async def blocked_connect(_adapter, _platform):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
+    runner._create_adapter = lambda _platform, _config: adapter
+    runner._configure_profile_adapter = lambda *_args: None
+    runner._adapter_credential_claim = lambda *_args: None
+    runner._adapter_listener_claim = lambda *_args: None
+    runner._connect_initial_adapter_with_timeout = blocked_connect
+
+    async def _run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    runner._run_in_executor_with_context = _run_inline
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_profile", lambda: None)
+    monkeypatch.setattr(lsp, "shutdown_service", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        mcp_startup, "clear_mcp_discovery_profile", lambda _home: None
+    )
+    profile_home = tmp_path / "profiles" / "coder"
+
+    startup = asyncio.create_task(
+        runner._start_one_profile_adapters("coder", profile_home, {})
+    )
+    await entered.wait()
+    unload = asyncio.create_task(
+        runner.unload_profile_runtime("coder", profile_home=profile_home)
+    )
+    cleanup_wait = asyncio.create_task(cleanup_entered.wait())
+    try:
+        completed, _pending = await asyncio.wait(
+            {cleanup_wait, unload}, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert cleanup_wait in completed
+        assert not unload.done()
+        assert runner._partial_adapter_cleanup_retry[
+            ("coder", Platform.FEISHU)
+        ] is adapter
+
+        release_cleanup.set()
+        result = await unload
+        assert await startup == 0
+        assert result == {"evicted_sessions": 0, "disconnected_adapters": 0}
+        assert (
+            "coder", Platform.FEISHU
+        ) not in runner._partial_adapter_cleanup_retry
+    finally:
+        release_cleanup.set()
+        if not startup.done():
+            startup.cancel()
+        if not unload.done():
+            unload.cancel()
+        await asyncio.gather(startup, unload, return_exceptions=True)
+        if not cleanup_wait.done():
+            cleanup_wait.cancel()
+        await asyncio.gather(cleanup_wait, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_profile_unload_retries_cleanup_ledger_after_cancelling_owner(
+    tmp_path, monkeypatch
+):
+    """取消 cleanup owner 后，ledger 必须重放；失败不能被当成卸载成功。"""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.run import GatewayRunner
+    import agent.lsp as lsp
+    import hermes_cli.mcp_startup as mcp_startup
+    import tools.mcp_tool as mcp_tool
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._running_agents = {}
+    runner._profile_adapters = {}
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = set()
+    runner._profile_adapter_operations = {}
+    runner._partial_adapter_cleanup_retry = {}
+    runner._partial_adapter_cleanup_tasks = {}
+    runner._retiring_adapter_cleanups = {}
+    runner._published_adapter_cleanup_retry = {}
+    runner._sessions = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner._evict_cached_agents_for_profile = lambda _profile: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+    first_cleanup_entered = asyncio.Event()
+    first_cleanup_cancelled = asyncio.Event()
+    retry_cleanup_entered = asyncio.Event()
+    release_retry_cleanup = asyncio.Event()
+
+    class _Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        async def disconnect(self):
+            self.calls += 1
+            if self.calls == 1:
+                first_cleanup_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    first_cleanup_cancelled.set()
+                    raise RuntimeError("cleanup failed after cancellation")
+            retry_cleanup_entered.set()
+            await release_retry_cleanup.wait()
+
+    adapter = _Adapter()
+    profile_cfg = GatewayConfig(multiplex_profiles=True)
+    profile_cfg.platforms = {
+        Platform.FEISHU: PlatformConfig(enabled=True, token="profile-token")
+    }
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
+    runner._create_adapter = lambda _platform, _config: adapter
+    runner._configure_profile_adapter = lambda *_args: None
+    runner._adapter_credential_claim = lambda *_args: None
+    runner._adapter_listener_claim = lambda *_args: None
+    runner._connect_initial_adapter_with_timeout = AsyncMock(return_value=False)
+
+    async def _run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    runner._run_in_executor_with_context = _run_inline
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_profile", lambda: None)
+    monkeypatch.setattr(lsp, "shutdown_service", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        mcp_startup, "clear_mcp_discovery_profile", lambda _home: None
+    )
+    profile_home = tmp_path / "profiles" / "coder"
+    startup = asyncio.create_task(
+        runner._start_one_profile_adapters("coder", profile_home, {})
+    )
+    await first_cleanup_entered.wait()
+    unload = asyncio.create_task(
+        runner.unload_profile_runtime("coder", profile_home=profile_home)
+    )
+    retry_wait = asyncio.create_task(retry_cleanup_entered.wait())
+    try:
+        await first_cleanup_cancelled.wait()
+        completed, _pending = await asyncio.wait(
+            {retry_wait, unload}, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert retry_wait in completed
+        assert not unload.done()
+        assert runner._partial_adapter_cleanup_retry[
+            ("coder", Platform.FEISHU)
+        ] is adapter
+
+        release_retry_cleanup.set()
+        assert await startup == 0
+        assert await unload == {
+            "evicted_sessions": 0,
+            "disconnected_adapters": 0,
+        }
+        assert adapter.calls == 2
+        assert ("coder", Platform.FEISHU) not in runner._partial_adapter_cleanup_retry
+    finally:
+        release_retry_cleanup.set()
+        for task in (startup, unload, retry_wait):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(startup, unload, retry_wait, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_default_profile_unload_replays_cancelled_published_cleanup(
+    tmp_path, monkeypatch
+):
+    """default unload 也必须重放 published ledger，不能因 adapter_map=None 假成功。"""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    import agent.lsp as lsp
+    import hermes_cli.mcp_startup as mcp_startup
+    import tools.mcp_tool as mcp_tool
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._running_agents = {}
+    runner._profile_adapters = {}
+    runner._profile_runtime_unloads = {}
+    runner._profile_runtime_unload_retry = set()
+    runner._profile_adapter_operations = {}
+    runner._partial_adapter_cleanup_retry = {}
+    runner._partial_adapter_cleanup_tasks = {}
+    runner._retiring_adapter_cleanups = {}
+    runner._published_adapter_cleanup_retry = {}
+    runner._published_adapter_cleanup_tasks = {}
+    runner._background_tasks = set()
+    runner._sessions = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner._evict_cached_agents_for_profile = lambda _profile: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+    first_retry_entered = asyncio.Event()
+    first_retry_cancelled = asyncio.Event()
+    replay_entered = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    class _Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        async def disconnect(self):
+            self.calls += 1
+            if self.calls == 1:
+                first_retry_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    first_retry_cancelled.set()
+                    raise RuntimeError("published cleanup cancelled")
+            replay_entered.set()
+            await release_replay.wait()
+
+    adapter = _Adapter()
+    runner.adapters = {Platform.FEISHU: adapter}
+
+    async def _run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    runner._run_in_executor_with_context = _run_inline
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_profile", lambda: None)
+    monkeypatch.setattr(lsp, "shutdown_service", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        mcp_startup, "clear_mcp_discovery_profile", lambda _home: None
+    )
+    runner._schedule_published_adapter_cleanup_retry(
+        "", Platform.FEISHU, adapter, runner.adapters
+    )
+    await first_retry_entered.wait()
+    unload = asyncio.create_task(
+        runner.unload_profile_runtime("", profile_home=tmp_path / "default")
+    )
+    replay_wait = asyncio.create_task(replay_entered.wait())
+    try:
+        await first_retry_cancelled.wait()
+        completed, _pending = await asyncio.wait(
+            {replay_wait, unload}, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert replay_wait in completed
+        assert not unload.done()
+        assert runner.adapters[Platform.FEISHU] is adapter
+
+        release_replay.set()
+        result = await unload
+        assert result == {"evicted_sessions": 0, "disconnected_adapters": 1}
+        assert runner.adapters == {}
+        assert ("", Platform.FEISHU) not in runner._published_adapter_cleanup_retry
+    finally:
+        runner._running = False
+        release_replay.set()
+        for task in (unload, replay_wait):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(unload, replay_wait, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_gateway_profile_unload_failure_keeps_exact_home_retry_ownership(
+    tmp_path, monkeypatch
+):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    import agent.lsp as lsp
+    import hermes_cli.mcp_startup as mcp_startup
+    import tools.mcp_tool as mcp_tool
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    adapter = SimpleNamespace(disconnect=AsyncMock())
+    runner._profile_adapters = {"coder": {Platform.FEISHU: adapter}}
+    runner._agent_cache = {"agent:coder:feishu:dm:x": (object(),)}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    evicted = []
+    runner._evict_cached_agents_for_profile = lambda profile: evicted.append(profile)
+
+    async def _run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    runner._run_in_executor_with_context = _run_inline
+    old_home = tmp_path / "profiles" / "coder-v1"
+    monkeypatch.setattr(
+        mcp_tool,
+        "shutdown_mcp_profile",
+        lambda: (_ for _ in ()).throw(RuntimeError("old child still running")),
+    )
+    monkeypatch.setattr(lsp, "shutdown_service", lambda **_kwargs: None)
+    monkeypatch.setattr(mcp_startup, "clear_mcp_discovery_profile", lambda _home: None)
+
+    with pytest.raises(RuntimeError, match="failed to unload"):
+        await runner.unload_profile_runtime("coder", profile_home=old_home)
+
+    assert runner._profile_adapters["coder"][Platform.FEISHU] is adapter
+    adapter.disconnect.assert_not_awaited()
+    assert evicted == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_profile_unload_adapter_partial_failure_only_retries_owner(
+    tmp_path, monkeypatch
+):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    import agent.lsp as lsp
+    import hermes_cli.mcp_startup as mcp_startup
+    import tools.mcp_tool as mcp_tool
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    good = SimpleNamespace(disconnect=AsyncMock())
+    flaky = SimpleNamespace(
+        disconnect=AsyncMock(side_effect=[RuntimeError("old poller alive"), None])
+    )
+    runner._profile_adapters = {
+        "coder": {Platform.FEISHU: good, Platform.SLACK: flaky}
+    }
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner._evict_cached_agents_for_profile = lambda _profile: 0
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+
+    async def _run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    runner._run_in_executor_with_context = _run_inline
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_profile", lambda: None)
+    monkeypatch.setattr(lsp, "shutdown_service", lambda **_kwargs: None)
+    monkeypatch.setattr(mcp_startup, "clear_mcp_discovery_profile", lambda _home: None)
+    profile_home = tmp_path / "profiles" / "coder"
+
+    with pytest.raises(RuntimeError, match="old poller alive"):
+        await runner.unload_profile_runtime("coder", profile_home=profile_home)
+    assert Platform.FEISHU not in runner._profile_adapters["coder"]
+    assert runner._profile_adapters["coder"][Platform.SLACK] is flaky
+    assert runner._profile_runtime_unload_retry == {"coder"}
+
+    result = await runner.unload_profile_runtime("coder", profile_home=profile_home)
+    assert result["disconnected_adapters"] == 1
+    assert good.disconnect.await_count == 1
+    assert flaky.disconnect.await_count == 2
+    assert "coder" not in runner._profile_adapters
+    assert runner._profile_runtime_unload_retry == set()
 
 
 @pytest.mark.asyncio

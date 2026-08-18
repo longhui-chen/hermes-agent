@@ -379,11 +379,20 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         # 模型只能靠撞墙学习，所以这里钉住它的存在。
         assert "## 工作目录与路径" in text
         assert "绝对路径" in text
+        # PC Host 只接受用户授权根目录内的相对路径。通用的“用户文件用绝对
+        # 路径”规则必须显式给它让路，否则模型会反过来追问用户电脑路径。
+        assert "已连接电脑的授权文件夹是唯一例外" in text
+        assert '`action="list"`、`path="."`' in text
+        assert "不要索要、猜测或生成电脑绝对路径" in text
         # 相对路径两头都不能承诺：文件工具只在没跑过终端命令时锚到产出目录，
         # 一旦 cd 过就跟着终端走；终端命令参数则从来不锚到 ZET_AGENT_OUTPUT_DIR。
         # 把任何一头说成无条件的，模型都会把产物写到收不回来的地方。
         assert "相对路径没有稳定含义" in text
         assert "终端命令的锚点也不与文件工具共用" in text
+    # 播种衔接指令两版都在（清单由系统按计划骨架创建，模型只更新状态）。
+    for text in (auto, manual):
+        assert "系统已按计划骨架自动创建任务清单" in text
+        assert "不要整表重建" in text
 
 
 def test_workflow_addendum_workdir_alias_line_follows_capability(monkeypatch):

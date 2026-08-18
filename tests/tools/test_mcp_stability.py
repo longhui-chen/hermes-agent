@@ -3,7 +3,11 @@
 import asyncio
 import os
 import signal
-from unittest.mock import patch, MagicMock
+import subprocess
+import sys
+import threading
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -72,6 +76,7 @@ class TestStdioPidTracking:
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pid_servers,
+            _orphan_stdio_pid_start_times,
             _orphan_stdio_pids,
             _lock,
         )
@@ -81,6 +86,7 @@ class TestStdioPidTracking:
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
             _orphan_stdio_pid_servers[fake_pid] = "orphan"
+            _orphan_stdio_pid_start_times[fake_pid] = 100
 
         # Should not raise (ProcessLookupError is caught)
         with patch("tools.mcp_tool.time.sleep"), patch(
@@ -91,8 +97,11 @@ class TestStdioPidTracking:
         with _lock:
             assert fake_pid not in _orphan_stdio_pids
 
-    def test_kill_orphaned_uses_sigkill_when_available(self, monkeypatch):
-        """SIGTERM-first then SIGKILL after 2s for orphan cleanup."""
+    def test_kill_orphaned_keeps_legacy_owner_when_generation_unknown(
+        self, monkeypatch
+    ):
+        """legacy owner 缺 start-time 时必须保留且不得向未知 PID 发信号。"""
+        import tools.mcp_tool as mcp_tool
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pid_servers,
@@ -110,22 +119,37 @@ class TestStdioPidTracking:
         fake_sigkill = 9
         monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
 
-        # Post-#21561 the alive check routes through
-        # ``gateway.status._pid_exists`` (so it's safe on Windows — see
-        # bpo-14484). Return True so the SIGKILL escalation fires.
+        # 进程仍存活但缺少已记录的 start-time，不能判断 PID 是否已复用。
         with patch("tools.mcp_tool.os.kill") as mock_kill, \
              patch("gateway.status._pid_exists", return_value=True), \
              patch("tools.mcp_tool.time.sleep") as mock_sleep:
-            _kill_orphaned_mcp_children()
+            assert _kill_orphaned_mcp_children() == [fake_pid]
+        mock_kill.assert_not_called()
+        mock_sleep.assert_not_called()
 
         with _lock:
-            assert fake_pid not in _orphan_stdio_pids
+            assert fake_pid in _orphan_stdio_pids
+            assert not any(
+                key[1] == fake_pid for key in mcp_tool._retiring_stdio_owners
+            )
+
+        with patch("gateway.status._pid_exists", return_value=False), \
+             patch("tools.mcp_tool.os.kill"), \
+             patch("tools.mcp_tool.time.sleep"):
+            assert _kill_orphaned_mcp_children() == [fake_pid]
+        with _lock:
+            assert fake_pid in _orphan_stdio_pids
+            _orphan_stdio_pids.discard(fake_pid)
+            _orphan_stdio_pid_servers.pop(fake_pid, None)
 
 
     def test_run_stdio_reaps_orphans_before_spawn(self):
         """_run_stdio kills orphaned PIDs from prior failed attempts (#57355)."""
+        import tools.mcp_tool as mcp_tool
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
+            _orphan_stdio_pid_start_times,
             _orphan_stdio_pids,
             _stdio_pids,
             _stdio_pgids,
@@ -134,13 +158,11 @@ class TestStdioPidTracking:
         )
         from unittest.mock import patch, MagicMock, AsyncMock
 
-        # Seed an orphan PID that belongs to a prior failed connection.
         fake_pid = 999999997
-        with _lock:
-            _orphan_stdio_pids.add(fake_pid)
 
         server = MCPServerTask.__new__(MCPServerTask)
         server.name = "test-zombie-reap"
+        server.profile_identity = mcp_tool._current_mcp_profile_identity()
         server._ready = MagicMock()
         server._shutdown_event = MagicMock()
         server._shutdown_event.is_set.return_value = True
@@ -148,6 +170,14 @@ class TestStdioPidTracking:
         server._sampling = None
         server._elicitation = None
         server._registered_tool_names = []
+        with _lock:
+            _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_servers[fake_pid] = (
+                server.profile_identity,
+                server.name,
+                server,
+            )
+            _orphan_stdio_pid_start_times[fake_pid] = 100
 
         config = {"command": "echo", "args": ["hello"]}
 
@@ -185,12 +215,233 @@ class TestStdioPidTracking:
         with _lock:
             assert fake_pid not in _orphan_stdio_pids
 
+    def test_run_stdio_does_not_spawn_while_exact_orphan_lingers(self):
+        """同一 owner 的旧进程杀不掉时，本轮重连必须显性失败。"""
+        import tools.mcp_tool as mcp_tool
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask.__new__(MCPServerTask)
+        server.name = "test-lingering-owner"
+        server.profile_identity = mcp_tool._current_mcp_profile_identity()
+        server._sampling = None
+        server._elicitation = None
+
+        config = {"command": "echo", "args": ["hello"]}
+
+        async def _run():
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._build_safe_env", return_value={}), \
+                 patch("tools.mcp_tool._resolve_stdio_command",
+                       return_value=("echo", {})), \
+                 patch("tools.mcp_tool.check_package_for_malware",
+                       return_value=None, create=True), \
+                 patch("tools.osv_check.check_package_for_malware",
+                       return_value=None), \
+                 patch("tools.mcp_tool._kill_orphaned_mcp_children",
+                       return_value=[4242]) as reap, \
+                 patch("tools.mcp_tool.stdio_client") as stdio:
+                with pytest.raises(RuntimeError, match="still owns child processes"):
+                    await server._run_stdio(config)
+                stdio.assert_not_called()
+                reap.assert_called_once_with(
+                    False,
+                    server.name,
+                    (server.profile_identity, server.name, server),
+                )
+
+        asyncio.run(_run())
+
+    def test_posix_run_stdio_fails_when_spawn_identity_is_unverified(self):
+        """POSIX 也必须 fail-closed，不能建立无 PID owner 的 session。"""
+        import tools.mcp_tool as mcp_tool
+
+        async def _run():
+            server = mcp_tool.MCPServerTask("unverified")
+            transport = MagicMock()
+            transport.__aenter__ = AsyncMock(return_value=(object(), object()))
+            transport.__aexit__ = AsyncMock(return_value=False)
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._build_safe_env", return_value={}), \
+                 patch("tools.mcp_tool._resolve_stdio_command",
+                       return_value=("echo", {})), \
+                 patch("tools.osv_check.check_package_for_malware",
+                       return_value=None), \
+                 patch("tools.mcp_tool._wrap_command_with_watchdog",
+                       side_effect=lambda command, args: (command, args)), \
+                 patch("tools.mcp_tool._write_stderr_log_header"), \
+                 patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None), \
+                 patch("tools.mcp_tool._kill_orphaned_mcp_children",
+                       return_value=[]), \
+                 patch("tools.mcp_tool._observe_child_pids",
+                       side_effect=[(True, set()), (True, {4242})]), \
+                 patch("tools.mcp_tool._filter_mcp_children", return_value=set()), \
+                 patch("tools.mcp_tool.stdio_client", return_value=transport), \
+                 patch("tools.mcp_tool.ClientSession") as session, \
+                 patch.object(mcp_tool.os, "name", "posix"):
+                with pytest.raises(
+                    RuntimeError, match="ownership could not be verified"
+                ):
+                    await server._run_stdio({"command": "echo"})
+            transport.__aexit__.assert_awaited_once()
+            session.assert_not_called()
+
+        asyncio.run(_run())
+
+    def test_concurrent_run_stdio_serializes_spawn_owner_capture(self, monkeypatch):
+        """并发 profile 只能在各自 spawn 窗口登记各自 PID owner。"""
+        import tools.mcp_tool as mcp_tool
+
+        live_pids = set()
+        next_pid = iter((51001, 51002))
+        spawn_state = {"active": 0, "max_active": 0}
+
+        class _ObservedLock:
+            def __init__(self):
+                self._lock = asyncio.Lock()
+                self.second_waiting = asyncio.Event()
+
+            async def __aenter__(self):
+                if self._lock.locked():
+                    self.second_waiting.set()
+                await self._lock.acquire()
+
+            async def __aexit__(self, *_exc):
+                self._lock.release()
+
+        observed_lock = _ObservedLock()
+        first_spawn_entered = asyncio.Event()
+        release_first_spawn = asyncio.Event()
+
+        class _Transport:
+            async def __aenter__(self):
+                self.pid = next(next_pid)
+                spawn_state["active"] += 1
+                spawn_state["max_active"] = max(
+                    spawn_state["max_active"], spawn_state["active"]
+                )
+                if self.pid == 51001:
+                    first_spawn_entered.set()
+                    await release_first_spawn.wait()
+                live_pids.add(self.pid)
+                spawn_state["active"] -= 1
+                return object(), object()
+
+            async def __aexit__(self, *_exc):
+                live_pids.discard(self.pid)
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def initialize(self):
+                return SimpleNamespace()
+
+        async def _run():
+            release = asyncio.Event()
+            servers = [
+                mcp_tool.MCPServerTask("shared"),
+                mcp_tool.MCPServerTask("shared"),
+            ]
+            servers[0].profile_identity = "/profiles/a"
+            servers[1].profile_identity = "/profiles/b"
+
+            async def wait_for_release():
+                await release.wait()
+                return "shutdown"
+
+            async def discover_tools(_server):
+                return None
+
+            async def wait_for_lifecycle(_server):
+                return await wait_for_release()
+
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._build_safe_env", return_value={}), \
+                 patch("tools.mcp_tool._resolve_stdio_command",
+                       return_value=("echo", {})), \
+                 patch("tools.mcp_tool.check_package_for_malware",
+                       return_value=None, create=True), \
+                 patch("tools.osv_check.check_package_for_malware",
+                       return_value=None), \
+                 patch("tools.mcp_tool._wrap_command_with_watchdog",
+                       side_effect=lambda command, args: (command, args)), \
+                 patch("tools.mcp_tool._write_stderr_log_header"), \
+                 patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None), \
+                 patch("tools.mcp_tool._kill_orphaned_mcp_children",
+                       return_value=[]), \
+                 patch("tools.mcp_tool._get_stdio_spawn_lock",
+                       return_value=observed_lock), \
+                 patch("tools.mcp_tool._observe_child_pids",
+                       side_effect=lambda: (True, set(live_pids))), \
+                 patch("tools.mcp_tool._filter_mcp_children",
+                       side_effect=lambda pids, **_kwargs: pids), \
+                 patch("tools.mcp_tool.stdio_client",
+                       side_effect=lambda *_args, **_kwargs: _Transport()), \
+                 patch("tools.mcp_tool.ClientSession",
+                       side_effect=lambda *_args, **_kwargs: _Session()), \
+                 patch("tools.mcp_tool.os.getpgid", side_effect=lambda pid: pid), \
+                 patch("gateway.status.get_process_start_time",
+                       side_effect=lambda pid: pid * 10), \
+                 patch("gateway.status._pid_exists", return_value=False), \
+                 patch.object(mcp_tool.MCPServerTask, "_discover_tools",
+                              discover_tools), \
+                 patch.object(mcp_tool.MCPServerTask,
+                              "_wait_for_lifecycle_event", wait_for_lifecycle):
+                tasks = [asyncio.create_task(
+                    servers[0]._run_stdio({"command": "echo"})
+                )]
+                await asyncio.wait_for(first_spawn_entered.wait(), timeout=1)
+                tasks.append(asyncio.create_task(
+                    servers[1]._run_stdio({"command": "echo"})
+                ))
+                await asyncio.wait_for(observed_lock.second_waiting.wait(), timeout=1)
+                assert spawn_state == {"active": 1, "max_active": 1}
+                release_first_spawn.set()
+                await asyncio.gather(*(server._ready.wait() for server in servers))
+                with mcp_tool._lock:
+                    assert set(mcp_tool._stdio_pids) == {51001, 51002}
+                    assert {
+                        pid: mcp_tool._stdio_pids[pid]
+                        for pid in (51001, 51002)
+                    } == {
+                        51001: ("/profiles/a", "shared", servers[0]),
+                        51002: ("/profiles/b", "shared", servers[1]),
+                    }
+                    assert {
+                        pid: mcp_tool._stdio_pid_start_times[pid]
+                        for pid in (51001, 51002)
+                    } == {
+                        51001: 510010,
+                        51002: 510020,
+                    }
+                assert spawn_state["max_active"] == 1
+                release.set()
+                assert await asyncio.gather(*tasks) == ["shutdown", "shutdown"]
+
+        try:
+            asyncio.run(_run())
+        finally:
+            with mcp_tool._lock:
+                for pid in (51001, 51002):
+                    mcp_tool._stdio_pids.pop(pid, None)
+                    mcp_tool._stdio_pid_start_times.pop(pid, None)
+                    mcp_tool._stdio_pgids.pop(pid, None)
+                    mcp_tool._orphan_stdio_pids.discard(pid)
+                    mcp_tool._orphan_stdio_pid_servers.pop(pid, None)
+                    mcp_tool._orphan_stdio_pid_start_times.pop(pid, None)
+                    mcp_tool._retiring_stdio_owners.clear()
+
     def test_kill_orphaned_can_filter_by_server_name(self):
         """Reconnect cleanup reaps only the orphan owned by that MCP server."""
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pid_servers,
+            _orphan_stdio_pid_start_times,
             _orphan_stdio_pids,
+            _retiring_stdio_owners,
             _lock,
         )
 
@@ -199,22 +450,295 @@ class TestStdioPidTracking:
         with _lock:
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
+            _retiring_stdio_owners.clear()
             _orphan_stdio_pids.update({target_pid, other_pid})
             _orphan_stdio_pid_servers[target_pid] = "feishu"
             _orphan_stdio_pid_servers[other_pid] = "mimir"
+            _orphan_stdio_pid_start_times[target_pid] = 100
+            _orphan_stdio_pid_start_times[other_pid] = 200
 
         with patch("tools.mcp_tool.os.kill") as mock_kill, \
              patch("gateway.status._pid_exists", return_value=False), \
              patch("tools.mcp_tool.time.sleep") as mock_sleep:
             _kill_orphaned_mcp_children(server_name="feishu")
 
-        mock_kill.assert_called_once_with(target_pid, signal.SIGTERM)
-        mock_sleep.assert_called_once_with(2)
+        mock_kill.assert_not_called()
+        mock_sleep.assert_not_called()
         with _lock:
             assert target_pid not in _orphan_stdio_pids
             assert target_pid not in _orphan_stdio_pid_servers
             assert other_pid in _orphan_stdio_pids
             assert _orphan_stdio_pid_servers[other_pid] == "mimir"
+
+    def test_exact_reaper_reports_same_owner_cleanup_in_flight(self, monkeypatch):
+        """并发严格回收必须返回 pending，不能把 in-flight owner 当成功。"""
+        import tools.mcp_tool as mcp_tool
+
+        fake_pid = 474747
+        owner = ("/profiles/a", "shared", object())
+        sleeping = threading.Event()
+        release = threading.Event()
+        alive = {"value": True}
+        first_result = {}
+
+        with mcp_tool._lock:
+            mcp_tool._orphan_stdio_pids.add(fake_pid)
+            mcp_tool._orphan_stdio_pid_servers[fake_pid] = owner
+            mcp_tool._orphan_stdio_pid_start_times[fake_pid] = 100
+
+        def fake_sleep(_seconds):
+            sleeping.set()
+            assert release.wait(timeout=2)
+            alive["value"] = False
+
+        monkeypatch.setattr(mcp_tool.time, "sleep", fake_sleep)
+        monkeypatch.setattr(
+            "gateway.status._pid_exists", lambda _pid: alive["value"]
+        )
+        monkeypatch.setattr(
+            "gateway.status.get_process_start_time", lambda _pid: 100
+        )
+        monkeypatch.setattr(mcp_tool.os, "kill", lambda _pid, _sig: None)
+
+        def first_reap():
+            first_result["value"] = mcp_tool._kill_orphaned_mcp_children(
+                False, "shared", owner
+            )
+
+        thread = threading.Thread(target=first_reap)
+        try:
+            thread.start()
+            assert sleeping.wait(timeout=2)
+            assert mcp_tool._kill_orphaned_mcp_children(
+                False, "shared", owner
+            ) == [fake_pid]
+            release.set()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert first_result["value"] == []
+        finally:
+            release.set()
+            thread.join(timeout=2)
+            with mcp_tool._lock:
+                mcp_tool._orphan_stdio_pids.discard(fake_pid)
+                mcp_tool._orphan_stdio_pid_servers.pop(fake_pid, None)
+                mcp_tool._orphan_stdio_pid_start_times.pop(fake_pid, None)
+                mcp_tool._retiring_stdio_owners.clear()
+
+    def test_reaper_does_not_signal_reused_pid(self, monkeypatch):
+        """PID start time 已变化时，旧 owner 必须按已退出处理。"""
+        import tools.mcp_tool as mcp_tool
+
+        fake_pid = 484848
+        owner = ("/profiles/a", "shared", object())
+        with mcp_tool._lock:
+            mcp_tool._orphan_stdio_pids.add(fake_pid)
+            mcp_tool._orphan_stdio_pid_servers[fake_pid] = owner
+            mcp_tool._orphan_stdio_pid_start_times[fake_pid] = 100
+
+        kill = MagicMock()
+        monkeypatch.setattr(mcp_tool.os, "kill", kill)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+        monkeypatch.setattr(
+            "gateway.status.get_process_start_time", lambda _pid: 200
+        )
+        monkeypatch.setattr(mcp_tool.time, "sleep", lambda _seconds: None)
+
+        assert mcp_tool._kill_orphaned_mcp_children(
+            False, "shared", owner
+        ) == []
+        kill.assert_not_called()
+        with mcp_tool._lock:
+            assert fake_pid not in mcp_tool._orphan_stdio_pids
+            assert fake_pid not in mcp_tool._orphan_stdio_pid_servers
+            assert fake_pid not in mcp_tool._orphan_stdio_pid_start_times
+
+    @pytest.mark.parametrize(
+        ("expected_start", "live_start"),
+        [(None, 200), (100, None)],
+    )
+    def test_reaper_keeps_owner_when_pid_generation_is_unknown(
+        self, monkeypatch, expected_start, live_start
+    ):
+        """generation 任一侧不可读时不得发信号或删除 owner。"""
+        import tools.mcp_tool as mcp_tool
+
+        fake_pid = 494949
+        owner = ("/profiles/a", "shared", object())
+        with mcp_tool._lock:
+            mcp_tool._orphan_stdio_pids.add(fake_pid)
+            mcp_tool._orphan_stdio_pid_servers[fake_pid] = owner
+            mcp_tool._orphan_stdio_pid_start_times[fake_pid] = expected_start
+
+        kill = MagicMock()
+        monkeypatch.setattr(mcp_tool.os, "kill", kill)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+        monkeypatch.setattr(
+            "gateway.status.get_process_start_time", lambda _pid: live_start
+        )
+        monkeypatch.setattr(mcp_tool.time, "sleep", lambda _seconds: None)
+
+        assert mcp_tool._kill_orphaned_mcp_children(
+            False, "shared", owner
+        ) == [fake_pid]
+        kill.assert_not_called()
+        with mcp_tool._lock:
+            assert mcp_tool._orphan_stdio_pid_servers[fake_pid] == owner
+            assert (
+                mcp_tool._orphan_stdio_pid_start_times[fake_pid]
+                == expected_start
+            )
+            assert not mcp_tool._retiring_stdio_owners
+            mcp_tool._orphan_stdio_pids.discard(fake_pid)
+            mcp_tool._orphan_stdio_pid_servers.pop(fake_pid, None)
+            mcp_tool._orphan_stdio_pid_start_times.pop(fake_pid, None)
+
+    def test_reaper_keeps_unknown_generation_when_direct_pid_exited_but_group_lives(
+        self, monkeypatch
+    ):
+        """direct PID 退出后仍可能有同组后代；generation 未知时不得发组信号。"""
+        import tools.mcp_tool as mcp_tool
+
+        fake_pid = 499949
+        owner = ("/profiles/a", "shared", object())
+        with mcp_tool._lock:
+            mcp_tool._orphan_stdio_pids.add(fake_pid)
+            mcp_tool._orphan_stdio_pid_servers[fake_pid] = owner
+            mcp_tool._orphan_stdio_pid_start_times[fake_pid] = None
+            mcp_tool._stdio_pgids[fake_pid] = fake_pid
+
+        def signal_group(_pgid, sig):
+            return None
+
+        killpg = MagicMock(side_effect=signal_group)
+        monkeypatch.setattr(mcp_tool.os, "killpg", killpg)
+        monkeypatch.setattr(mcp_tool.os, "getpgrp", lambda: fake_pid + 1)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+        monkeypatch.setattr(mcp_tool.time, "sleep", lambda _seconds: None)
+
+        try:
+            result = mcp_tool._kill_orphaned_mcp_children(
+                False, "shared", owner
+            )
+            assert call(fake_pid, signal.SIGTERM) not in killpg.call_args_list
+            assert result == [fake_pid]
+            with mcp_tool._lock:
+                assert mcp_tool._orphan_stdio_pid_servers[fake_pid] == owner
+                assert mcp_tool._stdio_pgids[fake_pid] == fake_pid
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._orphan_stdio_pids.discard(fake_pid)
+                mcp_tool._orphan_stdio_pid_servers.pop(fake_pid, None)
+                mcp_tool._orphan_stdio_pid_start_times.pop(fake_pid, None)
+                mcp_tool._stdio_pgids.pop(fake_pid, None)
+                mcp_tool._retiring_stdio_owners.clear()
+
+    def test_reused_pid_new_owner_is_not_hidden_by_old_retiring_owner(
+        self, monkeypatch
+    ):
+        """同 PID 的旧 orphan in-flight 不能让新 active strict cleanup 假成功。"""
+        import tools.mcp_tool as mcp_tool
+
+        fake_pid = 505050
+        old_owner = ("/profiles/a", "shared", object())
+        new_owner = ("/profiles/b", "shared", object())
+        with mcp_tool._lock:
+            mcp_tool._orphan_stdio_pids.add(fake_pid)
+            mcp_tool._orphan_stdio_pid_servers[fake_pid] = old_owner
+            mcp_tool._orphan_stdio_pid_start_times[fake_pid] = 100
+            mcp_tool._stdio_pids[fake_pid] = new_owner
+            mcp_tool._stdio_pid_start_times[fake_pid] = 200
+            mcp_tool._retiring_stdio_owners.add(
+                ("orphan", fake_pid, old_owner, 100)
+            )
+
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+        monkeypatch.setattr(
+            "gateway.status.get_process_start_time", lambda _pid: 200
+        )
+        monkeypatch.setattr(mcp_tool.os, "kill", lambda _pid, _sig: None)
+        monkeypatch.setattr(mcp_tool.time, "sleep", lambda _seconds: None)
+
+        assert mcp_tool._kill_orphaned_mcp_children(
+            True, "shared", new_owner
+        ) == [fake_pid]
+        with mcp_tool._lock:
+            assert mcp_tool._stdio_pids[fake_pid] == new_owner
+            assert mcp_tool._stdio_pid_start_times[fake_pid] == 200
+            mcp_tool._retiring_stdio_owners.clear()
+            mcp_tool._stdio_pids.pop(fake_pid, None)
+            mcp_tool._stdio_pid_start_times.pop(fake_pid, None)
+            mcp_tool._orphan_stdio_pids.discard(fake_pid)
+            mcp_tool._orphan_stdio_pid_servers.pop(fake_pid, None)
+            mcp_tool._orphan_stdio_pid_start_times.pop(fake_pid, None)
+
+    def test_same_named_real_pids_are_reaped_by_exact_profile_task(
+        self, tmp_path
+    ):
+        """卸载 A profile 只能终止 A 的同名真实子进程。"""
+        import tools.mcp_tool as mcp_tool
+        from gateway.status import get_process_start_time
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_a = tmp_path / "profiles" / "a"
+        profile_b = tmp_path / "profiles" / "b"
+        processes = []
+        servers = []
+        for profile in (profile_a, profile_b, profile_a):
+            token = set_hermes_home_override(profile)
+            try:
+                servers.append(mcp_tool.MCPServerTask("shared"))
+            finally:
+                reset_hermes_home_override(token)
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    start_new_session=True,
+                )
+            )
+
+        try:
+            with mcp_tool._lock:
+                for process, server in zip(processes, servers):
+                    mcp_tool._stdio_pids[process.pid] = (
+                        server.profile_identity,
+                        server.name,
+                        server,
+                    )
+                    start_time = get_process_start_time(process.pid)
+                    assert start_time is not None
+                    mcp_tool._stdio_pid_start_times[process.pid] = start_time
+
+            asyncio.run(servers[0].shutdown())
+
+            processes[0].wait(timeout=5)
+            assert processes[1].poll() is None
+            assert processes[2].poll() is None
+            with mcp_tool._lock:
+                assert processes[0].pid not in mcp_tool._stdio_pids
+                assert mcp_tool._stdio_pids[processes[1].pid][2] is servers[1]
+                assert mcp_tool._stdio_pids[processes[2].pid][2] is servers[2]
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            with mcp_tool._lock:
+                for process in processes:
+                    mcp_tool._stdio_pids.pop(process.pid, None)
+                    mcp_tool._orphan_stdio_pids.discard(process.pid)
+                    mcp_tool._orphan_stdio_pid_servers.pop(process.pid, None)
+                    mcp_tool._orphan_stdio_pid_start_times.pop(process.pid, None)
+                    mcp_tool._stdio_pgids.pop(process.pid, None)
+                    mcp_tool._stdio_pid_start_times.pop(process.pid, None)
+                    mcp_tool._retiring_stdio_owners.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +757,11 @@ class TestStdioPgroupReaping:
     def _reset_state(self):
         from tools.mcp_tool import (
             _orphan_stdio_pid_servers,
+            _orphan_stdio_pid_start_times,
             _orphan_stdio_pids,
+            _retiring_stdio_owners,
             _stdio_pgids,
+            _stdio_pid_start_times,
             _stdio_pids,
             _lock,
         )
@@ -242,13 +769,18 @@ class TestStdioPgroupReaping:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
+            _orphan_stdio_pid_start_times.clear()
+            _retiring_stdio_owners.clear()
             _stdio_pgids.clear()
+            _stdio_pid_start_times.clear()
 
     def test_killpg_used_when_pgid_tracked(self, monkeypatch):
         """SIGTERM and SIGKILL route through killpg when pgid is known."""
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pids,
+            _orphan_stdio_pid_start_times,
+            _orphan_stdio_pid_start_times,
             _stdio_pgids,
             _lock,
         )
@@ -258,6 +790,7 @@ class TestStdioPgroupReaping:
         fake_pgid = 525252  # session leader: pgid == pid
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_start_times[fake_pid] = 100
             _stdio_pgids[fake_pid] = fake_pgid
 
         fake_sigkill = 9
@@ -271,8 +804,9 @@ class TestStdioPgroupReaping:
         with patch("tools.mcp_tool.os.killpg") as mock_killpg, \
              patch("tools.mcp_tool.os.kill") as mock_kill, \
              patch("gateway.status._pid_exists", return_value=True), \
+             patch("gateway.status.get_process_start_time", return_value=100), \
              patch("time.sleep"):
-            _kill_orphaned_mcp_children()
+            assert _kill_orphaned_mcp_children() == [fake_pid]
 
         # Both phases should have used killpg (pgroup reach), not per-pid kill.
         mock_killpg.assert_any_call(fake_pgid, signal.SIGTERM)
@@ -280,6 +814,15 @@ class TestStdioPgroupReaping:
         assert mock_killpg.call_count == 2
         mock_kill.assert_not_called()
 
+        with _lock:
+            assert fake_pid in _orphan_stdio_pids
+            assert _stdio_pgids[fake_pid] == fake_pgid
+
+        with patch("gateway.status._pid_exists", return_value=False), \
+             patch("tools.mcp_tool.os.killpg", side_effect=ProcessLookupError), \
+             patch("tools.mcp_tool.os.kill"), \
+             patch("time.sleep"):
+            assert _kill_orphaned_mcp_children() == []
         with _lock:
             assert fake_pid not in _orphan_stdio_pids
             assert fake_pid not in _stdio_pgids
@@ -292,6 +835,7 @@ class TestStdioPgroupReaping:
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pids,
+            _orphan_stdio_pid_start_times,
             _stdio_pgids,
             _lock,
         )
@@ -306,8 +850,10 @@ class TestStdioPgroupReaping:
         other_pgid = 818181
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_start_times[fake_pid] = 100
             _stdio_pgids[fake_pid] = gateway_pgid  # == gateway's own pgid
             _orphan_stdio_pids.add(other_pid)
+            _orphan_stdio_pid_start_times[other_pid] = 200
             _stdio_pgids[other_pid] = other_pgid  # distinct group → killpg OK
 
         fake_sigkill = 9
@@ -317,6 +863,10 @@ class TestStdioPgroupReaping:
              patch("tools.mcp_tool.os.killpg") as mock_killpg, \
              patch("tools.mcp_tool.os.kill") as mock_kill, \
              patch("gateway.status._pid_exists", return_value=True), \
+             patch(
+                 "gateway.status.get_process_start_time",
+                 side_effect=lambda pid: 100 if pid == fake_pid else 200,
+             ), \
              patch("time.sleep"):
             _kill_orphaned_mcp_children()
 
@@ -340,6 +890,7 @@ class TestStdioPgroupReaping:
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pids,
+            _orphan_stdio_pid_start_times,
             _stdio_pgids,
             _lock,
         )
@@ -348,6 +899,7 @@ class TestStdioPgroupReaping:
         fake_pid = 747474
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_start_times[fake_pid] = 100
             # No entry in _stdio_pgids.
 
         with patch("tools.mcp_tool.os.kill") as mock_kill, \
@@ -356,7 +908,7 @@ class TestStdioPgroupReaping:
             # killpg may or may not exist; either way the no-pgid path skips it.
             _kill_orphaned_mcp_children()
 
-        mock_kill.assert_any_call(fake_pid, signal.SIGTERM)
+        mock_kill.assert_not_called()
 
         with _lock:
             assert fake_pid not in _orphan_stdio_pids
@@ -393,7 +945,8 @@ class TestStdioPgroupReaping:
         grandchild_pid_file = tmp_path / "grandchild.pid"
         grandchild_script = tmp_path / "grandchild.py"
         grandchild_script.write_text(
-            "import os, sys, time\n"
+            "import os, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             f"tmp = {str(grandchild_pid_file)!r} + '.tmp'\n"
             "with open(tmp, 'w') as f:\n"
             "    f.write(str(os.getpid()))\n"
@@ -405,8 +958,9 @@ class TestStdioPgroupReaping:
         # Parent: spawn grandchild, exit immediately (without killing it).
         parent_script = tmp_path / "parent.py"
         parent_script.write_text(
-            "import subprocess, sys\n"
+            "import subprocess, sys, time\n"
             f"subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+            "time.sleep(0.2)\n"
             # Parent exits — grandchild reparents to init.
         )
 
@@ -415,7 +969,11 @@ class TestStdioPgroupReaping:
             [sys.executable, str(parent_script)],
             start_new_session=True,
         )
+        from gateway.status import get_process_start_time
+
         parent_pgid = os.getpgid(parent.pid)
+        parent_start_time = get_process_start_time(parent.pid)
+        assert parent_start_time is not None
         # Wait for parent to exit and grandchild to spin up.
         parent.wait(timeout=15)
         deadline = _time.time() + 15  # fresh CPython spinup dilates under CI load
@@ -432,6 +990,7 @@ class TestStdioPgroupReaping:
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pid_servers,
+            _orphan_stdio_pid_start_times,
             _orphan_stdio_pids,
             _stdio_pgids,
             _stdio_pids,
@@ -441,26 +1000,36 @@ class TestStdioPgroupReaping:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
+            _orphan_stdio_pid_start_times.clear()
             _stdio_pgids.clear()
             _orphan_stdio_pids.add(parent.pid)
             _orphan_stdio_pid_servers[parent.pid] = "orphan"
+            _orphan_stdio_pid_start_times[parent.pid] = parent_start_time
             _stdio_pgids[parent.pid] = parent_pgid
+        def _grandchild_is_running() -> bool:
+            try:
+                return psutil.Process(grandchild_pid).status() != psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return False
+
         try:
             _kill_orphaned_mcp_children()
-        finally:
-            # Belt-and-suspenders: ensure grandchild is dead even if test fails.
-            try:
-                os.kill(grandchild_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
 
-        # Grandchild should be gone — SIGTERM via killpg in phase 1 reached it.
-        deadline = _time.time() + 10
-        while _time.time() < deadline and psutil.pid_exists(grandchild_pid):
-            _time.sleep(0.05)
-        assert not psutil.pid_exists(grandchild_pid), (
-            "grandchild survived killpg-based reaping (issue #23799 regression)"
-        )
+            # 孙进程忽略 SIGTERM；即使直接父 PID 已退出，第三阶段也必须发现
+            # 仍存活的进程组并发送 SIGKILL。孤儿退出后短暂成为 zombie 也算已退出。
+            deadline = _time.time() + 10
+            while _time.time() < deadline and _grandchild_is_running():
+                _time.sleep(0.05)
+            assert not _grandchild_is_running(), (
+                "grandchild survived killpg-based reaping (issue #23799 regression)"
+            )
+        finally:
+            # 断言失败后才兜底清理，不能让测试自己制造成功条件。
+            if _grandchild_is_running():
+                try:
+                    os.kill(grandchild_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 # ---------------------------------------------------------------------------

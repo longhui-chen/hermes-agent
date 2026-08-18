@@ -19,9 +19,64 @@ one-way (main.py imports this module; the reverse happens only lazily at call
 time — no import cycle).
 """
 
+import hashlib
+import hmac
 import os
+import stat
 import sys
 from pathlib import Path
+
+
+_TRUSTED_TRANSCRIPT_IMPORT_ENV = "ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT"
+_TRUSTED_TRANSCRIPT_IMPORT_SCOPE_ENV = "ZETTLAB_TRUSTED_TRANSCRIPT_IMPORT_SCOPE"
+_ZETTOS_LOCAL_SERVER_ROOT = "/zettos/main/apps/com.zettlab.local-server"
+
+
+def _assert_trusted_transcript_import_parent() -> None:
+    """Allow cross-profile reads only for a direct Local Server child.
+
+    The environment marker is intent, not authority: a model can set its own
+    environment.  Authority comes from Linux' parent-process metadata plus the
+    immutable ZettOS package boundary.  The executable must be the root-owned,
+    non-writable Local Server binary under its package root.  A terminal command
+    spawned by Hermes has Hermes/the shell as its parent and therefore fails.
+    """
+    if os.environ.get(_TRUSTED_TRANSCRIPT_IMPORT_ENV) != "1":
+        raise PermissionError("transcript import requires the trusted Local Server runner")
+    if not sys.platform.startswith("linux"):
+        raise PermissionError("transcript import is available only on a managed ZettOS device")
+
+    try:
+        parent_exe = os.path.realpath(os.readlink(f"/proc/{os.getppid()}/exe"))
+        parent_stat = os.stat(parent_exe)
+    except OSError as exc:
+        raise PermissionError("cannot attest the transcript import runner") from exc
+
+    expected_prefix = _ZETTOS_LOCAL_SERVER_ROOT + "/"
+    expected_suffix = "/sbin/zettlab-local-server"
+    if not parent_exe.startswith(expected_prefix) or not parent_exe.endswith(expected_suffix):
+        raise PermissionError("transcript import runner is not Local Server")
+    if not stat.S_ISREG(parent_stat.st_mode) or parent_stat.st_uid != 0:
+        raise PermissionError("transcript import runner is not a root-owned executable")
+    if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError("transcript import runner is writable by an untrusted principal")
+
+
+def _assert_transcript_import_scope(
+    source_profile: str,
+    source_session: str,
+    target_profile: str,
+    target_session: str,
+    owner_principal: str,
+) -> None:
+    """Bind the trusted invocation to the exact cross-profile operation."""
+    payload = "\0".join(
+        (source_profile, source_session, target_profile, target_session, owner_principal)
+    ).encode("utf-8")
+    expected = hashlib.sha256(payload).hexdigest()
+    supplied = os.environ.get(_TRUSTED_TRANSCRIPT_IMPORT_SCOPE_ENV, "")
+    if not hmac.compare_digest(supplied, expected):
+        raise PermissionError("transcript import scope does not match the requested operation")
 
 
 def _m():
@@ -45,6 +100,51 @@ def _session_browse_picker(sessions):
 
 def _size_delta_label(saved_mb):
     return _m()._size_delta_label(saved_mb)
+
+
+def importable_transcript_messages(rows):
+    """Keep only what the runtime-import contract accepts, in source order.
+
+    ``hermes_state._normalize_import_messages`` rejects anything that is not a
+    user/assistant message carrying non-empty text — tool calls and in-flight
+    state are deliberately not importable, because the target profile runs its
+    own toolset and replaying calls it cannot make would only teach it to
+    invoke missing tools. A generation transcript is mostly those: on the first
+    real app this ran against, 64 rows yielded 2 (29 of the 30 assistant rows
+    were pure tool_calls with NULL content).
+
+    Rows are dict-like with ``role`` / ``content`` / ``timestamp``.
+    """
+    kept = []
+    for row in rows:
+        if row["role"] not in ("user", "assistant"):
+            continue
+        content = row["content"]
+        if not isinstance(content, str):
+            continue
+        content = content.strip()
+        if not content:
+            continue
+        kept_message = {
+            "role": row["role"],
+            "content": content,
+            # Missing legacy timestamps must not make the payload hash depend
+            # on retry time. Unix epoch is valid under the import contract and
+            # gives the same source transcript the same receipt forever.
+            "created_at": float(row["timestamp"] or 0.0),
+        }
+        source_id = row.get("id") if hasattr(row, "get") else None
+        if source_id is not None:
+            kept_message["source_id"] = str(source_id)
+        kept.append(kept_message)
+    return kept
+
+
+def _open_session_db():
+    """Open the active profile store (a seam for CLI dispatcher tests)."""
+    from hermes_state import SessionDB
+
+    return SessionDB()
 
 
 def _confirm_prompt(prompt: str) -> bool:
@@ -225,9 +325,7 @@ def cmd_sessions(args, sessions_parser=None):
         return 1
 
     try:
-        from hermes_state import SessionDB
-
-        db = SessionDB()
+        db = _open_session_db()
     except Exception as e:
         print(f"Error: Could not open session database: {e}")
         return
@@ -794,6 +892,28 @@ def cmd_sessions(args, sessions_parser=None):
         else:
             print(f"Session '{args.session_id}' not found.")
 
+    elif action == "delete-agent":
+        # local-server 用 HERMES_HOME 指向根库调用本命令：只删根库 state.db 里属于该
+        # agent 的 zettlab 会话（profile 库随 profile 目录删除，不在此列）。会话 ID 形如
+        # zettlab:<user>:<agent>:<rand>，按 parts[2] 匹配 agent_id（设备级跨用户允许，
+        # 与 local-server 的 sessionBelongsToAgent 语义一致）。
+        agent_id = str(getattr(args, "agent_id", "") or "").strip()
+        if not agent_id:
+            print("Error: agent_id is required.")
+            return 2
+        sessions_dir = get_hermes_home() / "sessions"
+        if not args.yes:
+            if not _confirm_prompt(
+                f"Delete all chat sessions for agent '{agent_id}'? [y/N] "
+            ):
+                print("Cancelled.")
+                return
+        # 原子收集 + 删除（Codex P1 finding 2）：枚举根、沿 parent_session_id 收集压缩
+        # continuation、删除都在 SessionDB.delete_sessions_for_agent 的同一个写事务里，
+        # 并发压缩产生的 continuation 不会被漏删成孤立根。
+        deleted = db.delete_sessions_for_agent(agent_id, sessions_dir=sessions_dir)
+        print(f"Deleted {deleted} session(s) for agent '{agent_id}'.")
+
     elif action in ("prune", "archive"):
         from hermes_cli.session_filters import (
             build_prune_filters,
@@ -904,6 +1024,281 @@ def cmd_sessions(args, sessions_parser=None):
                 f"Archived {count} session(s). They're hidden from listings "
                 "but fully recoverable (nothing was deleted)."
             )
+
+    elif action == "import-transcript":
+        # Fork a conversation across profiles. The import contract
+        # (hermes_state._normalize_import_messages) accepts only user/assistant
+        # messages with non-empty text: tool calls and in-flight state are
+        # rejected on purpose, since the target profile runs its own toolset and
+        # a replayed history of calls it cannot make would just teach it to
+        # invoke missing tools. A generation transcript is therefore mostly
+        # untransferable — 64 rows collapsed to 2 on the first real app we ran
+        # this against — so report what was skipped rather than pretending the
+        # copy was faithful.
+        import hashlib
+        from hermes_cli.profiles import (
+            get_profile_dir,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+        from hermes_state import (
+            RUNTIME_IMPORT_MAX_CHUNK_MESSAGES,
+            RUNTIME_IMPORT_MAX_CONTENT_CHARS,
+            RUNTIME_IMPORT_MAX_MESSAGES,
+            RUNTIME_IMPORT_MAX_STAGED_BYTES,
+            SessionDB,
+        )
+
+        def _fail(message: str) -> None:
+            if getattr(args, "json", False):
+                print(_json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+            else:
+                print(f"Error: {message}", file=sys.stderr)
+
+        # Do this before consulting receipts or resolving the source profile:
+        # both the sibling read and a replayed target commit are privileged.
+        try:
+            _assert_trusted_transcript_import_parent()
+        except PermissionError as exc:
+            _fail(str(exc))
+            return 1
+
+        try:
+            source_profile = normalize_profile_name(args.source_profile)
+            validate_profile_name(source_profile)
+            owner_principal = str(getattr(args, "owner_principal", "") or "").strip()
+            if not owner_principal or len(owner_principal) > 256 or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in owner_principal):
+                raise ValueError("owner_principal is invalid")
+        except ValueError as exc:
+            _fail(str(exc))
+            return 1
+
+        target_home = Path(get_hermes_home()).resolve()
+        target_profile = (
+            target_home.name if target_home.parent.name == "profiles" else "default"
+        )
+        try:
+            _assert_transcript_import_scope(
+                source_profile,
+                args.source_session,
+                target_profile,
+                args.target_session,
+                owner_principal,
+            )
+        except PermissionError as exc:
+            _fail(str(exc))
+            return 1
+
+        # Same source + target always shares one receipt. Consult it before
+        # touching the live source: an earlier commit may have succeeded while
+        # its response was lost, and the source conversation may since have
+        # advanced, rewound, or compressed.
+        pair = f"{source_profile}\x00{args.source_session}\x00{args.target_session}\x00{owner_principal}"
+        import_id = "fork-" + hashlib.sha256(pair.encode("utf-8")).hexdigest()[:32]
+        snapshot_reader = getattr(db, "get_completed_transcript_import_snapshot", None)
+        existing_snapshot = snapshot_reader(import_id) if snapshot_reader else None
+        if existing_snapshot and existing_snapshot["status"] == "completed":
+            try:
+                committed = db.commit_completed_transcript_import(import_id)
+            except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the caller
+                _fail(f"{type(exc).__name__}: {exc}")
+                return 1
+            imported = int(committed.get("message_count") or existing_snapshot["expected_message_count"])
+            total_rows = existing_snapshot.get("source_total_rows")
+            result = {
+                "ok": True,
+                "target_session_id": args.target_session,
+                "source_session_id": args.source_session,
+                "imported": imported,
+                "skipped": max(int(total_rows or imported) - imported, 0),
+                "replayed": True,
+            }
+            if getattr(args, "json", False):
+                print(_json.dumps(result, ensure_ascii=False))
+            else:
+                print(
+                    f"Imported {result['imported']} message(s) into "
+                    f"{args.target_session} (skipped {result['skipped']} "
+                    f"tool/empty row(s))."
+                )
+            return 0
+
+        source_db = get_profile_dir(source_profile) / "state.db"
+        if not source_db.exists():
+            _fail(f"source profile has no session store at {source_db}")
+            return 1
+
+        # Canonical read-only store: this keeps structured-content decoding and
+        # SQLite connection policy aligned with normal Hermes history reads.
+        src = SessionDB(source_db, read_only=True)
+        try:
+            session_row = src._conn.execute(
+                "SELECT id, title, model_history_cutoff_message_id "
+                "FROM sessions WHERE id = ? AND user_id = ?",
+                (args.source_session, owner_principal),
+            ).fetchone()
+            if session_row is None:
+                _fail(f"source session {args.source_session!r} not found")
+                return 1
+            current_total_rows = src._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                (args.source_session,),
+            ).fetchone()[0]
+            # A structured message is stored as ``\0json:<payload>``.  It is
+            # deliberately not importable, so exclude it in SQLite before its
+            # payload crosses into Python.  The CASE separately keeps an
+            # oversized plain row out of Python too, allowing a deterministic
+            # rejection based on its stored byte length rather than decoding a
+            # multi-megabyte value first.
+            structured_prefix = SessionDB._CONTENT_JSON_PREFIX.encode("utf-8")
+            raw_content_limit = RUNTIME_IMPORT_MAX_CONTENT_CHARS * 4
+            select_messages = (
+                "SELECT id, role, CASE WHEN length(CAST(content AS BLOB)) <= ? "
+                "THEN content ELSE NULL END AS content, "
+                "length(CAST(content AS BLOB)) AS content_bytes, timestamp "
+                "FROM messages "
+            )
+            importable_text_where = (
+                " AND content IS NOT NULL "
+                "AND substr(CAST(content AS BLOB), 1, ?) != ?"
+            )
+            frozen_ids = existing_snapshot.get("source_message_ids") if existing_snapshot else None
+            if frozen_ids:
+                def _frozen_rows():
+                    for start in range(0, len(frozen_ids), 500):
+                        batch = frozen_ids[start:start + 500]
+                        placeholders = ",".join("?" for _ in batch)
+                        yield from src._conn.execute(
+                            select_messages
+                            + f"WHERE session_id = ? AND id IN ({placeholders})"
+                            + importable_text_where
+                            + " ORDER BY id",
+                            (
+                                raw_content_limit,
+                                args.source_session,
+                                *batch,
+                                len(structured_prefix),
+                                structured_prefix,
+                            ),
+                        )
+
+                cursor = _frozen_rows()
+                total_rows = int(existing_snapshot.get("source_total_rows") or current_total_rows)
+            else:
+                cursor = src._conn.execute(
+                    select_messages
+                    + "WHERE session_id = ? AND active = 1 AND llm_visible = 1 "
+                    "AND id > ? AND role IN ('user', 'assistant')"
+                    + importable_text_where
+                    + " ORDER BY id",
+                    (
+                        raw_content_limit,
+                        args.source_session,
+                        int(session_row["model_history_cutoff_message_id"] or 0),
+                        len(structured_prefix),
+                        structured_prefix,
+                    ),
+                )
+                total_rows = current_total_rows
+            messages = []
+            content_bytes = 0
+            for row in cursor:
+                raw_bytes = int(row["content_bytes"] or 0)
+                if raw_bytes > raw_content_limit:
+                    _fail(
+                        "source transcript contains a message exceeding the "
+                        f"{RUNTIME_IMPORT_MAX_CONTENT_CHARS}-character storage limit"
+                    )
+                    return 1
+                # The SQL filter has already excluded the only encoded content
+                # representation, so this is bounded plain text and requires
+                # no JSON decode or decoded-batch copy.
+                for message in importable_transcript_messages([dict(row)]):
+                    if len(message["content"]) > RUNTIME_IMPORT_MAX_CONTENT_CHARS:
+                        _fail(
+                            "source transcript contains a message exceeding "
+                            f"{RUNTIME_IMPORT_MAX_CONTENT_CHARS} characters"
+                        )
+                        return 1
+                    messages.append(message)
+                    if len(messages) > RUNTIME_IMPORT_MAX_MESSAGES:
+                        _fail(
+                            "source transcript exceeds the import limit of "
+                            f"{RUNTIME_IMPORT_MAX_MESSAGES} messages"
+                        )
+                        return 1
+                    content_bytes += len(message["content"].encode("utf-8"))
+                    if content_bytes > RUNTIME_IMPORT_MAX_STAGED_BYTES:
+                        _fail(
+                            "source transcript exceeds the staged import limit of "
+                            f"{RUNTIME_IMPORT_MAX_STAGED_BYTES} bytes"
+                        )
+                        return 1
+            if frozen_ids and [int(message["source_id"]) for message in messages] != frozen_ids:
+                _fail("source transcript no longer contains the frozen import snapshot")
+                return 1
+        finally:
+            src.close()
+
+        if not messages:
+            _fail(
+                f"nothing importable in {args.source_session!r}: "
+                f"{total_rows} rows, none of them user/assistant text"
+            )
+            return 1
+
+        canonical = _json.dumps(messages, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"))
+        if len(canonical.encode("utf-8")) > RUNTIME_IMPORT_MAX_STAGED_BYTES:
+            _fail(
+                "source transcript exceeds the staged import limit of "
+                f"{RUNTIME_IMPORT_MAX_STAGED_BYTES} bytes"
+            )
+            return 1
+        payload_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        title = args.title or session_row["title"]
+        source_message_ids = [int(message["source_id"]) for message in messages]
+
+        try:
+            for chunk_index, start in enumerate(
+                range(0, len(messages), RUNTIME_IMPORT_MAX_CHUNK_MESSAGES)
+            ):
+                db.stage_completed_transcript_import(
+                    import_id=import_id,
+                    source=f"profile:{source_profile}",
+                    source_session_id=args.source_session,
+                    target_session_id=args.target_session,
+                    owner_principal=owner_principal,
+                    title=title,
+                    payload_sha256=payload_sha256,
+                    expected_message_count=len(messages),
+                    chunk_index=chunk_index,
+                    messages=messages[start:start + RUNTIME_IMPORT_MAX_CHUNK_MESSAGES],
+                    source_message_ids=source_message_ids,
+                    source_total_rows=total_rows,
+                )
+            committed = db.commit_completed_transcript_import(import_id)
+        except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the caller
+            _fail(f"{type(exc).__name__}: {exc}")
+            return 1
+
+        result = {
+            "ok": True,
+            "target_session_id": args.target_session,
+            "source_session_id": args.source_session,
+            "imported": len(messages),
+            "skipped": total_rows - len(messages),
+            "replayed": bool(committed.get("replayed")),
+        }
+        if getattr(args, "json", False):
+            print(_json.dumps(result, ensure_ascii=False))
+        else:
+            print(
+                f"Imported {result['imported']} message(s) into "
+                f"{args.target_session} (skipped {result['skipped']} "
+                f"tool/empty row(s))."
+            )
+        return 0
 
     elif action == "rename":
         resolved_session_id = db.resolve_session_id(args.session_id)

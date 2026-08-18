@@ -29,10 +29,8 @@ Built-ins-always-win is enforced at registration time
 defensively). The dispatcher also rejects plugin dispatch when a same-
 name command provider is configured.
 
-Providers live in ``<repo>/plugins/tts/<name>/`` (built-in plugins, no
-shipped today) or ``~/.hermes/plugins/tts/<name>/`` (user-installed).
-None ship in-tree as of issue #30398 — the hook is additive
-infrastructure waiting for a real consumer (Cartesia, Fish Audio, …).
+Providers live in ``<repo>/plugins/tts/<name>/`` (bundled backends such as
+Zettlab) or ``~/.hermes/plugins/tts/<name>/`` (user-installed).
 
 Response contract
 -----------------

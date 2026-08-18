@@ -190,11 +190,13 @@ zpk-stage: zpk-venv
 	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes \
 		zpk/libexec/hermes-secure-launcher.py zpk/zpk-systemd.sh \
 		zpk/prepare-claw-service.sh zpk/init.d/start.sh zpk/init.d/stop.sh
+	@python3 scripts/check_zpk_secrets.py zpk
 	@echo "zettlab-claw ZPK payload staged at $(ZPK_SRC_DIR)"
 
 zpk-pack: zpk-stage
 	mkdir -p build
 	python3 ../my-scripts/zpk-pack.py -p . -o "$(ZPK_OUTPUT)" --jobs "$(ZPK_PACK_JOBS)" --quiet
+	@python3 scripts/check_zpk_secrets.py "$(ZPK_OUTPUT)" || { rm -f "$(ZPK_OUTPUT)"; exit 1; }
 
 clean-zpk:
 	rm -rf build zpk/.check-app "$(ZPK_SRC_DIR)"

@@ -27,10 +27,12 @@ falls back to the Nous path or local execution.
 from __future__ import annotations
 
 import logging
-import os
+import ipaddress
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
+
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,9 @@ _LOCAL_SERVER_ANCHOR_ENVS = (
 _ACTION_TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
 _VENDOR_GATEWAY_PATHS = {
     "browser-use": "/api/v1/browser-use",
+    # The Zettlab TTS provider uses an OpenAI-compatible transport internally;
+    # the public provider boundary remains ``zettlab``.
+    "zettlab-tts": "/api/v1/ai-proxy",
 }
 
 
@@ -57,15 +62,38 @@ class ZettlabToolGatewayConfig:
 
 def _local_server_origin() -> str:
     for env_key in _LOCAL_SERVER_ANCHOR_ENVS:
-        raw = os.getenv(env_key, "").strip()
+        raw = str(get_secret(env_key, "") or "").strip()
         if not raw:
             continue
-        parts = urlsplit(raw)
-        if not parts.scheme or not parts.netloc:
+        parts = None
+        try:
+            parts = urlsplit(raw)
+            hostname = parts.hostname or ""
+            # Accessing port validates malformed values such as :not-a-port.
+            _ = parts.port
+        except ValueError:
+            hostname = ""
+        if (
+            parts is None
+            or parts.scheme not in {"http", "https"}
+            or not parts.netloc
+            or parts.username is not None
+            or parts.password is not None
+            or not _is_loopback_host(hostname)
+        ):
             logger.debug("Ignoring malformed %s for Zettlab gateway: %r", env_key, raw)
             continue
         return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
     return ""
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def local_server_gateway_url(vendor: str) -> str:
@@ -89,7 +117,7 @@ def resolve_zettlab_tool_gateway(vendor: str) -> Optional[ZettlabToolGatewayConf
     origin = local_server_gateway_url(vendor)
     if not origin:
         return None
-    token = os.getenv(_ACTION_TOKEN_ENV, "").strip()
+    token = str(get_secret(_ACTION_TOKEN_ENV, "") or "").strip()
     if not token:
         return None
     return ZettlabToolGatewayConfig(vendor=vendor, gateway_origin=origin, token=token)

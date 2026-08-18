@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -246,23 +247,93 @@ def _env_enabled(name: str) -> bool:
     return env_var_enabled(name)
 
 
-def _get_disabled_plugins() -> set:
+def _load_plugin_policy_config() -> Dict[str, Any]:
+    """Read plugin policy without expanding unrelated config secrets.
+
+    Plugin discovery can run before a multiplex request has installed its
+    profile secret scope. Loading the complete resolved config here would make
+    an unrelated ``${...}`` reference abort policy resolution and silently
+    drop ``plugins.disabled``. Read the raw user file instead, then apply the
+    administrator-managed overlay so plugin policy keeps the same precedence.
+
+    Parse and I/O errors deliberately propagate: discovery must fail closed
+    before any plugin is loaded when its allow/deny policy cannot be read.
+    """
+    config_path = get_hermes_home() / "config.yaml"
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            config = fast_safe_load(config_file) or {}
+    except FileNotFoundError:
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+
+    # Expand only the policy subtree. Expanding the whole user config would
+    # make unrelated provider secrets a prerequisite for plugin discovery in
+    # multiplex mode. User policy refs follow the active profile scope;
+    # administrator-managed policy refs keep their process-env-only contract.
+    from hermes_cli.config import (
+        _deep_merge,
+        _expand_env_vars,
+        _process_env_ref_value,
+    )
+    from hermes_cli.managed_scope import load_managed_config
+
+    user_policy = (
+        {"plugins": config.get("plugins")}
+        if "plugins" in config
+        else {}
+    )
+    user_policy = _expand_env_vars(user_policy)
+
+    managed_config = load_managed_config()
+    managed_policy = (
+        {"plugins": managed_config.get("plugins")}
+        if isinstance(managed_config, dict) and "plugins" in managed_config
+        else {}
+    )
+    managed_policy = _expand_env_vars(
+        managed_policy,
+        env_getter=_process_env_ref_value,
+    )
+    return _deep_merge(user_policy, managed_policy)
+
+
+def _reject_unresolved_plugin_policy_refs(
+    values: Any,
+    *,
+    key: str,
+) -> None:
+    if not isinstance(values, list):
+        return
+    unresolved = [
+        value
+        for value in values
+        if isinstance(value, str) and re.search(r"\${[^}]+}", value)
+    ]
+    if unresolved:
+        raise ValueError(
+            f"plugins.{key} contains an unresolved config reference"
+        )
+
+
+def _get_disabled_plugins(config: Optional[Dict[str, Any]] = None) -> set:
     """Read the disabled plugins list from config.yaml.
 
     Kept for backward compat and explicit deny-list semantics. A plugin
     name in this set will never load, even if it appears in
     ``plugins.enabled``.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        disabled = cfg_get(config, "plugins", "disabled", default=[])
-        return set(disabled) if isinstance(disabled, list) else set()
-    except Exception:
-        return set()
+    if config is None:
+        config = _load_plugin_policy_config()
+    disabled = cfg_get(config, "plugins", "disabled", default=[])
+    _reject_unresolved_plugin_policy_refs(disabled, key="disabled")
+    return set(disabled) if isinstance(disabled, list) else set()
 
 
-def _get_enabled_plugins() -> Optional[set]:
+def _get_enabled_plugins(
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[set]:
     """Read the enabled-plugins allow-list from config.yaml.
 
     Plugins are opt-in by default — only plugins whose name appears in
@@ -276,20 +347,18 @@ def _get_enabled_plugins() -> Optional[set]:
     * ``set()`` — an empty list was explicitly set; nothing loads.
     * ``set(...)`` — the concrete allow-list.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        plugins_cfg = config.get("plugins")
-        if not isinstance(plugins_cfg, dict):
-            return None
-        if "enabled" not in plugins_cfg:
-            return None
-        enabled = plugins_cfg.get("enabled")
-        if not isinstance(enabled, list):
-            return None
-        return set(enabled)
-    except Exception:
+    if config is None:
+        config = _load_plugin_policy_config()
+    plugins_cfg = config.get("plugins")
+    if not isinstance(plugins_cfg, dict):
         return None
+    if "enabled" not in plugins_cfg:
+        return None
+    enabled = plugins_cfg.get("enabled")
+    _reject_unresolved_plugin_policy_refs(enabled, key="enabled")
+    if not isinstance(enabled, list):
+        return None
+    return set(enabled)
 
 
 # ---------------------------------------------------------------------------

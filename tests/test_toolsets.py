@@ -332,6 +332,7 @@ class TestZetAgentDeviceToolReachability:
             defs = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
         names = {d["function"]["name"] for d in defs}
         assert "app_host" in names
+        assert "app_workspace" not in names
 
     def test_device_dump_fixture_plus_catalog_entry_exposes_app_host(self, monkeypatch):
         """Live-dump boundary test: feed the exact enabled list a real device's
@@ -377,6 +378,37 @@ class TestZetAgentDeviceToolReachability:
         # app_host unreachable (deletion experiments EV8a/EV8b).
         assert "app_host" in TOOLSETS["zettlab_apphost"]["tools"]
         assert "app_host" in resolve_toolset("hermes-zet-agent")
+        assert "app_workspace" in TOOLSETS["zettlab_app_workspace"]["tools"]
+        assert "app_workspace" not in resolve_toolset("hermes-zet-agent")
+
+    def test_explicit_dedicated_interactive_toolset_exposes_workspace(self, monkeypatch):
+        """ZLS adds this catalog only to its dedicated interactive profile.
+
+        Hermes must keep it independently resolvable so the local-server can
+        expose the sidebar tool without leaking it into the shared composite.
+        """
+        from model_tools import get_tool_definitions
+        from tests.tools._profile_scope import mux_profile_scope
+
+        scope = {
+            "ZET_APPHOST_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apphost",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "t",
+        }
+        with mux_profile_scope(monkeypatch, scope):
+            defs = get_tool_definitions(
+                enabled_toolsets=["zettlab_app_workspace"], quiet_mode=True,
+            )
+        assert "app_workspace" in {definition["function"]["name"] for definition in defs}
+
+    def test_device_meetings_alias_keeps_chat_and_cron_contracts_separate(self):
+        """Chat recovers the read-only bridge without changing Cron bindings."""
+        assert TOOLSETS["zettlab_device_meetings"]["tools"] == ["device_meetings"]
+        assert "device_meetings" in resolve_toolset("hermes-zet-agent")
+        assert "skill_operation" not in TOOLSETS["zettlab_device_meetings"]["tools"]
+        assert set(TOOLSETS["zettlab_skill_runtime"]["tools"]) == {
+            "skill_operation",
+            "device_meetings",
+        }
 
     def test_app_host_stays_off_shared_and_cron_real_paths(self):
         # Deliberate scoping, same rationale as call_agent: the App Host
@@ -386,8 +418,10 @@ class TestZetAgentDeviceToolReachability:
         # decision, not a drive-by.
         from toolsets import _HERMES_CORE_TOOLS
         assert "app_host" not in _HERMES_CORE_TOOLS
+        assert "app_workspace" not in _HERMES_CORE_TOOLS
         # Real path for cron (no explicit config -> its default composite).
         assert "app_host" not in self._real_path_tool_names({}, "cron")
+        assert "app_workspace" not in self._real_path_tool_names({}, "cron")
 
     def test_profile_scope_sensitive_tools_reachable_on_zet_agent_real_path(self):
         """Generalized guard for this class of omission: a tool whose check_fn
@@ -396,6 +430,8 @@ class TestZetAgentDeviceToolReachability:
         it, it is silently unreachable exactly where it is meant to work.
 
         Exemptions, each deliberate and documented:
+        - explicitly non-Zet-Agent session surfaces: ``skill_operation`` is
+          Cron-only and therefore must not be recovered into a zet_agent turn.
         - opt-in toolsets (_DEFAULT_OFF_TOOLSETS): injected via platform
           config when the user enables them (e.g. video_generate) — absent by
           decision, not lost.
@@ -412,16 +448,25 @@ class TestZetAgentDeviceToolReachability:
         known_preexisting_gaps = {
             "list_my_channels", "send_channel_message", "get_personal_calendar",
         }
+        non_default_zet_agent_tools = {
+            "skill_operation",  # Cron-only.
+            # Local-server adds this dedicated-maintainer-only catalog to an
+            # AppDedicated interactive profile. It must stay absent from the
+            # ordinary zet_agent composite and from cron.
+            "app_workspace",
+        }
         discover_builtin_tools()
         scope_sensitive = {
             entry.name
             for entry in registry._tools.values()
             if getattr(entry.check_fn, "_profile_scope_sensitive", False)
+            and entry.name not in non_default_zet_agent_tools
             and entry.toolset not in _DEFAULT_OFF_TOOLSETS
         }
         # Sanity: the guard must be looking at a non-empty set, otherwise a
         # marker rename would silently turn this test into a no-op.
         assert "app_host" in scope_sensitive
+        assert "app_data" in scope_sensitive
         reachable = self._real_path_tool_names(self._DEVICE_CONFIG, "zet_agent")
         missing = scope_sensitive - reachable - known_preexisting_gaps
         assert not missing, (

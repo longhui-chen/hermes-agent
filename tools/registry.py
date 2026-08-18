@@ -164,11 +164,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "defer_to_tool_search",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 defer_to_tool_search=True):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +189,11 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Tool Search is opt-out only for a small set of platform-native tools
+        # whose schema must remain directly callable when their platform
+        # toolset is selected. Selection still happens through toolsets; this
+        # flag never grants a tool to another platform.
+        self.defer_to_tool_search = bool(defer_to_tool_search)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +276,14 @@ def check_fn_cache_scope() -> Optional[str]:
 
 
 def _must_recheck_profile_scope(fn: Callable) -> bool:
-    """Whether *fn* reads profile-local authorization in a shared gateway."""
+    """Whether *fn* reads authorization from request-local runtime scope.
+
+    Session-sensitive checks must never use the process-wide TTL/last-good
+    cache, even in a single-profile gateway. Profile-sensitive checks retain
+    the historical uncached behavior only for multiplex gateways.
+    """
+    if getattr(fn, "_session_scope_sensitive", False):
+        return True
     if not getattr(fn, "_profile_scope_sensitive", False):
         return False
     try:
@@ -451,6 +465,32 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
         return None
 
 
+_DELEGATED_CHILD_PROTECTED_TOOLS = frozenset({"app_host", "app_data", "app_workspace"})
+
+
+def _delegated_child_scope_gate(name: str) -> Optional[str]:
+    """Deny profile-secret App tools to anonymous delegated children."""
+    if name not in _DELEGATED_CHILD_PROTECTED_TOOLS:
+        return None
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        is_child = bool(is_delegated_child_context())
+    except Exception:
+        logger.warning(
+            "Unable to resolve delegated-child scope for %s; denying dispatch",
+            name,
+        )
+        is_child = True
+    if not is_child:
+        return None
+    return tool_error(
+        f"{name} is unavailable to delegate_task child agents.",
+        error_type="delegated_child_scope",
+        tool=name,
+    )
+
+
 def _resolve_runtime_tool_args(name: str, args: dict) -> dict:
     """Resolve platform-owned semantic arguments before any execution gate."""
     if not isinstance(args, dict):
@@ -499,12 +539,35 @@ class ToolRegistry:
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
         self._lock = threading.RLock()
-        # Monotonically-increasing generation counter. Bumped on every
-        # mutation (register / deregister / register_toolset_alias / MCP
-        # refresh). External callers (e.g. get_tool_definitions) can memoize
-        # against it: a cache entry keyed on the generation is valid for as
-        # long as the generation hasn't changed.
+        # 内建工具使用进程级版本；动态 MCP 另按 profile 递增，避免 A 的 reload
+        # 让 B 的 agent cache 无意义失效。
         self._generation: int = 0
+        self._profile_generations: Dict[str, int] = {}
+
+    @staticmethod
+    def _current_profile_identity() -> str:
+        from hermes_constants import get_hermes_home
+
+        return str(Path(get_hermes_home()).expanduser().resolve())
+
+    def cache_generation(self) -> tuple[int, int]:
+        """返回全局内建版本与当前 profile 的动态 MCP 版本。"""
+        with self._lock:
+            profile = self._current_profile_identity()
+            return self._generation, self._profile_generations.get(profile, 0)
+
+    def _bump_generation(self, generation_profile: str | None) -> None:
+        if generation_profile is None:
+            self._generation += 1
+            return
+        profile = str(Path(generation_profile).expanduser().resolve())
+        self._profile_generations[profile] = self._profile_generations.get(profile, 0) + 1
+
+    def clear_profile_generation(self, profile_identity: str | Path) -> None:
+        """在 profile 完整卸载后移除其动态版本所有权。"""
+        profile = str(Path(profile_identity).expanduser().resolve())
+        with self._lock:
+            self._profile_generations.pop(profile, None)
 
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
@@ -555,7 +618,13 @@ class ToolRegistry:
             if entry.toolset == toolset
         )
 
-    def register_toolset_alias(self, alias: str, toolset: str) -> None:
+    def register_toolset_alias(
+        self,
+        alias: str,
+        toolset: str,
+        *,
+        generation_profile: str | None = None,
+    ) -> None:
         """Register an explicit alias for a canonical toolset name."""
         with self._lock:
             existing = self._toolset_aliases.get(alias)
@@ -565,7 +634,7 @@ class ToolRegistry:
                     alias, existing, toolset,
                 )
             self._toolset_aliases[alias] = toolset
-            self._generation += 1
+            self._bump_generation(generation_profile)
 
     def get_registered_toolset_aliases(self) -> Dict[str, str]:
         """Return a snapshot of ``{alias: canonical_toolset}`` mappings."""
@@ -644,6 +713,8 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        defer_to_tool_search: bool = True,
+        generation_profile: str | None = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -652,6 +723,11 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
+
+        ``defer_to_tool_search`` defaults to True for non-core tools. A
+        platform-native tool may set it to False when its direct schema is a
+        compatibility contract; toolset selection remains the authority for
+        whether that tool is available at all.
         """
         with self._lock:
             existing = self._tools.get(name)
@@ -703,6 +779,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                defer_to_tool_search=defer_to_tool_search,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -712,9 +789,9 @@ class ToolRegistry:
             # write path for that classification.
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
-            self._generation += 1
+            self._bump_generation(generation_profile)
 
-    def deregister(self, name: str) -> None:
+    def deregister(self, name: str, *, generation_profile: str | None = None) -> None:
         """Remove a tool from the registry.
 
         Also cleans up the toolset check if no other tools remain in the
@@ -778,12 +855,29 @@ class ToolRegistry:
                     for alias, target in self._toolset_aliases.items()
                     if target != entry.toolset
                 }
-            self._generation += 1
+            self._bump_generation(generation_profile)
         logger.debug("Deregistered tool: %s", name)
 
     # ------------------------------------------------------------------
     # Schema retrieval
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _effective_schema(entry: ToolEntry) -> dict:
+        schema = {**entry.schema, "name": entry.name}
+        if entry.dynamic_schema_overrides is None:
+            return schema
+        try:
+            overrides = entry.dynamic_schema_overrides()
+            if isinstance(overrides, dict):
+                schema.update(overrides)
+        except Exception as exc:
+            logger.warning(
+                "dynamic_schema_overrides for tool %s raised %s; using static schema",
+                entry.name,
+                exc,
+            )
+        return schema
 
     def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
@@ -813,24 +907,7 @@ class ToolRegistry:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
                     continue
-            # Ensure schema always has a "name" field — use entry.name as fallback
-            schema_with_name = {**entry.schema, "name": entry.name}
-            # Apply runtime-dynamic overrides (e.g. delegate_task description
-            # depends on current delegation.max_concurrent_children /
-            # max_spawn_depth). Caller side (model_tools.get_tool_definitions)
-            # already keys its memo on config.yaml mtime + size, so changes
-            # to delegation.* in config invalidate the cache automatically.
-            if entry.dynamic_schema_overrides is not None:
-                try:
-                    overrides = entry.dynamic_schema_overrides()
-                    if isinstance(overrides, dict):
-                        schema_with_name.update(overrides)
-                except Exception as exc:
-                    logger.warning(
-                        "dynamic_schema_overrides for tool %s raised %s; "
-                        "using static schema",
-                        name, exc,
-                    )
+            schema_with_name = self._effective_schema(entry)
             result.append({"type": "function", "function": schema_with_name})
         return result
 
@@ -893,6 +970,10 @@ class ToolRegistry:
                 ensure_ascii=False,
             )
 
+        blocked = _delegated_child_scope_gate(name)
+        if blocked is not None:
+            return blocked
+
         # Zettlab file-change protection：registry.dispatch 是所有工具执行的
         # 统一汇聚点，gate 必须在这里——除 model_tools.handle_function_call
         # 外，插件公开 API ctx.dispatch_tool()（slash command / hook）也直连
@@ -946,13 +1027,13 @@ class ToolRegistry:
         return sorted(entry.name for entry in self._snapshot_entries())
 
     def get_schema(self, name: str) -> Optional[dict]:
-        """Return a tool's raw schema dict, bypassing check_fn filtering.
+        """Return a tool's effective schema, bypassing check_fn filtering.
 
-        Useful for token estimation and introspection where availability
-        doesn't matter — only the schema content does.
+        Runtime overrides are applied so introspection and argument coercion
+        see the same profile-specific contract that was shown to the model.
         """
         entry = self.get_entry(name)
-        return entry.schema if entry else None
+        return self._effective_schema(entry) if entry else None
 
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         """Return the toolset a tool belongs to, or None."""

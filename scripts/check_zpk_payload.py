@@ -31,7 +31,20 @@ CORE_IMPORTS = [
 ]
 
 PROJECT_RUNTIME_MODULES = {
+    "agent.agent_runtime_helpers": Path("agent/agent_runtime_helpers.py"),
+    "agent.memory_manager": Path("agent/memory_manager.py"),
+    "agent.prompt_builder": Path("agent/prompt_builder.py"),
+    "agent.system_prompt": Path("agent/system_prompt.py"),
+    "agent.tool_executor": Path("agent/tool_executor.py"),
+    "gateway.deep_memory_identity": Path("gateway/deep_memory_identity.py"),
+    "gateway.platforms.zet_agent": Path("gateway/platforms/zet_agent.py"),
     "gateway.run": Path("gateway/run.py"),
+    "plugins.memory.zettlab_deep_memory": Path(
+        "plugins/memory/zettlab_deep_memory/__init__.py"
+    ),
+    "plugins.memory.zettlab_deep_memory.outbox": Path(
+        "plugins/memory/zettlab_deep_memory/outbox.py"
+    ),
     "tools.code_execution_tool": Path("tools/code_execution_tool.py"),
     "tools.environments.local": Path("tools/environments/local.py"),
     "tools.process_registry": Path("tools/process_registry.py"),
@@ -301,6 +314,29 @@ def _check_seed_policy() -> None:
     print(out.splitlines()[-1] if out else "seed policy check ran")
 
 
+def _check_langfuse_relay_contract(extras: list[str]) -> None:
+    if "langfuse" not in extras:
+        return
+    from langfuse import Langfuse
+
+    client = Langfuse(
+        public_key="relay-public-contract",
+        secret_key="relay-secret-contract",
+        base_url="http://127.0.0.1:19092",
+    )
+    try:
+        processor = client._otel_tracer.span_processor._span_processors[0]
+        endpoint = processor.span_exporter._endpoint
+        expected = "http://127.0.0.1:19092/api/public/otel/v1/traces"
+        if endpoint != expected:
+            raise RuntimeError(
+                f"Langfuse relay endpoint contract changed: {endpoint!r} != {expected!r}"
+            )
+    finally:
+        client.shutdown()
+    print("Langfuse relay endpoint contract ok")
+
+
 def main() -> int:
     install_spec = os.environ.get("ZPK_INSTALL_SPEC", DEFAULT_INSTALL_SPEC)
     extras = _parse_install_spec(install_spec)
@@ -327,6 +363,8 @@ def main() -> int:
     )
 
     _check_seed_policy()
+
+    _check_langfuse_relay_contract(extras)
 
     pyproject = _load_pyproject()
     optional_deps = pyproject.get("project", {}).get("optional-dependencies", {})

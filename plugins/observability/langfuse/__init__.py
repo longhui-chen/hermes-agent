@@ -5,15 +5,16 @@ Traces Hermes conversations, LLM calls, and tool usage to Langfuse.
 Activation is handled by the Hermes plugin system — standalone plugins only
 load when listed in ``plugins.enabled`` (via ``hermes plugins enable
 observability/langfuse`` or ``hermes tools → Langfuse Observability``). At
-runtime the plugin also requires the ``langfuse`` SDK and credentials; if
-either is missing the hooks are inert.
+runtime the plugin also requires the ``langfuse`` SDK and either direct
+credentials or a local relay configuration; otherwise the hooks are inert.
 
-Required env vars (set via ``hermes tools`` or ~/.hermes/.env):
+Direct-mode env vars (set via ``hermes tools`` or ~/.hermes/.env):
   HERMES_LANGFUSE_PUBLIC_KEY  - Langfuse project public key (pk-lf-...)
   HERMES_LANGFUSE_SECRET_KEY  - Langfuse project secret key (sk-lf-...)
   HERMES_LANGFUSE_BASE_URL    - Langfuse server URL (default: https://cloud.langfuse.com)
 
 Optional env vars:
+  HERMES_LANGFUSE_MODE        - direct (default) or relay
   HERMES_LANGFUSE_ENV         - environment tag (e.g. "production", "local")
   HERMES_LANGFUSE_RELEASE     - release/version tag
   HERMES_LANGFUSE_SAMPLE_RATE - sampling rate 0.0–1.0 (default: 1.0)
@@ -27,14 +28,17 @@ Optional env vars:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +155,29 @@ def _validate_langfuse_key(env_name: str, value: str) -> Optional[str]:
     )
 
 
+def _is_loopback_relay_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        if (
+            parsed.scheme != "http"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        return ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _relay_transport_key(kind: str) -> str:
+    return f"relay-{kind}-{secrets.token_hex(8)}"
+
+
 def _get_langfuse() -> Optional[Langfuse]:
     """Return a cached Langfuse client, or ``None`` if unavailable.
 
@@ -170,9 +197,41 @@ def _get_langfuse() -> Optional[Langfuse]:
         _LANGFUSE_CLIENT = _INIT_FAILED
         return None
 
-    public_key = _env("HERMES_LANGFUSE_PUBLIC_KEY") or _env("LANGFUSE_PUBLIC_KEY")
-    secret_key = _env("HERMES_LANGFUSE_SECRET_KEY") or _env("LANGFUSE_SECRET_KEY")
-    if not (public_key and secret_key):
+    mode = (_env("HERMES_LANGFUSE_MODE", "direct") or "direct").lower()
+    if _env("HERMES_MANAGED_GATEWAY") == "1":
+        mode = "relay"
+    if mode == "relay":
+        for key in (
+            "HERMES_LANGFUSE_PUBLIC_KEY",
+            "HERMES_LANGFUSE_SECRET_KEY",
+            "LANGFUSE_BASIC_AUTH",
+            "LANGFUSE_OTEL_TRACES_EXPORT_PATH",
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+        ):
+            os.environ.pop(key, None)
+        base_url = _env("HERMES_LANGFUSE_BASE_URL")
+        if not _is_loopback_relay_url(base_url):
+            logger.warning(
+                "Langfuse plugin: relay mode requires a loopback HTTP base URL; "
+                "tracing is disabled"
+            )
+            _LANGFUSE_CLIENT = _INIT_FAILED
+            return None
+        # Langfuse 4.7.1 requires constructor keys and uses them to produce an
+        # Authorization header. Ephemeral random values grant no permission and
+        # never persist; local-server strips the header before IoT forwarding.
+        public_key = _relay_transport_key("public")
+        secret_key = _relay_transport_key("secret")
+    elif mode == "direct":
+        public_key = _env("HERMES_LANGFUSE_PUBLIC_KEY") or _env("LANGFUSE_PUBLIC_KEY")
+        secret_key = _env("HERMES_LANGFUSE_SECRET_KEY") or _env("LANGFUSE_SECRET_KEY")
+        if not (public_key and secret_key):
+            _LANGFUSE_CLIENT = _INIT_FAILED
+            return None
+        base_url = _env("HERMES_LANGFUSE_BASE_URL") or _env("LANGFUSE_BASE_URL") or "https://cloud.langfuse.com"
+    else:
+        logger.warning("Langfuse plugin: unsupported HERMES_LANGFUSE_MODE=%r", mode)
         _LANGFUSE_CLIENT = _INIT_FAILED
         return None
 
@@ -184,14 +243,16 @@ def _get_langfuse() -> Optional[Langfuse]:
     # to post them, by which point the warning is buried under whatever
     # else the process is logging.  Catch it here, surface it once, and
     # short-circuit via the same _INIT_FAILED path as the empty case.
-    placeholder_issues = [
-        msg
-        for msg in (
-            _validate_langfuse_key("HERMES_LANGFUSE_PUBLIC_KEY", public_key),
-            _validate_langfuse_key("HERMES_LANGFUSE_SECRET_KEY", secret_key),
-        )
-        if msg
-    ]
+    placeholder_issues = []
+    if mode == "direct":
+        placeholder_issues = [
+            msg
+            for msg in (
+                _validate_langfuse_key("HERMES_LANGFUSE_PUBLIC_KEY", public_key),
+                _validate_langfuse_key("HERMES_LANGFUSE_SECRET_KEY", secret_key),
+            )
+            if msg
+        ]
     if placeholder_issues:
         logger.warning(
             "Langfuse plugin: credentials look like placeholders, traces will "
@@ -203,7 +264,6 @@ def _get_langfuse() -> Optional[Langfuse]:
         _LANGFUSE_CLIENT = _INIT_FAILED
         return None
 
-    base_url = _env("HERMES_LANGFUSE_BASE_URL") or _env("LANGFUSE_BASE_URL") or "https://cloud.langfuse.com"
     environment = _env("HERMES_LANGFUSE_ENV") or _env("LANGFUSE_ENV")
     release = _env("HERMES_LANGFUSE_RELEASE") or _env("LANGFUSE_RELEASE")
     sample_rate = _env("HERMES_LANGFUSE_SAMPLE_RATE")

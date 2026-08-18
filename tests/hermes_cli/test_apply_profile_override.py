@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
+    create_profile_dir: bool = True,
     argv: list[str] | None = None,
 ):
     """Run _apply_profile_override in isolation.
@@ -32,7 +33,7 @@ def _run_apply_profile_override(
     if active_profile is not None:
         (hermes_root / "active_profile").write_text(active_profile)
 
-    if active_profile and active_profile != "default":
+    if active_profile and active_profile != "default" and create_profile_dir:
         (hermes_root / "profiles" / active_profile).mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -164,3 +165,37 @@ class TestSupervisedChildIgnoresStickyProfile:
         assert result is not None
         assert result.endswith("coder")
 
+
+
+class TestDanglingStickyProfile:
+    """active_profile naming a profile that no longer exists.
+
+    delete_profile/rename_profile keep the pointer in sync, but a profile removed
+    by anything else leaves it dangling. Seen 2026-08-13 on board .212: the device
+    local-server re-cloned an assistant, deleting profile 'zettlab' and creating
+    'zettlab-2', while active_profile still said 'zettlab'.
+    """
+
+    def test_dangling_sticky_pointer_falls_back_instead_of_exiting(
+        self, tmp_path, monkeypatch
+    ):
+        # Exiting here would take down *every* hermes command on the device,
+        # including `hermes profile use <name>` — the one that repairs it.
+        result = _run_apply_profile_override(
+            tmp_path, monkeypatch,
+            hermes_home=None, active_profile="zettlab", create_profile_dir=False,
+        )
+        assert result is None, f"dangling pointer must not set HERMES_HOME, got {result!r}"
+
+    def test_explicit_missing_profile_still_exits(self, tmp_path, monkeypatch):
+        # The relaxation is scoped to the sticky pointer: an explicit --profile/-p
+        # names a profile for *this* run, so a missing one stays a hard error.
+        import pytest
+
+        with pytest.raises(SystemExit) as exc:
+            _run_apply_profile_override(
+                tmp_path, monkeypatch,
+                hermes_home=None, active_profile=None,
+                argv=["hermes", "-p", "ghost", "gateway", "start"],
+            )
+        assert exc.value.code == 1

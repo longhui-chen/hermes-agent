@@ -2126,7 +2126,9 @@ def _navigate_within_identity(
             )
             if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
                 snapshot_text = _truncate_snapshot(snapshot_text)
+                result["_browser_content_source_truncated"] = True
             result["snapshot"] = snapshot_text
+            result["_browser_content_provenance"] = "page_text"
             result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
@@ -2229,13 +2231,17 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         # Apply same summarization logic as the main browser tool
         from tools.browser_tool import (
             SNAPSHOT_SUMMARIZE_THRESHOLD,
-            _extract_relevant_content,
+            _extract_relevant_content_with_provenance,
             _truncate_snapshot,
         )
 
+        provenance = "page_text"
+        source_truncated = len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD
         if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
             if user_task:
-                snapshot = _extract_relevant_content(snapshot, user_task)
+                snapshot, provenance = _extract_relevant_content_with_provenance(
+                    snapshot, user_task
+                )
             else:
                 snapshot = _truncate_snapshot(snapshot)
 
@@ -2246,6 +2252,8 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         return json.dumps({
             "success": True,
             "snapshot": snapshot,
+            "_browser_content_provenance": provenance,
+            **({"_browser_content_source_truncated": True} if source_truncated else {}),
             "element_count": refs_count,
         })
     except Exception as e:
