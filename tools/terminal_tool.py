@@ -1324,6 +1324,7 @@ _VIDEO_EDIT_WORKER_BROKER_START_MAX_ATTEMPTS = 2
 _VIDEO_EDIT_WORKER_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 _VIDEO_EDIT_UPLOAD_TIMEOUT_SECONDS = 3700
 _PROACTIVE_VIDEO_UPLOAD_TIMEOUT_SECONDS = 10800
+_PROACTIVE_VIDEO_COMPLETE_TIMEOUT_SECONDS = 3700
 _VIDEO_EDIT_WORKER_SOURCE_LIMIT_BYTES = 512 * 1024
 _VIDEO_EDIT_WORKER_INTERPRETER_LIMIT_BYTES = 32 * 1024 * 1024
 _TRUSTED_RUNTIME_SOURCE_CACHE_MAX_BYTES = 8 * 1024 * 1024
@@ -4869,6 +4870,11 @@ def _video_edit_runtime_timeout(
         and _cloud_render_business_subcommand(parsed.argv[2:]) == "upload"
     ):
         return max(requested_timeout, _PROACTIVE_VIDEO_UPLOAD_TIMEOUT_SECONDS)
+    if (
+        Path(parsed.argv[1]).name == "proactive_video.py"
+        and _cloud_render_business_subcommand(parsed.argv[2:]) == "complete"
+    ):
+        return max(requested_timeout, _PROACTIVE_VIDEO_COMPLETE_TIMEOUT_SECONDS)
     return requested_timeout
 
 
@@ -4929,7 +4935,13 @@ def _proactive_video_arguments_match_receipt(
     if agent_id != expected_agent_id or position >= len(arguments):
         return False
     subcommand = arguments[position]
-    if subcommand not in {"resolve", "upload", "create-project", "report"}:
+    if subcommand not in {
+        "resolve",
+        "upload",
+        "create-project",
+        "complete",
+        "report",
+    }:
         return False
     manifest_id, position = _exact_cli_option(
         arguments,

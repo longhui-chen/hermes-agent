@@ -536,6 +536,27 @@ def test_proactive_upload_uses_turn_bounded_long_timeout():
     )
 
 
+def test_proactive_complete_uses_manifest_completion_timeout():
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/proactive_video.py",
+            "--agent-id",
+            "agent-1",
+            "complete",
+            "--manifest-id",
+            "pvm_" + "A" * 32,
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert (
+        terminal_tool_module._video_edit_runtime_timeout(parsed, 600)
+        == terminal_tool_module._PROACTIVE_VIDEO_COMPLETE_TIMEOUT_SECONDS
+    )
+
+
 @pytest.mark.parametrize("script_name", ("cloud_render_business.py", "proactive_video.py"))
 @pytest.mark.parametrize(
     "arguments",
@@ -741,6 +762,34 @@ def test_proactive_receipt_allows_manifest_bound_upload_wrapper():
             "HERMES_TURN_ID": turn_id,
             "HERMES_SESSION_KEY": "api-lineage-tip",
             "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+        },
+    )
+
+
+def test_proactive_receipt_allows_manifest_bound_complete_wrapper():
+    turn_id = "pvm-" + "a" * 24
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/proactive_video.py",
+            "--agent-id",
+            "agent-1",
+            "complete",
+            "--manifest-id",
+            "pvm_" + "A" * 32,
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+            "HERMES_EXECUTION_POLICY": "silent_automation",
         },
     )
 
