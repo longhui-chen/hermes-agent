@@ -414,7 +414,16 @@ class TestExtractMedia:
         )
         assert msg_type == MessageType.VOICE
         assert urls == ["dl_voice_rt"]
-        assert mtypes == ["audio"]
+        # 🔴 契约重写(2026-08-16):原断言钉的是 ``["audio"]``。
+        # ``media_types`` 的契约是 **MIME**(见 adapter.py 的 EXT_MAP 注释),
+        # 而下游 ``gateway.run._event_media_is_audio`` 判的是 ``"audio/"``。
+        # 裸类别 "audio" 判 False,且因为**非空**连消息级兜底也跳过 ——
+        # 实测 image/audio/video 三个门全 False,只有语音靠
+        # ``message_type == VOICE`` 短路才没出事。
+        # ⇒ 推不出子类型时如实记「未知」,让消息级类型兜底。
+        assert mtypes == ["audio/*"], (
+            "逐附件类型没写成 media-range ⇒ 异构列表会被消息级类型压平"
+        )
 
 
     def test_image_no_filename_still_photo(self):
@@ -434,8 +443,165 @@ class TestExtractMedia:
         )
         assert msg_type == MessageType.PHOTO
         assert urls == ["dl_img_noext"]
-        # Without fileName, mime defaults to octet-stream but msg_type_str=="image" still wins
-        assert mtypes == ["application/octet-stream"]
+        # 🔴 契约重写(2026-08-16)。原断言是
+        #     assert mtypes == ["application/octet-stream"]
+        #     # ... msg_type_str=="image" still wins
+        # 那句注释描述的是**当时的实现恰好怎么跑**,⛔ 不是产品需求 ——
+        # 它把一个 bug 钉成了契约:``application/octet-stream`` 非空且非
+        # ``image/``,下游关口既判不出图片、又因非空跳过 PHOTO 兜底,
+        # ⇒ **这条路的图从来没进过模型**。改对了反而会让这条测试变红。
+        # ⇒ 需求是「钉钉说这是图片,它就得能进模型」。
+        assert mtypes == [""]
+
+
+class TestDingTalkMediaReachesTheModel:
+    """⭐ 判据换成**下游关口本身**,⛔ 不再钉某个实现值。
+
+    ``media_types`` 里放什么是实现细节;用户要的是「钉钉发的图 Agent 看得到」。
+    直接驱动 ``gateway.run._event_media_is_image`` 等三个真实关口来断言。
+    """
+
+    def _event(self, mtypes, msg_type):
+        from gateway.platforms.base import MessageEvent
+
+        return MessageEvent(text="", message_type=msg_type,
+                            media_urls=["x"] * len(mtypes), media_types=list(mtypes))
+
+    def test_image_content_branch_reaches_the_model(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.run import _event_media_is_image
+
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "picture"
+        msg.image_content = MagicMock(download_code="dl_a")
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert _event_media_is_image(self._event(mtypes, msg_type), 0), (
+            f"钉钉图片进不了模型:media_types={mtypes!r} message_type={msg_type!r}"
+        )
+
+    def test_rich_text_image_reaches_the_model(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.run import _event_media_is_image
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = [{"type": "picture", "downloadCode": "dl_b"}]
+        msg.message_type = "richText"
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert _event_media_is_image(self._event(mtypes, msg_type), 0), (
+            f"钉钉富文本图片进不了模型:media_types={mtypes!r} message_type={msg_type!r}"
+        )
+
+    def test_image_without_filename_reaches_the_model(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.run import _event_media_is_image
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "image"
+        msg.extensions = {"content": {"downloadCode": "dl_c"}}
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert _event_media_is_image(self._event(mtypes, msg_type), 0), (
+            f"无 fileName 的钉钉图片进不了模型:media_types={mtypes!r}"
+        )
+
+    def test_voice_reaches_the_audio_bucket(self):
+        """兄弟枚举:同一个函数里 audio 是同一形态的缺陷,一并修。"""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.run import _event_media_is_audio
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = [{"type": "voice", "downloadCode": "dl_v"}]
+        msg.message_type = "richText"
+        mt, _, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert _event_media_is_audio(self._event(mtypes, mt), 0), (mtypes, mt)
+
+    def test_rich_text_video_is_currently_unreachable(self):
+        """⚠️ 如实标注:``mapped == "video"`` 那条分支**今天走不到**。
+
+        ``DINGTALK_TYPE_MAPPING`` 只映射 ``picture→image`` / ``voice→audio``;
+        富文本里的 ``type="video"`` 落到默认 ``"file"`` ⇒ DOCUMENT。
+        我在那条分支上顺手做的同形修改因此是**防御性的、当前未被执行**,
+        ⛔ 不许把它说成「video 也修好了」。
+        ⛔ 不在本轮给 mapping 加 video —— 那是改行为,不是修这个缺陷。
+        """
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter, DINGTALK_TYPE_MAPPING
+        from gateway.platforms.base import MessageType
+
+        assert "video" not in DINGTALK_TYPE_MAPPING, DINGTALK_TYPE_MAPPING
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = [{"type": "video", "downloadCode": "dl_w"}]
+        msg.message_type = "richText"
+        mt, _, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert mt == MessageType.DOCUMENT and mtypes == ["application/octet-stream"]
+
+    def test_a_real_filename_still_yields_its_real_mime(self):
+        """🔒 必须保持不变:有 fileName 的那条路**一格不动**。"""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+        from gateway.run import _event_media_is_image
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "image"
+        msg.extensions = {"content": {"downloadCode": "dl_d", "fileName": "shot.png"}}
+        msg_type, _, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert mtypes == ["image/png"], mtypes           # ⛔ 没变
+        assert msg_type == MessageType.PHOTO
+        assert _event_media_is_image(self._event(mtypes, msg_type), 0)
+
+    def test_a_real_document_is_still_a_document(self):
+        """🔒 必须保持不变:⛔ 别把非图片一起放进图片桶。"""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+        from gateway.run import _event_media_is_image
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "file"
+        msg.extensions = {"content": {"downloadCode": "dl_e", "fileName": "report.pdf"}}
+        msg_type, _, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert mtypes == ["application/pdf"], mtypes     # ⛔ 没变
+        assert msg_type == MessageType.DOCUMENT
+        assert not _event_media_is_image(self._event(mtypes, msg_type), 0)
+
+    def test_a_file_without_extension_is_not_promoted_to_image(self):
+        """🔒 ⛔ 作用域别外扩:``msgtype='file'`` 且推不出 MIME 时仍是文档。"""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+        from gateway.run import _event_media_is_image
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "file"
+        msg.extensions = {"content": {"downloadCode": "dl_f", "fileName": "blob"}}
+        msg_type, _, mtypes = DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+        assert mtypes == ["application/octet-stream"], mtypes   # ⛔ 没变
+        assert msg_type == MessageType.DOCUMENT
+        assert not _event_media_is_image(self._event(mtypes, msg_type), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -765,3 +931,38 @@ class TestDingTalkAdapterAICards:
         mock_card_sdk.deliver_card_with_options_async.assert_called_once()
         mock_card_sdk.streaming_update_with_options_async.assert_called_once()
         assert result.success is True
+
+
+class TestDingTalkHeterogeneousMediaIsNowRouted:
+    """⭐ 本类原名 ``…IsAKnownLimitation``,断言的是**当时的错误行为**。
+
+    它当时就注明「若转绿说明有人修好了,请同步更新注释」——**现在正是那一刻**:
+    机器人第三轮 H⑦ 点名后已改为逐附件 media-range,断言随之翻面。
+    """
+
+    def _extract(self, items):
+        from types import SimpleNamespace
+
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        msg = SimpleNamespace(
+            rich_text_content=SimpleNamespace(rich_text_list=items),
+            message_type="richText", image_content=None, extensions={},
+        )
+        return DingTalkAdapter._extract_media(DingTalkAdapter, msg)
+
+    def test_picture_then_voice_keeps_each_attachment_its_own_kind(self):
+        _mt, _urls, types = self._extract([
+            {"type": "picture", "downloadCode": "d1"},
+            {"type": "voice", "downloadCode": "d2"},
+        ])
+        assert types[0].startswith("image/")
+        assert types[1].startswith("audio/"), "语音仍会被送进视觉模型"
+
+    def test_voice_then_picture_keeps_each_attachment_its_own_kind(self):
+        _mt, _urls, types = self._extract([
+            {"type": "voice", "downloadCode": "d1"},
+            {"type": "picture", "downloadCode": "d2"},
+        ])
+        assert types[0].startswith("audio/")
+        assert types[1].startswith("image/"), "图片仍会进 STT 路径"

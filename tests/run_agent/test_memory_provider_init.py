@@ -94,6 +94,50 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert "status_callback" not in provider.init_kwargs
 
 
+def test_aiagent_keeps_memo_account_separate_from_deep_memory_identity():
+    memo = RecordingMemoryProvider()
+    memo.name = "zettlab_memo"
+    deep_memory = RecordingMemoryProvider()
+    deep_memory.name = "zettlab_deep_memory"
+    cfg = {"memory": {"provider": "zettlab_memo"}, "agent": {}}
+
+    def make_agent(provider, provider_name):
+        cfg["memory"]["provider"] = provider_name
+        with (
+            patch("hermes_cli.config.load_config", return_value=cfg),
+            patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+            patch("plugins.memory.load_memory_provider", return_value=provider),
+            patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            from run_agent import AIAgent
+
+            return AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                session_id=f"{provider_name}-session",
+                platform="zet_agent",
+                user_id="account-1",
+                session_owner_id="iam:alice",
+                deep_memory_principal="iam:alice",
+                deep_memory_subject="user-1",
+            )
+
+    make_agent(memo, "zettlab_memo")
+    assert memo.init_kwargs["user_id"] == "account-1"
+    assert "deep_memory_principal" not in memo.init_kwargs
+    assert "deep_memory_subject" not in memo.init_kwargs
+
+    make_agent(deep_memory, "zettlab_deep_memory")
+    assert deep_memory.init_kwargs["user_id"] == "account-1"
+    assert deep_memory.init_kwargs["deep_memory_principal"] == "iam:alice"
+    assert deep_memory.init_kwargs["deep_memory_subject"] == "user-1"
+
+
 class CoreShadowProvider:
     """Provider that tries to register tools shadowing built-in core tools."""
 
@@ -134,5 +178,4 @@ def test_core_tool_names_rejected_from_memory_routing_table():
     assert "clarify" not in schema_names
     assert "delegate_task" not in schema_names
     assert "honcho_search" in schema_names
-
 

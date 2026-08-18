@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -378,6 +378,38 @@ class TestBackgroundInHelp:
 
 class TestBackgroundInCLICommands:
     """Verify /background is registered in the CLI command system."""
+
+    @pytest.mark.asyncio
+    async def test_feishu_background_media_keeps_quote_until_attachment_succeeds(self, monkeypatch, tmp_path):
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(return_value=("test-model", {"api_key": "test-key"}))
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(return_value={
+            "model": "test-model", "runtime": {"api_key": "test-key"}, "request_overrides": None,
+        })
+        runner._run_in_executor_with_context = AsyncMock(return_value={"final_response": "附件", "messages": []})
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        first, second = tmp_path / "first.pdf", tmp_path / "second.pdf"
+        first.write_bytes(b"pdf")
+        second.write_bytes(b"pdf")
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([(str(first), False), (str(second), False)], ""))
+        mock_adapter.extract_images = MagicMock(return_value=([], ""))
+        mock_adapter.send_document = AsyncMock(side_effect=[
+            SendResult(success=False, error="temporary"), SendResult(success=True, message_id="doc-2")
+        ])
+        runner.adapters[Platform.FEISHU] = mock_adapter
+        source = SessionSource(platform=Platform.FEISHU, user_id="ou_user", chat_id="oc_group", chat_type="group", thread_id="om_old_root")
+
+        await runner._run_background_task("整理文件", source, "bg_feishu", event_message_id="om_question")
+
+        calls = mock_adapter.send_document.await_args_list
+        assert calls[0].kwargs["metadata"]["reply_to_message_id"] == "om_question"
+        assert calls[1].kwargs["metadata"]["reply_to_message_id"] == "om_question"
 
 
     def test_background_autocompletes(self):

@@ -3,6 +3,8 @@
 Covers ``POST /v1/profile/reload`` (new in ZET-1139) and the ZET-1139
 additions to ``POST /v1/skills/reload`` (in-process invalidate + DB clear).
 """
+import ast
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,6 +12,93 @@ import pytest
 from gateway.config import PlatformConfig
 import gateway.platforms.zet_agent as zet_agent
 from gateway.platforms.zet_agent import ZetAgentAdapter
+
+
+def _reload_unavailable_call_sites() -> list[tuple[int, str, str, bool]]:
+    """枚举 ``_reload_unavailable_response`` 的全部调用点。
+
+    返回 ``(行号, code, operation, 是否显式传了 user_message)``。
+
+    ⛔ 判据不看文案内容 —— 「文案写得好不好」是开集，钉不住。看的是
+    「同一个 code 的兄弟调用点有没有做同一件事」这个二值性质（闭集）。
+
+    残留开集（判据覆盖不到，靠 review 兜）：
+      · 把函数赋给别名后再调用（``f = _reload_unavailable_response; f(...)``）
+      · 用非字面量表达式传 code / operation
+    两者当前都不存在；出现时下面的 ``<expr>`` 会让断言自然失败。
+    """
+    tree = ast.parse(Path(zet_agent.__file__).read_text(encoding="utf-8"))
+    sites: list[tuple[int, str, str, bool]] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_reload_unavailable_response"
+        ):
+            continue
+        pos = [a.value if isinstance(a, ast.Constant) else "<expr>" for a in node.args]
+        kw = {k.arg: k.value for k in node.keywords}
+
+        def _pick(idx: int, name: str) -> str:
+            if len(pos) > idx:
+                return str(pos[idx])
+            node_kw = kw.get(name)
+            if isinstance(node_kw, ast.Constant):
+                return str(node_kw.value)
+            return "<expr>"
+
+        sites.append(
+            (node.lineno, _pick(1, "code"), _pick(0, "operation"), "user_message" in kw)
+        )
+    return sites
+
+
+def test_same_error_code_siblings_agree_on_user_message():
+    """同一个 code 的调用点，要么全部给专属文案，要么全部吃默认。
+
+    混着来 = 「兄弟调用点没跟上」：有人已经在同一个 code 上写了针对性的
+    可行动文案，另一个点却仍然回落到通用默认句 —— 用户在那条路径上会
+    收到一句与实际失败无关的提示。
+
+    实证（2026-08-15）：``profile_unload_unavailable`` 6 个调用点里 5 个
+    写了 ``Profile <X> could not be safely released.``，唯独
+    ``profile-unload runtime cleanup`` 吃默认的 "Runtime configuration
+    could not be refreshed." —— 那条路径失败的是 runtime 释放，不是配置刷新。
+    既有测试只断言 ``body["error"]["code"]``，对文案零覆盖，所以全绿。
+    """
+    sites = _reload_unavailable_call_sites()
+    assert sites, "一个调用点都没枚举到 —— 判据失效（函数被改名？）"
+
+    by_code: dict[str, list[tuple[int, bool]]] = {}
+    for lineno, code, _operation, has_msg in sites:
+        by_code.setdefault(code, []).append((lineno, has_msg))
+
+    mixed = {
+        code: entries
+        for code, entries in by_code.items()
+        if len({has_msg for _, has_msg in entries}) > 1
+    }
+    assert not mixed, (
+        "以下 code 的兄弟调用点对 user_message 的处理不一致 —— "
+        f"部分给了专属文案、部分吃默认: {mixed}"
+    )
+
+
+def test_every_reload_failure_names_a_distinct_operation():
+    """每个调用点的 operation 必须全局唯一。
+
+    ``operation`` 是唯一进日志的定位信息（``code`` 按族复用、correlation_id
+    每次随机）。两处不同的失败点写同一个 operation ⇒ 日志里分不出是哪一步
+    炸的，排查只能靠猜。
+    """
+    sites = _reload_unavailable_call_sites()
+    assert sites, "一个调用点都没枚举到 —— 判据失效（函数被改名？）"
+
+    seen: dict[str, list[int]] = {}
+    for lineno, _code, operation, _has_msg in sites:
+        seen.setdefault(operation, []).append(lineno)
+    dupes = {op: lines for op, lines in seen.items() if len(lines) > 1}
+    assert not dupes, f"以下 operation 被多个调用点复用，日志无法定位: {dupes}"
 
 
 class _FakeRequest:
@@ -145,6 +234,9 @@ async def test_profile_reload_no_gateway_runner_returns_500(monkeypatch):
     resp = await adapter._handle_profile_reload(_FakeRequest())
 
     assert resp.status == 500
+    assert resp.payload["error"]["code"] == "profile_reload_unavailable"
+    assert "reference" in resp.payload["error"]["message"]
+    assert "gateway runner" not in resp.payload["error"]["message"].lower()
 
 
 @pytest.mark.asyncio
@@ -193,6 +285,9 @@ async def test_profile_reload_missing_session_db_returns_500(monkeypatch):
     resp = await adapter._handle_profile_reload(_FakeRequest())
 
     assert resp.status == 500
+    assert resp.payload["error"]["code"] == "profile_reload_unavailable"
+    assert "reference" in resp.payload["error"]["message"]
+    assert "session db" not in resp.payload["error"]["message"].lower()
     runner.invalidate_all_cached_agents.assert_not_called()
 
 
@@ -211,6 +306,25 @@ async def test_profile_reload_rejects_missing_bearer(monkeypatch):
 # =========================================================================
 # /v1/skills/reload — ZET-1139 additions
 # =========================================================================
+
+
+@pytest.mark.asyncio
+async def test_skills_reload_no_gateway_runner_returns_safe_reference(monkeypatch):
+    adapter = _make_adapter(monkeypatch, gateway_runner=None)
+    import agent.prompt_builder as pb
+    import agent.skill_commands as sc
+
+    monkeypatch.setattr(
+        pb, "clear_skills_system_prompt_cache", lambda clear_snapshot=False: None
+    )
+    monkeypatch.setattr(sc, "scan_skill_commands", lambda: ["a"])
+
+    resp = await adapter._handle_skills_reload(_FakeRequest())
+
+    assert resp.status == 500
+    assert resp.payload["error"]["code"] == "skills_reload_unavailable"
+    assert "reference" in resp.payload["error"]["message"]
+    assert "gateway runner" not in resp.payload["error"]["message"].lower()
 
 
 @pytest.mark.asyncio
@@ -360,4 +474,7 @@ async def test_skills_reload_missing_session_db_returns_500(monkeypatch):
     resp = await adapter._handle_skills_reload(_FakeRequest())
 
     assert resp.status == 500
+    assert resp.payload["error"]["code"] == "skills_reload_unavailable"
+    assert "reference" in resp.payload["error"]["message"]
+    assert "session db" not in resp.payload["error"]["message"].lower()
     runner.invalidate_all_cached_agents.assert_not_called()

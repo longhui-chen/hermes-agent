@@ -29,6 +29,10 @@ def _reset_agent_creator_runtime(monkeypatch):
         "agent.credential_broker.request_agentcomputer_token",
         lambda agent_id: str(agent_id).removeprefix("test-broker:"),
     )
+    monkeypatch.setattr(
+        "agent.credential_broker.request_app_auto_refresh_token",
+        lambda agent_id: str(agent_id).removeprefix("test-broker:"),
+    )
     yield
     set_zettlab_turn_id(previous_turn_id)
     secret_scope.set_multiplex_active(previous_multiplex)
@@ -110,12 +114,121 @@ def _canonical_command(suffix: str) -> str:
     )
 
 
+def _write_application_app_agent_helper(tmp_path, body: str) -> os.PathLike:
+    script = (
+        tmp_path
+        / "presets"
+        / "skills"
+        / "application-create"
+        / "scripts"
+        / "create_agent.py"
+    )
+    script.parent.mkdir(parents=True)
+    preamble = """
+import os as _secret_os
+
+def _read_injected_secret(key):
+    descriptor = int(_secret_os.environ.pop(key + "_FD"))
+    with _secret_os.fdopen(descriptor, "rb", closefd=True) as stream:
+        return stream.read(4097).decode("utf-8")
+
+"""
+    script.write_text(
+        textwrap.dedent(preamble).lstrip() + textwrap.dedent(body).lstrip(),
+        encoding="utf-8",
+    )
+    (script.parent.parent / "manifest.yaml").write_text(
+        "id: application-create\n"
+        "optional_runtime_capabilities:\n"
+        "  - zettlab.agent_action_token_fd.v1\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def _application_app_agent_command(suffix: str) -> str:
+    return (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/application-create/'
+        f'scripts/create_agent.py" {suffix}'
+    )
+
+
 def _auto_approve_mutations(monkeypatch) -> None:
     monkeypatch.setattr(
         terminal_tool_module,
         "_request_agentcomputer_mutation_approval",
         lambda _parsed: None,
     )
+
+
+def test_application_helper_uses_optional_scoped_capability(
+    monkeypatch,
+    tmp_path,
+):
+    _write_application_app_agent_helper(
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({
+            "argv": sys.argv[1:],
+            "token": _read_injected_secret("ZETTLAB_AGENT_ACTION_TOKEN"),
+        }))
+        """,
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    _auto_approve_mutations(monkeypatch)
+    payload = json.dumps({
+        "app_slug": "prices",
+        "name": "Prices maintainer",
+        "soul_identity": "Maintain prices",
+        "cron_job": {
+            "name": "refresh",
+            "schedule": "0 8 * * *",
+            "prompt": "refresh prices",
+            "output_language": "zh-CN",
+        },
+    })
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(terminal_tool_module.terminal_tool(
+            _application_app_agent_command(
+                f"create-app-agent --payload {shlex.quote(payload)}"
+            ),
+            task_id="application-app-agent-helper",
+        ))
+
+    assert result["exit_code"] == 0
+    output = json.loads(result["output"])
+    assert output["argv"][:2] == ["create-app-agent", "--payload"]
+    assert output["token"] == "***"
+    assert "scope-token" not in result["output"]
+
+
+def test_application_helper_rejects_unrelated_creator_commands(
+    monkeypatch,
+    tmp_path,
+):
+    _write_application_app_agent_helper(tmp_path, "print('must not run')\n")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+
+    result = terminal_tool_module._parse_agent_creator_command(
+        _application_app_agent_command("preflight")
+    )
+
+    assert result is None
 
 
 def test_terminal_dispatch_runs_preflight_with_only_scoped_credentials(
@@ -499,9 +612,9 @@ def test_agentcomputer_mkdir_deferred_approval_replays_exactly_once(
     real_build_runtime_env = local_environment.build_agent_creator_runtime_env
     token_acquisitions = []
 
-    def tracked_build_runtime_env():
+    def tracked_build_runtime_env(**kwargs):
         token_acquisitions.append(True)
-        return real_build_runtime_env()
+        return real_build_runtime_env(**kwargs)
 
     monkeypatch.setattr(
         local_environment,
@@ -930,6 +1043,397 @@ def test_create_payload_limit_matches_agentcomputer_cli_contract():
     assert terminal_tool_module._validate_agent_creator_payload(at_limit) == at_limit
     with pytest.raises(ValueError, match="payload too large"):
         terminal_tool_module._validate_agent_creator_payload(too_large)
+
+
+# --- create-app-agent (POST /api/v1/skill/app-agents) -------------------------
+# Same pinned script, same manifest gate, same trust snapshot — only the
+# payload allowlist differs, keyed by the subcommand token that is ALSO
+# argv[1] of the executed script. The regression that matters most: the
+# ordinary create channel must keep rejecting the app-agent-only fields.
+
+_APP_AGENT_PAYLOAD = {
+    "app_slug": "stock-watch",
+    "name": "行情守望者",
+    "soul_identity": "为 stock-watch 应用抓取并写入行情数据",
+    "cron_job": {
+        "name": "refresh",
+        "schedule": "0 7 * * *",
+        "prompt": "抓取最新行情并调用应用的 /api/refresh 写入",
+        "output_language": "zh",
+        "timezone": "Asia/Shanghai",
+    },
+}
+
+
+def test_create_app_agent_payload_passes_over_stdin(monkeypatch, tmp_path):
+    _auto_approve_mutations(monkeypatch)
+    _configure(
+        monkeypatch,
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({
+            "argv": sys.argv[1:],
+            "payload": json.loads(sys.stdin.read()),
+            "token_ok": (
+                _read_injected_secret("ZETTLAB_AGENT_ACTION_TOKEN")
+                == "scope-token"
+            ),
+        }, ensure_ascii=False))
+        """,
+    )
+    command = (
+        _canonical_command("create-app-agent --payload -")
+        + " <<'JSON'\n"
+        + json.dumps(_APP_AGENT_PAYLOAD, ensure_ascii=False)
+        + "\nJSON"
+    )
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                command,
+                task_id="app-agent-create-flow",
+            )
+        )
+
+    assert result["agent_creator_direct"] is True
+    assert result["exit_code"] == 0
+    output = json.loads(result["output"])
+    assert output["argv"] == ["create-app-agent", "--payload", "-"]
+    assert output["payload"] == _APP_AGENT_PAYLOAD
+    assert output["token_ok"] is True
+
+
+def test_create_app_agent_inline_payload_is_canonicalized(monkeypatch, tmp_path):
+    _auto_approve_mutations(monkeypatch)
+    _configure(
+        monkeypatch,
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({"argv": sys.argv[1:]}, ensure_ascii=False))
+        """,
+    )
+    payload = json.dumps(_APP_AGENT_PAYLOAD, ensure_ascii=False)
+    command = _canonical_command(
+        f"create-app-agent --payload {shlex.quote(payload)}"
+    )
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module._run_agent_creator_command_if_allowed(
+                command,
+                cwd=str(tmp_path),
+                timeout=5,
+            )
+        )
+
+    assert result["exit_code"] == 0
+    argv = json.loads(result["output"])["argv"]
+    assert argv[:2] == ["create-app-agent", "--payload"]
+    assert json.loads(argv[2]) == _APP_AGENT_PAYLOAD
+
+
+def test_create_app_agent_capability_probe_reaches_the_script(
+    monkeypatch,
+    tmp_path,
+):
+    """The capability gate runs before anything is created: the skill sends
+    {"probe": true} over the same subcommand and reads the server's answer.
+    Without "probe" in the app-agent allowlist the whole command is blocked,
+    the skill sees only a generic guard error, and the feature silently never
+    starts."""
+    _configure(
+        monkeypatch,
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({
+            "argv": sys.argv[1:],
+            "payload": json.loads(sys.stdin.read()),
+        }, ensure_ascii=False))
+        """,
+    )
+    command = (
+        _canonical_command("create-app-agent --payload -")
+        + " <<'JSON'\n"
+        + json.dumps({"probe": True})
+        + "\nJSON"
+    )
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                command,
+                task_id="app-agent-capability-probe",
+            )
+        )
+
+    assert result["agent_creator_direct"] is True
+    assert result["exit_code"] == 0
+    output = json.loads(result["output"])
+    assert output["argv"] == ["create-app-agent", "--payload", "-"]
+    assert output["payload"] == {"probe": True}
+
+
+# Fields the ordinary create channel must never accept, with a value each.
+_APP_AGENT_ONLY_FIELDS = {
+    "app_slug": _APP_AGENT_PAYLOAD["app_slug"],
+    "cron_job": _APP_AGENT_PAYLOAD["cron_job"],
+    "probe": True,
+}
+
+
+@pytest.mark.parametrize("app_field", sorted(_APP_AGENT_ONLY_FIELDS))
+def test_plain_create_still_rejects_app_agent_fields(
+    monkeypatch,
+    tmp_path,
+    app_field,
+):
+    """The key regression guard: the app-agent allowlist is reachable ONLY
+    through the create-app-agent subcommand — the ordinary create channel
+    keeps its original boundary."""
+    _configure(monkeypatch, tmp_path, "print('must not run')\n")
+    payload = json.dumps({
+        "name": "x",
+        "soul_identity": "y",
+        app_field: _APP_AGENT_ONLY_FIELDS[app_field],
+    }, ensure_ascii=False)
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                _canonical_command(f"create --payload {shlex.quote(payload)}"),
+                task_id="plain-create-app-field-rejection",
+            )
+        )
+
+    assert result["agent_creator_blocked"] is True
+    assert result["errorCode"] == "agent_creator_command_blocked"
+    assert "must not run" not in result["output"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",
+        '{"app_slug":"a","name":"x","soul_identity":"y","enabled_toolsets":["agent_call"]}',
+        '{"app_slug":"a","name":"x","soul_identity":"y","token":"steal"}',
+    ],
+    ids=["non_object", "toolset_injection", "unknown_field"],
+)
+def test_create_app_agent_rejects_keys_outside_its_allowlist(
+    monkeypatch,
+    tmp_path,
+    payload,
+):
+    _configure(monkeypatch, tmp_path, "print('must not run')\n")
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                _canonical_command(
+                    f"create-app-agent --payload {shlex.quote(payload)}"
+                ),
+                task_id="app-agent-invalid-payload",
+            )
+        )
+
+    assert result["agent_creator_blocked"] is True
+    assert result["errorCode"] == "agent_creator_command_blocked"
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    [
+        "create-app-agent2",
+        "Create-App-Agent",
+        "createappagent",
+        "create_app_agent",
+        "create-app-agent ",
+    ],
+    ids=["suffix", "case", "no-dashes", "underscores", "trailing-space"],
+)
+def test_forged_subcommand_names_do_not_unlock_the_wide_allowlist(
+    monkeypatch,
+    tmp_path,
+    subcommand,
+):
+    """The allowlist is selected by exact match on the subcommand token that
+    is passed verbatim to the digest-verified script — near-miss spellings
+    must fall through to the shell guard, never to the wide allowlist."""
+    _configure(monkeypatch, tmp_path, "print('must not run')\n")
+    payload = json.dumps(_APP_AGENT_PAYLOAD, ensure_ascii=False)
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                _canonical_command(
+                    f"{shlex.quote(subcommand)} --payload {shlex.quote(payload)}"
+                ),
+                task_id="app-agent-forged-subcommand",
+            )
+        )
+
+    assert result["agent_creator_blocked"] is True
+    assert result["errorCode"] == "agent_creator_command_blocked"
+    assert "must not run" not in result["output"]
+
+
+def test_create_app_agent_requires_approval_bound_to_its_payload(
+    monkeypatch,
+    tmp_path,
+):
+    """Both creation paths require a one-shot decision on their exact bytes."""
+    _configure(
+        monkeypatch,
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({"argv": sys.argv[1:]}, ensure_ascii=False))
+        """,
+    )
+    approval_requests = []
+
+    def record_approval(_tool_name, _reason, **kwargs):
+        approval_requests.append(kwargs.get("rule_key", ""))
+        return {
+            "approved": False,
+            "status": "approval_required",
+            "approval_id": "create-approval-id",
+        }
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", record_approval)
+    plain_payload = '{"name":"x","soul_identity":"y"}'
+    app_payload = json.dumps(_APP_AGENT_PAYLOAD, ensure_ascii=False)
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        plain = json.loads(terminal_tool_module.terminal_tool(
+            _canonical_command(f"create --payload {shlex.quote(plain_payload)}"),
+            task_id="approval-scope-plain-create",
+        ))
+        app_agent = json.loads(terminal_tool_module.terminal_tool(
+            _canonical_command(
+                f"create-app-agent --payload {shlex.quote(app_payload)}"
+            ),
+            task_id="approval-scope-app-create",
+        ))
+
+    # Ordinary create: exactly one approval request, bound to agent.create,
+    # and the run is held pending.
+    assert plain["status"] == "pending_approval"
+    assert plain["approval_pending"] is True
+    assert len(approval_requests) == 2
+    assert approval_requests[0].startswith("agentcomputer:agent.create:")
+    # create-app-agent: a separate request bound to its app/schedule payload.
+    assert app_agent["status"] == "pending_approval"
+    assert app_agent["approval_pending"] is True
+    assert len(approval_requests) == 2
+    assert approval_requests[1].startswith("agentcomputer:agent.create:")
+    assert approval_requests[1] != approval_requests[0]
+
+
+def test_create_app_agent_capability_mismatch_blocks_before_secret(
+    monkeypatch,
+    tmp_path,
+):
+    """The manifest capability gate applies after the creation approval."""
+    _auto_approve_mutations(monkeypatch)
+    script = _configure(monkeypatch, tmp_path, "print('must not run')\n")
+    (script.parent.parent / "manifest.yaml").write_text(
+        "id: agent-creator\nruntime_capabilities: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "tools.environments.local.build_agent_creator_runtime_env",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("capability mismatch must not acquire a token")
+        ),
+    )
+    payload = json.dumps(_APP_AGENT_PAYLOAD, ensure_ascii=False)
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module._run_agent_creator_command_if_allowed(
+                _canonical_command(
+                    f"create-app-agent --payload {shlex.quote(payload)}"
+                ),
+                cwd=str(tmp_path),
+                timeout=5,
+            )
+        )
+
+    assert result["agent_creator_blocked"] is True
+    assert result["errorCode"] == "agent_creator_runtime_capability_unavailable"
+    assert "must not run" not in json.dumps(result)
+
+
+def test_create_app_agent_script_digest_mismatch_blocks(monkeypatch, tmp_path):
+    """The startup trust snapshot digest still gates the new subcommand: a
+    script rewritten after the snapshot must not run, even though its path
+    and inode identity are unchanged. No approval stub — the approval-exempt
+    path still walks every trust gate."""
+    _auto_approve_mutations(monkeypatch)
+    script = _configure(monkeypatch, tmp_path, "print('snapshot version')\n")
+    terminal_tool_module._capture_connector_runtime_root()
+    with open(script, "w", encoding="utf-8") as handle:
+        handle.write("print('tampered version')\n")
+    payload = json.dumps(_APP_AGENT_PAYLOAD, ensure_ascii=False)
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module._run_agent_creator_command_if_allowed(
+                _canonical_command(
+                    f"create-app-agent --payload {shlex.quote(payload)}"
+                ),
+                cwd=str(tmp_path),
+                timeout=5,
+            )
+        )
+
+    assert result["agent_creator_blocked"] is True
+    assert result["errorCode"] == "agent_creator_identity_changed"
+    assert "tampered version" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # --payload - without a heredoc body
+        'create-app-agent --payload -',
+        # extra trailing argument
+        'create-app-agent --payload {} --force',
+        # missing payload entirely
+        'create-app-agent',
+    ],
+    ids=["empty_stdin", "extra_arg", "no_payload"],
+)
+def test_create_app_agent_rejects_unsupported_shapes(
+    monkeypatch,
+    tmp_path,
+    command,
+):
+    _configure(monkeypatch, tmp_path, "print('must not run')\n")
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                _canonical_command(command),
+                task_id="app-agent-shape-rejection",
+            )
+        )
+
+    assert result["agent_creator_blocked"] is True
+    assert result["errorCode"] == "agent_creator_command_blocked"
 
 
 @pytest.mark.parametrize(

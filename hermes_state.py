@@ -194,6 +194,9 @@ def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
     )
 
 
+_AGENT_DELETE_BATCH = 200  # 远低于 SQLite 默认变量上限 999，并给 delegate 的 chunk+chunk 双倍留足余量。
+
+
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
@@ -214,30 +217,40 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     found: set[str] = set(seeds)
     frontier = list(seeds)
     while frontier:
-        ph = ",".join("?" * len(frontier))
-        cursor = conn.execute(
-            f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
-            f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
-            frontier + frontier,
-        )
-        frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
-        found.update(frontier)
+        nxt: list = []
+        # delegate 遍历也分批：frontier + frontier 两条 IN 会翻倍变量数，_AGENT_DELETE_BATCH 上限=2*_AGENT_DELETE_BATCH < 999。
+        for i in range(0, len(frontier), _AGENT_DELETE_BATCH):
+            chunk = frontier[i:i + _AGENT_DELETE_BATCH]
+            ph = ",".join("?" * len(chunk))
+            cursor = conn.execute(
+                f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
+                f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
+                chunk + chunk,
+            )
+            for row in cursor:
+                sid = row["id"]
+                if sid not in found:
+                    found.add(sid)
+                    nxt.append(sid)
+        frontier = nxt
     # Return only the discovered children — never the parents themselves.
     return [sid for sid in found if sid not in seeds]
 
 
 def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
     ids = _collect_delegate_child_ids(conn, parent_ids)
-    if ids:
-        ph = ",".join("?" * len(ids))
-        conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
+    # delegate cascade 的最终删除也分批：单根大量 delegate 时 ids 可能超 SQLite 变量上限（Codex P1）。
+    for i in range(0, len(ids), _AGENT_DELETE_BATCH):
+        chunk = ids[i:i + _AGENT_DELETE_BATCH]
+        ph = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
         # FK safety: orphan any untagged stragglers pointing at a doomed row.
         conn.execute(
             f"UPDATE sessions SET parent_session_id = NULL "
             f"WHERE parent_session_id IN ({ph})",
-            ids,
+            chunk,
         )
-        conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
+        conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
     return ids
 
 T = TypeVar("T")
@@ -3089,6 +3102,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def migrate_session_owner_from_account(
+        self,
+        session_id: str,
+        expected_account_id: str,
+        owner_principal: str,
+    ) -> bool:
+        """Atomically upgrade one proven legacy Zet session owner.
+
+        The caller must have received both identities from the authenticated
+        Zet boundary.  This deliberately cannot infer ownership for NULL rows
+        or for a session belonging to another account.
+        """
+        if not session_id or not expected_account_id or not owner_principal:
+            return False
+
+        def _do(conn):
+            result = conn.execute(
+                "UPDATE sessions SET user_id = ? WHERE id = ? AND user_id = ?",
+                (owner_principal, session_id, expected_account_id),
+            )
+            return result.rowcount == 1
+
+        return bool(self._execute_write(_do))
 
     def record_gateway_session_peer(
         self,
@@ -7136,7 +7173,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _completed_runtime_import_target_matches(conn, row) -> bool:
         target = conn.execute(
-            "SELECT model_config FROM sessions WHERE id = ?",
+            "SELECT model_config, user_id FROM sessions WHERE id = ?",
             (row["target_session_id"],),
         ).fetchone()
         if target is None:
@@ -7153,6 +7190,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return (
             metadata.get("import_id") == row["import_id"]
             and metadata.get("payload_sha256") == row["payload_sha256"]
+            and metadata.get("owner_principal", "") == row["owner_principal"]
+            and (target["user_id"] or "") == row["owner_principal"]
         )
 
     def discard_runtime_import_staging(self) -> int:
@@ -7163,6 +7202,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).rowcount
         )
 
+    def get_completed_transcript_import_snapshot(
+        self, import_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the frozen CLI source selection or completed receipt."""
+        _validate_runtime_import_identifier("import_id", import_id)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT status, expected_message_count, source_message_ids_json, "
+                "source_total_rows FROM runtime_imports WHERE import_id = ?",
+                (import_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        source_message_ids = None
+        if row["source_message_ids_json"]:
+            parsed = json.loads(row["source_message_ids_json"])
+            if not isinstance(parsed, list) or not all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in parsed
+            ):
+                raise RuntimeImportConflict("stored source snapshot is invalid")
+            source_message_ids = parsed
+        return {
+            "status": row["status"],
+            "expected_message_count": row["expected_message_count"],
+            "source_message_ids": source_message_ids,
+            "source_total_rows": row["source_total_rows"],
+        }
+
     def stage_completed_transcript_import(
         self,
         *,
@@ -7170,11 +7238,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         source: str,
         source_session_id: str,
         target_session_id: str,
+        owner_principal: str = "",
         title: Optional[str],
         payload_sha256: str,
         expected_message_count: int,
         chunk_index: int,
         messages: List[Dict[str, Any]],
+        source_message_ids: Optional[List[int]] = None,
+        source_total_rows: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Stage one bounded chunk without mutating the canonical transcript.
 
@@ -7183,6 +7254,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         have different canonical encodings. ``commit`` returns a separate
         server-computed ``normalized_sha256`` for the Hermes-normalized rows.
         """
+        owner_principal = str(owner_principal or "").strip()
         for field, value in (("import_id", import_id), ("source", source),
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
@@ -7192,6 +7264,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
             reject_portable_credentials(value, field=field)
+        if owner_principal:
+            _validate_runtime_import_identifier("owner_principal", owner_principal, max_length=256)
         if title is not None and not isinstance(title, str):
             raise ValueError("title must be text when provided")
         title = self.sanitize_title(title)
@@ -7205,6 +7279,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(
                 f"expected_message_count must be 1..{RUNTIME_IMPORT_MAX_MESSAGES}"
             )
+        source_message_ids_json = None
+        if source_message_ids is not None:
+            if (
+                not isinstance(source_message_ids, list)
+                or len(source_message_ids) != expected_message_count
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in source_message_ids
+                )
+                or len(set(source_message_ids)) != len(source_message_ids)
+            ):
+                raise ValueError(
+                    "source_message_ids must contain one unique positive integer "
+                    "per expected message"
+                )
+            source_message_ids_json = json.dumps(
+                source_message_ids, separators=(",", ":")
+            )
+        if source_total_rows is not None and (
+            not isinstance(source_total_rows, int)
+            or isinstance(source_total_rows, bool)
+            or source_total_rows < expected_message_count
+        ):
+            raise ValueError("source_total_rows must cover every expected message")
         if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
             raise ValueError("chunk_index must be a non-negative integer")
         normalized = self._normalize_import_messages(messages)
@@ -7225,8 +7323,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = conn.execute(
                 "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
             ).fetchone()
-            metadata = (source, source_session_id, target_session_id,
-                        payload_sha256.lower(), expected_message_count)
+            metadata = (source, source_session_id, target_session_id, owner_principal,
+                        payload_sha256.lower(), expected_message_count,
+                        source_message_ids_json, source_total_rows)
             if row is None:
                 if chunk_index != 0:
                     raise RuntimeImportConflict("first chunk_index must be 0")
@@ -7245,11 +7344,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                 conn.execute(
                     """INSERT INTO runtime_imports
-                       (import_id, source, source_session_id, target_session_id, title,
-                        payload_sha256, expected_message_count, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (import_id, source, source_session_id, target_session_id, title,
-                     payload_sha256.lower(), expected_message_count, now, now),
+                       (import_id, source, source_session_id, target_session_id, owner_principal, title,
+                        payload_sha256, expected_message_count, source_message_ids_json,
+                        source_total_rows, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (import_id, source, source_session_id, target_session_id, owner_principal, title,
+                     payload_sha256.lower(), expected_message_count,
+                     source_message_ids_json, source_total_rows, now, now),
                 )
                 row = conn.execute(
                     "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
@@ -7267,6 +7368,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["source"] == source
                     and source_session_matches
                     and row["target_session_id"] == target_session_id
+                    and row["owner_principal"] == owner_principal
                     and row["payload_sha256"] == payload_sha256.lower()
                     and row["expected_message_count"] == expected_message_count
                 )
@@ -7290,7 +7392,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeImportConflict("target_session_id already exists")
             if tuple(row[k] for k in (
                 "source", "source_session_id", "target_session_id",
-                "payload_sha256", "expected_message_count"
+                "owner_principal",
+                "payload_sha256", "expected_message_count",
+                "source_message_ids_json", "source_total_rows"
             )) != metadata:
                 raise RuntimeImportConflict("import_id is already bound to different metadata")
             existing = conn.execute(
@@ -7403,15 +7507,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         row["source_session_id"]
                     ),
                     "payload_sha256": row["payload_sha256"],
+                    "owner_principal": row["owner_principal"],
                 }
             })
             conn.execute(
                 """INSERT INTO sessions
-                   (id, source, model_config, started_at, ended_at, end_reason, title)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (id, source, model_config, started_at, ended_at, end_reason, title, user_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (row["target_session_id"], f"import:{row['source']}",
                  model_config, started_at, completed_at,
-                 "import_completed", title),
+                 "import_completed", title, row["owner_principal"] or None),
             )
             # Hash the exact normalized message sequence that becomes canonical
             # state. Staging-only source IDs and transport chunk boundaries must
@@ -7451,6 +7556,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """UPDATE runtime_imports SET status = 'completed',
                    normalized_sha256 = ?, source_session_id = ?, title = NULL,
+                   source_message_ids_json = NULL,
                    completed_at = ?, updated_at = ?
                    WHERE import_id = ?""",
                 (normalized_sha,
@@ -8834,6 +8940,87 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(existing)
             return len(existing)
+
+        count = self._execute_write(_do)
+        for sid in removed_delegate_ids:
+            self._remove_session_files(sessions_dir, sid)
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return count
+
+    def delete_sessions_for_agent(self, agent_id: str, sessions_dir: Optional[Path] = None) -> int:
+        """Delete every session belonging to *agent_id* (roots + descendants) atomically.
+
+        The descendant walk and the delete run in ONE write transaction, so a
+        compression that lands a new continuation mid-delete cannot be orphaned
+        (Codex P1 on TB-20260814-012). Roots are zettlab:<user>:<agent>:<rand>
+        rows matching parts[2] == agent_id. Descendants are walked recursively
+        along parent_session_id: a zettlab: descendant whose agent segment
+        differs is skipped (a fork can hang another agent's session under a
+        source session); a timestamp-hex continuation carries no independent
+        owner and inherits the root's ownership.
+        """
+        removed_ids: list = []
+        removed_delegate_ids: list = []
+
+        def _do(conn):
+            roots: list = []
+            # GLOB 是大小写敏感的（LIKE 默认不敏感，会误选 ZETTLAB: 前缀的非 Zettlab 会话）；
+            # 惰性迭代 cursor，不 fetchall 全库。
+            cursor = conn.execute("SELECT id FROM sessions WHERE id GLOB 'zettlab:*'")
+            for row in cursor:
+                sid = row["id"]
+                if not sid.startswith("zettlab:"):
+                    continue
+                parts = sid.split(":")
+                if len(parts) >= 4 and parts[2] == agent_id:
+                    roots.append(sid)
+            if not roots:
+                return 0
+
+            found = set(roots)
+            frontier = list(roots)
+            while frontier:
+                nxt = []
+                # lineage 遍历也分批：单层 frontier 仍可能超 SQLite 变量上限（Codex P1）。
+                for i in range(0, len(frontier), _AGENT_DELETE_BATCH):
+                    chunk = frontier[i:i + _AGENT_DELETE_BATCH]
+                    ph = ",".join("?" * len(chunk))
+                    cur = conn.execute(
+                        f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
+                        chunk,
+                    )
+                    for row in cur:
+                        sid = row["id"]
+                        if sid in found:
+                            continue
+                        if sid.startswith("zettlab:"):
+                            p = sid.split(":")
+                            if len(p) < 4 or p[2] != agent_id:
+                                continue
+                        found.add(sid)
+                        nxt.append(sid)
+                frontier = nxt
+
+            all_ids = list(found)
+            # 一次收集全部 delegate 后代（避免对无索引 _delegate_from 每批重复全表扫描），
+            # 再统一分批删除 delegate + 主 lineage，避免单条 IN 超 SQLite 变量上限（Codex P1）。
+            delegate_ids = _collect_delegate_child_ids(conn, all_ids)
+            removed_delegate_ids.extend(delegate_ids)
+            for ids in (delegate_ids, all_ids):
+                for i in range(0, len(ids), _AGENT_DELETE_BATCH):
+                    chunk = ids[i:i + _AGENT_DELETE_BATCH]
+                    ph = ",".join("?" * len(chunk))
+                    conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
+                    conn.execute(
+                        f"UPDATE sessions SET parent_session_id = NULL "
+                        f"WHERE parent_session_id IN ({ph})",
+                        chunk,
+                    )
+                    conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
+            self._delete_unreferenced_system_prompts(conn)
+            removed_ids.extend(all_ids)
+            return len(all_ids)
 
         count = self._execute_write(_do)
         for sid in removed_delegate_ids:

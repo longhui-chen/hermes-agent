@@ -513,12 +513,55 @@ class TestGetJob:
                 assert data["job"] == SAMPLE_JOB
                 mock_get.assert_called_once_with(VALID_JOB_ID)
 
+    @pytest.mark.asyncio
+    async def test_get_job_returns_server_owned_revision(self, adapter):
+        app = _create_app(adapter)
+        job = {**SAMPLE_JOB, "revision": 4}
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_get", return_value=job):
+                response = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
+        assert response.status == 200
+        assert (await response.json())["job"]["revision"] == 4
+
 
 # ---------------------------------------------------------------------------
 # 11-12. test_update_job
 # ---------------------------------------------------------------------------
 
 class TestUpdateJob:
+
+    @pytest.mark.asyncio
+    async def test_update_passes_expected_revision_to_job_store(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value={**SAMPLE_JOB, "revision": 5})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_update", mock_update):
+                response = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"schedule": "0 9 * * *", "enabled": True, "expected_revision": 4},
+                )
+        assert response.status == 200
+        assert mock_update.call_args.args[1]["expected_revision"] == 4
+        assert (await response.json())["job"]["revision"] == 5
+
+    @pytest.mark.asyncio
+    async def test_update_revision_conflict_returns_409_without_success_notification(self, adapter):
+        from cron.jobs import JobRevisionConflict
+
+        app = _create_app(adapter)
+        notify = MagicMock()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", side_effect=JobRevisionConflict("job revision changed")
+            ), patch(f"{_MOD}._notify_cron_provider_jobs_changed", notify):
+                response = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}", json={"enabled": False, "expected_revision": 0},
+                )
+        assert response.status == 409
+        payload = await response.json()
+        assert payload["code"] == "revision_conflict"
+        notify.assert_not_called()
+
 
     @pytest.mark.asyncio
     async def test_update_introducing_linear_requires_live_chat_grant(self, adapter):
@@ -653,6 +696,21 @@ class TestDeleteJob:
                 data = await resp.json()
                 assert data["ok"] is True
                 mock_remove.assert_called_once_with(VALID_JOB_ID)
+
+    @pytest.mark.asyncio
+    async def test_delete_revision_conflict_returns_409_without_notification(self, adapter):
+        from cron.jobs import JobRevisionConflict
+
+        app = _create_app(adapter)
+        notify = MagicMock()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_remove", side_effect=JobRevisionConflict("job revision changed")
+            ), patch(f"{_MOD}._notify_cron_provider_jobs_changed", notify):
+                response = await cli.delete(f"/api/jobs/{VALID_JOB_ID}?expected_revision=3")
+                assert response.status == 409
+                assert (await response.json())["code"] == "revision_conflict"
+                notify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -887,5 +945,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-
-

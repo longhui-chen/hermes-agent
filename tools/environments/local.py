@@ -91,7 +91,15 @@ def _validate_managed_root_directory_chain(directory: Path) -> Path:
             or info.st_uid != 0
             or info.st_mode & 0o022
         ):
-            raise OSError("managed profile directory chain is not trusted")
+            # 把「是哪一级、坏在哪」写进异常。只说 chain is not trusted 时,现场
+            # 完全看不出该修谁:08-14 板 .212 上是 <profile>/home 被 zls 的 lark-cli
+            # broker chown 成了沙箱 uid,导致该 agent 每条 terminal 命令全灭,
+            # 而板上的智能体自己把原因归到了「技能目录」,方向整个跑偏。
+            raise OSError(
+                "managed profile directory chain is not trusted: "
+                f"{component} (uid={info.st_uid} mode={stat.S_IMODE(info.st_mode):o}), "
+                f"每一级都必须 uid=0 且 group/other 不可写"
+            )
     return resolved
 
 
@@ -484,6 +492,299 @@ def _prepare_managed_execute_code_workspace(
     return uid
 
 
+def _managed_terminal_profile_tag(env: Mapping[str, str] | None) -> str:
+    """返回受管终端 HOME 的稳定 profile 后缀。"""
+
+    profile_id = Path(_managed_terminal_profile_scope(env)).name
+    if not profile_id or profile_id in {".", ".."}:
+        raise OSError("managed terminal profile identity is unavailable")
+    return f"-{profile_id}"
+
+
+def _ensure_credential_dir(root: Path, relative: Path) -> Path:
+    """在可信根内无跟随地建出 root:root 0700 凭据目录。
+
+    受管终端**不降权**:_managed_terminal_identity 的 docstring 写明那个 uid 只是
+    「profile resource ID」,命令仍以 service UID(root)执行;本模块里也确实没有任何
+    setuid/setresuid/preexec_fn。所以凭据目录归 root:root 0700,与克隆进程建出来的
+    既有目录一致(2026-08-13 板 .212 实测 <profile>/home 及其下全是 root:root 700)。
+    """
+
+    root_info = os.lstat(root)
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise OSError("managed terminal lark-cli credential root is not trusted")
+
+    if _IS_WINDOWS:
+        trusted_root = root.resolve(strict=True)
+        current = root
+        for component in relative.parts:
+            current /= component
+            created = False
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                os.mkdir(current, 0o700)
+                created = True
+                info = os.lstat(current)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential source is not trusted"
+                )
+            if created:
+                os.chmod(current, 0o700)
+            if not current.resolve(strict=True).is_relative_to(trusted_root):
+                raise OSError(
+                    "managed terminal lark-cli credential source is not trusted"
+                )
+        return current
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(root, directory_flags)
+    opened_root = os.fstat(directory_fd)
+    if (
+        opened_root.st_dev != root_info.st_dev
+        or opened_root.st_ino != root_info.st_ino
+        or not stat.S_ISDIR(opened_root.st_mode)
+    ):
+        os.close(directory_fd)
+        raise OSError("managed terminal lark-cli credential root changed")
+
+    try:
+        for component in relative.parts:
+            created = False
+            try:
+                os.mkdir(component, 0o700, dir_fd=directory_fd)
+                created = True
+            except FileExistsError:
+                pass
+            info = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential source is not trusted"
+                )
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            opened = os.fstat(child_fd)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or not stat.S_ISDIR(opened.st_mode)
+            ):
+                os.close(child_fd)
+                raise OSError(
+                    "managed terminal lark-cli credential source changed"
+                )
+            if created:
+                os.fchmod(child_fd, 0o700)
+            os.close(directory_fd)
+            directory_fd = child_fd
+    finally:
+        os.close(directory_fd)
+
+    path = root / relative
+    if not path.resolve(strict=True).is_relative_to(root.resolve(strict=True)):
+        raise OSError("managed terminal lark-cli credential source is not trusted")
+    return path
+
+
+def _retire_occupied_credential_path(
+    destination: Path,
+    *,
+    parent_fd: int | None = None,
+) -> None:
+    """把挡住软链的实体挪开,而不是抛错把整台设备卡死。
+
+    受管 HOME 里出现真目录/真文件是常态,不是异常:软链只在本函数里建,而在它建成
+    之前跑过的任何一条命令(lark-cli 自己首当其冲)都会按 $HOME 直接创建
+    `~/.lark-cli`。一旦如此,后续每一轮都撞 rmdir 失败——原来这里直接抛
+    OSError,结果是**这台设备上所有 agent 的任何 lark-cli 相关脚本全部失败**,
+    而报错只有一句「credential directory is occupied」,既不说路径也不说怎么办。
+    2026-08-13 板 .212 实测:用户被卡在 onboarding 授权步,智能体只能回一句
+    「配置暂未推进」;同一坑 08-06 已经撞过一次、手工绕过没根治。
+
+    受管 HOME 是本模块自己造的、每 profile 独立的目录(见
+    _managed_terminal_home_path 的属主/权限校验),里面的残留没有保留价值,
+    但仍然改名留痕而不是删除——凭据类目录不该被静默销毁。
+    """
+
+    retired = destination.with_name(
+        f"{destination.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}"
+    )
+
+    def _exists(name: str) -> bool:
+        if parent_fd is None:
+            candidate = destination.with_name(name)
+            return candidate.exists() or candidate.is_symlink()
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+    suffix = 1
+    while _exists(retired.name):
+        retired = destination.with_name(
+            f"{destination.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}-{suffix}"
+        )
+        suffix += 1
+    try:
+        if parent_fd is None:
+            destination.rename(retired)
+        else:
+            os.rename(
+                destination.name,
+                retired.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+    except OSError as exc:
+        raise OSError(
+            "managed terminal lark-cli credential path is occupied and could not "
+            f"be moved aside: {destination}"
+        ) from exc
+
+
+def _open_managed_credential_parent(home: Path, relative: Path) -> int | None:
+    """Open/create ``relative.parent`` without following links outside HOME."""
+
+    home_info = os.lstat(home)
+    if not stat.S_ISDIR(home_info.st_mode) or stat.S_ISLNK(home_info.st_mode):
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+
+    if _IS_WINDOWS:
+        # Managed terminal execution is Linux-only. Keep local Windows tests and
+        # development usable while still rejecting an already-linked parent.
+        trusted_home = home.resolve(strict=True)
+        parent = home
+        for component in relative.parent.parts:
+            parent /= component
+            try:
+                info = os.lstat(parent)
+            except FileNotFoundError:
+                parent.mkdir()
+                info = os.lstat(parent)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential parent is not trusted"
+                )
+            if not parent.resolve(strict=True).is_relative_to(trusted_home):
+                raise OSError(
+                    "managed terminal lark-cli credential parent is not trusted"
+                )
+        return None
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(home, directory_flags)
+    opened_home = os.fstat(directory_fd)
+    if (
+        opened_home.st_dev != home_info.st_dev
+        or opened_home.st_ino != home_info.st_ino
+        or not stat.S_ISDIR(opened_home.st_mode)
+    ):
+        os.close(directory_fd)
+        raise OSError("managed terminal lark-cli credential home changed")
+
+    try:
+        for component in relative.parent.parts:
+            try:
+                os.mkdir(component, 0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            info = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(
+                    "managed terminal lark-cli credential parent is not trusted"
+                )
+            child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            opened = os.fstat(child_fd)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or not stat.S_ISDIR(opened.st_mode)
+            ):
+                os.close(child_fd)
+                raise OSError(
+                    "managed terminal lark-cli credential parent changed"
+                )
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _link_profile_lark_cli_credentials(
+    home: Path,
+    env: Mapping[str, str] | None,
+    profile_tag: str,
+) -> None:
+    """把当前 profile 的 lark-cli 凭据目录软链到受管 HOME。"""
+
+    if not profile_tag:
+        return
+    profile_root = Path(_managed_terminal_profile_scope(env))
+    # 先验 profile 根再决定要不要在它下面建东西:顺序反过来等于往未校验的路径里写。
+    trusted_profile_root = _validate_managed_root_directory_chain(profile_root)
+    source_home = trusted_profile_root / "home"
+    try:
+        source_info = os.lstat(source_home)
+    except FileNotFoundError:
+        # 源还没有就建出来再链,**不能掉头就走**。早退意味着这一轮沙箱里没有软链,
+        # 而沙箱在 /run(tmpfs):这一轮 lark-cli 写下的凭据落进 tmpfs,重启即失,
+        # 且把 ~/.lark-cli 变成真目录挡住下一轮的软链。用户体感是「我明明授权了,
+        # 它却说没授权」——2026-08-13 板 .212 整晚都困在这个循环里。
+        # 触发窗口:克隆刚建好 profile、home 还没写完,第一条命令就跑起来了。
+        _ensure_credential_dir(trusted_profile_root, Path("home"))
+        source_info = os.lstat(source_home)
+    if not stat.S_ISDIR(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+    trusted_source_home = _validate_managed_root_directory_chain(source_home)
+    if trusted_source_home.parent != trusted_profile_root:
+        raise OSError("managed terminal lark-cli credential home is not trusted")
+    for relative in (Path(".lark-cli"), Path(".local") / "share" / "lark-cli"):
+        # 缺哪个补哪个,保证沙箱里从第一秒起就是软链；每级都通过目录 FD 创建并
+        # 校验，已有 symlink 会在触碰其目标前被拒绝。
+        source = _ensure_credential_dir(trusted_source_home, relative)
+        destination = home / relative
+        parent_fd = _open_managed_credential_parent(home, relative)
+        try:
+            if parent_fd is None:
+                if destination.is_symlink():
+                    if destination.resolve() == source.resolve():
+                        continue
+                    destination.unlink()
+                elif destination.exists():
+                    _retire_occupied_credential_path(destination)
+                os.symlink(source, destination)
+                continue
+
+            try:
+                destination_info = os.stat(
+                    destination.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                destination_info = None
+            if destination_info is not None:
+                if stat.S_ISLNK(destination_info.st_mode):
+                    target = os.readlink(destination.name, dir_fd=parent_fd)
+                    if target == str(source):
+                        continue
+                    os.unlink(destination.name, dir_fd=parent_fd)
+                else:
+                    _retire_occupied_credential_path(
+                        destination,
+                        parent_fd=parent_fd,
+                    )
+            os.symlink(source, destination.name, dir_fd=parent_fd)
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+
+
 def _managed_terminal_home_path(
     env: Mapping[str, str] | None,
 ) -> Path:
@@ -513,7 +814,8 @@ def _managed_terminal_home_path(
         raise OSError("managed terminal home root is not trusted")
     os.chmod(_MANAGED_TERMINAL_HOME_ROOT, 0o711)
 
-    home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+    profile_tag = _managed_terminal_profile_tag(env)
+    home = _MANAGED_TERMINAL_HOME_ROOT / f"{uid}{profile_tag}"
     created = False
     try:
         os.mkdir(home, 0o700)
@@ -531,6 +833,7 @@ def _managed_terminal_home_path(
         or home_info.st_mode & 0o077
     ):
         raise OSError("managed terminal profile home is not trusted")
+    _link_profile_lark_cli_credentials(home, env, profile_tag)
 
     return home
 
@@ -673,13 +976,19 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
 
         killed = _terminate_managed_uid(uid)
         cgroup_removed = _remove_managed_terminal_cgroup(uid)
-        home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+        profile_tag = _managed_terminal_profile_tag(
+            {"HERMES_HOME": profile_home}
+        )
+        homes = (
+            _MANAGED_TERMINAL_HOME_ROOT / f"{uid}{profile_tag}",
+            _MANAGED_TERMINAL_HOME_ROOT / str(uid),
+        )
         removed = False
-        try:
-            info = os.lstat(home)
-        except FileNotFoundError:
-            pass
-        else:
+        for home in homes:
+            try:
+                info = os.lstat(home)
+            except FileNotFoundError:
+                continue
             if (
                 not stat.S_ISDIR(info.st_mode)
                 or info.st_uid != uid
@@ -1329,7 +1638,6 @@ def _managed_terminal_cwd(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return cwd
     home = _prepare_managed_terminal_home(env)
-    _wire_lark_cli_relay(env)
     try:
         _prepare_managed_profile_runtime(env)
     except OSError as exc:
@@ -1716,15 +2024,39 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
 
 def _inject_context_hermes_home(env: dict) -> None:
-    """Bridge the context-local Hermes home override into subprocess env."""
-    try:
-        from hermes_constants import get_hermes_home_override
+    """把 context-local 的 profile-scoped 环境桥接进子进程环境。
 
-        value = get_hermes_home_override()
-        if value:
-            env["HERMES_HOME"] = value
-    except Exception:
-        pass
+    ⚠️ 这里**曾经**是一个 ``except Exception: pass``。它把三件性质完全不同的事
+    压成了同一个"静默通过",其中最毒的一件是:连 ``from hermes_constants import``
+    的 ImportError 也一起吞掉 ⇒ 打包/部署一出问题,这个 pin **永久静默失效、全路径、
+    全时间**,而日志上一切正常。那不是降级,那是"保护装置整个不存在,却没人知道"。
+
+    ⇒ 三个分支必须分开处置,⛔ 不许再合并成一个 catch:
+
+    ① **没有 pin**(override 为空)⇒ 静默 no-op、**不记日志**。
+       这是绝大多数正常路径(单 profile),记日志只会刷屏,把真信号淹掉。
+
+    ② **机制本身不可用**(ImportError / 符号缺失)⇒ **响亮地失败**。
+       这是部署错误,不是运行时条件。悄悄跑下去 = 带着一个并不存在的安全边界在服务。
+
+    ③ **有 pin,但取用时抛异常** ⇒ **fail closed**,让异常上抛、子进程不要起。
+       "明知该指向 A 却指向了 B 的凭据库"比"这次操作失败"严重得多:各 profile 绑的是
+       **不同的真人身份**,指错=一个 agent 拿别人的身份去操作。
+       ⭐ 爆炸半径很窄:只有 pin 存在(多 profile 会话)才可能触发,单 profile 走 ①。
+    """
+    try:
+        from hermes_constants import apply_context_profile_scoped_env
+    except ImportError:
+        # ② 机制不可用:先留下能定位的日志,再上抛 —— ⛔ 不许静默继续。
+        logger.error(
+            "profile pin unavailable: cannot import apply_context_profile_scoped_env; "
+            "a child process may be pointed at another profile's credential store",
+            exc_info=True,
+        )
+        raise
+
+    # ③ 取 pin 若抛异常,**不接住** —— fail closed 好过指向别人的凭据库。
+    apply_context_profile_scoped_env(env)
 
 
 def _inject_session_context_env(env: dict) -> None:
@@ -1809,10 +2141,10 @@ MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
 })
 PROFILE_PUBLIC_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    # Platform-owned, profile-scoped filesystem capability. Unlike connector
-    # and action tokens this value is safe for model-authored shell commands,
-    # and skills use it as the conventional location for mutable state.
+    # 平台拥有的、按 profile 隔离的路径能力。它们不是 bearer token，终端和
+    # skills 需要随当前 profile 重注入，绝不能从上一个 shell snapshot 继承。
     "ZET_AGENT_OUTPUT_DIR",
+    "WECOM_CLI_CONFIG_DIR",
 })
 _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
 _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
@@ -1840,6 +2172,21 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
     """
     for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
         env.pop(key, None)
+
+    # WECOM_CLI_CONFIG_DIR 不是 profile .env 里的 bearer 值，而是已经由
+    # _inject_context_hermes_home 钉住的当前 HERMES_HOME 派生出的路径。无论
+    # 前台、背景还是 PTY spawn，都必须先丢掉 snapshot 的旧值再从当前 profile
+    # 重建；没有当前 profile 时宁可不注入，不能复用别人的凭据目录。
+    try:
+        from hermes_constants import apply_context_profile_scoped_env
+    except ImportError:
+        logger.error(
+            "profile-scoped WECOM_CLI_CONFIG_DIR injection is unavailable",
+            exc_info=True,
+        )
+        raise
+    apply_context_profile_scoped_env(env)
+
     if not inject:
         return
 
@@ -1852,7 +2199,7 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
         scope = None
         multiplex_active = True
 
-    for key in PROFILE_PUBLIC_RUNTIME_ENV_KEYS:
+    for key in PROFILE_PUBLIC_RUNTIME_ENV_KEYS - {"WECOM_CLI_CONFIG_DIR"}:
         if scope is not None:
             raw_value = scope.get(key)
         elif not multiplex_active:
@@ -1914,7 +2261,7 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     return env
 
 
-def build_agent_creator_runtime_env() -> dict[str, str]:
+def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[str, str]:
     """Build the minimal env for the trusted agent-creator preset runner.
 
     The action token is never read from process env or a profile ``.env``.
@@ -1923,7 +2270,10 @@ def build_agent_creator_runtime_env() -> dict[str, str]:
     broker. The direct runner then gives it to the CLI over a one-shot FD.
     """
 
-    from agent.credential_broker import request_agentcomputer_token
+    from agent.credential_broker import (
+        request_agentcomputer_token,
+        request_app_auto_refresh_token,
+    )
     from agent.secret_scope import current_secret_scope, is_multiplex_active
 
     scope = current_secret_scope()
@@ -1935,7 +2285,12 @@ def build_agent_creator_runtime_env() -> dict[str, str]:
     ).strip()
     if not agent_id:
         raise RuntimeError("agent creator profile identity unavailable")
-    token = request_agentcomputer_token(agent_id)
+    request_token = (
+        request_app_auto_refresh_token
+        if app_auto_refresh
+        else request_agentcomputer_token
+    )
+    token = request_token(agent_id)
     if (
         "\x00" in token
         or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
@@ -3062,6 +3417,23 @@ class LocalEnvironment(BaseEnvironment):
         """
         exports = super()._snapshot_ephemeral_env_exports()
         public_env: dict[str, str] = {}
+        _inject_context_hermes_home(public_env)
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            multiplex_active = is_multiplex_active()
+        except ImportError:
+            logger.error(
+                "profile-scoped WECOM_CLI_CONFIG_DIR snapshot injection is unavailable",
+                exc_info=True,
+            )
+            raise
+        if "HERMES_HOME" not in public_env and not multiplex_active:
+            profile_home = str(self.env.get("HERMES_HOME") or "").strip()
+            if profile_home:
+                from hermes_constants import apply_profile_scoped_env
+
+                apply_profile_scoped_env(public_env, profile_home)
         _apply_profile_secret_scope_env(public_env, inject=True)
         for key in sorted(PROFILE_PUBLIC_RUNTIME_ENV_KEYS):
             value = public_env.get(key)

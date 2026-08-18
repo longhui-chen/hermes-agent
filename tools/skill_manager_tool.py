@@ -34,6 +34,7 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
 import contextvars as _ctxvars
@@ -987,13 +988,16 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
 
-    # SKILL.md is the canonical skill file and lives at the skill root, not
-    # under an allowed subdirectory. Accept its two natural spellings —
-    # 'SKILL.md' and '<skill-name>/SKILL.md' — so callers can target the main
-    # file. The traversal guard above still applies, so this can't escape.
+    # SKILL.md is the canonical skill file and lives only at the skill root.
+    # Discovery recursively indexes every file with this basename, so allowing
+    # e.g. references/SKILL.md or benign/SKILL.md would let a supporting-file
+    # write create an independently routed skill and bypass create/edit topic
+    # guards. The caller already supplies ``name`` separately; only the exact
+    # root-relative spelling is valid here.
     if normalized.parts and normalized.name == "SKILL.md":
-        if len(normalized.parts) == 1 or len(normalized.parts) == 2:
+        if len(normalized.parts) == 1:
             return None
+        return "Nested SKILL.md files are not allowed; edit the skill root SKILL.md instead."
 
     # Must be under an allowed subdirectory
     if not normalized.parts or normalized.parts[0] not in ALLOWED_SUBDIRS:
@@ -1034,6 +1038,103 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
         )
 
 
+def _reserved_topic_owner(name: str, content: str) -> Optional[Tuple[str, str]]:
+    """Return (owner_skill_name, topic) when a new skill lands on a reserved topic.
+
+    A skill declares the topics it owns under ``metadata.hermes.reserved_topics``.
+    Only skills that ship with the platform get to reserve anything: a reserved
+    topic in a skill the agent wrote itself would let it fence off ground from
+    the platform, which is backwards.
+
+    Name collision alone does not catch this. A device under observation grew
+    three skills on one topic in a single afternoon — ``public-market-dashboard-apps``,
+    ``public-data-dashboard-apps``, ``external-data-dashboard-apps`` — three
+    distinct names in three distinct categories, every one of them admitted by
+    the name check. Each carried its own end-to-end procedure for the same job,
+    and the one that happened to load decided the outcome.
+    """
+    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+
+    haystack_parts = [name.replace("-", " ").replace("_", " ")]
+    try:
+        frontmatter, _ = _parse_frontmatter(content)
+    except Exception:
+        frontmatter = {}
+    if isinstance(frontmatter, dict):
+        haystack_parts.append(str(frontmatter.get("description") or ""))
+        meta = frontmatter.get("metadata")
+        hermes_meta = meta.get("hermes") if isinstance(meta, dict) else None
+        if isinstance(hermes_meta, dict):
+            tags = hermes_meta.get("tags")
+            if isinstance(tags, list):
+                haystack_parts.extend(str(tag) for tag in tags)
+    haystack = " ".join(haystack_parts).lower()
+
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        # Reservations are only honoured from the read-only preset library.
+        # ``get_all_skills_dirs`` also yields the profile's own writable dir.
+        if not _is_platform_skills_dir(skills_dir):
+            continue
+        for skill_md in skills_dir.rglob("SKILL.md"):
+            if is_excluded_skill_path(skill_md):
+                continue
+            try:
+                owner_fm, _ = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(owner_fm, dict):
+                continue
+            meta = owner_fm.get("metadata")
+            hermes_meta = meta.get("hermes") if isinstance(meta, dict) else None
+            if not isinstance(hermes_meta, dict):
+                continue
+            reserved = hermes_meta.get("reserved_topics")
+            if not isinstance(reserved, list):
+                continue
+            owner_name = str(owner_fm.get("name") or skill_md.parent.name)
+            if owner_name == name:
+                continue
+            for topic in reserved:
+                needle = str(topic).strip().lower()
+                if needle and needle in haystack:
+                    return owner_name, str(topic)
+    return None
+
+
+def _reserved_topic_guard(name: str, content: str) -> Optional[Dict[str, Any]]:
+    """Reject a user SKILL.md whose post-write content claims platform turf."""
+    owner = _reserved_topic_owner(name, content)
+    if not owner:
+        return None
+    skill_name, topic = owner
+    return {
+        "success": False,
+        "error": (
+            f"The '{topic}' topic belongs to the '{skill_name}' skill, which owns "
+            f"the platform workflow for it. A second skill on the same topic does "
+            f"not extend that workflow — it competes with it, and whichever one "
+            f"loads first wins, so the same request starts producing different "
+            f"results run to run. Follow '{skill_name}' instead; if it is missing "
+            f"something, say so in the conversation so it can be fixed at the "
+            f"source rather than forked here."
+        ),
+    }
+
+
+def _is_platform_skills_dir(skills_dir: Path) -> bool:
+    """True for the read-only preset library shipped with the device."""
+    presets_root = os.environ.get("ZETTLAB_PRESETS_DIR", "").strip()
+    if not presets_root:
+        return False
+    try:
+        skills_dir.resolve().relative_to(Path(presets_root).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
@@ -1065,6 +1166,10 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "success": False,
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
+
+    reserved_guard = _reserved_topic_guard(name, content)
+    if reserved_guard:
+        return reserved_guard
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
@@ -1129,6 +1234,10 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     err = _existing_skill_frontmatter_guard(name, existing["path"])
     if err:
         return {"success": False, "error": err}
+
+    reserved_guard = _reserved_topic_guard(name, content)
+    if reserved_guard:
+        return reserved_guard
 
     skill_md = existing["path"] / "SKILL.md"
     read_guard = _background_review_read_before_write_guard(
@@ -1261,14 +1370,19 @@ def _patch_skill(
     if err:
         return {"success": False, "error": err}
 
-    # If patching SKILL.md, validate frontmatter is still intact
-    if not file_path:
+    # Resolve semantics from the canonical target, not from how the caller
+    # spelled it: file_path="SKILL.md" and the omitted default target the same
+    # file and must cross the same reserved-topic/frontmatter boundary.
+    if target == skill_dir / "SKILL.md":
         err = _validate_skill_frontmatter_name(name, new_content)
         if err:
             return {
                 "success": False,
                 "error": f"Patch would break SKILL.md structure: {err}",
             }
+        reserved_guard = _reserved_topic_guard(name, new_content)
+        if reserved_guard:
+            return reserved_guard
 
     original_content = content  # for rollback
     atomic_write_text(target, new_content)
@@ -1447,6 +1561,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
     assert target is not None
+    if target == existing["path"] / "SKILL.md":
+        err = _validate_skill_frontmatter_name(name, file_content)
+        if err:
+            return {"success": False, "error": err}
+        reserved_guard = _reserved_topic_guard(name, file_content)
+        if reserved_guard:
+            return reserved_guard
     if target.exists():
         read_guard = _background_review_read_before_write_guard(
             name, target, "write_file", file_path

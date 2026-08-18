@@ -41,7 +41,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 from urllib.parse import unquote, urlparse
 
 try:
@@ -61,6 +61,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
+    safe_exc,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -95,6 +96,137 @@ def _get_scoped_secret(name, default=None):
 
 
 logger = logging.getLogger(__name__)
+
+#: 企业微信回调 msgtype 的**已知全集**，按官方 AI Bot SDK 的类型定义切分。
+#
+# 来源（⛔ 不是从我们自己的实现反推 —— 那样 oracle 会与实现共享判据）：
+#   https://github.com/WecomTeam/aibot-node-sdk
+#   src/types/message.ts  —— `MessageType` 枚举 + 各 *Message 接口
+#
+# ⭐ 判据是**闭集**：`_extract_media` 不靠「我列到了哪几种形状」决定取不取媒体，
+# 凡是不在已知全集里的 msgtype 一律留痕告警，⛔ 不许"没写到的就静默丢"。
+#
+# 🔴 三个集合必须分开，⛔ 不许合并 —— 合并过一次，代价见下：
+#   * 可下载：`image` / `file` / `video` 三者结构同构（`url` + `aeskey`，
+#     url 五分钟有效且已加密）。
+#   * 仅转写：`voice` **没有任何可下载资源**，`VoiceContent` 只有
+#     `content: string`（语音转成的文本）。文字由 `_extract_text` 取。
+#     ⚠️ 我曾把 `voice` 并进可下载集，理由写成「本模块只负责语音文件本体」
+#     —— **根本不存在这个本体**，结果是每条合法语音都误报
+#     `no_media_reference`。⭐ 错误的理由留在注释里比错误的代码活得久。
+#   * 纯文本 / 容器：其余。
+_WECOM_DOWNLOADABLE_MSGTYPES: frozenset[str] = frozenset({"image", "file", "video"})
+_WECOM_TRANSCRIPT_MSGTYPES: frozenset[str] = frozenset({"voice"})
+#: 图文混排子项的 msgtype —— 官方限定 `'text' | 'image'`，⛔ 不是顶层那一套。
+_WECOM_MIXED_ITEM_MSGTYPES: frozenset[str] = frozenset({"text", "image"})
+
+
+class MediaFailure(NamedTuple):
+    """一次入站媒体没取到 —— ``kind`` 是哪类附件，``reason`` 是**为什么**。
+
+    🔴 原先这里只有 ``kind``(``failed_kinds: List[str]``)，于是七种成因被压成
+    一个词，用户拿到的建议永远是同一句「可以先压缩后再试」——
+    对**链接过期**、**解密失败**、**磁盘写满**全都是错误指引:他压缩完再发
+    还是失败,而真正该做的(立刻重发 / 清理空间)一个字都没说。
+    ⭐ 全局硬规则「面向用户的错误必须分类、可行动」在这里被违反了,
+      ⛔ 而且「补错的建议比不补更坏」——它让用户去做一件确定无效的事。
+    """
+
+    kind: str
+    reason: str
+
+
+#: reason ⇒ 给**用户**的一句可行动的话。闭集,新增 reason 必须同步登记。
+#: ⛔ 每条只有一句 —— 判据「不写它用户会不会做错事」,不写就会:
+#:   过期类不立刻重发就永远拿不到,存储类不清理空间重发多少次都白搭。
+#: ⛔ 一个字都不含 reason 码 / 路径 / 原始错误(那些在日志里)。
+_MEDIA_FAILURE_ADVICE: Dict[str, str] = {
+    # 企微媒体 url 仅 5 分钟有效 ⇒ 过期与网络故障在这里表现相同
+    "download_failed": "没能下载到（附件链接 5 分钟后失效）。请重新发送。",
+    "decrypt_failed": "内容已损坏或链接已失效。请重新发送。",
+    "cache_write_failed": "设备存储写入失败。请清理存储空间后重试。",
+    "base64_decode_failed": "内容已损坏。请重新发送。",
+    "not_an_image": "这个图片格式无法识别。请改用 JPG 或 PNG 重发。",
+    "no_media_reference": "这条消息里没有附件内容。请重新发送。",
+    # ⭐ 唯一一处「压缩」是**正确**建议的地方 —— 它对应的是真的太大。
+    # ⛔ 而它此前被误用在所有成因上,那才是 P2-4 的病根。
+    "too_large": "文件超出企业微信的大小上限。请压缩后再发，或改发较小的文件。",
+    "payload_malformed": "这条消息里没有附件内容。请重新发送。",
+}
+#: ⭐ 未知 reason 也**不许伪装成成功**、⛔ 也不许把 reason 码甩给用户。
+_MEDIA_FAILURE_ADVICE_FALLBACK = "暂时读不到。请稍后重新发送。"
+
+#: 给**用户**看的附件名字 —— ⛔ 不许把内部标识 ``image`` / ``file`` 直接拼进
+#: 面向用户的文案(我上一轮就是这么写的,用户会看到「未能读取你发送的附件
+#: (image)」)。照抄 ``weixin.py`` 的 ``_MEDIA_KIND_LABEL``。
+class WeComMediaTooLarge(ValueError):
+    """远端媒体超过大小上限 —— ⛔ 与「下载失败」是**两种**成因。
+
+    🔴 原先它是裸 ``ValueError``,和网络故障一起被记成 ``download_failed``,
+    于是用户收到「请重新发送」—— 同一个文件重发**必然再次失败**。
+    ⭐ 又一次「补错的建议比不补更坏」。继承 ``ValueError`` 保持向后兼容
+    （既有 ``except ValueError`` 的调用点行为不变）。
+    """
+
+
+def _mixed_items(container: Any) -> Tuple[List[Dict[str, Any]], bool]:
+    """把 ``mixed`` 容器拆成子项列表。返回 ``(items, malformed)``。
+
+    🔴 官方 ``MixedMessage`` 要求 ``mixed: MixedContent`` 且 ``msg_item``
+    是数组 ⇒ 这两层**任一层**形状不对就是载荷畸形,⛔ 不是「一条空消息」。
+    原先两处都写成 ``if isinstance(...) else {}`` / ``else []`` 把畸形
+    **归一成空**,于是纯附件的畸形 mixed 消息静默消失。
+    ⚠️ 我上一轮只补了**子项**畸形,漏了**外层容器** —— 兄弟调用点没跟上。
+
+    ⛔ 合法的空数组(``msg_item: []``)⛔ 不算畸形:形状是对的。
+    """
+    if not isinstance(container, dict):
+        return [], True
+    raw = container.get("msg_item")
+    if not isinstance(raw, list):
+        return [], True
+    # 🔴 元素层同形:``msg_item`` 是 list 但里面混了非 dict 时,原先直接
+    # **过滤掉**并返回 ``malformed=False`` ⇒ 纯畸形的 mixed 消息仍然静默消失。
+    # ⭐ 我上一轮修了「容器层」就以为修完了 —— 容器 / 元素是**两层**,
+    #   这正是同一个缺陷的第三次「兄弟点没跟上」。
+    # ⛔ 有效项照常保留(混排里合法的那半不该被连坐丢掉)。
+    items = [i for i in raw if isinstance(i, dict)]
+    return items, len(items) != len(raw)
+
+
+_WECOM_KIND_LABEL: Dict[str, str] = {
+    "image": "图片",
+    "file": "文件",
+    "video": "视频",
+    "voice": "语音",
+}
+#: 官方 AI Bot 回调的 msgtype **全集**（``MessageType`` 枚举，六种）。
+#  oracle 是仓外协议事实，⛔ 不从实现导出。
+_WECOM_OFFICIAL_MSGTYPES: frozenset[str] = frozenset({
+    "text", "image", "mixed", "voice", "file", "video",
+})
+
+#: 官方枚举之外、但本仓**确实在处理**的类型。⭐ 每一项都必须给出代码依据 ——
+#  ⛔ 不许再往这里塞「印象里有」的名字。
+#
+#    appmsg —— WeCom AI Bot 的 PDF/Word/Excel 附件走这个 msgtype，
+#              见 `_extract_text` 与 `_extract_media` 两处真实分支。
+#    event  —— 回调侧的事件消息，见
+#              `callback_adapter.py:370/374/381` 三处真实分支。
+#
+#  🔴 曾经这里还有一个 ``stream``：**全仓零处理逻辑**，官方枚举里也没有 ——
+#  是我凭印象加进去的（`git log -S` 指向 028c9c187b，就是我那个 commit）。
+#  ⭐ 与把 ``voice`` 并进可下载集同形：**为一个不存在的东西写了登记**。
+#  ⇒ 已删。它若真出现，会走「未处理的 WeCom msgtype」告警 —— 那正是我们想要的。
+_WECOM_LOCAL_KNOWN_MSGTYPES: frozenset[str] = frozenset({"appmsg", "event"})
+
+_WECOM_KNOWN_MSGTYPES: frozenset[str] = (
+    _WECOM_OFFICIAL_MSGTYPES | _WECOM_LOCAL_KNOWN_MSGTYPES
+)
+
+#: 兼容别名：本模块内曾用 `_WECOM_MEDIA_MSGTYPES` 表示"要下载的类型"。
+#  ⛔ 不要用它做新判断 —— 名字里的 "MEDIA" 会诱导把 voice 也算进来。
+_WECOM_MEDIA_MSGTYPES = _WECOM_DOWNLOADABLE_MSGTYPES
 
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
 
@@ -261,7 +393,7 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             message = f"WeCom startup failed: {exc}"
             self._set_fatal_error("wecom_connect_error", message, retryable=True)
-            logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
+            logger.error("[%s] Failed to connect: %s", self.name, safe_exc(exc), exc_info=True)
             await self._cleanup_ws()
             if self._http_client:
                 await self._http_client.aclose()
@@ -374,7 +506,7 @@ class WeComAdapter(BasePlatformAdapter):
             except Exception as exc:
                 if not self._running:
                     return
-                logger.warning("[%s] WebSocket error: %s", self.name, exc)
+                logger.warning("[%s] WebSocket error: %s", self.name, safe_exc(exc))
                 self._fail_pending_responses(RuntimeError("WeCom connection interrupted"))
 
                 delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
@@ -387,7 +519,7 @@ class WeComAdapter(BasePlatformAdapter):
                     self._mark_connected()
                     logger.info("[%s] Reconnected", self.name)
                 except Exception as reconnect_exc:
-                    logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
+                    logger.warning("[%s] Reconnect failed: %s", self.name, safe_exc(reconnect_exc))
 
     async def _read_events(self) -> None:
         """Read websocket frames until the connection closes."""
@@ -419,7 +551,7 @@ class WeComAdapter(BasePlatformAdapter):
                         }
                     )
                 except Exception as exc:
-                    logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
+                    logger.debug("[%s] Heartbeat send failed: %s", self.name, safe_exc(exc))
         except asyncio.CancelledError:
             pass
 
@@ -559,7 +691,7 @@ class WeComAdapter(BasePlatformAdapter):
         # Mirrors what the Telegram adapter does (re.sub @botname).
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()
-        media_urls, media_types = await self._extract_media(body)
+        media_urls, media_types, media_failures = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
 
@@ -567,8 +699,32 @@ class WeComAdapter(BasePlatformAdapter):
             text = reply_text
 
         if not text and not media_urls:
+            if media_failures:
+                # 🔴 有附件、却一个都没取到 —— ⛔ 不许当成空消息静默丢弃。
+                # 原先这里直接 return，handle_message 从不被调用,
+                # 用户看到的就是「发了图没反应」(族 A 现场)。
+                await self._reply_media_intake_failed(chat_id, media_failures)
+                return
+            # ⚠️ 真的空消息(没有任何媒体引用)⇒ 跳过,行为逐字不变。
             logger.debug("[%s] Empty WeCom message skipped", self.name)
             return
+
+        # 有正文、但部分/全部附件没取到 ⇒ ⛔ 不许静默:Agent 必须知道用户发过
+        # 附件,否则它会答非所问("你说的图片我没看到"都说不出来)。
+        # ⚠️ ⛔ 不单独给用户发消息 —— 正文已经在处理中,再发一条就是刷屏。
+        #
+        # 🔴 **层级**:这条提示走 ``channel_prompt``,⛔ 不许拼进 ``text``。
+        # 我上一版拼进了 text —— 那等于**把系统生成的内容伪装成用户原话**:
+        #   · 它会进命令解析（带附件的 ``/command`` 会把提示当成参数）
+        #   · 它会进文本批处理的合并结果
+        #   · 它会被**持久化进对话历史**，以后每一轮都带着它
+        # ⭐ 仓内早有正确层级:``MessageEvent.channel_prompt``
+        #   （``gateway/platforms/base.py:2241`` 注释写明「Applied at API call
+        #   time and **never persisted** to transcript history」）。
+        #   ⇒ 照抄它，⛔ 不自造第二套。
+        _media_prompt = (
+            self._media_failure_note(media_failures) if media_failures else None
+        )
 
         source = self.build_source(
             chat_id=chat_id,
@@ -579,6 +735,7 @@ class WeComAdapter(BasePlatformAdapter):
 
         event = MessageEvent(
             text=text,
+            channel_prompt=_media_prompt,
             message_type=message_type,
             source=source,
             raw_message=payload,
@@ -632,6 +789,21 @@ class WeComAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            # 🔴 ``channel_prompt`` 必须一起并 —— ⛔ 不许只并 text/media。
+            # 这是「半条链」:我在上面**新造**了 per-event 的 channel_prompt
+            # (附件取不到的提示),但合并分支只搬 text 和 media ⇒ 用户先发一条
+            # 纯文本、再发「正文+失败附件」时,后一条的提示被静默丢弃,
+            # Agent 又不知道有附件 —— 缺陷原样复活在批处理路径上。
+            #
+            # ⚠️ 这条**只对本 adapter 成立**:其余 7 个 batcher 的 channel_prompt
+            # 全部来自 ``resolve_channel_prompt(chat_id)`` = 每会话常量,同 key
+            # 下每个 event 值相同,丢了也无影响 ⇒ ⛔ 不去改它们(越界扩散)。
+            #
+            # ⭐ 合并语义直接复用 ``_merge_caption``(base.py:5311):它做的正是
+            # 「去重 + \n\n 拼接」,与这里需要的**逐字相同** ⇒ ⛔ 不自造第二套。
+            if event.channel_prompt:
+                existing.channel_prompt = self._merge_caption(
+                    existing.channel_prompt, event.channel_prompt)
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -687,20 +859,20 @@ class WeComAdapter(BasePlatformAdapter):
         reply_text: Optional[str] = None
         msgtype = str(body.get("msgtype") or "").lower()
 
-        if msgtype == "mixed":
-            _raw_mixed = body.get("mixed")
-            mixed = _raw_mixed if isinstance(_raw_mixed, dict) else {}
-            _raw_items = mixed.get("msg_item")
-            items = _raw_items if isinstance(_raw_items, list) else []
-            for item in items:
-                if not isinstance(item, dict):
+        def _mixed_text(container: Any) -> List[str]:
+            out: List[str] = []
+            for item in _mixed_items(container)[0]:
+                if str(item.get("msgtype") or "").lower() != "text":
                     continue
-                if str(item.get("msgtype") or "").lower() == "text":
-                    _raw_text = item.get("text")
-                    text_block = _raw_text if isinstance(_raw_text, dict) else {}
-                    content = str(text_block.get("content") or "").strip()
-                    if content:
-                        text_parts.append(content)
+                _raw_text = item.get("text")
+                text_block = _raw_text if isinstance(_raw_text, dict) else {}
+                content = str(text_block.get("content") or "").strip()
+                if content:
+                    out.append(content)
+            return out
+
+        if msgtype == "mixed":
+            text_parts.extend(_mixed_text(body.get("mixed")))
         else:
             text_block = body.get("text") if isinstance(body.get("text"), dict) else {}
             content = str(text_block.get("content") or "").strip()
@@ -728,32 +900,96 @@ class WeComAdapter(BasePlatformAdapter):
         elif quote_type == "voice":
             quote_voice = quote.get("voice") if isinstance(quote.get("voice"), dict) else {}
             reply_text = str(quote_voice.get("content") or "").strip() or None
+        elif quote_type == "mixed":
+            # 🔴 官方 ``QuoteContent`` 允许 ``mixed``,而原先这里只认 text/voice
+            # ⇒ 用户引用一条图文混排消息再问「看这张图」时,Agent **既拿不到
+            # 引用的文字、也拿不到引用的图片**,只能答非所问。
+            # ⭐ 与下面 ``_extract_media`` 的 quoted 分支共用同一个 walker,
+            #   ⛔ 不各写一套(两套就会漂移)。
+            reply_text = "\n".join(_mixed_text(quote.get("mixed"))) or None
 
         return "\n".join(part for part in text_parts if part).strip(), reply_text
 
-    async def _extract_media(self, body: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-        """Best-effort extraction of inbound media to local cache paths."""
+    async def _extract_media(
+        self, body: Dict[str, Any]
+    ) -> Tuple[List[str], List[str], List[MediaFailure]]:
+        """取入站媒体到本地缓存。返回 ``(paths, types, failures)``。
+
+        🔴 第三个返回值是本轮新增的（RH 复审 P1-3）。原先只返回前两个，于是
+        ``_on_message`` 无法区分这两种**完全不同**的情况：
+
+          * 用户发的就是一条空消息 ⇒ 跳过是对的
+          * 用户发了图/文件，但**一个都没取到** ⇒ 整条消息被静默丢弃，
+            ``handle_message`` 从不被调用（实测 ``handle_message_calls=0``），
+            用户看到的是「发了图没反应」——这正是族 A 的现场。
+
+        ⭐ 空列表有二义时，就必须把「有没有尝试过」单独带出来 ——
+        与 MCP 那边 ``(observable, pids)`` 是同一个形状的问题。
+        """
         media_paths: List[str] = []
         media_types: List[str] = []
+        failures: List[MediaFailure] = []
         refs: List[Tuple[str, Dict[str, Any]]] = []
         msgtype = str(body.get("msgtype") or "").lower()
 
-        if msgtype == "mixed":
-            _raw_mixed = body.get("mixed")
-            mixed = _raw_mixed if isinstance(_raw_mixed, dict) else {}
-            _raw_items = mixed.get("msg_item")
-            items = _raw_items if isinstance(_raw_items, list) else []
+        def _walk_mixed(container: Any) -> None:
+            """扫一个 mixed 容器的子项;外层或子项畸形都要留痕。"""
+            items, malformed = _mixed_items(container)
+            if malformed:
+                # 🔴 ``mixed`` 不是 dict / ``msg_item`` 不是数组 / 数组里混了
+                # 非 dict 元素。原先被归一成空集合 ⇒ 畸形 mixed 静默消失。
+                failures.append(MediaFailure("mixed", "payload_malformed"))
+            # ⚠️ ⛔ 这里**不 return**:容器层畸形时 ``items`` 本来就是空的,
+            # 而元素层畸形时混排里**合法的那半仍要处理** —— 我上一版在这里
+            # 直接 return,等于让一个坏元素把整条消息里的好图片一起丢掉。
+            # ⭐ 「修一个缺陷时别弄坏原来对的东西」,作用域要刚好。
             for item in items:
-                if not isinstance(item, dict):
-                    continue
                 item_type = str(item.get("msgtype") or "").lower()
+                # 官方把混排子项限定为 `'text' | 'image'`（message.ts），
+                # ⇒ 这里能下载的只有 image。⛔ 别照抄顶层那套类型集：
+                # 我上一版把 file/voice/video 也收进来，全是**协议里不存在的
+                # 分支**，还顺手让测试构造了假 payload 去喂它。
                 if item_type == "image" and isinstance(item.get("image"), dict):
                     refs.append(("image", item["image"]))
+                elif item_type == "image":
+                    # 🔴 P2-3:类型说是 image、``image`` 对象却不是 dict
+                    # (缺失 / null / 被上游改成字符串)。原先这里**什么都不做**
+                    # ⇒ refs 为空 ⇒ 整条消息被当成真空消息静默丢弃。
+                    failures.append(MediaFailure("image", "payload_malformed"))
+                elif item_type not in _WECOM_MIXED_ITEM_MSGTYPES:
+                    logger.warning(
+                        "[%s] mixed 消息里出现未知 msg_item 类型: %s（本条已跳过）",
+                        self.name, item_type or "<empty>",
+                    )
+
+        if msgtype == "mixed":
+            _walk_mixed(body.get("mixed"))
         else:
             if isinstance(body.get("image"), dict):
                 refs.append(("image", body["image"]))
-            if msgtype == "file" and isinstance(body.get("file"), dict):
-                refs.append(("file", body["file"]))
+            elif msgtype == "image":
+                failures.append(MediaFailure("image", "payload_malformed"))
+            # file / video —— 官方回调各有独立顶层对象，与 image 同构
+            # （`url` 五分钟有效 + `aeskey`）。⛔ 原先只有 file，video 整类被静默丢弃。
+            #
+            # 🔴 ⛔ voice 不在这里：`VoiceContent` 只有 `content: string`
+            #    （语音转成的文本），**没有 url / aeskey / media_id**。
+            #    把它并进来会让每条合法语音都走进下载分支、然后误报
+            #    `no_media_reference`。文字由 `_extract_text` 取。
+            # ⭐ 由集合驱动，⛔ 不写字面量元组：写死一份就有了第二个真相源，
+            #    集合改了这里不跟着改（漂移），而且**逆改集合驱动不到这条分支**
+            #    —— 一个无法被驱动的分支 = 一个无法被验证的承诺。
+            #    image 在上面单独处理（它同时出现在 mixed 子项里），故减去。
+            for _mt in sorted(_WECOM_DOWNLOADABLE_MSGTYPES - {"image"}):
+                if msgtype != _mt:
+                    continue
+                if isinstance(body.get(_mt), dict):
+                    refs.append((_mt, body[_mt]))
+                else:
+                    # 🔴 P2-3 同形:``msgtype=file`` / ``video`` 但顶层对象
+                    # 形状不对。协议里这个对象是**必填**的 ⇒ 缺了就是畸形,
+                    # ⛔ 不是「用户发了条空消息」。
+                    failures.append(MediaFailure(_mt, "payload_malformed"))
             # Handle appmsg (WeCom AI Bot attachments with PDF/Word/Excel)
             if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
                 appmsg = body["appmsg"]
@@ -761,51 +997,247 @@ class WeComAdapter(BasePlatformAdapter):
                     refs.append(("file", appmsg["file"]))
                 elif isinstance(appmsg.get("image"), dict):
                     refs.append(("image", appmsg["image"]))
+            elif msgtype and msgtype not in _WECOM_KNOWN_MSGTYPES:
+                # ⭐ 闭集兜底：判据不是「我列到的形状」，而是「不管它是什么，
+                # 没被任何分支接住就必须留痕」。⛔ 不许再有"没写到的就静默丢"。
+                logger.warning(
+                    "[%s] 未处理的 WeCom msgtype: %s（可能有媒体未被取到）",
+                    self.name, msgtype,
+                )
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
-        if quote_type == "image" and isinstance(quote.get("image"), dict):
-            refs.append(("image", quote["image"]))
-        elif quote_type == "file" and isinstance(quote.get("file"), dict):
-            refs.append(("file", quote["file"]))
+        if quote_type in {"image", "file"}:
+            if isinstance(quote.get(quote_type), dict):
+                refs.append((quote_type, quote[quote_type]))
+            else:
+                failures.append(MediaFailure(quote_type, "payload_malformed"))
+        elif quote_type == "mixed":
+            # 🔴 官方 ``QuoteContent`` 允许 ``mixed`` —— 原先这里只认 image/file,
+            # 引用一条图文混排消息时那张图**完全不可见**。
+            # ⭐ 复用同一个 walker,⛔ 不为「引用」再写一套(两套必漂移)。
+            _walk_mixed(quote.get("mixed"))
 
         for kind, ref in refs:
-            cached = await self._cache_media(kind, ref)
+            cached = await self._cache_media(kind, ref, failures=failures)
             if cached:
                 path, content_type = cached
                 media_paths.append(path)
                 media_types.append(content_type)
+            # ⛔ 这里**不再** append —— 记账已收敛进 ``_media_intake_failed``。
+            # 两处都记就会重复计数(「2 个附件」其实只有 1 个);
+            # ⭐ 而它能安全去掉的前提是「_cache_media 的每一条 return None
+            #   都先经过 _media_intake_failed」—— 这条由 test_wecom_media_
+            #   failure_reasons.py::test_every_failure_path_records_a_reason
+            #   驱动全部七种成因钉死,⛔ 不靠读代码保证。
 
-        return media_paths, media_types
+        return media_paths, media_types, failures
 
-    async def _cache_media(self, kind: str, media: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-        """Cache an inbound image/file/media reference to local storage."""
+    @staticmethod
+    def _media_failure_note(failures: List[MediaFailure]) -> str:
+        """给 **Agent** 看的一行提示（⛔ 不是给用户的文案）。
+
+        Agent 需要知道「用户发过附件但系统没取到」，否则它连
+        「你发的图我没收到」都说不出来，只会答非所问。
+
+        ⚠️ 这条给 Agent 的提示**带 reason 原文**是对的:它要据此决定说什么
+        （链接过期 ⇒ 让用户重发;存储满 ⇒ 别让用户白重发）。
+        ⛔ 用户侧那条**不许**带 reason 码 —— 见 ``_reply_media_intake_failed``。
+        """
+        kinds = "、".join(
+            f"{_WECOM_KIND_LABEL.get(f.kind, f.kind)}/{f.reason}"
+            for f in sorted(set(failures))
+        )
+        return f"[系统提示：用户发送了 {len(failures)} 个附件（{kinds}），但未能取到内容]"
+
+    @staticmethod
+    def _media_failure_reply_text(failures: List[MediaFailure]) -> str:
+        """把失败清单翻译成给**用户**的一句话:是什么 + 现在怎么办。
+
+        🔴 上一版**只有一句写死的**「请稍后重新发送；如果是较大的文件，
+        可以先压缩后再试」——对链接过期、解密失败、磁盘写满全是错误指引。
+        ⭐ 「补错的建议比不补更坏」:它让用户去做一件确定无效的事,
+          然后以为是自己的问题。
+        ⛔ 不堆文案:名字一行、建议去重后最多两句,⛔ 无成功态/进度旁白。
+        """
+        kinds = "、".join(sorted({
+            _WECOM_KIND_LABEL.get(f.kind, "附件") for f in failures}))
+        advice: List[str] = []
+        for f in failures:
+            tip = _MEDIA_FAILURE_ADVICE.get(f.reason, _MEDIA_FAILURE_ADVICE_FALLBACK)
+            if tip not in advice:
+                advice.append(tip)
+        return f"未能读取你发送的{kinds}。" + "".join(advice[:2])
+
+    async def _reply_media_intake_failed(
+        self, chat_id: str, failures: List[MediaFailure]
+    ) -> None:
+        """纯附件消息一个都没取到 ⇒ 给用户一条**可行动**的回复。
+
+        ⭐ 判据「不写它用户会不会做错事」= **会**：他看不到任何反应，
+        会以为机器人挂了或自己没发出去，然后反复重发。
+        ⛔ 但一个字都不含内部路径 / 原始错误 / reason 码 —— 那些在日志里
+        （``_media_intake_failed`` 已记 reason / url_host / 错误类型）。
+        """
+        try:
+            res = await self.send(
+                chat_id,
+                self._media_failure_reply_text(failures),
+                reply_to=None,
+                metadata=None,
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] 连「附件读取失败」的回复都没发出去 (chat_id=%s): %s",
+                self.name, chat_id, safe_exc(exc),
+            )
+            return
+        # ⭐ 判据是 SendResult.success,⛔ 不是「没抛异常」——
+        # 这条判据我今晚已经在三个地方犯过,写完就地再过一遍。
+        if getattr(res, "success", True) is False:
+            logger.error(
+                "[%s] 「附件读取失败」的回复被平台拒收 (chat_id=%s): %s",
+                self.name, chat_id, getattr(res, "error", None) or "unknown",
+            )
+
+    def _media_intake_failed(
+        self,
+        kind: str,
+        reason: str,
+        media: Dict[str, Any],
+        exc: Optional[BaseException] = None,
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> None:
+        """入站媒体没拿到 —— 必须留下【可区分、可定位】的痕迹。
+
+        ⛔ 原先这些分支只打 logger.debug（默认不输出）甚至什么都不打，于是用户
+        看到的是「发了图没反应」，而日志里空空如也 —— 既是缺陷本身，也是它一直
+        排查不出来的原因。⇒ 升到 warning，并让六种失败彼此可区分。
+
+        ⛔ 不许打印 url 全文 / aeskey / base64 内容：企微媒体 url 带鉴权参数，
+        原先 ``logger.debug("... from %s", url)`` 是会泄漏的。这里只记 host 与
+        长度这类足以定位、又不含凭据的摘要。
+
+        🔴 ⛔ 用 ``.hostname`` 而不是 ``.netloc``：``netloc`` **包含 userinfo**，
+           ``https://user:secret@host/x`` 的 netloc 就是 ``user:secret@host``
+           —— 我上一版正是用 netloc 去"脱敏"，等于换个地方继续泄漏凭据。
+           ⭐ 修一个泄漏点时用的工具本身也要过一遍同一条判据。
+        """
+        url = str(media.get("url") or "")
+        host = ""
+        if url:
+            try:
+                parsed = urlparse(url)
+                # hostname 已剥掉 userinfo 且小写化；端口单独取，⛔ 不回落 netloc。
+                host = parsed.hostname or ""
+                if host and parsed.port:
+                    host = f"{host}:{parsed.port}"
+            except Exception:
+                host = "<unparsable>"
+        logger.warning(
+            "[%s] 入站媒体获取失败: kind=%s reason=%s has_url=%s url_host=%s "
+            "has_base64=%s has_aeskey=%s err=%s",
+            self.name, kind, reason, bool(url), host or "-",
+            bool(media.get("base64")), bool(media.get("aeskey")),
+            type(exc).__name__ if exc is not None else "-",
+        )
+        # ⭐ 记账收敛到这**一个**出口:七条失败分支已经全部经过这里,
+        # 于是「日志里有、但调用方看不见」这种半条链结构上不可能再出现。
+        # ⛔ 不在调用方各自 append —— 那就有第二个真相源,漏一处就静默丢。
+        if failures is not None:
+            failures.append(MediaFailure(kind=kind, reason=reason))
+
+    def _write_cache_or_report(
+        self,
+        kind: str,
+        media: Dict[str, Any],
+        writer,
+        *args,
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> Optional[str]:
+        """落盘那一步的统一出口 —— 写失败必须变成**消息级**失败。
+
+        🔴 原先四个写盘点(base64/url × image/document)全都让 ``OSError`` 裸奔:
+        磁盘满、只读挂载、权限不足时异常一路冒到 ``_on_message`` 再到监听循环
+        ⇒ **整条连接断开**,而这条消息的 ID 已经进了 dedup ⇒ 重连后也不会重放,
+        用户那条消息**永久消失**。一次磁盘故障变成一次静默丢消息。
+
+        ⛔ 只捕 ``OSError``:磁盘/权限/路径这类**环境**故障才降级成消息级失败。
+        编程错误(TypeError/AttributeError)照旧向上抛 —— fail fast,⛔ 不许在这
+        里兜底成"看起来正常"。
+
+        ⭐ 四个调用点收敛到这一个出口,⛔ 不在四处各写一遍 try —— 复制四份的
+        结果就是下次新增第五个写盘点时漏掉它。
+        """
+        try:
+            return writer(*args)
+        except OSError as exc:
+            self._media_intake_failed(
+                kind, "cache_write_failed", media, exc, failures=failures)
+            return None
+
+    async def _cache_media(
+        self,
+        kind: str,
+        media: Dict[str, Any],
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        """取一条入站媒体到本地缓存。失败时把 ``MediaFailure`` 记进 ``failures``。
+
+        ⭐ ``failures`` 用**出参**而不是改返回值:返回值一改,12 个调用点
+        (含 3 个 ``monkeypatch.setattr`` 打桩点)全要跟着动 —— 而这条缺陷
+        只在「原因没带出来」这一点上,改动作用域应当**刚好等于**它。
+        照抄 ``weixin._collect_media`` 的出参风格,⛔ 不自造第三种。
+        """
         if "base64" in media and media.get("base64"):
             try:
                 raw = self._decode_base64(media["base64"])
             except Exception as exc:
-                logger.debug("[%s] Failed to decode %s base64 media: %s", self.name, kind, exc)
+                self._media_intake_failed(
+                    kind, "base64_decode_failed", media, exc, failures=failures)
                 return None
 
             if kind == "image":
                 ext = self._detect_image_ext(raw)
                 try:
-                    return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
+                    path = self._write_cache_or_report(
+                        kind, media, cache_image_from_bytes, raw, ext, failures=failures)
                 except ValueError as exc:
-                    logger.warning("[%s] Rejected non-image bytes: %s", self.name, exc)
+                    self._media_intake_failed(
+                    kind, "not_an_image", media, exc, failures=failures)
                     return None
+                if path is None:
+                    return None
+                return path, self._mime_for_ext(ext, fallback="image/jpeg")
 
             filename = str(media.get("filename") or media.get("name") or "wecom_file")
-            return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            path = self._write_cache_or_report(
+                kind, media, cache_document_from_bytes, raw, filename, failures=failures)
+            if path is None:
+                return None
+            return path, mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
         url = str(media.get("url") or "").strip()
         if not url:
+            # 既没有 base64 也没有 url —— 原先这里【一句日志都没有】,
+            # 是六条失败分支里最不可观测的一条。
+            self._media_intake_failed(
+                kind, "no_media_reference", media, failures=failures)
             return None
 
         try:
             raw, headers = await self._download_remote_bytes(url, max_bytes=ABSOLUTE_MAX_BYTES)
+        except WeComMediaTooLarge as exc:
+            # 🔴 ⛔ 必须排在 download_failed 前面:超限是**确定性**失败,
+            # 给「请重新发送」等于让用户做一件必然再失败的事。
+            self._media_intake_failed(
+                kind, "too_large", media, exc, failures=failures)
+            return None
         except Exception as exc:
-            logger.debug("[%s] Failed to download %s from %s: %s", self.name, kind, url, exc)
+            # ⚠️ 企微媒体 url 仅 5 分钟有效,过期与网络故障在这里表现相同;
+            # reason 统一为 download_failed,由 err 类型区分,⛔ 不臆断是哪种。
+            self._media_intake_failed(
+                    kind, "download_failed", media, exc, failures=failures)
             return None
 
         aes_key = str(media.get("aeskey") or "").strip()
@@ -813,20 +1245,30 @@ class WeComAdapter(BasePlatformAdapter):
             try:
                 raw = self._decrypt_file_bytes(raw, aes_key)
             except Exception as exc:
-                logger.debug("[%s] Failed to decrypt %s from %s: %s", self.name, kind, url, exc)
+                self._media_intake_failed(
+                    kind, "decrypt_failed", media, exc, failures=failures)
                 return None
 
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
         if kind == "image":
             ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
             try:
-                return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
+                path = self._write_cache_or_report(
+                    kind, media, cache_image_from_bytes, raw, ext, failures=failures)
             except ValueError as exc:
-                logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
+                self._media_intake_failed(
+                    kind, "not_an_image", media, exc, failures=failures)
                 return None
+            if path is None:
+                return None
+            return path, content_type or self._mime_for_ext(ext, fallback="image/jpeg")
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
-        return cache_document_from_bytes(raw, filename), content_type
+        path = self._write_cache_or_report(
+            kind, media, cache_document_from_bytes, raw, filename, failures=failures)
+        if path is None:
+            return None
+        return path, content_type
 
     @staticmethod
     def _decode_base64(data: str) -> bytes:
@@ -1153,7 +1595,7 @@ class WeComAdapter(BasePlatformAdapter):
                 headers = {key.lower(): value for key, value in response.headers.items()}
                 content_length = headers.get("content-length")
                 if content_length and content_length.isdigit() and int(content_length) > max_bytes:
-                    raise ValueError(
+                    raise WeComMediaTooLarge(
                         f"Remote media exceeds WeCom limit: {int(content_length)} bytes > {max_bytes} bytes"
                     )
 
@@ -1161,7 +1603,7 @@ class WeComAdapter(BasePlatformAdapter):
                 async for chunk in response.aiter_bytes():
                     data.extend(chunk)
                     if len(data) > max_bytes:
-                        raise ValueError(
+                        raise WeComMediaTooLarge(
                             f"Remote media exceeds WeCom limit while downloading: {len(data)} bytes > {max_bytes} bytes"
                         )
 
@@ -1352,7 +1794,7 @@ class WeComAdapter(BasePlatformAdapter):
         except FileNotFoundError as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as exc:
-            logger.error("[%s] Failed to prepare outbound media %s: %s", self.name, media_source, exc)
+            logger.error("[%s] Failed to prepare outbound media %s: %s", self.name, media_source, safe_exc(exc))
             return SendResult(success=False, error=str(exc))
 
         if prepared["rejected"]:
@@ -1388,7 +1830,7 @@ class WeComAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending media to WeCom")
         except Exception as exc:
-            logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
+            logger.error("[%s] Failed to send media %s: %s", self.name, media_source, safe_exc(exc))
             return SendResult(success=False, error=str(exc))
 
         caption_result = None
@@ -1452,7 +1894,7 @@ class WeComAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
-            logger.error("[%s] Send failed: %s", self.name, exc)
+            logger.error("[%s] Send failed: %s", self.name, safe_exc(exc))
             return SendResult(success=False, error=str(exc))
 
         error = self._response_error(response)
@@ -1610,7 +2052,7 @@ def qr_scan_for_bot_info(
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        logger.error("WeCom QR: failed to fetch QR code: %s", exc)
+        logger.error("WeCom QR: failed to fetch QR code: %s", safe_exc(exc))
         print(f" failed: {exc}")
         return None
 
@@ -1660,7 +2102,7 @@ def qr_scan_for_bot_info(
             with urllib.request.urlopen(req, timeout=10) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
-            logger.debug("WeCom QR poll error: %s", exc)
+            logger.debug("WeCom QR poll error: %s", safe_exc(exc))
             time.sleep(_QR_POLL_INTERVAL)
             continue
 

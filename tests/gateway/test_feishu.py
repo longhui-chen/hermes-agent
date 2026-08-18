@@ -101,6 +101,63 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    def test_reply_body_disables_topics(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        body = FeishuAdapter._build_reply_message_body(
+            content='{"text":"答复"}',
+            msg_type="text",
+            reply_in_thread=False,
+            uuid_value="u1",
+        )
+        self.assertFalse(body.reply_in_thread)
+
+    def test_thread_metadata_routes_the_create_into_the_topic(self):
+        """🔴 本条的断言**反过来了**,理由要留着。
+
+        原名 ``test_flat_create_ignores_inbound_thread_metadata``,断言
+        ``receive_id_type == "chat_id"`` —— 它和被它钉住的实现**出自同一个
+        commit**(``8e0a8dd2b3``),而那个 commit 删掉了 merge-base 上原有的
+        thread 路由。⇒ 它钉的是**当时的实现**,不是需求;而那个实现会把线程里
+        的回答发到**群主时间线**(错位回复 + 扩大内容可见范围)。
+        ⭐ 见 [[gate-can-pin-the-bug-as-contract]]:换驱动方式、契约回到需求本身。
+        ⛔ 非线程场景的断言一字未改(见下一条)。
+        """
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter.__new__(FeishuAdapter)
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace())))
+        create = Mock(return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="m1")))
+        adapter._client.im.v1.message.create = create
+        adapter._run_blocking = AsyncMock(side_effect=lambda fn, request: fn(request))
+        asyncio.run(adapter._send_raw_message(
+            chat_id="oc_chat",
+            msg_type="text",
+            payload='{"text":"hi"}',
+            reply_to=None,
+            metadata={"thread_id": "om_old_root"},
+        ))
+        request = create.call_args.args[0]
+        self.assertEqual(request.receive_id_type, "thread_id")
+        self.assertEqual(request.request_body.receive_id, "om_old_root")
+
+    def test_plain_create_without_thread_metadata_is_unchanged(self):
+        """🔴 必须保持不变:没有 thread_id 时仍然是扁平的 chat_id 发送。"""
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter.__new__(FeishuAdapter)
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace())))
+        create = Mock(return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="m1")))
+        adapter._client.im.v1.message.create = create
+        adapter._run_blocking = AsyncMock(side_effect=lambda fn, request: fn(request))
+        asyncio.run(adapter._send_raw_message(
+            chat_id="oc_chat", msg_type="text", payload='{"text":"hi"}',
+            reply_to=None, metadata=None,
+        ))
+        request = create.call_args.args[0]
+        self.assertEqual(request.receive_id_type, "chat_id")
+        self.assertEqual(request.request_body.receive_id, "oc_chat")
+
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
     def test_websocket_sdk_accepts_channel_ua_tag(self):
         """The shipped SDK must support the Channel signaling argument.
@@ -1192,7 +1249,7 @@ class TestAdapterBehavior(unittest.TestCase):
 
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_document_reply_uses_thread_flag(self):
+    def test_send_document_reply_keeps_quote_out_of_topic(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -1244,7 +1301,181 @@ class TestAdapterBehavior(unittest.TestCase):
             os.unlink(file_path)
 
         self.assertTrue(result.success)
+        # 🔴 断言反过来了,理由要留着:原名 ``…keeps_quote_out_of_topic``、
+        # 断言 ``reply_in_thread is False``,与被它钉住的实现**出自同一个 commit**
+        # (``8e0a8dd2b3``)—— 那个 commit 删掉了 merge-base 上原有的 thread 路由。
+        # 在**线程内**(metadata 带 ``thread_id``)回复本来就该留在话题里;
+        # 硬编码 False 会把回答推到群主时间线。
+        # ⛔ 非线程的显式回复仍然是 False —— 由
+        # ``test_robot_round3_p1_fixes.py::…test_explicit_reply_to_outside_a_thread_unchanged`` 钉住。
         self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_audio_99992402_flat_retry_does_not_invent_reply_from_thread(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        list_messages = Mock(return_value=SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(items=[SimpleNamespace(message_id="om-thread-last")]),
+        ))
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(
+                file=SimpleNamespace(create=Mock()),
+                message=SimpleNamespace(list=list_messages),
+            ))
+        )
+        adapter._fetch_last_message_in_thread = AsyncMock(return_value="om-thread-last")
+        adapter._run_blocking = AsyncMock(return_value=SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(file_key="file_audio"),
+        ))
+        adapter._feishu_send_with_retry = AsyncMock(side_effect=[
+            SimpleNamespace(success=lambda: False, code=99992402),
+            SimpleNamespace(
+                success=lambda: True,
+                code=0,
+                data=SimpleNamespace(message_id="om_audio"),
+            ),
+        ])
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".ogg", delete=False) as tmp:
+            tmp.write(b"not-real-opus")
+            file_path = tmp.name
+        try:
+            result = asyncio.run(adapter.send_voice(
+                chat_id="oc_chat",
+                audio_path=file_path,
+                metadata={"thread_id": "omt-thread"},
+            ))
+        finally:
+            os.unlink(file_path)
+
+        self.assertTrue(result.success)
+        calls = adapter._feishu_send_with_retry.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].kwargs["metadata"], {"thread_id": "omt-thread"})
+        self.assertIsNone(calls[1].kwargs["reply_to"])
+        self.assertIsNone(calls[1].kwargs["metadata"])
+        list_messages.assert_not_called()
+        adapter._fetch_last_message_in_thread.assert_not_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_audio_99992402_explicit_reply_recovery_stays_available(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(file=SimpleNamespace(create=Mock())))
+        )
+        adapter._run_blocking = AsyncMock(return_value=SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(file_key="file_audio"),
+        ))
+        adapter._feishu_send_with_retry = AsyncMock(side_effect=[
+            SimpleNamespace(success=lambda: False, code=99992402),
+            SimpleNamespace(
+                success=lambda: True,
+                code=0,
+                data=SimpleNamespace(message_id="om_audio"),
+            ),
+        ])
+        metadata = {
+            "thread_id": "omt-thread",
+            "reply_to_message_id": "om-parent",
+        }
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".ogg", delete=False) as tmp:
+            tmp.write(b"not-real-opus")
+            file_path = tmp.name
+        try:
+            result = asyncio.run(adapter.send_voice(
+                chat_id="oc_chat",
+                audio_path=file_path,
+                metadata=metadata,
+            ))
+        finally:
+            os.unlink(file_path)
+
+        self.assertTrue(result.success)
+        calls = adapter._feishu_send_with_retry.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].kwargs["reply_to"], "om-parent")
+        self.assertEqual(calls[1].kwargs["metadata"], metadata)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_audio_99992402_reply_id_without_thread_recovers_with_quote(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(file=SimpleNamespace(create=Mock())))
+        )
+        adapter._run_blocking = AsyncMock(return_value=SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(file_key="file_audio"),
+        ))
+        adapter._feishu_send_with_retry = AsyncMock(side_effect=[
+            SimpleNamespace(success=lambda: False, code=99992402),
+            SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_audio")),
+        ])
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".ogg", delete=False) as tmp:
+            tmp.write(b"not-real-opus")
+            file_path = tmp.name
+        try:
+            result = asyncio.run(adapter.send_voice(
+                chat_id="oc_chat",
+                audio_path=file_path,
+                metadata={"reply_to_message_id": "om-parent"},
+            ))
+        finally:
+            os.unlink(file_path)
+
+        self.assertTrue(result.success)
+        calls = adapter._feishu_send_with_retry.await_args_list
+        self.assertEqual(calls[1].kwargs["reply_to"], "om-parent")
+        self.assertEqual(calls[1].kwargs["metadata"], {"reply_to_message_id": "om-parent"})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_audio_99992402_without_thread_or_reply_retries_flat_through_raw_send(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        upload_api = SimpleNamespace(create=Mock(return_value=SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(file_key="file_audio"),
+        )))
+        message_api = SimpleNamespace(create=Mock(side_effect=[
+            SimpleNamespace(success=lambda: False, code=99992402),
+            SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_audio")),
+        ]))
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(file=upload_api, message=message_api))
+        )
+
+        async def _direct(func, request):
+            return func(request)
+
+        adapter._run_blocking = _direct
+        with tempfile.NamedTemporaryFile("wb", suffix=".ogg", delete=False) as tmp:
+            tmp.write(b"not-real-opus")
+            file_path = tmp.name
+        try:
+            result = asyncio.run(adapter.send_voice(
+                chat_id="oc_chat",
+                audio_path=file_path,
+            ))
+        finally:
+            os.unlink(file_path)
+
+        self.assertTrue(result.success)
+        self.assertEqual(message_api.create.call_count, 2)
+        self.assertEqual(message_api.create.call_args_list[1].args[0].request_body.receive_id, "oc_chat")
 
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2465,5 +2696,3 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
-

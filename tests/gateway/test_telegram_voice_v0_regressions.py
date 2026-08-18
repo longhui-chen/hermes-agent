@@ -172,6 +172,49 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
 
 
 @pytest.mark.asyncio
+async def test_pending_feishu_stt_echo_is_flat_at_the_shared_exit():
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = _runner(adapter)
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc-chat",
+        chat_type="group",
+        thread_id="om-root",
+        message_id="om-question",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        message_id="om-question",
+    )
+    runner._pending_event_audio_paths = lambda _event: ["voice.ogg"]
+    runner._transcribe_pending_audio_event_once = AsyncMock(
+        return_value=('"hello"', ["hello"])
+    )
+    runner._should_echo_stt_transcripts = lambda: True
+    runner._thread_metadata_for_source = lambda *_args, **_kwargs: {
+        "thread_id": "om-root",
+        "reply_to_message_id": "om-question",
+    }
+    runner._reply_anchor_for_event = lambda _event: "om-question"
+
+    await runner._transcribe_and_echo_pending_voice(
+        event,
+        adapter,
+        source,
+        "",
+        log_context="test",
+    )
+
+    adapter.send.assert_awaited_once_with(
+        "oc-chat",
+        '🎙️ "hello"',
+        metadata={"thread_id": "om-root"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
     monkeypatch,
     tmp_path,
@@ -274,5 +317,4 @@ def _voice_event(source, urls):
         media_urls=list(urls),
         media_types=["audio/ogg"] * len(urls),
     )
-
 

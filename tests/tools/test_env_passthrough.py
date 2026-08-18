@@ -318,18 +318,79 @@ class TestTerminalIntegration:
             assert "PATH" in result
 
     def test_passthrough_cannot_override_connector_runtime_scope(self):
-        """Connector runtime vars are dedicated-runner only, never passthrough."""
+        """Connector runtime vars are dedicated-runner only, never passthrough.
+
+        ⚠️ 这条原本对 ``PROFILE_SCOPED_SUBPROCESS_ENV_KEYS`` **整个并集**断言
+        「键绝不出现在 run env」。但那个并集由 5 个语义不同的子集合拼成，而
+        "dedicated-runner only" 的理由（来自 `159b9c199f fix(connectors):
+        收紧连接器令牌执行边界`）只针对 **bearer token** 那几类。
+        ``PROFILE_PUBLIC_RUNTIME_ENV_KEYS`` 在定义处写的恰恰相反 ——
+        「平台拥有的、按 profile 隔离的路径能力……终端和 skills **需要随当前
+        profile 重注入**」。⇒ 对这一类要求「键不出现」是把连接器令牌的规则
+        套错了对象，也正是它挡住了 profile 隔离修复。
+
+        ⇒ 拆成两类：bearer 类**原保护一条不减**；public 路径类换成成对断言
+        （正向值对 / 反向外部值被丢弃 / profile 之间互不相等）。
+        """
         from tools.environments.local import (
+            PROFILE_PUBLIC_RUNTIME_ENV_KEYS,
             PROFILE_SCOPED_SUBPROCESS_ENV_KEYS,
             _make_run_env,
             _sanitize_subprocess_env,
         )
 
+        bearer_keys = PROFILE_SCOPED_SUBPROCESS_ENV_KEYS - PROFILE_PUBLIC_RUNTIME_ENV_KEYS
+        assert bearer_keys, "calibration: bearer 类为空,判据会恒真"
+
         for var in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
             register_env_passthrough([var])
+            # 无论哪一类,注册 passthrough 都不该让它成为 passthrough,
+            # 也不该让外部值穿过 sanitize —— 这两条对所有键都保持不变。
             assert not is_env_passthrough(var)
             assert var not in _sanitize_subprocess_env({var: "secret", "PATH": "/usr/bin"})
-            assert var not in _make_run_env({var: "secret"})
+
+        # ── bearer token:原契约,键绝不出现在通用子进程环境里 ──
+        for var in sorted(bearer_keys):
+            assert var not in _make_run_env({var: "secret"}), (
+                f"{var} 是 bearer token,⛔ 不该进通用子进程环境")
+
+        # ── public 路径能力:反向 —— 外部传入的值一律不被采纳 ──
+        for var in sorted(PROFILE_PUBLIC_RUNTIME_ENV_KEYS):
+            assert _make_run_env({var: "secret"}).get(var) != "secret", (
+                f"{var} 采纳了调用方传入的外部值,越过了 profile 派生")
+
+    def test_profile_public_runtime_keys_are_derived_per_profile(self, tmp_path,
+                                                                 monkeypatch):
+        """public 路径能力必须【按 profile 派生】,而且两个 profile 互不相等。
+
+        ⭐ 这条是 P1 那个缺陷的直接反面：`WECOM_CLI_CONFIG_DIR` 曾经硬指
+        `profiles/main`，于是 A profile 的企微 CLI 读到了 B profile 的配置。
+        只断言"外部值没被采纳"不够 —— 那只证明某个特定字符串没进来，
+        ⛔ 没证明进来的是**对的那个**。
+        """
+        from tools.environments.local import (
+            PROFILE_PUBLIC_RUNTIME_ENV_KEYS,
+            _make_run_env,
+        )
+
+        def _run_env_for(home):
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            return _make_run_env({})
+
+        env_a = _run_env_for(tmp_path / "profileA")
+        env_b = _run_env_for(tmp_path / "profileB")
+
+        derived = [k for k in sorted(PROFILE_PUBLIC_RUNTIME_ENV_KEYS) if k in env_a]
+        assert derived, (
+            "calibration: 一个 public 路径键都没被注入,下面的隔离断言会恒真")
+
+        for var in derived:
+            # 正向:值确实由当前 profile 派生(落在该 profile 目录下)
+            assert str(tmp_path / "profileA") in env_a[var], (
+                f"{var}={env_a[var]!r} 不是从当前 profile 派生的")
+            # 隔离:换个 profile 必须拿到不同的值
+            assert env_b.get(var) != env_a[var], (
+                f"{var} 在两个 profile 下相同({env_a[var]!r}) —— profile 隔离失效")
 
     def test_passthrough_allows_auxiliary_non_secret_routing(self):
         """AUXILIARY_*_PROVIDER / _MODEL and GATEWAY_RELAY routing hints are not

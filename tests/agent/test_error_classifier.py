@@ -67,6 +67,11 @@ class TestFailoverReason:
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
+            # Our own exception — every other member describes something that
+            # happened upstream, so without this one an AttributeError from
+            # our code falls through to `unknown` ("retry with backoff") and
+            # reaches the user as a `provider_*` code.
+            "internal_error",
             "unknown",
         }
         actual = {r.value for r in FailoverReason}

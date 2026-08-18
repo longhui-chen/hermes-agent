@@ -326,7 +326,7 @@ class TestInboundMessages:
         )
         adapter._text_batch_delay_seconds = 0  # disable batching for tests
         adapter.handle_message = AsyncMock()
-        adapter._extract_media = AsyncMock(return_value=(["/tmp/test.png"], ["image/png"]))
+        adapter._extract_media = AsyncMock(return_value=(["/tmp/test.png"], ["image/png"], []))
 
         payload = {
             "cmd": "aibot_msg_callback",
@@ -368,7 +368,7 @@ class TestWeComZombieSessionFix:
             )
         )
         adapter.handle_message = AsyncMock()
-        adapter._extract_media = AsyncMock(return_value=([], []))
+        adapter._extract_media = AsyncMock(return_value=([], [], []))
 
         payload = {
             "cmd": "aibot_msg_callback",

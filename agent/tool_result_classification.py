@@ -19,7 +19,18 @@ NO_EFFECT_TOOL_NAMES = frozenset({
 })
 
 
-def tool_may_have_side_effect(tool_name: str) -> bool:
+def tool_may_have_side_effect(tool_name: str, function_args: Any = None) -> bool:
+    # search_files target='nas' injects chat preview cards via local-server;
+    # its interrupted execution must stay effect-capable.
+    if tool_name == "search_files":
+        args = function_args
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = None
+        if isinstance(args, dict) and (args.get("target") or "") == "nas":
+            return True
     return tool_name not in NO_EFFECT_TOOL_NAMES
 
 

@@ -671,6 +671,7 @@ class InboundContext:
 
     # Populated by ContentExtractMiddleware
     raw_text: str = ""
+    user_authored_message: str = ""
     media_refs: list = dc_field(default_factory=list)
 
     # Populated by ExtractContentMiddleware for elem_type 1009 (WeChat forward).
@@ -1563,6 +1564,21 @@ class ExtractContentMiddleware(InboundMiddleware):
         return " ".join(parts) if parts else ""
 
     @staticmethod
+    def _extract_user_authored_message(msg_body: list) -> str:
+        """Return only text the Yuanbao user actually supplied."""
+        parts: list[str] = []
+        for elem in msg_body or []:
+            if not isinstance(elem, dict) or elem.get("msg_type") != "TIMTextElem":
+                continue
+            content = elem.get("msg_content") or {}
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+        return " ".join(parts).strip()
+
+    @staticmethod
     def _rewrite_slash_command(text: str) -> str:
         """Normalize input text: strip whitespace and convert full-width slash
         (Chinese input method) to ASCII slash so commands are recognized correctly.
@@ -1711,6 +1727,7 @@ class ExtractContentMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
+        ctx.user_authored_message = self._extract_user_authored_message(ctx.msg_body)
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         ctx.link_urls = self._extract_link_urls(ctx.msg_body)
         ctx.forwarded_records = self._extract_forwarded_records(ctx.msg_body, ctx.from_account)
@@ -2961,6 +2978,7 @@ class DispatchMiddleware(InboundMiddleware):
         async def _dispatch_inbound_event() -> None:
             event = MessageEvent(
                 text=ctx.raw_text,
+                user_authored_message=ctx.user_authored_message,
                 message_type=(
                     MessageType.DOCUMENT
                     if any(mt.startswith(("application/", "text/")) for mt in ctx.media_types)

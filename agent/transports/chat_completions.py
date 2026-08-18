@@ -651,7 +651,15 @@ class ChatCompletionsTransport(ProviderTransport):
             for k, v in overrides.items():
                 if k == "response_format" and _gemini_without_response_format:
                     if response_format_requires_structured_output(v):
-                        raise ValueError("response_format is not supported by the Gemini transport.")
+                        # 同上:HTTP 边界只认 ResponseFormatValidationError,
+                        # 普通 ValueError ⇒ 可操作的 400 退化成 500 内部异常。
+                        from agent.response_format import (
+                            ResponseFormatValidationError,
+                        )
+
+                        raise ResponseFormatValidationError(
+                            "response_format is not supported by the Gemini transport."
+                        )
                     continue
                 api_kwargs[k] = v
 
@@ -785,7 +793,15 @@ class ChatCompletionsTransport(ProviderTransport):
             for k, v in overrides.items():
                 if k == "response_format" and _gemini_without_response_format:
                     if response_format_requires_structured_output(v):
-                        raise ValueError("response_format is not supported by the Gemini transport.")
+                        # 同上:HTTP 边界只认 ResponseFormatValidationError,
+                        # 普通 ValueError ⇒ 可操作的 400 退化成 500 内部异常。
+                        from agent.response_format import (
+                            ResponseFormatValidationError,
+                        )
+
+                        raise ResponseFormatValidationError(
+                            "response_format is not supported by the Gemini transport."
+                        )
                     continue
                 if k == "extra_body" and isinstance(v, dict):
                     extra_body.update(v)

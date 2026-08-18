@@ -187,6 +187,38 @@ class TestGuidanceConstants:
         for text in required:
             assert text in guidance
 
+    @pytest.mark.parametrize(
+        ("lang", "own_files", "implicit_input", "controlled_index", "fallback"),
+        [
+            (
+                "en",
+                "files, photos, videos, recordings, meeting materials, or documents",
+                "as the object or input and no trusted file reference",
+                "controlled, permission-bounded index without asking for an exact path",
+                "only when `file-search` is unavailable",
+            ),
+            (
+                "zh",
+                "文件、照片、视频、录音、会议资料或文档",
+                "作为待查找、识别或处理的对象/输入",
+                "受控索引和权限范围检索，不要先要求准确路径",
+                "只有 `file-search` 不可用",
+            ),
+        ],
+    )
+    def test_private_discovery_routes_authorized_user_files_to_file_search(
+        self, lang, own_files, implicit_input, controlled_index, fallback
+    ):
+        kernel = zettlab_agent_kernel_guidance(lang)
+        turn = zettlab_turn_rules_guidance(lang)
+
+        for guidance in (kernel, turn):
+            assert '`skill_view(name="file-search")`' in guidance
+            assert own_files in guidance
+            assert implicit_input in guidance
+            assert controlled_index in guidance
+            assert fallback in guidance
+
     @pytest.mark.parametrize("lang", ["en", "zh"])
     def test_outbound_followup_supports_both_reply_languages_flow(self, lang):
         guidance = zettlab_turn_rules_guidance(lang)
@@ -475,6 +507,23 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
+
+    def test_file_search_trigger_concepts_survive_prompt_index(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "search" / "file-search"
+        skill_dir.mkdir(parents=True)
+        description = (
+            "Search user files, videos, meetings, people, OCR, documents."
+        )
+        assert len(description) == 60
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: file-search\ndescription: {description}\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert f"- file-search: {description}" in result
+        assert "file-search: Search user files, videos, meetings, people..." not in result
 
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(

@@ -520,6 +520,11 @@ def _apply_profile_override() -> None:
     profile_name = None
     consume = 0
     profile_index = None
+    # True once profile_name came from the sticky active_profile file rather
+    # than an explicit --profile/-p. Step 3 treats the two differently: an
+    # explicit flag that does not resolve is a hard error, while a stale
+    # sticky pointer must not brick every hermes command on the device.
+    from_sticky = False
 
     def _inside_mcp_add_args(index: int) -> bool:
         """True once argv reaches `hermes mcp add ... --args <command argv>`.
@@ -655,6 +660,7 @@ def _apply_profile_override() -> None:
                 name = active_path.read_text(encoding="utf-8").strip()
                 if name and name != "default":
                     profile_name = name
+                    from_sticky = True
                     consume = 0  # don't strip anything from argv
         except (UnicodeDecodeError, OSError):
             pass  # corrupted file, skip
@@ -667,7 +673,27 @@ def _apply_profile_override() -> None:
             hermes_home = resolve_profile_env(profile_name)
         except FileNotFoundError as exc:
             hermes_home = _resolve_sudo_user_profile_env(profile_name)
+            if not hermes_home and from_sticky:
+                # A dangling *sticky* pointer must not brick the CLI. delete_profile
+                # and rename_profile keep active_profile in sync, but a profile
+                # removed by anything else (e.g. the device's local-server clone
+                # flow, which deletes the old profile and creates a differently
+                # named one) leaves it naming a directory that no longer exists.
+                # Exiting here would take down every hermes invocation on the
+                # device — including `hermes profile use <name>`, the one command
+                # that repairs it. Fall back to default and say so loudly.
+                # Observed 2026-08-13 on board .212 (profile "zettlab" re-cloned
+                # as "zettlab-2").
+                print(
+                    f"Warning: active_profile names '{profile_name}', which no longer "
+                    f"exists — falling back to the default profile. "
+                    f"Repair with: hermes profile use <name>",
+                    file=sys.stderr,
+                )
+                return
             if not hermes_home:
+                # An explicit --profile/-p stays strict: the caller named this
+                # profile for this run, so a missing one is a hard error.
                 print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(1)
         except ValueError as exc:
@@ -12216,6 +12242,14 @@ def main():
         "--yes", "-y", action="store_true", help="Skip confirmation"
     )
 
+    sessions_delete_agent = sessions_subparsers.add_parser(
+        "delete-agent", help="Delete every chat session belonging to a local agent"
+    )
+    sessions_delete_agent.add_argument("agent_id", help="Local agent ID")
+    sessions_delete_agent.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation"
+    )
+
     sessions_prune = sessions_subparsers.add_parser(
         "prune",
         help="Delete old sessions (filterable by time window, source, title, ...)",
@@ -12348,6 +12382,43 @@ def main():
     )
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
+
+    sessions_import_transcript = sessions_subparsers.add_parser(
+        "import-transcript",
+        help="Copy another profile's conversation into this profile as a new session",
+        description=(
+            "Trusted Local Server operation. Fork a session across profiles: "
+            "read the source profile's "
+            "transcript read-only and publish the importable part of it as a "
+            "new session here. Only user/assistant messages carrying text "
+            "cross over — tool calls and in-flight state are rejected by the "
+            "import contract, because the target profile has its own toolset "
+            "and would otherwise be handed a history of calls it cannot make. "
+            "Idempotent on (source-session, target-session): re-running "
+            "returns the same result instead of duplicating the session."
+        ),
+    )
+    sessions_import_transcript.add_argument(
+        "--source-profile",
+        required=True,
+        help="Profile id to copy the session FROM (sibling under profiles/)",
+    )
+    sessions_import_transcript.add_argument(
+        "--source-session", required=True, help="Session id in the source profile"
+    )
+    sessions_import_transcript.add_argument(
+        "--target-session", required=True, help="Session id to create here"
+    )
+    sessions_import_transcript.add_argument(
+        "--owner-principal", required=True,
+        help="Local Server-attested owner principal; source and target must match it",
+    )
+    sessions_import_transcript.add_argument(
+        "--title", default=None, help="Title for the created session"
+    )
+    sessions_import_transcript.add_argument(
+        "--json", action="store_true", help="Emit a machine-readable result"
+    )
 
     sessions_rename = sessions_subparsers.add_parser(
         "rename", help="Set or change a session's title"

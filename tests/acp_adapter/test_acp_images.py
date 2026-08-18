@@ -1,4 +1,5 @@
 import base64
+from types import SimpleNamespace
 
 import pytest
 from acp.schema import (
@@ -11,6 +12,45 @@ from acp.schema import (
 )
 
 from acp_adapter.server import HermesACPAgent, _content_blocks_to_openai_user_content
+from acp_adapter.session import SessionManager
+
+
+class _NoopDb:
+    def get_session(self, *_args, **_kwargs):
+        return None
+
+    def create_session(self, *_args, **_kwargs):
+        return None
+
+    def update_session(self, *_args, **_kwargs):
+        return None
+
+
+class _CaptureConnection:
+    async def session_update(self, *_args, **_kwargs):
+        return None
+
+    async def request_permission(self, *_args, **_kwargs):
+        return SimpleNamespace(outcome="allow")
+
+
+class _CaptureAgent:
+    def __init__(self):
+        self.model = "fake-model"
+        self.provider = "fake-provider"
+        self.enabled_toolsets = ["hermes-acp"]
+        self.disabled_toolsets = []
+        self.tools = []
+        self.valid_tool_names = set()
+        self._supports_active_turn_redirect = True
+        self.calls = []
+
+    def run_conversation(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "final_response": "ok",
+            "messages": [{"role": "assistant", "content": "ok"}],
+        }
 
 
 def test_acp_image_blocks_convert_to_openai_multimodal_content():
@@ -70,12 +110,36 @@ async def test_initialize_advertises_image_prompt_capability():
     assert response.agent_capabilities.prompt_capabilities.image is True
 
 
+@pytest.mark.asyncio
+async def test_acp_image_only_turn_passes_explicit_user_caption_provenance():
+    fake = _CaptureAgent()
+    manager = SessionManager(agent_factory=lambda **_kwargs: fake, db=_NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    acp_agent.on_connect(_CaptureConnection())
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[
+            ImageContentBlock(
+                type="image",
+                data="aGVsbG8=",
+                mimeType="image/png",
+            )
+        ],
+    )
+
+    call = fake.calls[-1]
+    assert call["persist_user_message"] == "[Image attachment]"
+    assert call["user_authored_message"] == ""
+    assert call["user_message_has_image"] is True
+
+
 # 1x1 transparent PNG — smallest valid image payload for inlining tests.
 _ONE_PX_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
     "890000000a49444154789c6300010000000500010d0a2db40000000049454e44ae426082"
 )
-
 
 
 

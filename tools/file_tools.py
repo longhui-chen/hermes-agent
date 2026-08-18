@@ -2429,6 +2429,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
+                semantic: bool = False, path_prefix: str = "",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
@@ -2445,6 +2446,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             file_glob or "",
             limit,
             offset,
+            bool(semantic),
+            str(path_prefix or ""),
         )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
@@ -2465,6 +2468,22 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 pattern=pattern,
                 already_searched=count,
             )
+
+        # NAS library search: no workspace path involved, so the path
+        # resolution / sibling-profile / read-block machinery below does not
+        # apply. Dispatch straight to the ops layer; environments without the
+        # Zettlab NAS integration simply don't have the method.
+        if target == "nas":
+            file_ops = _get_file_ops(task_id)
+            nas_search = getattr(file_ops, "nas_search", None)
+            if nas_search is None:
+                return tool_error(
+                    "NAS search (target='nas') is not available in this environment."
+                )
+            result = nas_search(pattern=pattern, limit=limit,
+                                semantic=bool(semantic),
+                                path_prefix=str(path_prefix or ""))
+            return json.dumps(result.to_dict(densify=True), ensure_ascii=False)
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
@@ -2641,12 +2660,14 @@ PATCH_SCHEMA = {
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.\n\nNAS library search (target='nas', Zettlab devices only): searches the user's personal NAS files/photos/videos/documents by filename + parsed document content in one call. Hits render automatically as tappable preview cards in the chat — do NOT re-list them; reply with a short summary only. Set semantic=true for photo/visual queries (e.g. \"photos of birds\") — image-only AI matching, first call may take ~30s. pattern is plain keywords (not regex); path/file_glob/output_mode/context are ignored.",
     "parameters": {
         "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": "Regex pattern for content search, or glob pattern (e.g., '*.py') for file search"},
-            "target": {"type": "string", "enum": ["content", "files"], "description": "'content' searches inside file contents, 'files' searches for files by name", "default": "content"},
+            "pattern": {"type": "string", "description": "Regex pattern for content search, glob pattern (e.g., '*.py') for file search, or plain keywords for NAS search"},
+            "target": {"type": "string", "enum": ["content", "files", "nas"], "description": "'content' searches inside file contents, 'files' searches for files by name, 'nas' searches the user's NAS library (Zettlab devices; results become chat preview cards)", "default": "content"},
+            "semantic": {"type": "boolean", "description": "NAS search only: also run on-device AI visual matching (images). Use for photo/visual queries; first call may take ~30s.", "default": False},
+            "path_prefix": {"type": "string", "description": "NAS search only: absolute directory to scope hits to (e.g. the folder you just located), so the preview cards match exactly what you told the user. Must be inside the device's search roots."},
             "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
             "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
             "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
@@ -2710,7 +2731,9 @@ def _handle_search_files(args, **kw):
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
+        semantic=bool(args.get("semantic", False)),
+        path_prefix=str(args.get("path_prefix") or ""), task_id=tid)
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)

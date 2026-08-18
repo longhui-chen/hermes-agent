@@ -16,6 +16,7 @@ import socket as _socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import weakref
@@ -45,6 +46,147 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# 🔴 **引用租约的等待必须有独立硬期限。**
+# interim 发送在 ``gateway/run.py`` 里已被 ``_INTERIM_SEND_TIMEOUT`` 兜住,
+# 但那只放开了 **agent worker** —— 租约的释放走 ``consume()``,而 ``consume()``
+# 由发送任务的完成回调驱动。飞书 SDK 内部永久卡死时**回调永不执行**
+# ⇒ 最终正文在 ``metadata()`` 里无限等 ⇒ **用户的回答永远发不出去**。
+# ⭐ 半条链:我给 worker 设了阈值,却没给租约**独立的解除路径**。
+# ⛔ 期限不许拍脑袋:
+#   · 必须 **> ``_INTERIM_SEND_TIMEOUT``(15s)** —— 否则会在 interim 还在正常
+#     飞、马上就要释放的时候提前放弃,把本该带引用的正文降级成无引用。
+#   · 取值沿用**本文件既有的投递路径量纲** ``_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS``
+#     (30s = 2× interim 上限),⛔ 不另发明一个数。
+_FEISHU_QUOTE_LEASE_KEY = "_feishu_quote_lease"
+_FEISHU_QUOTE_RESERVATION_KEY = "_feishu_quote_reservation"
+_FEISHU_QUOTE_WAIT_TIMEOUT_SECONDS = _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS
+
+
+class FeishuQuoteLease:
+    """同一 turn 共享的飞书可见引用资格。"""
+
+    def __init__(self, reply_to_message_id: str | None):
+        self._reply_to_message_id = str(reply_to_message_id or "")
+        self._available = bool(self._reply_to_message_id)
+        self._reservation = None
+        self._condition = threading.Condition()
+
+    def metadata(
+        self,
+        metadata: dict | None,
+        cancelled: threading.Event | None = None,
+    ) -> dict | None:
+        prepared = dict(metadata) if metadata else {}
+        with self._condition:
+            existing = prepared.get(_FEISHU_QUOTE_RESERVATION_KEY)
+            deadline = time.monotonic() + _FEISHU_QUOTE_WAIT_TIMEOUT_SECONDS
+            timed_out = False
+            while (
+                self._available
+                and self._reservation is not None
+                and existing is not self._reservation
+                and not (cancelled and cancelled.is_set())
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                self._condition.wait(remaining)
+            if timed_out and not (cancelled and cancelled.is_set()):
+                # 持有者永远不会回来了(SDK 卡死 ⇒ consume 的回调不执行)。
+                # ⛔ **不抢占**它的 reservation —— 迟到的 interim 若最终发出,
+                #    引用仍归它,否则会出现**重复引用**。
+                # ⛔ **不清 ``self._reservation``** —— 它仍然属于那一趟。
+                # ⇒ 本趟降级为**无引用正文**,保证交付不被卡住。
+                logger.warning(
+                    "飞书引用租约等待超时 %.1fs,最终正文降级为无引用发送"
+                    "(迟到的 interim 仍保留其 reservation)",
+                    _FEISHU_QUOTE_WAIT_TIMEOUT_SECONDS,
+                )
+                prepared.pop("reply_to_message_id", None)
+                prepared.pop(_FEISHU_QUOTE_RESERVATION_KEY, None)
+                return prepared or None
+            if cancelled and cancelled.is_set():
+                prepared.pop("reply_to_message_id", None)
+                prepared.pop(_FEISHU_QUOTE_RESERVATION_KEY, None)
+                return prepared or None
+            if existing is not None and existing is self._reservation:
+                return prepared
+            prepared.pop(_FEISHU_QUOTE_RESERVATION_KEY, None)
+            if self._available and self._reservation is None:
+                self._reservation = object()
+                prepared["reply_to_message_id"] = self._reply_to_message_id
+                prepared[_FEISHU_QUOTE_RESERVATION_KEY] = self._reservation
+            else:
+                prepared.pop("reply_to_message_id", None)
+        return prepared or None
+
+    def reply_to(self, reply_to_message_id: str | None) -> str | None:
+        with self._condition:
+            return reply_to_message_id if self._available else None
+
+    def wake_waiters(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def consume(self, metadata: dict | None, result) -> None:
+        succeeded = result is True or getattr(result, "success", False)
+        reservation = (
+            metadata.get(_FEISHU_QUOTE_RESERVATION_KEY) if metadata else None
+        )
+        explicit_anchor = str(
+            (metadata or {}).get("reply_to_message_id") or ""
+        ) == self._reply_to_message_id
+        with self._condition:
+            owns_reservation = (
+                reservation is not None and reservation is self._reservation
+            )
+            legacy_unreserved = (
+                reservation is None
+                and self._reservation is None
+                and explicit_anchor
+            )
+            if succeeded and (owns_reservation or legacy_unreserved):
+                self._available = False
+                self._reservation = None
+                self._condition.notify_all()
+            elif not succeeded and owns_reservation:
+                self._reservation = None
+                self._condition.notify_all()
+
+
+def _feishu_quote_lease(metadata: dict | None) -> FeishuQuoteLease | None:
+    lease = metadata.get(_FEISHU_QUOTE_LEASE_KEY) if metadata else None
+    return lease if isinstance(lease, FeishuQuoteLease) else None
+
+
+def _feishu_quote_metadata(metadata: dict | None) -> dict | None:
+    lease = _feishu_quote_lease(metadata)
+    return lease.metadata(metadata) if lease else metadata
+
+
+async def _reserve_feishu_quote_metadata(metadata: dict | None) -> dict | None:
+    lease = _feishu_quote_lease(metadata)
+    if lease is None:
+        return metadata
+    cancelled = threading.Event()
+    worker = asyncio.create_task(
+        asyncio.to_thread(lease.metadata, metadata, cancelled)
+    )
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancelled.set()
+        lease.wake_waiters()
+        reserved = await asyncio.shield(worker)
+        lease.consume(reserved, False)
+        raise
+
+
+def _consume_feishu_quote(metadata: dict | None, result) -> None:
+    lease = _feishu_quote_lease(metadata)
+    if lease:
+        lease.consume(metadata, result)
 
 
 def _platform_name(platform) -> str:
@@ -83,6 +225,13 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
+    if _platform_name(getattr(source, "platform", None)) == "feishu":
+        lease = getattr(source, "_feishu_quote_lease", None)
+        if isinstance(lease, FeishuQuoteLease):
+            metadata[_FEISHU_QUOTE_LEASE_KEY] = lease
+        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        if anchor is not None:
+            metadata["reply_to_message_id"] = str(anchor)
     if not metadata:
         return None
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
@@ -94,6 +243,22 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
     return metadata
+
+
+def _flat_feishu_metadata(metadata: dict | None) -> dict | None:
+    """保留飞书路由上下文，但不可逆地移除可见引用资格。"""
+    if not metadata:
+        return metadata
+    if (
+        "reply_to_message_id" not in metadata
+        and _FEISHU_QUOTE_LEASE_KEY not in metadata
+    ):
+        return metadata
+    flat = dict(metadata)
+    flat.pop("reply_to_message_id", None)
+    flat.pop(_FEISHU_QUOTE_LEASE_KEY, None)
+    flat.pop(_FEISHU_QUOTE_RESERVATION_KEY, None)
+    return flat or None
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -133,8 +298,10 @@ def _reply_anchor_for_event(event) -> str | None:
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu":
+        if getattr(event, "_flat_feishu_delivery", False):
+            return None
+        return getattr(event, "message_id", None)
     return getattr(event, "message_id", None)
 
 
@@ -541,7 +708,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union, NamedTuple
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -767,7 +934,54 @@ def validate_inbound_media_size(
         )
 
 
-async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
+async def read_aiohttp_body_with_limit(response, *, media_type: str) -> bytearray:
+    """aiohttp 版的「有上限地读响应体」。
+
+    ⭐ 判据结构逐字照抄下面的 httpx 版 ``_read_httpx_body_with_limit``:
+    ①先按 ``Content-Length`` 早拒 ②再按累计字节复检（**头可以撒谎或缺失**）。
+    ⚠️ 唯一差异是库 API:aiohttp 用 ``response.content.iter_chunked(...)``,
+    httpx 用 ``response.aiter_bytes()``。⛔ 上限与校验函数**复用同一对**,
+    不另设第二套阈值。
+    分块大小照抄仓内 aiohttp 先例 ``plugins/platforms/matrix/adapter.py:2351``
+    的 ``65536``。
+
+    🔴 为什么必须有:裸 ``await response.read()`` 会把**整个**响应先读进内存,
+    之后才轮到落盘处的大小校验 —— 在 1C2G 设备上单个超大附件就能把进程
+    撑爆,大小门根本来不及生效。⭐「先读完再校验」= 没有校验。
+    """
+    max_bytes = get_inbound_media_max_bytes()
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            logger.debug(
+                "Ignoring invalid Content-Length for inbound %s: %r",
+                media_type, content_length,
+            )
+        else:
+            validate_inbound_media_size(
+                declared_size, media_type=media_type, max_bytes=max_bytes,
+            )
+    # 🔴 **⛔ 不许攒 chunk 列表再 join。**
+    # ``chunks`` 已持有完整响应体(N 字节),``b"".join(chunks)`` **再分配一份
+    # 同样大小** ⇒ 默认 128 MiB 上限下瞬时驻留约 **256 MiB**,在 ~2GB 共享设备上
+    # 足以把进程连同别人的会话一起压垮。⭐ 有上限 ≠ 有界:上限管的是**一份**。
+    # ⇒ 累积进**单个** ``bytearray`` 并**直接返回**,⛔ 不做 ``bytes(buf)``
+    # (那正是要删掉的那份复制)。调用点全集两处
+    # (``weixin.py:627`` 入站 / ``:2403`` 出站),都交给 ``handle.write(...)``。
+    buf = bytearray()
+    total = 0
+    async for chunk in response.content.iter_chunked(65536):
+        total += len(chunk)
+        validate_inbound_media_size(
+            total, media_type=media_type, max_bytes=max_bytes,
+        )
+        buf.extend(chunk)
+    return buf
+
+
+async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytearray:
     """Read an httpx streaming response body without exceeding the media cap.
 
     Rejects early on an oversized ``Content-Length`` header, then re-checks
@@ -789,13 +1003,16 @@ async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
                 declared_size, media_type=media_type, max_bytes=max_bytes,
             )
 
-    chunks: list[bytes] = []
+    # ⭐ 兄弟调用点:与上面 aiohttp 版**同一缺陷**。⛔ 不留一处旧写法。
+    # 调用点全集两处(:1080 image / :1222 audio),都交给 ``cache_*_from_bytes``
+    # → ``len()`` / 魔数比较 / 落盘,``bytearray`` 全部支持。
+    buf = bytearray()
     total = 0
     async for chunk in response.aiter_bytes():
         total += len(chunk)
         validate_inbound_media_size(total, media_type=media_type, max_bytes=max_bytes)
-        chunks.append(chunk)
-    return b"".join(chunks)
+        buf.extend(chunk)
+    return buf
 
 
 def get_image_cache_dir() -> Path:
@@ -813,7 +1030,11 @@ def _looks_like_image(data: bytes) -> bool:
         return True
     if data[:3] == b"\xff\xd8\xff":
         return True
-    if data[:6] in {b"GIF87a", b"GIF89a"}:
+    # ⚠️ ``bytes(...)`` 不能省:``data`` 现在可能是 ``bytearray``(读体函数改成
+    # 返回单个缓冲区)。**``bytearray`` 不可哈希**,直接 ``in {…}`` 会抛
+    # ``TypeError``,把 GIF 之外的图片判定一起打挂。⭐ 本文件唯一需要哈希的就是
+    # 这一处(其余是 ``==`` / ``len`` / ``.write``)—— 已按闭集扫过。
+    if bytes(data[:6]) in {b"GIF87a", b"GIF89a"}:
         return True
     if data[:2] == b"BM":
         return True
@@ -2126,6 +2347,11 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Original user-authored content before an adapter injects media anchors,
+    # sender attribution, reply context, or other model-facing scaffolding.
+    # Kept at the end to preserve existing positional construction.
+    user_authored_message: Optional[Any] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2523,6 +2749,156 @@ _RETRYABLE_ERROR_PATTERNS = (
 # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
 # ``None`` when the response was already delivered (e.g. via streaming).
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+
+
+class MediaFailure(NamedTuple):
+    """一次入站媒体没取到 —— ``kind`` 是哪类附件，``reason`` 是**为什么**。
+
+    ⭐ 放在 base 是因为 **wecom 与 weixin 两条 adapter 都要用**,而它承载的是
+    **面向用户的建议**:两份拷贝一旦漂移,同一种故障会在两个平台给出不同
+    (其中一个必然过时的)指引。⛔ 单一真相源。
+    """
+
+    kind: str
+    reason: str
+
+
+#: reason ⇒ 给**用户**的一句可行动的话。⛔ 新增 reason 必须同步登记。
+#: 判据「不写它用户会不会做错事」:过期类不立刻重发就永远拿不到,
+#: 存储类不清空间重发多少次都白搭,超限类不压缩重发必然再失败。
+#: ⛔ 一个字都不含 reason 码 / 路径 / 原始错误(那些只进日志)。
+MEDIA_FAILURE_ADVICE: Dict[str, str] = {
+    "download_failed": "没能下载到（附件链接会较快失效）。请重新发送。",
+    "decrypt_failed": "内容已损坏或链接已失效。请重新发送。",
+    "cache_write_failed": "设备存储写入失败。请清理存储空间后重试。",
+    "base64_decode_failed": "内容已损坏。请重新发送。",
+    "not_an_image": "这个图片格式无法识别。请改用 JPG 或 PNG 重发。",
+    "not_a_valid_media": "这个文件的格式无法识别。请换一种格式重发。",
+    "no_media_reference": "这条消息里没有附件内容。请重新发送。",
+    "payload_malformed": "这条消息里没有附件内容。请重新发送。",
+    # ⭐ 唯一一处「压缩」是**正确**建议的地方 —— 它对应的是真的太大。
+    "too_large": "文件超出平台的大小上限。请压缩后再发，或改发较小的文件。",
+}
+#: ⭐ 未知 reason ⛔ 不许伪装成成功、⛔ 也不许把 reason 码甩给用户。
+MEDIA_FAILURE_ADVICE_FALLBACK = "暂时读不到。请稍后重新发送。"
+
+
+def media_failure_reply_text(
+    failures: "List[MediaFailure]", labels: Dict[str, str]
+) -> str:
+    """把失败清单翻译成给**用户**的一句话:是什么 + 现在怎么办。
+
+    ``labels`` 由各 adapter 提供(它们的 kind 键不同:wecom 用
+    ``image``/``file``,weixin 用 item type 数字)。
+    ⛔ 不堆文案:名字一行、建议去重后最多两句,⛔ 无成功态 / 进度旁白。
+    """
+    kinds = "、".join(sorted({labels.get(f.kind, "附件") for f in failures}))
+    advice: List[str] = []
+    for f in failures:
+        tip = MEDIA_FAILURE_ADVICE.get(f.reason, MEDIA_FAILURE_ADVICE_FALLBACK)
+        if tip not in advice:
+            advice.append(tip)
+    return f"未能读取你发送的{kinds}。" + "".join(advice[:2])
+
+
+_SECRET_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s'\"<>]+")
+_ABS_PATH_RE = re.compile(r"(?<![\w])/(?:[\w.\-]+/){1,}[\w.\-]+")
+
+
+def _redact_url(m: "re.Match[str]") -> str:
+    """把 URL 压成 ``scheme://host[:port]/…`` —— 去掉 userinfo、path、query。"""
+    try:
+        u = urlsplit(m.group(0))
+        host = u.hostname or "?"
+        if u.port:
+            host = f"{host}:{u.port}"
+        return f"{u.scheme}://{host}/…"
+    except Exception:
+        return "<url>"
+
+
+def safe_exc(exc: BaseException) -> str:
+    """把异常渲染成**可诊断但不泄漏**的一行。
+
+    🔴 为什么需要它（实测，⛔ 不是猜的）——这些异常的 ``__str__`` 会带出机密：
+
+    ===============================  ==========================================
+    ``aiohttp.ClientResponseError``  ``403, message='...', url='https://u:pw@h/x?token=…'``
+    ``aiohttp.InvalidURL``           整条 URL 原样
+    ``httpx`` 的 ``raise_for_status``  ``Client error '403' for url 'https://…?token=…'``
+    ``OSError`` / ``FileNotFoundError``  ``[Errno 2] ... : '/Users/x/.secret/token.json'``
+    ===============================  ==========================================
+
+    各平台的媒体 url 都带鉴权参数,而 ``logger.warning("... %s", exc)`` 这种
+    写法在本仓**遍地都是** ⇒ 一次 403 就把 token 写进日志。
+    ⭐ 已有两个独立实证（wecom 媒体链接 · weixin 四个下载出口）。
+
+    保留:异常**类型名** + 清洗后的消息（URL 只剩 scheme+host，绝对路径只剩
+    最后一段）。⛔ 不整条丢掉 —— 「未授权」和「超时」必须还能分得开。
+
+    ⚠️ **本函数⛔ 挡不住 ``exc_info=True``**:traceback 里同样有异常消息。
+       那一面是**开集**,见 ``test_exception_logging_no_leak.py`` 的说明。
+    """
+    msg = str(exc)
+    msg = _SECRET_URL_RE.sub(_redact_url, msg)
+    msg = _ABS_PATH_RE.sub(lambda m: ".../" + m.group(0).rsplit("/", 1)[-1], msg)
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+def safe_traceback(exc: BaseException, limit: int = 12) -> str:
+    """把 traceback 渲染成**可诊断但不泄漏**的一段 —— ``exc_info=True`` 的替代品。
+
+    🔴 ``safe_exc`` 的 docstring 自己写着「⛔ 挡不住 ``exc_info=True``」并把那一面
+    标为**开集**。而 logging 在 ``exc_info=True`` 下会**重新格式化原始异常对象**,
+    于是 ``aiohttp.ClientResponseError`` 的完整签名 URL / userinfo / query token
+    照样落进 ``agent.log`` —— 一次附件上传失败就把渠道凭据**持久化**了。
+    ⇒ 在凭据真的会流过的调用点上,用这个函数替掉 ``exc_info=True``。
+
+    ⭐ 复用 ``safe_exc`` 的**同一套**清洗器,⛔ 不另发明第二套(会漂移)。
+    保留:调用栈的文件/行/函数(定位靠它)+ 清洗后的异常行。
+    ⛔ 丢掉:每一帧的源码文本 —— 那里同样可能带上字面量密钥。
+    """
+    import traceback as _traceback
+
+    frames = _traceback.extract_tb(exc.__traceback__)[-limit:]
+    lines = [f'  {f.filename}:{f.lineno} in {f.name}' for f in frames]
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        lines.append(f"  caused by {safe_exc(cause)}")
+    return safe_exc(exc) + ("\n" + "\n".join(lines) if lines else "")
+
+
+def log_media_intake_failure(
+    logger_: Any, platform: str, kind: str, reason: str,
+    url: str = "", exc: Optional[BaseException] = None, **extra: Any,
+) -> None:
+    """入站媒体没拿到 —— 留下【可区分、可定位】且**不泄漏凭据**的痕迹。
+
+    🔴 ⛔ 不许把异常对象直接 ``%s`` 进日志:``aiohttp.ClientResponseError``
+    的 ``__str__`` **包含完整 URL**(实测 403 日志里出现
+    ``...?token=TOP_SECRET``),而各平台的媒体 url 都带鉴权参数。
+    ⇒ 只记异常**类型名**,加上足以定位、又不含凭据的 host 摘要。
+    ⚠️ 我在 wecom 侧修过这个形状(``netloc`` 含 userinfo),却没扫到 weixin
+    的四个下载出口 —— **兄弟调用点没跟上**。
+
+    🔴 用 ``.hostname`` 而不是 ``.netloc``:``netloc`` **包含 userinfo**,
+    ``https://user:secret@host/x`` 的 netloc 就是 ``user:secret@host``。
+    """
+    host = ""
+    if url:
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or ""
+            if host and parsed.port:
+                host = f"{host}:{parsed.port}"
+        except Exception:
+            host = "<unparsable>"
+    logger_.warning(
+        "[%s] 入站媒体获取失败: kind=%s reason=%s url_host=%s err=%s%s",
+        platform, kind, reason, host or "-",
+        type(exc).__name__ if exc is not None else "-",
+        "".join(f" {k}={v}" for k, v in sorted(extra.items())),
+    )
 
 
 def resolve_channel_prompt(
@@ -3912,13 +4288,13 @@ class BasePlatformAdapter(ABC):
                 return
         await self.stop_typing(chat_id)
 
-    async def send_multiple_images(
+    async def _send_multiple_images_with_result(
         self,
         chat_id: str,
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> bool:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3933,9 +4309,11 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        sent_any = False
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
+            item_metadata = await _reserve_feishu_quote_metadata(metadata)
             try:
                 logger.info(
                     "[%s] Sending image: %s (alt=%s)",
@@ -3948,26 +4326,48 @@ class BasePlatformAdapter(ABC):
                         chat_id=chat_id,
                         image_path=_unquote(image_url[7:]),
                         caption=alt_text if alt_text else None,
-                        metadata=metadata,
+                        metadata=item_metadata,
                     )
                 elif self._is_animation_url(image_url):
                     img_result = await self.send_animation(
                         chat_id=chat_id,
                         animation_url=image_url,
                         caption=alt_text if alt_text else None,
-                        metadata=metadata,
+                        metadata=item_metadata,
                     )
                 else:
                     img_result = await self.send_image(
                         chat_id=chat_id,
                         image_url=image_url,
                         caption=alt_text if alt_text else None,
-                        metadata=metadata,
+                        metadata=item_metadata,
                     )
+                _consume_feishu_quote(item_metadata, img_result)
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                else:
+                    sent_any = True
+            except asyncio.CancelledError:
+                _consume_feishu_quote(item_metadata, False)
+                raise
             except Exception as img_err:
+                _consume_feishu_quote(item_metadata, False)
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+        return sent_any
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        await self._send_multiple_images_with_result(
+            chat_id=chat_id,
+            images=images,
+            metadata=metadata,
+            human_delay=human_delay,
+        )
 
     async def send_image(
         self,
@@ -4924,6 +5324,19 @@ class BasePlatformAdapter(ABC):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
+
+    def note_long_running_turn(self, source: "SessionSource") -> None:
+        """gateway 每发出一次「仍在处理」心跳时调用。默认 no-op（ZET-2111）。
+
+        ⭐ 判据设计：**被调到这件事本身**就蕴含了两个条件 —— 这一轮跑够了
+        `HERMES_AGENT_NOTIFY_INTERVAL`，且用户没有关掉长任务通知。心跳只在这
+        两条都成立时才发。
+        ⛔ 因此 adapter 里不许自己重新读阈值 / 开关判一遍：那两个判据长在
+        gateway 的闭包里（`_display_surface_mode` 依赖 `source` /
+        `user_config` / `platform_key`，adapter 复用不了），各判一次必然漂移。
+        ⛔ 也不许靠 metadata 反推 —— 心跳与所有状态/进度消息共用
+        `_non_conversational_metadata`，从消息侧分辨不出来。
+        """
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes.
@@ -6015,7 +6428,11 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
-                            metadata=_final_thread_metadata,
+                            metadata=(
+                                dict(_final_thread_metadata)
+                                if _platform_name(self.platform) != "feishu"
+                                else _flat_feishu_metadata(_final_thread_metadata)
+                            ),
                         )
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
@@ -6037,7 +6454,11 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
+                _text_result = None
                 if text_content and not _tts_caption_delivered:
+                    _text_metadata = await _reserve_feishu_quote_metadata(
+                        _final_thread_metadata
+                    )
                     delivery_adapter = self._final_delivery_adapter(event.source)
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
@@ -6088,12 +6509,21 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    try:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_text_metadata,
+                        )
+                    except asyncio.CancelledError:
+                        _consume_feishu_quote(_text_metadata, False)
+                        raise
+                    except Exception:
+                        _consume_feishu_quote(_text_metadata, False)
+                        raise
+                    _text_result = result
+                    _consume_feishu_quote(_text_metadata, result)
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -6129,20 +6559,60 @@ class BasePlatformAdapter(ABC):
                             ttl_seconds=_ephemeral_ttl,
                         )
 
+                _media_thread_metadata = _final_thread_metadata
+                if (
+                    _platform_name(self.platform) == "feishu"
+                    and _text_result is not None
+                    and getattr(_text_result, "success", False)
+                ):
+                    _media_thread_metadata = _flat_feishu_metadata(_final_thread_metadata)
+                _feishu_media_quote_available = bool(
+                    _platform_name(self.platform) == "feishu"
+                    and _media_thread_metadata
+                    and _media_thread_metadata.get("reply_to_message_id")
+                )
+
+                async def _next_media_metadata():
+                    if _platform_name(self.platform) == "feishu":
+                        if not _feishu_media_quote_available:
+                            return _flat_feishu_metadata(_media_thread_metadata)
+                        return await _reserve_feishu_quote_metadata(
+                            _media_thread_metadata
+                        )
+                    return _media_thread_metadata
+
+                def _consume_feishu_media_quote(metadata, result):
+                    nonlocal _feishu_media_quote_available
+                    _consume_feishu_quote(metadata, result)
+                    if _feishu_media_quote_available and getattr(result, "success", False) is True:
+                        _feishu_media_quote_available = False
+
+                def _consume_feishu_batch_quote(metadata, sent_any):
+                    nonlocal _feishu_media_quote_available
+                    _consume_feishu_quote(metadata, sent_any)
+                    if _feishu_media_quote_available and sent_any is True:
+                        _feishu_media_quote_available = False
+
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
                 # Send extracted images as native attachments
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
+                    _image_metadata = await _next_media_metadata()
                     try:
-                        await self.send_multiple_images(
+                        image_sent = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
-                            metadata=_final_thread_metadata,
+                            metadata=_image_metadata,
                             human_delay=human_delay,
                         )
+                        _consume_feishu_batch_quote(_image_metadata, image_sent)
+                    except asyncio.CancelledError:
+                        _consume_feishu_batch_quote(_image_metadata, False)
+                        raise
                     except Exception as batch_err:
+                        _consume_feishu_batch_quote(_image_metadata, False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -6176,15 +6646,21 @@ class BasePlatformAdapter(ABC):
                         _non_image_local.append(file_path)
 
                 if _image_paths:
+                    _image_metadata = await _next_media_metadata()
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_sent = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
-                            metadata=_final_thread_metadata,
+                            metadata=_image_metadata,
                             human_delay=human_delay,
                         )
+                        _consume_feishu_batch_quote(_image_metadata, image_sent)
+                    except asyncio.CancelledError:
+                        _consume_feishu_batch_quote(_image_metadata, False)
+                        raise
                     except Exception as batch_err:
+                        _consume_feishu_batch_quote(_image_metadata, False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 if _non_image_media:
@@ -6196,13 +6672,14 @@ class BasePlatformAdapter(ABC):
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
+                    _media_metadata = await _next_media_metadata()
                     try:
                         ext = Path(media_path).suffix.lower()
                         if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
                             media_result = await self.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_media_metadata,
                             )
                         elif ext in _VIDEO_EXTS:
                             logger.info(
@@ -6214,13 +6691,13 @@ class BasePlatformAdapter(ABC):
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_media_metadata,
                             )
                         else:
                             media_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_media_metadata,
                             )
 
                         if not media_result.success:
@@ -6229,28 +6706,38 @@ class BasePlatformAdapter(ABC):
                                 event.source.chat_id,
                                 media_path,
                                 is_voice=is_voice,
-                                metadata=_final_thread_metadata,
+                                metadata=(
+                                    _flat_feishu_metadata(_final_thread_metadata)
+                                    if _platform_name(self.platform) == "feishu"
+                                    else _final_thread_metadata
+                                ),
                             )
+                        _consume_feishu_media_quote(_media_metadata, media_result)
+                    except asyncio.CancelledError:
+                        _consume_feishu_media_quote(_media_metadata, False)
+                        raise
                     except Exception as media_err:
+                        _consume_feishu_media_quote(_media_metadata, False)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
+                    _file_metadata = await _next_media_metadata()
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
                             file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_file_metadata,
                             )
                         else:
                             file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_file_metadata,
                             )
                         if not file_result.success:
                             logger.warning(
@@ -6262,9 +6749,18 @@ class BasePlatformAdapter(ABC):
                             await self._notify_media_delivery_failure(
                                 event.source.chat_id,
                                 file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=(
+                                    _flat_feishu_metadata(_final_thread_metadata)
+                                    if _platform_name(self.platform) == "feishu"
+                                    else _final_thread_metadata
+                                ),
                             )
+                        _consume_feishu_media_quote(_file_metadata, file_result)
+                    except asyncio.CancelledError:
+                        _consume_feishu_media_quote(_file_metadata, False)
+                        raise
                     except Exception as file_err:
+                        _consume_feishu_media_quote(_file_metadata, False)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing

@@ -124,6 +124,76 @@ def test_multiplex_managed_env_remains_final_authority(tmp_path, monkeypatch):
     assert not GatewayConfig.from_dict({"multiplex_profiles": True}).multiplex_profiles
 
 
+def test_managed_gateway_reasserts_secretless_langfuse_policy_after_all_dotenv_layers(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    project_env = tmp_path / "project.env"
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    stale = (
+        "HERMES_MANAGED_GATEWAY=0\n"
+        "HERMES_LANGFUSE_MODE=direct\n"
+        "HERMES_LANGFUSE_BASE_URL=https://langfuse.example\n"
+        "HERMES_LANGFUSE_PUBLIC_KEY=old-public\n"
+        "HERMES_LANGFUSE_SECRET_KEY=old-secret\n"
+        "LANGFUSE_PUBLIC_KEY=old-global-public\n"
+        "LANGFUSE_SECRET_KEY=old-global-secret\n"
+        "LANGFUSE_BASIC_AUTH=Basic YTpi\n"
+        "LANGFUSE_OTEL_TRACES_EXPORT_PATH=wrong/path\n"
+    )
+    (home / ".env").write_text(stale, encoding="utf-8")
+    project_env.write_text(stale, encoding="utf-8")
+    (managed / ".env").write_text(stale, encoding="utf-8")
+
+    _reset_env_loader_operator_snapshot(monkeypatch)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_LANGFUSE_MODE", "relay")
+    monkeypatch.setenv("HERMES_LANGFUSE_BASE_URL", "http://127.0.0.1:19092")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+    load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert os.environ["HERMES_MANAGED_GATEWAY"] == "1"
+    assert os.environ["HERMES_LANGFUSE_MODE"] == "relay"
+    assert os.environ["HERMES_LANGFUSE_BASE_URL"] == "http://127.0.0.1:19092"
+    for key in env_loader._MANAGED_LANGFUSE_CREDENTIAL_KEYS:
+        assert key not in os.environ
+
+
+def test_dotenv_cannot_grant_managed_gateway_langfuse_policy(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_MANAGED_GATEWAY=1\n"
+        "HERMES_LANGFUSE_MODE=direct\n"
+        "HERMES_LANGFUSE_BASE_URL=https://langfuse.example\n"
+        "LANGFUSE_SECRET_KEY=dotenv-secret\n",
+        encoding="utf-8",
+    )
+
+    _reset_env_loader_operator_snapshot(monkeypatch)
+    for key in (
+        "HERMES_MANAGED_GATEWAY",
+        "HERMES_LANGFUSE_MODE",
+        "HERMES_LANGFUSE_BASE_URL",
+        "LANGFUSE_SECRET_KEY",
+    ):
+        # Register an undo operation before making the key absent. A bare
+        # delenv on an already-absent key cannot clean up a value later loaded
+        # directly into os.environ by dotenv.
+        monkeypatch.setenv(key, "pytest-cleanup-sentinel")
+        monkeypatch.delenv(key, raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["HERMES_MANAGED_GATEWAY"] == "1"
+    assert os.environ["HERMES_LANGFUSE_MODE"] == "direct"
+    assert os.environ["HERMES_LANGFUSE_BASE_URL"] == "https://langfuse.example"
+    assert os.environ["LANGFUSE_SECRET_KEY"] == "dotenv-secret"
+
+
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()
