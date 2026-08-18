@@ -173,6 +173,11 @@ _CAPABILITY_DELIVERED_RE = re.compile(
     r"(?:created|configured|updated|deployed|seeded|synchronized|synced)",
     re.IGNORECASE,
 )
+# 花括号定界是刻意的，别改成 `(.*?)`。结束标签在后面锚着，非贪婪匹配会一路
+# 回溯扩展到配对的那个 `}`——title 里含 `}`（"JSON {schema}"）或 payload 有嵌套
+# 对象都解得对。反过来 `(.*?)` 在 JSON 字符串里恰好出现结束标签时会提前收尾，
+# 比现在更脆弱。（2026-08-19 有一轮 review 按「非贪婪会在第一个 `}` 收尾」报过
+# 这里，实测不成立。）
 _RECOMMENDATION_RESPONSE_RE = re.compile(
     r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
     r"\[/creation_recommendation_response\]",
