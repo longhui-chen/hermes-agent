@@ -477,6 +477,56 @@ def _valid_tool_names_for_response(agent: Any) -> set[str]:
     return valid
 
 
+def _seal_video_edit_provider_request(
+    agent: Any,
+    api_kwargs: Dict[str, Any],
+) -> bool:
+    """Re-apply the trusted video request contract at the provider boundary.
+
+    Request middleware and Relay are allowed to return a replacement payload.
+    The final transport callback therefore must not rely on the earlier
+    conversation-loop snapshot for tool visibility or thinking policy.  This
+    helper is deliberately narrow: non-Zettlab, non-video, and non-chat
+    requests are left untouched.
+    """
+    if not isinstance(api_kwargs, dict):
+        return False
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    if getattr(agent, "api_mode", "") != "chat_completions":
+        return False
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    if not bool(getattr(task, "video_edit_applicable", False)):
+        return False
+
+    bootstrap_required = _video_edit_skill_load_required(agent)
+    scope_active = trusted_skill_scope_active(agent)
+    changed = False
+
+    if bootstrap_required:
+        changed = _apply_forced_video_edit_skill_view(agent, api_kwargs) or changed
+    elif scope_active:
+        changed = _apply_zet_agent_plan_tool_visibility(agent, api_kwargs) or changed
+
+    # The provider rejects a follow-up containing an assistant tool call when
+    # thinking mode is enabled but no reasoning_content is echoed back.  The
+    # same route/model predicate used by the bootstrap applies to every
+    # trusted video request, not only the first skill_view call.
+    if (bootstrap_required or scope_active) and _should_disable_thinking_for_forced_tool_choice(agent):
+        before = (
+            api_kwargs.get("extra_body"),
+            api_kwargs.get("reasoning_effort"),
+        )
+        _disable_thinking_for_forced_tool_choice(api_kwargs)
+        agent._zet_agent_force_present_plan_disable_thinking = True
+        changed = changed or before != (
+            api_kwargs.get("extra_body"),
+            api_kwargs.get("reasoning_effort"),
+        )
+
+    return changed
+
+
 def _error_text(error: Exception) -> str:
     parts = []
     for value in (

@@ -9,8 +9,10 @@ from agent.conversation_loop import (
     _apply_forced_video_edit_skill_view,
     _apply_zet_agent_plan_tool_visibility,
     _enforce_single_plan_interaction_tool_call,
+    _seal_video_edit_provider_request,
     _valid_tool_names_for_response,
 )
+from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 from gateway.session_context import clear_turn_vars, set_turn_vars
 from run_agent import AIAgent
 
@@ -263,6 +265,103 @@ def test_video_edit_skill_force_stops_after_trusted_scope_activates(monkeypatch)
         "terminal",
     ]
     assert "tool_choice" not in api_kwargs
+
+
+def test_provider_boundary_reseals_bootstrap_after_middleware_replacement(
+    monkeypatch,
+):
+    """A replacement payload cannot bypass the exact skill_view bootstrap."""
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: False,
+    )
+    skill_tool = _tool("skill_view")
+    agent = _agent(
+        valid_tool_names={"skill_view", "terminal"},
+        _zet_agent_execution_policy_tools=[skill_tool, _tool("terminal")],
+        _zet_agent_execution_policy_valid_tool_names={"skill_view", "terminal"},
+    )
+    # This is the shape an execution middleware replacement could return after
+    # the normal conversation-loop policy pass.
+    replacement = {
+        "messages": [{"role": "user", "content": "剪辑"}],
+        "tools": [_tool("terminal")],
+        "tool_choice": "required",
+        "reasoning_effort": "high",
+    }
+    client = MagicMock()
+    client.chat.completions.create.return_value = _text_response("ok")
+
+    _dispatch_nonstreaming_api_request(
+        agent,
+        replacement,
+        make_client=lambda *_args, **_kwargs: client,
+    )
+
+    sent = client.chat.completions.create.call_args.kwargs
+    assert [tool["function"]["name"] for tool in sent["tools"]] == [
+        "skill_view"
+    ]
+    assert sent["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "skill_view"},
+    }
+    assert sent["parallel_tool_calls"] is False
+    assert sent["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in sent
+
+
+def test_provider_boundary_reseals_active_scope_follow_up(monkeypatch):
+    """Follow-up provider calls retain the trusted allowlist and no-thinking policy."""
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"terminal"}),
+    )
+    agent = _agent(valid_tool_names={"skill_view", "terminal", "todo"})
+    replacement = {
+        "tools": [_tool("terminal"), _tool("todo")],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "terminal"},
+        },
+        "reasoning_effort": "high",
+    }
+
+    assert _seal_video_edit_provider_request(agent, replacement)
+    assert [tool["function"]["name"] for tool in replacement["tools"]] == [
+        "terminal"
+    ]
+    assert replacement["parallel_tool_calls"] is False
+    assert replacement["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in replacement
+
+
+def test_policy_exhausted_scope_is_not_an_active_capability():
+    tokens = set_turn_vars(turn_id="policy-exhausted-video")
+    try:
+        identity = response_mode._current_skill_direct_turn_identity()
+        assert identity is not None
+        task = response_mode._SkillDirectTaskContext(
+            task_sha256="task-policy-exhausted",
+            turn_identity=identity,
+            video_edit_applicable=True,
+        )
+        agent = _agent(_zet_agent_skill_direct_task=task)
+        agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
+            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+            task_sha256=task.task_sha256,
+            turn_identity=identity,
+            allowed_tools=frozenset(),
+            policy_exhausted=True,
+        )
+
+        assert response_mode.trusted_skill_scope_active(agent) is False
+    finally:
+        clear_turn_vars(tokens)
 
 
 def test_video_edit_skill_force_does_not_change_non_video_or_plan_requests(monkeypatch):

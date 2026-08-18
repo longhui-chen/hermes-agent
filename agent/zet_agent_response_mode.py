@@ -1438,7 +1438,11 @@ def trusted_skill_scope_active(agent: Any) -> bool:
             and isinstance(task, _SkillDirectTaskContext)
             and task.turn_identity == turn_identity
             and task.task_sha256 == scope.task_sha256
-            and (scope.allowed_tools or scope.policy_exhausted)
+            # A bounded policy failure is a terminal capability state, not an
+            # active scope.  Treating ``policy_exhausted`` as active lets the
+            # request skip the fresh attested ``skill_view`` bootstrap and can
+            # leak a stale provider tool list into the next retry.
+            and bool(scope.allowed_tools)
         )
 
 
