@@ -812,7 +812,8 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
     try:
         parsed = urlsplit(raw)
     except Exception:
-        return raw[:max_len]
+        # 畸形 URL 仍可能携带签名 query；解析失败时绝不能退回客户端原文。
+        return "<invalid-url>"[:max_len]
 
     if parsed.scheme and parsed.netloc:
         # Strip potential embedded credentials (user:pass@host).
@@ -981,14 +982,19 @@ async def read_aiohttp_body_with_limit(response, *, media_type: str) -> bytearra
     return buf
 
 
-async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytearray:
+async def _read_httpx_body_with_limit(
+    response,
+    *,
+    media_type: str,
+    max_bytes: Optional[int] = None,
+) -> bytearray:
     """Read an httpx streaming response body without exceeding the media cap.
 
     Rejects early on an oversized ``Content-Length`` header, then re-checks
     the running total as chunks arrive so a lying/absent header can't smuggle
     an unbounded body past the cap.
     """
-    max_bytes = get_inbound_media_max_bytes()
+    max_bytes = get_inbound_media_max_bytes() if max_bytes is None else max_bytes
     content_length = response.headers.get("content-length")
     if content_length:
         try:
@@ -1072,7 +1078,13 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     return str(filepath)
 
 
-async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) -> str:
+async def cache_image_from_url(
+    url: str,
+    ext: str = ".jpg",
+    retries: int = 2,
+    *,
+    max_bytes: Optional[int] = None,
+) -> str:
     """
     Download an image from a URL and save it to the local cache.
 
@@ -1114,7 +1126,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
                 ) as response:
                     response.raise_for_status()
                     content = await _read_httpx_body_with_limit(
-                        response, media_type="image",
+                        response, media_type="image", max_bytes=max_bytes,
                     )
                 return cache_image_from_bytes(content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
@@ -2802,7 +2814,9 @@ def media_failure_reply_text(
 
 
 _SECRET_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s'\"<>]+")
+_DATA_URI_RE = re.compile(r"data:[^\s'\"<>]*,[^\s'\"<>]*", re.IGNORECASE)
 _ABS_PATH_RE = re.compile(r"(?<![\w])/(?:[\w.\-]+/){1,}[\w.\-]+")
+_SAFE_EXC_MESSAGE_MAX_CHARS = 2048  # 与仓内约 2000 字符的诊断预览同量级
 
 
 def _redact_url(m: "re.Match[str]") -> str:
@@ -2840,8 +2854,12 @@ def safe_exc(exc: BaseException) -> str:
        那一面是**开集**,见 ``test_exception_logging_no_leak.py`` 的说明。
     """
     msg = str(exc)
+    msg = _DATA_URI_RE.sub("<data-uri>", msg)
     msg = _SECRET_URL_RE.sub(_redact_url, msg)
     msg = _ABS_PATH_RE.sub(lambda m: ".../" + m.group(0).rsplit("/", 1)[-1], msg)
+    msg = re.sub(r"[\r\n]+", " ", msg)
+    if len(msg) > _SAFE_EXC_MESSAGE_MAX_CHARS:
+        msg = msg[: _SAFE_EXC_MESSAGE_MAX_CHARS - 1].rstrip() + "…"
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
@@ -2893,12 +2911,163 @@ def log_media_intake_failure(
                 host = f"{host}:{parsed.port}"
         except Exception:
             host = "<unparsable>"
+    safe_host = _LOG_UNSAFE_CHARS.sub("?", host)[:80]
+    safe_extra = []
+    for key, value in sorted(extra.items()):
+        if key in {"content_type", "mime_type"}:
+            label = _probe_media_type_label(value)
+        else:
+            label = _LOG_UNSAFE_CHARS.sub("?", str(value))[:80] or "-"
+        safe_extra.append(f" {key}={label}")
     logger_.warning(
         "[%s] 入站媒体获取失败: kind=%s reason=%s url_host=%s err=%s%s",
-        platform, kind, reason, host or "-",
+        platform, kind, reason, safe_host or "-",
         type(exc).__name__ if exc is not None else "-",
-        "".join(f" {k}={v}" for k, v in sorted(extra.items())),
+        "".join(safe_extra),
     )
+
+
+#: 入站媒体观测点的**唯一**前缀。
+#:
+#: 🔴 为什么要有它(踩过的坑):上一次排查时,窗口里 6 条命中**全部来自
+#: traceback 本身** —— 我搜的字符串同时出现在源码行里,于是异常一打印就"命中",
+#: 量具和被测对象混在一起,证不了任何事。
+#: ⇒ 这个前缀①全仓只出现在**一处产出点**(门里钉死)②只在 ``logger.info``
+#: 的正常路径打,**永远不在 except 块里** ⇒ 它出现 = 真有一条入站媒体消息
+#: 走到了这里,⛔ 不可能是 traceback 顺带带出来的。
+_IM_MEDIA_PROBE = "[IM-MEDIA-PROBE]"
+_IM_MEDIA_PROBE_MAX_SAMPLES = 8
+_IM_MEDIA_PROBE_KNOWN_MIMES = frozenset({
+    *_AUDIO_MIME_TYPES.values(),
+    *SUPPORTED_VIDEO_TYPES.values(),
+    *SUPPORTED_DOCUMENT_TYPES.values(),
+    *SUPPORTED_IMAGE_DOCUMENT_TYPES.values(),
+    "application/octet-stream",
+    "audio/aac",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/silk",
+    "audio/x-m4a",
+    "audio/x-opus+ogg",
+})
+
+#: 探针失败时的前缀 —— ⛔ 不许静默吞掉(探针自己坏了也得看得见)。
+_IM_MEDIA_PROBE_ERR = "[IM-MEDIA-PROBE-ERR]"
+
+
+def _probe_media_type_label(value: Any) -> str:
+    """把发送方 MIME 压成已知闭集标签；未知值不回显原文。"""
+    primary = str(value or "").split(";", 1)[0].strip().lower()
+    return primary if primary in _IM_MEDIA_PROBE_KNOWN_MIMES else "other"
+
+
+def _probe_correlation_id(event: Any) -> str:
+    """给这条消息一个短关联 ID —— ⛔ 不回显原始 chat_id / user_id / message_id。
+
+    确定性哈希:同一条消息在日志里前后几行拿到的是同一个 ID,
+    用户报「我发的那张图」时能对得上,又不落任何可反查的身份。
+    """
+    import hashlib
+
+    src = getattr(event, "source", None)
+    seed = "|".join(
+        str(x)
+        for x in (
+            getattr(getattr(src, "platform", None), "value", getattr(src, "platform", "")),
+            getattr(src, "chat_id", ""),
+            getattr(event, "message_id", ""),
+        )
+    )
+    return hashlib.sha1(seed.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def log_inbound_media_probe(event: Any) -> None:
+    """入站媒体观测点 —— 让一次真机实测**能产出判定**,而不是又一次「没反应」。
+
+    ⭐ 它回答的唯一问题:**这条媒体消息到 Hermes 手里时,长什么样?**
+
+    ==============================  ====================================
+    ``n_urls > 0`` 且关口判 True    附件到了、也认出来了 ⇒ 链路通
+    ``n_urls > 0`` 但关口判 False   附件到了、**MIME/类型判错** ⇒ **归 Hermes**
+    ``n_urls == 0`` 而消息是媒体型  附件**根本没到** ⇒ 归上游(板端/adapter 下载)
+    ==============================  ====================================
+
+    ⭐ 同一轮里用**飞书当阳性对照**:飞书那条打出 ``n_urls>0`` 而目标渠道打出
+    ``n_urls=0``,归属当场判定,⛔ 不需要再猜。
+
+    🔴 ⛔ 不许写进这条日志的东西(这轮刚修完三处凭据泄漏,⛔ 别自己又开一个):
+      · ``media_urls`` 的**值** —— 那是本地路径或带签名参数的远程 URL;
+        只出 **条数** 与每项的 ``local/remote``(靠 scheme 判,⛔ 不靠形状);
+      · 原始 ``chat_id`` / ``user_id`` / ``message_id`` —— 只出哈希前 8 位;
+      · 任何 base64 / 正文内容。
+      ``media_types`` 由发送方提供,只出解析后的已知 MIME 闭集;未知值固定为
+      ``other``,⛔ 不回显原文。
+
+    ⛔ 本函数**永不向调用方抛异常** —— 观测点把消息处理弄挂了是不可接受的;
+    但也⛔ 不静默:自己坏了就打 ``_IM_MEDIA_PROBE_ERR``。
+    """
+    try:
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        message_type = getattr(event, "message_type", None)
+        mt_name = getattr(message_type, "name", None) or str(message_type)
+
+        # 只在**媒体相关**的消息上出声:纯文本不打,免得淹没信号。
+        # ⭐ 「是媒体型但一个附件都没有」正是最要紧的那一格 ⇒ 必须也打。
+        if not media_urls and mt_name not in {
+            "PHOTO", "VIDEO", "AUDIO", "VOICE", "DOCUMENT"
+        }:
+            return
+
+        # 关口判据从 gateway.run 取 —— ⭐ 与生产**同一份**实现,
+        # ⛔ 不在这里重写一遍(重写必然漂移,那就不是观测而是第二个真相)。
+        # 函数内导入:run.py 在模块层 import 本文件,顶层导入会成环。
+        from gateway.run import (
+            _event_media_is_audio,
+            _event_media_is_image,
+            _event_media_is_stt_input,
+            _event_media_is_video,
+            _event_media_type_at,
+            _is_remote_media_ref,
+        )
+
+        n = len(media_urls)
+        sample_n = min(n, _IM_MEDIA_PROBE_MAX_SAMPLES)
+        sample_more = n - sample_n
+        types = [
+            _probe_media_type_label(_event_media_type_at(event, i))
+            for i in range(sample_n)
+        ]
+        refs = [
+            "remote" if _is_remote_media_ref(str(media_urls[i])) else "local"
+            for i in range(sample_n)
+        ]
+
+        def _flags(fn) -> str:
+            return "".join(
+                "T" if fn(event, i) else "F" for i in range(sample_n)
+            ) or "-"
+
+        src = getattr(event, "source", None)
+        logger.info(
+            "%s id=%s platform=%s chat_type=%s msg_type=%s n_urls=%d n_types=%d "
+            "types=[%s] refs=[%s] sample_more=%d image=%s audio=%s stt=%s video=%s",
+            _IM_MEDIA_PROBE,
+            _probe_correlation_id(event),
+            getattr(getattr(src, "platform", None), "value", getattr(src, "platform", "?")),
+            getattr(src, "chat_type", "?"),
+            mt_name,
+            n,
+            len(getattr(event, "media_types", None) or []),
+            ",".join(types),
+            ",".join(refs),
+            sample_more,
+            _flags(_event_media_is_image),
+            _flags(_event_media_is_audio),
+            _flags(_event_media_is_stt_input),
+            _flags(_event_media_is_video),
+        )
+    except Exception as exc:  # ⛔ 绝不把消息处理弄挂,但也⛔ 不静默
+        logger.warning("%s %s", _IM_MEDIA_PROBE_ERR, safe_exc(exc))
 
 
 def resolve_channel_prompt(
@@ -5976,6 +6145,10 @@ class BasePlatformAdapter(ABC):
             return
 
         coerce_plaintext_gateway_command(event)
+
+        # ⭐ 入站媒体观测点:**所有 adapter 的唯一漏斗**就在这里,
+        #    一处即覆盖 22 家,⛔ 不需要每家各插一遍(那必然漏)。
+        log_inbound_media_probe(event)
 
         # Telegram topic recovery only applies to private DM topic lanes. Do
         # not submit a no-op check for group/forum/channel traffic to the
