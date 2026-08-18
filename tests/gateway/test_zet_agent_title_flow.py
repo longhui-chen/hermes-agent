@@ -307,3 +307,41 @@ def test_title_input_strips_agent_creator_routing_directive():
     )
 
     assert ZetAgentAdapter._title_user_message(routed) == "帮我创建一个整理照片的 Agent"
+
+
+@pytest.mark.asyncio
+async def test_silent_automation_does_not_bind_billing_task_title(monkeypatch):
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    result = (
+        {
+            "final_response": "done",
+            "messages": [],
+            "session_id": "zettlab:u1:main:silent",
+            "completed": True,
+        },
+        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    captured = {}
+
+    async def fake_run_agent(_self, **_kwargs):
+        captured["billing_task_title"] = unquote(billing_task_title_encoded())
+        return result
+
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_run_agent)
+
+    got = await adapter._run_agent(
+        user_message="frozen weekly task must stay private",
+        trusted_user_message="private weekly task title",
+        session_id="zettlab:u1:main:silent",
+        turn_id="silent-turn-1",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        execution_policy="silent_automation",
+    )
+
+    assert got == result
+    assert captured["billing_task_title"] == ""

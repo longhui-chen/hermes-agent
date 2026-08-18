@@ -3304,6 +3304,10 @@ class ZetAgentAdapter(APIServerAdapter):
             if isinstance(trusted_user_message, str)
             else title_user_message
         )
+        if scoped_execution_policy == "silent_automation":
+            # Silent ActionV1 payloads must not leak their frozen task text into
+            # the billing/ledger X-Task-Title header or a user-visible card.
+            title_source = ""
         turn_title_token = push_zettlab_turn_title(
             ""
             if not str(turn_id or "").strip() or title_source.startswith("[ZETTLAB:")

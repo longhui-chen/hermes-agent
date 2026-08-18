@@ -12,6 +12,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
+from gateway.session_context import generic_lifecycle_hooks_allowed
+
 logger = logging.getLogger(__name__)
 
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
@@ -83,6 +85,13 @@ def apply_llm_request_middleware(
     Middleware may return ``{"request": {...}}`` to replace the effective
     provider kwargs before Hermes sends them.
     """
+    if not generic_lifecycle_hooks_allowed():
+        return RequestMiddlewareResult(
+            payload=request,
+            original_payload=request,
+            changed=False,
+            trace=[],
+        )
     if not _has_middleware(LLM_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
             payload=request,
@@ -190,6 +199,8 @@ def run_llm_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run provider execution through registered LLM execution middleware."""
+    if not generic_lifecycle_hooks_allowed():
+        return next_call(request)
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(request)

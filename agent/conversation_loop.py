@@ -402,7 +402,23 @@ def _apply_zet_agent_plan_tool_visibility(agent: Any, api_kwargs: Dict[str, Any]
     if not trusted_skill_scope_active(agent):
         return False
 
-    scoped_tools = trusted_skill_allowed_tool_names(agent) | {"present_plan"}
+    trusted_tools = trusted_skill_allowed_tool_names(agent)
+    if getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation":
+        # Middleware/Relay may replace the provider payload after the first
+        # visibility pass.  Silent requests must be sealed by the intersection
+        # of the attested skill scope and the request-local policy snapshot;
+        # never re-add clarify/todo/present_plan from the broader skill scope.
+        policy_tools = set(
+            getattr(
+                agent,
+                "_zet_agent_execution_policy_valid_tool_names",
+                (),
+            )
+            or ()
+        )
+        scoped_tools = trusted_tools & policy_tools
+    else:
+        scoped_tools = trusted_tools | {"present_plan"}
 
     def _tool_name(tool: Any) -> str:
         if not isinstance(tool, dict):
@@ -509,6 +525,16 @@ def _seal_video_edit_provider_request(
         changed = _apply_forced_video_edit_skill_view(agent, api_kwargs) or changed
     elif scope_active:
         changed = _apply_zet_agent_plan_tool_visibility(agent, api_kwargs) or changed
+        if getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation":
+            # Once the signed skill is active, no caller/plugin-selected tool
+            # choice is part of the ActionV1 snapshot.  Drop replacements from
+            # LLM middleware so the provider sees only the policy∩scope tools.
+            if api_kwargs.pop("tool_choice", None) is not None:
+                changed = True
+            tool_config = api_kwargs.get("toolConfig")
+            if isinstance(tool_config, dict) and "toolChoice" in tool_config:
+                tool_config.pop("toolChoice", None)
+                changed = True
 
     transport_instruction = transport_attested_skill_instruction(agent)
     if transport_instruction:

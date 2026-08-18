@@ -655,6 +655,41 @@ def test_trusted_video_memory_schema_is_scoped_even_when_platform_omits_it(
     ] == ["terminal"]
 
 
+def test_silent_provider_replacement_is_sealed_to_policy_scope(monkeypatch):
+    agent = _agent(
+        valid_tool_names={"skill_view", "terminal", "todo", "clarify"},
+        _zet_agent_execution_policy="silent_automation",
+        _zet_agent_execution_policy_valid_tool_names={"skill_view", "terminal"},
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"terminal", "todo", "clarify"}),
+    )
+
+    api_kwargs = {
+        "tools": [_tool("terminal"), _tool("todo"), _tool("clarify")],
+        "tool_choice": {"type": "function", "function": {"name": "todo"}},
+        "toolConfig": {
+            "tools": [_tool("terminal"), _tool("present_plan")],
+            "toolChoice": {"tool": {"name": "present_plan"}},
+        },
+    }
+
+    assert _seal_video_edit_provider_request(agent, api_kwargs)
+    assert [tool["function"]["name"] for tool in api_kwargs["tools"]] == [
+        "terminal"
+    ]
+    assert [
+        tool["function"]["name"] for tool in api_kwargs["toolConfig"]["tools"]
+    ] == ["terminal"]
+    assert "tool_choice" not in api_kwargs
+    assert "toolChoice" not in api_kwargs["toolConfig"]
+
+
 def test_plan_success_memory_authorization_matches_memory_tool_shape():
     content = (
         "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
