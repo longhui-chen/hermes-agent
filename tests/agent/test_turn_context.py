@@ -520,6 +520,141 @@ description: Trusted video-edit execution flow test
         secret_scope_module.reset_secret_scope(secret_token)
 
 
+def test_trusted_skill_reload_bypasses_dedup_for_one_fresh_attestation(
+    tmp_path,
+    monkeypatch,
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted video-edit reload skill\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+
+    task_id = "trusted-skill-reload-task"
+    skills_tool_module.reset_skill_view_dedup(task_id)
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:reload-session",
+        session_id="zettlab:user:main:reload-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="trusted-skill-reload-turn",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(
+            agent,
+            "请把 [file: /data/input.mp4] 剪辑成成片",
+        )
+        args = {"name": "video-edit-workflow-mini"}
+
+        def _view():
+            return skills_tool_module._skill_view_with_bump(
+                args,
+                task_id=task_id,
+            )
+
+        first_result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args=args,
+            dispatch=_view,
+        )
+        first_payload = json.loads(first_result)
+        first_attestation = first_payload[response_mode._ATTESTATION_FIELD]
+        assert first_payload.get("dedup") is None
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=first_result,
+        )
+
+        # Simulate an out-of-policy operation revoking the bounded scope. The
+        # same turn must read the signed bytes again; the earlier one-shot
+        # attestation cannot be reused from the repeat-view stub.
+        agent._zet_agent_skill_direct_scope = None
+        agent._zet_agent_skill_direct_operation = None
+        reload_result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args=args,
+            dispatch=_view,
+        )
+        reload_payload = json.loads(reload_result)
+        assert reload_payload.get("dedup") is None
+        assert reload_payload[response_mode._ATTESTATION_FIELD] != first_attestation
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=reload_result,
+        )
+
+        # Once the trusted scope is active, an ordinary repeat remains deduped.
+        repeat_result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args=args,
+            dispatch=_view,
+        )
+        repeat_payload = json.loads(repeat_result)
+        assert repeat_payload["dedup"] is True
+        assert response_mode._ATTESTATION_FIELD not in repeat_payload
+        assert not response_mode.trusted_skill_view_fresh_read_required()
+    finally:
+        skills_tool_module.reset_skill_view_dedup(task_id)
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_trusted_skill_fresh_read_context_clears_after_dispatch_error(
+    monkeypatch,
+):
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    monkeypatch.setattr(
+        response_mode,
+        "_trusted_skill_view_refresh_required",
+        lambda _agent, _args: True,
+    )
+
+    def _fail():
+        assert response_mode.trusted_skill_view_fresh_read_required()
+        raise RuntimeError("skill read failed")
+
+    with pytest.raises(RuntimeError, match="skill read failed"):
+        response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args={"name": "trusted-skill"},
+            dispatch=_fail,
+        )
+
+    assert not response_mode.trusted_skill_view_fresh_read_required()
+
+
 def test_video_edit_followup_turn_reuses_same_session_capability_flow(
     tmp_path, monkeypatch
 ):

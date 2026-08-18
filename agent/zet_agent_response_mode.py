@@ -277,6 +277,10 @@ _SKILL_DIRECT_LOCK = threading.Lock()
 _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT: ContextVar[
     _TrustedExecutionReceipt | None
 ] = ContextVar("_TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT", default=None)
+_TRUSTED_SKILL_VIEW_FRESH_READ: ContextVar[bool] = ContextVar(
+    "_TRUSTED_SKILL_VIEW_FRESH_READ",
+    default=False,
+)
 
 
 def _current_skill_direct_turn_identity() -> _TurnIdentity | None:
@@ -1438,6 +1442,49 @@ def trusted_skill_scope_active(agent: Any) -> bool:
         )
 
 
+def _trusted_skill_view_refresh_required(
+    agent: Any,
+    function_args: Mapping[str, Any],
+) -> bool:
+    """Require a new signed read only while rebuilding a trusted scope."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    if function_args.get("file_path") not in (None, ""):
+        return False
+    requested_path = _trusted_skill_path_for_slug(function_args.get("name", ""))
+    if not requested_path or trusted_skill_scope_active(agent):
+        return False
+
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    if (
+        not isinstance(task, _SkillDirectTaskContext)
+        or turn_identity is None
+        or task.turn_identity != turn_identity
+    ):
+        return False
+
+    task_paths = set()
+    if task.video_edit_applicable:
+        task_paths.add(_VIDEO_EDIT_SKILL_PATH)
+    if task.camera_applicable:
+        task_paths.add(_CAMERA_SKILL_PATH)
+    if requested_path not in task_paths:
+        return False
+
+    if getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation":
+        return (
+            _trusted_skill_path_for_slug(task.trusted_skill_slug)
+            == requested_path
+        )
+    return True
+
+
+def trusted_skill_view_fresh_read_required() -> bool:
+    """Expose the dispatch-local signed-read requirement to ``skill_view``."""
+    return _TRUSTED_SKILL_VIEW_FRESH_READ.get()
+
+
 def _activate_execution_policy_tools(
     agent: Any,
     allowed_tools: frozenset[str],
@@ -2340,6 +2387,15 @@ def dispatch_trusted_skill_operation(
 
     if receipt is not None:
         _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
+    fresh_read_required = (
+        function_name == "skill_view"
+        and _trusted_skill_view_refresh_required(agent, function_args)
+    )
+    if fresh_read_required:
+        logger.info(
+            "zet_agent: refreshing signed trusted skill view for a new scope"
+        )
+    fresh_read_token = _TRUSTED_SKILL_VIEW_FRESH_READ.set(fresh_read_required)
     try:
         result = dispatch()
     except BaseException:
@@ -2352,6 +2408,7 @@ def dispatch_trusted_skill_operation(
             )
         raise
     finally:
+        _TRUSTED_SKILL_VIEW_FRESH_READ.reset(fresh_read_token)
         _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
 
     if function_name != "skill_view":

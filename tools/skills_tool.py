@@ -1939,6 +1939,15 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     task_id = kw.get("task_id")
+    trusted_fresh_read = False
+    try:
+        from agent.zet_agent_response_mode import (
+            trusted_skill_view_fresh_read_required,
+        )
+
+        trusted_fresh_read = trusted_skill_view_fresh_read_required()
+    except Exception:
+        pass
     # ── Repeat-view dedup ────────────────────────────────────────────
     # Mirrors read_file's unchanged-stub: when this session already
     # loaded the SAME skill file and it hasn't changed on disk, return a
@@ -1949,9 +1958,10 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
-    if stub is not None:
-        return stub
+    if not trusted_fresh_read:
+        stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+        if stub is not None:
+            return stub
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=task_id
     )
