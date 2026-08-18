@@ -748,11 +748,24 @@ class TestNoUndefinedNameOnLinesThisPrTouched:
         files, added = self._changed_lines()
         assert files and any(added.values()), "量具坏了:一行改动都没找到"
         ruff = ".venv/bin/ruff" if pathlib.Path(".venv/bin/ruff").exists() else "ruff"
+        # 🔴 阳性对照必须**独立于 diff**。
+        # ⚠️ 原写法只对 `files`(本 PR 改过的文件)跑 ruff,再断言 hits 非空 ——
+        #    这等于假定「本 PR 恰好改到了一个带上游 F821 的文件」。
+        #    实测:第二轮工作没再碰 `tui_gateway/methods_tools.py` ⇒ hits=0 ⇒
+        #    **门出生即红,红在一个与缺陷完全无关的自校准上**。
+        # ⇒ 阳性对照固定打在那个已知带 F821 的文件上;判定仍只看 `files`。
+        control = subprocess.run([ruff, "check", "--select", "F821", "--no-cache",
+                                  "--output-format", "json", self._REBIND_EXEMPT],
+                                 capture_output=True, text=True).stdout
+        assert json.loads(control), (
+            f"阳性对照失效:{self._REBIND_EXEMPT} 里一条 F821 都扫不出来 ⇒ "
+            "要么 ruff 没真跑,要么那些上游存量已被修掉 —— **先判量具坏**,"
+            "⛔ 不许当成「本 PR 干净」。"
+        )
         out = subprocess.run([ruff, "check", "--select", "F821", "--no-cache",
                               "--output-format", "json"] + files,
                              capture_output=True, text=True).stdout
         hits = json.loads(out)
-        assert hits, "F821 一条都没有 ⇒ 量具可疑(仓里已知有上游存量)"
         mine = []
         for h in hits:
             rel = h["filename"].split("hermes-rh-fix-20260816/")[-1]

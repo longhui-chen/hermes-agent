@@ -122,6 +122,7 @@ FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    log_media_intake_failure,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -2619,7 +2620,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
             return self._finalize_send_result(message_response, "image send failed")
         except Exception as exc:
-            logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
+            # 🔴 原版把 **image_path 原文 + 原始异常 + traceback** 一起写进日志。
+            # 飞书媒体 url 带鉴权参数,``ClientResponseError.__str__`` 会把整条
+            # url 带出来,``exc_info=True`` 还会让 logging 重新格式化原始异常
+            # ⇒ 一次失败就把渠道凭据**持久化**进 agent.log。
+            # ⭐ 照抄 ``gateway/platforms/weixin.py`` 做对的那份:只记异常**类型名**
+            #   + host 摘要(``.hostname`` 而非 ``.netloc`` —— netloc 含 userinfo)。
+            log_media_intake_failure(
+                logger, "feishu", "image", "send_failed", url="", exc=exc)
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -2638,7 +2646,8 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             image_path = await self._download_remote_image(image_url)
         except Exception as exc:
-            logger.error("[Feishu] Failed to download image %s: %s", image_url, exc, exc_info=True)
+            log_media_intake_failure(
+                logger, "feishu", "image", "download_failed", url=image_url, exc=exc)
             return await super().send_image(
                 chat_id=chat_id,
                 image_url=image_url,
@@ -2670,7 +2679,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 preferred_name="animation.gif",
             )
         except Exception as exc:
-            logger.error("[Feishu] Failed to download animation %s: %s", animation_url, exc, exc_info=True)
+            log_media_intake_failure(
+                logger, "feishu", "animation", "download_failed", url=animation_url, exc=exc)
             return await super().send_animation(
                 chat_id=chat_id,
                 animation_url=animation_url,
@@ -4331,7 +4341,8 @@ class FeishuAdapter(BasePlatformAdapter):
             media_type = self._normalize_media_type(content_type, default=self._default_image_media_type(ext))
             return cached_path, media_type
         except Exception:
-            logger.warning("[Feishu] Failed to cache image resource %s", image_key, exc_info=True)
+            log_media_intake_failure(
+                logger, "feishu", "image", "cache_failed", image_key=str(image_key))
             return "", ""
 
     async def _download_feishu_message_resource(
@@ -4404,12 +4415,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.info("[Feishu] Cached message document resource at %s", cached_path)
                 return cached_path, (media_type or self._guess_document_media_type(filename))
             except Exception:
-                logger.warning(
-                    "[Feishu] Failed to cache message resource %s/%s",
-                    message_id,
-                    file_key,
-                    exc_info=True,
-                )
+                log_media_intake_failure(
+                logger, "feishu", "resource", "cache_failed",
+                message_id=str(message_id), file_key=str(file_key))
         return "", ""
 
     # =========================================================================
@@ -5101,29 +5109,103 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
-                # 音频可能返回 99992402；是否引用只由显式 reply_to_message_id 决定。
+                # 音频可能返回 99992402(thread_id 路由下的已知返回码)。
+                #
+                # 🔴 **这是 `bd994a9a2`(恢复通用 thread 路由)的兄弟调用点,当时没跟上。**
+                # 上一版这里最后一步用 ``metadata=None`` 回退 —— **把 ``thread_id``
+                # 一起丢掉** ⇒ 只属于话题的语音被发到**群主时间线**:
+                # ①错位回复 ②**扩大内容可见范围**(私密话题内容进了整个群)。
+                #
+                # ⭐ 「照抄」三问 —— 先例是 merge-base 上的同一段(逐分支对照):
+                #   ① 先例:门槛 = 失败 ∧ code==99992402 ∧ audio ∧ **thread_id 存在**;
+                #      锚点 = 显式 ``reply_to_message_id``,**没有就去
+                #      ``_fetch_last_message_in_thread(thread_id)`` 取**;
+                #      拿到锚点 ⇒ reply 重试(带 metadata);仍失败 ⇒ 退 chat_id。
+                #   ② 我这版(修前):**少了 thread_id 门槛**(非线程音频也进这块)、
+                #      **少了锚点获取**(该函数被 8e0a8dd2b3 一并删掉)。
+                #   ③ 差异逐条消除:门槛补回、锚点获取补回。
+                #      **唯一刻意保留的差异**:线程内的最后一步 ⛔ 不再退到群顶层。
+                #      先例那样写是因为**当时 create 分支还带 thread 路由**,
+                #      ``metadata=None`` 是有意退到群顶层的最后手段;而今天的判据是
+                #      「⛔ 把线程发送失败降级成群顶层发送不可接受」——
+                #      ⇒ 线程内改为**保留 thread metadata 再试一次**,仍失败就**返回失败**。
                 if (not self._response_succeeded(message_response)
                         and getattr(message_response, "code", None) == 99992402
                         and resolved_message_type == "audio"):
-                    reply_message_id = (metadata or {}).get("reply_to_message_id")
-                    if reply_message_id:
-                        logger.info("[Feishu] Audio: retrying via reply API in thread")
+                    # ⭐⭐ **「引用」和「路由」是两件事 —— 混为一谈就会二选一。**
+                    #
+                    # 本仓有两条**都成立**的既有契约,表面上打架:
+                    #   (A) ⛔ 不许**发明引用**:用户没给锚点时,不许从线程里
+                    #       捞一条当 quote(测试
+                    #       ``test_audio_99992402_flat_retry_does_not_invent_reply_from_thread``,
+                    #       与 H④「显式 reply_to=None 就是不要引用」同族)。
+                    #   (B) ⛔ 不许把话题内容发到**群主时间线**(本轮 finding:
+                    #       错位回复 + 扩大内容可见范围)。
+                    # ⇒ 解法不是二选一:**引用只由显式锚点决定;路由由 metadata
+                    #   里的 thread_id 决定**,两者互不代替。
+                    #
+                    # ⚠️ 机器人建议「取得线程内锚点后重试」——**那会违反 (A)**。
+                    #   ⭐ finding 的**现象**是对的,它给的**修法**不能照做。
+                    #   ⇒ ``_fetch_last_message_in_thread`` 不恢复(会变成发明引用)。
+                    thread_id = (metadata or {}).get("thread_id")
+                    anchor = (metadata or {}).get("reply_to_message_id")
+                    if anchor:
+                        # 显式锚点与线程与否**无关** —— 非线程也要用它重试。
+                        # (契约:``..._reply_id_without_thread_recovers_with_quote``)
+                        logger.info("[Feishu] Audio: retrying via reply API with explicit anchor")
                         message_response = await self._feishu_send_with_retry(
                             chat_id=chat_id,
                             msg_type=resolved_message_type,
                             payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                            reply_to=reply_message_id,
+                            reply_to=anchor,
                             metadata=metadata,
                         )
                     if not self._response_succeeded(message_response):
-                        logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
-                        message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type=resolved_message_type,
-                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                            reply_to=None,
-                            metadata=None,
-                        )
+                        if thread_id:
+                            # 🔴 **保住路由,⛔ 不发明引用。**
+                            # ``metadata`` 原样带上 ⇒ ``_send_raw_message`` 的 create
+                            # 分支会以 ``thread_id`` 作 receive_id(``bd994a9a2``
+                            # 恢复的那条路由)⇒ 仍然落在话题里,且没有可见引用。
+                            # ⚠️ **⛔ 不许原样回传整个 metadata。**
+                            # ``_send_raw_message`` 的第①件事是「metadata 恢复引用
+                            # **只在线程内**生效」—— 原样传回去会把
+                            # ``reply_to_message_id`` **重新装上**,而这第三次重试
+                            # 存在的全部理由就是「**不带引用**重发一次」
+                            # (带引用的上一次刚失败)⇒ 大概率再撞同一个 99992402,
+                            # 这条重试就白设了。
+                            # ⇒ **保留 thread_id,摘掉 reply_to_message_id** ——
+                            #   作用域刚好等于缺陷作用域。
+                            flat_metadata = {
+                                k: v for k, v in (metadata or {}).items()
+                                if k != "reply_to_message_id"
+                            }
+                            logger.warning(
+                                "[Feishu] Audio send failed in thread, retrying flat **inside** the thread"
+                            )
+                            message_response = await self._feishu_send_with_retry(
+                                chat_id=chat_id,
+                                msg_type=resolved_message_type,
+                                payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                                reply_to=None,
+                                metadata=flat_metadata,
+                            )
+                            if not self._response_succeeded(message_response):
+                                # ⛔ **不降级到群顶层。** 把只属于话题的语音发到群主
+                                # 时间线 = 扩大内容可见范围;发失败比发错地方轻。
+                                logger.error(
+                                    "[Feishu] Audio could not be delivered inside the thread —— "
+                                    "⛔ refusing to fall back to the chat timeline"
+                                )
+                        else:
+                            # 🔴 **必须保持不变**:非线程语音与先例逐字相同 —— 退 chat_id。
+                            logger.warning("[Feishu] Audio send failed, retrying with chat_id")
+                            message_response = await self._feishu_send_with_retry(
+                                chat_id=chat_id,
+                                msg_type=resolved_message_type,
+                                payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                                reply_to=None,
+                                metadata=None,
+                            )
             return self._finalize_send_result(message_response, "file send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)

@@ -42,6 +42,7 @@ from agent.prompt_builder import (
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
+    USER_FACING_NARRATION_GUIDANCE,
     TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
@@ -256,6 +257,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Pointer to the zettlab-memo-setup skill for user questions about the runtime itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+
+    # ⛔ 不许把内部执行状态播报进回答正文(用户实测在 IM 里看到过 Progress 块)。
+    # 🔴 **无条件** —— 它必须对**所有渠道、所有模型**生效:上面 TASK_COMPLETION_
+    # GUIDANCE 那种「配置可关 + 依赖 valid_tool_names」的挂法在这里是错的,
+    # 一关就漏,而漏出去的正是给用户看的那一面。
+    stable_parts.append(USER_FACING_NARRATION_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes

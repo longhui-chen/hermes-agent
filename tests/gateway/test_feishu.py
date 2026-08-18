@@ -1326,7 +1326,6 @@ class TestAdapterBehavior(unittest.TestCase):
                 message=SimpleNamespace(list=list_messages),
             ))
         )
-        adapter._fetch_last_message_in_thread = AsyncMock(return_value="om-thread-last")
         adapter._run_blocking = AsyncMock(return_value=SimpleNamespace(
             success=lambda: True,
             data=SimpleNamespace(file_key="file_audio"),
@@ -1356,10 +1355,14 @@ class TestAdapterBehavior(unittest.TestCase):
         calls = adapter._feishu_send_with_retry.await_args_list
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].kwargs["metadata"], {"thread_id": "omt-thread"})
+        # 🔴 **「不发明引用」保留;``metadata is None`` 改掉 —— 它钉的正是泄漏本身。**
+        # 那一版把「不引用」实现成了「连 metadata 一起丢」,于是 ``thread_id`` 也没了
+        # ⇒ 只属于话题的语音被发到**群主时间线**(错位回复 + 扩大内容可见范围)。
+        # ⭐ 引用与路由是两件事:``reply_to`` 仍必须是 None(⛔ 不发明引用),
+        #   但 ``metadata`` 必须**原样带着 thread_id**(路由留在话题里)。
         self.assertIsNone(calls[1].kwargs["reply_to"])
-        self.assertIsNone(calls[1].kwargs["metadata"])
+        self.assertEqual(calls[1].kwargs["metadata"], {"thread_id": "omt-thread"})
         list_messages.assert_not_called()
-        adapter._fetch_last_message_in_thread.assert_not_awaited()
 
     @patch.dict(os.environ, {}, clear=True)
     def test_audio_99992402_explicit_reply_recovery_stays_available(self):
