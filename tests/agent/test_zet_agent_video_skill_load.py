@@ -187,6 +187,38 @@ def test_video_edit_first_request_forces_exact_skill_view_without_mutating_regis
     assert skill_tool["function"]["parameters"] == original_skill_parameters
 
 
+def test_video_edit_skill_force_recovers_skill_view_from_policy_snapshot(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: False,
+    )
+    policy_skill_tool = _tool("skill_view")
+    agent = _agent(
+        # The active scope narrowed the live set to execution tools before it
+        # failed; the policy snapshot is the same-turn attested source.
+        tools=[_tool("terminal")],
+        valid_tool_names={"terminal"},
+        _zet_agent_execution_policy_tools=[policy_skill_tool, _tool("terminal")],
+        _zet_agent_execution_policy_valid_tool_names={"skill_view", "terminal"},
+    )
+    api_kwargs = {"tools": [_tool("terminal")]}
+
+    assert _apply_forced_video_edit_skill_view(agent, api_kwargs)
+    assert [tool["function"]["name"] for tool in api_kwargs["tools"]] == [
+        "skill_view"
+    ]
+    assert api_kwargs["tools"][0]["function"]["parameters"]["properties"][
+        "name"
+    ]["enum"] == [_VIDEO_EDIT_SKILL]
+    assert "tool_choice" in api_kwargs
+    assert policy_skill_tool["function"]["parameters"]["properties"]["name"] == {
+        "type": "string",
+        "description": "Skill name",
+    }
+
+
 def test_video_edit_skill_force_stops_after_trusted_scope_activates(monkeypatch):
     monkeypatch.setattr(
         "agent.conversation_loop.trusted_skill_scope_active",

@@ -892,34 +892,48 @@ def _apply_forced_video_edit_skill_view(
 
     selected_tool = None
     tools = api_kwargs.get("tools")
-    if not isinstance(tools, list):
-        tools = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        function = tool.get("function")
-        if not isinstance(function, dict) or function.get("name") != "skill_view":
-            continue
-        selected_tool = copy.deepcopy(tool)
-        selected_function = selected_tool["function"]
-        parameters = selected_function.get("parameters")
-        if not isinstance(parameters, dict):
-            parameters = {}
-        original_properties = parameters.get("properties")
-        if not isinstance(original_properties, dict):
-            original_properties = {}
-        original_name = original_properties.get("name")
-        name_schema = (
-            dict(original_name) if isinstance(original_name, dict) else {}
-        )
-        name_schema.update({"type": "string", "enum": [_VIDEO_EDIT_SKILL_NAME]})
-        selected_function["parameters"] = {
-            "type": "object",
-            "properties": {"name": name_schema},
-            "required": ["name"],
-            "additionalProperties": False,
-        }
-        break
+    tool_sources = [tools] if isinstance(tools, list) else []
+
+    # A trusted silent turn deliberately narrows ``agent.tools`` after
+    # ``skill_view`` succeeds.  If a malformed/out-of-policy follow-up
+    # revokes that scope, the next protocol retry still needs to expose the
+    # original attested bootstrap tool.  Use the request-local policy snapshot
+    # captured before narrowing; it contains only the tools authorized for this
+    # turn and never grants an execution tool by itself.
+    for source_name in ("_zet_agent_execution_policy_tools", "tools"):
+        source = getattr(agent, source_name, None)
+        if isinstance(source, (list, tuple)) and source not in tool_sources:
+            tool_sources.append(source)
+
+    for source in tool_sources:
+        for tool in source:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict) or function.get("name") != "skill_view":
+                continue
+            selected_tool = copy.deepcopy(tool)
+            selected_function = selected_tool["function"]
+            parameters = selected_function.get("parameters")
+            if not isinstance(parameters, dict):
+                parameters = {}
+            original_properties = parameters.get("properties")
+            if not isinstance(original_properties, dict):
+                original_properties = {}
+            original_name = original_properties.get("name")
+            name_schema = (
+                dict(original_name) if isinstance(original_name, dict) else {}
+            )
+            name_schema.update({"type": "string", "enum": [_VIDEO_EDIT_SKILL_NAME]})
+            selected_function["parameters"] = {
+                "type": "object",
+                "properties": {"name": name_schema},
+                "required": ["name"],
+                "additionalProperties": False,
+            }
+            break
+        if selected_tool is not None:
+            break
 
     # Filtering is unconditional: a misconfigured request must not expose a
     # side-effect tool while the trusted execution scope is absent.
