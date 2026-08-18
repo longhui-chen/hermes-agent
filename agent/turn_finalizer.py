@@ -615,20 +615,26 @@ def finalize_turn(
         # 写的文本作为 canonical_final_response 发出去，Web 关联不上回执，已经被
         # 接管的 create 会永久停在「不确定」。链末补回：proposal 已经在 governor
         # 那边消费过了，回执是这一轮唯一的凭据，不能让它被顺手洗掉。
-        if _canonical_response_required and not _CREATION_ACTION_RECEIPT_RE.search(
-            final_response or ""
-        ):
+        if _canonical_response_required:
+            # governor 在链上先于第三方 hook 注册，它那一段结果里的 marker 就是
+            # 这一轮唯一权威的回执。只判断「链末还有没有 marker」是不够的：后置
+            # hook 完全可以换一个语法合法但指向别的 proposal 的 marker，或者在保
+            # 留真值的同时追加一个冲突的——前者会让 Web 结算错卡片，后者会让它
+            # 因回执冲突永久失败关闭。所以不是「缺了才补」，而是无条件重建：
+            # 清掉链末所有 action-result marker，只把 governor 那个原值接回去。
+            _governor_receipt = None
             for _hook_result in _transform_results:
                 if not isinstance(_hook_result, str):
                     continue
                 _receipt = _CREATION_ACTION_RECEIPT_RE.search(_hook_result)
-                if _receipt is None:
-                    continue
-                _kept = (final_response or "").rstrip()
+                if _receipt is not None:
+                    _governor_receipt = _receipt.group(0)
+                    break
+            if _governor_receipt is not None:
+                _kept = _CREATION_ACTION_RECEIPT_RE.sub("", final_response or "").rstrip()
                 final_response = (
-                    f"{_kept}\n\n{_receipt.group(0)}" if _kept else _receipt.group(0)
+                    f"{_kept}\n\n{_governor_receipt}" if _kept else _governor_receipt
                 )
-                break
         final_response = ensure_hardware_enrollment_intent(
             agent,
             user_message=original_user_message,

@@ -618,9 +618,30 @@ def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
         ),
         None,
     )
-    if not isinstance(last_user_content, str):
-        return False
-    return "[creation_recommendation_response]" in last_user_content
+    # 多模态 content 是 API 正式接受的形态：wrapper 藏在 parts 数组的某个 text
+    # part 里时，只看标量字符串就会漏判，transport 不被清除。
+    # _normalize_multimodal_content() 会保留这些文本 part，governor 对整个列表
+    # 做 str() 之后照样能解析出里面的 JSON wrapper——降级边界必须一起覆盖。
+    for _text in _iter_message_text_parts(last_user_content):
+        if "[creation_recommendation_response]" in _text:
+            return True
+    return False
+
+
+def _iter_message_text_parts(content: Any):
+    """Yield every text fragment a message content field can carry."""
+    if isinstance(content, str):
+        yield content
+        return
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if isinstance(part, str):
+            yield part
+        elif isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                yield text
 
 
 def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
@@ -5780,6 +5801,20 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(
                 _openai_error(
                     "canonical-final-v1 requires a valid creation recommendation action"
+                ),
+                status=400,
+            )
+        # 结构化输出与可信回执互斥：governor 的 _on_pre_llm_call() 遇到
+        # structured_output 会直接进入 suppression，既不消费动作也不生成回执，
+        # 而 HTTP 请求照常以普通模型结果收尾。放行这类请求等于让 Web 收到一个
+        # 「没接管、也没法重试」的死状态。宁可在进 Agent 前明确拒绝。
+        from agent.response_format import response_format_requires_structured_output
+
+        if response_format_requires_structured_output(body.get("response_format")):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot be combined with a structured "
+                    "response_format: the receipt would never be produced"
                 ),
                 status=400,
             )

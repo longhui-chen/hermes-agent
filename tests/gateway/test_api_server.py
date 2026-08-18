@@ -1217,6 +1217,51 @@ def test_plain_endpoint_never_keeps_receipt_transport_for_any_action_wrapper(pay
     assert _has_creation_recommendation_wrapper(_body_with_action(payload_json)) is True
 
 
+def test_wrapper_probe_covers_multimodal_text_parts():
+    """多模态 content 是 API 正式接受的形态，降级边界必须一起覆盖。
+
+    wrapper 藏在 parts 数组的 text part 里时，只看标量字符串会漏判，transport
+    不被清除；而 governor 对整个列表做 str() 之后照样能解析出 JSON wrapper，
+    普通端点于是能拉起原生创建流程并产出可信回执。
+    """
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {
+                        "type": "text",
+                        "text": (
+                            "确认创建\n\n[creation_recommendation_response]\n"
+                            '{"version":1,"type":"creation_recommendation_response",'
+                            '"action":"create","creation_type":"agent",'
+                            '"proposal_id":"p1","title":"T","dedup_key":"d1"}\n'
+                            "[/creation_recommendation_response]"
+                        ),
+                    },
+                ],
+            }
+        ]
+    }
+    assert _has_creation_recommendation_wrapper(body) is True
+
+
+def test_wrapper_probe_ignores_multimodal_without_the_envelope():
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "这张图里是什么"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        ]
+    }
+    assert _has_creation_recommendation_wrapper(body) is False
+
+
 def test_wrapper_probe_ignores_bodies_without_the_envelope():
     """对照：没有信封的普通聊天不受影响，不该被误清 transport。"""
     assert _has_creation_recommendation_wrapper(
@@ -1649,6 +1694,52 @@ class TestChatCompletionsEndpoint:
 
         assert response.status == 400
         run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "response_format",
+        [{"type": "json_object"}, {"type": "json_schema", "json_schema": {"name": "x"}}],
+        ids=["json_object", "json_schema"],
+    )
+    async def test_canonical_final_endpoint_rejects_structured_output(
+        self, adapter, response_format
+    ):
+        """结构化输出与可信回执互斥，必须在进 Agent 前拒绝。
+
+        governor 的 _on_pre_llm_call() 遇到 structured_output 会直接进入
+        suppression：既不消费动作也不生成回执，而 HTTP 请求照常以普通模型结果
+        收尾。放行这类请求等于让 Web 收到一个「没接管、也没法重试」的死状态。
+        """
+        body = self._canonical_action_body()
+        body["response_format"] = response_format
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_allows_plain_text_response_format(self, adapter):
+        """对照：非结构化的 response_format 不该被这道门误伤。"""
+        body = self._canonical_action_body()
+        body["response_format"] = {"type": "text"}
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_ordinary_chat_stays_on_legacy_endpoint(self, adapter):

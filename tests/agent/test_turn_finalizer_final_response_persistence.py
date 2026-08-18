@@ -889,3 +889,81 @@ def test_receipt_is_not_synthesised_when_no_canonical_response_was_required(monk
 
     assert result["canonical_response_required"] is False
     assert _RECEIPT_MARKER not in result["final_response"]
+
+
+_FOREIGN_RECEIPT = "<!--creation-recommendation-action-result b3RoZXI-->"
+
+
+def test_a_later_hook_cannot_swap_in_a_different_receipt(monkeypatch):
+    """后置 hook 换掉回执时，链末必须还原成 governor 那个原值。
+
+    marker 只要语法合法就能骗过「链末还有没有 marker」的判断。换成指向别的
+    proposal 的 marker，Web 会去结算另一张卡片。
+    """
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        kwargs["require_canonical_response"]()
+        return [
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
+            "第三方重写。\n\n" + _FOREIGN_RECEIPT,
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "创建它"}, {"role": "assistant", "content": "好的"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert _RECEIPT_MARKER in result["final_response"], "governor 的原始回执没有被还原"
+    assert _FOREIGN_RECEIPT not in result["final_response"], (
+        "后置 hook 塞进来的回执被当成可信值发了出去——Web 会去结算别的卡片"
+    )
+
+
+def test_a_later_hook_cannot_append_a_conflicting_receipt(monkeypatch):
+    """追加冲突 marker 同样要被清掉：两个回执并存会让 Web 永久失败关闭。"""
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        kwargs["require_canonical_response"]()
+        return [
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER + "\n\n" + _FOREIGN_RECEIPT,
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "创建它"}, {"role": "assistant", "content": "好的"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"].count("creation-recommendation-action-result") == 1
+    assert _RECEIPT_MARKER in result["final_response"]
+    assert _FOREIGN_RECEIPT not in result["final_response"]
