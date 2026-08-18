@@ -2270,6 +2270,7 @@ def _make_request_fingerprint(
     *,
     execution_scope_digest: str = "",
     admission_scope: str = "",
+    identity_scope: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
     material = repr(subset).encode("utf-8")
@@ -2286,6 +2287,16 @@ def _make_request_fingerprint(
     if admission_scope:
         material += (
             b"\0zettlab-admission-scope-v1:" + admission_scope.encode("ascii")
+        )
+    # identity_scope 把「这份 body 属于谁、属于哪个会话」并进指纹。_idem_cache 是
+    # 进程全局的，少了它，两个不同 profile / owner / session key 的请求只要
+    # Idempotency-Key 和 body 相同就会互相命中——后到的那个直接复用前一个会话的
+    # agent 结果，跳过 governor 的 owner / proposal 校验，甚至拿到别人会话的
+    # accepted 回执和正文。只并进摘要，不并原值。
+    if identity_scope:
+        material += (
+            b"\0zettlab-identity-scope-v1:"
+            + hashlib.sha256(identity_scope.encode("utf-8")).hexdigest().encode("ascii")
         )
     return hashlib.sha256(material).hexdigest()
 
@@ -6311,6 +6322,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "canonical_final_v1"
                     if request.get("canonical_final_creation_action_admitted", False)
                     else "plain"
+                ),
+                identity_scope="\0".join(
+                    (
+                        str(request.get("hermes_profile_home") or ""),
+                        str(gateway_session_key or ""),
+                        str(session_id or ""),
+                    )
                 ),
             )
             try:
