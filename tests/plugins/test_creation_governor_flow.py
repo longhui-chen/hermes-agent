@@ -68,6 +68,7 @@ def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch)
         "pre_llm_call",
         "transform_llm_output",
         "attachment_action",
+        "pre_tool_call",
     }
     assert manager._aux_tasks["creation_governor_checkpoint"]["plugin"] == "creation-governor"
 
@@ -86,6 +87,7 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
         "pre_llm_call",
         "transform_llm_output",
         "attachment_action",
+        "pre_tool_call",
     ]
     assert [tool["name"] for tool in context.tools] == ["detect_creation_opportunity"]
 

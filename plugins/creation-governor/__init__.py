@@ -2573,11 +2573,12 @@ def register(ctx: Any) -> None:
         },
     )
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
     # 连接推荐卡（channel.connect / connector.connect）的按钮回执：dismiss
     # 落 30 天拒绝闩锁。hook 由 zet_agent 的 attachment/action 入站派发。
     ctx.register_hook("attachment_action", _on_attachment_action)
+    # 排在最后：flow 测试按索引取前两个 hook，新增注册不该挤动它们的位置。
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset="creation_governor",
