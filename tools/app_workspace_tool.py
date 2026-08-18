@@ -20,7 +20,7 @@ from tools.registry import registry
 
 
 _ACTIONS = frozenset({
-    "status", "checkout", "read", "apply_patch", "build", "publish",
+    "status", "checkout", "list", "read", "apply_patch", "build", "publish",
     "discard", "maintainer_schedule_status", "maintenance_tasks",
     "create_maintenance_task", "update_maintenance_task",
     "delete_maintenance_task", "maintenance_task_runs",
@@ -39,11 +39,20 @@ APP_WORKSPACE_SCHEMA = {
     "name": "app_workspace",
     "description": (
         "Edit the current version of an app only through App Host's dedicated "
-        "maintainer workspace. This is a fixed checkout/read/replace/build/"
+        "maintainer workspace. This is a fixed checkout/list/read/replace/build/"
         "publish/discard surface, not a terminal, general filesystem, URL, or "
         "environment interface. Start with status, use its app_instance_id and "
         "revision as the required compare-and-swap values, and read a file "
-        "before replacing it with apply_patch."
+        "before replacing it with apply_patch. After checkout, use list to see "
+        "which files exist and read only paths it returned — never guess a "
+        "pathname. A generated app keeps its page source at static/index.html, "
+        "its server code in main.go and any schema in migrations/, but list is "
+        "the authority; a read that comes back absent means your path was "
+        "wrong, not that the app lacks that kind of source. The one exception: "
+        "if list itself fails with error.code list_unsupported, this device's "
+        "App Host predates the list route — every other action still works, so "
+        "fall back to probing with read and do guess pathnames there; that "
+        "error is never evidence the app or its source is missing."
     ),
     "parameters": {
         "type": "object",
@@ -218,6 +227,9 @@ def _build_request(args: dict):
         method = "DELETE" if action == "discard" else "POST"
         path = root if action == "discard" else f"{root}/{action}"
         return method, path, {"expected_instance_id": instance}, _apphost._LONG_TIMEOUT if action == "build" else _apphost._DEFAULT_TIMEOUT
+    if action == "list":
+        _only(args, base_fields)
+        return "POST", root + "/list", {"expected_instance_id": instance}, _apphost._DEFAULT_TIMEOUT
     if action == "read":
         _only(args, base_fields | {"path"})
         return "POST", root + "/read", {
@@ -322,6 +334,7 @@ def app_workspace_tool(args, **_kw) -> str:
     except _apphost._BadRequest as exc:
         return _bad_request(str(exc))
 
+    action = args.get("action")
     base = _apphost._base_url()
     token = _apphost._secret("ZETTLAB_AGENT_ACTION_TOKEN")
     if not base or not token:
@@ -343,6 +356,25 @@ def app_workspace_tool(args, **_kw) -> str:
         if upstream is not None:
             return _apphost._fail(upstream, status=exc.code)
         if exc.code == 404:
+            # list 是这一批里唯一的新路由：Hermes 先于 App Host 部署时，只有它
+            # 会撞 404，而 status / read / apply_patch / build / publish 在旧
+            # 服务端上全都照常可用。若也回「尚不支持 App Workspace」，维护者会
+            # 把一个路由缺失读成整个工作区不可用而放弃整轮维护——工具说明里还
+            # 写着「先 list 再 read」，它更没有理由继续。所以这一档单独降级，
+            # 并直接告诉它替代走法。
+            if action == "list":
+                return _apphost._local_error(
+                    "list_unsupported",
+                    "这台设备的 App Host 版本还没有列文件能力。**只有列文件这一个动作缺失**，"
+                    "status / read / apply_patch / build / publish 全都照常可用，工作区也已经检出，"
+                    "不要据此判断应用不存在、源码找不到或维护无法继续。"
+                    "改用逐个 read 探路：若这是本 skill 生成的应用，先试 static/index.html（页面）、"
+                    "main.go（后端）、migrations/ 下的 .sql（建表）——这几条只是生成应用的**候选**，"
+                    "blueprint 应用或用户自己调整过目录结构时它们可能都不在。任何一个路径 read 不到，"
+                    "只说明这个文件不存在，换一个继续试；这种情况下允许按应用类型推测路径，"
+                    "「先 list 再 read」那条要求不适用于这台设备。",
+                    status=exc.code,
+                )
             return _apphost._local_error(
                 "unsupported",
                 "设备端 App Host 尚不支持 App Workspace；没有安全的兼容路径",
@@ -353,7 +385,6 @@ def app_workspace_tool(args, **_kw) -> str:
         return _apphost._local_error("transport_error", "无法连接 App Workspace 服务", status=None)
     if len(raw) > _MAX_RESPONSE_BYTES:
         return _apphost._local_error("transport_error", "App Workspace 返回内容过大", status=status)
-    action = args.get("action")
     if action in {"apply_patch", "discard", "delete_maintenance_task"}:
         if status == 204 and not raw:
             return _apphost._ok({})
