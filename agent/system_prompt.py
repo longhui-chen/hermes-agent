@@ -52,6 +52,7 @@ from agent.prompt_builder import (
     zettlab_turn_rules_guidance,
 )
 from agent.runtime_cwd import resolve_context_cwd
+from gateway.session_context import SILENT_AUTOMATION_POLICY
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
@@ -311,7 +312,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+    silent_automation = (
+        getattr(agent, "_zet_agent_execution_policy", "")
+        == SILENT_AUTOMATION_POLICY
+    )
+    has_skills_tools = not silent_automation and any(
+        name in agent.valid_tool_names
+        for name in ["skills_list", "skill_view", "skill_manage"]
+    )
     if has_skills_tools:
         avail_toolsets = {
             toolset

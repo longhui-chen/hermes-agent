@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from agent import relay_runtime
+from gateway.session_context import clear_turn_vars, set_turn_vars
 from hermes_cli import lifecycle, observability, plugins
 
 
@@ -58,3 +59,64 @@ def test_plugin_only_dispatch_does_not_reenter_builtin_observers(monkeypatch):
     )
 
     assert plugins.invoke_hook("custom", value=1) == ["custom", {"value": 1}]
+
+
+def test_silent_automation_skips_generic_lifecycle_observers_and_plugins(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        observability,
+        "observe_lifecycle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("silent turn reached built-in lifecycle observer")
+        ),
+    )
+    monkeypatch.setattr(
+        plugins,
+        "invoke_hook",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("silent turn reached plugin lifecycle hook")
+        ),
+    )
+    monkeypatch.setattr(
+        observability,
+        "handles_hook",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("silent turn inspected built-in lifecycle hooks")
+        ),
+    )
+    monkeypatch.setattr(
+        plugins,
+        "has_hook",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("silent turn inspected plugin lifecycle hooks")
+        ),
+    )
+
+    tokens = set_turn_vars(
+        turn_id="silent-lifecycle-turn",
+        execution_policy="silent_automation",
+    )
+    try:
+        assert lifecycle.has_hook("pre_llm_call") is False
+        assert lifecycle.invoke_hook("pre_llm_call", user_message="frozen") == []
+    finally:
+        clear_turn_vars(tokens)
+
+
+def test_silent_automation_skips_pre_tool_plugin_gate(monkeypatch):
+    monkeypatch.setattr(
+        plugins,
+        "_get_pre_tool_call_directive_details",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("silent turn reached pre_tool_call plugin gate")
+        ),
+    )
+    tokens = set_turn_vars(
+        turn_id="silent-tool-hook-turn",
+        execution_policy="silent_automation",
+    )
+    try:
+        assert plugins.resolve_pre_tool_block("terminal", {"command": "trusted"}) is None
+    finally:
+        clear_turn_vars(tokens)

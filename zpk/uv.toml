@@ -1,0 +1,9 @@
+# Reviewed resolver policy for reproducible ZPK builds. The Makefile selects
+# this file explicitly so host/user uv configuration cannot affect packaging,
+# while `uv sync --locked` still validates the committed lockfile.
+exclude-newer = "14 days"
+
+[exclude-newer-package]
+vercel = false
+nemo-relay = false
+huggingface_hub = false

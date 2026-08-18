@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
+from gateway.session_context import generic_lifecycle_hooks_allowed
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -2080,6 +2081,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
+    if not generic_lifecycle_hooks_allowed():
+        return []
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
@@ -2102,6 +2105,8 @@ def has_middleware(kind: str) -> bool:
 
 def has_hook(hook_name: str) -> bool:
     """Return True when a loaded plugin handles a hook."""
+    if not generic_lifecycle_hooks_allowed():
+        return False
     return get_plugin_manager().has_hook(hook_name)
 
 
@@ -2278,6 +2283,8 @@ def resolve_pre_tool_block(
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
     """
+    if not generic_lifecycle_hooks_allowed():
+        return None
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,

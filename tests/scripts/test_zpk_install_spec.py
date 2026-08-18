@@ -170,6 +170,16 @@ def test_zpk_python_is_explicit_target_compatible_path() -> None:
     assert "--python 3.11" not in makefile
 
 
+def test_zpk_uv_config_matches_locked_resolver_policy() -> None:
+    with (REPO_ROOT / "zpk" / "uv.toml").open("rb") as handle:
+        zpk_uv = tomllib.load(handle)
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        project_uv = tomllib.load(handle)["tool"]["uv"]
+
+    assert zpk_uv["exclude-newer"] == project_uv["exclude-newer"]
+    assert zpk_uv["exclude-newer-package"] == project_uv["exclude-newer-package"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="ZPK Makefile is POSIX-only")
 def test_zpk_make_flow_uses_locked_sync_and_reviewed_uv_path(
     tmp_path: Path,
@@ -183,6 +193,8 @@ def test_zpk_make_flow_uses_locked_sync_and_reviewed_uv_path(
     assert "python -m pip install" not in makefile
     assert makefile.count('"$(UV)" --no-progress') == 6
     (tmp_path / "Makefile").write_text(makefile, encoding="utf-8")
+    (tmp_path / "zpk").mkdir()
+    shutil.copyfile(REPO_ROOT / "zpk" / "uv.toml", tmp_path / "zpk" / "uv.toml")
 
     uv_log = tmp_path / "uv-calls.jsonl"
     fake_uv = tmp_path / "reviewed-uv"
@@ -291,16 +303,8 @@ if (
         assert "--no-editable" in sync_argv
         assert "pip" not in sync_argv
         assert "install" not in sync_argv
-        assert sync_argv[sync_argv.index("--exclude-newer") + 1] == "14 days"
-        assert {
-            sync_argv[index + 1]
-            for index, argument in enumerate(sync_argv[:-1])
-            if argument == "--exclude-newer-package"
-        } == {
-            "vercel=false",
-            "nemo-relay=false",
-            "huggingface-hub=false",
-        }
+        assert "--exclude-newer" not in sync_argv
+        assert "--exclude-newer-package" not in sync_argv
         assert {
             sync_argv[index + 1]
             for index, argument in enumerate(sync_argv[:-1])
@@ -316,9 +320,10 @@ if (
     assert project_sync[reinstall_index + 1] == "hermes-agent"
 
     for call in calls:
-        assert call["uv_env"]["UV_NO_CONFIG"] == "1"
+        assert call["uv_env"]["UV_CONFIG_FILE"] == str(tmp_path / "zpk" / "uv.toml")
+        assert "UV_NO_CONFIG" not in call["uv_env"]
         for variable in poisoned_uv_env:
-            if variable not in {"UV_NO_CONFIG", "UV_PROJECT_ENVIRONMENT"}:
+            if variable not in {"UV_CONFIG_FILE", "UV_PROJECT_ENVIRONMENT"}:
                 assert variable not in call["uv_env"]
     assert "UV_PROJECT_ENVIRONMENT" not in calls[0]["uv_env"]
     for call in calls[1:]:
@@ -384,24 +389,14 @@ def test_uv_lock_check_rejects_project_drift(tmp_path: Path) -> None:
         "UV_WORKING_DIR",
     ):
         clean_env.pop(variable, None)
-    clean_env["UV_NO_CONFIG"] = "1"
-
-    # Keep the isolated check aligned with the project's lock-time resolver
-    # policy. Newer uv releases otherwise treat the relative project setting
-    # as removed when invoked from a copied, standalone project.
-    lock_policy = [
-        "--exclude-newer",
-        "14 days",
-        "--exclude-newer-package",
-        "nemo-relay=false",
-        "--exclude-newer-package",
-        "vercel=false",
-        "--exclude-newer-package",
-        "huggingface-hub=false",
-    ]
+    clean_env.pop("UV_NO_CONFIG", None)
+    zpk_dir = tmp_path / "zpk"
+    zpk_dir.mkdir()
+    shutil.copyfile(REPO_ROOT / "zpk" / "uv.toml", zpk_dir / "uv.toml")
+    clean_env["UV_CONFIG_FILE"] = str(zpk_dir / "uv.toml")
 
     current = subprocess.run(
-        [uv, "lock", "--check", "--offline", *lock_policy],
+        [uv, "lock", "--check", "--offline"],
         cwd=tmp_path,
         env=clean_env,
         text=True,
@@ -421,7 +416,7 @@ def test_uv_lock_check_rejects_project_drift(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     drifted = subprocess.run(
-        [uv, "lock", "--check", "--offline", *lock_policy],
+        [uv, "lock", "--check", "--offline"],
         cwd=tmp_path,
         env=clean_env,
         text=True,

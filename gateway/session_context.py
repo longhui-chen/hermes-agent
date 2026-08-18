@@ -155,6 +155,7 @@ _EXECUTION_POLICY: ContextVar = ContextVar(
     "HERMES_EXECUTION_POLICY",
     default=_UNSET,
 )
+SILENT_AUTOMATION_POLICY = "silent_automation"
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -429,6 +430,11 @@ def execution_policy() -> str:
     if value is _UNSET or value is None:
         return ""
     return str(value).strip().lower()
+
+
+def generic_lifecycle_hooks_allowed() -> bool:
+    """Keep unbound/plugin lifecycle code outside trusted silent turns."""
+    return execution_policy() != SILENT_AUTOMATION_POLICY
 
 
 def set_current_session_id(session_id: str) -> None:
