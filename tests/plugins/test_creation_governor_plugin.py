@@ -265,6 +265,71 @@ def test_final_onboarding_welcome_emits_existing_cards_without_auxiliary_model(m
     assert plugin._session_states[next(iter(plugin._session_states))]["last_proposal"]["proposal_id"] == task["proposal_id"]
 
 
+@pytest.mark.parametrize(
+    ("transport", "expected"),
+    [("canonical_final_v1", True), ("", False)],
+    ids=["capable", "legacy"],
+)
+def test_onboarding_welcome_task_card_is_marked_with_action_receipts(
+    monkeypatch, transport, expected
+):
+    """引导页最后一屏的 Task 卡走的是同一个文本信封，标注不能漏。
+
+    它从 onboarding 分支直接返回，绕过了常规推荐那次统一的 action_receipts
+    标注。漏标不只是「少个字段」：Web 会把它当老卡按猜测结算，而下一轮用户
+    真点「创建」时 receipt_required 读到 False、不落 pending receipt，
+    local-server 那边照样要收据，这张卡必然 fail-closed。
+    """
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    context.emit_attachment = lambda _attachment: True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": [],
+            "channels_recommendable": [],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": False},
+            "task": {
+                "title": "持续跟进产品进展",
+                "reason": "让变化中的进展保持更新。",
+                "proposalText": "要现在设置吗？",
+            },
+        }
+    )
+    session_id = f"welcome-receipts-{transport or 'legacy'}"
+    plugin._on_pre_llm_call(
+        profile_name="onboarding",
+        session_id=session_id,
+        turn_id="turn-welcome",
+        user_message=f"Please welcome the user.\n{marker}",
+        conversation_history=[],
+    )
+    transformed = plugin._transform_llm_output(
+        session_id=session_id,
+        turn_id="turn-welcome",
+        response_text="Frank，很高兴认识你。",
+        completed=True,
+        creation_action_receipt_transport=transport,
+    )
+
+    task = _decode_envelope(transformed)
+    assert task.get("action_receipts", False) is expected
+    state = plugin._session_states[next(iter(plugin._session_states))]
+    assert state["last_proposal"]["action_receipts"] is expected
+
+
 def test_onboarding_welcome_channel_is_omitted_when_inventory_has_no_supported_target(monkeypatch):
     plugin = _load_plugin()
     context = _Context(_FakeLlm([]))

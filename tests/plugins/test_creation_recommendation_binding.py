@@ -258,6 +258,153 @@ def test_capable_card_action_fails_closed_after_transport_downgrade(
     assert not state["pending_action_results"]
 
 
+def test_rejected_action_blocks_creation_tools_for_that_turn():
+    """被拒的动作正文照样进模型，闸门必须落在工具派发上。
+
+    往上下文里塞一句「别创建」是劝阻不是约束：模型完全可以照着那段动作正文
+    去调 skill_manage(create) / cronjob(create)，于是一个已过期/已重放的推荐
+    仍然能把资源建出来。
+    """
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "deny-gate")
+
+    rejected = plugin._on_pre_llm_call(
+        session_id="deny-gate",
+        sender_id="owner-a",
+        turn_id="rejected-turn",
+        user_message=_action(payload, proposal_id="stale-proposal"),
+        conversation_history=[],
+    )
+    assert "invalid or expired" in rejected["context"]
+
+    for tool_name in ("skill_manage", "cronjob"):
+        blocked = plugin._on_pre_tool_call(
+            tool_name=tool_name,
+            args={"action": "create", "name": "whatever"},
+            turn_id="rejected-turn",
+        )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+
+    # 闸门只挡创建。同一轮里读取/修改类动作照常放行——被拒的是「建东西」，
+    # 不是整个会话。
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "patch", "name": "whatever"},
+            turn_id="rejected-turn",
+        )
+        is None
+    )
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="cronjob", args={"action": "list"}, turn_id="rejected-turn"
+        )
+        is None
+    )
+    # 作用域是单个 turn：别的轮次不受牵连。
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="some-other-turn",
+        )
+        is None
+    )
+    # 与创建无关的工具永远不过这道门。
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="web_search", args={"query": "x"}, turn_id="rejected-turn"
+        )
+        is None
+    )
+
+    # 本轮收尾后闸门失效，同一个 turn_id 复用不会被莫名挡住。
+    plugin._transform_llm_output(
+        session_id="deny-gate",
+        sender_id="owner-a",
+        turn_id="rejected-turn",
+        response_text="这条推荐已经不能用了。",
+        completed=True,
+    )
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="rejected-turn",
+        )
+        is None
+    )
+
+
+def test_accepted_action_leaves_creation_tools_open():
+    """正向对照：动作被接管的那一轮，创建工具必须照常可用。"""
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "deny-gate-control")
+
+    accepted = plugin._on_pre_llm_call(
+        session_id="deny-gate-control",
+        sender_id="owner-a",
+        turn_id="accepted-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+    )
+    assert "invalid or expired" not in accepted["context"]
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="accepted-turn",
+        )
+        is None
+    )
+
+
+def test_rejected_action_blocks_creation_when_tool_args_are_unparseable():
+    """参数读不出来时按拒绝处理：这一轮本来就不该有任何创建落地。"""
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "deny-gate-opaque")
+    plugin._on_pre_llm_call(
+        session_id="deny-gate-opaque",
+        sender_id="owner-a",
+        turn_id="opaque-turn",
+        user_message=_action(payload, proposal_id="stale-proposal"),
+        conversation_history=[],
+    )
+
+    for args in ("{not json", None, 42):
+        blocked = plugin._on_pre_tool_call(
+            tool_name="skill_manage", args=args, turn_id="opaque-turn"
+        )
+        assert blocked is not None and blocked["action"] == "block"
+
+    # JSON 字符串形式的参数要能被解析出 action，不能一律拦。
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args=json.dumps({"action": "patch"}),
+            turn_id="opaque-turn",
+        )
+        is None
+    )
+
+
+def test_pending_receipt_key_is_bounded_for_oversized_turn_ids():
+    """turn_id 原样当 pending 键时，条数上限拦不住单条键的体积。"""
+    plugin = _load_plugin()
+    oversized = "t" * (plugin.MAX_RAW_PENDING_TURN_KEY_LEN + 1)
+
+    key = plugin._pending_turn_key(oversized)
+    assert key.startswith("sha256:")
+    assert len(key) < plugin.MAX_RAW_PENDING_TURN_KEY_LEN
+    # 存和取走同一个归一化，查找语义不变。
+    assert plugin._pending_turn_key(oversized) == key
+    assert plugin._pending_turn_key(oversized + "x") != key
+    # 上限之内的 turn_id 原样保留。
+    at_limit = "t" * plugin.MAX_RAW_PENDING_TURN_KEY_LEN
+    assert plugin._pending_turn_key(at_limit) == at_limit
+
+
 def test_native_creation_routes_are_explicit_for_each_recommendation_type():
     plugin = _load_plugin()
 

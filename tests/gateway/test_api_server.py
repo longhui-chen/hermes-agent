@@ -1781,6 +1781,91 @@ class TestChatCompletionsEndpoint:
         run_agent.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_rejects_oversized_turn_id(self, adapter):
+        """turn_id 会成为 pending receipt 的键并驻留到 TTL 到期。
+
+        不设上限的话，少量携带超长 turn_id 的请求就能把端侧内存吃掉，而这些
+        请求本身完全合法、不会被任何其他门拦下。
+        """
+        from gateway.platforms.api_server import MAX_CANONICAL_FINAL_TURN_ID_LEN
+
+        body = self._canonical_action_body()
+        body["metadata"]["turn_id"] = "t" * (MAX_CANONICAL_FINAL_TURN_ID_LEN + 1)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_allows_turn_id_at_limit(self, adapter):
+        """对照：正好卡在上限的 turn_id 不该被误伤。"""
+        from gateway.platforms.api_server import MAX_CANONICAL_FINAL_TURN_ID_LEN
+
+        body = self._canonical_action_body()
+        body["metadata"]["turn_id"] = "t" * MAX_CANONICAL_FINAL_TURN_ID_LEN
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_rejects_tool_choice_none(self, adapter):
+        """工具全禁时原生创建流程根本跑不到，却会照常回 accepted。
+
+        skill_manage / cronjob 都是工具；tool_choice=none 之下 create 动作被
+        governor 正常消费、回执写 accepted，用户在 Web 上看到「已接管」，
+        资源却从未被创建。
+        """
+        body = self._canonical_action_body()
+        body["tool_choice"] = "none"
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_choice", ["auto", "required", None])
+    async def test_canonical_final_endpoint_allows_other_tool_choices(
+        self, adapter, tool_choice
+    ):
+        """对照：只有 none 会关掉全部工具，其余取值不该被这道门误伤。"""
+        body = self._canonical_action_body()
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_canonical_final_endpoint_allows_plain_text_response_format(self, adapter):
         """对照：非结构化的 response_format 不该被这道门误伤。"""
         body = self._canonical_action_body()
