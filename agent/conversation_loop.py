@@ -686,11 +686,17 @@ def _enforce_single_plan_interaction_tool_call(
             None,
         )
         if selected is None:
+            returned_names = sorted({
+                name
+                for name in (_tool_call_name(call) for call in tool_calls)
+                if name
+            })[:4]
             assistant_message.tool_calls = []
             _filter_provider_replay_tool_calls(assistant_message, None)
             logger.warning(
                 "zet_agent video edit: provider violated forced skill_view; "
-                "dropping all tool calls before execution"
+                "dropping all tool calls before execution (returned=%s)",
+                returned_names or ["<unnamed>"],
             )
             return bool(tool_calls)
         if len(tool_calls) == 1:
@@ -983,7 +989,15 @@ def _apply_forced_video_edit_skill_view(
             "from the execution-policy snapshot"
         )
 
-    api_kwargs["tool_choice"] = "required"
+    # This bootstrap has exactly one safe, signed tool target. A generic
+    # ``required`` choice still lets non-conforming OpenAI-compatible models
+    # hallucinate another tool name, forcing a retry before any skill bytes are
+    # read. Bind the provider request to the exact function as well as the
+    # already narrowed schema; response validation remains fail-closed below.
+    api_kwargs["tool_choice"] = {
+        "type": "function",
+        "function": {"name": "skill_view"},
+    }
     disabled_thinking = _should_disable_thinking_for_forced_tool_choice(agent)
     if disabled_thinking:
         agent._zet_agent_force_present_plan_disable_thinking = True

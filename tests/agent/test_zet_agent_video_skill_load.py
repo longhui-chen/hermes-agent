@@ -163,7 +163,10 @@ def test_video_edit_first_request_forces_exact_skill_view_without_mutating_regis
 
     assert _apply_forced_video_edit_skill_view(_agent(), api_kwargs)
 
-    assert api_kwargs["tool_choice"] == "required"
+    assert api_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "skill_view"},
+    }
     assert api_kwargs["parallel_tool_calls"] is False
     assert [tool["function"]["name"] for tool in api_kwargs["tools"]] == [
         "skill_view"
@@ -382,6 +385,14 @@ def test_video_edit_plain_text_is_bounded_to_two_protocol_retries():
         result = agent.run_conversation("剪辑\n[file: /data/input.mp4]")
 
     assert api_call.call_count == 3
+    assert all(
+        call.args[0]["tool_choice"]
+        == {
+            "type": "function",
+            "function": {"name": "skill_view"},
+        }
+        for call in api_call.call_args_list
+    )
     assert result["failed"] is True
     assert result["completed"] is False
     assert "video-edit skill protocol error" in result["error"].lower()
