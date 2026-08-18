@@ -291,6 +291,34 @@ def _text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+# 用户消息进 governor 前的字符预算。动作信封挂在消息末尾，而 Web 会在它前面
+# 放一段给模型看的动作说明文案——文案一长就能把信封挤出这个窗口。
+USER_MESSAGE_LIMIT = 2000
+
+
+def _bounded_user_message(raw: Any) -> str:
+    """把用户消息压到预算内，但**不能把结尾的动作信封切掉**。
+
+    信封被切掉的后果不是「少看见一段文字」：governor 完全看不到这次动作，
+    既不接管也不生成回执，而 HTTP 请求照常以普通模型结果收尾——版本化端点
+    那边已经按「这是一次动作」放行了，Web 于是把这次创建永久停在「不确定
+    且不能重试」。准入和这里必须看到同一个信封。
+    """
+    normalized = " ".join(str(raw or "").split())
+    if len(normalized) <= USER_MESSAGE_LIMIT:
+        return normalized
+    match = _RECOMMENDATION_RESPONSE_RE.search(normalized)
+    if match is None:
+        return normalized[:USER_MESSAGE_LIMIT]
+    envelope = normalized[match.start():match.end()]
+    if len(envelope) >= USER_MESSAGE_LIMIT:
+        # 信封本身就超预算。截断它只会让解析失败，原样交出去反而是更诚实的
+        # 输入——payload 大小另有上限把关。
+        return envelope
+    head = normalized[: USER_MESSAGE_LIMIT - len(envelope) - 1].rstrip()
+    return f"{head} {envelope}" if head else envelope
+
+
 def _normalize_creation_type(value: Any) -> str:
     normalized = _text(value, 40).lower().replace("-", "_")
     if normalized == "scheduled_task":
@@ -1835,7 +1863,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         return None
     if suppression_reason:
         return None
-    user_message = _text(raw_user_message, 2000)
+    user_message = _bounded_user_message(raw_user_message)
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
