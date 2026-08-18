@@ -429,8 +429,10 @@ def test_action_envelope_survives_a_right_brace_inside_a_string_field():
         creation_action_receipt_transport=RECEIPT_TRANSPORT,
     )
 
+    # 断言必须是正向的「真的接管了」。写成「没有 invalid or expired」会在信封
+    # 压根没被识别时也通过——那时走的是普通聊天分支，什么都不返回。
     assert result is not None
-    assert "invalid or expired" not in result["context"]
+    assert "agent-creator" in result["context"]
 
 
 # 动作信封挂在消息末尾，Web 会在它前面放一段给模型看的动作说明文案。文案一长
@@ -452,8 +454,9 @@ def test_action_envelope_survives_a_long_leading_instruction():
         creation_action_receipt_transport=RECEIPT_TRANSPORT,
     )
 
+    # 同上：正向断言。信封被截掉时这一轮会退化成普通聊天，负向断言照样通过。
     assert result is not None
-    assert "invalid or expired" not in result["context"]
+    assert "agent-creator" in result["context"]
 
 
 def test_bounded_user_message_keeps_the_trailing_envelope():
