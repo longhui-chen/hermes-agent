@@ -475,6 +475,7 @@ def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
     return bool(
         _text(kwargs.get("platform"), 40).lower() in _NONINTERACTIVE_PLATFORMS
         or _text(kwargs.get("execution_origin"), 80).lower() == "background_review"
+        or _text(kwargs.get("execution_policy"), 80).lower() == "silent_automation"
         or kwargs.get("is_kanban_worker")
     )
 
