@@ -622,11 +622,98 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
     return state
 
 
+# pending_action_results 有条目数上限，但没有单条键长上限：调用方给的 turn_id
+# 原样当键，MAX_PENDING_ACTION_RESULTS 条超长键就能在端侧吃掉数百 MB。超过这个
+# 长度的 turn_id 改用定长摘要——存和取走同一个归一化，查找语义不变。
+MAX_RAW_PENDING_TURN_KEY_LEN = 256
+
+
+def _pending_turn_key(turn_id: str) -> str:
+    if len(turn_id) <= MAX_RAW_PENDING_TURN_KEY_LEN:
+        return turn_id
+    return "sha256:" + hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+
+
+# 被判为无效/过期的 recommendation action，本轮不允许落地任何创建。
+# 只靠 pre_llm_call 往上下文里塞一句「别创建」是劝阻不是约束：那条被拒的动作
+# 正文照样进模型，模型完全可以照着它去调 skill_manage(create) / cronjob(create)。
+# 闸门必须落在执行点，也就是 pre_tool_call。
+#
+# 作用域是单个 turn_id：拿不到 turn_id 时无法界定范围，此时保持放行——宁可漏挡
+# 一次，也不能因为一个无 id 的请求把全设备的创建工具锁死。
+DENIED_CREATION_TOOL_ACTIONS = {
+    "skill_manage": {"create"},
+    "cronjob": {"create"},
+}
+MAX_DENIED_CREATION_TURNS = 256
+_denied_creation_turns: "OrderedDict[str, bool]" = OrderedDict()
+
+
+def _deny_creation_tools_for_turn(turn_id: str) -> None:
+    key = _pending_turn_key(turn_id)
+    if not key:
+        return
+    with _state_lock:
+        _denied_creation_turns[key] = True
+        _denied_creation_turns.move_to_end(key)
+        while len(_denied_creation_turns) > MAX_DENIED_CREATION_TURNS:
+            _denied_creation_turns.popitem(last=False)
+
+
+def _release_creation_deny(turn_id: str) -> None:
+    key = _pending_turn_key(turn_id)
+    if not key:
+        return
+    with _state_lock:
+        _denied_creation_turns.pop(key, None)
+
+
+def _creation_tools_denied(turn_id: str) -> bool:
+    key = _pending_turn_key(turn_id)
+    if not key:
+        return False
+    with _state_lock:
+        return key in _denied_creation_turns
+
+
+def _on_pre_tool_call(
+    tool_name: str = "",
+    args: Any = None,
+    turn_id: str = "",
+    **_: Any,
+) -> dict[str, str] | None:
+    denied_actions = DENIED_CREATION_TOOL_ACTIONS.get(tool_name)
+    if not denied_actions or not _creation_tools_denied(turn_id):
+        return None
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, TypeError):
+            args = None
+    # args 解析不出来时无法确认这次是不是 create，按拒绝处理：这一轮本来就
+    # 不该有任何创建落地。
+    action = ""
+    if isinstance(args, dict):
+        action = str(args.get("action") or "").strip().lower()
+        if action and action not in denied_actions:
+            return None
+    return {
+        "action": "block",
+        "message": (
+            "creation-governor refused this creation: it originates from a "
+            "creation recommendation action that was already rejected as "
+            "invalid or expired. Tell the user the recommendation is no longer "
+            "actionable instead of creating anything."
+        ),
+    }
+
+
 def _store_pending_action_result_locked(
     state: dict[str, Any], turn_id: str, receipt: _ActionReceipt
 ) -> None:
     if not turn_id:
         return
+    turn_id = _pending_turn_key(turn_id)
     pending = state["pending_action_results"]
     pending[turn_id] = receipt
     pending.move_to_end(turn_id)
@@ -1826,6 +1913,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                 and current_proposal.get("action_receipts") is True
             )
         if receipt_required and not receipt_transport:
+            _deny_creation_tools_for_turn(outer_turn_id)
             return _join_context(
                 "[Creation governor internal action: Ignore this invalid or expired "
                 "recommendation action. Do not create anything from it and do not expose this block.]"
@@ -1839,6 +1927,8 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                     outer_turn_id,
                     outcome.receipt,
                 )
+        if not outcome.context:
+            _deny_creation_tools_for_turn(outer_turn_id)
         return _join_context(
             outcome.context
             or "[Creation governor internal action: Ignore this invalid or expired "
@@ -2172,13 +2262,18 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     if not session_id:
         return None
     turn_id = str(kwargs.get("turn_id") or "")
+    # 本轮的工具派发已经结束，deny 闸门到此失效。不释放也有条数上限兜着，
+    # 但留着会让同一个 turn_id 的后续复用被莫名挡掉。
+    _release_creation_deny(turn_id)
     if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
         "structured_output"
     ):
         if turn_id:
             with _state_lock:
                 state = _state_locked(session_id, time.monotonic())
-                state["pending_action_results"].pop(turn_id, None)
+                state["pending_action_results"].pop(
+                    _pending_turn_key(turn_id), None
+                )
         return None
 
     response_text = _ACTION_RESULT_ENVELOPE_RE.sub("", original_response).rstrip()
@@ -2196,7 +2291,9 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     with _state_lock:
         state = _state_locked(session_id, now)
         pending = state["pending_action_results"]
-        action_result = pending.pop(turn_id, None) if turn_id else None
+        action_result = (
+            pending.pop(_pending_turn_key(turn_id), None) if turn_id else None
+        )
 
     require_canonical_response = kwargs.get("require_canonical_response")
     if (
@@ -2263,6 +2360,12 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             "expires_at": expires_at,
             "evidence_turn_ids": [source_turn_id] if source_turn_id else [],
             "source_turn_id": source_turn_id,
+            # 引导页最后一屏的 Task 卡跟常规推荐走同一个文本信封，却是从这里
+            # 直接返回的，绕过了下面那次统一的 action_receipts 标注。漏标的后果
+            # 不是「少个字段」：Web 会把它当老卡按猜测结算，而下一轮用户真点
+            # 「创建」时 receipt_required 读到 False、不落 pending receipt，
+            # local-server 那边照样要收据，于是这张卡必然 fail-closed。
+            "action_receipts": bool(_receipt_transport(kwargs)),
         }
         channel_target = _text(welcome.get("channel_target"), 80).lower()
         channel_emitted = False
@@ -2470,6 +2573,7 @@ def register(ctx: Any) -> None:
         },
     )
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
     # 连接推荐卡（channel.connect / connector.connect）的按钮回执：dismiss
     # 落 30 天拒绝闩锁。hook 由 zet_agent 的 attachment/action 入站派发。

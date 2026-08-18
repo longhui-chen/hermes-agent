@@ -548,6 +548,12 @@ def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
     return False
 
 
+# MAX_CANONICAL_FINAL_TURN_ID_LEN 限住会被 governor 当作 pending receipt 键、
+# 并驻留到 TTL 到期的那个 turn_id。正常值是 local-server 的 UUID 类关联令牌，
+# 200 已经很宽松；不设上限则少量请求就能长期占住设备内存。
+MAX_CANONICAL_FINAL_TURN_ID_LEN = 200
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -610,19 +616,24 @@ def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
     messages = body.get("messages")
     if not isinstance(messages, list):
         return False
-    last_user_content = next(
+    # 看的是**实际送进 Agent 的那条消息**，不按 role 过滤也不向前搜索：
+    # _handle_chat_completions 无条件取 conversation_messages[-1] 当 user_message，
+    # governor 解析的就是它。若这里只看最后一条 user 消息，一个「末条是 assistant
+    # 且正文带 wrapper」的普通请求就会漏判——transport 不被清除，governor 照样
+    # 解析那个 wrapper、消费 proposal 并产出可信回执，版本化端点的门禁被绕过。
+    last_message = next(
         (
-            message.get("content")
+            message
             for message in reversed(messages)
-            if isinstance(message, dict) and message.get("role") == "user"
+            if isinstance(message, dict) and message.get("role") != "system"
         ),
         None,
     )
+    last_content = last_message.get("content") if isinstance(last_message, dict) else None
     # 多模态 content 是 API 正式接受的形态：wrapper 藏在 parts 数组的某个 text
-    # part 里时，只看标量字符串就会漏判，transport 不被清除。
-    # _normalize_multimodal_content() 会保留这些文本 part，governor 对整个列表
-    # 做 str() 之后照样能解析出里面的 JSON wrapper——降级边界必须一起覆盖。
-    for _text in _iter_message_text_parts(last_user_content):
+    # part 里时，只看标量字符串就会漏判。_normalize_multimodal_content() 会保留
+    # 这些文本 part，governor 对整个列表做 str() 之后照样能解析出 JSON wrapper。
+    for _text in _iter_message_text_parts(last_content):
         if "[creation_recommendation_response]" in _text:
             return True
     return False
@@ -5834,6 +5845,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(
                     "canonical-final-v1 cannot be combined with a structured "
                     "response_format: the receipt would never be produced"
+                ),
+                status=400,
+            )
+        # turn_id 会成为 pending_action_results 的键并驻留到 TTL 到期。不设上限
+        # 的话，少量携带超长 turn_id 的请求就能把设备上的 Hermes 撑爆（端侧
+        # 2 GB 硬预算）。正常的 turn_id 是 local-server 的 UUID 类关联令牌。
+        if len(_extract_turn_id(body)) > MAX_CANONICAL_FINAL_TURN_ID_LEN:
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 turn_id exceeds "
+                    f"{MAX_CANONICAL_FINAL_TURN_ID_LEN} characters"
+                ),
+                status=400,
+            )
+        # 禁用了工具的 create 动作永远走不到原生创建流程（skill_manage / cronjob
+        # 都是工具），但 governor 会照常消费 proposal 并回 accepted——Web 结算成
+        # 「已接管」，资源却根本不会被创建。宁可在进 Agent 前拒掉。
+        if str(body.get("tool_choice") or "").strip().lower() == "none":
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot run with tool_choice=none: the "
+                    "native creation flow would never execute"
                 ),
                 status=400,
             )
