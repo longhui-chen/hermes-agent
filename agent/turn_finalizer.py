@@ -23,12 +23,19 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import re
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.prompt_builder import STEER_USER_PREFIX
 from agent.response_format import response_format_requires_structured_output
 from agent.zet_agent_response_mode import ensure_hardware_enrollment_intent
+
+# creation-governor 产出的可信回执信封。finalizer 需要认得它，才能在第三方
+# transform hook 洗掉之后把它补回链末结果里。
+_CREATION_ACTION_RECEIPT_RE = re.compile(
+    r"<!--creation-recommendation-action-result\s+[A-Za-z0-9_-]+\s*-->"
+)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -602,6 +609,26 @@ def finalize_turn(
         for _hook_result in _transform_results:
             if isinstance(_hook_result, str) and _hook_result:
                 final_response = _hook_result
+        # creation-governor 在链中段产出可信回执 marker，但 invoke_hook 会把结果
+        # 继续交给后面注册的 hook，finalizer 采用的是链末结果。第三方 hook 若整体
+        # 重写响应，marker 就没了——而 canonical_response_required 仍会让这段被改
+        # 写的文本作为 canonical_final_response 发出去，Web 关联不上回执，已经被
+        # 接管的 create 会永久停在「不确定」。链末补回：proposal 已经在 governor
+        # 那边消费过了，回执是这一轮唯一的凭据，不能让它被顺手洗掉。
+        if _canonical_response_required and not _CREATION_ACTION_RECEIPT_RE.search(
+            final_response or ""
+        ):
+            for _hook_result in _transform_results:
+                if not isinstance(_hook_result, str):
+                    continue
+                _receipt = _CREATION_ACTION_RECEIPT_RE.search(_hook_result)
+                if _receipt is None:
+                    continue
+                _kept = (final_response or "").rstrip()
+                final_response = (
+                    f"{_kept}\n\n{_receipt.group(0)}" if _kept else _receipt.group(0)
+                )
+                break
         final_response = ensure_hardware_enrollment_intent(
             agent,
             user_message=original_user_message,

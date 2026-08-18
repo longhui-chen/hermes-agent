@@ -37,6 +37,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _extract_creation_action_receipt_transport,
+    _has_creation_recommendation_wrapper,
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
@@ -1171,6 +1172,58 @@ def test_extract_connector_route_capability_accepts_only_fixed_base64url(raw, wa
 )
 def test_extract_creation_action_receipt_transport_is_fail_closed(metadata, want):
     assert _extract_creation_action_receipt_transport({"metadata": metadata}) == want
+
+
+def _body_with_action(payload_json: str) -> dict:
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "确认创建\n\n[creation_recommendation_response]\n"
+                    + payload_json
+                    + "\n[/creation_recommendation_response]"
+                ),
+            }
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "payload_json",
+    [
+        # 严格解析认得的规范形态
+        '{"version":1,"type":"creation_recommendation_response","action":"create",'
+        '"creation_type":"agent","proposal_id":"p1","title":"T","dedup_key":"d1"}',
+        # governor 会先规范化再接受，但严格解析不认：大写 action
+        '{"version":1,"type":"creation_recommendation_response","action":"CREATE",'
+        '"creation_type":"agent","proposal_id":"p1","title":"T","dedup_key":"d1"}',
+        # 同上：别名 creation_type
+        '{"version":1,"type":"creation_recommendation_response","action":"create",'
+        '"creation_type":"scheduled-task","proposal_id":"p1","title":"T","dedup_key":"d1"}',
+        # 连 JSON 都不合法——照样不能让普通端点带着 receipt transport 过去
+        "{not json at all",
+    ],
+)
+def test_plain_endpoint_never_keeps_receipt_transport_for_any_action_wrapper(payload_json):
+    """降级边界必须比 governor 的接受面更宽。
+
+    严格解析器要求 action 小写、creation_type 属于固定三项；governor 会先规范化
+    （CREATE → create、scheduled-task → task）再接受。两边判据不一致时，一个
+    「严格解析不认、governor 认」的 payload 打到普通 /v1/chat/completions 上，
+    transport 不会被清除，普通端点就能改 proposal、拉起原生创建流程并产出可信
+    回执——版本化端点这道门等于白设。
+    """
+    assert _has_creation_recommendation_wrapper(_body_with_action(payload_json)) is True
+
+
+def test_wrapper_probe_ignores_bodies_without_the_envelope():
+    """对照：没有信封的普通聊天不受影响，不该被误清 transport。"""
+    assert _has_creation_recommendation_wrapper(
+        {"messages": [{"role": "user", "content": "今天天气怎么样"}]}
+    ) is False
+    assert _has_creation_recommendation_wrapper({"messages": "not a list"}) is False
+    assert _has_creation_recommendation_wrapper({}) is False
 
 
 # ---------------------------------------------------------------------------

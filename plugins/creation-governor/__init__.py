@@ -370,12 +370,27 @@ def _latch_dismissal(session_id: str, dedup_key: str, now: float) -> None:
 
 
 def _raw_session_key(kwargs: dict[str, Any]) -> str:
-    return _text(
+    """会话作用域的内部标识。
+
+    不能用 `_text()`：它是给展示文本用的，会折叠内部空白并截断到 160 字符，
+    而 `APIServerAdapter._parse_session_key_header()` 允许最长 256 且保留内部
+    空白。两个合法的不同会话因此可能塌成同一个 scope，`last_proposal`、mute
+    偏好和 pending receipt 会串到别人的会话上。
+
+    短且无需归一的键原样保留（与既有 scope 兼容，不会因升级重置用户偏好）；
+    其余用完整值的摘要，碰撞由 sha256 保证而不是由截断决定。
+    """
+    raw = str(
         kwargs.get("conversation_session_id")
         or kwargs.get("session_id")
-        or kwargs.get("task_id"),
-        160,
+        or kwargs.get("task_id")
+        or ""
     )
+    if not raw:
+        return ""
+    if len(raw) <= 160 and raw == " ".join(raw.split()):
+        return raw
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def _scoped_session_key(raw_session_id: str, owner_id: str) -> str:

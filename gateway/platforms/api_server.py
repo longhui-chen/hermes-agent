@@ -594,6 +594,35 @@ def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
     return ""
 
 
+def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
+    """正文里是否出现了创建建议动作信封——不看内容是否合法。
+
+    降级边界要用这个宽判据，不能复用下面那个严格解析器：严格解析要求 action
+    小写、creation_type 属于固定三项，而 creation-governor 会先做规范化
+    （`CREATE` → `create`、`scheduled-task` → `task` 之类）再接受动作。两边判据
+    不一致时，一个「严格解析不认、governor 认」的 payload 打到普通端点上，
+    transport 不会被清除，于是普通端点也能改 proposal、拉起原生创建流程并产出
+    可信回执——版本化端点这道门就白设了。
+
+    判据放宽到「有没有这个 wrapper」之后，governor 将来新增多少种规范化写法都
+    不会开出新口子：可信回执只可能从版本化 handler 显式放行的请求里出来。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    last_user_content = next(
+        (
+            message.get("content")
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        None,
+    )
+    if not isinstance(last_user_content, str):
+        return False
+    return "[creation_recommendation_response]" in last_user_content
+
+
 def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
     messages = body.get("messages")
     if not isinstance(messages, list):
@@ -5798,7 +5827,7 @@ class APIServerAdapter(BasePlatformAdapter):
         creation_action_receipt_transport = (
             _extract_creation_action_receipt_transport(body)
         )
-        if _is_canonical_final_creation_action(body) and not request.get(
+        if _has_creation_recommendation_wrapper(body) and not request.get(
             "canonical_final_creation_action_admitted", False
         ):
             creation_action_receipt_transport = ""

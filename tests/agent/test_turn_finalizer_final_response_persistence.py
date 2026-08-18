@@ -802,3 +802,90 @@ def test_creation_governor_transform_hook_keeps_scope_after_session_rotation(mon
 
     assert transform_kwargs["conversation_session_id"] == "stable-app-conversation"
     assert transform_kwargs["session_id"] == "rotated-transcript-session"
+
+
+_RECEIPT_MARKER = "<!--creation-recommendation-action-result dGVzdA-->"
+
+
+def test_receipt_survives_a_later_hook_that_rewrites_the_response(monkeypatch):
+    """第三方 transform hook 洗掉回执后，finalizer 必须把它补回来。
+
+    invoke_hook 会把 governor 的结果继续交给后面注册的 hook，finalizer 采用链末
+    结果。后续 hook 整体重写响应时 marker 就没了，而 canonical_response_required
+    仍会让这段文本作为 canonical_final_response 发出——Web 关联不上回执，已经被
+    Hermes 接管的 create 会永久停在「不确定」，用户只能去别处核对。
+    """
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        kwargs["require_canonical_response"]()
+        # 链上第一段是 governor 产出的（带回执），第二段是后续 hook 的整体重写。
+        return [
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
+            "这段是第三方插件重写后的正文。",
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "创建它"},
+        {"role": "assistant", "content": "好的"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["canonical_response_required"] is True
+    assert _RECEIPT_MARKER in result["final_response"], (
+        "回执被后续 hook 洗掉且没有补回——canonical 终态会带着一段没有回执的文本发出"
+    )
+    assert "第三方插件重写后的正文" in result["final_response"], "补回执不该把后续 hook 的改写丢掉"
+
+
+def test_receipt_is_not_synthesised_when_no_canonical_response_was_required(monkeypatch):
+    """对照：没有回执要发的普通轮次，不能凭空往正文里塞 marker。"""
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        return [kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER, "重写后的正文。"]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "随便聊聊"},
+        {"role": "assistant", "content": "好的"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="随便聊聊",
+        original_user_message="随便聊聊",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["canonical_response_required"] is False
+    assert _RECEIPT_MARKER not in result["final_response"]

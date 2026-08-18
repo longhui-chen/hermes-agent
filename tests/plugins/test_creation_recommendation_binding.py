@@ -940,3 +940,30 @@ def test_card_is_only_delivered_by_the_turn_that_produced_it():
         )
         is None
     )
+
+
+def test_two_long_session_keys_do_not_share_one_governor_scope():
+    """会话作用域不能被截断/空白折叠塌在一起。
+
+    APIServerAdapter 允许最长 256 字符且保留内部空白的 session key。若 scope 用
+    展示用的 _text()（折叠空白 + 截断 160）算，两个合法的不同会话会共享
+    last_proposal、mute 偏好和 pending receipt——一个会话里的动作会作用到另一个。
+    """
+    plugin = _load_plugin()
+
+    shared_prefix = "zettlab:user-with-a-very-long-identity:" + "x" * 150
+    first = plugin._raw_session_key({"conversation_session_id": shared_prefix + "-alpha"})
+    second = plugin._raw_session_key({"conversation_session_id": shared_prefix + "-beta"})
+    assert first != second, "两个仅后缀不同的超长 key 塌成了同一个 scope"
+
+    spaced = plugin._raw_session_key({"conversation_session_id": "conv  a"})
+    collapsed = plugin._raw_session_key({"conversation_session_id": "conv a"})
+    assert spaced != collapsed, "内部空白被折叠后两个不同 key 撞在了一起"
+
+
+def test_short_plain_session_key_keeps_its_original_scope():
+    """短且无需归一的 key 原样保留——升级不该把用户既有的会话偏好重置掉。"""
+    plugin = _load_plugin()
+    assert plugin._raw_session_key({"conversation_session_id": "conv-1"}) == "conv-1"
+    assert plugin._raw_session_key({"session_id": "sess-2"}) == "sess-2"
+    assert plugin._raw_session_key({}) == ""
