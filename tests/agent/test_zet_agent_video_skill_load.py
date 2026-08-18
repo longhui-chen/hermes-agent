@@ -213,10 +213,38 @@ def test_video_edit_skill_force_recovers_skill_view_from_policy_snapshot(
         "name"
     ]["enum"] == [_VIDEO_EDIT_SKILL]
     assert "tool_choice" in api_kwargs
+    assert _valid_tool_names_for_response(agent) == {"skill_view", "terminal"}
+    exact = _tool_call("skill_view", '{"name":"video-edit-workflow-mini"}')
+    assistant_message = SimpleNamespace(tool_calls=[exact], provider_data={})
+    assert not _enforce_single_plan_interaction_tool_call(
+        agent,
+        assistant_message,
+    )
+    assert assistant_message.tool_calls == [exact]
     assert policy_skill_tool["function"]["parameters"]["properties"]["name"] == {
         "type": "string",
         "description": "Skill name",
     }
+
+
+def test_video_edit_skill_force_does_not_restore_unauthorized_policy_tool(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: False,
+    )
+    agent = _agent(
+        tools=[_tool("terminal")],
+        valid_tool_names={"terminal"},
+        _zet_agent_execution_policy_tools=[_tool("skill_view"), _tool("terminal")],
+        _zet_agent_execution_policy_valid_tool_names={"terminal"},
+    )
+    api_kwargs = {"tools": [_tool("terminal")]}
+
+    assert not _apply_forced_video_edit_skill_view(agent, api_kwargs)
+    assert api_kwargs["tools"] == []
+    assert agent.valid_tool_names == {"terminal"}
 
 
 def test_video_edit_skill_force_stops_after_trusted_scope_activates(monkeypatch):

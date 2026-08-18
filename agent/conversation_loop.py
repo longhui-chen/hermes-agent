@@ -892,7 +892,25 @@ def _apply_forced_video_edit_skill_view(
 
     selected_tool = None
     tools = api_kwargs.get("tools")
-    tool_sources = [tools] if isinstance(tools, list) else []
+    live_valid_tool_names = set(
+        getattr(agent, "valid_tool_names", set()) or set()
+    )
+    policy_valid_tool_names = set(
+        getattr(
+            agent,
+            "_zet_agent_execution_policy_valid_tool_names",
+            set(),
+        )
+        or set()
+    )
+    skill_view_authorized = "skill_view" in (
+        live_valid_tool_names | policy_valid_tool_names
+    )
+    tool_sources = (
+        [tools]
+        if skill_view_authorized and isinstance(tools, list)
+        else []
+    )
 
     # A trusted silent turn deliberately narrows ``agent.tools`` after
     # ``skill_view`` succeeds.  If a malformed/out-of-policy follow-up
@@ -902,7 +920,11 @@ def _apply_forced_video_edit_skill_view(
     # turn and never grants an execution tool by itself.
     for source_name in ("_zet_agent_execution_policy_tools", "tools"):
         source = getattr(agent, source_name, None)
-        if isinstance(source, (list, tuple)) and source not in tool_sources:
+        if (
+            skill_view_authorized
+            and isinstance(source, (list, tuple))
+            and source not in tool_sources
+        ):
             tool_sources.append(source)
 
     for source in tool_sources:
@@ -949,6 +971,17 @@ def _apply_forced_video_edit_skill_view(
             "skill_view schema"
         )
         return False
+
+    # The silent policy snapshot is also the authoritative validation scope.
+    # Re-exposing only the schema is insufficient: response validation would
+    # otherwise reject the exact forced call as an unknown tool before the
+    # attestation handler can mint a fresh execution scope.
+    if "skill_view" not in live_valid_tool_names:
+        agent.valid_tool_names = live_valid_tool_names | {"skill_view"}
+        logger.info(
+            "zet_agent video edit: restored trusted skill_view validation "
+            "from the execution-policy snapshot"
+        )
 
     api_kwargs["tool_choice"] = "required"
     disabled_thinking = _should_disable_thinking_for_forced_tool_choice(agent)
