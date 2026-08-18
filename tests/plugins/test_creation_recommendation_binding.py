@@ -405,6 +405,112 @@ def test_pending_receipt_key_is_bounded_for_oversized_turn_ids():
     assert plugin._pending_turn_key(at_limit) == at_limit
 
 
+# 卡片的 title / reason 里合法地含一个 `}`（"JSON {schema}" 这种）时，按花括号
+# 定界的非贪婪正则会在字符串内部就收尾，解出来的是残片——那张完全合法的卡片
+# 因此点不动。
+def test_action_envelope_survives_a_right_brace_inside_a_string_field():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "brace-title")
+    payload = dict(payload)
+    payload["title"] = "解析 JSON {schema} 的助手"
+    # 卡片状态里存的 title 也要跟着换，否则动作会因名字对不上被判无效。
+    state_key = plugin._session_key({"session_id": "brace-title", "sender_id": "owner-a"})
+    with plugin._state_lock:
+        state = plugin._session_states[state_key]
+        state["last_proposal"]["suggested_name"] = payload["title"]
+        state["last_candidate"]["suggested_name"] = payload["title"]
+
+    result = plugin._on_pre_llm_call(
+        session_id="brace-title",
+        sender_id="owner-a",
+        turn_id="brace-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+    assert result is not None
+    assert "invalid or expired" not in result["context"]
+
+
+# 动作信封挂在消息末尾，Web 会在它前面放一段给模型看的动作说明文案。文案一长
+# 就能把信封挤出 governor 的字符预算——那样 governor 完全看不到这次动作，既不
+# 接管也不生成回执，请求却以普通模型结果收尾，Web 把这次创建永久停在
+# 「不确定且不能重试」。
+def test_action_envelope_survives_a_long_leading_instruction():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "long-prefix")
+    long_prefix = "请注意：" + "这是一段很长的动作说明文案。" * 400
+    assert len(long_prefix) > plugin.USER_MESSAGE_LIMIT
+
+    result = plugin._on_pre_llm_call(
+        session_id="long-prefix",
+        sender_id="owner-a",
+        turn_id="long-prefix-turn",
+        user_message=long_prefix + "\n\n" + _action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+    assert result is not None
+    assert "invalid or expired" not in result["context"]
+
+
+def test_bounded_user_message_keeps_the_trailing_envelope():
+    plugin = _load_plugin()
+    envelope = (
+        "[creation_recommendation_response]"
+        '{"version":1,"type":"creation_recommendation_response"}'
+        "[/creation_recommendation_response]"
+    )
+    bounded = plugin._bounded_user_message("x" * 5000 + envelope)
+    assert bounded.endswith(envelope)
+    assert len(bounded) <= plugin.USER_MESSAGE_LIMIT
+    # 对照：没有信封时就是普通截断。
+    plain = plugin._bounded_user_message("x" * 5000)
+    assert len(plain) == plugin.USER_MESSAGE_LIMIT
+    # 对照：预算之内原样返回。
+    assert plugin._bounded_user_message("短消息") == "短消息"
+
+
+# 双击 / 传输重发会让两个并发请求复用同一个 turn_id：先到的原子消费掉 proposal
+# 拿到 accepted，后到的因为 proposal 已被消费而落拒绝闸门。闸门只按 turn_id 记
+# 的话会把先到那个请求真实的创建也挡掉——客户端收到 accepted，资源却没建出来。
+def test_accepted_action_survives_a_concurrent_replay_deny():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "concurrent-replay")
+
+    accepted = plugin._on_pre_llm_call(
+        session_id="concurrent-replay",
+        sender_id="owner-a",
+        turn_id="shared-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+    assert "invalid or expired" not in accepted["context"]
+
+    # 同一个 turn_id 的第二份请求：proposal 已被消费，判为无效重放。
+    replay = plugin._on_pre_llm_call(
+        session_id="concurrent-replay",
+        sender_id="owner-a",
+        turn_id="shared-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+    assert "invalid or expired" in replay["context"]
+
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="shared-turn",
+        )
+        is None
+    ), "重放请求落下的闸门挡掉了先到那个请求真实的创建"
+
+
 def test_native_creation_routes_are_explicit_for_each_recommendation_type():
     plugin = _load_plugin()
 
