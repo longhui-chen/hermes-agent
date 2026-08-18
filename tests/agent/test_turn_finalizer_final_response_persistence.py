@@ -819,7 +819,7 @@ def test_receipt_survives_a_later_hook_that_rewrites_the_response(monkeypatch):
     def invoke_hook(name, **kwargs):
         if name != "transform_llm_output":
             return []
-        kwargs["require_canonical_response"]()
+        kwargs["require_canonical_response"](_RECEIPT_MARKER)
         # 链上第一段是 governor 产出的（带回执），第二段是后续 hook 的整体重写。
         return [
             kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
@@ -904,7 +904,7 @@ def test_a_later_hook_cannot_swap_in_a_different_receipt(monkeypatch):
     def invoke_hook(name, **kwargs):
         if name != "transform_llm_output":
             return []
-        kwargs["require_canonical_response"]()
+        kwargs["require_canonical_response"](_RECEIPT_MARKER)
         return [
             kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
             "第三方重写。\n\n" + _FOREIGN_RECEIPT,
@@ -940,7 +940,7 @@ def test_a_later_hook_cannot_append_a_conflicting_receipt(monkeypatch):
     def invoke_hook(name, **kwargs):
         if name != "transform_llm_output":
             return []
-        kwargs["require_canonical_response"]()
+        kwargs["require_canonical_response"](_RECEIPT_MARKER)
         return [
             kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
             kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER + "\n\n" + _FOREIGN_RECEIPT,
@@ -967,3 +967,45 @@ def test_a_later_hook_cannot_append_a_conflicting_receipt(monkeypatch):
     assert result["final_response"].count("creation-recommendation-action-result") == 1
     assert _RECEIPT_MARKER in result["final_response"]
     assert _FOREIGN_RECEIPT not in result["final_response"]
+
+
+def test_sanitisation_only_turn_does_not_borrow_another_hooks_marker(monkeypatch):
+    """governor 只清洗、本轮没有回执时，链末不能从别的 hook 结果里补一个 marker。
+
+    伪造 marker 被剥掉的轮次同样会置 canonical_response_required。若此时后置
+    hook 追加了任意语法合法的 marker，把它当成权威回执发出去会让 Web 去结算
+    另一张卡片。
+    """
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        # 只做清洗：没有回执可交，传 None。
+        kwargs["require_canonical_response"](None)
+        return [
+            kwargs["response_text"],
+            "第三方追加。\n\n" + _FOREIGN_RECEIPT,
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "随便说说"}, {"role": "assistant", "content": "好的"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="随便说说",
+        original_user_message="随便说说",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["canonical_response_required"] is True
+    assert "creation-recommendation-action-result" not in result["final_response"], (
+        "本轮没有回执，却把后置 hook 的 marker 当成权威值发了出去"
+    )

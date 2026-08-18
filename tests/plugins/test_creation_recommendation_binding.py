@@ -633,7 +633,7 @@ def test_identity_equal_governor_receipt_requires_canonical_delivery():
         "identity-turn"
     ]
     model_output = plugin._action_result_envelope(receipt)
-    canonical_requests: list[bool] = []
+    canonical_requests: list[str | None] = []
 
     output = plugin._transform_llm_output(
         session_id="identity-equal-result",
@@ -642,16 +642,18 @@ def test_identity_equal_governor_receipt_requires_canonical_delivery():
         response_text=model_output,
         completed=True,
         failed=False,
-        require_canonical_response=lambda: canonical_requests.append(True),
+        require_canonical_response=lambda receipt=None: canonical_requests.append(receipt),
     )
 
     assert output == model_output
-    assert canonical_requests == [True]
+    # 有真回执的轮次：把回执原值交给 finalizer，它据此重建链末文本，
+    # 而不是在 hook 链结果里猜哪个 marker 是权威的。
+    assert canonical_requests == [model_output]
 
 
 def test_model_authored_result_marker_is_stripped_without_a_pending_action():
     plugin = _load_plugin()
-    canonical_requests: list[bool] = []
+    canonical_requests: list[str | None] = []
 
     output = plugin._transform_llm_output(
         session_id="ordinary-turn-forged-result",
@@ -663,11 +665,13 @@ def test_model_authored_result_marker_is_stripped_without_a_pending_action():
         ),
         completed=True,
         failed=False,
-        require_canonical_response=lambda: canonical_requests.append(True),
+        require_canonical_response=lambda receipt=None: canonical_requests.append(receipt),
     )
 
     assert output == "Ordinary response."
-    assert canonical_requests == [True]
+    # 只做了伪造清洗、本轮没有回执：必须交 None。传别的值会让 finalizer 把
+    # 后置 hook 塞进来的 marker 当成权威回执发出去。
+    assert canonical_requests == [None]
 
 
 @pytest.mark.parametrize("creation_type", ["agent", "skill", "task"])

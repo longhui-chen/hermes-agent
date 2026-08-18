@@ -38,6 +38,7 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _extract_creation_action_receipt_transport,
     _has_creation_recommendation_wrapper,
+    _make_request_fingerprint,
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
@@ -1215,6 +1216,25 @@ def test_plain_endpoint_never_keeps_receipt_transport_for_any_action_wrapper(pay
     回执——版本化端点这道门等于白设。
     """
     assert _has_creation_recommendation_wrapper(_body_with_action(payload_json)) is True
+
+
+def test_idempotency_fingerprint_separates_admission_scopes():
+    """普通端点与版本化端点不能共用同一条幂等缓存。
+
+    同一个 Idempotency-Key + 同一份 body 下，普通端点先缓存的无回执结果会让
+    canonical-final-v1 的重试直接命中缓存、跳过 governor 和动作接管；反过来
+    普通端点也会复用只应由版本化端点产出的 canonical 结果。
+    """
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    keys = ["model", "messages"]
+    plain = _make_request_fingerprint(body, keys=keys, admission_scope="plain")
+    canonical = _make_request_fingerprint(
+        body, keys=keys, admission_scope="canonical_final_v1"
+    )
+    assert plain != canonical
+
+    # 同一 scope 下仍然稳定，否则幂等本身就失效了。
+    assert plain == _make_request_fingerprint(body, keys=keys, admission_scope="plain")
 
 
 def test_wrapper_probe_covers_multimodal_text_parts():

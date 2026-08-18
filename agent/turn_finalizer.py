@@ -550,6 +550,7 @@ def finalize_turn(
     _response_transformed = False
     _response_transform_suffix = ""
     _canonical_response_required = False
+    _canonical_receipt_marker = None
     _structured_output = False
 
     # Plugin hook: transform_llm_output
@@ -566,9 +567,13 @@ def finalize_turn(
             (getattr(agent, "request_overrides", None) or {}).get("response_format")
         )
 
-        def _require_canonical_response() -> None:
-            nonlocal _canonical_response_required
+        def _require_canonical_response(receipt_marker=None) -> None:
+            nonlocal _canonical_response_required, _canonical_receipt_marker
             _canonical_response_required = True
+            # governor 传的是它这一轮实际开具的回执原值；只做 sanitization 的轮次
+            # 传 None（本轮压根没有回执可发）。
+            if receipt_marker:
+                _canonical_receipt_marker = receipt_marker
 
         _transform_results = _invoke_hook(
             "transform_llm_output",
@@ -616,25 +621,23 @@ def finalize_turn(
         # 接管的 create 会永久停在「不确定」。链末补回：proposal 已经在 governor
         # 那边消费过了，回执是这一轮唯一的凭据，不能让它被顺手洗掉。
         if _canonical_response_required:
-            # governor 在链上先于第三方 hook 注册，它那一段结果里的 marker 就是
-            # 这一轮唯一权威的回执。只判断「链末还有没有 marker」是不够的：后置
-            # hook 完全可以换一个语法合法但指向别的 proposal 的 marker，或者在保
-            # 留真值的同时追加一个冲突的——前者会让 Web 结算错卡片，后者会让它
-            # 因回执冲突永久失败关闭。所以不是「缺了才补」，而是无条件重建：
-            # 清掉链末所有 action-result marker，只把 governor 那个原值接回去。
-            _governor_receipt = None
-            for _hook_result in _transform_results:
-                if not isinstance(_hook_result, str):
-                    continue
-                _receipt = _CREATION_ACTION_RECEIPT_RE.search(_hook_result)
-                if _receipt is not None:
-                    _governor_receipt = _receipt.group(0)
-                    break
-            if _governor_receipt is not None:
-                _kept = _CREATION_ACTION_RECEIPT_RE.sub("", final_response or "").rstrip()
+            # 权威回执只认 governor 通过回调交过来的那个原值。不能在 hook 链的
+            # 结果里找「第一个 marker」当它：governor 只做伪造清洗、本轮并没有
+            # 回执时也会置位 _canonical_response_required，那时链上出现的任何
+            # marker 都是后置 hook 塞的，认下来会让 Web 去结算别人的卡片。
+            #
+            # 无论有没有回执，都先清掉链末所有 action-result marker——后置 hook
+            # 换掉真值、或在真值旁边追加一个冲突 marker，都会被这一步抹平；
+            # 然后只把 governor 的原值接回去（没有就不接）。
+            _kept = _CREATION_ACTION_RECEIPT_RE.sub("", final_response or "").rstrip()
+            if _canonical_receipt_marker:
                 final_response = (
-                    f"{_kept}\n\n{_governor_receipt}" if _kept else _governor_receipt
+                    f"{_kept}\n\n{_canonical_receipt_marker}"
+                    if _kept
+                    else _canonical_receipt_marker
                 )
+            else:
+                final_response = _kept
         final_response = ensure_hardware_enrollment_intent(
             agent,
             user_message=original_user_message,

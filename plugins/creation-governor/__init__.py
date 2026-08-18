@@ -2202,7 +2202,14 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     if (
         stripped_forged_result or isinstance(action_result, _ActionReceipt)
     ) and callable(require_canonical_response):
-        require_canonical_response()
+        # 把权威回执原值交给 finalizer，而不是让它在 hook 链的结果里猜哪个
+        # marker 是真的。只做了清洗、本轮没有真回执时传 None：finalizer 会清掉
+        # 链末所有 marker 而不是从别的 hook 结果里补一个进来。
+        require_canonical_response(
+            _action_result_envelope(action_result)
+            if isinstance(action_result, _ActionReceipt)
+            else None
+        )
 
     if isinstance(action_result, _ActionReceipt):
         visible_response = response_text if usable_response else ""

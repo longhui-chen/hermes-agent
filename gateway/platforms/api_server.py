@@ -2249,6 +2249,7 @@ def _make_request_fingerprint(
     keys: List[str],
     *,
     execution_scope_digest: str = "",
+    admission_scope: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
     material = repr(subset).encode("utf-8")
@@ -2256,6 +2257,15 @@ def _make_request_fingerprint(
         material += (
             b"\0zettlab-business-execution-scope-v1:"
             + execution_scope_digest.encode("ascii")
+        )
+    # admission_scope 把「这份 body 是从哪条路由、以什么准入模式进来的」并进指纹。
+    # 少了它，同一个 Idempotency-Key + 同一份 body 会在普通端点和
+    # canonical-final-v1 之间共用缓存：普通端点先缓存的无回执结果会让版本化重试
+    # 直接命中缓存、跳过 governor 和动作接管；反过来普通端点也会复用只应由版本化
+    # 端点产出的 canonical 结果。
+    if admission_scope:
+        material += (
+            b"\0zettlab-admission-scope-v1:" + admission_scope.encode("ascii")
         )
     return hashlib.sha256(material).hexdigest()
 
@@ -6254,6 +6264,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
                 execution_scope_digest=_business_execution_scope_digest(
                     business_execution_token
+                ),
+                admission_scope=(
+                    "canonical_final_v1"
+                    if request.get("canonical_final_creation_action_admitted", False)
+                    else "plain"
                 ),
             )
             try:
