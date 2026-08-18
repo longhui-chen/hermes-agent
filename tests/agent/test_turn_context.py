@@ -346,6 +346,46 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert ctx.conversation_history == compacted_history
     assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
+def test_governor_scope_follows_the_compression_child():
+    """推荐卡存进哪个 scope，必须跟响应头回给客户端的 session 一致。
+
+    压缩旋转恢复会把 agent.session_id 换成 canonical child。在恢复之前绑定
+    governor scope，卡片就存进了父 scope，客户端照响应头提交动作时 governor 在
+    子 scope 里找不到刚展示的 proposal，只能拒绝——那张卡从此点不动。
+    """
+    agent = _FakeAgent()
+
+    def _recover(_agent):
+        _agent.session_id = "compression-child"
+        return [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}]
+
+    with patch(
+        "agent.turn_context.recover_rotated_compression_session",
+        side_effect=_recover,
+    ):
+        _build(agent, conversation_history=[{"role": "user", "content": "stale parent"}])
+
+    assert agent._creation_governor_conversation_session_id == "compression-child"
+
+
+def test_explicit_gateway_session_key_survives_the_compression_child():
+    """对照：调用方显式指定的 gateway key 是稳定作用域，恢复不该动它。"""
+    agent = _FakeAgent()
+    agent._gateway_session_key = "app-conversation-42"
+
+    def _recover(_agent):
+        _agent.session_id = "compression-child"
+        return [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}]
+
+    with patch(
+        "agent.turn_context.recover_rotated_compression_session",
+        side_effect=_recover,
+    ):
+        _build(agent, conversation_history=[{"role": "user", "content": "stale parent"}])
+
+    assert agent._creation_governor_conversation_session_id == "app-conversation-42"
+
+
 def test_records_trusted_current_user_and_previous_assistant_messages():
     agent = _FakeAgent()
     _build(
