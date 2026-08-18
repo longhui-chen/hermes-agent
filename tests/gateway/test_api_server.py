@@ -38,6 +38,7 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _extract_creation_action_receipt_transport,
     _has_creation_recommendation_wrapper,
+    _is_canonical_final_creation_action,
     _make_request_fingerprint,
     _hermes_version,
     _redact_api_error_text,
@@ -1216,6 +1217,43 @@ def test_plain_endpoint_never_keeps_receipt_transport_for_any_action_wrapper(pay
     回执——版本化端点这道门等于白设。
     """
     assert _has_creation_recommendation_wrapper(_body_with_action(payload_json)) is True
+
+
+def test_admission_requires_the_action_to_be_the_last_conversation_message():
+    """准入判据必须和真正喂给 Agent 的那条消息是同一条。
+
+    _handle_chat_completions 取 conversation_messages[-1] 当 user_message。若准入
+    向前搜索，动作后面跟一条 assistant 消息就会放行、但 governor 拿到的是那条
+    assistant——它看不到动作，既不接管也不产回执，请求以普通模型结果收尾，Web
+    把创建永久标成「不确定且不可重试」。
+    """
+    action = (
+        "确认创建\n\n[creation_recommendation_response]\n"
+        '{"version":1,"type":"creation_recommendation_response","action":"create",'
+        '"creation_type":"agent","proposal_id":"p1","title":"T","dedup_key":"d1"}\n'
+        "[/creation_recommendation_response]"
+    )
+    assert _is_canonical_final_creation_action(
+        {"messages": [{"role": "user", "content": action}]}
+    ) is True
+    # system 消息不算对话尾巴，不该影响判定
+    assert _is_canonical_final_creation_action(
+        {
+            "messages": [
+                {"role": "user", "content": action},
+                {"role": "system", "content": "be nice"},
+            ]
+        }
+    ) is True
+    # 动作后面还有 assistant：拒绝，让客户端拿到明确的 400 而不是静默的不确定态
+    assert _is_canonical_final_creation_action(
+        {
+            "messages": [
+                {"role": "user", "content": action},
+                {"role": "assistant", "content": "好的"},
+            ]
+        }
+    ) is False
 
 
 def test_idempotency_fingerprint_separates_admission_scopes():

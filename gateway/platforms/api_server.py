@@ -648,14 +648,23 @@ def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
     messages = body.get("messages")
     if not isinstance(messages, list):
         return False
-    last_user_content = next(
+    # 必须是**最后一条**对话消息本身携带动作，不能向前搜索：
+    # _handle_chat_completions 取 conversation_messages[-1] 当 user_message，
+    # 如果动作后面还跟着一条 assistant 消息，向前搜索会放行准入，但 governor
+    # 拿到的是那条 assistant——它看不到动作，既不接管也不产回执，请求却以普通
+    # 模型结果收尾，Web 因此把创建永久标成「不确定且不可重试」。准入判据必须
+    # 和后续真正喂给 Agent 的那条消息是同一条。
+    last_message = next(
         (
-            message.get("content")
+            message
             for message in reversed(messages)
-            if isinstance(message, dict) and message.get("role") == "user"
+            if isinstance(message, dict) and message.get("role") != "system"
         ),
         None,
     )
+    if not isinstance(last_message, dict) or last_message.get("role") != "user":
+        return False
+    last_user_content = last_message.get("content")
     if not isinstance(last_user_content, str):
         return False
     match = re.search(
