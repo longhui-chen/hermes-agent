@@ -674,6 +674,12 @@ def _pending_turn_key(turn_id: str) -> str:
 #
 # 作用域是单个 turn_id：拿不到 turn_id 时无法界定范围，此时保持放行——宁可漏挡
 # 一次，也不能因为一个无 id 的请求把全设备的创建工具锁死。
+#
+# 只列了 skill 和 task 两种品类的落地工具，因为 agent 品类的推荐当前是关的
+# （`AGENT_RECOMMENDATION_ENABLED = False`，硬闸在 `_detect_creation_opportunity`
+# 里事后过滤），生产上不存在 creation_type=agent 的 proposal。
+# **打开那个开关时必须回来补这里**：agent 的落地路径是 agent-creator 经 terminal
+# 跑 create_agent.py，不是一个能按工具名挡住的独立工具，需要单独设计执行点。
 DENIED_CREATION_TOOL_ACTIONS = {
     "skill_manage": {"create"},
     "cronjob": {"create"},
