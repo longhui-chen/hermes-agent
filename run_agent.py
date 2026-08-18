@@ -7139,6 +7139,42 @@ class AIAgent:
                 message["reasoning_content"] = " "
         return message
 
+    def _reasoning_echo_route_key(self) -> tuple[str, str, str]:
+        """Return the normalized route identity used for echo capability state."""
+        return (
+            str(getattr(self, "provider", "") or "").strip().lower(),
+            str(getattr(self, "model", "") or "").strip().lower(),
+            str(
+                getattr(
+                    self,
+                    "_base_url_lower",
+                    getattr(self, "base_url", ""),
+                )
+                or ""
+            ).strip().lower(),
+        )
+
+    def _learn_reasoning_echo_for_current_route(self) -> bool:
+        """Remember an upstream-declared echo requirement for this chat route.
+
+        Public model aliases can resolve to different upstream families over
+        time, so static model-name matching cannot safely express this
+        capability. The conversation loop calls this only after an explicit
+        pre-delivery validation error. State is agent-local and bounded so it
+        neither leaks across profiles nor grows with arbitrary model switches.
+        """
+        if getattr(self, "api_mode", "chat_completions") != "chat_completions":
+            return False
+
+        key = self._reasoning_echo_route_key()
+        learned = list(getattr(self, "_reasoning_echo_required_routes", ()))
+        if key in learned:
+            return False
+        learned.append(key)
+        self._reasoning_echo_required_routes = learned[-8:]
+        self._thinking_pad_cache = None
+        return True
+
     def _needs_thinking_reasoning_pad(self) -> bool:
         """Return True when the active provider enforces reasoning_content echo-back.
 
@@ -7154,12 +7190,13 @@ class AIAgent:
         ``urlparse``) calls under it. Caching drops the per-turn cost from
         ~5us × 16 = ~80us to <1us.
         """
-        key = (self.provider, self.model, getattr(self, "_base_url_lower", self.base_url))
+        key = self._reasoning_echo_route_key()
         cached = getattr(self, "_thinking_pad_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
         result = (
-            self._needs_deepseek_tool_reasoning()
+            key in getattr(self, "_reasoning_echo_required_routes", ())
+            or self._needs_deepseek_tool_reasoning()
             or self._needs_kimi_tool_reasoning()
             or self._needs_mimo_tool_reasoning()
         )

@@ -492,6 +492,22 @@ def _error_text(error: Exception) -> str:
     return " ".join(parts).lower()
 
 
+def _is_reasoning_echo_required_error(error: Exception) -> bool:
+    """Return True only for an upstream-declared reasoning replay requirement."""
+    if getattr(error, "status_code", None) not in {400, 422}:
+        return False
+    text = _error_text(error)
+    if "reasoning_content" not in text:
+        return False
+    return (
+        "must be passed back" in text
+        or (
+            "thinking mode" in text
+            and ("is required" in text or "required field" in text)
+        )
+    )
+
+
 def _is_deepseek_thinking_default_model(agent: Any) -> bool:
     model = str(getattr(agent, "model", "") or "").strip().lower()
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
@@ -6199,6 +6215,25 @@ def run_conversation(
                     and not classified.should_fallback
                 )
                 if is_client_error:
+                    # Opaque model aliases may switch upstream families without
+                    # changing the public provider/model name. Learn the
+                    # capability only from the upstream's explicit validation
+                    # response, repair the replay payload, and retry once. A
+                    # different route gets a different capability key; strict
+                    # providers that reject the field never enter this branch.
+                    if (
+                        getattr(agent, "api_mode", "") == "chat_completions"
+                        and not _retry.reasoning_echo_retry_attempted
+                        and _is_reasoning_echo_required_error(api_error)
+                    ):
+                        _retry.reasoning_echo_retry_attempted = True
+                        agent._learn_reasoning_echo_for_current_route()
+                        if agent._reapply_reasoning_echo_for_provider(api_messages):
+                            agent._buffer_vprint(
+                                "🧠 Upstream requires reasoning_content replay; "
+                                "repaired assistant tool-call history and retrying once."
+                            )
+                            continue
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /

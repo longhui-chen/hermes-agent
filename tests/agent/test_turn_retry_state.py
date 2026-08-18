@@ -29,6 +29,7 @@ EXPECTED_FIELDS = {
     "llama_cpp_grammar_retry_attempted",
     "plan_tool_choice_thinking_retry_attempted",
     "plan_text_fallback_retry_attempted",
+    "reasoning_echo_retry_attempted",
     "primary_recovery_attempted",
     "has_retried_429",
     "auth_failover_attempted",
