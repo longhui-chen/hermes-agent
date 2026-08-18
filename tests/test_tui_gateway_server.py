@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -702,6 +703,10 @@ def test_profile_scoped_mcp_discovery_uses_target_home(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mcp_startup, "_mcp_discovery_started", False)
     monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", None)
+    # `_mcp_discovery_by_profile` 没被 monkeypatch（它是 dict，setattr 换掉整个
+    # 对象会让生产侧持有的引用失配）⇒ 快照 + finally 恢复。做法照抄
+    # tests/hermes_cli/test_mcp_startup.py 的 saved_profiles 夹具。
+    saved_by_profile = dict(mcp_startup._mcp_discovery_by_profile)
     # ensure_mcp_discovery_started flips this module global; monkeypatch it so
     # the enablement doesn't leak into sibling tests in this file.
     monkeypatch.setattr(entry, "_mcp_discovery_enabled", False)
@@ -713,12 +718,34 @@ def test_profile_scoped_mcp_discovery_uses_target_home(monkeypatch, tmp_path):
 
     try:
         entry.ensure_mcp_discovery_started()
-        thread = mcp_startup._mcp_discovery_thread
+        # 本测试上面设了 `set_hermes_home_override(profile_home)` ⇒
+        # `_discovery_profile_identity()` 非 None ⇒ `_set_discovery_state()` 走
+        # profile 分支，线程存进 `_mcp_discovery_by_profile`，**按设计不再写**
+        # 全局兼容槽 `_mcp_discovery_thread`。
+        #
+        # ⚠️ 原断言是 `_mcp_discovery_thread is not None`，钉的是 profile 隔离
+        # **之前**的实现；隔离落地（本分支 `6a47851bc2`）后它必然为 None ——
+        # merge-base `f9a507316b` 上这条是 PASSED，本分支上 FAILED，是本分支
+        # 引入的回归。取线程只是为了 join，⛔ 不是本测试的契约（契约是最后那句
+        # `seen == [profile_home]`：discovery 跑在目标 profile 的 home 下）。
+        #
+        # 改后判据**比原来更严**：同时钉住隔离的两个方向——线程必须进 profile
+        # 索引、且全局槽必须保持空。⛔ 不是把红灯改绿。
+        assert mcp_startup._mcp_discovery_thread is None, (
+            "profile-scoped discovery ⛔ 不该写全局兼容槽 _mcp_discovery_thread"
+        )
+        threads = list(mcp_startup._mcp_discovery_by_profile.values())
+        assert len(threads) == 1, (
+            f"应当且仅当为该 profile 起一个 discovery 线程，实际={threads}"
+        )
+        thread = threads[0]
         assert thread is not None
         thread.join(timeout=2)
     finally:
         reset_hermes_home_override(token)
         mcp_startup._mcp_discovery_thread = None
+        mcp_startup._mcp_discovery_by_profile.clear()
+        mcp_startup._mcp_discovery_by_profile.update(saved_by_profile)
         mcp_startup._mcp_discovery_started = False
 
     assert seen == [str(profile_home)]
@@ -13688,16 +13715,43 @@ def test_reload_env_rpc_calls_hermes_cli_reload_env(monkeypatch):
     assert calls["n"] == 1
 
 
-def test_reload_env_rpc_surfaces_errors(monkeypatch):
+def test_reload_env_rpc_surfaces_errors(monkeypatch, caplog):
+    """失败必须显性，但 ⛔ 不许把底层异常原文回显给用户。
+
+    ⛔ 旧断言是 `assert "env path locked" in resp["error"]["message"]` —— 它把
+    「回显底层异常文本」钉成了必须行为，正好和硬规则「面向用户的错误不许裸露
+    底层报错」相反：那句原文可能带配置文件路径、parser 内部信息。于是任何做
+    错误脱敏的修复都会被这条测试判红，反过来逼人把泄漏加回去。
+    正确契约是四件事：失败仍显性 · 有稳定业务码 · 提示可行动 · 带可反查的
+    reference（原始异常只进日志）。
+    """
     def _broken():
         raise RuntimeError("env path locked")
 
     fake = types.SimpleNamespace(reload_env=_broken)
-    with patch.dict(sys.modules, {"hermes_cli.config": fake}):
-        resp = server.handle_request({"id": "1", "method": "reload.env", "params": {}})
+    with caplog.at_level(logging.ERROR):
+        with patch.dict(sys.modules, {"hermes_cli.config": fake}):
+            resp = server.handle_request(
+                {"id": "1", "method": "reload.env", "params": {}}
+            )
 
+    # ① 失败仍然显性
     assert "error" in resp
-    assert "env path locked" in resp["error"]["message"]
+    message = resp["error"]["message"]
+
+    # ② ⛔ 原始异常文本不许出现在面向用户的消息里
+    assert "env path locked" not in message, (
+        f"底层异常原文泄漏到用户可见消息：{message!r}"
+    )
+
+    # ③ 稳定业务码 + ④ 可行动提示
+    assert "ENV_RELOAD_" in message, f"缺少稳定业务错误码：{message!r}"
+    assert "reference" in message.lower(), f"缺少可反查的 reference：{message!r}"
+
+    # ⑤ 原始异常必须进日志，且带同一个 correlation id —— 否则用户报了
+    # reference 也查不到，"可反查"就是空话。
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "request_id=1" in logged, f"日志缺少可关联的 request_id：{logged!r}"
 
 
 # ── max_iterations config reading ─────────────────────────────────────
@@ -15876,6 +15930,36 @@ def test_tts_stream_begin_and_stop_lifecycle(monkeypatch):
     assert playback_stops == [True]
     with server._tts_stream_lock:
         assert server._tts_stream_state is None
+
+
+def test_tts_stream_begin_propagates_profile_context(monkeypatch):
+    from contextvars import ContextVar
+
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setenv("HERMES_VOICE", "0")
+    _fake_tts_modules(monkeypatch)
+    profile_marker: ContextVar[str] = ContextVar(
+        "tts_profile_marker",
+        default="missing",
+    )
+    seen = {}
+    observed = threading.Event()
+
+    def scoped_stream(_text_queue, _stop, done, **_kwargs):
+        seen["profile"] = profile_marker.get()
+        observed.set()
+        done.set()
+
+    sys.modules["tools.tts_tool"].stream_tts_to_speaker = scoped_stream
+    token = profile_marker.set("profile-a")
+    try:
+        assert server._tts_stream_begin() is not None
+        assert observed.wait(1)
+    finally:
+        profile_marker.reset(token)
+        server._tts_stream_stop(user_barge=False)
+
+    assert seen["profile"] == "profile-a"
 
 
 def test_tts_stream_begin_barges_in_on_previous_pipeline(monkeypatch):

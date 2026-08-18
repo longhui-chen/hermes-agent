@@ -59,12 +59,17 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, greedy_pack_blocks
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MediaFailure,
     MessageEvent,
     MessageType,
     SendResult,
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    log_media_intake_failure,
+    safe_exc,
+    media_failure_reply_text,
+    read_aiohttp_body_with_limit,
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -315,7 +320,7 @@ class ContextTokenStore:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.warning("weixin: failed to restore context tokens for %s: %s", _safe_id(account_id), exc)
+            logger.warning("weixin: failed to restore context tokens for %s: %s", _safe_id(account_id), safe_exc(exc))
             return
         restored = 0
         for user_id, token in data.items():
@@ -342,7 +347,7 @@ class ContextTokenStore:
         try:
             atomic_json_write(self._path(account_id), payload)
         except Exception as exc:
-            logger.warning("weixin: failed to persist context tokens for %s: %s", _safe_id(account_id), exc)
+            logger.warning("weixin: failed to persist context tokens for %s: %s", _safe_id(account_id), safe_exc(exc))
 
 
 class TypingTicketCache:
@@ -617,7 +622,10 @@ async def _download_bytes(
     async def _do_download() -> bytes:
         async with session.get(url) as response:
             response.raise_for_status()
-            return await response.read()
+            # 🔴 ⛔ 不许裸 read():整个响应先进内存,落盘处的大小校验来不及生效,
+            # 1C2G 设备上单个超大入站附件即可 OOM。⭐「先读完再校验」= 没有校验。
+            return await read_aiohttp_body_with_limit(
+                response, media_type="weixin inbound media")
     return await asyncio.wait_for(_do_download(), timeout=timeout_seconds)
 
 
@@ -654,8 +662,22 @@ def _assert_weixin_cdn_url(url: str) -> None:
         )
 
 
+def _media_slot(item: Dict[str, Any], key: str) -> Dict[str, Any]:
+    """取 ``item[key]`` 并**归一成 dict**。
+
+    🔴 ``(item.get(key) or {})`` 对**字符串**没有防护:``"s" or {}`` 就是
+    ``"s"``,后面 ``.get()`` 直接 AttributeError。上游把 ``image_item`` 塞成
+    字符串时四种媒体全部炸,异常冒到 ``_process_message_safe`` 只记日志 ⇒
+    **用户一个字都收不到**。
+    ⭐ 归一收敛到这**一个**出口,⛔ 不在四个 helper 里各写一遍 isinstance。
+    """
+    v = item.get(key)
+    return v if isinstance(v, dict) else {}
+
+
 def _media_reference(item: Dict[str, Any], key: str) -> Dict[str, Any]:
-    return (item.get(key) or {}).get("media") or {}
+    v = _media_slot(item, key).get("media")
+    return v if isinstance(v, dict) else {}
 
 
 async def _download_and_decrypt_media(
@@ -985,7 +1007,7 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
             # gibberish). Return empty so the central STT pipeline in
             # ``gateway/run.py`` produces the body from the downloaded
             # audio instead.
-            voice_item = item.get("voice_item") or {}
+            voice_item = _media_slot(item, "voice_item")
             if not (voice_item.get("media") or {}):
                 # No raw audio to download — Weixin supplied only its own
                 # speech-to-text result. Use it, but preserve the voice
@@ -1057,7 +1079,7 @@ async def qr_login(
                 timeout_ms=QR_TIMEOUT_MS,
             )
         except Exception as exc:
-            logger.error("weixin: failed to fetch QR code: %s", exc)
+            logger.error("weixin: failed to fetch QR code: %s", safe_exc(exc))
             return None
 
         qrcode_value = str(qr_resp.get("qrcode") or "")
@@ -1099,7 +1121,7 @@ async def qr_login(
                 await asyncio.sleep(1)
                 continue
             except Exception as exc:
-                logger.warning("weixin: QR poll error: %s", exc)
+                logger.warning("weixin: QR poll error: %s", safe_exc(exc))
                 await asyncio.sleep(1)
                 continue
 
@@ -1139,7 +1161,7 @@ async def qr_login(
                     except Exception:
                         pass
                 except Exception as exc:
-                    logger.error("weixin: QR refresh failed: %s", exc)
+                    logger.error("weixin: QR refresh failed: %s", safe_exc(exc))
                     return None
             elif status == "confirmed":
                 account_id = str(status_resp.get("ilink_bot_id") or "")
@@ -1316,7 +1338,7 @@ class WeixinAdapter(BasePlatformAdapter):
             if not self._acquire_platform_lock('weixin-bot-token', self._token, 'Weixin bot token'):
                 return False
         except Exception as exc:
-            logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
+            logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, safe_exc(exc))
 
         self._poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
         # Disable aiohttp's built-in ClientTimeout (total=None) to prevent
@@ -1423,7 +1445,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 break
             except Exception as exc:
                 consecutive_failures += 1
-                logger.error("[%s] poll error (%d/%d): %s", self.name, consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc)
+                logger.error("[%s] poll error (%d/%d): %s", self.name, consecutive_failures, MAX_CONSECUTIVE_FAILURES, safe_exc(exc))
                 await asyncio.sleep(BACKOFF_DELAY_SECONDS if consecutive_failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY_SECONDS)
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     consecutive_failures = 0
@@ -1432,7 +1454,7 @@ class WeixinAdapter(BasePlatformAdapter):
         try:
             await self._process_message(message)
         except Exception as exc:
-            logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), exc, exc_info=True)
+            logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), safe_exc(exc), exc_info=True)
 
     async def _process_message(self, message: Dict[str, Any]) -> None:
         assert self._poll_session is not None
@@ -1473,15 +1495,24 @@ class WeixinAdapter(BasePlatformAdapter):
 
         media_paths: List[str] = []
         media_types: List[str] = []
+        media_failures: List[MediaFailure] = []
 
         for item in item_list:
-            await self._collect_media(item, media_paths, media_types)
+            await self._collect_media(item, media_paths, media_types, media_failures)
             ref_message = item.get("ref_msg") or {}
             ref_item = ref_message.get("message_item")
             if isinstance(ref_item, dict):
-                await self._collect_media(ref_item, media_paths, media_types)
+                await self._collect_media(
+                    ref_item, media_paths, media_types, media_failures)
 
         if not text and not media_paths:
+            if media_failures:
+                # 🔴 有附件、却一个都没取到 —— ⛔ 不许当成空消息静默丢弃。
+                # 原先这里直接 return，用户看到的就是「发了图没反应」。
+                await self._reply_media_intake_failed(
+                    effective_chat_id, media_failures)
+                return
+            # ⚠️ 真的空消息 ⇒ 跳过，行为逐字不变。
             return
 
         source = self.build_source(
@@ -1492,6 +1523,12 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         event = MessageEvent(
             text=text,
+            # ⛔ 提示走 channel_prompt，⛔ 不拼进 text —— 拼进 text 等于把系统
+            # 内容伪装成用户原话（会进命令解析、批处理合并、持久化历史）。
+            # 照抄 wecom 那处的层级选择（`base.py:2241` 注释写明它不持久化）。
+            channel_prompt=(
+                self._media_failure_note(media_failures) if media_failures else None
+            ),
             message_type=_message_type_from_media(media_types, text),
             source=source,
             raw_message=message,
@@ -1573,6 +1610,21 @@ class WeixinAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            # 🔴 ``channel_prompt`` 必须一起并 —— ⛔ 不许只并 text/media。
+            # 这是「半条链」:我在上面**新造**了 per-event 的 channel_prompt
+            # (附件取不到的提示),但合并分支只搬 text 和 media ⇒ 用户先发一条
+            # 纯文本、再发「正文+失败附件」时,后一条的提示被静默丢弃,
+            # Agent 又不知道有附件 —— 缺陷原样复活在批处理路径上。
+            #
+            # ⚠️ 这条**只对本 adapter 成立**:其余 7 个 batcher 的 channel_prompt
+            # 全部来自 ``resolve_channel_prompt(chat_id)`` = 每会话常量,同 key
+            # 下每个 event 值相同,丢了也无影响 ⇒ ⛔ 不去改它们(越界扩散)。
+            #
+            # ⭐ 合并语义直接复用 ``_merge_caption``(base.py:5311):它做的正是
+            # 「去重 + \n\n 拼接」,与这里需要的**逐字相同** ⇒ ⛔ 不自造第二套。
+            if event.channel_prompt:
+                existing.channel_prompt = self._merge_caption(
+                    existing.channel_prompt, event.channel_prompt)
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -1602,48 +1654,201 @@ class WeixinAdapter(BasePlatformAdapter):
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
 
-    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
+    #: item type ⇒ 与 wecom 同名的 kind 字符串。⛔ 不再拿内部数字当 kind。
+    _ITEM_KIND = {
+        ITEM_IMAGE: "image",
+        ITEM_VIDEO: "video",
+        ITEM_FILE: "file",
+        ITEM_VOICE: "voice",
+    }
+    #: kind ⇒ 给**用户**看的名字。⛔ 不许把内部标识拼进面向用户的文案。
+    _MEDIA_KIND_LABEL = {
+        "image": "图片", "video": "视频", "file": "文件", "voice": "语音",
+    }
+
+    def _note_media_failure(
+        self,
+        kind: str,
+        reason: str,
+        media: Dict[str, Any],
+        exc: Optional[BaseException] = None,
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> None:
+        """入站媒体没拿到 —— **唯一**记账出口（照抄 wecom 的形状）。
+
+        🔴 日志走 ``log_media_intake_failure``，⛔ 不再 ``%s`` 异常对象:
+        ``aiohttp.ClientResponseError.__str__`` **包含完整 URL**，而微信
+        媒体 url 带鉴权参数 —— 实测 403 日志里会出现 ``...?token=...``。
+        ⚠️ 我在 wecom 侧修过同一个形状(``netloc`` 含 userinfo)，却没扫到
+        这里的四个下载出口 —— **兄弟调用点没跟上**（RH 复审第五轮抓出）。
+        """
+        # 🔴 ⛔ 不许假定 ``media`` 是 dict:上游把 ``image_item`` 塞成字符串时,
+        # 下载异常虽被捕获,这里再 ``.get()`` 会**二次抛** AttributeError,
+        # 一路冒到 ``_process_message_safe`` 只记日志 ⇒ 用户一个字都收不到。
+        # ⭐ **记账函数是失败路径上的最后一道** —— 它自己崩了就什么都不剩。
+        _url = ""
+        if isinstance(media, dict):
+            _url = str(media.get("full_url") or "")
+        log_media_intake_failure(
+            logger, self.name, kind, reason, url=_url, exc=exc,
+        )
+        if failures is not None:
+            failures.append(MediaFailure(kind=kind, reason=reason))
+
+    @staticmethod
+    def _media_failure_note(failures: List[MediaFailure]) -> str:
+        """给 **Agent** 看的一行提示（⛔ 不是给用户的文案）。
+
+        照抄 wecom 同名方法 —— Agent 需要知道「用户发过附件但系统没取到」，
+        否则它连「你发的图我没收到」都说不出来。
+        """
+        kinds = "、".join(
+            f"{WeixinAdapter._MEDIA_KIND_LABEL.get(f.kind, f.kind)}/{f.reason}"
+            for f in sorted(set(failures))
+        )
+        return f"[系统提示：用户发送了 {len(failures)} 个附件（{kinds}），但未能取到内容]"
+
+    async def _reply_media_intake_failed(
+        self, chat_id: str, failures: List[MediaFailure]
+    ) -> None:
+        """纯附件消息一个都没取到 ⇒ 给用户一条**可行动**的回复。
+
+        ⭐ 判据「不写它用户会不会做错事」= **会**：他看不到任何反应，
+        会以为机器人挂了或自己没发出去，然后反复重发。
+        ⛔ 一个字都不含内部路径 / 原始错误 —— 那些在日志里。
+        """
+        try:
+            res = await self.send(
+                chat_id,
+                # 🔴 建议按**成因**给,⛔ 不是一句话通吃。
+                # 我上一版写死「请重新发送」并注释说「这条路只有一种成因」——
+                # **那个前提是错的**:落盘 writer 就在同一个 try 里,磁盘满
+                # 也会走到这句话,而重发多少次都白搭（RH 第五轮抓出）。
+                # ⭐ 与 wecom 共用 base 的建议表,⛔ 不各留一份(必漂移)。
+                media_failure_reply_text(failures, self._MEDIA_KIND_LABEL),
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] 连「附件读取失败」的回复都没发出去 (chat=%s): %s",
+                self.name, _safe_id(chat_id), safe_exc(exc),
+            )
+            return
+        # ⭐ 判据是 SendResult.success，⛔ 不是「没抛异常」。
+        if getattr(res, "success", True) is False:
+            logger.error(
+                "[%s] 「附件读取失败」的回复被平台拒收 (chat=%s): %s",
+                self.name, _safe_id(chat_id), getattr(res, "error", None) or "unknown",
+            )
+
+    async def _collect_media(
+        self,
+        item: Dict[str, Any],
+        media_paths: List[str],
+        media_types: List[str],
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> None:
+        """取一个 item 的媒体。``failed_kinds`` 收集**声明了但没取到**的类型。
+
+        🔴 第三个出参是本轮新增（RH 复审第四轮 P1-2）。原先四类下载失败都只是
+        「不 append」，调用方只看到空 ``media_paths`` ⇒ 在 ``:1484`` 直接
+        ``return``，用户发的图片/视频/文件/语音只要下载失败，就是
+        **「发了但没有任何回复」**。
+
+        ⭐ 这是 wecom 那条缺陷的**同根孪生** —— 我上一轮只修了 wecom、
+        没扫这里，正是「兄弟调用点没跟上」。
+        修法照抄刚在 wecom 做对的那套（把「有没有尝试过」从空列表里拆出来），
+        **但用 weixin 自己的出参风格**，⛔ 不强行改成返回三元组：
+        它本来就是 ``(media_paths, media_types)`` 两个出参，加第三个最一致。
+        """
         item_type = item.get("type")
+        before = len(media_paths)
+        noted = len(failures) if failures is not None else 0
         if item_type == ITEM_IMAGE:
-            path = await self._download_image(item)
+            path = await self._download_image(item, failures)
             if path:
                 media_paths.append(path)
                 media_types.append("image/jpeg")
         elif item_type == ITEM_VIDEO:
-            path = await self._download_video(item)
+            path = await self._download_video(item, failures)
             if path:
                 media_paths.append(path)
                 media_types.append("video/mp4")
         elif item_type == ITEM_FILE:
-            path, mime = await self._download_file(item)
+            path, mime = await self._download_file(item, failures)
             if path:
                 media_paths.append(path)
                 media_types.append(mime)
         elif item_type == ITEM_VOICE:
-            voice_path = await self._download_voice(item)
+            voice_path = await self._download_voice(item, failures)
             if voice_path:
                 media_paths.append(voice_path)
                 media_types.append("audio/silk")
+        else:
+            return          # 非媒体 item —— ⛔ 不算失败
+        # ⭐ 兜底：声明了媒体类型、没落进来、**而下载出口也没记账**
+        # （例如 ``_media_reference`` 拿不到引用，压根没走进 try）。
+        # ⛔ 这一条不许覆盖已记的成因 —— 否则精确原因会被压成 payload_malformed。
+        if (failures is not None and len(media_paths) == before
+                and len(failures) == noted):
+            failures.append(MediaFailure(
+                self._ITEM_KIND.get(item_type, str(item_type)),
+                "payload_malformed"))
 
-    async def _download_image(self, item: Dict[str, Any]) -> Optional[str]:
+    async def _download_image(
+        self, item: Dict[str, Any],
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> Optional[str]:
         media = _media_reference(item, "image_item")
+        # 🔴 十六进制 aeskey 的转换**移出** try —— 它是**载荷解析**，不是下载。
+        # 留在里面时 ``bytes.fromhex`` 对畸形 aeskey 抛 ValueError，会被同一个
+        # handler 记成 ``download_failed``，用户拿到「请重新发送」。
+        # ⭐ 通则：**``try`` 包了几件事，就是错误分类的分辨率上限** ——
+        #   包了三件就只能说出三件的最小公约数，文案层救不了作用域太宽的 try。
+        _raw_key = str(_media_slot(item, "image_item").get("aeskey") or "")
+        _aes_key_b64: Optional[str] = None
+        if _raw_key:
+            try:
+                _aes_key_b64 = base64.b64encode(bytes.fromhex(_raw_key)).decode("ascii")
+            except ValueError as exc:
+                self._note_media_failure(
+                    "image", "payload_malformed", media, exc, failures)
+                return None
         try:
             data = await _download_and_decrypt_media(
                 self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
-                aes_key_b64=(item.get("image_item") or {}).get("aeskey")
-                and base64.b64encode(bytes.fromhex(str((item.get("image_item") or {}).get("aeskey")))).decode("ascii")
-                or media.get("aes_key"),
+                aes_key_b64=_aes_key_b64 or media.get("aes_key"),
                 full_url=media.get("full_url"),
                 timeout_seconds=30.0,
             )
-            return cache_image_from_bytes(data, ".jpg")
         except Exception as exc:
-            logger.warning("[%s] image download failed: %s", self.name, exc)
+            # ⚠️ 下载与解密在同一层:上游 helper 不区分,这里⛔不臆断是哪种。
+            self._note_media_failure("image", "download_failed", media, exc, failures)
             return None
+        # 🔴 落盘**单独**一层:磁盘满 / 只读挂载与「下载不到」是**两种**成因,
+        #    混在一个 try 里会让存储故障也去劝用户「请重新发送」——
+        #    重发多少次都白搭。⭐ 补错的建议比不补更坏。
+        try:
+            path = cache_image_from_bytes(data, ".jpg")
+        except OSError as exc:
+            # ⭐ 只有**环境**故障(磁盘满/只读/权限)才是 cache_write_failed。
+            # ⛔ 原先是 ``except Exception``:``ValueError("not an image")``、
+            # 超限、以及我们自己的编程错误全被归成"磁盘问题",用户被要求
+            # 去清存储 —— 又一次「补错的建议比不补更坏」。
+            # ⭐ 照抄 wecom ``_write_cache_or_report``:环境错误降级,其余照分类。
+            self._note_media_failure("image", "cache_write_failed", media, exc, failures)
+            return None
+        except ValueError as exc:
+            # 内容不是它自称的格式 ⇒ 让用户换个格式,⛔ 不是让他清存储。
+            self._note_media_failure("image", "not_a_valid_media", media, exc, failures)
+            return None
+        return path
 
-    async def _download_video(self, item: Dict[str, Any]) -> Optional[str]:
+    async def _download_video(
+        self, item: Dict[str, Any],
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> Optional[str]:
         media = _media_reference(item, "video_item")
         try:
             data = await _download_and_decrypt_media(
@@ -1654,14 +1859,35 @@ class WeixinAdapter(BasePlatformAdapter):
                 full_url=media.get("full_url"),
                 timeout_seconds=120.0,
             )
-            return cache_document_from_bytes(data, "video.mp4")
         except Exception as exc:
-            logger.warning("[%s] video download failed: %s", self.name, exc)
+            # ⚠️ 下载与解密在同一层:上游 helper 不区分,这里⛔不臆断是哪种。
+            self._note_media_failure("video", "download_failed", media, exc, failures)
             return None
+        # 🔴 落盘**单独**一层:磁盘满 / 只读挂载与「下载不到」是**两种**成因,
+        #    混在一个 try 里会让存储故障也去劝用户「请重新发送」——
+        #    重发多少次都白搭。⭐ 补错的建议比不补更坏。
+        try:
+            path = cache_document_from_bytes(data, "video.mp4")
+        except OSError as exc:
+            # ⭐ 只有**环境**故障(磁盘满/只读/权限)才是 cache_write_failed。
+            # ⛔ 原先是 ``except Exception``:``ValueError("not an image")``、
+            # 超限、以及我们自己的编程错误全被归成"磁盘问题",用户被要求
+            # 去清存储 —— 又一次「补错的建议比不补更坏」。
+            # ⭐ 照抄 wecom ``_write_cache_or_report``:环境错误降级,其余照分类。
+            self._note_media_failure("video", "cache_write_failed", media, exc, failures)
+            return None
+        except ValueError as exc:
+            # 内容不是它自称的格式 ⇒ 让用户换个格式,⛔ 不是让他清存储。
+            self._note_media_failure("video", "not_a_valid_media", media, exc, failures)
+            return None
+        return path
 
-    async def _download_file(self, item: Dict[str, Any]) -> Tuple[Optional[str], str]:
-        file_item = item.get("file_item") or {}
-        media = file_item.get("media") or {}
+    async def _download_file(
+        self, item: Dict[str, Any],
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> Tuple[Optional[str], str]:
+        file_item = _media_slot(item, "file_item")
+        media = _media_reference(item, "file_item")
         filename = str(file_item.get("file_name") or "document.bin")
         mime = _mime_from_filename(filename)
         try:
@@ -1673,14 +1899,35 @@ class WeixinAdapter(BasePlatformAdapter):
                 full_url=media.get("full_url"),
                 timeout_seconds=60.0,
             )
-            return cache_document_from_bytes(data, filename), mime
         except Exception as exc:
-            logger.warning("[%s] file download failed: %s", self.name, exc)
+            # ⚠️ 下载与解密在同一层:上游 helper 不区分,这里⛔不臆断是哪种。
+            self._note_media_failure("file", "download_failed", media, exc, failures)
             return None, mime
+        # 🔴 落盘**单独**一层:磁盘满 / 只读挂载与「下载不到」是**两种**成因,
+        #    混在一个 try 里会让存储故障也去劝用户「请重新发送」——
+        #    重发多少次都白搭。⭐ 补错的建议比不补更坏。
+        try:
+            path = cache_document_from_bytes(data, filename)
+        except OSError as exc:
+            # ⭐ 只有**环境**故障(磁盘满/只读/权限)才是 cache_write_failed。
+            # ⛔ 原先是 ``except Exception``:``ValueError("not an image")``、
+            # 超限、以及我们自己的编程错误全被归成"磁盘问题",用户被要求
+            # 去清存储 —— 又一次「补错的建议比不补更坏」。
+            # ⭐ 照抄 wecom ``_write_cache_or_report``:环境错误降级,其余照分类。
+            self._note_media_failure("file", "cache_write_failed", media, exc, failures)
+            return None, mime
+        except ValueError as exc:
+            # 内容不是它自称的格式 ⇒ 让用户换个格式,⛔ 不是让他清存储。
+            self._note_media_failure("file", "not_a_valid_media", media, exc, failures)
+            return None, mime
+        return path, mime
 
-    async def _download_voice(self, item: Dict[str, Any]) -> Optional[str]:
-        voice_item = item.get("voice_item") or {}
-        media = voice_item.get("media") or {}
+    async def _download_voice(
+        self, item: Dict[str, Any],
+        failures: Optional[List[MediaFailure]] = None,
+    ) -> Optional[str]:
+        voice_item = _media_slot(item, "voice_item")
+        media = _media_reference(item, "voice_item")
         # #27300: previously short-circuited when ``voice_item.text`` was set
         # on the assumption that Tencent Cloud's STT was good enough.
         # For non-Chinese audio that text is garbage (e.g. a Russian
@@ -1697,10 +1944,28 @@ class WeixinAdapter(BasePlatformAdapter):
                 full_url=media.get("full_url"),
                 timeout_seconds=60.0,
             )
-            return cache_audio_from_bytes(data, ".silk")
         except Exception as exc:
-            logger.warning("[%s] voice download failed: %s", self.name, exc)
+            # ⚠️ 下载与解密在同一层:上游 helper 不区分,这里⛔不臆断是哪种。
+            self._note_media_failure("voice", "download_failed", media, exc, failures)
             return None
+        # 🔴 落盘**单独**一层:磁盘满 / 只读挂载与「下载不到」是**两种**成因,
+        #    混在一个 try 里会让存储故障也去劝用户「请重新发送」——
+        #    重发多少次都白搭。⭐ 补错的建议比不补更坏。
+        try:
+            path = cache_audio_from_bytes(data, ".silk")
+        except OSError as exc:
+            # ⭐ 只有**环境**故障(磁盘满/只读/权限)才是 cache_write_failed。
+            # ⛔ 原先是 ``except Exception``:``ValueError("not an image")``、
+            # 超限、以及我们自己的编程错误全被归成"磁盘问题",用户被要求
+            # 去清存储 —— 又一次「补错的建议比不补更坏」。
+            # ⭐ 照抄 wecom ``_write_cache_or_report``:环境错误降级,其余照分类。
+            self._note_media_failure("voice", "cache_write_failed", media, exc, failures)
+            return None
+        except ValueError as exc:
+            # 内容不是它自称的格式 ⇒ 让用户换个格式,⛔ 不是让他清存储。
+            self._note_media_failure("voice", "not_a_valid_media", media, exc, failures)
+            return None
+        return path
 
     async def _maybe_fetch_typing_ticket(self, user_id: str, context_token: Optional[str]) -> None:
         if not self._poll_session or not self._token:
@@ -1719,7 +1984,7 @@ class WeixinAdapter(BasePlatformAdapter):
             if typing_ticket:
                 self._typing_cache.set(user_id, typing_ticket)
         except Exception as exc:
-            logger.debug("[%s] getConfig failed for %s: %s", self.name, _safe_id(user_id), exc)
+            logger.debug("[%s] getConfig failed for %s: %s", self.name, _safe_id(user_id), safe_exc(exc))
 
     def _split_text(self, content: str) -> List[str]:
         return _split_text_for_weixin_delivery(
@@ -1869,7 +2134,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     attempt + 1,
                     self._send_chunk_retries + 1,
                     wait,
-                    exc,
+                    safe_exc(exc),
                 )
                 if wait > 0:
                     await asyncio.sleep(wait)
@@ -1916,14 +2181,14 @@ class WeixinAdapter(BasePlatformAdapter):
                 try:
                     await _deliver_media(media_path, is_voice)
                 except Exception as exc:
-                    logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, exc)
+                    logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, safe_exc(exc))
 
             # Deliver bare local file paths.
             for file_path in local_files:
                 try:
                     await _deliver_media(file_path, is_voice=False)
                 except Exception as exc:
-                    logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+                    logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, safe_exc(exc))
 
             # Deliver text content.
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
@@ -1940,7 +2205,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     await asyncio.sleep(self._send_chunk_delay_seconds)
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
-            logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
+            logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), safe_exc(exc))
             return SendResult(success=False, error=str(exc))
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
@@ -1976,7 +2241,7 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug(
                 "[%s] typing ticket refresh failed for %s: %s",
-                self.name, _safe_id(chat_id), exc,
+                self.name, _safe_id(chat_id), safe_exc(exc),
             )
         return None
 
@@ -1996,7 +2261,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 status=TYPING_START,
             )
         except Exception as exc:
-            logger.debug("[%s] typing start failed for %s: %s", self.name, _safe_id(chat_id), exc)
+            logger.debug("[%s] typing start failed for %s: %s", self.name, _safe_id(chat_id), safe_exc(exc))
 
     async def stop_typing(self, chat_id: str) -> None:
         if not self._send_session or not self._token:
@@ -2014,7 +2279,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 status=TYPING_STOP,
             )
         except Exception as exc:
-            logger.debug("[%s] typing stop failed for %s: %s", self.name, _safe_id(chat_id), exc)
+            logger.debug("[%s] typing stop failed for %s: %s", self.name, _safe_id(chat_id), safe_exc(exc))
 
     async def send_image(
         self,
@@ -2075,7 +2340,7 @@ class WeixinAdapter(BasePlatformAdapter):
             message_id = await self._send_file(chat_id, file_path, caption or "")
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
-            logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), exc)
+            logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), safe_exc(exc))
             return SendResult(success=False, error=str(exc))
 
     async def send_video(
@@ -2092,7 +2357,7 @@ class WeixinAdapter(BasePlatformAdapter):
             message_id = await self._send_file(chat_id, video_path, caption or "")
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
-            logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), exc)
+            logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), safe_exc(exc))
             return SendResult(success=False, error=str(exc))
 
     async def send_voice(
@@ -2119,7 +2384,7 @@ class WeixinAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
-            logger.error("[%s] send_voice failed to=%s: %s", self.name, _safe_id(chat_id), exc)
+            logger.error("[%s] send_voice failed to=%s: %s", self.name, _safe_id(chat_id), safe_exc(exc))
             return SendResult(success=False, error=str(exc))
 
     async def _download_remote_media(self, url: str) -> str:
@@ -2134,7 +2399,9 @@ class WeixinAdapter(BasePlatformAdapter):
         async def _do_fetch():
             async with self._send_session.get(url) as response:
                 response.raise_for_status()
-                return await response.read()
+                # 出站也一样:要发出去的媒体同样先落内存。⭐ 兄弟调用点。
+                return await read_aiohttp_body_with_limit(
+                    response, media_type="weixin outbound media")
         data = await asyncio.wait_for(_do_fetch(), timeout=30)
         suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:

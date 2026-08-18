@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -53,14 +54,16 @@ async def test_unsupported_platform_disables_v25_memory_import(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_memory_import_durability_race_returns_unsupported(monkeypatch):
+async def test_memory_import_durability_race_returns_unsupported(
+    monkeypatch, caplog
+):
     import tools.memory_tool as memory_tool
+
+    private_error = "directory fsync unsupported at /Users/private/profile/memories"
 
     class _Store:
         def import_replace(self, **_kwargs):
-            raise memory_tool.MemoryImportUnsupported(
-                "profile filesystem stopped supporting directory fsync"
-            )
+            raise memory_tool.MemoryImportUnsupported(private_error)
 
     monkeypatch.setattr(
         memory_tool, "portable_memory_import_supported", lambda: True
@@ -79,12 +82,17 @@ async def test_memory_import_durability_race_returns_unsupported(monkeypatch):
         "entries": ["safe fact"],
     })
 
-    response = await adapter._handle_memory_import(request)
+    with caplog.at_level("ERROR", logger="gateway.platforms.zet_agent"):
+        response = await adapter._handle_memory_import(request)
 
     assert response.status == 501
-    assert json.loads(response.text)["error"]["code"] == (
-        "memory_import_unsupported"
-    )
+    body = json.loads(response.text)
+    assert body["error"]["code"] == "memory_import_unsupported"
+    assert private_error not in response.text
+    reference = re.search(r"reference ([0-9a-f]{12})", body["error"]["message"])
+    assert reference is not None
+    assert private_error in caplog.text
+    assert f"correlation_id={reference.group(1)}" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -604,6 +612,152 @@ class _DirectImportRequest(dict):
         return self._body
 
 
+@pytest.mark.parametrize("endpoint", ["transcript", "memory"])
+@pytest.mark.asyncio
+async def test_import_validation_error_is_actionable_without_duplicate_retry(
+    monkeypatch, endpoint
+):
+    private_error = "invalid field at /Users/private/profile/state.db"
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    if endpoint == "transcript":
+        class _SessionDB:
+            def stage_completed_transcript_import(self, **_kwargs):
+                raise ValueError(private_error)
+
+        adapter._ensure_session_db = lambda: _SessionDB()
+        request = _DirectImportRequest({
+            "operation": "stage",
+            "import_id": "invalid-transcript",
+        })
+        response = await adapter._handle_session_import(request)
+        expected_fields = ("payload_sha256", "chunk metadata", "message fields")
+    else:
+        import tools.memory_tool as memory_tool
+
+        class _Store:
+            def import_replace(self, **_kwargs):
+                raise ValueError(private_error)
+
+        monkeypatch.setattr(
+            memory_tool, "portable_memory_import_supported", lambda: True
+        )
+        monkeypatch.setattr(
+            memory_tool, "load_on_disk_store", lambda **_kwargs: _Store()
+        )
+        request = _DirectImportRequest({
+            "mode": "replace",
+            "import_id": "invalid-memory",
+        })
+        response = await adapter._handle_memory_import(request)
+        expected_fields = ("target", "payload_sha256", "entries")
+
+    message = json.loads(response.text)["error"]["message"]
+    assert response.status == 400
+    assert all(field in message for field in expected_fields)
+    assert message.lower().count("retry") == 1
+    assert private_error not in message
+
+
+@pytest.mark.asyncio
+async def test_memory_import_conflict_is_safe_and_correlated(monkeypatch, caplog):
+    import tools.memory_tool as memory_tool
+
+    private_error = "unsafe lock /Users/private/profile/memories/.import.lock"
+
+    class _Store:
+        def import_replace(self, **_kwargs):
+            raise memory_tool.MemoryImportConflict(private_error)
+
+    monkeypatch.setattr(
+        memory_tool, "portable_memory_import_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        memory_tool, "load_on_disk_store", lambda **_kwargs: _Store()
+    )
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": "conflict-safe-error",
+        "mode": "replace",
+        "target": "memory",
+        "payload_sha256": hashlib.sha256(b"conflict").hexdigest(),
+        "entries": ["safe fact"],
+    })
+
+    with caplog.at_level("ERROR", logger="gateway.platforms.zet_agent"):
+        response = await adapter._handle_memory_import(request)
+
+    body = json.loads(response.text)
+    assert response.status == 409
+    assert body["error"]["code"] == "memory_import_conflict"
+    assert body["error"]["message"].lower().count("retry") == 1
+    assert private_error not in response.text
+    reference = re.search(r"reference ([0-9a-f]{12})", body["error"]["message"])
+    assert reference is not None
+    assert private_error in caplog.text
+    assert f"correlation_id={reference.group(1)}" in caplog.text
+
+
+@pytest.mark.parametrize("endpoint", ["transcript", "memory"])
+@pytest.mark.asyncio
+async def test_import_internal_type_error_returns_safe_500(
+    monkeypatch, caplog, endpoint
+):
+    private_error = "internal state mismatch at /Users/private/profile/state.db"
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    if endpoint == "transcript":
+        class _DB:
+            def stage_completed_transcript_import(self, **_kwargs):
+                raise TypeError(private_error)
+
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: _DB())
+        request = _DirectImportRequest({
+            "operation": "stage",
+            "import_id": "internal-type-error",
+            "messages": [],
+        })
+        call = adapter._handle_session_import
+        expected_code = "runtime_import_failed"
+    else:
+        import tools.memory_tool as memory_tool
+
+        class _Store:
+            def import_replace(self, **_kwargs):
+                raise TypeError(private_error)
+
+        monkeypatch.setattr(
+            memory_tool, "portable_memory_import_supported", lambda: True
+        )
+        monkeypatch.setattr(
+            memory_tool, "load_on_disk_store", lambda **_kwargs: _Store()
+        )
+        request = _DirectImportRequest({
+            "mode": "replace",
+            "import_id": "internal-type-error",
+            "entries": [],
+        })
+        call = adapter._handle_memory_import
+        expected_code = "memory_import_failed"
+
+    with caplog.at_level("ERROR", logger="gateway.platforms.zet_agent"):
+        response = await call(request)
+
+    body = json.loads(response.text)
+    assert response.status == 500
+    assert body["error"]["code"] == expected_code
+    assert private_error not in response.text
+    reference = re.search(r"reference ([0-9a-f]{12})", body["error"]["message"])
+    assert reference is not None
+    assert private_error in caplog.text
+    assert f"correlation_id={reference.group(1)}" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_uncached_multiplex_session_imports_use_each_profile_database(
     tmp_path, monkeypatch
@@ -1031,7 +1185,7 @@ async def test_failed_reload_and_unload_do_not_release_a_successful_unload_barri
     assert first.status == 200
 
     class _FailingRunner:
-        async def unload_profile_runtime(self, _profile):
+        async def unload_profile_runtime(self, _profile, **_kwargs):
             raise RuntimeError("unload failed")
 
         def invalidate_cached_agents_for_profile(self, _profile):
@@ -1049,6 +1203,10 @@ async def test_failed_reload_and_unload_do_not_release_a_successful_unload_barri
     assert failed_reload.status == 500
     failed = await adapter._handle_profile_unload(_Request())
     assert failed.status == 500
+    failed_body = json.loads(failed.text)
+    assert failed_body["error"]["code"] == "profile_unload_unavailable"
+    assert "reference" in failed_body["error"]["message"]
+    assert "unload failed" not in failed_body["error"]["message"].lower()
 
     blocked = await adapter._handle_memory_import(
         _Request(
@@ -1089,7 +1247,7 @@ async def test_reload_cannot_release_a_concurrent_successful_unload_barrier(tmp_
             return self._body
 
     class _Runner:
-        async def unload_profile_runtime(self, _profile):
+        async def unload_profile_runtime(self, _profile, **_kwargs):
             return {"evicted_sessions": 0, "disconnected_adapters": 0}
 
         def invalidate_cached_agents_for_profile(self, _profile):
@@ -1343,7 +1501,10 @@ async def test_session_import_rejects_profile_state_db_symlink(tmp_path):
     try:
         response = await adapter._handle_session_import(request)
         assert response.status == 500
-        assert json.loads(response.text)["error"]["code"] == "runtime_import_failed"
+        error = json.loads(response.text)["error"]
+        assert error["code"] == "runtime_import_failed"
+        assert str(profile_home) not in error["message"]
+        assert re.search(r"reference [0-9a-f]{12}", error["message"])
         assert (profile_home / "state.db").is_symlink()
         assert victim._conn.execute(
             "SELECT COUNT(*) FROM runtime_imports"

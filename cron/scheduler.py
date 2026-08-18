@@ -3302,7 +3302,11 @@ def run_job(
     # (which carries cron_hint preamble, skill wrappers, etc).
     persist_prompt = _build_job_persist_prompt(job)
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # Only tasks stamped by Local Server's maintenance-task contract carry a
+    # task identity to App Host. Existing cron jobs retain their historical
+    # session form until explicitly recreated as bound maintenance tasks.
+    _cron_session_kind = "task_" if "maintenance-key=" in str(job.get("prompt") or "") else ""
+    _cron_session_id = f"cron_{_cron_session_kind}{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -4345,6 +4349,10 @@ def run_one_job(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # ADIC v1: opened unconditionally (cheap, bounded) so the app_slug-gated
+    # verdict override below always has a ledger to read; only read once the
+    # agent's own run has finished, right before mark_job_run.
+    _import_attempts_token = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4368,6 +4376,14 @@ def run_one_job(
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
+
+        # ADIC v1: mirrors the per-turn ContextVar pattern below — cron fires
+        # from the ticker thread where no per-turn scope is installed, so this
+        # job's run_conversation call (and the app_host tool calls inside it)
+        # need their own bounded scope to record data.import outcomes into.
+        from gateway.session_context import push_import_attempts_scope
+
+        _import_attempts_token = push_import_attempts_scope()
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4481,6 +4497,43 @@ def run_one_job(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # ADIC v1 §4.5/§7: a maintenance job scoped to an app (app_slug set by
+        # local-server at provision time) is judged by whether data actually
+        # landed this round, not by whether the agent produced a plausible
+        # reply — that is the exact gap the 17:57 Hangzhou incident exposed.
+        # This overrides whatever success/error the run above computed;
+        # non-app_slug jobs are completely unaffected.
+        if job.get("app_slug"):
+            from gateway.session_context import import_attempts_snapshot
+
+            # import_operation is the APP's own declared write-operation name
+            # (e.g. "records.refresh" for a blueprint app), stamped per job by
+            # local-server — not necessarily the literal "data.import". Filter
+            # the ledger to that name so a read call (data.import_schema) or a
+            # different app's operation never counts as this job's import,
+            # and so an app whose write operation isn't literally named
+            # "data.import" isn't judged a hard failure every round. Jobs
+            # created before this field existed (or on any path that omits
+            # it) fall back to the original fixed name.
+            _target_operation = str(job.get("import_operation") or "data.import").strip()
+            _import_attempts = [
+                attempt for attempt in import_attempts_snapshot()
+                if attempt.get("operation") == _target_operation
+            ]
+            if any(attempt.get("ok") for attempt in _import_attempts):
+                success, error = True, None
+            elif _import_attempts:
+                _last_import_failure = _import_attempts[-1]
+                success = False
+                error = (
+                    _last_import_failure.get("error_message")
+                    or _last_import_failure.get("error_code")
+                    or "import attempt failed"
+                )
+            else:
+                success = False
+                error = "no import attempted in this run"
+
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(
                 job["id"],
@@ -4544,6 +4597,11 @@ def run_one_job(
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        if _import_attempts_token is not None:
+            from gateway.session_context import pop_import_attempts_scope
+
+            pop_import_attempts_scope(_import_attempts_token)
 
 
 def _notify_provider_jobs_changed() -> None:

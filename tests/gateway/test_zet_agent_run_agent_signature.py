@@ -21,8 +21,12 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.zet_agent import (
     ZetAgentAdapter,
     _api_request_profile,
+    _deep_memory_principal,
+    _deep_memory_subject,
     _onboarding_deepseek_fast_path,
+    _zettlab_request_account_id,
 )
+from gateway.session_context import pop_zettlab_auth_principal, push_zettlab_auth_principal
 
 
 def test_onboarding_deepseek_fast_path_sets_supported_wire_field():
@@ -177,13 +181,23 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
 
     public_session_id = "zettlab:userA:main:session-1"
     scoped_session_key = f"/profiles/main|{public_session_id}"
-    agent = adapter._create_agent(
-        session_id=public_session_id,
-        gateway_session_key=scoped_session_key,
-        requested_model="request/model",
-        requested_provider="request-provider",
-        model_options={"reasoning_effort": "high", "service_tier": "priority"},
-    )
+    account_token = _zettlab_request_account_id.set("account-1")
+    principal_token = push_zettlab_auth_principal("iam:alice")
+    deep_principal_token = _deep_memory_principal.set("iam:alice")
+    deep_subject_token = _deep_memory_subject.set("user-1")
+    try:
+        agent = adapter._create_agent(
+            session_id=public_session_id,
+            gateway_session_key=scoped_session_key,
+            requested_model="request/model",
+            requested_provider="request-provider",
+            model_options={"reasoning_effort": "high", "service_tier": "priority"},
+        )
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
 
     assert isinstance(agent, FakeAgent)
     assert captured["model"] == "request/model"
@@ -193,6 +207,92 @@ def test_zet_agent_create_agent_applies_request_runtime_options(monkeypatch):
     assert captured["service_tier"] == "priority"
     assert captured["platform"] == "zet_agent"
     assert captured["profile_name"] == "main"
+    assert captured["user_id"] == "account-1"  # Memo and legacy SessionDB account
+    assert captured["session_owner_id"] == "iam:alice"  # SessionDB owner
+    assert captured["deep_memory_principal"] == "iam:alice"
+    assert captured["deep_memory_subject"] == "user-1"
+
+
+def test_zet_agent_create_agent_strips_private_principal_from_request_overrides(monkeypatch):
+    """Regression: ``_zettlab_auth_principal`` must be popped from
+    request_overrides before it reaches the AIAgent, even when the principal
+    ContextVar is set.
+
+    ``_run_agent`` stamps this private field into ``request_overrides``, and
+    ``_create_agent`` must strip it so it never becomes a model argument.
+    Reading ``zettlab_auth_principal()`` first and only popping inside an `or`
+    short-circuits the pop whenever the ContextVar is truthy; the residual
+    field then flows through ``agent.request_overrides`` and is expanded into
+    ``chat.completions.create(**kwargs)`` as an unknown keyword argument,
+    crashing every authenticated chat turn with
+    ``TypeError: unexpected keyword argument '_zettlab_auth_principal'``.
+    """
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.model = kwargs.get("model")
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "request-provider",
+            "model": "request/model",
+            "api_key": "request-key",
+        },
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "request/model")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._checkpoint_agent_kwargs", lambda _cfg: {})
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        lambda: {"enabled": False},
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model", lambda: None
+    )
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent._resolve_request_runtime_agent_kwargs",
+        lambda provider, target_model=None: {
+            "provider": provider,
+            "model": target_model,
+            "api_key": "request-key",
+        },
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+    account_token = _zettlab_request_account_id.set("account-1")
+    principal_token = push_zettlab_auth_principal("iam:alice")
+    try:
+        agent = adapter._create_agent(
+            session_id="zettlab:userA:main:session-1",
+            gateway_session_key="/profiles/main|zettlab:userA:main:session-1",
+            requested_model="request/model",
+            requested_provider="request-provider",
+            # _run_agent stamps these private fields into request_overrides
+            # before _create_agent runs; both must be stripped here.
+            request_overrides={
+                "_zettlab_auth_principal": "iam:alice",
+                "_zettlab_session_context_account_id": "account-1",
+            },
+        )
+    finally:
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert isinstance(agent, FakeAgent)
+    overrides = captured.get("request_overrides") or {}
+    assert "_zettlab_auth_principal" not in overrides
+    assert "_zettlab_session_context_account_id" not in overrides
+    assert captured["session_owner_id"] == "iam:alice"
+    assert captured["user_id"] == "account-1"
 
 
 def test_onboarding_agent_is_lightweight_before_construction(monkeypatch):

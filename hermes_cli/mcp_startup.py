@@ -2,13 +2,95 @@
 
 from __future__ import annotations
 
+import contextvars
 import threading
+import time
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Optional
 
 _mcp_discovery_lock = threading.Lock()
+# 无 profile pin 的单 profile 进程保留原状态槽，避免改变 CLI 启动语义。
 _mcp_discovery_started = False
 _mcp_discovery_thread: Optional[threading.Thread] = None
+_mcp_discovery_by_profile: dict[str, Optional[threading.Thread]] = {}
+_mcp_discovery_teardown_started = False
+
+# ── module-level 状态的权威分类（闭集门读这里）──────────────────────────
+#
+# 形状与 tools/mcp_tool.py 的 `_MCP_*_MUTABLES` 一致：分类清单放生产侧，
+# 让新增状态的人在同一个文件里就看到必须登记。
+#
+# ⛔ 判据不许按变量名前缀（或任何"长什么样"的形状）筛 —— 那样只罩住恰好长
+# 成那样的状态，新增别的命名会静默免检，门恒绿、冒充保护。判据按"必须满足
+# 什么"：本模块每一个 module-level 名字都必须出现在下面某一类里。
+#
+# ⚠️ 与 mcp_tool 的差异（有意为之，不是另发明一套）：mcp_tool 的 module 状态
+# 几乎全是容器，纯运行时 MutableMapping/MutableSet/list 枚举就够；本模块大半
+# 状态是 bool / Thread / Lock，纯容器判据会漏掉它们（新增 `_x_started = False`
+# 扫不到）。所以在照抄那套运行时容器判据之外，额外用 AST 覆盖名字全集。
+#
+# 闭集边界：只覆盖本模块**仓内 Python 可见**的 module-level 状态。第三方 SDK
+# 内部持有的进程级状态属于开集，由 MCP/LSP 的真实 child-env 集成测试兜底。
+_MCP_STARTUP_PROCESS_GLOBAL_STATE = frozenset({
+    "_mcp_discovery_lock",
+    "_mcp_discovery_teardown_started",
+})
+# 无 profile pin 的单 profile 兼容槽。
+_MCP_STARTUP_SINGLE_PROFILE_STATE = frozenset({
+    "_mcp_discovery_started",
+    "_mcp_discovery_thread",
+})
+# 按 profile 分区的索引；运行时必须是映射（闭集门会反证）。
+_MCP_STARTUP_PROFILE_INDEX_STATE = frozenset({
+    "_mcp_discovery_by_profile",
+})
+# 不可变常量 / 类型别名；⛔ 可变容器不许登记到这里（闭集门会反证）。
+_MCP_STARTUP_IMMUTABLE_STATE: frozenset[str] = frozenset()
+# 上面这些清单自身也是 module-level 赋值，AST 判据会扫到，所以要自登记。
+# （mcp_tool 那套只枚举运行时可变容器，frozenset 不是 MutableSet，天然不用
+# 自登记；本模块多了一层 AST 名字判据，就得把清单自己也算进去。）
+_MCP_STARTUP_INVENTORY_STATE: frozenset[str] = frozenset({
+    "_MCP_STARTUP_PROCESS_GLOBAL_STATE",
+    "_MCP_STARTUP_SINGLE_PROFILE_STATE",
+    "_MCP_STARTUP_PROFILE_INDEX_STATE",
+    "_MCP_STARTUP_IMMUTABLE_STATE",
+    "_MCP_STARTUP_INVENTORY_STATE",
+})
+
+
+def _discovery_profile_identity() -> str | None:
+    """返回显式 profile 身份；单 profile 无 pin 时使用兼容状态槽。"""
+    from hermes_constants import get_hermes_home_override
+
+    override = get_hermes_home_override()
+    return str(Path(override).expanduser().resolve()) if override else None
+
+
+def _discovery_state(profile_identity: str | None) -> tuple[bool, Optional[threading.Thread]]:
+    if profile_identity is None:
+        return _mcp_discovery_started, _mcp_discovery_thread
+    return (
+        profile_identity in _mcp_discovery_by_profile,
+        _mcp_discovery_by_profile.get(profile_identity),
+    )
+
+
+def _set_discovery_state(
+    profile_identity: str | None,
+    *,
+    started: bool,
+    thread: Optional[threading.Thread],
+) -> None:
+    global _mcp_discovery_started, _mcp_discovery_thread
+    if profile_identity is None:
+        _mcp_discovery_started = started
+        _mcp_discovery_thread = thread
+        return
+    if not started:
+        _mcp_discovery_by_profile.pop(profile_identity, None)
+    else:
+        _mcp_discovery_by_profile[profile_identity] = thread
 
 
 def _has_configured_mcp_servers() -> bool:
@@ -25,18 +107,21 @@ def _has_configured_mcp_servers() -> bool:
 
 
 def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
-    """Spawn one shared background MCP discovery thread for this process.
+    """Spawn one shared background MCP discovery thread for this profile.
 
     If the first background discovery run exits without connecting any MCP
     server (for example after startup cancellation / OOM restart), later calls
     are allowed to retry instead of permanently pinning the process in a
     "discovery already started" state with zero MCP tools.
     """
-    global _mcp_discovery_started, _mcp_discovery_thread
+    profile_identity = _discovery_profile_identity()
 
     with _mcp_discovery_lock:
-        if _mcp_discovery_started:
-            thread = _mcp_discovery_thread
+        if _mcp_discovery_teardown_started:
+            logger.debug("MCP discovery skipped: process teardown has started")
+            return
+        started, thread = _discovery_state(profile_identity)
+        if started:
             if thread is not None and thread.is_alive():
                 return
             try:
@@ -51,36 +136,23 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                 "Background MCP discovery previously exited with no connected "
                 "servers; retrying discovery thread"
             )
-            _mcp_discovery_started = False
-            _mcp_discovery_thread = None
+            _set_discovery_state(profile_identity, started=False, thread=None)
 
-        _mcp_discovery_started = True
+        _set_discovery_state(profile_identity, started=True, thread=None)
         if not _has_configured_mcp_servers():
             return
 
-        # Capture the caller's context-local HERMES_HOME override (profile
-        # scoping in multi-profile processes like the dashboard/desktop
-        # backend) and re-install it inside the discovery thread. ContextVars
-        # do not propagate into bare threads, so without this a session
-        # "switched" to profile X would discover the LAUNCH profile's
-        # mcp_servers instead (#67605). The config gate above already runs on
-        # the caller's thread, so it sees the same override.
-        try:
-            from hermes_constants import get_hermes_home_override
-
-            home_override = get_hermes_home_override()
-        except Exception:
-            home_override = None
+        # Bare threads do not inherit ContextVars.  Copy the complete caller
+        # context so profile home and secret scope travel together; copying
+        # only HERMES_HOME lets a secondary profile discover with the wrong
+        # credential namespace.
+        discovery_context = contextvars.copy_context()
 
         def _discover() -> None:
-            token = None
             try:
-                from hermes_constants import set_hermes_home_override
-
-                token = set_hermes_home_override(home_override)
-            except Exception:
-                token = None
-            try:
+                with _mcp_discovery_lock:
+                    if _mcp_discovery_teardown_started:
+                        return
                 _discover_mcp_tools_without_interactive_oauth()
                 try:
                     from tools.mcp_tool import get_mcp_status
@@ -94,23 +166,20 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             except Exception:
                 logger.debug("Background MCP tool discovery failed", exc_info=True)
             finally:
-                if token is not None:
-                    try:
-                        from hermes_constants import reset_hermes_home_override
-
-                        reset_hermes_home_override(token)
-                    except Exception:
-                        pass
                 with _mcp_discovery_lock:
-                    global _mcp_discovery_thread, _mcp_discovery_started
-                    _mcp_discovery_thread = None
+                    _started, current = _discovery_state(profile_identity)
+                    if current is threading.current_thread():
+                        _set_discovery_state(
+                            profile_identity, started=_started, thread=None
+                        )
 
         thread = threading.Thread(
-            target=_discover,
+            target=discovery_context.run,
+            args=(_discover,),
             name=thread_name,
             daemon=True,
         )
-        _mcp_discovery_thread = thread
+        _set_discovery_state(profile_identity, started=True, thread=thread)
         thread.start()
 
 
@@ -183,24 +252,23 @@ def wait_for_mcp_discovery(
     ``mcp_single_query_discovery_timeout`` instead (default 15s vs 1.5s
     interactive) because one-shot sessions have no second turn to recover.
     """
-    thread = _mcp_discovery_thread
+    _started, thread = _discovery_state(_discovery_profile_identity())
     if thread is None or not thread.is_alive():
         return
     thread.join(timeout=_resolve_discovery_timeout(timeout, single_query=single_query))
 
 
 def mcp_discovery_in_flight() -> bool:
-    """Return True if THIS module's background discovery thread is still running.
+    """返回当前 profile 的 discovery 线程是否仍在运行。
 
     Mirrors ``tui_gateway.entry.mcp_discovery_in_flight`` for the surfaces that
     start discovery through ``start_background_mcp_discovery`` here (the desktop
     app + dashboard WebSocket sidecar via ``tui_gateway/ws.py``, and
     ``hermes dashboard``).  Those processes populate THIS module's
-    ``_mcp_discovery_thread``, not ``tui_gateway.entry``'s, so the late-refresh
-    scheduler must consult both to decide whether a slow server's tools are
-    still pending (see #51587).
+    late-refresh scheduler 仍会检查 ``tui_gateway.entry`` 的兼容 owner；
+    在本共享 owner 内，由调用方的 profile 身份选择线程。
     """
-    thread = _mcp_discovery_thread
+    _started, thread = _discovery_state(_discovery_profile_identity())
     return thread is not None and thread.is_alive()
 
 
@@ -212,11 +280,50 @@ def join_mcp_discovery(timeout: "float | None" = None) -> bool:
     ``wait_for_mcp_discovery`` this accepts an unbounded/long wait and reports
     the outcome, for the off-critical-path late-refresh waiter.
     """
-    thread = _mcp_discovery_thread
+    _started, thread = _discovery_state(_discovery_profile_identity())
     if thread is None:
         return True
     thread.join(timeout=timeout)
     return not thread.is_alive()
+
+
+def join_all_mcp_discovery(timeout: "float | None" = None) -> bool:
+    """在进程 shutdown 前等待所有 profile 的 discovery，使用一个总预算。"""
+    with _mcp_discovery_lock:
+        threads = [
+            thread
+            for thread in [_mcp_discovery_thread, *_mcp_discovery_by_profile.values()]
+            if thread is not None and thread.is_alive()
+        ]
+    deadline = None if timeout is None else time.monotonic() + timeout
+    for thread in threads:
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        thread.join(timeout=remaining)
+    return not any(thread.is_alive() for thread in threads)
+
+
+def begin_mcp_discovery_teardown() -> None:
+    """关闭本进程 discovery admission；shutdown 期间不可重新打开。"""
+    global _mcp_discovery_teardown_started
+    with _mcp_discovery_lock:
+        _mcp_discovery_teardown_started = True
+
+
+def mcp_discovery_admission_open() -> bool:
+    with _mcp_discovery_lock:
+        return not _mcp_discovery_teardown_started
+
+
+def clear_mcp_discovery_profile(profile_home: str | Path) -> None:
+    """清除已经完整卸载的 profile discovery owner 状态。"""
+    profile_identity = str(Path(profile_home).expanduser().resolve())
+    with _mcp_discovery_lock:
+        thread = _mcp_discovery_by_profile.get(profile_identity)
+        if thread is not None and thread.is_alive():
+            raise RuntimeError(
+                f"cannot clear MCP discovery while it is running for {profile_identity}"
+            )
+        _set_discovery_state(profile_identity, started=False, thread=None)
 
 
 def ensure_mcp_discovery_before_agent_build(

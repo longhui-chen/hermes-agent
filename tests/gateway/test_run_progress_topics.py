@@ -59,6 +59,21 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class FirstSendFailsProgressAdapter(ProgressCaptureAdapter):
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if len(self.sent) == 1:
+            return SendResult(success=False, error="temporary")
+        return SendResult(success=True, message_id="progress-2")
+
+
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
     """Capture sends while exercising Discord's real preview formatter."""
 
@@ -879,6 +894,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    event_message_id=None,
 ):
     if config_data:
         import yaml
@@ -924,8 +940,121 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id=event_message_id,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_feishu_turn_interims_share_one_visible_quote(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DelayedInterimAgent,
+        session_id="sess-feishu-shared-quote",
+        event_message_id="om-user",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": True,
+            },
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc-group",
+        chat_type="group",
+        thread_id="omt-topic",
+    )
+
+    assert result["final_response"] == "done"
+    interims = [call for call in adapter.sent if "interim" in call["content"]]
+    assert len(interims) == 2
+    assert interims[0]["metadata"]["reply_to_message_id"] == "om-user"
+    assert "reply_to_message_id" not in interims[1]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_failed_interim_releases_quote_for_next_success(
+    monkeypatch, tmp_path
+):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DelayedInterimAgent,
+        session_id="sess-feishu-failed-quote",
+        event_message_id="om-user",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": True,
+            },
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc-group",
+        chat_type="group",
+        thread_id="omt-topic",
+        adapter_cls=FirstSendFailsProgressAdapter,
+    )
+
+    interims = [call for call in adapter.sent if "interim" in call["content"]]
+    assert len(interims) == 2
+    assert all(
+        call["metadata"]["reply_to_message_id"] == "om-user"
+        for call in interims
+    )
+
+
+@pytest.mark.asyncio
+async def test_feishu_unscheduled_interim_releases_quote(monkeypatch, tmp_path):
+    gateway_run = importlib.import_module("gateway.run")
+    original_schedule = gateway_run.safe_schedule_threadsafe
+    skipped = False
+
+    def _disable_stream_consumer(*_args, **_kwargs):
+        raise RuntimeError("test direct interim scheduler")
+
+    def _skip_first_interim(coro, loop, **kwargs):
+        nonlocal skipped
+        if (
+            not skipped
+            and kwargs.get("log_message")
+            == "interim_assistant_callback scheduling error"
+        ):
+            skipped = True
+            coro.close()
+            return None
+        return original_schedule(coro, loop, **kwargs)
+
+    monkeypatch.setattr(gateway_run, "safe_schedule_threadsafe", _skip_first_interim)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_build_stream_consumer_config",
+        _disable_stream_consumer,
+    )
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DelayedInterimAgent,
+        session_id="sess-feishu-unscheduled-quote",
+        event_message_id="om-user",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": True,
+            },
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc-group",
+        chat_type="group",
+        thread_id="omt-topic",
+    )
+
+    interims = [call for call in adapter.sent if "interim" in call["content"]]
+    assert skipped is True
+    assert len(interims) == 1
+    assert interims[0]["metadata"]["reply_to_message_id"] == "om-user"
 
 
 @pytest.mark.asyncio

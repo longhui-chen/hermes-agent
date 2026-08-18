@@ -1453,23 +1453,33 @@ def _profile_home(profile: str | None) -> Path | None:
 
 
 def _profile_scoped(handler):
-    """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
+    """Bind a profile-aware RPC handler to its effective HERMES_HOME.
 
-    Pets are per-profile: ``display.pet.*`` lives in the profile's config.yaml and
-    sprites install under its ``pets/`` dir (both resolve via ``get_hermes_home``).
-    The desktop sends ``profile`` on pet calls so config + pets dir resolve to the
-    focused profile even in app-global remote mode, where one backend serves every
-    profile. No-op for the launch profile (own-profile backends already resolve it).
+    Prefer the explicit ``params['profile']``. Session-bound RPCs such as
+    ``reload.mcp`` may omit it, so fall back to that session's durable profile home.
+    No-op for the launch profile (own-profile backends already resolve it).
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        requested_profile = (
+            params.get("profile") if isinstance(params, dict) else None
+        )
+        home = _profile_home(requested_profile)
+        if home is None and not requested_profile and isinstance(params, dict):
+            session = _sessions.get(str(params.get("session_id") or ""))
+            session_home = (session or {}).get("profile_home")
+            if session_home:
+                candidate = Path(session_home)
+                if candidate.resolve() != Path(_hermes_home).resolve():
+                    home = candidate
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
+        secret_token = set_secret_scope(build_profile_secret_scope(home))
         try:
             return handler(rid, params)
         finally:
+            reset_secret_scope(secret_token)
             reset_hermes_home_override(token)
 
     return wrapper
@@ -11805,14 +11815,14 @@ _mcp_reload_lock = threading.Lock()
 # lock only skips the redundant reload if this advanced while it waited — i.e.
 # the leader actually completed. If the leader threw (flapping server), the
 # follower sees no advance and re-runs the full reload itself.
-_mcp_reload_gen = 0
+_mcp_reload_gen_by_profile: dict[str, int] = {}
 # The mcp_rev hash that the last successful reload actually LOADED (config
 # re-hashed after discovery, so it reflects what discover_mcp_tools read —
 # not what the caller hoped for). A follower coalesces only when the
 # revision it was asked to load matches this; otherwise the config changed
 # under the leader (rev A loaded, rev B requested) and the follower must
 # re-run the full reload itself instead of acking B against A's registry.
-_mcp_reload_loaded_rev = ""
+_mcp_reload_loaded_rev_by_profile: dict[str, str] = {}
 # Bounded convergence for a config edit racing a slow reload: the leader
 # re-hashes after discovery and repeats until the hash is stable.
 _MCP_RELOAD_MAX_PASSES = 3
@@ -11841,7 +11851,7 @@ def _compute_mcp_rev() -> str:
         return ""
 
 
-def _finish_reload(rid, params: dict, *, coalesced: bool) -> dict:
+def _finish_reload(rid, params: dict, *, coalesced: bool, loaded_rev: str) -> dict:
     """Shared tail for both reload paths: honor ``always`` (persist the
     confirm opt-out) and return the ok payload."""
     if bool(params.get("always", False)):
@@ -11852,7 +11862,7 @@ def _finish_reload(rid, params: dict, *, coalesced: bool) -> dict:
         except Exception as _exc:
             logger.warning("Failed to persist mcp_reload_confirm=false: %s", _exc)
 
-    payload = {"status": "reloaded", "loaded_rev": _mcp_reload_loaded_rev}
+    payload = {"status": "reloaded", "loaded_rev": loaded_rev}
     if coalesced:
         payload["coalesced"] = True
 
@@ -12840,8 +12850,11 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     text_queue: queue.Queue = queue.Queue()
     stop = threading.Event()
     done = threading.Event()
+    tts_context = contextvars.copy_context()
     threading.Thread(
-        target=stream_tts_to_speaker, args=(text_queue, stop, done), daemon=True
+        target=tts_context.run,
+        args=(stream_tts_to_speaker, text_queue, stop, done),
+        daemon=True,
     ).start()
 
     global _tts_stream_state

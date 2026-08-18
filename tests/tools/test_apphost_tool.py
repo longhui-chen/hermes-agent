@@ -18,6 +18,7 @@ import pytest
 from tests.tools._profile_scope import mux_profile_scope, request_fingerprint
 from tools.apphost_tool import (
     APP_HOST_SCHEMA,
+    _CALL_HTTP_METHODS,
     _check_app_host,
     _local_error,
     app_host_tool,
@@ -85,11 +86,11 @@ class _RawResp:
         return self._body
 
 
-def _capture_urlopen(seen, payload=None):
+def _capture_urlopen(seen, payload=None, status=200):
     def _open(req, timeout=None):
         seen["req"] = req
         seen["timeout"] = timeout
-        return _Resp(payload if payload is not None else {"code": 200, "data": {}})
+        return _Resp(payload if payload is not None else {"code": 200, "data": {}}, status=status)
 
     return _open
 
@@ -169,6 +170,46 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     assert seen["req"].full_url == _BASE_URL + "/storage"
 
 
+def test_request_forwards_only_task_local_execution_headers(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+    )
+    seen = {}
+    session_tokens = set_session_vars(session_id="cron_task_abcdef123456_20260817_120000")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="a" * 64
+    )
+    try:
+        with mux_profile_scope(monkeypatch, _scope()), patch(
+            "tools.apphost_tool._urlopen", _capture_urlopen(seen)
+        ):
+            assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+    req = seen["req"]
+    assert req.get_header("X-zettlab-business-execution-token") == "a" * 64
+    assert req.get_header("X-hermes-turn-id") == "turn-1"
+    assert req.get_header("X-hermes-session-id") == "cron_task_abcdef123456_20260817_120000"
+    assert req.get_header("X-zettlab-app-maintenance-task-id") == "abcdef123456"
+
+
+def test_business_execution_token_is_not_lost_when_turn_correlation_is_absent(monkeypatch):
+    from gateway.session_context import clear_turn_vars, set_turn_vars
+
+    seen = {}
+    turn_tokens = set_turn_vars(business_execution_token="b" * 64)
+    try:
+        with mux_profile_scope(monkeypatch, _scope()), patch(
+            "tools.apphost_tool._urlopen", _capture_urlopen(seen)
+        ):
+            assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
+    finally:
+        clear_turn_vars(turn_tokens)
+    assert seen["req"].get_header("X-zettlab-business-execution-token") == "b" * 64
+    assert seen["req"].get_header("X-hermes-turn-id") is None
+
+
 def test_app_host_request_keeps_its_own_base_url(monkeypatch):
     seen = {}
     with mux_profile_scope(
@@ -190,16 +231,19 @@ def test_app_host_request_keeps_its_own_base_url(monkeypatch):
     ("list", {}, "GET", "?mine=1", None),
     ("acquire_slot", {}, "POST", "/buildslot", None),
     ("release_slot", {"slot_token": "s1"}, "DELETE", "/buildslot/s1", None),
-    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1"},
+    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1",
+                 "data_refresh": "static"},
      "POST", "/publish",
-     {"mode": "install", "source_subdir": "runs/run-1/app1"}),
+     {"mode": "install", "source_subdir": "runs/run-1/app1",
+      "data_refresh": "static"}),
     ("publish", {"mode": "reload", "source_subdir": "runs/run-2/app1",
                  "note": "Footer 加了一个链接"},
      "POST", "/publish",
      {"mode": "reload", "source_subdir": "runs/run-2/app1",
       "note": "Footer 加了一个链接"}),
-    ("install", {"staging_dir": "/tmp/stage", "slug": "app1"}, "POST", "/install",
-     {"staging_dir": "/tmp/stage", "slug": "app1"}),
+    ("install", {"staging_dir": "/tmp/stage", "slug": "app1",
+                 "data_refresh": "static"}, "POST", "/install",
+     {"staging_dir": "/tmp/stage", "slug": "app1", "data_refresh": "static"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/stage"}, "POST", "/app1/reload",
      {"staging_dir": "/tmp/stage"}),
     # The note travels with the version and is what the user is shown when
@@ -216,11 +260,21 @@ def test_app_host_request_keeps_its_own_base_url(monkeypatch):
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}, "POST",
      "/app1/lifecycle", {"action": "restart"}),
     ("logs", {"slug": "app1", "tail": 50}, "GET", "/app1/logs?tail=50", None),
+    ("app_capabilities", {"slug": "app1"}, "GET", "/app1/capabilities", None),
+    ("app_operation", {"slug": "app1", "app_operation": "summary", "payload": {"range": "week"}, "capability_digest": "a" * 64}, "POST", "/app1/operations/summary", {"payload": {"range": "week"}, "capability_digest": "a" * 64}),
+    # call rides POST /{slug}/call with method/path/body in the request body:
+    # the app path is payload, never URL — the server builds the target URL
+    # from the slug (the agent has no host/port to give).
+    ("call", {"slug": "app1", "path": "/api/refresh", "http_method": "POST",
+              "body": {"source": "cron"}},
+     "POST", "/app1/call",
+     {"method": "POST", "path": "/api/refresh", "body": {"source": "cron"}}),
 ])
 def test_action_routing_flow(monkeypatch, action, args, method, path, body):
     seen = {}
     with mux_profile_scope(monkeypatch, _scope(), poison_environ=True):
-        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+        completion_status = 204 if action in {"release_slot", "delete"} else 200
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, status=completion_status)):
             out = json.loads(app_host_tool({"action": action, **args}))
     assert out["ok"] is True
     req = seen["req"]
@@ -246,30 +300,14 @@ def test_handler_always_returns_json_string(monkeypatch):
         json.loads(out)  # must be valid JSON
 
 
-# --- 2xx is success regardless of body ---------------------------------------
+# --- completion status contract ----------------------------------------------
 
 # Every HTTP action with the minimal args to reach the network layer.
-_ALL_HTTP_ACTION_ARGS = [
-    ("probe", {}),
-    ("list", {}),
-    ("acquire_slot", {}),
+@pytest.mark.parametrize("action,args", [
     ("release_slot", {"slot_token": "s1"}),
-    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1"}),
-    ("install", {"staging_dir": "/tmp/s", "slug": "app1"}),
-    ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
-    ("rollback", {"slug": "app1", "to_version": "v1"}),
     ("delete", {"slug": "app1"}),
-    ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}),
-    ("logs", {"slug": "app1"}),
-]
-
-
-@pytest.mark.parametrize("action,args", _ALL_HTTP_ACTION_ARGS)
-def test_2xx_empty_body_is_success_for_every_action(monkeypatch, action, args):
-    """The upstream deliberately answers 204 with no body (release_slot
-    always; delete idempotently). A 2xx must never fall into the error
-    branch — flagging it as transport_error reported every successful
-    release/delete as a failure on a real device."""
+])
+def test_204_is_success_only_for_actions_with_a_204_completion_contract(monkeypatch, action, args):
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", return_value=_RawResp(204)):
             out = json.loads(app_host_tool({"action": action, **args}))
@@ -277,14 +315,454 @@ def test_2xx_empty_body_is_success_for_every_action(monkeypatch, action, args):
     assert out["data"] == {}
 
 
-@pytest.mark.parametrize("status", [200, 201, 202, 204])
-def test_2xx_success_tier_is_the_range_not_specific_codes(monkeypatch, status):
-    # The tier test must be "status is 2xx", not an enumeration of codes:
-    # a future 200-empty-body or 202 must not degrade into an error.
+# Typed capability and workflow-journal routes have dedicated wire-shape and
+# completion-contract coverage above; this table keeps the ordinary routes
+# compact without weakening those stricter assertions.
+_ALL_HTTP_ACTION_ARGS = [
+    ("probe", {}), ("list", {}), ("acquire_slot", {}),
+    ("release_slot", {"slot_token": "s1"}),
+    ("publish", {"mode": "install", "source_subdir": "runs/run-1/app1", "data_refresh": "static"}),
+    ("install", {"staging_dir": "/tmp/s", "slug": "app1", "data_refresh": "static"}),
+    ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
+    ("rollback", {"slug": "app1", "to_version": "v1"}),
+    ("delete", {"slug": "app1"}),
+    ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}),
+    ("logs", {"slug": "app1"}),
+    ("call", {"slug": "app1", "path": "/api/refresh", "http_method": "POST"}),
+]
+
+
+@pytest.mark.parametrize("status", [201, 202, 204])
+def test_non_completion_2xx_is_outcome_unknown(monkeypatch, status):
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", return_value=_RawResp(status)):
-            out = json.loads(app_host_tool({"action": "release_slot", "slot_token": "s1"}))
+            out = json.loads(app_host_tool({"action": "probe"}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["status"] == status
+
+
+def test_app_operation_requires_capability_digest_before_sending(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch("tools.apphost_tool._urlopen") as open_request:
+        out = json.loads(app_host_tool({
+            "action": "app_operation", "slug": "app1", "app_operation": "summary", "payload": {},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    open_request.assert_not_called()
+
+
+# --- ADIC v1: turn-scoped data.import ledger ---------------------------------
+# app_host records EVERY app_operation outcome, tagged with its operation
+# name, into a bounded, turn-scoped ledger (gateway.session_context) that
+# cron/scheduler.py reads right before mark_job_run to judge success by
+# whether the app's own declared write operation actually landed this round,
+# not by whether the agent produced a plausible reply. See
+# zettlab-local-docs/app-fullstack/2026-08-17-应用数据导入契约-ADIC-v1.md §4.5
+# and the paired interface-freeze doc §7-8. Recording is deliberately NOT
+# filtered to the literal "data.import" here — local-server stamps
+# job["import_operation"] with the app's own declared mutation name (e.g.
+# "records.refresh" for a blueprint app), and cron/scheduler.py does the name
+# filtering at verdict time against that per-job value. A read call like
+# data.import_schema IS recorded (see the test below) — it is excluded from
+# the verdict purely because its name never matches any job's
+# import_operation, not because this layer special-cases read calls. The
+# call() two-layer status (tested above) is a completely separate code path
+# and must stay untouched.
+
+_IMPORT_ARGS = {
+    "action": "app_operation", "slug": "hangzhou-weather-live",
+    "app_operation": "data.import",
+    "payload": {"daily": [{"forecast_date": "2026-08-18"}]},
+    "capability_digest": "b" * 64,
+}
+
+
+def test_data_import_success_is_recorded_in_active_ledger(monkeypatch):
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _capture_urlopen({}, {"import_receipt": {"committed": True}}),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is True
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import", "ok": True, "error_code": "", "error_message": "",
+    }]
+
+
+def test_data_import_rejection_is_recorded_with_upstream_code(monkeypatch):
+    upstream = {"code": "import_rejected", "message": "湿度必须是 0-100 的整数"}
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _http_error(400, json.dumps(upstream).encode("utf-8")),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is False and out["error"]["code"] == "import_rejected"
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import", "ok": False, "error_code": "import_rejected",
+        "error_message": "湿度必须是 0-100 的整数",
+    }]
+
+
+def test_data_import_not_confirmed_is_recorded_with_upstream_code(monkeypatch):
+    """502 import_not_confirmed (2xx from the app but no valid receipt) must
+    be distinguishable from import_rejected in the ledger, per the interface
+    freeze's error-code table (§4)."""
+    upstream = {"code": "import_not_confirmed", "message": "app answered without a receipt"}
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _http_error(502, json.dumps(upstream).encode("utf-8")),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is False and out["error"]["code"] == "import_not_confirmed"
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger[0]["error_code"] == "import_not_confirmed"
+
+
+def test_data_import_schema_read_is_recorded_under_its_own_operation_name(monkeypatch):
+    """A read call (data.import_schema) IS recorded — this layer does not
+    special-case reads. It is kept out of a job's import verdict purely
+    because cron/scheduler.py filters the ledger by job["import_operation"],
+    and "data.import_schema" never equals that value. If this layer instead
+    pre-filtered by name, an app whose declared write operation isn't
+    literally "data.import" (e.g. "records.refresh") would never get
+    anything recorded and would fail every round — see the P0 this test
+    guards against in tests/cron/test_import_contract_verdict.py."""
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, {"daily_forecast": {}})):
+                app_host_tool({
+                    "action": "app_operation", "slug": "app1",
+                    "app_operation": "data.import_schema", "payload": {},
+                    "capability_digest": "c" * 64,
+                })
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import_schema", "ok": True, "error_code": "", "error_message": "",
+    }]
+
+
+def test_call_action_never_touches_the_import_ledger(monkeypatch):
+    """The legacy call() two-layer status (app-level 400/500 arrives as
+    ok:true) must never be mistaken for a data.import outcome."""
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        payload = {"status": 500, "content_type": "application/json", "body": {"error": "boom"}}
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, payload)):
+                out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+        assert out["ok"] is True
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == []
+
+
+def test_data_import_outside_a_pushed_scope_is_a_silent_noop(monkeypatch):
+    """Interactive turns never push a ledger scope. Recording must not raise
+    and must not fabricate a ledger visible to a later reader."""
+    from gateway.session_context import import_attempts_snapshot
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch(
+            "tools.apphost_tool._urlopen",
+            _capture_urlopen({}, {"import_receipt": {"committed": True}}),
+        ):
+            out = json.loads(app_host_tool(_IMPORT_ARGS))
     assert out["ok"] is True
+    assert import_attempts_snapshot() == []
+
+
+def test_publish_operation_is_passed_through_unchanged(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+    )
+
+    seen = {}
+    operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "user_confirmed_auto", "maintenance": {"schedule": "0 9 * * *"}}
+    session_tokens = set_session_vars(session_id="session-1")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="e" * 64
+    )
+    try:
+        with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+            "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
+        ) as mint, patch(
+            "tools.apphost_tool._urlopen",
+            _capture_urlopen(seen, {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}),
+        ):
+            out = json.loads(app_host_tool({
+                "action": "publish", "mode": "install", "source_subdir": "runs/app",
+                "data_refresh": "user_confirmed_auto", "operation": operation,
+            }))
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+    assert out["ok"] is True
+    mint.assert_called_once_with("main")
+    assert json.loads(seen["req"].data)["operation"] == operation
+    assert seen["req"].get_header("X-zettlab-agent-action-token") == "a" * 64
+
+
+def test_auto_publish_requires_an_active_user_turn_before_minting_scope(monkeypatch):
+    operation = {"operation_id": "op-1", "data_refresh": "user_confirmed_auto"}
+    with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+        "tools.apphost_tool.request_app_auto_refresh_token"
+    ) as mint, patch("tools.apphost_tool._urlopen") as open_request:
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "user_confirmed_auto", "operation": operation,
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "automatic_maintenance_unavailable"
+    assert out["status"] == 0
+    mint.assert_not_called()
+    open_request.assert_not_called()
+
+
+def test_auto_publish_without_operation_is_rejected_before_credentials_or_network(monkeypatch):
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool.request_app_auto_refresh_token", side_effect=AssertionError("scope must not be minted")
+    ), patch("tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "user_confirmed_auto",
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+
+
+def test_operation_enabled_publish_202_returns_verified_pending_receipt(monkeypatch):
+    operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "static"}
+    response = {"operation": {"operation_id": "op-1", "terminal": "pending"}}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=202)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": operation,
+        }))
+    assert out["ok"] is True
+    assert out["data"]["outcome"] == "pending"
+    assert out["data"]["operation_id"] == "op-1"
+
+
+def test_operation_enabled_publish_200_returns_verified_terminal_receipt(monkeypatch):
+    operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "static"}
+    response = {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=200)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": operation,
+        }))
+    assert out["ok"] is True
+    assert out["data"]["outcome"] == "completed"
+    assert out["data"]["state"] == "succeeded"
+
+
+def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+    )
+
+    seen = {}
+    operation = {"operation_id": "op-reload", "data_refresh": "user_confirmed_auto"}
+    response = {"operation": {"operation_id": "op-reload", "terminal": "succeeded"}}
+    session_tokens = set_session_vars(session_id="session-1")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="e" * 64
+    )
+    try:
+        with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+            "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
+        ), patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, response)):
+            out = json.loads(app_host_tool({
+                "action": "publish", "mode": "reload", "source_subdir": "runs/app",
+                "operation": operation,
+            }))
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+    assert out["ok"] is True
+    assert json.loads(seen["req"].data) == {
+        "mode": "reload", "source_subdir": "runs/app",
+        "data_refresh": "user_confirmed_auto", "operation": operation,
+    }
+
+
+def test_operation_enabled_publish_rejects_conflicting_outer_data_refresh(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch("tools.apphost_tool._urlopen") as open_request:
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static",
+            "operation": {"operation_id": "op-1", "data_refresh": "user_confirmed_auto"},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    open_request.assert_not_called()
+
+
+@pytest.mark.parametrize(("action", "args", "hint"), [
+    ("install", {
+        "slug": "app1", "staging_dir": "/tmp/stage", "data_refresh": "static",
+        "operation": {"operation_id": "op-1", "data_refresh": "static"},
+    }, "publish(mode=install)"),
+    ("reload", {
+        "slug": "app1", "staging_dir": "/tmp/stage",
+        "operation": {"operation_id": "op-1", "data_refresh": "static"},
+    }, "publish(mode=reload)"),
+])
+def test_legacy_mutations_reject_workflow_operation_before_secret_or_network(monkeypatch, action, args, hint):
+    # The local rejection must happen in _build_request before credentials are
+    # resolved: an old route cannot accidentally receive or discard a journal
+    # intent merely because this profile happens to have a valid token.
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")
+    ):
+        out = json.loads(app_host_tool({"action": action, **args}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    assert hint in out["error"]["message"]
+
+
+def test_legacy_install_rejects_auto_refresh_before_secret_or_network(monkeypatch):
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")
+    ):
+        out = json.loads(app_host_tool({
+            "action": "install", "slug": "weather", "staging_dir": "/tmp/stage",
+            "data_refresh": "user_confirmed_auto",
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    assert "publish(mode=install)" in out["error"]["message"]
+
+
+@pytest.mark.parametrize("response", [
+    {}, {"operation": {}},
+    {"operation": {"operation_id": "op-other", "terminal": "pending"}},
+    {"operation": {"operation_id": "op-1", "terminal": "succeeded"}},
+])
+def test_operation_enabled_publish_202_without_matching_open_receipt_is_unknown(monkeypatch, response):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=202)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": {"operation_id": "op-1", "data_refresh": "static"},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["operation_id"] == "op-1"
+
+
+@pytest.mark.parametrize("response", [
+    {}, {"operation": {}},
+    {"operation": {"operation_id": "op-other", "terminal": "succeeded"}},
+    {"operation": {"operation_id": "op-1", "terminal": "pending"}},
+])
+def test_operation_enabled_publish_200_without_matching_terminal_receipt_is_unknown(monkeypatch, response):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(response, status=200)
+    ):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "static", "operation": {"operation_id": "op-1", "data_refresh": "static"},
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["operation_id"] == "op-1"
+
+
+def test_workflow_operation_status_returns_pending_only_from_202_pending(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp({"operation_id": "op-1", "terminal": "pending"}, status=202)
+    ):
+        out = json.loads(app_host_tool({"action": "workflow_operation_status", "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is True
+    assert out["data"]["outcome"] == "pending"
+
+
+def test_workflow_operation_resume_uses_only_the_journal_receipt(monkeypatch):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen",
+        _capture_urlopen(seen, {"operation_id": "op-1", "terminal": "succeeded"}),
+    ):
+        out = json.loads(app_host_tool({"action": "workflow_operation_resume", "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is True
+    assert seen["req"].full_url == _BASE_URL + "/app1/operation/op-1/resume"
+    assert seen["req"].data is None
+
+
+@pytest.mark.parametrize(("action", "status", "terminal"), [
+    ("workflow_operation_status", 202, "pending"),
+    ("workflow_operation_resume", 200, "succeeded"),
+])
+def test_workflow_operation_receipt_must_match_requested_operation_id(monkeypatch, action, status, terminal):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen",
+        return_value=_Resp({"operation_id": "op-other", "terminal": terminal}, status=status),
+    ):
+        out = json.loads(app_host_tool({"action": action, "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
+    assert out["operation_id"] == "op-1"
+
+
+@pytest.mark.parametrize("status,payload", [
+    (200, None), (200, {}), (200, {"operation_id": "op-1"}),
+    (200, {"operation_id": "op-1", "terminal": "pending"}),
+    (202, {"operation_id": "op-1", "terminal": "succeeded"}),
+])
+def test_workflow_status_without_valid_status_receipt_is_outcome_unknown(monkeypatch, status, payload):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.apphost_tool._urlopen", return_value=_Resp(payload, status=status)
+    ):
+        out = json.loads(app_host_tool({"action": "workflow_operation_status", "slug": "app1", "operation_id": "op-1"}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "outcome_unknown"
 
 
 def test_2xx_text_plain_body_is_success_with_text_payload(monkeypatch):
@@ -382,7 +860,8 @@ def test_http_error_passes_upstream_error_body_verbatim(monkeypatch):
 
     with mux_profile_scope(monkeypatch, scope):
         with patch("tools.apphost_tool._urlopen", _boom):
-            out = app_host_tool({"action": "install", "slug": "a1", "staging_dir": "/tmp/s"})
+            out = app_host_tool({"action": "install", "slug": "a1",
+                                 "staging_dir": "/tmp/s", "data_refresh": "static"})
     parsed = json.loads(out)
     assert parsed["ok"] is False and parsed["status"] == 507
     assert parsed["error"] == upstream_body  # verbatim, key for key
@@ -441,6 +920,7 @@ def test_publish_404_without_body_points_at_legacy_route(monkeypatch):
                 "action": "publish",
                 "mode": "install",
                 "source_subdir": "runs/run-1/app1",
+                "data_refresh": "static",
             }))
     assert out["ok"] is False and out["status"] == 404
     assert out["error"]["code"] == "unsupported"
@@ -495,7 +975,8 @@ def test_unsupported_code_alone_does_not_mean_the_device_lacks_publish(monkeypat
     schema_version the server rejects. Both were observed live in ZET/#138."""
     with mux_profile_scope(monkeypatch, {k: "" for k in _scope()}):
         no_apphost = json.loads(app_host_tool({
-            "action": "publish", "mode": "install", "source_subdir": "runs/r/a"}))
+            "action": "publish", "mode": "install", "source_subdir": "runs/r/a",
+            "data_refresh": "static"}))
     assert no_apphost["error"]["code"] == "unsupported"
     assert no_apphost["status"] == 0, "no-App-Host must stay distinguishable by status"
 
@@ -506,7 +987,8 @@ def test_unsupported_code_alone_does_not_mean_the_device_lacks_publish(monkeypat
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", _http_error(422, body)):
             bad_schema = json.loads(app_host_tool({
-                "action": "publish", "mode": "install", "source_subdir": "runs/r/a"}))
+                "action": "publish", "mode": "install", "source_subdir": "runs/r/a",
+            "data_refresh": "static"}))
     assert bad_schema["error"]["code"] == "unsupported"
     assert bad_schema["status"] == 422, "a fixable metadata error must stay distinguishable by status"
 
@@ -517,7 +999,7 @@ def test_schema_does_not_adjudicate_between_publish_and_legacy():
     old device had two conflicting instructions and burned turns picking a
     side (ZET/#138). The description states mechanics; it does not rank."""
     text = json.dumps(APP_HOST_SCHEMA, ensure_ascii=False)
-    for word in ("preferred", "legacy"):
+    for word in ("preferred",):
         assert word not in text.lower(), f"{word!r} ranks the channels for the skill"
     subdir = APP_HOST_SCHEMA["parameters"]["properties"]["source_subdir"]["description"]
     assert ".staging" not in subdir, (
@@ -530,6 +1012,94 @@ def test_schema_does_not_adjudicate_between_publish_and_legacy():
     assert "404" in description and "409" in description, (
         "the description mentions unsupported; it must also bound the statuses"
     )
+
+
+# --- call against a server that predates the route ---------------------------
+# Same OTA-skew story as rollback/publish, with one difference: call has no
+# fallback channel, and the bodiless 404 shape is identical to what a naive
+# reading takes as "the app is missing" — the mapping is what keeps an old
+# device from sending the model off probing other slugs and paths.
+
+_CALL_ARGS = {"action": "call", "slug": "app1", "path": "/api/refresh",
+              "http_method": "POST"}
+
+
+def test_call_404_without_body_is_unsupported_not_retryable(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(404, b"404 page not found")):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == 404
+    assert out["error"]["code"] == "unsupported"
+    # The message must break the "404 means the app is missing" reading and
+    # close the door on retries — there is no fallback channel to name.
+    message = out["error"]["message"]
+    assert "call" in message
+    assert "不代表应用不存在" in message
+    # Telling the model to upgrade the device is a dead end (same rule as the
+    # publish branch).
+    assert "升级" not in message
+
+
+def test_call_404_with_json_body_stays_verbatim(monkeypatch):
+    """A parsable 404 is the server speaking — on this route it covers both
+    "unknown app" and "not the owner" (deliberately the same shape, so
+    existence never leaks). The unsupported mapping must never swallow it."""
+    upstream = {"code": "not_found", "message": 'unknown app "app1"',
+                "retryable": False}
+    body = json.dumps(upstream).encode("utf-8")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(404, body)):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == 404
+    assert out["error"] == upstream
+
+
+def test_call_unsupported_mapping_is_narrow(monkeypatch):
+    # Only (call, 404, no parsable body) maps to unsupported; a bodiless
+    # non-404 stays transport_error rather than a capability verdict.
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(502, b"<html></html>")):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == 502
+    assert out["error"]["code"] == "transport_error"
+
+
+# --- call: two-layer status & retryable pass-through --------------------------
+
+def test_call_app_level_error_is_tool_success(monkeypatch):
+    """Two-layer status: data.status is the APP's answer. An app-side 500
+    arrives as ok:true — the forwarding chain worked, the app answered — and
+    must never be conflated with a tool failure the model would retry."""
+    payload = {"status": 500, "content_type": "application/json",
+               "body": {"error": "refresh source unavailable"}}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, payload)):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is True
+    assert out["data"] == payload
+
+
+@pytest.mark.parametrize("upstream,status", [
+    # Transient states: the server names them retryable and pairs them with
+    # Retry-After: 5.
+    ({"code": "app_waking", "message": "还在启动", "retryable": True}, 503),
+    ({"code": "app_updating", "message": "正在更新", "retryable": True}, 503),
+    # The user pressed stop: retryable false is load-bearing — a retry loop
+    # here would make the stop button decorative.
+    ({"code": "app_stopped", "message": "应用已停止", "retryable": False}, 503),
+    ({"code": "app_unreachable", "message": "连接失败", "retryable": False}, 502),
+    ({"code": "app_response_too_large", "message": "响应过大", "retryable": False}, 502),
+])
+def test_call_forwarding_errors_pass_retryable_verbatim(monkeypatch, upstream, status):
+    """The {code, message, retryable} error body must arrive untouched: the
+    model's retry decision reads these fields, and flattening them into prose
+    (or dropping retryable) severs that contract."""
+    body = json.dumps(upstream).encode("utf-8")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _http_error(status, body)):
+            out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+    assert out["ok"] is False and out["status"] == status
+    assert out["error"] == upstream  # verbatim, key for key
 
 
 def test_connection_error_does_not_leak_url_or_token(monkeypatch):
@@ -550,7 +1120,8 @@ def test_connection_error_does_not_leak_url_or_token(monkeypatch):
 
 
 @pytest.mark.parametrize("args", [
-    {"action": "install", "slug": "a1", "staging_dir": "/tmp/s"},
+    {"action": "install", "slug": "a1", "staging_dir": "/tmp/s",
+     "data_refresh": "static"},
     {"action": "publish", "mode": "reload", "source_subdir": "runs/run-2/a1"},
 ])
 def test_mutation_failure_is_never_auto_retried(monkeypatch, args):
@@ -654,7 +1225,8 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     # selfCheck 5s); a client-side timeout cancels the request context and
     # triggers rollbackInstall on the server. acquire_slot pays the granted
     # slot's integrity walk before the response.
-    ("install", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
+    ("install", {"slug": "a1", "staging_dir": "/tmp/s",
+                 "data_refresh": "static"}, 120.0),
     ("reload", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
     ("publish", {"mode": "reload", "source_subdir": "runs/run-2/a1"}, 120.0),
     # No rebuild, but still stop + swap + health-check — long tier.
@@ -662,6 +1234,10 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     ("acquire_slot", {}, 120.0),
     ("probe", {}, 30.0),
     ("delete", {"slug": "a1"}, 30.0),
+    # Deliberately the default tier: the server's wake+respond budget (~25s)
+    # must expire first so failures arrive as structured error codes, not as
+    # a client-side status=null transport_error.
+    ("call", {"slug": "a1", "path": "/api/refresh", "http_method": "POST"}, 30.0),
 ])
 def test_timeout_is_tiered_per_action(monkeypatch, action, args, expected_timeout):
     seen = {}
@@ -721,6 +1297,12 @@ def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
     ("rollback", {"slug": "app1", "to_version": "   "}),  # whitespace is not a target
     ("lifecycle", {"slug": "app1"}),         # lifecycle_action missing
     ("lifecycle", {"slug": "app1", "lifecycle_action": "explode"}),
+    ("call", {"path": "/api/x", "http_method": "GET"}),   # slug missing
+    ("call", {"slug": "app1", "http_method": "GET"}),     # path missing
+    ("call", {"slug": "app1", "path": "/api/x"}),         # http_method missing
+    ("call", {"slug": "app1", "path": "/api/x", "http_method": "FETCH"}),
+    # HEAD/OPTIONS are real methods but not app domain verbs — not offered.
+    ("call", {"slug": "app1", "path": "/api/x", "http_method": "HEAD"}),
 ])
 def test_missing_required_params_rejected_without_http(monkeypatch, action, args):
     seen = {}
@@ -751,6 +1333,7 @@ _SERVER_INTERNAL_ROUTES = {
     ("DELETE", "/{name}"),
     ("POST", "/{name}/lifecycle"),
     ("GET", "/{name}/logs"),
+    ("POST", "/{name}/call"),
 }
 
 
@@ -774,7 +1357,8 @@ def test_every_action_routes_inside_server_route_table(monkeypatch):
     for action, args in _ALL_HTTP_ACTION_ARGS:
         seen = {}
         with mux_profile_scope(monkeypatch, _scope()):
-            with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            completion_status = 204 if action in {"release_slot", "delete"} else 200
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, status=completion_status)):
                 out = json.loads(app_host_tool({"action": action, **args}))
         assert out["ok"] is True, action
         req = seen["req"]
@@ -924,7 +1508,8 @@ def test_malformed_staging_dir_rejected_without_http(monkeypatch, bad_staging):
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool(
-                {"action": "install", "slug": "app1", "staging_dir": bad_staging}
+                {"action": "install", "slug": "app1", "staging_dir": bad_staging,
+                 "data_refresh": "static"}
             ))
     assert out["ok"] is False and out["status"] == 0
     assert out["error"]["code"] == "invalid_request"
@@ -953,6 +1538,69 @@ def test_malformed_publish_source_rejected_without_http(monkeypatch, bad_source)
             }))
     assert out["ok"] is False and out["status"] == 0
     assert out["error"]["code"] == "invalid_request"
+    assert "req" not in seen
+
+
+@pytest.mark.parametrize("bad_path", [
+    "api/refresh",                        # not rooted at the app
+    "//evil.example/steal",               # host-relative URL form
+    "http://127.0.0.1:9/x",               # full URL
+    "/redirect?to=https://x",             # embedded absolute URL anywhere
+    "/api/../internal",                   # traversal segment
+    "/api/refresh\nX-Injected: 1",
+    "/api/refresh\x00",
+    "/api/\x1bcontrol",
+    "/" + "a" * 2000,
+])
+def test_malformed_call_path_rejected_without_http(monkeypatch, bad_path):
+    """String-level precheck: a path that is really a URL, a traversal, or
+    carries control characters never rides a credentialed request (the server
+    stays the authoritative gate)."""
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({**_CALL_ARGS, "path": bad_path}))
+    assert out["ok"] is False and out["status"] == 0
+    assert out["error"]["code"] == "invalid_request"
+    assert "req" not in seen
+
+
+def test_call_http_method_is_case_normalized(monkeypatch):
+    # "post" is unambiguous — normalize instead of burning a model turn on a
+    # case correction. The wire form is canonical uppercase.
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({**_CALL_ARGS, "http_method": "post"}))
+    assert out["ok"] is True
+    assert json.loads(seen["req"].data.decode("utf-8"))["method"] == "POST"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", "/api/refresh"),
+        ("POST", "/api/delete-account"),
+        ("POST", "/api/refresh-all"),
+        ("PUT", "/api/refresh"),
+        ("PATCH", "/api/config"),
+        ("DELETE", "/api/items/1"),
+    ],
+)
+def test_call_rejects_writes_outside_the_refresh_capability(
+    monkeypatch, method, path
+):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({
+                "action": "call",
+                "slug": "app1",
+                "path": path,
+                "http_method": method,
+            }))
+    assert out["ok"] is False
+    assert out["status"] == 0
     assert "req" not in seen
 
 
@@ -1081,7 +1729,7 @@ def test_schema_declares_every_action_it_handles():
     declared = set(APP_HOST_SCHEMA["parameters"]["properties"]["action"]["enum"])
     for action in (
         "publish", "rollback", "reload", "install", "list", "delete",
-        "lifecycle", "logs",
+        "lifecycle", "logs", "call",
     ):
         assert action in declared, f"{action} is handled but not offered to the model"
 
@@ -1096,10 +1744,35 @@ def test_schema_declares_the_arguments_undo_depends_on():
     assert "note" in props
 
 
+def test_schema_requires_data_refresh_on_both_install_paths():
+    description = APP_HOST_SCHEMA["parameters"]["properties"]["data_refresh"]["description"]
+    assert "publish(mode=install)" in description
+    assert "legacy action=install" in description
+
+
 def test_undo_is_described_where_the_model_reads_it():
     text = APP_HOST_SCHEMA["description"]
     assert "rollback" in text
     assert "prev_version_id" in text, "the model has to be told where to get to_version"
+
+
+def test_call_is_described_where_the_model_reads_it():
+    """The description is the only place the model learns call's retry
+    discipline — the error codes come from the server, but which ones to obey
+    without retrying has to be said up front."""
+    text = APP_HOST_SCHEMA["description"]
+    # Transient vs terminal must both be named…
+    assert "app_updating" in text and "app_waking" in text
+    # …and app_stopped must be tied to a no-retry instruction (the user
+    # pressed stop; a retry loop would make that button decorative).
+    assert "app_stopped" in text
+    assert "never retry" in text
+    # The two-layer status contract: an app-side error is not a tool failure.
+    assert "data.status" in text
+    props = APP_HOST_SCHEMA["parameters"]["properties"]
+    for param in ("path", "http_method", "body"):
+        assert param in props, f"call's {param} is handled but not declared"
+    assert list(_CALL_HTTP_METHODS) == props["http_method"]["enum"]
 
 
 # --- creation provenance (session key) ---------------------------------------
@@ -1122,7 +1795,18 @@ def test_publish_install_carries_stable_session_key(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "api-rotated-tip")
     body = _routed_body(monkeypatch, {
         "action": "publish", "mode": "install", "source_subdir": "runs/run-1/app1",
+        "data_refresh": "static",
     })
+    assert body["session_id"] == _SESSION_KEY
+
+
+def test_publish_install_uses_current_session_build_when_path_is_omitted(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
+    body = _routed_body(monkeypatch, {
+        "action": "publish", "mode": "install", "data_refresh": "static",
+    })
+    assert body["mode"] == "install"
+    assert "source_subdir" not in body
     assert body["session_id"] == _SESSION_KEY
 
 
@@ -1134,12 +1818,17 @@ def test_publish_reload_never_rewrites_creation_provenance(monkeypatch):
     assert "session_id" not in body
 
 
-def test_legacy_install_carries_stable_session_key(monkeypatch):
+@pytest.mark.parametrize(
+    "data_refresh", ["static", "external_unconfirmed", "user_declined"]
+)
+def test_legacy_install_carries_session_key_and_data_refresh(monkeypatch, data_refresh):
     monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
     body = _routed_body(monkeypatch, {
         "action": "install", "staging_dir": "/tmp/stage", "slug": "app1",
+        "data_refresh": data_refresh,
     })
     assert body["session_id"] == _SESSION_KEY
+    assert body["data_refresh"] == data_refresh
 
 
 def test_rotating_session_id_is_not_provenance(monkeypatch):
@@ -1150,5 +1839,88 @@ def test_rotating_session_id_is_not_provenance(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "api-rotated-tip")
     body = _routed_body(monkeypatch, {
         "action": "publish", "mode": "install", "source_subdir": "runs/run-1/app1",
+        "data_refresh": "static",
     })
     assert "session_id" not in body
+
+
+# --- data_refresh: installing forces an answer -------------------------------
+# Five device runs shipped a dashboard with a manual button after the user
+# asked for a daily fetch. Every one of them had read the skill text that says
+# to ask. Skill text loses arguments with other skill text; a required argument
+# does not, so the decision moved into the tool call itself.
+
+def _never_called(req, timeout=None):
+    raise AssertionError("the tool must reject this before any HTTP call")
+
+
+def test_install_without_data_refresh_never_reaches_the_network(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _never_called):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": "runs/run-1/app1",
+            }))
+    assert out["ok"] is False
+    assert "data_refresh" in out["error"]["message"]
+
+
+def test_legacy_install_without_data_refresh_never_reaches_the_network(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _never_called):
+            out = json.loads(app_host_tool({
+                "action": "install",
+                "staging_dir": "/tmp/stage",
+                "slug": "app1",
+            }))
+    assert out["ok"] is False
+    assert "data_refresh" in out["error"]["message"]
+
+
+@pytest.mark.parametrize("value", ["", "auto", "yes", "AUTO_CONFIGURED", "true"])
+def test_install_rejects_values_outside_the_enum(monkeypatch, value):
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _never_called):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": "runs/run-1/app1",
+                "data_refresh": value,
+            }))
+    assert out["ok"] is False
+    assert "data_refresh" in out["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "value", ["static", "external_unconfirmed", "user_declined"])
+def test_install_forwards_every_accepted_answer(monkeypatch, value):
+    seen = {}
+
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "install",
+                "source_subdir": "runs/run-1/app1",
+                "data_refresh": value,
+            }))
+    assert out["ok"] is True
+    # The server records "the user asked for this", so it has to arrive intact.
+    assert json.loads(seen["req"].data.decode("utf-8"))["data_refresh"] == value
+
+
+def test_reload_does_not_ask_again(monkeypatch):
+    """Reload changes code on an app that already answered this at install."""
+    seen = {}
+
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({
+                "action": "publish",
+                "mode": "reload",
+                "source_subdir": "runs/run-2/app1",
+                "note": "Footer 加了一个链接",
+            }))
+    assert out["ok"] is True
+    assert "data_refresh" not in json.loads(seen["req"].data.decode("utf-8"))

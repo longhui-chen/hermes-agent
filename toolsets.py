@@ -313,9 +313,28 @@ TOOLSETS = {
         "includes": []
     },
 
+    "zettlab_app_workspace": {
+        "description": "Edit a dedicated maintainer's bounded App Host workspace (zettlab)",
+        "tools": ["app_workspace"],
+        "includes": []
+    },
+
     "zettlab_skill_runtime": {
         "description": "Profile-local Agent application operations and device evidence reads",
         "tools": ["skill_operation", "device_meetings"],
+        "includes": []
+    },
+
+    # Chat reachability alias for the read-only meeting bridge. Keep
+    # zettlab_skill_runtime unchanged because existing Cron jobs explicitly bind
+    # that broader toolset for skill_operation. The Zet Agent resolver recovers
+    # non-configurable toolsets only when every authored tool is present in its
+    # platform composite; skill_operation is intentionally Cron-only, so the
+    # broader entry cannot be recovered on Chat even though device_meetings is
+    # part of hermes-zet-agent.
+    "zettlab_device_meetings": {
+        "description": "Read-only access to meetings stored on the local Zettlab device",
+        "tools": ["device_meetings"],
         "includes": []
     },
 

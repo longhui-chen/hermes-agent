@@ -115,8 +115,17 @@ class TestStartupPlatformIsolation:
         )
 
         def fake_create_task(coro):
+            # 意图:不让后台任务真正执行,只给调用方一个占位 task。
+            # ⚠️ 占位物必须是【真的 awaitable】—— 严格 cleanup 路径会对它做
+            # asyncio.ensure_future() / await / asyncio.wait()。MagicMock 只是
+            # 当年表达"占位"的手段,走到那条路径就会炸成
+            # "An asyncio.Future, a coroutine or an awaitable is required"。
+            # 已完成的 Future 同样满足"不执行"的意图,且 cancel /
+            # add_done_callback / `in done` 都照常可用。
             coro.close()
-            return MagicMock()
+            placeholder = asyncio.get_running_loop().create_future()
+            placeholder.set_result(None)
+            return placeholder
 
         with patch("gateway.status.write_runtime_status"):
             with patch("hermes_cli.plugins.discover_plugins"):
@@ -827,8 +836,17 @@ class TestVoiceInputCallbackWiring:
         runner.config.sessions_dir = tmp_path
 
         def fake_create_task(coro):
+            # 意图:不让后台任务真正执行,只给调用方一个占位 task。
+            # ⚠️ 占位物必须是【真的 awaitable】—— 严格 cleanup 路径会对它做
+            # asyncio.ensure_future() / await / asyncio.wait()。MagicMock 只是
+            # 当年表达"占位"的手段,走到那条路径就会炸成
+            # "An asyncio.Future, a coroutine or an awaitable is required"。
+            # 已完成的 Future 同样满足"不执行"的意图,且 cancel /
+            # add_done_callback / `in done` 都照常可用。
             coro.close()
-            return MagicMock()
+            placeholder = asyncio.get_running_loop().create_future()
+            placeholder.set_result(None)
+            return placeholder
 
         with patch.object(runner, "_create_adapter", return_value=adapter):
             with patch("gateway.status.write_runtime_status"):

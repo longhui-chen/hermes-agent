@@ -491,7 +491,33 @@ def _jobs_lock():
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# ADIC v1: app_slug/import_operation are server-stamped at creation only
+# (see _validate_app_slug); update_job must reject any attempt to change
+# them regardless of caller, not just rely on the HTTP handler's allowlist
+# omitting them.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "revision", "app_slug", "import_operation"})
+
+
+class JobRevisionConflict(ValueError):
+    """A caller tried to update a job using a stale server-owned revision."""
+
+
+def _job_revision(job: Dict[str, Any]) -> int:
+    """Return the persisted edit revision, treating legacy jobs as revision 0."""
+    value = job.get("revision", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _expected_job_revision(updates: Dict[str, Any]) -> Optional[int]:
+    """Extract the optional CAS fence without ever persisting caller input."""
+    if "expected_revision" not in updates:
+        return None
+    expected = updates.pop("expected_revision")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        raise ValueError("expected_revision must be a non-negative integer")
+    return expected
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1180,6 +1206,10 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+    # Old jobs have no revision. Read compatibility deliberately treats that
+    # as the initial server-owned revision instead of rewriting jobs.json on a
+    # GET; the first successful mutation persists revision 1 atomically.
+    normalized["revision"] = _job_revision(normalized)
 
     # A task grant is durable scheduler-private material.  Its opaque token
     # must never leave jobs.json via any list/get/update API; only the raw
@@ -2100,6 +2130,57 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+# ADIC v1 (App Data Import Contract): local-server stamps these two fields on
+# a dedicated maintainer's cron job at provision time — never accepted from a
+# request body, never editable via update_job (see _IMMUTABLE_JOB_FIELDS
+# below) — so cron/scheduler.py's end-of-run verdict can tell an
+# import-serving job apart from an ordinary reminder/report job on the same
+# profile.
+#
+# Deliberately NOT the app-slug business format (local-server's
+# internal/apphost/slug.go slugPattern): the format rule belongs to whoever
+# creates apps, not to this storage layer. Duplicating it here would give the
+# contract two sources of truth — the moment local-server legitimately widens
+# its own rule, every job it provisions for a slug outside OUR copy of the
+# rule fails create_job with a 400, which fails the app's entire publish
+# transaction. Validate only what this layer actually needs as the field's
+# custodian: a safe, bounded opaque string that cannot corrupt jobs.json or
+# smuggle a path/newline into it. Same reasoning already applied to
+# import_operation not being pinned to the literal "data.import".
+_MAX_APP_SLUG_LENGTH = 128
+_MAX_IMPORT_OPERATION_LENGTH = 128
+
+
+def _validate_opaque_job_token(value: Any, *, field: str, max_length: int) -> Optional[str]:
+    """Safety-only bound for a server-stamped opaque string field: non-empty,
+    length-capped, no control characters (incl. newlines — jobs.json is
+    line-oriented JSON in places and logs embed this value verbatim), no path
+    separators (this value never becomes a filesystem path component today,
+    but a future caller treating it as one must not inherit a traversal
+    payload from here). Absent is fine; present-but-unsafe fails loudly
+    rather than silently creating a job that can never be judged."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    text = value.strip()
+    if not text or len(text) > max_length:
+        raise ValueError(f"{field} must be 1-{max_length} characters")
+    if any(ord(ch) < 0x20 for ch in text) or "/" in text or "\\" in text:
+        raise ValueError(f"{field} must not contain control characters or path separators")
+    return text
+
+
+def _validate_app_slug(value: Any) -> Optional[str]:
+    return _validate_opaque_job_token(value, field="app_slug", max_length=_MAX_APP_SLUG_LENGTH)
+
+
+def _validate_import_operation(value: Any) -> Optional[str]:
+    return _validate_opaque_job_token(
+        value, field="import_operation", max_length=_MAX_IMPORT_OPERATION_LENGTH
+    )
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -2175,6 +2256,9 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     timezone: Optional[str] = None,
     output_language: Optional[str] = None,
+    source: Optional[str] = None,
+    app_slug: Optional[str] = None,
+    import_operation: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2222,6 +2306,11 @@ def create_job(
         output_language: Optional canonical BCP 47 language tag captured when
                          an LLM creates an agent job. Direct/legacy callers may
                          omit it; script-only jobs ignore it.
+        app_slug: ADIC v1 — server-stamped app slug for a dedicated
+                  maintainer's import-tracked cron job (see _validate_app_slug).
+                  Never accept this from a model or an end-user-facing caller.
+        import_operation: ADIC v1 — server-stamped operation name paired with
+                  app_slug (see _validate_import_operation).
 
     Returns:
         The created job dict
@@ -2273,6 +2362,12 @@ def create_job(
         if normalized_no_agent
         else validate_output_language_tag(output_language)
     )
+    # ``source`` is a caller-owned provenance marker (e.g. "app_refresh" for a
+    # maintainer's refresh job). It is persisted verbatim so a gate can scope
+    # itself to a specific job class instead of treating every job alike.
+    normalized_source = str(source).strip() if isinstance(source, str) and str(source).strip() else None
+    normalized_app_slug = _validate_app_slug(app_slug)
+    normalized_import_operation = _validate_import_operation(import_operation)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -2326,6 +2421,9 @@ def create_job(
 
     job = {
         "id": job_id,
+        # The server owns this counter. It is an edit fence, not an app
+        # version nor a model-supplied field; a newly created job starts at 0.
+        "revision": 0,
         "name": name or label_source[:50].strip(),
         "prompt": prompt_text,
         "skills": normalized_skills,
@@ -2371,6 +2469,12 @@ def create_job(
         job["attach_to_session"] = normalized_attach
     if normalized_output_language is not None:
         job["output_language"] = normalized_output_language
+    if normalized_source is not None:
+        job["source"] = normalized_source
+    if normalized_app_slug is not None:
+        job["app_slug"] = normalized_app_slug
+    if normalized_import_operation is not None:
+        job["import_operation"] = normalized_import_operation
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
@@ -2456,8 +2560,16 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+def update_job(job_id: str, updates: Dict[str, Any], *, preserve_claim: bool = False) -> Optional[Dict[str, Any]]:
+    """Update a job, optionally guarded by its server-owned edit revision.
+
+    ``expected_revision`` is an optional compare-and-swap fence used by the
+    dedicated-maintainer scheduling bridge. It is never stored as a caller
+    field. Every successful update advances ``revision`` under the job-store
+    lock, so ordinary edits cannot silently race a guarded update.
+    """
+    updates = dict(updates or {})
+    expected_revision = _expected_job_revision(updates)
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -2472,6 +2584,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            current_revision = _job_revision(job)
+            if expected_revision is not None and expected_revision != current_revision:
+                raise JobRevisionConflict(
+                    f"job revision changed (expected {expected_revision}, current {current_revision})"
+                )
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -2575,13 +2693,31 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 key in updates and updates.get(key) != job.get(key)
                 for key in ("schedule", "timezone", "next_run_at", "enabled", "state")
             )
-            if trigger_identity_changed:
+            if trigger_identity_changed and not preserve_claim:
                 # A claim identifies the exact schedule occurrence that was
                 # active when it was created. User pause/resume/reschedule must
                 # invalidate that identity before a delayed provider retry can
-                # recover it.
+                # recover it. ``preserve_claim`` is set only by the defer path:
+                # a defer is a postponement, not a reschedule, so a still-firing
+                # occurrence must keep its claim instead of admitting a duplicate
+                # concurrent run.
                 updated["fire_claim"] = None
                 updated["in_flight_occurrence"] = None
+
+            # A user's explicit schedule / pause / resume edit invalidates any
+            # pending defer watermark: the "no earlier than" target was computed
+            # against the old cadence. defer_job only changes next_run_at (not
+            # these fields), so it never trips this and keeps its own watermark.
+            if any(
+                key in updates and updates.get(key) != job.get(key)
+                for key in ("schedule", "timezone", "enabled", "state")
+            ):
+                updated.pop("deferred_until", None)
+
+            # Never take a caller-provided revision. This is the single
+            # mutation seam for user/job configuration edits, so advancing it
+            # here makes a stale maintainer schedule update fail atomically.
+            updated["revision"] = current_revision + 1
 
             jobs[i] = updated
             save_jobs(jobs)
@@ -2643,14 +2779,106 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def remove_job(job_id: str) -> bool:
+def defer_job(
+    job_id: str,
+    *,
+    seconds: Optional[float] = None,
+    until: Optional[str] = None,
+    reason: Optional[str] = None,
+    clear_claim: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Postpone a scheduled job's next run without pausing it.
+
+    Unlike pause_job (enabled=False, whose resume discards everything the
+    schedule would have fired in between), a deferred job stays scheduled and
+    keeps its cadence: ``next_run_at`` moves out to the LATER of its current
+    slot and the requested retry point, and the deferral is recorded
+    (``deferred_at`` / ``defer_reason`` / ``defer_count``) for observability.
+    The scheduler's at-most-once advance has already consumed the current
+    slot by the time a deferral is decided, so the deferred slot folds away
+    — no backfill burst when the deferral lapses, matching the recurring
+    catch-up semantics. Used by the app-refresh governor gate so a memory-
+    pressured device postpones maintainer refreshes instead of running them
+    into a wall or failing them as errors.
+
+    Exactly one of ``seconds`` / ``until`` must be given. The deferral never
+    pulls a future slot earlier: a retry point before the current
+    ``next_run_at`` is a no-op on the schedule.
+    """
+    if (seconds is None) == (until is None):
+        raise ValueError("defer_job requires exactly one of seconds or until")
+    with _jobs_lock():
+        # Re-read and compute inside the lock: a defer decided against a stale
+        # snapshot would otherwise overwrite a newer next_run_at / defer_count
+        # written by the scheduler's advance, another defer, or a user edit.
+        job = resolve_job_ref(job_id)
+        if not job:
+            return None
+        now_dt = _hermes_now()
+        if seconds is not None:
+            retry_dt = now_dt + timedelta(seconds=max(0.0, float(seconds)))
+        else:
+            try:
+                retry_dt = datetime.fromisoformat(str(until))
+            except ValueError:
+                raise ValueError("until must be an ISO-8601 timestamp") from None
+            if retry_dt.tzinfo is None:
+                retry_dt = retry_dt.replace(tzinfo=now_dt.tzinfo)
+        new_next = retry_dt.isoformat()
+        current = job.get("next_run_at")
+        if current:
+            try:
+                cur_dt = datetime.fromisoformat(str(current))
+                if cur_dt.tzinfo is None:
+                    cur_dt = cur_dt.replace(tzinfo=now_dt.tzinfo)
+                if cur_dt > retry_dt:
+                    # Never move a scheduled future slot earlier: a deferral is
+                    # a postponement, not a run-now.
+                    new_next = current
+            except ValueError:
+                pass
+        updates: Dict[str, Any] = {
+            "next_run_at": new_next,
+            "deferred_at": now_dt.isoformat(),
+            "defer_reason": reason,
+            "defer_count": int(job.get("defer_count") or 0) + 1,
+            # Persist the absolute defer watermark separately: mark_job_run
+            # recomputes next_run_at from the schedule on completion and would
+            # otherwise overwrite a long user deferral with the natural next
+            # slot. mark_job_run honors the later of the two and clears the
+            # watermark once it has passed.
+            "deferred_until": new_next,
+        }
+        if clear_claim:
+            # The governor's pre-execution gate consumes the current occurrence
+            # WITHOUT running it, so the claim for that occurrence must be
+            # terminated here: when next_run_at is unchanged (the natural next
+            # slot is already later than the retry point), update_job's
+            # trigger-identity check won't clear it, and a still-fresh claim
+            # would reject the next callback within the claim TTL — silently
+            # stopping the job. The generic (user/API) defer must NOT do this:
+            # a job may be genuinely firing, and clearing its claim would admit
+            # a duplicate concurrent run.
+            updates["fire_claim"] = None
+            updates["in_flight_occurrence"] = None
+        return update_job(job["id"], updates, preserve_claim=not clear_claim)
+
+
+def remove_job(job_id: str, expected_revision: Optional[int] = None) -> bool:
     """Remove a job by ID or name."""
+    if expected_revision is not None and (isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0):
+        raise ValueError("expected_revision must be a non-negative integer")
     job = resolve_job_ref(job_id)
     if not job:
         return False
     canonical_id = job["id"]
     with _jobs_lock():
         jobs = load_jobs()
+        current = next((item for item in jobs if item["id"] == canonical_id), None)
+        if current is None:
+            return False
+        if expected_revision is not None and _job_revision(current) != expected_revision:
+            raise JobRevisionConflict("job revision changed; read it again before deleting")
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
@@ -2774,6 +3002,20 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["next_run_at"] = compute_next_run(
                     job["schedule"], next_run_base, tz_name=job.get("timezone")
                 )
+                # A user deferral during this run is a "no earlier than"
+                # watermark: honor it over the natural next slot, then clear it
+                # once it has been consumed or has passed.
+                deferred_until = job.get("deferred_until")
+                if deferred_until is not None:
+                    deferred_dt = _parse_occurrence_instant(deferred_until)
+                    if deferred_dt is not None:
+                        computed_dt = _parse_occurrence_instant(job["next_run_at"])
+                        if computed_dt is None or deferred_dt > computed_dt:
+                            job["next_run_at"] = deferred_until
+                        else:
+                            job.pop("deferred_until", None)
+                    else:
+                        job.pop("deferred_until", None)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't

@@ -498,7 +498,10 @@ def init_agent(
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
+    session_owner_id: str = None,
     user_id_alt: str = None,
+    deep_memory_principal: str = None,
+    deep_memory_subject: str = None,
     user_name: str = None,
     chat_id: str = None,
     chat_name: str = None,
@@ -586,7 +589,14 @@ def init_agent(
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
+    # Persistent transcript ownership is intentionally distinct from the
+    # platform account used by memory providers such as Memo.
+    agent._session_owner_id = session_owner_id
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
+    # Deep Memory has a separate authenticated identity contract.  It must
+    # never overload the platform account used by Memo or SessionDB migration.
+    agent._deep_memory_principal = deep_memory_principal
+    agent._deep_memory_subject = deep_memory_subject
     agent._user_name = user_name
     agent._chat_id = chat_id
     agent._chat_name = chat_name
@@ -1733,6 +1743,11 @@ def init_agent(
                         _init_kwargs["user_id"] = agent._user_id
                     if agent._user_id_alt:
                         _init_kwargs["user_id_alt"] = agent._user_id_alt
+                    if _mem_provider_name == "zettlab_deep_memory":
+                        if agent._deep_memory_principal:
+                            _init_kwargs["deep_memory_principal"] = agent._deep_memory_principal
+                        if agent._deep_memory_subject:
+                            _init_kwargs["deep_memory_subject"] = agent._deep_memory_subject
                     if agent._user_name:
                         _init_kwargs["user_name"] = agent._user_name
                     if agent._chat_id:

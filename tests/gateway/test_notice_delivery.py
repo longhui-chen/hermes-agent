@@ -47,3 +47,33 @@ async def test_deliver_platform_notice_uses_private_delivery_when_configured():
     adapter.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_feishu_platform_notice_keeps_route_without_visible_quote():
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.FEISHU: PlatformConfig(enabled=True, token="test")
+        }
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="notice-1")
+    )
+    runner.adapters = {Platform.FEISHU: adapter}
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc-chat",
+        chat_type="group",
+        user_id="user",
+        thread_id="om-root",
+        message_id="om-question",
+    )
+
+    await runner._deliver_platform_notice(source, "状态更新")
+
+    adapter.send.assert_awaited_once_with(
+        "oc-chat",
+        "状态更新",
+        metadata={"thread_id": "om-root"},
+    )
+

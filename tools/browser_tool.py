@@ -377,6 +377,10 @@ SNAPSHOT_SUMMARIZE_THRESHOLD = 15000
 # read_file paging and must not write unbounded bytes to disk.
 MAX_STORED_SNAPSHOT_CHARS = 2_000_000
 
+# Web Host already bounds image extraction; keep a second cheap tool-boundary
+# ceiling so a malformed or mismatched managed response cannot grow work here.
+MAX_MANAGED_PAGE_IMAGES = 512
+
 # Commands that legitimately return empty stdout (e.g. close, record).
 _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})
 
@@ -3614,6 +3618,29 @@ def browser_back(task_id: Optional[str] = None) -> str:
         JSON string with navigation result
     """
     managed_route = _route_browser_action("back")
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        if managed_payload.get("success") is not True:
+            return json.dumps(
+                _redact_browser_output(managed_payload), ensure_ascii=False
+            )
+        current_url = str(managed_payload.get("url") or "").strip()
+        if not current_url:
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed desktop back result omitted the landed page URL.",
+            }, ensure_ascii=False)
+        safety_error = _managed_page_safety_error(current_url)
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps(
+                {"success": False, "error": safety_error}, ensure_ascii=False
+            )
+        return json.dumps(
+            _redact_browser_output({"success": True, "url": current_url}),
+            ensure_ascii=False,
+        )
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
         return managed_result
@@ -4382,6 +4409,48 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         JSON string with list of images (src and alt)
     """
     managed_route = _route_browser_action("get_images")
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        if managed_payload.get("success") is not True:
+            return json.dumps(
+                _redact_browser_output(managed_payload), ensure_ascii=False
+            )
+        current_url = str(managed_payload.get("url") or "").strip()
+        if not current_url:
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed desktop image result omitted the page URL.",
+            }, ensure_ascii=False)
+        safety_error = _managed_page_safety_error(current_url)
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps(
+                {"success": False, "error": safety_error}, ensure_ascii=False
+            )
+        raw_images = managed_payload.get("images")
+        images = []
+        if isinstance(raw_images, list):
+            for image in raw_images[:MAX_MANAGED_PAGE_IMAGES]:
+                if not isinstance(image, dict):
+                    continue
+                src = image.get("src")
+                if (
+                    not isinstance(src, str)
+                    or not src
+                    or src.lower().startswith("data:")
+                ):
+                    continue
+                images.append(image)
+        redacted_images = _redact_browser_output(images)
+        if not isinstance(redacted_images, list):
+            redacted_images = []
+        response = {
+            "success": True,
+            "images": redacted_images,
+            "count": len(redacted_images),
+        }
+        return json.dumps(response, ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
         return managed_result

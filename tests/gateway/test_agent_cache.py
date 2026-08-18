@@ -169,10 +169,39 @@ class TestExtractCacheBustingConfig:
         from tools.registry import registry
 
         monkeypatch.setattr(registry, "_generation", 12345)
+        monkeypatch.setattr(registry, "_profile_generations", {})
 
         out = GatewayRunner._extract_cache_busting_config({})
 
-        assert out["tools.registry_generation"] == 12345
+        assert out["tools.registry_generation"] == (12345, 0)
+
+    def test_registry_generation_is_profile_scoped(self, tmp_path, monkeypatch):
+        from gateway.run import GatewayRunner
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.registry import registry
+
+        profile_a = (tmp_path / "profiles" / "a").resolve()
+        profile_b = (tmp_path / "profiles" / "b").resolve()
+        monkeypatch.setattr(registry, "_generation", 9)
+        monkeypatch.setattr(
+            registry,
+            "_profile_generations",
+            {str(profile_a): 3, str(profile_b): 7},
+        )
+
+        generations = []
+        for home in (profile_a, profile_b):
+            token = set_hermes_home_override(home)
+            try:
+                generations.append(
+                    GatewayRunner._extract_cache_busting_config({})[
+                        "tools.registry_generation"
+                    ]
+                )
+            finally:
+                reset_hermes_home_override(token)
+
+        assert generations == [(9, 3), (9, 7)]
 
 
 class TestAgentCacheLifecycle:
@@ -226,6 +255,103 @@ class TestAgentCacheLifecycle:
 
         with runner._agent_cache_lock:
             assert session_key not in runner._agent_cache
+
+    def test_profile_evict_keeps_all_ownership_when_cleanup_fails(self):
+        runner = _make_runner()
+        key = "agent:coder:feishu:dm:x"
+
+        class _Agent:
+            def close(self):
+                raise RuntimeError("child still running")
+
+        agent = _Agent()
+        entry = (agent, "sig")
+        runner._agent_cache[key] = entry
+        runner._running_agents = {}
+        runner._session_model_overrides = {key: "model"}
+        sessions = runner.__dict__["_sessions"]
+        with pytest.raises(RuntimeError, match="agent resource cleanup failed") as exc:
+            runner._evict_cached_agents_for_profile("coder")
+        assert "child still running" in str(exc.value.__cause__)
+
+        assert runner._agent_cache[key] is entry
+        assert runner._session_model_overrides[key] == "model"
+        assert key in sessions
+
+    def test_profile_evict_partial_failure_commits_success_before_retry(self):
+        runner = _make_runner()
+        good_key = "agent:coder:feishu:dm:good"
+        flaky_key = "agent:coder:feishu:dm:flaky"
+
+        class _Agent:
+            def __init__(self, fail_first=False):
+                self.calls = 0
+                self.fail_first = fail_first
+
+            def close(self):
+                self.calls += 1
+                if self.fail_first and self.calls == 1:
+                    raise RuntimeError("child still running")
+
+        good = _Agent()
+        flaky = _Agent(fail_first=True)
+        runner._agent_cache[good_key] = (good, "sig")
+        runner._agent_cache[flaky_key] = (flaky, "sig")
+        runner._running_agents = {}
+        runner._session_model_overrides = {}
+
+        with pytest.raises(RuntimeError, match="agent resource cleanup failed"):
+            runner._evict_cached_agents_for_profile("coder")
+        assert good_key not in runner._agent_cache
+        assert runner._agent_cache[flaky_key][0] is flaky
+
+        assert runner._evict_cached_agents_for_profile("coder") == 1
+        assert good.calls == 1
+        assert flaky.calls == 2
+        assert flaky_key not in runner._agent_cache
+
+    def test_profile_evict_retry_does_not_repeat_completed_memory_shutdown(self):
+        """同一 agent 的 close 重试不得重放已成功的 on_session_end。"""
+        runner = _make_runner()
+        key = "agent:coder:feishu:dm:flaky"
+
+        class _MemoryManager:
+            def __init__(self):
+                self.flush_calls = 0
+
+            def flush_pending(self, *, timeout):
+                assert timeout == 10
+                self.flush_calls += 1
+
+        class _Agent:
+            def __init__(self):
+                self._memory_manager = _MemoryManager()
+                self._session_messages = [{"role": "user", "content": "hi"}]
+                self.memory_shutdown_calls = 0
+                self.close_calls = 0
+
+            def shutdown_memory_provider(self, messages):
+                assert messages is self._session_messages
+                self.memory_shutdown_calls += 1
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("child still running")
+
+        agent = _Agent()
+        runner._agent_cache[key] = (agent, "sig")
+        runner._running_agents = {}
+        runner._session_model_overrides = {}
+
+        with pytest.raises(RuntimeError, match="agent resource cleanup failed"):
+            runner._evict_cached_agents_for_profile("coder")
+        assert runner._agent_cache[key][0] is agent
+
+        assert runner._evict_cached_agents_for_profile("coder") == 1
+        assert agent.memory_shutdown_calls == 1
+        assert agent._memory_manager.flush_calls == 1
+        assert agent.close_calls == 2
 
 
 class TestAgentCacheBoundedGrowth:
@@ -1061,4 +1187,3 @@ class TestCrossProcessInvalidationDefersCleanup:
         # Stale entry was popped, hard-teardown path never used.
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
-

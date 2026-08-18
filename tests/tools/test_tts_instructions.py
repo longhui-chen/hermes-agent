@@ -6,6 +6,7 @@ gpt-4o-mini-tts and OpenAI-compatible voice-design servers.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,7 +26,11 @@ class TestOpenaiBackendInstructions:
     def _run(self, tmp_path, monkeypatch, *, tts_config=None, instructions=None):
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
         mock_client = MagicMock()
-        mock_client.audio.speech.create.return_value = MagicMock()
+        response = MagicMock()
+        response.stream_to_file.side_effect = (
+            lambda path: Path(path).write_bytes(b"fake-audio")
+        )
+        mock_client.audio.speech.create.return_value = response
         mock_cls = MagicMock(return_value=mock_client)
 
         with patch("tools.tts_tool._import_openai_client", return_value=mock_cls), \

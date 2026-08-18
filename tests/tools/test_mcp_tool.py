@@ -4,12 +4,15 @@ All tests use mocks -- no real MCP servers or subprocesses are started.
 """
 
 import asyncio
+import ast
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -70,7 +73,15 @@ class TestFilterMCPChildren:
                 "-jar",
                 "/opt/jdtls/plugins/org.eclipse.equinox.launcher_1.7.0.jar",
             ],
-            103: ["/usr/bin/node", "server.js"],
+            103: [
+                "/usr/bin/python3",
+                "/repo/tools/mcp_stdio_watchdog.py",
+                "--",
+                "/usr/bin/node",
+                "server.js",
+            ],
+            104: ["/usr/local/bin/pyright-langserver", "--stdio"],
+            105: ["/usr/local/bin/gopls"],
         }
 
         class FakeProcess:
@@ -86,8 +97,57 @@ class TestFilterMCPChildren:
             AccessDenied=PermissionError,
         )
         monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+        monkeypatch.setattr(mcp_tool.os, "name", "posix")
 
-        assert mcp_tool._filter_mcp_children({101, 102, 103}) == {103}
+        assert mcp_tool._filter_mcp_children({101, 102, 103, 104, 105}) == {103}
+
+    def test_windows_filter_accepts_only_expected_spawn_identity(
+        self, monkeypatch
+    ):
+        """Windows 必须按本次 command/args 正向认领，不能靠 LSP 黑名单。"""
+        import sys
+
+        import tools.mcp_tool as mcp_tool
+
+        cmdlines = {
+            201: ["C:\\node.exe", "pyright-langserver.js", "--stdio"],
+            202: ["C:\\node.exe", "mcp-server.js", "--stdio"],
+            203: [
+                "C:\\node.exe",
+                "npx-cli.js",
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+            ],
+        }
+
+        class _Process:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def cmdline(self):
+                return cmdlines[self.pid]
+
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                Process=_Process,
+                NoSuchProcess=ProcessLookupError,
+                AccessDenied=PermissionError,
+            ),
+        )
+        monkeypatch.setattr(mcp_tool.os, "name", "nt")
+
+        assert mcp_tool._filter_mcp_children(
+            {201, 202},
+            expected_command="node.exe",
+            expected_args=["mcp-server.js", "--stdio"],
+        ) == {202}
+        assert mcp_tool._filter_mcp_children(
+            {201, 203},
+            expected_command="npx.cmd",
+            expected_args=["-y", "@modelcontextprotocol/server-filesystem"],
+        ) == {203}
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +632,41 @@ class TestToolHandler:
             clear_session_vars(session_tokens)
             _servers.pop("zettlab_memo", None)
 
+    def test_managed_memo_metadata_uses_zet_account_not_session_owner_principal(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.zet_agent import ZetAgentAdapter, _zettlab_request_account_id
+        from gateway.session_context import clear_session_vars, pop_zettlab_auth_principal, push_zettlab_auth_principal
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("stored", is_error=False)
+        )
+        server = _make_mock_server("zettlab_memo", session=mock_session)
+        server._config = {}
+        _servers["zettlab_memo"] = server
+        adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+        account_token = _zettlab_request_account_id.set("account-1")
+        principal_token = push_zettlab_auth_principal("iam:alice")
+        session_tokens = adapter._bind_api_server_session(
+            chat_id="session-1",
+            session_key="zettlab:account-1:main:session-1",
+            session_id="session-1",
+            session_user_id="account-1",
+        )
+
+        try:
+            handler = _make_tool_handler("zettlab_memo", "memo_write", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"statement": "remember this"}))
+            assert result["result"] == "stored"
+            assert mock_session.call_tool.call_args.kwargs["meta"]["zettlab/account_id"] == "account-1"
+        finally:
+            clear_session_vars(session_tokens)
+            pop_zettlab_auth_principal(principal_token)
+            _zettlab_request_account_id.reset(account_token)
+            _servers.pop("zettlab_memo", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
@@ -708,6 +803,97 @@ class TestRunOnMCPLoopInterrupts:
             mcp_mod._mcp_loop = old_loop
             mcp_mod._mcp_thread = old_thread
 
+    def test_strict_interrupt_waits_for_real_lifecycle_completion(self):
+        """生产入口收到 interrupt 后必须进入 completion wait，不能提前返回。"""
+        import tools.mcp_tool as mcp_mod
+        real_event = threading.Event
+        lifecycle_entered = real_event()
+        interrupt_requested = real_event()
+        observed = queue.Queue()
+        outcomes = queue.Queue()
+        release_holder = {}
+        event_count = 0
+        event_count_lock = threading.Lock()
+
+        class _ObservedLifecycleEvent:
+            def __init__(self):
+                nonlocal event_count
+                self._event = real_event()
+                self._reported_wait = False
+                with event_count_lock:
+                    event_count += 1
+                    self._index = event_count
+
+            def set(self):
+                return self._event.set()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def wait(self, timeout=None):
+                if self._index == 2 and not self._reported_wait:
+                    self._reported_wait = True
+                    observed.put("completion-wait")
+                return self._event.wait(timeout)
+
+        async def blocked_lifecycle():
+            release = asyncio.Event()
+            release_holder["event"] = release
+            lifecycle_entered.set()
+            await release.wait()
+
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        old_loop = mcp_mod._mcp_loop
+        old_thread = mcp_mod._mcp_thread
+        mcp_mod._mcp_loop = loop
+        mcp_mod._mcp_thread = loop_thread
+
+        def run_strict_call():
+            try:
+                mcp_mod._run_on_mcp_loop(
+                    blocked_lifecycle,
+                    timeout=10,
+                    wait_for_completion_on_cancel=True,
+                )
+            except BaseException as exc:
+                outcomes.put(exc)
+            finally:
+                observed.put("returned")
+
+        caller = threading.Thread(target=run_strict_call, daemon=True)
+        try:
+            with patch.object(
+                mcp_mod,
+                "threading",
+                SimpleNamespace(Event=_ObservedLifecycleEvent),
+            ), patch(
+                "tools.interrupt.is_interrupted",
+                new=lambda: interrupt_requested.is_set(),
+            ):
+                caller.start()
+                assert lifecycle_entered.wait(timeout=2)
+                interrupt_requested.set()
+                # 新实现必先进入 lifecycle_completed.wait；旧 wiring 会先返回。
+                assert observed.get(timeout=2) == "completion-wait"
+                assert caller.is_alive()
+                loop.call_soon_threadsafe(release_holder["event"].set)
+                caller.join(timeout=2)
+                assert not caller.is_alive()
+                assert observed.get(timeout=2) == "returned"
+                assert isinstance(outcomes.get(timeout=2), InterruptedError)
+        finally:
+            release = release_holder.get("event")
+            if release is not None:
+                loop.call_soon_threadsafe(release.set)
+            caller.join(timeout=2)
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=2)
+            loop.close()
+            mcp_mod._mcp_loop = old_loop
+            mcp_mod._mcp_thread = old_thread
+
 # ---------------------------------------------------------------------------
 # Tool registration (discovery + register)
 # ---------------------------------------------------------------------------
@@ -725,7 +911,7 @@ class TestDiscoverAndRegister:
         ]
         mock_session = MagicMock()
 
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
@@ -815,7 +1001,11 @@ class TestMCPServerTask:
         p_stdio, p_cs, _, _ = self._mock_stdio_and_session(mock_session)
 
         async def _test():
-            with patch("tools.mcp_tool.StdioServerParameters"), p_stdio, p_cs:
+            with patch("tools.mcp_tool.StdioServerParameters"), p_stdio, p_cs, \
+                 patch("tools.mcp_tool._observe_child_pids",
+                       side_effect=[(True, set()), (True, {42424242})]), \
+                 patch("tools.mcp_tool._filter_mcp_children",
+                       return_value={42424242}):
                 server = MCPServerTask("test_srv")
                 await server.start({"command": "npx", "args": ["-y", "test"]})
 
@@ -863,7 +1053,7 @@ class TestToolsetInjection:
 
         fresh_servers = {}
 
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
@@ -897,7 +1087,7 @@ class TestToolsetInjection:
         call_count = 0
         broken_fixed = False
 
-        async def flaky_connect(name, config):
+        async def flaky_connect(name, config, **_kwargs):
             nonlocal call_count
             call_count += 1
             if name == "broken" and not broken_fixed:
@@ -964,85 +1154,34 @@ class TestGracefulFallback:
 
 class TestShutdown:
 
-    def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
-        """The public shutdown path drains a parked server if graceful shutdown stalls.
-
-        This exercises the production ownership path: a real ``MCPServerTask``
-        is registered, its parked waiter owns child tasks on the shared loop,
-        and the bounded wait for the scheduled shutdown expires. The loop owner
-        must still cancel and drain that waiter before closing the loop.
-        """
+    def test_shutdown_timeout_before_cleanup_keeps_server_owner_for_retry(self):
+        """cleanup 未完成时的显式超时必须保留全局 exact owner。"""
         import tools.mcp_tool as mcp_mod
         from tools.mcp_tool import MCPServerTask, shutdown_mcp_servers
 
-        shutdown_started = threading.Event()
-        parked_task_done = threading.Event()
-        scheduled_shutdown = {}
-        schedule_count = 0
-
-        class StalledShutdownServer(MCPServerTask):
-            async def shutdown(self):
-                shutdown_started.set()
-                await asyncio.Event().wait()
-
-        server = StalledShutdownServer("parked")
+        server = MCPServerTask("parked")
         with mcp_mod._lock:
             mcp_mod._servers.clear()
             mcp_mod._server_connecting.clear()
-        mcp_mod._ensure_mcp_loop()
-        with mcp_mod._lock:
-            loop = mcp_mod._mcp_loop
-        assert loop is not None
-
-        async def install_parked_waiter():
-            task = asyncio.create_task(server._wait_for_reconnect_or_shutdown())
-            server._task = task
-            task.add_done_callback(lambda _task: parked_task_done.set())
-            await asyncio.sleep(0)
-            return task
-
-        parked_task = asyncio.run_coroutine_threadsafe(
-            install_parked_waiter(), loop
-        ).result(timeout=2)
-        with mcp_mod._lock:
             mcp_mod._servers[server.name] = server
 
-        def schedule_then_report_timeout(coro, target_loop, **_kwargs):
-            nonlocal schedule_count
-            schedule_count += 1
-            future = asyncio.run_coroutine_threadsafe(coro, target_loop)
-            if schedule_count > 1:
-                return future
-
-            scheduled_shutdown["future"] = future
-
-            class TimedOutFuture:
-                def result(self, timeout):
-                    assert timeout > 0
-                    assert shutdown_started.wait(timeout=2)
-                    raise TimeoutError("simulated bounded MCP shutdown timeout")
-
-            return TimedOutFuture()
-
         try:
-            with patch(
-                "agent.async_utils.safe_schedule_threadsafe",
-                side_effect=schedule_then_report_timeout,
+            with patch.object(
+                mcp_mod, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+            ), patch.object(
+                mcp_mod,
+                "_run_on_mcp_loop",
+                side_effect=TimeoutError("simulated bounded MCP shutdown timeout"),
             ):
-                shutdown_mcp_servers()
+                with pytest.raises(RuntimeError, match="timed out"):
+                    shutdown_mcp_servers()
 
-            assert loop.is_closed()
-            assert parked_task_done.is_set(), (
-                "parked MCPServerTask was not drained before its loop closed"
-            )
-            assert parked_task.done()
-            assert scheduled_shutdown["future"].done()
-            assert schedule_count == 2
+            assert mcp_mod._servers[server.name] is server
         finally:
             with mcp_mod._lock:
                 mcp_mod._servers.clear()
                 mcp_mod._server_connecting.clear()
-            mcp_mod._stop_mcp_loop()
+                mcp_mod._retiring_mcp_profiles.clear()
 
     def test_shutdown_deregisters_registered_tools(self):
         """shutdown_mcp_servers removes MCP tools and their raw alias."""
@@ -1570,7 +1709,7 @@ class TestUtilityToolRegistration:
         mock_tools = [_make_mcp_tool("read_file", "Read a file")]
         mock_session = MagicMock()
 
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
@@ -2191,7 +2330,7 @@ class TestDiscoveryFailedCount:
             "bad_server": {"command": "npx", "args": ["bad"]},
         }
 
-        async def fake_register(name, cfg):
+        async def fake_register(name, cfg, **_kwargs):
             if name == "bad_server":
                 raise ConnectionError("Connection refused")
             # Simulate successful registration
@@ -2236,7 +2375,7 @@ class TestDiscoveryFailedCount:
             "fail1": {"command": "npx", "args": ["fail"]},
         }
 
-        async def selective_register(name, cfg):
+        async def selective_register(name, cfg, **_kwargs):
             if name == "fail1":
                 raise ConnectionError("Refused")
             from tools.mcp_tool import MCPServerTask
@@ -2287,7 +2426,7 @@ class TestMCPSelectiveToolLoading:
         mock_registry = ToolRegistry()
         server = self._make_server(name, tool_names, session=session)
 
-        async def fake_connect(_name, _config):
+        async def fake_connect(_name, _config, **_kwargs):
             return server
 
         async def run():
@@ -2324,7 +2463,7 @@ class TestMCPSelectiveToolLoading:
 
         connect_called = []
 
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             connect_called.append(name)
             return self._make_server(name, ["create_service"])
 
@@ -2347,6 +2486,106 @@ class TestMCPSelectiveToolLoading:
 
         assert connect_called == []
         assert result == []
+
+
+def test_probe_cleanup_failure_is_explicit_and_keeps_live_owner(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    created = []
+
+    class _CleanupFailingServer(mcp_tool.MCPServerTask):
+        def __init__(self, name):
+            super().__init__(name)
+            created.append(self)
+
+        async def start(self, _config):
+            self._tools = [_make_mcp_tool("tool")]
+
+        async def shutdown(self):
+            raise RuntimeError("child still alive")
+
+    def run_inline(coro_or_factory, timeout=30, **_kwargs):
+        del timeout
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coro)
+
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(
+        mcp_tool,
+        "_load_mcp_config",
+        lambda: {"probe": {"command": "probe"}},
+    )
+    monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+    monkeypatch.setattr(mcp_tool, "MCPServerTask", _CleanupFailingServer)
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+
+    try:
+        with pytest.raises(RuntimeError, match="probe cleanup failed"):
+            mcp_tool.probe_mcp_server_tools()
+        assert len(created) == 1
+        with mcp_tool._lock:
+            assert created[0] in mcp_tool._live_mcp_servers
+    finally:
+        with mcp_tool._lock:
+            for server in created:
+                mcp_tool._live_mcp_servers.discard(server)
+
+
+def test_probe_carries_generation_captured_before_config_load(monkeypatch):
+    """config load 推进 generation 后，probe 的旧代次不得启动 transport。"""
+    import tools.mcp_tool as mcp_tool
+
+    created = []
+
+    class _Server(mcp_tool.MCPServerTask):
+        def __init__(self, name):
+            super().__init__(name)
+            self.start_called = False
+            created.append(self)
+
+        async def start(self, _config):
+            self.start_called = True
+
+    profile_identity = mcp_tool._current_mcp_profile_identity()
+    missing = object()
+    with mcp_tool._lock:
+        original_generation = mcp_tool._mcp_profile_generations.get(
+            profile_identity, missing
+        )
+
+    def load_and_retire():
+        with mcp_tool._lock:
+            mcp_tool._mcp_profile_generations[profile_identity] = (
+                mcp_tool._mcp_profile_generations.get(profile_identity, 0) + 1
+            )
+        return {"probe": {"command": "probe"}}
+
+    def run_inline(coro_or_factory, timeout=30, **_kwargs):
+        del timeout
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coro)
+
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_load_mcp_config", load_and_retire)
+    monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+    monkeypatch.setattr(mcp_tool, "_stop_mcp_loop_if_idle", lambda: True)
+    monkeypatch.setattr(mcp_tool, "MCPServerTask", _Server)
+
+    try:
+        assert mcp_tool.probe_mcp_server_tools() == {}
+        assert len(created) == 1
+        assert created[0].start_called is False
+        with mcp_tool._lock:
+            assert created[0] not in mcp_tool._live_mcp_servers
+    finally:
+        with mcp_tool._lock:
+            if original_generation is missing:
+                mcp_tool._mcp_profile_generations.pop(profile_identity, None)
+            else:
+                mcp_tool._mcp_profile_generations[profile_identity] = (
+                    original_generation
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -2400,7 +2639,7 @@ class TestMCPBuiltinCollisionGuard:
         mock_tools = [_make_mcp_tool("search", "Search the web")]
         mock_session = MagicMock()
 
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
@@ -2439,7 +2678,7 @@ class TestMCPBuiltinCollisionGuard:
         mock_tools = [_make_mcp_tool("do_thing", "Do a thing")]
         mock_session = MagicMock()
 
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
@@ -2515,7 +2754,7 @@ class TestRegisterMcpServers:
 
         fake_config = {"my_server": {"command": "npx", "args": ["test"]}}
 
-        async def fake_register(name, cfg):
+        async def fake_register(name, cfg, **_kwargs):
             server = _make_mock_server(name)
             server._registered_tool_names = ["mcp__my_server__tool1"]
             _servers[name] = server
@@ -2530,6 +2769,1084 @@ class TestRegisterMcpServers:
         assert "mcp__my_server__tool1" in result
         _servers.pop("my_server", None)
 
+    def test_same_named_server_is_reused_only_within_one_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """A/B profile 的同名 MCP 必须各自启动，不能复用对方的凭据进程。"""
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        server_name = "profile_isolation_probe"
+        config = {server_name: {"command": "profile-mcp"}}
+        spawned = []
+
+        async def fake_register(name, _config, **_kwargs):
+            env = mcp_tool._build_safe_env({})
+            server = SimpleNamespace(
+                name=name,
+                session=object(),
+                _registered_tool_names=[f"mcp__{name}__probe"],
+            )
+            spawned.append((mcp_tool._current_mcp_profile_identity(), env, server))
+            mcp_tool._servers[name] = server
+            return list(server._registered_tool_names)
+
+        def run_inline(coro_or_factory, timeout=30, **_kwargs):
+            del timeout
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(
+            mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+        )
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+        monkeypatch.setattr(
+            mcp_tool, "_discover_and_register_server", fake_register
+        )
+
+        profile_a = tmp_path / "profiles" / "a"
+        profile_b = tmp_path / "profiles" / "b"
+        try:
+            token = set_hermes_home_override(profile_a)
+            try:
+                mcp_tool.register_mcp_servers(config)
+                server_a = mcp_tool._servers[server_name]
+                # 同一 profile 的重复装配仍应复用，不增加子进程。
+                mcp_tool.register_mcp_servers(config)
+            finally:
+                reset_hermes_home_override(token)
+
+            token = set_hermes_home_override(profile_b)
+            try:
+                mcp_tool.register_mcp_servers(config)
+                server_b = mcp_tool._servers[server_name]
+            finally:
+                reset_hermes_home_override(token)
+
+            assert len(spawned) == 2
+            assert server_a is not server_b
+            assert spawned[0][1]["WECOM_CLI_CONFIG_DIR"] == str(
+                profile_a / "wecom-cli-config"
+            )
+            assert spawned[1][1]["WECOM_CLI_CONFIG_DIR"] == str(
+                profile_b / "wecom-cli-config"
+            )
+        finally:
+            for profile in (profile_a, profile_b):
+                token = set_hermes_home_override(profile)
+                try:
+                    mcp_tool._servers.pop(server_name, None)
+                    mcp_tool._server_connecting.discard(server_name)
+                    mcp_tool._server_connect_errors.pop(server_name, None)
+                    mcp_tool._parallel_safe_servers.discard(server_name)
+                finally:
+                    reset_hermes_home_override(token)
+
+    def test_all_name_keyed_mcp_lifecycle_state_is_profile_scoped(
+        self, tmp_path
+    ):
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        mapping_names = tuple(mcp_tool._PROFILE_SCOPED_MCP_MAPPINGS)
+        set_names = tuple(mcp_tool._PROFILE_SCOPED_MCP_SETS)
+        profile_a = tmp_path / "profiles" / "a"
+        profile_b = tmp_path / "profiles" / "b"
+        probe_key = "profile-state-probe"
+
+        token = set_hermes_home_override(profile_a)
+        try:
+            for name in mapping_names:
+                getattr(mcp_tool, name)[probe_key] = object()
+            for name in set_names:
+                getattr(mcp_tool, name).add(probe_key)
+        finally:
+            reset_hermes_home_override(token)
+
+        try:
+            token = set_hermes_home_override(profile_b)
+            try:
+                for name in mapping_names:
+                    assert probe_key not in getattr(mcp_tool, name), name
+                for name in set_names:
+                    assert probe_key not in getattr(mcp_tool, name), name
+            finally:
+                reset_hermes_home_override(token)
+        finally:
+            token = set_hermes_home_override(profile_a)
+            try:
+                for name in mapping_names:
+                    getattr(mcp_tool, name).pop(probe_key, None)
+                for name in set_names:
+                    getattr(mcp_tool, name).discard(probe_key)
+            finally:
+                reset_hermes_home_override(token)
+
+        tree = ast.parse(Path(mcp_tool.__file__).read_text(encoding="utf-8"))
+
+        def module_control_flow(statements):
+            """下降模块控制流块，但不把函数/类内部赋值算作全局状态。"""
+            for node in statements:
+                yield node
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                child_blocks = []
+                for field in ("body", "orelse", "finalbody"):
+                    block = getattr(node, field, None)
+                    if isinstance(block, list):
+                        child_blocks.append(block)
+                for handler in getattr(node, "handlers", []):
+                    child_blocks.append(handler.body)
+                for case in getattr(node, "cases", []):
+                    child_blocks.append(case.body)
+                for block in child_blocks:
+                    yield from module_control_flow(block)
+
+        constructed = {
+            node.target.id
+            for node in module_control_flow(tree.body)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id in {"_ProfileScopedMapping", "_ProfileScopedSet"}
+        }
+        assert constructed == set(mapping_names) | set(set_names)
+
+        from collections.abc import MutableMapping, MutableSet
+
+        module_mutables = {
+            name
+            for name, value in vars(mcp_tool).items()
+            if not name.startswith("__")
+            and isinstance(value, (MutableMapping, MutableSet, list))
+        }
+
+        classified = (
+            set(mapping_names)
+            | set(set_names)
+            | set(mcp_tool._MCP_PROFILE_CUSTOM_MUTABLES)
+            | set(mcp_tool._MCP_PROCESS_GLOBAL_MUTABLES)
+            | set(mcp_tool._MCP_LIFECYCLE_INDEX_MUTABLES)
+        )
+        assert module_mutables == classified
+
+    def test_profile_shutdown_keeps_sibling_profile_running(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_a = tmp_path / "profiles" / "a"
+        profile_b = tmp_path / "profiles" / "b"
+        server_a = SimpleNamespace(name="shared", shutdown=AsyncMock())
+        server_b = SimpleNamespace(name="shared", shutdown=AsyncMock())
+
+        def run_inline(coro_or_factory, timeout=30, **_kwargs):
+            del timeout
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+
+        fake_loop = SimpleNamespace(is_running=lambda: True)
+        monkeypatch.setattr(mcp_tool, "_mcp_loop", fake_loop)
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+
+        token = set_hermes_home_override(profile_a)
+        try:
+            mcp_tool._servers["shared"] = server_a
+        finally:
+            reset_hermes_home_override(token)
+        token = set_hermes_home_override(profile_b)
+        try:
+            mcp_tool._servers["shared"] = server_b
+        finally:
+            reset_hermes_home_override(token)
+
+        token = set_hermes_home_override(profile_a)
+        try:
+            mcp_tool.shutdown_mcp_profile()
+            assert "shared" not in mcp_tool._servers
+        finally:
+            reset_hermes_home_override(token)
+
+        token = set_hermes_home_override(profile_b)
+        try:
+            assert mcp_tool._servers["shared"] is server_b
+            mcp_tool._servers.pop("shared", None)
+        finally:
+            reset_hermes_home_override(token)
+
+        server_a.shutdown.assert_awaited_once()
+        server_b.shutdown.assert_not_awaited()
+
+    def test_profile_shutdown_failure_keeps_state_for_retry(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile = tmp_path / "profiles" / "a"
+        server = SimpleNamespace(
+            name="shared",
+            shutdown=AsyncMock(side_effect=RuntimeError("close failed")),
+        )
+
+        def run_inline(coro_or_factory, timeout=30, **_kwargs):
+            del timeout
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+
+        monkeypatch.setattr(
+            mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+        )
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+        token = set_hermes_home_override(profile)
+        try:
+            mcp_tool._servers["shared"] = server
+            with pytest.raises(RuntimeError, match="failed to close 1 MCP server"):
+                mcp_tool.shutdown_mcp_profile()
+            assert mcp_tool._servers["shared"] is server
+        finally:
+            mcp_tool._servers.pop("shared", None)
+            reset_hermes_home_override(token)
+
+    def test_profile_shutdown_partial_failure_commits_success_before_retry(
+        self, tmp_path, monkeypatch
+    ):
+        """profile 批量关闭部分失败时，只重试仍失败的 exact owner。"""
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile = tmp_path / "profiles" / "a"
+        good = SimpleNamespace(name="good", shutdown=AsyncMock())
+        flaky = SimpleNamespace(
+            name="flaky",
+            shutdown=AsyncMock(side_effect=[RuntimeError("still alive"), None]),
+        )
+
+        def run_inline(coro_or_factory, timeout=30, **_kwargs):
+            del timeout
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+
+        monkeypatch.setattr(
+            mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+        )
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+        monkeypatch.setattr(mcp_tool, "_stop_mcp_loop", lambda **_kwargs: True)
+        token = set_hermes_home_override(profile)
+        try:
+            mcp_tool._servers["good"] = good
+            mcp_tool._servers["flaky"] = flaky
+            with pytest.raises(RuntimeError, match="failed to close 1 MCP server"):
+                mcp_tool.shutdown_mcp_profile()
+            assert "good" not in mcp_tool._servers
+            assert mcp_tool._servers["flaky"] is flaky
+
+            mcp_tool.shutdown_mcp_profile()
+            assert good.shutdown.await_count == 1
+            assert flaky.shutdown.await_count == 2
+            assert "flaky" not in mcp_tool._servers
+        finally:
+            mcp_tool._servers.pop("good", None)
+            mcp_tool._servers.pop("flaky", None)
+            reset_hermes_home_override(token)
+
+    def test_global_shutdown_partial_failure_commits_success_before_retry(
+        self, monkeypatch
+    ):
+        """全局批量关闭也只重试失败 owner，不能双清已成功 server。"""
+        import tools.mcp_tool as mcp_tool
+
+        good = SimpleNamespace(
+            name="global-good",
+            profile_identity=mcp_tool._current_mcp_profile_identity(),
+            shutdown=AsyncMock(),
+        )
+        flaky = SimpleNamespace(
+            name="global-flaky",
+            profile_identity=mcp_tool._current_mcp_profile_identity(),
+            shutdown=AsyncMock(side_effect=[RuntimeError("still alive"), None]),
+        )
+
+        def run_inline(coro_or_factory, timeout=30, **_kwargs):
+            del timeout
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+
+        monkeypatch.setattr(
+            mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+        )
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+        monkeypatch.setattr(mcp_tool, "_stop_mcp_loop", lambda **_kwargs: True)
+        mcp_tool._servers[good.name] = good
+        mcp_tool._servers[flaky.name] = flaky
+        try:
+            with pytest.raises(RuntimeError, match="failed to close 1 MCP server"):
+                mcp_tool.shutdown_mcp_servers()
+            assert good.name not in mcp_tool._servers
+            assert mcp_tool._servers[flaky.name] is flaky
+
+            mcp_tool.shutdown_mcp_servers()
+            assert good.shutdown.await_count == 1
+            assert flaky.shutdown.await_count == 2
+        finally:
+            mcp_tool._servers.pop(good.name, None)
+            mcp_tool._servers.pop(flaky.name, None)
+
+    def test_mcp_stderr_log_is_profile_scoped(self, tmp_path):
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        paths = []
+        for profile in (tmp_path / "profiles" / "a", tmp_path / "profiles" / "b"):
+            token = set_hermes_home_override(profile)
+            try:
+                paths.append(Path(mcp_tool._get_mcp_stderr_log().name))
+            finally:
+                reset_hermes_home_override(token)
+
+        assert paths == [
+            tmp_path / "profiles" / "a" / "logs" / "mcp-stderr.log",
+            tmp_path / "profiles" / "b" / "logs" / "mcp-stderr.log",
+        ]
+        mcp_tool._close_mcp_stderr_logs()
+
+    def test_mcp_availability_check_is_never_cached_across_profile_switches(self):
+        import tools.mcp_tool as mcp_tool
+
+        check = mcp_tool._make_check_fn("shared", "mcp__shared__probe")
+        assert check._session_scope_sensitive is True
+
+    @pytest.mark.parametrize("registration_path", ["live", "lazy_cache"])
+    def test_normalized_tool_name_routes_to_each_profiles_exact_handler(
+        self, tmp_path, monkeypatch, registration_path
+    ):
+        """全局 Registry 的同名入口必须按 profile 路由到不同 handler。"""
+        import tools.mcp_tool as mcp_tool
+        import tools.registry as registry_module
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        created_handlers = []
+
+        def make_handler(server_name, raw_tool_name, _timeout):
+            marker = object()
+
+            def handler(_args, **_kwargs):
+                return json.dumps(
+                    {"server": server_name, "raw_tool": raw_tool_name, "marker": id(marker)}
+                )
+
+            created_handlers.append(handler)
+            return handler
+
+        monkeypatch.setattr(registry_module, "registry", registry)
+        monkeypatch.setattr(mcp_tool, "_make_tool_handler", make_handler)
+
+        profile_a = tmp_path / "profiles" / "a"
+        profile_b = tmp_path / "profiles" / "b"
+        expected = {}
+        try:
+            for profile, raw_name in (
+                (profile_a, "foo-bar"),
+                (profile_b, "foo_bar"),
+            ):
+                token = set_hermes_home_override(profile)
+                try:
+                    if registration_path == "live":
+                        server = SimpleNamespace(
+                            _tools=[_make_mcp_tool(raw_name)],
+                            session=SimpleNamespace(),
+                            tool_timeout=30,
+                            initialize_result=None,
+                        )
+                        registered = mcp_tool._register_server_tools(
+                            "shared", server, {}
+                        )
+                    else:
+                        registered = mcp_tool._register_from_cache_sync(
+                            "shared",
+                            {},
+                            {
+                                "tools": [
+                                    {
+                                        "name": raw_name,
+                                        "description": "probe",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {},
+                                        },
+                                    }
+                                ],
+                                "utility_tools": [],
+                            },
+                        )
+                    assert registered == ["mcp__shared__foo_bar"]
+                    entry = registry.get_entry("mcp__shared__foo_bar")
+                    expected[profile] = json.loads(entry.handler({}))
+                finally:
+                    reset_hermes_home_override(token)
+
+            assert len(created_handlers) == 2
+            assert created_handlers[0] is not created_handlers[1]
+            assert expected[profile_a]["raw_tool"] == "foo-bar"
+            assert expected[profile_b]["raw_tool"] == "foo_bar"
+
+            for profile, raw_name in (
+                (profile_a, "foo-bar"),
+                (profile_b, "foo_bar"),
+            ):
+                token = set_hermes_home_override(profile)
+                try:
+                    routed = json.loads(
+                        registry.get_entry("mcp__shared__foo_bar").handler({})
+                    )
+                    assert routed["raw_tool"] == raw_name
+                    assert routed["marker"] == expected[profile]["marker"]
+                finally:
+                    reset_hermes_home_override(token)
+
+            token = set_hermes_home_override(profile_a)
+            try:
+                mcp_tool._clear_current_mcp_profile_state(
+                    mcp_tool._current_mcp_profile_identity()
+                )
+            finally:
+                reset_hermes_home_override(token)
+
+            token = set_hermes_home_override(profile_b)
+            try:
+                entry = registry.get_entry("mcp__shared__foo_bar")
+                assert entry is not None
+                routed = json.loads(entry.handler({}))
+                assert routed["raw_tool"] == "foo_bar"
+                mcp_tool._clear_current_mcp_profile_state(
+                    mcp_tool._current_mcp_profile_identity()
+                )
+                assert registry.get_entry("mcp__shared__foo_bar") is None
+            finally:
+                reset_hermes_home_override(token)
+        finally:
+            for profile in (profile_a, profile_b):
+                token = set_hermes_home_override(profile)
+                try:
+                    mcp_tool._clear_current_mcp_profile_state(
+                        mcp_tool._current_mcp_profile_identity()
+                    )
+                finally:
+                    reset_hermes_home_override(token)
+
+    @pytest.mark.parametrize("registration_path", ["live", "lazy_cache"])
+    def test_profile_handler_refresh_has_no_half_published_window(
+        self, tmp_path, monkeypatch, registration_path
+    ):
+        """Registry entry 发布后，调用方不能看到旧 handler 或空 owner。"""
+        import tools.mcp_tool as mcp_tool
+        import tools.registry as registry_module
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        profile = tmp_path / "profiles" / "a"
+        published = threading.Event()
+        release_register = threading.Event()
+        dispatch_done = threading.Event()
+        schema_done = threading.Event()
+        dispatch_waiting = threading.Event()
+        schema_waiting = threading.Event()
+        pause_register = threading.Event()
+        result = {}
+
+        class _ObservedRLock:
+            def __init__(self):
+                self._lock = threading.RLock()
+
+            def __enter__(self):
+                waiting = {
+                    "mcp-dispatch": dispatch_waiting,
+                    "mcp-schema": schema_waiting,
+                }.get(threading.current_thread().name)
+                if waiting is not None:
+                    waiting.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *_exc):
+                self._lock.release()
+
+        monkeypatch.setattr(mcp_tool, "_lock", _ObservedRLock())
+
+        def make_handler(_server_name, raw_tool_name, _timeout):
+            return lambda _args, **_kwargs: json.dumps({"raw": raw_tool_name})
+
+        def register_tool(raw_name):
+            if registration_path == "live":
+                server = SimpleNamespace(
+                    _tools=[
+                        _make_mcp_tool(
+                            raw_name,
+                            input_schema={
+                                "type": "object",
+                                "properties": {
+                                    raw_name: {"type": "string"}
+                                },
+                            },
+                        )
+                    ],
+                    session=SimpleNamespace(),
+                    tool_timeout=30,
+                    initialize_result=None,
+                    _is_recycled_stdio=lambda: False,
+                )
+                mcp_tool._servers["shared"] = server
+                return mcp_tool._register_server_tools("shared", server, {})
+            return mcp_tool._register_from_cache_sync(
+                "shared",
+                {},
+                {
+                    "tools": [
+                        {
+                            "name": raw_name,
+                            "description": "probe",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    raw_name: {"type": "string"}
+                                },
+                            },
+                        }
+                    ],
+                    "utility_tools": [],
+                },
+            )
+
+        original_register = registry.register
+
+        def paused_register(*args, **kwargs):
+            original_register(*args, **kwargs)
+            if pause_register.is_set():
+                published.set()
+                assert release_register.wait(timeout=2)
+
+        monkeypatch.setattr(registry_module, "registry", registry)
+        monkeypatch.setattr(mcp_tool, "_make_tool_handler", make_handler)
+        monkeypatch.setattr(registry, "register", paused_register)
+
+        def refresh():
+            token = set_hermes_home_override(profile)
+            try:
+                result["registered"] = register_tool("foo_bar")
+            finally:
+                reset_hermes_home_override(token)
+
+        def dispatch():
+            token = set_hermes_home_override(profile)
+            try:
+                entry = registry.get_entry("mcp__shared__foo_bar")
+                result["dispatch"] = json.loads(entry.handler({}))["raw"]
+            finally:
+                reset_hermes_home_override(token)
+                dispatch_done.set()
+
+        def read_schema():
+            token = set_hermes_home_override(profile)
+            try:
+                definitions = registry.get_definitions(
+                    {"mcp__shared__foo_bar"}
+                )
+                result["schema_properties"] = set(
+                    definitions[0]["function"]["parameters"]["properties"]
+                )
+            finally:
+                reset_hermes_home_override(token)
+                schema_done.set()
+
+        token = set_hermes_home_override(profile)
+        try:
+            assert register_tool("foo-bar") == ["mcp__shared__foo_bar"]
+        finally:
+            reset_hermes_home_override(token)
+
+        pause_register.set()
+        refresh_thread = threading.Thread(target=refresh, name="mcp-refresh")
+        dispatch_thread = threading.Thread(target=dispatch, name="mcp-dispatch")
+        schema_thread = threading.Thread(target=read_schema, name="mcp-schema")
+        try:
+            refresh_thread.start()
+            assert published.wait(timeout=2)
+            dispatch_thread.start()
+            schema_thread.start()
+            assert dispatch_waiting.wait(timeout=2)
+            assert schema_waiting.wait(timeout=2)
+            assert not dispatch_done.is_set()
+            assert not schema_done.is_set()
+            release_register.set()
+            refresh_thread.join(timeout=2)
+            dispatch_thread.join(timeout=2)
+            schema_thread.join(timeout=2)
+            assert not refresh_thread.is_alive()
+            assert not dispatch_thread.is_alive()
+            assert not schema_thread.is_alive()
+            assert result["registered"] == ["mcp__shared__foo_bar"]
+            assert result["dispatch"] == "foo_bar"
+            assert result["schema_properties"] == {"foo_bar"}
+        finally:
+            release_register.set()
+            refresh_thread.join(timeout=2)
+            dispatch_thread.join(timeout=2)
+            schema_thread.join(timeout=2)
+            token = set_hermes_home_override(profile)
+            try:
+                mcp_tool._clear_current_mcp_profile_state(
+                    mcp_tool._current_mcp_profile_identity()
+                )
+            finally:
+                reset_hermes_home_override(token)
+
+    def test_retiring_and_generation_fence_reject_late_server_publish(
+        self, tmp_path, monkeypatch
+    ):
+        """retiring 中及 clear 后，旧 generation server 都不得复活 owner。"""
+        import tools.mcp_tool as mcp_tool
+        import tools.registry as registry_module
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        monkeypatch.setattr(registry_module, "registry", registry)
+        profile = tmp_path / "profiles" / "a"
+        token = set_hermes_home_override(profile)
+        try:
+            old_server = mcp_tool.MCPServerTask("shared")
+            old_server.session = SimpleNamespace()
+            old_server._tools = [_make_mcp_tool("probe")]
+            old_server.initialize_result = None
+
+            with mcp_tool._lock:
+                mcp_tool._retiring_mcp_profiles.add(
+                    old_server.profile_identity
+                )
+            with pytest.raises(RuntimeError, match="retired profile generation"):
+                mcp_tool._register_server_tools("shared", old_server, {})
+            assert registry.get_entry("mcp__shared__probe") is None
+
+            with mcp_tool._lock:
+                mcp_tool._retiring_mcp_profiles.discard(
+                    old_server.profile_identity
+                )
+            mcp_tool._clear_current_mcp_profile_state(
+                old_server.profile_identity
+            )
+            with pytest.raises(RuntimeError, match="retired profile generation"):
+                mcp_tool._register_server_tools("shared", old_server, {})
+            assert registry.get_entry("mcp__shared__probe") is None
+
+            new_server = mcp_tool.MCPServerTask("shared")
+            new_server.session = SimpleNamespace()
+            new_server._tools = [_make_mcp_tool("probe")]
+            new_server.initialize_result = None
+            assert mcp_tool._register_server_tools(
+                "shared", new_server, {}
+            ) == ["mcp__shared__probe"]
+        finally:
+            mcp_tool._clear_current_mcp_profile_state(
+                mcp_tool._current_mcp_profile_identity()
+            )
+            reset_hermes_home_override(token)
+
+    def test_inflight_lazy_cache_registration_cannot_adopt_new_generation(
+        self, tmp_path, monkeypatch
+    ):
+        """旧 discovery 卡在 cache lookup 时，clear 后不得按新代次晚发布。"""
+        import tools.mcp_schema_cache as cache_module
+        import tools.mcp_tool as mcp_tool
+        import tools.registry as registry_module
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        monkeypatch.setattr(registry_module, "registry", registry)
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(cache_module, "config_fingerprint", lambda _cfg: "fp")
+        entered = threading.Event()
+        release = threading.Event()
+        result = {}
+        profile = tmp_path / "profiles" / "a"
+
+        def get_cached_entry(_name, _fingerprint):
+            entered.set()
+            assert release.wait(timeout=2)
+            return {
+                "tools": [{
+                    "name": "probe",
+                    "description": "probe",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }],
+                "utility_tools": [],
+            }
+
+        monkeypatch.setattr(cache_module, "get_cached_entry", get_cached_entry)
+
+        def register_old_generation():
+            token = set_hermes_home_override(profile)
+            try:
+                result["value"] = mcp_tool.register_mcp_servers({
+                    "shared": {"lazy": True, "command": "old-creds"}
+                })
+            except BaseException as exc:
+                result["error"] = exc
+            finally:
+                reset_hermes_home_override(token)
+
+        thread = threading.Thread(target=register_old_generation)
+        thread.start()
+        try:
+            assert entered.wait(timeout=2)
+            token = set_hermes_home_override(profile)
+            try:
+                profile_identity = mcp_tool._current_mcp_profile_identity()
+                with mcp_tool._lock:
+                    before = mcp_tool._mcp_profile_generations[profile_identity]
+                mcp_tool._clear_current_mcp_profile_state(profile_identity)
+                with mcp_tool._lock:
+                    assert mcp_tool._mcp_profile_generations[profile_identity] == before + 1
+            finally:
+                reset_hermes_home_override(token)
+            release.set()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert isinstance(result.get("error"), RuntimeError)
+            assert "retired profile" in str(result["error"])
+            assert "value" not in result
+            assert registry.get_entry("mcp__shared__probe") is None
+            token = set_hermes_home_override(profile)
+            try:
+                assert "mcp__shared__probe" not in mcp_tool._mcp_tool_handlers
+                assert "shared" not in mcp_tool._lazy_server_configs
+            finally:
+                reset_hermes_home_override(token)
+        finally:
+            release.set()
+            thread.join(timeout=2)
+            token = set_hermes_home_override(profile)
+            try:
+                mcp_tool._clear_current_mcp_profile_state(
+                    mcp_tool._current_mcp_profile_identity()
+                )
+            finally:
+                reset_hermes_home_override(token)
+
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    @pytest.mark.parametrize("repeat_cancel", [False, True], ids=["once", "twice"])
+    def test_connect_cancellation_keeps_exact_live_owner_until_cleanup(
+        self, monkeypatch, cleanup_fails, repeat_cancel
+    ):
+        """cancel 必须 await 严格 cleanup；失败时 live owner 留给重试。"""
+        import tools.mcp_tool as mcp_tool
+
+        started = None
+        run_unwound = None
+        shutdown_started = None
+        release_shutdown = None
+        created = []
+        original_shutdown = mcp_tool.MCPServerTask.shutdown
+
+        async def blocked_run(server, _config):
+            created.append(server)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                run_unwound.set()
+
+        async def observed_shutdown(server):
+            assert run_unwound.is_set()
+            shutdown_started.set()
+            await release_shutdown.wait()
+            if cleanup_fails:
+                raise RuntimeError("cleanup failed")
+            await original_shutdown(server)
+
+        monkeypatch.setattr(mcp_tool.MCPServerTask, "run", blocked_run)
+        monkeypatch.setattr(
+            mcp_tool.MCPServerTask, "shutdown", observed_shutdown
+        )
+
+        async def exercise():
+            nonlocal started, run_unwound, shutdown_started, release_shutdown
+            started = asyncio.Event()
+            run_unwound = asyncio.Event()
+            shutdown_started = asyncio.Event()
+            release_shutdown = asyncio.Event()
+            task = asyncio.create_task(
+                mcp_tool._connect_server("cancelled", {"command": "probe"})
+            )
+            await started.wait()
+            task.cancel()
+            await shutdown_started.wait()
+            try:
+                if repeat_cancel:
+                    task.cancel()
+                    cancellation_delivered = asyncio.Event()
+                    asyncio.get_running_loop().call_soon(
+                        cancellation_delivered.set
+                    )
+                    await cancellation_delivered.wait()
+                    assert not task.done()
+            finally:
+                release_shutdown.set()
+            if cleanup_fails:
+                with pytest.raises(RuntimeError, match="cancellation cleanup failed"):
+                    await task
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        try:
+            asyncio.run(exercise())
+            assert len(created) == 1
+            with mcp_tool._lock:
+                if cleanup_fails:
+                    assert created[0] in mcp_tool._live_mcp_servers
+                else:
+                    assert created[0] not in mcp_tool._live_mcp_servers
+            if cleanup_fails:
+                assert mcp_tool._stop_mcp_loop(only_if_idle=True) is False
+        finally:
+            with mcp_tool._lock:
+                for server in created:
+                    mcp_tool._live_mcp_servers.discard(server)
+
+    def test_standalone_start_and_cleanup_failure_is_explicit_and_keeps_owner(
+        self, monkeypatch, caplog
+    ):
+        """无 discovery owner 时，二次 cleanup 失败也必须显性且可重试。"""
+        import tools.mcp_tool as mcp_tool
+
+        created = []
+
+        class _StartAndCleanupFailingServer(mcp_tool.MCPServerTask):
+            def __init__(self, name):
+                super().__init__(name)
+                created.append(self)
+
+            async def start(self, _config):
+                raise ConnectionError("backend start failed")
+
+            async def shutdown(self):
+                raise RuntimeError("child still alive")
+
+        monkeypatch.setattr(
+            mcp_tool, "MCPServerTask", _StartAndCleanupFailingServer
+        )
+        try:
+            with caplog.at_level(logging.ERROR):
+                with pytest.raises(RuntimeError, match="start cleanup failed") as exc:
+                    asyncio.run(
+                        mcp_tool._connect_server(
+                            "standalone", {"command": "probe"}
+                        )
+                    )
+            assert isinstance(exc.value.__cause__, RuntimeError)
+            assert str(exc.value.__cause__) == "child still alive"
+            assert len(created) == 1
+            with mcp_tool._lock:
+                assert created[0] in mcp_tool._live_mcp_servers
+            assert any(
+                record.exc_info
+                and isinstance(record.exc_info[1], ConnectionError)
+                and str(record.exc_info[1]) == "backend start failed"
+                for record in caplog.records
+            )
+        finally:
+            with mcp_tool._lock:
+                for server in created:
+                    mcp_tool._live_mcp_servers.discard(server)
+
+    def test_registration_and_shutdown_failure_keeps_owner_for_profile_retry(
+        self, monkeypatch
+    ):
+        """注册失败后的 cleanup 也失败时，_servers owner 不得先删。"""
+        import tools.mcp_tool as mcp_tool
+
+        class _CleanupFailingServer(mcp_tool.MCPServerTask):
+            fail_shutdown = True
+            shutdown_calls = 0
+
+            async def shutdown(self):
+                self.shutdown_calls += 1
+                if self.fail_shutdown:
+                    raise RuntimeError("child still alive")
+                await super().shutdown()
+
+        server = _CleanupFailingServer("shared")
+        server.session = object()
+        monkeypatch.setattr(
+            mcp_tool,
+            "_connect_server",
+            AsyncMock(return_value=server),
+        )
+        monkeypatch.setattr(
+            mcp_tool,
+            "_register_server_tools",
+            MagicMock(side_effect=RuntimeError("registration failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="child still alive"):
+            asyncio.run(mcp_tool._discover_and_register_server("shared", {}))
+        assert mcp_tool._servers["shared"] is server
+
+        server.fail_shutdown = False
+
+        def run_inline(coro_or_factory, timeout=30, **_kwargs):
+            del timeout
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+
+        monkeypatch.setattr(
+            mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+        )
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+        monkeypatch.setattr(mcp_tool, "_stop_mcp_loop", lambda **_kwargs: True)
+        mcp_tool.shutdown_mcp_profile()
+        assert "shared" not in mcp_tool._servers
+        assert server.shutdown_calls == 2
+
+    def test_profile_shutdown_waits_for_unpublished_live_owner_single_flight(
+        self, tmp_path, monkeypatch
+    ):
+        """未发布 connect 必须被 unload 等待，第二个 unload 不能拆 retiring 门。"""
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_a = tmp_path / "profiles" / "a"
+        profile_b = tmp_path / "profiles" / "b"
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+        finished = threading.Event()
+        errors = []
+
+        class _LiveServer:
+            name = "shared"
+            profile_identity = ""
+            shutdown_calls = 0
+
+            async def shutdown(self):
+                self.shutdown_calls += 1
+                cleanup_entered.set()
+                assert await asyncio.to_thread(release_cleanup.wait, 2)
+                with mcp_tool._lock:
+                    mcp_tool._live_mcp_servers.discard(self)
+
+        live = _LiveServer()
+        token = set_hermes_home_override(profile_a)
+        try:
+            live.profile_identity = mcp_tool._current_mcp_profile_identity()
+        finally:
+            reset_hermes_home_override(token)
+
+        def run_inline(coro_or_factory, timeout=30, **_kwargs):
+            del timeout
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+
+        monkeypatch.setattr(
+            mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+        )
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+        token = set_hermes_home_override(profile_b)
+        try:
+            mcp_tool._servers["sibling"] = SimpleNamespace(
+                name="sibling", session=object()
+            )
+        finally:
+            reset_hermes_home_override(token)
+        with mcp_tool._lock:
+            mcp_tool._live_mcp_servers.add(live)
+
+        def unload_a():
+            token = set_hermes_home_override(profile_a)
+            try:
+                mcp_tool.shutdown_mcp_profile()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                reset_hermes_home_override(token)
+                finished.set()
+
+        thread = threading.Thread(target=unload_a)
+        thread.start()
+        try:
+            assert cleanup_entered.wait(timeout=2)
+            assert not finished.is_set()
+            token = set_hermes_home_override(profile_a)
+            try:
+                with pytest.raises(RuntimeError, match="already in progress"):
+                    mcp_tool.shutdown_mcp_profile()
+                with pytest.raises(RuntimeError, match="already in progress"):
+                    mcp_tool.shutdown_mcp_servers()
+                with mcp_tool._lock:
+                    assert live.profile_identity in mcp_tool._retiring_mcp_profiles
+                assert live.shutdown_calls == 1
+            finally:
+                reset_hermes_home_override(token)
+            release_cleanup.set()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert errors == []
+            token = set_hermes_home_override(profile_b)
+            try:
+                assert "sibling" in mcp_tool._servers
+            finally:
+                reset_hermes_home_override(token)
+        finally:
+            release_cleanup.set()
+            thread.join(timeout=2)
+            with mcp_tool._lock:
+                mcp_tool._live_mcp_servers.discard(live)
+            token = set_hermes_home_override(profile_b)
+            try:
+                mcp_tool._servers.pop("sibling", None)
+            finally:
+                reset_hermes_home_override(token)
+
     def test_skips_servers_already_connecting(self):
         """Servers in _server_connecting must not be spawned again (#58862)."""
         from tools.mcp_tool import (
@@ -2542,7 +3859,7 @@ class TestRegisterMcpServers:
         _server_connecting.add("my_srv")
         connect_calls = []
 
-        async def fake_register(name, cfg):
+        async def fake_register(name, cfg, **_kwargs):
             connect_calls.append(name)
             server = _make_mock_server(name)
             server._registered_tool_names = [f"mcp_{name}_tool"]
@@ -2748,7 +4065,8 @@ class TestMCPDiscoveryCrossProcessLock:
         fh = open(lock_file, "w", encoding="utf-8")
         cookie = _LockCookie(fh)
 
-        def mock_acquire():
+        def mock_acquire(profile_identity=None):
+            # 锁按 profile 派生后,调用点会把已捕获的 identity 传下来。
             return cookie
 
         mock_config = {"test_srv": {"command": "echo", "enabled": True}}
@@ -2763,6 +4081,7 @@ class TestMCPDiscoveryCrossProcessLock:
 
     def test_lock_held_retries_exhausted_fallback(self):
         """All retry attempts see lock held -> runs discovery unguarded."""
+        import tools.mcp_tool as mcp_tool
         from tools.mcp_tool import (
             _LOCK_UNAVAILABLE,
             discover_mcp_tools,
@@ -2778,7 +4097,11 @@ class TestMCPDiscoveryCrossProcessLock:
              patch("tools.mcp_tool._existing_tool_names", return_value=[]):
             result = discover_mcp_tools()
         # Must still run local discovery
-        reg_spy.assert_called_once_with(mock_config)
+        reg_spy.assert_called_once_with(
+            mock_config,
+            profile_identity=mcp_tool._current_mcp_profile_identity(),
+            profile_generation=0,
+        )
 
     def test_posix_flock_acquire_and_release(self):
         """_acquire_lock_on_fh uses fcntl.flock on POSIX."""
@@ -3014,3 +4337,291 @@ class TestBuildSafeEnvHomeContract:
 
         assert env.get("HERMES_HOME") == str(a)
         assert env.get("HOME") == str(a / "home")
+
+
+def test_single_server_reload_keeps_owner_when_loop_is_unavailable(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    original = SimpleNamespace(shutdown=AsyncMock())
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_servers", {"demo": original})
+    monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
+    monkeypatch.setattr(
+        mcp_tool,
+        "discover_mcp_tools",
+        lambda: pytest.fail("reload must not discover after failed shutdown"),
+    )
+
+    with pytest.raises(RuntimeError, match="loop unavailable"):
+        mcp_tool.reload_single_mcp_server("demo")
+
+    assert mcp_tool._servers["demo"] is original
+
+
+def test_single_server_reload_blocks_profile_shutdown_until_cleanup_finishes(
+    monkeypatch
+):
+    """单 server cleanup in-flight 时，profile shutdown 必须显式拒绝双清。"""
+    import tools.mcp_tool as mcp_tool
+
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    reload_finished = threading.Event()
+    errors = []
+
+    class _Server:
+        name = "demo"
+
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+            cleanup_entered.set()
+            assert await asyncio.to_thread(release_cleanup.wait, 2)
+
+    server = _Server()
+
+    def run_inline(coro_or_factory, timeout=30, **_kwargs):
+        del timeout
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coro)
+
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(
+        mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+    )
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_inline)
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda **_kwargs: [])
+    mcp_tool._servers[server.name] = server
+
+    def reload_server():
+        try:
+            mcp_tool.reload_single_mcp_server(server.name)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            reload_finished.set()
+
+    thread = threading.Thread(target=reload_server, daemon=True)
+    thread.start()
+    try:
+        assert cleanup_entered.wait(timeout=2)
+        with pytest.raises(RuntimeError, match="operation already in progress"):
+            mcp_tool.shutdown_mcp_profile()
+        assert not reload_finished.is_set()
+
+        release_cleanup.set()
+        assert reload_finished.wait(timeout=2)
+        assert errors == []
+        assert server.shutdown_calls == 1
+        assert server.name not in mcp_tool._servers
+    finally:
+        release_cleanup.set()
+        thread.join(timeout=2)
+        mcp_tool._servers.pop(server.name, None)
+        with mcp_tool._lock:
+            mcp_tool._retiring_mcp_server_operations.clear()
+            mcp_tool._retiring_mcp_profiles.clear()
+
+
+def test_single_server_reload_uses_identity_cas_before_removal(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    original = SimpleNamespace(shutdown=AsyncMock())
+    replacement = SimpleNamespace(shutdown=AsyncMock())
+    servers = {"demo": original}
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_servers", servers)
+    monkeypatch.setattr(
+        mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+    )
+
+    def replace_during_shutdown(_factory, timeout, **_kwargs):
+        assert timeout == 20
+        servers["demo"] = replacement
+
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", replace_during_shutdown)
+    monkeypatch.setattr(
+        mcp_tool,
+        "discover_mcp_tools",
+        lambda **_kwargs: pytest.fail("reload must not discover after losing ownership"),
+    )
+
+    with pytest.raises(RuntimeError, match="lost ownership"):
+        mcp_tool.reload_single_mcp_server("demo")
+
+    assert servers["demo"] is replacement
+
+
+def test_single_server_reload_keeps_owner_when_shutdown_fails(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    original = SimpleNamespace(shutdown=AsyncMock())
+    servers = {"demo": original}
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_servers", servers)
+    monkeypatch.setattr(
+        mcp_tool, "_mcp_loop", SimpleNamespace(is_running=lambda: True)
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "_run_on_mcp_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("stuck")),
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "discover_mcp_tools",
+        lambda **_kwargs: pytest.fail("reload must not discover after failed shutdown"),
+    )
+
+    with pytest.raises(TimeoutError, match="stuck"):
+        mcp_tool.reload_single_mcp_server("demo")
+
+    assert servers["demo"] is original
+
+
+# 下面六条走本文件既有的 `async def _test()` + `asyncio.run(_test())` 形态
+# （同文件已有 29 处先例），而不是 @pytest.mark.asyncio：
+# home-guard-tests.yml 这道 CI 门刻意不装 pytest-asyncio（它的注释里写明
+# 「the rest of that dir uses pytest-asyncio … extra deps」，为此只挑了 LSP
+# 目录里唯一那个同步文件），而 tests/tools/test_mcp_tool.py 正在它的文件清单里。
+# 用 pytest.mark.asyncio 会让这道门整体红在 "async def functions are not
+# natively supported"，而不是红在被测契约上。
+def test_server_shutdown_concurrent_callers_share_one_success():
+    """两个并发 cleanup 必须共享同一轮成功，底层资源只能提交一次。"""
+    import tools.mcp_tool as mcp_tool
+
+    async def _test():
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        class _Server(mcp_tool.MCPServerTask):
+            def __init__(self):
+                super().__init__("demo")
+                self.cleanup_calls = 0
+
+            async def _shutdown_owned(self):
+                self.cleanup_calls += 1
+                cleanup_entered.set()
+                await release_cleanup.wait()
+
+        server = _Server()
+        first = asyncio.create_task(server.shutdown())
+        await cleanup_entered.wait()
+        second = asyncio.create_task(server.shutdown())
+        await asyncio.sleep(0)
+        assert not second.done()
+
+        release_cleanup.set()
+        await asyncio.gather(first, second)
+        assert server.cleanup_calls == 1
+
+    asyncio.run(_test())
+
+
+def test_server_shutdown_failure_does_not_latch_success():
+    """第一轮失败不能置成功 latch，下一轮必须真正重试。"""
+    import tools.mcp_tool as mcp_tool
+
+    async def _test():
+        class _Server(mcp_tool.MCPServerTask):
+            def __init__(self):
+                super().__init__("demo")
+                self.cleanup_calls = 0
+
+            async def _shutdown_owned(self):
+                self.cleanup_calls += 1
+                if self.cleanup_calls == 1:
+                    raise RuntimeError("still alive")
+
+        server = _Server()
+        with pytest.raises(RuntimeError, match="still alive"):
+            await server.shutdown()
+        await server.shutdown()
+        assert server.cleanup_calls == 2
+
+    asyncio.run(_test())
+
+
+def test_server_shutdown_keeps_registry_when_child_survives(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    server = mcp_tool.MCPServerTask("demo")
+    deregister = MagicMock()
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_deregister_tools", deregister)
+
+    def keep_child(_include_active, server_name, owner_identity):
+        assert server_name == "demo"
+        assert owner_identity == (server.profile_identity, "demo", server)
+        return [4242]
+
+    monkeypatch.setattr(
+        mcp_tool,
+        "_kill_orphaned_mcp_children",
+        keep_child,
+    )
+
+    async def _test():
+        with pytest.raises(RuntimeError, match="still owns child processes"):
+            await server.shutdown()
+
+    asyncio.run(_test())
+
+    deregister.assert_not_called()
+
+
+def test_server_task_cannot_start_transport_after_process_teardown(monkeypatch):
+    import hermes_cli.mcp_startup as mcp_startup
+    import tools.mcp_tool as mcp_tool
+
+    server = mcp_tool.MCPServerTask("demo")
+    run_stdio = AsyncMock(return_value="shutdown")
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_run_stdio", run_stdio)
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_teardown_started", True)
+
+    async def _test():
+        await server.run({"command": "demo"})
+
+    asyncio.run(_test())
+
+    run_stdio.assert_not_awaited()
+    assert server._shutdown_event.is_set()
+    assert server._ready.is_set()
+
+
+def test_preflight_does_not_construct_http_client_after_shutdown(monkeypatch):
+    import httpx
+    import tools.mcp_tool as mcp_tool
+
+    server = mcp_tool.MCPServerTask("demo")
+    server._shutdown_event.set()
+    construct = MagicMock(side_effect=AssertionError("client constructed"))
+    monkeypatch.setattr(httpx, "AsyncClient", construct)
+
+    async def _test():
+        await server._preflight_content_type("https://example.invalid/mcp")
+
+    asyncio.run(_test())
+
+    construct.assert_not_called()
+
+
+def test_streamable_http_does_not_construct_client_after_shutdown(monkeypatch):
+    import httpx
+    import tools.mcp_tool as mcp_tool
+
+    server = mcp_tool.MCPServerTask("demo")
+    server._shutdown_event.set()
+    construct = MagicMock(side_effect=AssertionError("client constructed"))
+    monkeypatch.setattr(httpx, "AsyncClient", construct)
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_MCP_NEW_HTTP", True)
+
+    async def _test():
+        return await server._run_http({"url": "https://example.invalid/mcp"})
+
+    result = asyncio.run(_test())
+
+    assert result == "shutdown"
+    construct.assert_not_called()
