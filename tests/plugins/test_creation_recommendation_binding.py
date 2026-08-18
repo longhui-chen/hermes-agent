@@ -406,33 +406,31 @@ def test_pending_receipt_key_is_bounded_for_oversized_turn_ids():
 
 
 # 卡片的 title / reason 里合法地含一个 `}`（"JSON {schema}" 这种）时，按花括号
-# 定界的非贪婪正则会在字符串内部就收尾，解出来的是残片——那张完全合法的卡片
-# 因此点不动。
-def test_action_envelope_survives_a_right_brace_inside_a_string_field():
+# 定界的非贪婪正则会在字符串内部就收尾，解出来的是残片。
+#
+# 直接测正则而不是走整条 _on_pre_llm_call：结构化解析失败时会退到「卡片名字
+# 出现在消息里就算数」的 legacy 分支，端到端断言会被那条兜底掩盖成绿的。
+def test_recommendation_response_envelope_tolerates_a_right_brace_in_a_string():
     plugin = _load_plugin()
-    payload = _show_card(plugin, "brace-title")
-    payload = dict(payload)
-    payload["title"] = "解析 JSON {schema} 的助手"
-    # 卡片状态里存的 title 也要跟着换，否则动作会因名字对不上被判无效。
-    state_key = plugin._session_key({"session_id": "brace-title", "sender_id": "owner-a"})
-    with plugin._state_lock:
-        state = plugin._session_states[state_key]
-        state["last_proposal"]["suggested_name"] = payload["title"]
-        state["last_candidate"]["suggested_name"] = payload["title"]
-
-    result = plugin._on_pre_llm_call(
-        session_id="brace-title",
-        sender_id="owner-a",
-        turn_id="brace-turn",
-        user_message=_action(payload),
-        conversation_history=[],
-        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    payload = {
+        "version": 1,
+        "type": "creation_recommendation_response",
+        "action": "create",
+        "proposal_id": "proposal-brace",
+        "creation_type": "agent",
+        "title": "解析 JSON {schema} 的助手",
+    }
+    text = (
+        "[creation_recommendation_response]"
+        + json.dumps(payload, ensure_ascii=False)
+        + "[/creation_recommendation_response]"
     )
 
-    # 断言必须是正向的「真的接管了」。写成「没有 invalid or expired」会在信封
-    # 压根没被识别时也通过——那时走的是普通聊天分支，什么都不返回。
-    assert result is not None
-    assert "agent-creator" in result["context"]
+    match = plugin._RECOMMENDATION_RESPONSE_RE.search(text)
+    assert match is not None
+    decoded = json.loads(match.group(1))
+    assert decoded["title"] == "解析 JSON {schema} 的助手"
+    assert decoded["proposal_id"] == "proposal-brace"
 
 
 # 动作信封挂在消息末尾，Web 会在它前面放一段给模型看的动作说明文案。文案一长
@@ -454,9 +452,10 @@ def test_action_envelope_survives_a_long_leading_instruction():
         creation_action_receipt_transport=RECEIPT_TRANSPORT,
     )
 
-    # 同上：正向断言。信封被截掉时这一轮会退化成普通聊天，负向断言照样通过。
+    # 同上：断言精确到接管本身。信封被截掉时这一轮退化成普通聊天，而 carry
+    # context 里照样有路由名，宽松断言会假绿。
     assert result is not None
-    assert "agent-creator" in result["context"]
+    assert "The user accepted the previous recommendation" in result["context"]
 
 
 def test_bounded_user_message_keeps_the_trailing_envelope():
