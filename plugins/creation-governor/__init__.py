@@ -678,6 +678,25 @@ DENIED_CREATION_TOOL_ACTIONS = {
 }
 MAX_DENIED_CREATION_TURNS = 256
 _denied_creation_turns: "OrderedDict[str, bool]" = OrderedDict()
+# 同一个 turn_id 上已经有一次动作被真正接管。双击或传输重发会让两个并发请求
+# 复用同一个 turn_id：先到的原子消费掉 proposal 拿到 accepted，后到的因为
+# proposal 已被消费而落 deny——闸门只按 turn_id 记的话，会把先到那个请求真实
+# 的创建也挡掉，客户端收到 accepted、资源却没建出来。接管优先于拒绝。
+_accepted_creation_turns: "OrderedDict[str, bool]" = OrderedDict()
+
+
+def _mark_creation_turn_accepted(turn_id: str) -> None:
+    key = _pending_turn_key(turn_id)
+    if not key:
+        return
+    with _state_lock:
+        _accepted_creation_turns[key] = True
+        _accepted_creation_turns.move_to_end(key)
+        while len(_accepted_creation_turns) > MAX_DENIED_CREATION_TURNS:
+            _accepted_creation_turns.popitem(last=False)
+        # 接管可能比拒绝后到（两个并发请求的顺序不受控），此时要把已经落下的
+        # 闸门撤掉，而不是让它挡住这次真实的创建。
+        _denied_creation_turns.pop(key, None)
 
 
 def _deny_creation_tools_for_turn(turn_id: str) -> None:
@@ -685,6 +704,8 @@ def _deny_creation_tools_for_turn(turn_id: str) -> None:
     if not key:
         return
     with _state_lock:
+        if key in _accepted_creation_turns:
+            return
         _denied_creation_turns[key] = True
         _denied_creation_turns.move_to_end(key)
         while len(_denied_creation_turns) > MAX_DENIED_CREATION_TURNS:
@@ -697,6 +718,7 @@ def _release_creation_deny(turn_id: str) -> None:
         return
     with _state_lock:
         _denied_creation_turns.pop(key, None)
+        _accepted_creation_turns.pop(key, None)
 
 
 def _creation_tools_denied(turn_id: str) -> bool:
@@ -1950,6 +1972,10 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                 "recommendation action. Do not create anything from it and do not expose this block.]"
             )
         outcome = _handle_previous_proposal_action(session_id, user_message, now)
+        if outcome.receipt is not None and outcome.receipt.status == "accepted":
+            # 这一轮真的接管了动作。记下来，好让同 turn_id 的并发请求（双击 /
+            # 传输重发）落下的拒绝闸门不会把这次真实的创建挡掉。
+            _mark_creation_turn_accepted(outer_turn_id)
         if outcome.receipt is not None and receipt_transport:
             with _state_lock:
                 state = _state_locked(session_id, now)
