@@ -154,7 +154,7 @@ def cron_attached_skills() -> tuple[str, ...]:
 # fixed name here would make every app whose write operation isn't literally
 # named "data.import" fail every single round (the mirror-image bug this
 # ledger exists to prevent: false failure instead of false success). Not part
-# of _VAR_MAP: like _BUSINESS_EXECUTION_TOKEN, this must never mirror into
+# of _VAR_MAP: like _HARDWARE_EXECUTION_TOKEN, this must never mirror into
 # os.environ or forward to generic terminal/plugin/model-driving subprocesses,
 # and it must stay absent (not merely empty) for interactive turns that never
 # push a scope, so app_host's call() two-layer status is completely untouched.
@@ -225,11 +225,11 @@ _BUSINESS_EXECUTION_ACTION_VERSION: ContextVar = ContextVar(
     "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
     default=_UNSET,
 )
-# Legacy-named capability retained only for hardware skills such as camsnap.
+# Dedicated capability retained only for hardware skills such as camsnap.
 # It stays outside _VAR_MAP so generic subprocesses cannot inherit it, and it
 # must never be used as a fallback for the ActionV1 video path.
 _HARDWARE_EXECUTION_TOKEN: ContextVar = ContextVar(
-    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
     default=_UNSET,
 )
 # Stable caller session bound alongside an ActionV1 receipt. It stays

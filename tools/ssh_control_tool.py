@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from agent.secret_scope import get_secret
-from gateway.session_context import business_execution_token, get_session_env
+from gateway.session_context import get_session_env, hardware_execution_token
 from tools.registry import registry
 
 _MAX_RESPONSE_BYTES = 1 << 20
@@ -98,7 +98,7 @@ def _session_value(name: str) -> str:
 
 def _runtime_context() -> tuple[str, str, str, str]:
     action_token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
-    execution_token = str(business_execution_token() or "").strip()
+    execution_token = str(hardware_execution_token() or "").strip()
     session_id = _session_value("HERMES_SESSION_ID") or _session_value("HERMES_SESSION_KEY")
     turn_id = _session_value("HERMES_TURN_ID")
     return action_token, execution_token, session_id, turn_id
@@ -162,7 +162,7 @@ def ssh_control_tool(args: dict[str, Any], **_: Any) -> str:
                 headers={
                     "Content-Type": "application/json",
                     "X-Zettlab-Agent-Action-Token": action_token,
-                    "X-Zettlab-Business-Execution-Token": execution_token,
+                    "X-Zettlab-Hardware-Execution-Token": execution_token,
                     "X-Hermes-Session-Id": session_id,
                     "X-Hermes-Turn-Id": turn_id,
                 },

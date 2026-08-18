@@ -485,7 +485,7 @@ description: Trusted video-edit execution flow test
                 assert "ZETTLAB_AGENT_ACTION_TOKEN" not in runtime_env
                 assert runtime_env["ZETTLAB_BUSINESS_EXECUTION_ACTION"] == "a" * 64
                 assert runtime_env["ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION"] == "1"
-                assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in runtime_env
+                assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in runtime_env
                 assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
                 assert (
                     runtime_env["HERMES_SESSION_KEY"]
@@ -1972,7 +1972,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
             assert frozen == {
                 "ZET_AGENT_ID": "main",
                 "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token:camera/v2",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "b" * 64,
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN": "b" * 64,
                 "HERMES_TURN_ID": "camera-turn",
                 "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
                 "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",

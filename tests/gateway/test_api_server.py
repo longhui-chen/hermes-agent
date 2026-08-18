@@ -3612,7 +3612,7 @@ class TestCORS:
         assert "x-zettlab-business-execution-action" not in allowed
         assert "x-zettlab-business-execution-action-version" not in allowed
 
-    def test_cors_headers_allow_camera_business_execution_token_unit(self):
+    def test_cors_headers_reject_hardware_execution_token_unit(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         headers = adapter._cors_headers_for_origin("http://localhost:3000")
         assert headers is not None
@@ -3620,7 +3620,8 @@ class TestCORS:
             value.strip().lower()
             for value in headers["Access-Control-Allow-Headers"].split(",")
         }
-        assert "x-zettlab-business-execution-token" in allowed
+        assert "x-zettlab-hardware-execution-token" not in allowed
+        assert "x-zettlab-business-execution-token" not in allowed
 
     def test_cors_headers_for_origin_rejects_unknown_origin(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -3715,7 +3716,7 @@ class TestCORS:
             assert "x-zettlab-agent-action-token" not in allowed
 
     @pytest.mark.asyncio
-    async def test_cors_camera_business_execution_token_preflight_is_granted(self):
+    async def test_cors_hardware_execution_token_preflight_is_not_granted(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3725,7 +3726,7 @@ class TestCORS:
                     "Origin": "http://localhost:3000",
                     "Access-Control-Request-Method": "POST",
                     "Access-Control-Request-Headers": (
-                        "Content-Type, X-Zettlab-Business-Execution-Token"
+                        "Content-Type, X-Zettlab-Hardware-Execution-Token"
                     ),
                 },
             )
@@ -3737,7 +3738,8 @@ class TestCORS:
                     "",
                 ).split(",")
             }
-            assert "x-zettlab-business-execution-token" in allowed
+            assert "x-zettlab-hardware-execution-token" not in allowed
+            assert "x-zettlab-business-execution-token" not in allowed
 
     @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):
@@ -4909,12 +4911,12 @@ def test_action_v1_parser_accepts_only_fixed_header_pair():
 
 def test_hardware_execution_token_parser_accepts_only_fixed_opaque_header():
     request = types.SimpleNamespace(
-        headers={"X-Zettlab-Business-Execution-Token": "b" * 64}
+        headers={"X-Zettlab-Hardware-Execution-Token": "b" * 64}
     )
     assert api_server_module._extract_hardware_execution_token(request) == "b" * 64
     assert api_server_module._extract_hardware_execution_token(
         types.SimpleNamespace(
-            headers={"X-Zettlab-Business-Execution-Token": "not-a-token"}
+            headers={"X-Zettlab-Hardware-Execution-Token": "not-a-token"}
         )
     ) == ""
 
@@ -4942,7 +4944,7 @@ async def test_hardware_execution_token_relays_opaquely_to_agent(auth_adapter):
                 },
                 headers={
                     "Authorization": "Bearer sk-secret",
-                    "X-Zettlab-Business-Execution-Token": "b" * 64,
+                    "X-Zettlab-Hardware-Execution-Token": "b" * 64,
                 },
             )
 

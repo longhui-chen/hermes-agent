@@ -770,7 +770,7 @@ def trusted_camera_runtime_receipt() -> Mapping[str, str]:
     return {
         "ZET_AGENT_ID": receipt.agent_id,
         "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": receipt.hardware_execution_token,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": receipt.hardware_execution_token,
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
     }

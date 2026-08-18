@@ -6510,7 +6510,7 @@ def _run_camera_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())
@@ -6606,7 +6606,7 @@ def _run_printer3d_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())

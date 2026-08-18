@@ -291,7 +291,7 @@ def test_make_run_env_keeps_profile_scoped_connector_runtime_out_of_popen_env(mo
         "ZETTLAB_CONNECTORS_AUTH_TOKEN": "main-token",
         "ZET_AGENT_ID": "main",
         "ZETTLAB_AGENT_ACTION_TOKEN": "main-action",
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "main-business",
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": "main-hardware",
     })
     try:
         env = _make_run_env({
@@ -493,7 +493,7 @@ def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
     ss.set_multiplex_active(True)
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "foreign-action")
-    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "foreign-business")
+    monkeypatch.setenv("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "foreign-hardware")
     monkeypatch.setenv("ZETTLAB_EXECUTION_SCOPE_DIGEST", "f" * 64)
     token = ss.set_secret_scope({
         "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=main",
@@ -510,7 +510,7 @@ def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
     assert env["ZETTLAB_CONNECTORS_URL"].endswith("agent_id=main")
     assert env["ZET_AGENT_ID"] == "main"
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
-    assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in env
+    assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in env
     assert "ZETTLAB_EXECUTION_SCOPE_DIGEST" not in env
 
 
@@ -524,7 +524,7 @@ def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "single-connector")
     monkeypatch.setenv("ZET_AGENT_ID", "single-agent")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "stale-action")
-    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "stale-business")
+    monkeypatch.setenv("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "stale-hardware")
     monkeypatch.setenv("ZETTLAB_EXECUTION_SCOPE_DIGEST", "e" * 64)
 
     env = build_connector_runtime_env()
@@ -533,7 +533,7 @@ def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
     assert env["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "single-connector"
     assert env["ZET_AGENT_ID"] == "single-agent"
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
-    assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in env
+    assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in env
     assert "ZETTLAB_EXECUTION_SCOPE_DIGEST" not in env
 
 

@@ -628,7 +628,7 @@ _ACTION_VERSION = "1"
 _ACTION_HEADER = "X-Zettlab-Business-Execution-Action"
 _ACTION_VERSION_HEADER = "X-Zettlab-Business-Execution-Action-Version"
 _ACTION_RE = re.compile(r"[0-9a-f]{64}")
-_HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Business-Execution-Token"
+_HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
 
 
 def _extract_business_execution_action(request: Any) -> Optional[Dict[str, str]]:
@@ -645,7 +645,7 @@ def _extract_business_execution_action(request: Any) -> Optional[Dict[str, str]]
 
 
 def _extract_hardware_execution_token(request: Any) -> str:
-    """Relay the legacy-named capability only to trusted hardware helpers."""
+    """Relay the dedicated capability only to trusted hardware helpers."""
     if request is None:
         return ""
     token = str(
@@ -1750,16 +1750,14 @@ class ResponseStore:
 # CORS middleware
 # ---------------------------------------------------------------------------
 
-# ActionV1 headers and X-Zettlab-Agent-Action-Token are intentionally absent.
-# They are loopback capability transport, not a browser/App contract; omission
-# makes browser preflight fail closed even for an allowed origin.
+# ActionV1, HardwareExecutionToken, and X-Zettlab-Agent-Action-Token headers are
+# intentionally absent. They are loopback capability transport, not a
+# browser/App contract; omission makes browser preflight fail closed even for
+# an allowed origin.
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": (
-        "Authorization, Content-Type, Idempotency-Key, "
-        "X-Zettlab-Business-Execution-Token"
-    ),
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
 }
 
 

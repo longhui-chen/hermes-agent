@@ -14,7 +14,7 @@ from tools.environments.local import build_printer3d_runtime_env
 
 
 ACTION_TOKEN = "a" * 64
-BUSINESS_TOKEN = "b" * 64
+HARDWARE_TOKEN = "b" * 64
 
 
 @pytest.fixture(autouse=True)
@@ -42,9 +42,9 @@ def _write_runtime(tmp_path: Path, *, control: bool) -> Path:
         print(json.dumps({
             "argv": sys.argv[1:],
             "action": secret("ZETTLAB_AGENT_ACTION_TOKEN"),
-            "business": secret("ZETTLAB_BUSINESS_EXECUTION_TOKEN"),
+            "hardware": secret("ZETTLAB_HARDWARE_EXECUTION_TOKEN"),
             "action_plain": os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
-            "business_plain": os.environ.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
+            "hardware_plain": os.environ.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", ""),
         }))
     """).lstrip(), encoding="utf-8")
     manifest = root / "skills" / skill_id / "manifest.yaml"
@@ -67,7 +67,7 @@ def _bind_receipt():
     session_tokens = set_session_vars(session_key="zettlab:owner-1:agent-1:stable", session_id="session-1")
     turn_tokens = set_turn_vars(
         turn_id="turn-1",
-        hardware_execution_token=BUSINESS_TOKEN,
+        hardware_execution_token=HARDWARE_TOKEN,
     )
     turn_identity = response_mode._current_skill_direct_turn_identity()
     assert turn_identity is not None
@@ -141,11 +141,11 @@ def test_printer3d_runtime_direct_runner_uses_private_fds(monkeypatch, tmp_path)
         _clear_receipt(tokens)
     assert result["printer3d_runtime_direct"] is True
     assert result["exit_code"] == 0
-    assert ACTION_TOKEN not in result["output"] and BUSINESS_TOKEN not in result["output"]
+    assert ACTION_TOKEN not in result["output"] and HARDWARE_TOKEN not in result["output"]
     payload = json.loads(result["output"])
     assert payload["argv"] == ["pause", "--printer-id", "printer-1", "--idempotency-key", "idem-1"]
-    assert payload["action"] == "[REDACTED]" and payload["business"] == "[REDACTED]"
-    assert payload["action_plain"] == "" and payload["business_plain"] == ""
+    assert payload["action"] == "[REDACTED]" and payload["hardware"] == "[REDACTED]"
+    assert payload["action_plain"] == "" and payload["hardware_plain"] == ""
 
 
 def test_printer3d_runtime_rejects_untrusted_manifest(monkeypatch, tmp_path):

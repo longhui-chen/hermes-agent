@@ -506,22 +506,18 @@ def _session_key():
 
 
 def _execution_headers():
-    """Forward server-issued execution context; model arguments never shape it."""
+    """Forward AppHost-owned request correlation; model arguments never shape it."""
     try:
         from gateway.session_context import (
-            business_execution_token,
             current_turn_identity,
             get_session_env,
         )
-        token = str(business_execution_token() or "").strip()
         identity = current_turn_identity()
         turn_id = identity[0] if identity else ""
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
     except Exception:
         return {}
     headers = {}
-    if token:
-        headers["X-Zettlab-Business-Execution-Token"] = token
     if turn_id:
         headers["X-Hermes-Turn-Id"] = str(turn_id)
     if session_id:
@@ -552,7 +548,6 @@ def _auto_refresh_scope_token(action, body, execution_headers):
         return None
 
     required_execution_headers = {
-        "X-Zettlab-Business-Execution-Token",
         "X-Hermes-Turn-Id",
         "X-Hermes-Session-Id",
     }

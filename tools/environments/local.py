@@ -2132,16 +2132,22 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
-VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    # Current ActionV1 plus retired video authorization keys. Generic
-    # subprocesses must never inherit either current or stale capability data.
+RETIRED_BUSINESS_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
+    # Scrub-only compatibility fence. No runtime may read or emit these retired
+    # generic authorization values, but a stale parent environment must not leak
+    # them into a model-authored subprocess either.
     "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
     "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
     "ZETTLAB_BUSINESS_EXECUTION_MODE",
     "ZETTLAB_EXECUTION_SCOPE_DIGEST",
     "ZETTLAB_EXECUTION_REQUEST_DIGEST",
+})
+VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_BUSINESS_EXECUTION_ACTION",
     "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
+})
+HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -2158,7 +2164,9 @@ _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
+    | RETIRED_BUSINESS_EXECUTION_ENV_KEYS
     | VIDEO_EDIT_RUNTIME_ENV_KEYS
+    | HARDWARE_RUNTIME_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
     | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
 )
@@ -2366,8 +2374,8 @@ def build_camera_runtime_env() -> dict[str, str]:
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
             frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
         ).strip(),
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": str(
-            frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "") or ""
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(
+            frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or ""
         ).strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
@@ -2377,7 +2385,7 @@ def build_camera_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
@@ -2404,7 +2412,7 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "") or "").strip(),
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
@@ -2412,7 +2420,7 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,

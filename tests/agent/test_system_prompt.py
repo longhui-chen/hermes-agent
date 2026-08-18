@@ -130,19 +130,19 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
-def test_silent_automation_does_not_scan_or_emit_full_skill_index():
+def test_silent_automation_keeps_the_normal_skill_index_available():
     agent = _make_agent(
         valid_tool_names={"skill_view"},
         _zet_agent_execution_policy="silent_automation",
     )
     with patch(
         "run_agent.build_skills_system_prompt",
-        side_effect=AssertionError("silent turns must not scan the Skill index"),
-    ):
+        return_value="<available_skills>signed-index</available_skills>",
+    ) as build_skills:
         stable = _stable_prompt(agent)
 
-    assert "## Skills (mandatory)" not in stable
-    assert "<available_skills>" not in stable
+    build_skills.assert_called_once()
+    assert "<available_skills>signed-index</available_skills>" in stable
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
