@@ -188,6 +188,26 @@ def test_bodyless_old_server_404_fails_closed_without_fallback(monkeypatch):
     assert output["status"] == 404
 
 
+def test_list_404_on_older_server_degrades_to_a_usable_path(monkeypatch):
+    # 部署顺序问题：Hermes 先于 App Host 上线时，只有 list 这个新路由会 404，
+    # 而 status / read / apply_patch / build / publish 在旧服务端上照常可用。
+    # 若也回「尚不支持 App Workspace」，维护者会把一个路由缺失读成整个工作区
+    # 不可用而放弃整轮维护——工具说明里还写着「先 list 再 read」，它更没有理由
+    # 继续。所以这一档必须单独降级，并且要给出可以照做的替代路径。
+    error = urllib.error.HTTPError(_BASE + "/x", 404, "not found", {}, io.BytesIO(b"404 page not found"))
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", side_effect=error):
+        output = json.loads(app_workspace_tool(_args("list")))
+    assert output["ok"] is False
+    assert output["status"] == 404
+    message = output["error"]["message"]
+    assert "其它动作照常可用" in message, "不能让维护者以为整个工作区不可用"
+    assert "static/index.html" in message and "main.go" in message, "必须给出可以直接照做的替代路径"
+    # 其它动作的 404 仍然是「整个 App Workspace 不支持」，语义不能被这次改动冲淡
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", side_effect=error):
+        other = json.loads(app_workspace_tool(_args("checkout")))
+    assert "其它动作照常可用" not in other["error"]["message"]
+
+
 def test_workspace_rejects_wrong_success_status(monkeypatch):
     with mux_profile_scope(monkeypatch, _SCOPE), patch(
         "tools.app_workspace_tool._apphost._urlopen", _capture({}, _Response({"checked_out": True}, status=202))

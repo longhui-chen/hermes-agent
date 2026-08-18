@@ -330,6 +330,7 @@ def app_workspace_tool(args, **_kw) -> str:
     except _apphost._BadRequest as exc:
         return _bad_request(str(exc))
 
+    action = args.get("action")
     base = _apphost._base_url()
     token = _apphost._secret("ZETTLAB_AGENT_ACTION_TOKEN")
     if not base or not token:
@@ -351,6 +352,20 @@ def app_workspace_tool(args, **_kw) -> str:
         if upstream is not None:
             return _apphost._fail(upstream, status=exc.code)
         if exc.code == 404:
+            # list 是这一批里唯一的新路由：Hermes 先于 App Host 部署时，只有它
+            # 会撞 404，而 status / read / apply_patch / build / publish 在旧
+            # 服务端上全都照常可用。若也回「尚不支持 App Workspace」，维护者会
+            # 把一个路由缺失读成整个工作区不可用而放弃整轮维护——工具说明里还
+            # 写着「先 list 再 read」，它更没有理由继续。所以这一档单独降级，
+            # 并直接告诉它替代走法。
+            if action == "list":
+                return _apphost._local_error(
+                    "unsupported",
+                    "这台设备的 App Host 版本还没有列文件能力；工作区的其它动作照常可用，"
+                    "请直接按生成应用的常规布局读取：页面 static/index.html、后端 main.go、"
+                    "建表 migrations/ 下的 .sql；某个路径读不到只说明它不存在，换一个再读。",
+                    status=exc.code,
+                )
             return _apphost._local_error(
                 "unsupported",
                 "设备端 App Host 尚不支持 App Workspace；没有安全的兼容路径",
@@ -361,7 +376,6 @@ def app_workspace_tool(args, **_kw) -> str:
         return _apphost._local_error("transport_error", "无法连接 App Workspace 服务", status=None)
     if len(raw) > _MAX_RESPONSE_BYTES:
         return _apphost._local_error("transport_error", "App Workspace 返回内容过大", status=status)
-    action = args.get("action")
     if action in {"apply_patch", "discard", "delete_maintenance_task"}:
         if status == 204 and not raw:
             return _apphost._ok({})
