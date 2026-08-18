@@ -31,3 +31,38 @@ def test_silent_automation_skips_llm_middleware(monkeypatch):
         )
     finally:
         clear_turn_vars(tokens)
+
+
+def test_silent_automation_skips_tool_request_and_execution_middleware(monkeypatch):
+    args = {"command": "trusted-helper"}
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("silent turn reached tool middleware or relay")
+
+    monkeypatch.setattr(middleware, "_has_middleware", unexpected)
+    monkeypatch.setattr(middleware, "_get_middleware_callbacks", unexpected)
+    from agent import relay_runtime
+
+    monkeypatch.setattr(relay_runtime, "apply_tool_request_intercepts", unexpected)
+
+    tokens = set_turn_vars(
+        turn_id="silent-tool-middleware-turn",
+        execution_policy="silent_automation",
+    )
+    try:
+        request_result = middleware.apply_tool_request_middleware(
+            "terminal", args, session_id="session-1"
+        )
+        assert request_result.payload is args
+        assert request_result.original_payload is args
+        assert request_result.changed is False
+        assert request_result.trace == []
+
+        assert (
+            middleware.run_tool_execution_middleware(
+                "terminal", args, lambda payload: ("tool", payload)
+            )
+            == ("tool", args)
+        )
+    finally:
+        clear_turn_vars(tokens)

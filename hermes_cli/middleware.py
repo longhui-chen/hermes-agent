@@ -136,6 +136,14 @@ def apply_tool_request_middleware(
     Middleware may return ``{"args": {...}}`` to replace the effective tool
     arguments before hooks, guardrails, approvals, and execution see them.
     """
+    if not generic_lifecycle_hooks_allowed():
+        return RequestMiddlewareResult(
+            payload=args,
+            original_payload=args,
+            changed=False,
+            trace=[],
+        )
+
     original_args = _safe_copy(args)
     current_args = _safe_copy(original_args)
     trace: List[Dict[str, Any]] = []
@@ -221,6 +229,8 @@ def run_tool_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run tool execution through registered tool execution middleware."""
+    if not generic_lifecycle_hooks_allowed():
+        return next_call(args)
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(args)

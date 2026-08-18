@@ -192,8 +192,13 @@ def test_zpk_uv_config_matches_locked_resolver_policy() -> None:
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         project_uv = tomllib.load(handle)["tool"]["uv"]
 
-    assert zpk_uv["exclude-newer"] == project_uv["exclude-newer"]
-    assert zpk_uv["exclude-newer-package"] == project_uv["exclude-newer-package"]
+    # uv 0.7.x accepts an absolute RFC3339 cutoff, but not relative durations
+    # or the later per-package config table. The lockfile already pins the
+    # exceptional packages, so the unsupported table is unnecessary here.
+    assert zpk_uv["exclude-newer"] == "2026-08-04T00:00:00Z"
+    assert project_uv["exclude-newer"] == zpk_uv["exclude-newer"]
+    assert "exclude-newer-package" not in zpk_uv
+    assert "exclude-newer-package" not in project_uv
 
 
 def test_zpk_payload_checker_covers_deep_memory_runtime() -> None:
