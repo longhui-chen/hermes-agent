@@ -46,18 +46,32 @@ def resolve_canonical_document(path: str | os.PathLike[str]) -> Path:
         raise CanonicalDocumentUnavailable(str(source)) from exc
 
     # The runtime contract is deliberately narrower than "any Markdown path":
-    # canonical artifacts always end in .doc/content.md.  Do not turn a
-    # user-controlled xattr into an arbitrary-file indirection primitive.
+    #
+    #   <base>/.cache/<fs>/<aa>/<bb>/<file-id>/<mtime>-<size>/.doc/content.md
+    #
+    # The xattr lives on a user-owned source file, so a suffix-only check would
+    # still be an arbitrary-file indirection primitive. Pin the full cache
+    # shape and require the source to live below the same runtime base root.
     if (
         not target.is_absolute()
         or target.name != "content.md"
         or target.parent.name != ".doc"
+        or len(target.parents) < 8
+        or target.parents[6].name != ".cache"
     ):
         raise CanonicalDocumentUnavailable(str(source))
     try:
+        source_real = source.resolve(strict=True)
         target_stat = target.lstat()
-        if not stat.S_ISREG(target_stat.st_mode) or not os.access(target, os.R_OK):
+        target_real = target.resolve(strict=True)
+        cache_root = target.parents[7].resolve(strict=True)
+        source_real.relative_to(cache_root)
+        if (
+            target_real != target
+            or not stat.S_ISREG(target_stat.st_mode)
+            or not os.access(target, os.R_OK)
+        ):
             raise CanonicalDocumentUnavailable(str(source))
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise CanonicalDocumentUnavailable(str(source)) from exc
     return target

@@ -32,8 +32,18 @@ def test_resolve_canonical_document_requires_runtime_pointer(tmp_path, monkeypat
 def test_read_file_reads_canonical_markdown_not_binary_source(tmp_path, monkeypatch):
     source = tmp_path / "report.pdf"
     source.write_bytes(b"%PDF-binary-source")
-    sidecar = tmp_path / ".doc" / "content.md"
-    sidecar.parent.mkdir()
+    sidecar = (
+        tmp_path
+        / ".cache"
+        / "local"
+        / "12"
+        / "34"
+        / "1234"
+        / "1-18"
+        / ".doc"
+        / "content.md"
+    )
+    sidecar.parent.mkdir(parents=True)
     sidecar.write_text("# Canonical\n\nparsed once", encoding="utf-8")
 
     def fake_getxattr(path, key):
@@ -53,6 +63,18 @@ def test_resolve_canonical_document_rejects_arbitrary_markdown_pointer(tmp_path,
     source = tmp_path / "report.pdf"
     source.write_bytes(b"%PDF")
     unrelated = tmp_path / "secrets.md"
+    unrelated.write_text("not a runtime artifact", encoding="utf-8")
+    monkeypatch.setattr(os, "getxattr", lambda *_: os.fsencode(unrelated), raising=False)
+
+    with pytest.raises(CanonicalDocumentUnavailable):
+        resolve_canonical_document(source)
+
+
+def test_resolve_canonical_document_rejects_suffix_only_pointer(tmp_path, monkeypatch):
+    source = tmp_path / "report.pdf"
+    source.write_bytes(b"%PDF")
+    unrelated = tmp_path / "private" / ".doc" / "content.md"
+    unrelated.parent.mkdir(parents=True)
     unrelated.write_text("not a runtime artifact", encoding="utf-8")
     monkeypatch.setattr(os, "getxattr", lambda *_: os.fsencode(unrelated), raising=False)
 
