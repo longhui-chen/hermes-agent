@@ -199,13 +199,38 @@ def test_list_404_on_older_server_degrades_to_a_usable_path(monkeypatch):
         output = json.loads(app_workspace_tool(_args("list")))
     assert output["ok"] is False
     assert output["status"] == 404
+
+    # 复审抓到的要害：**降级必须落在 error.code 上，不能只落在文案上**。上层
+    # skill 按 code 分支（PUBLISH.md 明写 `error.code="unsupported"` = 设备不支持、
+    # 告知用户并停止），沿用 `unsupported` 的话，调用方在读到这段新文案之前就已经
+    # 走完终止路径了，动作级降级等于没做。已有 `publish_unsupported` 这个先例。
+    assert output["error"]["code"] == "list_unsupported", (
+        "list 路由缺失必须有自己的 code，不能跟「整个 App Workspace 不支持」共用 unsupported"
+    )
+
     message = output["error"]["message"]
-    assert "其它动作照常可用" in message, "不能让维护者以为整个工作区不可用"
+    assert "只有列文件这一个动作缺失" in message, "不能让维护者以为整个工作区不可用"
     assert "static/index.html" in message and "main.go" in message, "必须给出可以直接照做的替代路径"
+    # 第二条复审 finding：这几条路径只对本 skill 生成的应用成立。blueprint 应用或
+    # 用户自己调过目录结构时它们可能都不在，文案不能把它们说成确定答案——否则维护者
+    # 三条都读不到，又受「never guess a pathname」约束，仍会判定源码找不到而放弃。
+    assert "候选" in message, "必须说明这几条路径只是生成应用的候选，不是确定答案"
+    assert "不适用于这台设备" in message, "必须解除「先 list 再 read」的约束，否则维护者无路可走"
+
     # 其它动作的 404 仍然是「整个 App Workspace 不支持」，语义不能被这次改动冲淡
     with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", side_effect=error):
         other = json.loads(app_workspace_tool(_args("checkout")))
-    assert "其它动作照常可用" not in other["error"]["message"]
+    assert other["error"]["code"] == "unsupported"
+    assert "只有列文件这一个动作缺失" not in other["error"]["message"]
+
+
+def test_tool_description_tells_the_maintainer_how_to_recover_from_list_unsupported(monkeypatch):
+    # 工具说明里写着「never guess a pathname」。若不在同一处说明 list_unsupported
+    # 是唯一例外，维护者会在旧服务端上被自己的工具说明锁死：既拿不到 list，又不
+    # 允许猜路径。约束必须落在它实际生效的那份文本里。
+    description = APP_WORKSPACE_SCHEMA["description"]
+    assert "list_unsupported" in description
+    assert "guess pathnames" in description
 
 
 def test_workspace_rejects_wrong_success_status(monkeypatch):

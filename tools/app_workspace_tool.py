@@ -48,7 +48,11 @@ APP_WORKSPACE_SCHEMA = {
         "pathname. A generated app keeps its page source at static/index.html, "
         "its server code in main.go and any schema in migrations/, but list is "
         "the authority; a read that comes back absent means your path was "
-        "wrong, not that the app lacks that kind of source."
+        "wrong, not that the app lacks that kind of source. The one exception: "
+        "if list itself fails with error.code list_unsupported, this device's "
+        "App Host predates the list route — every other action still works, so "
+        "fall back to probing with read and do guess pathnames there; that "
+        "error is never evidence the app or its source is missing."
     ),
     "parameters": {
         "type": "object",
@@ -360,10 +364,15 @@ def app_workspace_tool(args, **_kw) -> str:
             # 并直接告诉它替代走法。
             if action == "list":
                 return _apphost._local_error(
-                    "unsupported",
-                    "这台设备的 App Host 版本还没有列文件能力；工作区的其它动作照常可用，"
-                    "请直接按生成应用的常规布局读取：页面 static/index.html、后端 main.go、"
-                    "建表 migrations/ 下的 .sql；某个路径读不到只说明它不存在，换一个再读。",
+                    "list_unsupported",
+                    "这台设备的 App Host 版本还没有列文件能力。**只有列文件这一个动作缺失**，"
+                    "status / read / apply_patch / build / publish 全都照常可用，工作区也已经检出，"
+                    "不要据此判断应用不存在、源码找不到或维护无法继续。"
+                    "改用逐个 read 探路：若这是本 skill 生成的应用，先试 static/index.html（页面）、"
+                    "main.go（后端）、migrations/ 下的 .sql（建表）——这几条只是生成应用的**候选**，"
+                    "blueprint 应用或用户自己调整过目录结构时它们可能都不在。任何一个路径 read 不到，"
+                    "只说明这个文件不存在，换一个继续试；这种情况下允许按应用类型推测路径，"
+                    "「先 list 再 read」那条要求不适用于这台设备。",
                     status=exc.code,
                 )
             return _apphost._local_error(
