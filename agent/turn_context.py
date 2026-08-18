@@ -359,16 +359,21 @@ def build_turn_context(
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
-    agent._creation_governor_conversation_session_id = (
-        getattr(agent, "_gateway_session_key", None) or agent.session_id
-    )
-
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
     # belong to the canonical child, including observability metadata.
     recovered_history = recover_rotated_compression_session(agent)
     if recovered_history is not None:
         conversation_history = recovered_history
+
+    # governor 的会话作用域必须跟这一轮最终生效的 session 一致，所以绑定在恢复
+    # 之后。压缩旋转恢复会把 agent.session_id 换成 canonical child，而响应头回给
+    # 客户端的也是它；在恢复之前绑定，推荐卡就存进了父 scope，客户端照响应头提交
+    # 动作时 governor 在子 scope 里找不到刚展示的 proposal，只能拒绝——那张卡从此
+    # 点不动。显式的 gateway key 不受影响：它本来就是调用方指定的稳定作用域。
+    agent._creation_governor_conversation_session_id = (
+        getattr(agent, "_gateway_session_key", None) or agent.session_id
+    )
 
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
