@@ -5011,15 +5011,7 @@ async def test_action_v1_silent_turn_strips_all_chat_context_before_agent_work(
                         {"role": "assistant", "content": "private prior reply"},
                         {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": "run frozen manifest"},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": "data:image/png;base64,iVBORw0KGgo="
-                                    },
-                                },
-                            ],
+                            "content": "run frozen manifest",
                         },
                     ],
                     "stream": False,
@@ -5047,6 +5039,65 @@ async def test_action_v1_silent_turn_strips_all_chat_context_before_agent_work(
     assert kwargs["business_execution_action"] == action
     assert kwargs["business_execution_action_version"] == "1"
     assert kwargs["execution_policy"] == "silent_automation"
+
+
+@pytest.mark.asyncio
+async def test_action_v1_silent_turn_rejects_multimodal_input_before_agent_work(
+    auth_adapter,
+):
+    action = "a" * 64
+    app = _create_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        with (
+            patch.object(
+                auth_adapter,
+                "_ensure_session_db_async",
+                new_callable=AsyncMock,
+            ) as ensure_session_db,
+            patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as run_agent,
+        ):
+            response = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "run frozen manifest"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": "data:image/png;base64,iVBORw0KGgo="
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                    "stream": False,
+                    "metadata": {
+                        "execution_policy": "silent_automation",
+                        "turn_id": "pvm-" + "a" * 24,
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "silent-multimodal",
+                    "X-Zettlab-Business-Execution-Action": action,
+                    "X-Zettlab-Business-Execution-Action-Version": "1",
+                },
+            )
+            payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "silent_automation_multimodal_unsupported"
+    assert payload["error"]["param"] == "messages[0].content"
+    ensure_session_db.assert_not_awaited()
+    run_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

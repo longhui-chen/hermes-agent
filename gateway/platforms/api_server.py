@@ -848,6 +848,17 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _content_has_image_payload(content: Any) -> bool:
+    """Return whether normalized content carries an image attachment."""
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _IMAGE_PART_TYPES
+        for part in content
+    )
+
+
 def _extract_current_turn_reference_image(content: Any) -> str:
     """Return one bounded data image from the current normalized user turn.
 
@@ -5421,6 +5432,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
+                if requested_silent_automation and _content_has_image_payload(content):
+                    return web.json_response(
+                        _openai_error(
+                            "silent_automation does not accept multimodal input",
+                            param=f"messages[{idx}].content",
+                            code="silent_automation_multimodal_unsupported",
+                        ),
+                        status=400,
+                    )
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
