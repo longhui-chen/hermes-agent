@@ -1835,6 +1835,7 @@ registry.register(
 _skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
 _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
+_TRUSTED_SKILL_ATTESTATION_FIELD = "_zet_agent_trusted_skill_attestation"
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
     "Skill content unchanged since it was loaded earlier in this "
@@ -1859,6 +1860,13 @@ def _skill_view_fingerprint(payload: dict) -> tuple | None:
 def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
     """Record a served skill_view so an identical repeat can be deduped."""
     if not task_id:
+        return
+    # Trusted execution proofs are one-shot and bound to the current user turn.
+    # Reusing an unchanged stub after the proof is consumed (or on a later turn)
+    # would prevent the skill from minting the fresh scope required to execute.
+    # Keep ordinary informational skills deduped, but always re-read any result
+    # that carried a trusted-execution attestation.
+    if payload.get(_TRUSTED_SKILL_ATTESTATION_FIELD):
         return
     # Never dedup setup-needed views: readiness depends on config/env state
     # that can change without the skill file changing, and the model must

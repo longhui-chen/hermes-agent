@@ -339,6 +339,118 @@ def test_transformed_response_is_persisted_for_existing_final_delivery(monkeypat
     assert result["response_transform_suffix"] == proposal
 
 
+def test_hardware_enrollment_intent_is_appended_and_persisted(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent.platform = "zet_agent"
+    agent.api_mode = "chat_completions"
+    messages = [
+        {"role": "user", "content": "帮我连接下摄像头"},
+        {"role": "assistant", "content": "请在连接器页面添加摄像头。"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="请在连接器页面添加摄像头。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="帮我连接下摄像头",
+        original_user_message="帮我连接下摄像头",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["response_transformed"] is True
+    assert result["response_transform_suffix"].startswith(
+        "\n\n```zettlab-hardware-enrollment-intent\n"
+    )
+    assert '"requested_types": [\n    "camera"\n  ]' in result["final_response"]
+    assert result["messages"][-1]["content"] == result["final_response"]
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+
+
+def test_connected_pc_file_result_does_not_append_hardware_enrollment_intent(
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent.platform = "zet_agent"
+    agent.api_mode = "chat_completions"
+    response = "授权目录下共有 38 个条目，其中 30 个文件夹、8 个文件。"
+    messages = [
+        {"role": "user", "content": "查看下硬件连接中的电脑"},
+        {"role": "assistant", "content": response},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=response,
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="查看下硬件连接中的电脑",
+        original_user_message="查看下硬件连接中的电脑",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == response
+    assert "zettlab-hardware-enrollment-intent" not in result["final_response"]
+    assert result["response_transformed"] is False
+    assert agent.persisted_messages[-1]["content"] == response
+
+
+def test_hardware_status_result_removes_stale_enrollment_card_and_persists(
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent.platform = "zet_agent"
+    agent.api_mode = "chat_completions"
+    visible = "摄像头在线；打印机已连接，但当前对话未授权。"
+    response = (
+        visible
+        + "\n\n```zettlab-hardware-enrollment-intent\n"
+        + '{"schema_version":"1","kind":"hardware",'
+        + '"requested_types":["camera","printer3d","pc_node"],'
+        + '"discovery_requested":true}\n```'
+    )
+    messages = [
+        {"role": "user", "content": "检查所有已连接硬件的状态"},
+        {"role": "assistant", "content": response},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=response,
+        api_call_count=4,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="检查所有已连接硬件的状态",
+        original_user_message="检查所有已连接硬件的状态",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == visible
+    assert result["messages"][-1]["content"] == visible
+    assert agent.persisted_messages[-1]["content"] == visible
+    assert "zettlab-hardware-enrollment-intent" not in result["final_response"]
+
+
 def test_transformed_response_survives_cold_session_db_readback(monkeypatch, tmp_path):
     proposal = "\n\n要不要为你生成创建方案？"
 
