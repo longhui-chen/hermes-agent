@@ -503,6 +503,7 @@ def test_accepted_action_survives_a_concurrent_replay_deny():
     )
     assert "invalid or expired" in replay["context"]
 
+    # 一次接管只买一张票：先到那个请求的创建放行……
     assert (
         plugin._on_pre_tool_call(
             tool_name="skill_manage",
@@ -511,6 +512,17 @@ def test_accepted_action_survives_a_concurrent_replay_deny():
         )
         is None
     ), "重放请求落下的闸门挡掉了先到那个请求真实的创建"
+
+    # ……而重放请求的创建必须被挡住。让「接管」全局压过「拒绝」会在这里漏掉，
+    # 那正是重复创建本身。
+    blocked = plugin._on_pre_tool_call(
+        tool_name="skill_manage",
+        args={"action": "create"},
+        turn_id="shared-turn",
+    )
+    assert blocked is not None and blocked["action"] == "block", (
+        "同一轮的第二次创建被放行了——一次 accepted 只应该买一张票"
+    )
 
 
 def test_native_creation_routes_are_explicit_for_each_recommendation_type():
