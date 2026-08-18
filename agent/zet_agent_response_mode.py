@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -102,8 +103,13 @@ _PRINTER3D_INTENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _HARDWARE_ENROLLMENT_FENCE = "zettlab-hardware-enrollment-intent"
+_CONNECTOR_ENROLLMENT_FENCE = "zettlab-connector-enrollment-intent"
 _HARDWARE_ENROLLMENT_BLOCK_RE = re.compile(
     r"\s*```zettlab-hardware-enrollment-intent\s*\r?\n[\s\S]*?\r?\n```",
+    re.IGNORECASE,
+)
+_CONNECTOR_ENROLLMENT_BLOCK_RE = re.compile(
+    r"\s*```zettlab-connector-enrollment-intent\s*\r?\n(?P<payload>[\s\S]*?)\r?\n```",
     re.IGNORECASE,
 )
 _LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE = re.compile(
@@ -158,6 +164,31 @@ _HARDWARE_ENROLLMENT_TYPE_RES = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "tv",
+        re.compile(
+            r"(?:电视|電視|投屏设备|投屏裝置|投屏|tv|television|display|renderer|テレビ|TV|텔레비전)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "voice_terminal",
+        re.compile(
+            r"(?:语音终端|語音終端|麦克风终端|麥克風終端|语音遥控器|語音遙控器|voice\s*terminal|microphone\s*terminal|voice\s*remote)",
+            re.IGNORECASE,
+        ),
+    ),
+)
+_DISCOVERABLE_SUBNET_HARDWARE_TYPES = frozenset({"camera", "tv"})
+_RFC1918_NETWORKS = tuple(
+    ipaddress.ip_network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+_IPV4_SCOPE_RE = re.compile(
+    r"(?<![\d.])(?P<address>(?:\d{1,3}\.){3}\d{1,3})(?:/(?P<prefix>\d{1,2}))?(?![\d.])"
+)
+_CURRENT_PRIVATE_NETWORK_RE = re.compile(
+    r"(?:当前|本机|现在所在的?)(?:局域网|网段|子网)|(?:current|local)\s+(?:private\s+)?(?:network|subnet|lan)\b",
+    re.IGNORECASE,
 )
 _VIDEO_EDIT_POLICY_VIOLATION_RETRIES = 2
 _VIDEO_EDIT_RESUME_TTL_SECONDS = 3 * 60 * 60
@@ -2591,7 +2622,36 @@ def request_response_mode(agent: Any) -> str:
     return "plan" if mode == "plan" else ""
 
 
-def _hardware_enrollment_requested_types(user_message: Any) -> tuple[str, ...]:
+def _private_hardware_discovery_scope(user_message: Any) -> str:
+    """Return one normalized RFC1918 /24-/30 scope from the user message."""
+    task_text, _ = _task_text_and_video_asset(user_message)
+    matches = list(_IPV4_SCOPE_RE.finditer(task_text))
+    if len(matches) != 1:
+        return ""
+    match = matches[0]
+    prefix = match.group("prefix") or "24"
+    try:
+        network = ipaddress.ip_network(
+            f"{match.group('address')}/{prefix}",
+            strict=False,
+        )
+    except ValueError:
+        return ""
+    if (
+        network.version != 4
+        or network.prefixlen < 24
+        or network.prefixlen > 30
+        or not any(network.subnet_of(private) for private in _RFC1918_NETWORKS)
+    ):
+        return ""
+    return str(network)
+
+
+def _hardware_enrollment_requested_types(
+    user_message: Any,
+    *,
+    subnet_scoped: bool = False,
+) -> tuple[str, ...]:
     """Recognize only short, direct hardware enrollment requests.
 
     Skill selection remains the primary semantic path. This bounded classifier
@@ -2622,8 +2682,36 @@ def _hardware_enrollment_requested_types(user_message: Any) -> tuple[str, ...]:
         positioned_types.sort(key=lambda item: item[0])
         return tuple(hardware_type for _, hardware_type in positioned_types)
     if _HARDWARE_ENROLLMENT_GENERIC_RE.search(normalized):
-        return ("camera", "printer3d", "pc_node")
+        if subnet_scoped:
+            return ("camera", "tv")
+        return ("camera", "printer3d", "pc_node", "tv")
     return ()
+
+
+def _strip_model_hardware_enrollment_blocks(text: str) -> str:
+    """Remove hardware-only setup blocks while preserving protocol intents."""
+    stripped = _HARDWARE_ENROLLMENT_BLOCK_RE.sub("", text)
+    stripped = _LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE.sub("", stripped)
+
+    def remove_hardware_v2(match: re.Match[str]) -> str:
+        try:
+            payload = json.loads(match.group("payload"))
+        except (TypeError, ValueError):
+            return match.group(0)
+        if not isinstance(payload, dict) or payload.get("kind") != "connector_enrollment":
+            return match.group(0)
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            return match.group(0)
+        known_hardware = {"camera", "printer3d", "pc_node", "tv", "voice_terminal"}
+        if not all(
+            isinstance(item, dict) and item.get("resource_kind") in known_hardware
+            for item in items
+        ):
+            return match.group(0)
+        return ""
+
+    return _CONNECTOR_ENROLLMENT_BLOCK_RE.sub(remove_hardware_v2, stripped)
 
 
 def ensure_hardware_enrollment_intent(
@@ -2636,7 +2724,7 @@ def ensure_hardware_enrollment_intent(
     interrupted: bool,
     structured_output: bool,
 ) -> str:
-    """Append a canonical, secret-free hardware enrollment intent when needed.
+    """Append one canonical, secret-free connector enrollment intent when needed.
 
     The transform never discovers hardware or accepts addresses/credentials. It
     only gives first-party App/Web clients enough information to render the
@@ -2654,30 +2742,61 @@ def ensure_hardware_enrollment_intent(
         or not text.strip()
     ):
         return text
-    visible_text = _HARDWARE_ENROLLMENT_BLOCK_RE.sub("", text)
-    visible_text = _LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE.sub("", visible_text)
+    visible_text = _strip_model_hardware_enrollment_blocks(text)
     removed_model_intent = visible_text != text
     if removed_model_intent:
         visible_text = visible_text.strip()
-    requested_types = _hardware_enrollment_requested_types(user_message)
+    network_scope = _private_hardware_discovery_scope(user_message)
+    task_text, _ = _task_text_and_video_asset(user_message)
+    current_network = not network_scope and bool(_CURRENT_PRIVATE_NETWORK_RE.search(task_text))
+    if _IPV4_SCOPE_RE.search(task_text) and not network_scope:
+        # An invalid, public, oversized or ambiguous range must not degrade to
+        # broad unscoped discovery.
+        return visible_text if removed_model_intent else text
+    requested_types = _hardware_enrollment_requested_types(
+        user_message,
+        subnet_scoped=bool(network_scope) or current_network,
+    )
+    if requested_types and _CONNECTOR_ENROLLMENT_BLOCK_RE.search(visible_text):
+        # A mixed hardware + protocol V2 intent is outside this hardware-only
+        # canonicalizer. Preserve that single V2 block and suppress the legacy
+        # fallback instead of dropping protocol items or producing two cards.
+        return visible_text if removed_model_intent else text
     if not requested_types:
         # A model-authored setup block is not authoritative. Remove stale or
         # over-eager hardware cards from status/usage turns even when no new
         # canonical enrollment intent needs to be appended.
         return visible_text if removed_model_intent else text
 
+    if (network_scope or current_network) and any(
+        hardware_type not in _DISCOVERABLE_SUBNET_HARDWARE_TYPES
+        for hardware_type in requested_types
+    ):
+        # Do not silently convert a printer/PC/pairing request into a camera/TV
+        # scan. The model can explain that those types use trusted manual or
+        # account/pairing discovery instead.
+        return visible_text if removed_model_intent else text
+
+    intent: dict[str, Any] = {
+        "schema_version": "2",
+        "kind": "connector_enrollment",
+        "items": [
+            {"resource_kind": hardware_type}
+            for hardware_type in requested_types
+        ],
+        "setup_requested": True,
+    }
+    if network_scope:
+        intent["network_scope"] = {"cidr": network_scope}
+    elif current_network:
+        intent["network_scope"] = {"mode": "current"}
     payload = json.dumps(
-        {
-            "schema_version": "1",
-            "kind": "hardware",
-            "requested_types": list(requested_types),
-            "discovery_requested": True,
-        },
+        intent,
         ensure_ascii=False,
         indent=2,
     )
     return (
-        f"{visible_text}\n\n```{_HARDWARE_ENROLLMENT_FENCE}\n"
+        f"{visible_text}\n\n```{_CONNECTOR_ENROLLMENT_FENCE}\n"
         f"{payload}\n```"
     )
 
