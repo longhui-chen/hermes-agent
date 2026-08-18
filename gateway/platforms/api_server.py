@@ -678,8 +678,11 @@ def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
     last_user_content = last_message.get("content")
     if not isinstance(last_user_content, str):
         return False
+    # 用结束标签定界，不要用 `\{.*?\}`：卡片的 title / reason 里合法地含一个
+    # `}`（比如 "JSON {schema}"）时，非贪婪的花括号会在字符串内部就收尾，
+    # json.loads 拿到残片 → 400，用户手里那张完全合法的卡片点不动。
     match = re.search(
-        r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+        r"\[creation_recommendation_response\]\s*(.*?)\s*"
         r"\[/creation_recommendation_response\]\s*$",
         last_user_content,
         re.DOTALL,

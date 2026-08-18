@@ -173,8 +173,11 @@ _CAPABILITY_DELIVERED_RE = re.compile(
     r"(?:created|configured|updated|deployed|seeded|synchronized|synced)",
     re.IGNORECASE,
 )
+# 用结束标签定界，不要用 `\{.*?\}`：卡片的 title / reason 里合法地含一个 `}`
+# （比如 "JSON {schema}"）时，非贪婪的花括号会在字符串内部就收尾，解出来的是
+# 残片——动作因此被判成无效，用户手里那张完全合法的卡片点不动。
 _RECOMMENDATION_RESPONSE_RE = re.compile(
-    r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+    r"\[creation_recommendation_response\]\s*(.*?)\s*"
     r"\[/creation_recommendation_response\]",
     re.DOTALL,
 )
