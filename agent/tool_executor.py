@@ -2285,7 +2285,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         if agent._tool_guardrail_halt_decision is not None:
             remaining_calls = [
                 call
-                for _, later_calls in segments[segment_index + 1 :]
+                for _, later_calls in segments[segment_index:]
                 for call in later_calls
             ]
             if remaining_calls:

@@ -1948,6 +1948,39 @@ def _memory_authorization_for_scope(
     return inferred_digest, target
 
 
+def _silent_skill_view_scope_block_message(
+    agent: Any,
+    function_args: Mapping[str, Any],
+) -> str | None:
+    """Fail closed before a silent turn can read an unrelated skill."""
+    if getattr(agent, "_zet_agent_execution_policy", "") != "silent_automation":
+        return None
+
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    expected_path = (
+        _trusted_skill_path_for_slug(task.trusted_skill_slug)
+        if isinstance(task, _SkillDirectTaskContext)
+        else ""
+    )
+    requested_path = _trusted_skill_path_for_slug(function_args.get("name", ""))
+    if (
+        expected_path
+        and requested_path == expected_path
+        and turn_identity is not None
+        and task.turn_identity == turn_identity
+    ):
+        return None
+
+    logger.warning(
+        "zet_agent: blocked silent skill_view outside the transport-selected scope"
+    )
+    return (
+        "Silent automation may load only the transport-selected signed skill "
+        "for this request-bound turn. Do not inspect or load another skill."
+    )
+
+
 def trusted_skill_operation_block_message(
     agent: Any,
     *,
@@ -1961,6 +1994,13 @@ def trusted_skill_operation_block_message(
     before dispatch, so trusted helper authority cannot escape its task.
     """
     _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+    if function_name == "skill_view":
+        silent_scope_block = _silent_skill_view_scope_block_message(
+            agent,
+            function_args,
+        )
+        if silent_scope_block is not None:
+            return silent_scope_block
     turn_identity = _current_skill_direct_turn_identity()
     with _SKILL_DIRECT_LOCK:
         scope = getattr(agent, "_zet_agent_skill_direct_scope", None)
@@ -2362,6 +2402,20 @@ def dispatch_trusted_skill_operation(
     ``skill_view`` scope is activated later from the final displayed result.
     """
     _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+    if function_name == "skill_view":
+        silent_scope_block = _silent_skill_view_scope_block_message(
+            agent,
+            function_args,
+        )
+        if silent_scope_block is not None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": silent_scope_block,
+                    "trusted_skill_scope_blocked": True,
+                },
+                ensure_ascii=False,
+            )
     receipt: _TrustedExecutionReceipt | None = None
     block_message: str | None = None
     if function_name == "terminal":

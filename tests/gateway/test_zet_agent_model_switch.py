@@ -1,10 +1,11 @@
 import os
+import queue
 import types
 from collections import OrderedDict
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
-import queue
 
 from gateway.config import PlatformConfig
 import gateway.platforms.zet_agent as zet_agent
@@ -279,6 +280,35 @@ async def test_run_agent_no_note_when_model_unchanged(monkeypatch):
     adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={"sess-1": "glm-5.1"})
     captured = await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="sess-1")
     assert captured["user_message"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_silent_run_skips_model_identity_note_and_seen_state(monkeypatch):
+    adapter = _seen_adapter(
+        monkeypatch,
+        config_model="glm-5.1",
+        seen={"sess-1": "deepseek-v4"},
+    )
+    effective_model = MagicMock(side_effect=AssertionError("must not resolve"))
+    ensure_seen = MagicMock(side_effect=AssertionError("must not load seen state"))
+    save_seen = MagicMock(side_effect=AssertionError("must not persist seen state"))
+    monkeypatch.setattr(adapter, "_effective_model", effective_model)
+    monkeypatch.setattr(adapter, "_ensure_seen_models", ensure_seen)
+    monkeypatch.setattr(adapter, "_save_seen_models", save_seen)
+
+    captured = await _capture_run_agent(
+        monkeypatch,
+        adapter,
+        user_message="run the frozen task",
+        session_id="sess-1",
+        execution_policy="silent_automation",
+    )
+
+    assert captured["user_message"] == "run the frozen task"
+    assert adapter._seen_models == {"sess-1": "deepseek-v4"}
+    effective_model.assert_not_called()
+    ensure_seen.assert_not_called()
+    save_seen.assert_not_called()
 
 
 @pytest.mark.asyncio

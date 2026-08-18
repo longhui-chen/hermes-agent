@@ -5,6 +5,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import agent.tool_executor as tool_executor
 from agent.trusted_tool_result import TrustedToolResult
 from run_agent import AIAgent
 from tools import terminal_tool as terminal_tool_module
@@ -378,6 +379,53 @@ def test_raw_video_terminal_failure_halts_once_and_skips_later_calls(
     ]
     assert len(cancelled) == 1
     assert "guardrail halt" in cancelled[0]["content"]
+
+
+def test_segmented_guardrail_halt_cancels_current_and_later_segments():
+    calls = [
+        _mock_tool_call("terminal", "{}", "c-current"),
+        _mock_tool_call("skill_view", "{}", "c-later-1"),
+        _mock_tool_call("skill_view", "{}", "c-later-2"),
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=calls)
+    agent = SimpleNamespace(
+        _incremental_persistence_failed=False,
+        _tool_guardrail_halt_decision=object(),
+    )
+    messages = []
+    segments = [
+        ("sequential", [calls[0]]),
+        ("parallel", calls[1:]),
+    ]
+
+    with (
+        patch.object(tool_executor, "execute_tool_calls_sequential") as sequential,
+        patch.object(tool_executor, "execute_tool_calls_concurrent") as concurrent,
+        patch.object(
+            tool_executor,
+            "_flush_session_db_after_tool_progress",
+            return_value=True,
+        ),
+        patch.object(tool_executor, "_budget_for_agent", return_value=object()),
+        patch.object(tool_executor, "get_active_env", return_value=None),
+        patch.object(tool_executor, "enforce_turn_budget"),
+    ):
+        tool_executor.execute_tool_calls_segmented(
+            agent,
+            assistant_message,
+            messages,
+            "task-segmented-halt",
+            segments=segments,
+        )
+
+    sequential.assert_not_called()
+    concurrent.assert_not_called()
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-current",
+        "c-later-1",
+        "c-later-2",
+    ]
+    assert all("guardrail halt" in message["content"] for message in messages)
 
 
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():

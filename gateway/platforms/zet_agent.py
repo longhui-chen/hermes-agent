@@ -3229,7 +3229,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # one-shot identity note. Covers session- and agent-level switches,
         # survives restarts; a brand-new session just records its baseline.
         try:
-            if session_id:
+            if (
+                scoped_execution_policy != "silent_automation"
+                and session_id
+            ):
                 _eff_model = self._effective_model(session_id, gateway_session_key)
                 if _eff_model:
                     with self._seen_lock():
