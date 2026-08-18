@@ -1,0 +1,13 @@
+name: zettlab_deep_memory
+version: 0.3.0
+description: "Zettlab on-device account and device scoped deep memory."
+pip_dependencies: []
+requires_env:
+  - ZETTLAB_AGENT_ACTION_TOKEN
+  - ZETTLAB_DEEP_MEMORY_URL
+hooks:
+  - on_turn_start
+  - prefetch
+  - on_memory_write
+  - on_session_switch
+  - shutdown

@@ -47,6 +47,7 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.tool_result_classification import tool_may_have_side_effect
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -366,7 +367,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
     cache_key = (
-        getattr(_registry, "_generation", 0),
+        _registry.cache_generation(),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
     )
@@ -1299,7 +1300,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
-            # Tool was cancelled (interrupt) or thread didn't return
+            # Tool was cancelled (interrupt) or thread didn't return. The
+            # worker may have completed its request server-side already:
+            # effect-capable tools get an explicit unknown disposition.
+            effect_disposition = (
+                "unknown" if tool_may_have_side_effect(name, args) else "none"
+            )
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
                 _emit_terminal_post_tool_call(
@@ -1380,6 +1386,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
+        if name == "search_memory":
+            # memory.citations 采集：所有工具执行路径的结果汇聚点（并行路径）。
+            from agent.agent_runtime_helpers import collect_memory_citations
+            collect_memory_citations(agent, function_result)
+        elif name == "memory":
+            # memory.saved 采集（写方向透明化，并行路径）。
+            from agent.agent_runtime_helpers import collect_memory_saves
+            collect_memory_saves(agent, args, function_result)
+
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -1421,6 +1436,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             stage=f"tool result {name}",
         ):
             return
+
+        # hermes.todo 快照（并发路径）：在主线程、canonical 结果落盘成功之后
+        # 才推送——worker 内先推会在 DB busy 时 fail-open：App 已看到新清单，
+        # 下一轮 hydrate 却是旧状态（codex P1）。
+        if name == "todo":
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(function_result)
+                    _todo_emit_cb(
+                        _todo_payload.get("todos", []),
+                        _todo_payload.get("summary", {}),
+                    )
+                except Exception:
+                    pass
 
         # Every completion surface is downstream of the canonical append. If
         # the UI bridge or process dies while projecting one of these events,
@@ -1505,12 +1536,20 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
     already emit a result for every call_id.
     """
     for tc in tool_calls:
-        name = getattr(getattr(tc, "function", None), "name", "") or "tool"
+        fn = getattr(tc, "function", None)
+        name = getattr(fn, "name", "") or "tool"
+        # The in-flight call may have already executed server-side (e.g. a
+        # NAS search that injected chat cards): effect-capable → unknown.
+        disposition = (
+            "unknown"
+            if tool_may_have_side_effect(name, getattr(fn, "arguments", None))
+            else "none"
+        )
         messages.append(make_tool_result_message(
             name,
             f"[Tool execution cancelled — {name} was skipped due to {reason}]",
             getattr(tc, "id", "") or "",
-            effect_disposition="none",
+            effect_disposition=disposition,
         ))
 
 
@@ -1633,17 +1672,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
-            # Emit hermes.todo event onto the SSE stream (zet_agent platform).
-            # todo_emit_callback is injected by ZetAgentAdapter._create_agent
-            # when a stream_q is available; absent it, this is a no-op.
-            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
-            if callable(_todo_emit_cb):
-                try:
-                    import json as _json
-                    _todo_payload = _json.loads(function_result)
-                    _todo_emit_cb(_todo_payload.get("todos", []), _todo_payload.get("summary", {}))
-                except Exception:
-                    pass
+            # hermes.todo 快照不在这里推：与并发路径统一，由下方 canonical tool
+            # result 落盘成功后再 emit（codex P1）——计划执行进度现在绑定在这些
+            # 单条 merge=true 更新上，先推后写会在 DB busy 时让 App 看到下一轮
+            # hydrate 不回来的进度。
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
@@ -1766,9 +1798,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
         elif function_name == "present_plan":
-            from tools.plan_tool import present_plan as _present_plan
+            from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 
-            function_result = _present_plan(
+            function_result, _plan_meta = _present_plan_with_meta(
                 title=function_args.get("title", ""),
                 groups=function_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
@@ -1789,6 +1821,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._zet_agent_plan_presented = True
                 if getattr(agent, "plan_emit_callback", None) is None:
                     agent._zet_agent_plan_fallback_response = function_result
+                if _plan_meta is not None:
+                    # 播种延迟到批次收尾（conversation_loop 调 seed_pending_plan_todos）：
+                    # 就地 append 合成消息对会插进本批次其余 tool result 中间，破坏
+                    # assistant↔tool 配对与 messages[-num_tools:] 预算统计。
+                    agent._pending_plan_seed = _plan_meta
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")
@@ -2007,6 +2044,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         middleware_trace=middleware_trace,
                     )
                 )
+                if function_name == "search_memory":
+                    # 生产主路径（registry 分派）的 memory.citations 采集挂点。
+                    from agent.agent_runtime_helpers import collect_memory_citations
+                    collect_memory_citations(agent, function_result)
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
                     agent,
@@ -2117,6 +2158,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
+        if function_name == "search_memory":
+            # memory.citations 采集：所有工具执行路径的结果汇聚点（串行路径）。
+            from agent.agent_runtime_helpers import collect_memory_citations
+            collect_memory_citations(agent, function_result)
+        elif function_name == "memory":
+            # memory.saved 采集（写方向透明化，串行路径）。
+            from agent.agent_runtime_helpers import collect_memory_saves
+            collect_memory_saves(agent, function_args, function_result)
+
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -2146,6 +2196,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         ):
             return
+
+        # hermes.todo 快照（串行路径）：canonical 结果落盘成功之后才推——与并发
+        # 路径同规（codex P1）。用 display_function_result：function_result 可能
+        # 已被 maybe_persist_tool_result 换成文件引用，解析不出 todos。
+        if function_name == "todo":
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(display_function_result)
+                    _todo_emit_cb(
+                        _todo_payload.get("todos", []),
+                        _todo_payload.get("summary", {}),
+                    )
+                except Exception:
+                    pass
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.

@@ -70,7 +70,9 @@ def test_managed_terminal_inherits_service_identity_inside_profile_cgroup(
     assert "/usr/bin/unshare" not in captured["argv"]
 
 
-def test_managed_terminal_keeps_existing_root_cwd(monkeypatch, tmp_path):
+def test_managed_terminal_keeps_existing_root_cwd_without_lark_relay(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     run_env = {"HERMES_HOME": "/profiles/main"}
     workspace = tmp_path / "private-workspace"
@@ -93,6 +95,12 @@ def test_managed_terminal_keeps_existing_root_cwd(monkeypatch, tmp_path):
         "_prepare_managed_profile_runtime",
         lambda _env: None,
     )
+    relay_calls = []
+    monkeypatch.setattr(
+        local_module,
+        "_wire_lark_cli_relay",
+        lambda _env: relay_calls.append(True),
+    )
 
     assert local_module._managed_terminal_cwd(
         str(workspace),
@@ -106,6 +114,7 @@ def test_managed_terminal_keeps_existing_root_cwd(monkeypatch, tmp_path):
     assert run_env["TMPDIR"] == "/tmp"
     assert run_env["TMP"] == "/tmp"
     assert run_env["TEMP"] == "/tmp"
+    assert relay_calls == []
 
 
 @pytest.mark.skipif(
@@ -996,6 +1005,62 @@ def test_managed_uid_inventory_ignores_zombies(tmp_path):
     assert local_module._managed_uid_processes(100001, tmp_path) == {101}
 
 
+def test_profile_retirement_removes_profile_scoped_and_legacy_homes(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    profile_home = tmp_path / "profiles" / "agent-one"
+    profile_home.mkdir(parents=True)
+    scope = str(profile_home.resolve())
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    monkeypatch.setattr(local_module, "_MANAGED_TERMINAL_HOME_ROOT", homes)
+    uid = os.getuid()
+    named_home = homes / f"{uid}-agent-one"
+    legacy_home = homes / str(uid)
+    for home in (named_home, legacy_home):
+        home.mkdir(mode=0o700)
+    real_lstat = os.lstat
+
+    def trusted_home_lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        if Path(path) in {named_home, legacy_home}:
+            return os.stat_result(
+                (
+                    info.st_mode,
+                    info.st_ino,
+                    info.st_dev,
+                    info.st_nlink,
+                    uid,
+                    uid,
+                    info.st_size,
+                    info.st_atime,
+                    info.st_mtime,
+                    info.st_ctime,
+                )
+            )
+        return info
+
+    monkeypatch.setattr(local_module.os, "lstat", trusted_home_lstat)
+    monkeypatch.setattr(
+        local_module, "_MANAGED_TERMINAL_SCOPE_BY_UID", {uid: scope}
+    )
+    monkeypatch.setattr(local_module, "_MANAGED_TERMINAL_RETIRED_UIDS", set())
+    monkeypatch.setattr(local_module, "_MANAGED_TERMINAL_RETIRED_SCOPES", set())
+    monkeypatch.setattr(local_module, "_terminate_managed_uid", lambda _uid: 0)
+    monkeypatch.setattr(
+        local_module, "_remove_managed_terminal_cgroup", lambda _uid: True
+    )
+    monkeypatch.setattr(local_module, "_managed_uid_processes", lambda _uid: set())
+
+    result = local_module.retire_managed_terminal_profile(str(profile_home))
+
+    assert result["terminal_home_removed"] is True
+    assert not named_home.exists()
+    assert not legacy_home.exists()
+
+
 @pytest.mark.skipif(
     sys.platform != "linux" or os.geteuid() != 0,
     reason="requires Linux root identity broker",
@@ -1024,9 +1089,11 @@ def test_profile_retirement_removes_cgroup_and_rotates_resource_identity(
     uid, gid = local_module._managed_terminal_identity(env)
     homes = tmp_path / "homes"
     homes.mkdir(mode=0o711)
-    home = homes / str(uid)
-    home.mkdir(mode=0o700)
-    os.chown(home, uid, gid)
+    named_home = homes / f"{uid}-profile"
+    legacy_home = homes / str(uid)
+    for home in (named_home, legacy_home):
+        home.mkdir(mode=0o700)
+        os.chown(home, uid, gid)
 
     result = local_module.retire_managed_terminal_profile(profile_home)
     new_uid, _ = local_module._managed_terminal_identity(env)
@@ -1035,7 +1102,8 @@ def test_profile_retirement_removes_cgroup_and_rotates_resource_identity(
     assert result["terminal_cgroup_removed"] is True
     assert result["killed_uid_processes"] == 0
     assert removed_cgroups == [uid]
-    assert not home.exists()
+    assert not named_home.exists()
+    assert not legacy_home.exists()
     assert new_uid != uid
 
 

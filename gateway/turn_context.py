@@ -89,6 +89,7 @@ class TurnContext:
     _interrupt_depth: int = 0
     event_message_id: Optional[str] = None
     moa_config: Optional[dict] = None
+    user_authored_message: Optional[Any] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     user_config: Any = None
@@ -119,7 +120,9 @@ class TurnContext:
     _hooks_ref: Any = None
     _status_adapter: Any = None
     _status_chat_id: Any = None
+    _conversation_thread_metadata: Optional[dict] = None
     _status_thread_metadata: Optional[dict] = None
+    _feishu_quote_lease: Any = None
 
     # --- extracted sibling callbacks (bound TurnRunner methods; run_sync
     #     reads them through the ctx exactly where it used to close over

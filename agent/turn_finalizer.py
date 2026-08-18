@@ -28,6 +28,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.prompt_builder import STEER_USER_PREFIX
 from agent.response_format import response_format_requires_structured_output
+from agent.zet_agent_response_mode import ensure_hardware_enrollment_intent
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -586,6 +587,15 @@ def finalize_turn(
         for _hook_result in _transform_results:
             if isinstance(_hook_result, str) and _hook_result:
                 final_response = _hook_result
+        final_response = ensure_hardware_enrollment_intent(
+            agent,
+            user_message=original_user_message,
+            response_text=final_response or "",
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            structured_output=_structured_output,
+        )
         _response_transformed = final_response != _pre_transform_response
         if (
             _response_transformed

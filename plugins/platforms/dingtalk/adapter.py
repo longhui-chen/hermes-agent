@@ -887,7 +887,17 @@ class DingTalkAdapter(BasePlatformAdapter):
             download_code = getattr(image_content, "download_code", None)
             if download_code:
                 media_urls.append(download_code)
-                media_types.append("image")
+                # ⛔ 这里原来记的是裸类别 "image"。``media_types`` 的契约是
+                # **MIME**(见 EXT_MAP 上方注释),而下游关口
+                # ``gateway.run._event_media_is_image`` 判的是
+                # ``mtype.startswith("image/")`` —— "image" 没有斜杠,判 False;
+                # 更糟的是它**非空**,于是 ``message_type == PHOTO`` 那条兜底
+                # 根本不会被走到 ⇒ 这条路的图从来没进过模型。
+                # ⭐ 这一格没有文件名可推子类型,而关口**本来就为此留了通路**
+                # (``_event_media_type_at`` 的 docstring:some adapters only set
+                # a message-level type)⇒ 记「未知」,让 PHOTO 兜底生效。
+                # ⛔ 不编一个 "image/*" 之类的假 MIME(下游要拿它当 content-type)。
+                media_types.append("")
                 msg_type = MessageType.PHOTO
 
         # Check for rich text with mixed content
@@ -906,12 +916,32 @@ class DingTalkAdapter(BasePlatformAdapter):
                         if dl_code:
                             mapped = DINGTALK_TYPE_MAPPING.get(item_type, "file")
                             media_urls.append(dl_code)
+                            # 🔴 **异构列表必须逐附件带类型。**
+                            #
+                            # 上一版这里写 ``""``(未知),依赖下游按**消息级**类型
+                            # 兜底。但消息级只有**一个**值(由第一个附件决定)⇒ 一条
+                            # richText 同时含图片和语音时:``picture→voice`` 两个都
+                            # 判成 image(**语音被送进视觉模型**);``voice→picture``
+                            # 两个都判成 audio(**图片进 STT**)。provider 报错或答非所问。
+                            #
+                            # ⭐ 用 RFC 7231 的 **media-range**(``image/*``),⛔ 不是
+                            # 编一个假的具体子类型:我们确实知道**大类**、确实不知道
+                            # **子类型**,这个写法如实表达这件事。
+                            # ⚠️ 上一版拒绝写类型的理由是「下游要拿它当 content-type」——
+                            # **那是个没验过的前提**。实查 ``media_types[i]`` 在
+                            # ``gateway/run.py`` 的消费者只有两处,**都只用于分类**
+                            # (:16967 路由 · :17165 且它对 ``""``/octet-stream 还会按
+                            # 扩展名重猜),⛔ 没有任何一处把它当 HTTP 头发出去。
+                            #
+                            # ⛔ 共用关口 ``_event_media_is_*`` 一个字都没动。
+                            # 同质列表结果**逐条不变**(``image/*`` 与「空+消息级 PHOTO」
+                            # 给出同一个 True);只有异构列表改判,且每一格都是从错到对。
                             if mapped == "image":
-                                media_types.append("image")
+                                media_types.append("image/*")
                                 if msg_type == MessageType.TEXT:
                                     msg_type = MessageType.PHOTO
                             elif mapped == "audio":
-                                media_types.append("audio")
+                                media_types.append("audio/*")
                                 if msg_type == MessageType.TEXT:
                                     # DingTalk's "voice" rich-text item is a
                                     # native voice note — route through STT.
@@ -922,7 +952,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                                     else:
                                         msg_type = MessageType.AUDIO
                             elif mapped == "video":
-                                media_types.append("video")
+                                media_types.append("video/*")
                                 if msg_type == MessageType.TEXT:
                                     msg_type = MessageType.VIDEO
                             else:
@@ -965,6 +995,14 @@ class DingTalkAdapter(BasePlatformAdapter):
                     if fname:
                         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
                         mime = EXT_MAP.get(ext, mime)
+                    # ⭐ 本分支下面第 5 步**已经知道**答案:``msg_type_str == "image"``
+                    # 就是钉钉说的「这是图片」。但上面这几行在推不出扩展名时记了
+                    # ``application/octet-stream`` —— 一个**非空且非 image/** 的值,
+                    # 于是下游关口既判不出 image、又因为它非空而跳过 PHOTO 兜底。
+                    # ⇒ 把「不知道子类型」如实记成不知道,⛔ 不要谎报成二进制流。
+                    # ⛔ 有 fileName 推出真 MIME 的那条路**一格不动**(它本来就对)。
+                    if msg_type_str == "image" and not mime.startswith("image/"):
+                        mime = ""
                     media_types.append(mime)
                     if msg_type == MessageType.TEXT:
                         # Image messages → PHOTO (distinct busy-session handling

@@ -283,6 +283,63 @@ class TestVisionConfig:
         assert kwargs["timeout"] == 120.0
 
 
+class TestVisionModerationBlock:
+    """A content-moderation refusal of the image must be signalled distinctly so
+    the caller refuses the whole turn (image never reaches the main model), NOT
+    swallowed into a benign 'couldn't see it' note that lets the model answer."""
+
+    @pytest.mark.asyncio
+    async def test_content_policy_refusal_sets_moderation_blocked(self, tmp_path):
+        img = tmp_path / "x.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        with (
+            patch(
+                "tools.vision_tools._image_to_base64_data_url",
+                return_value="data:image/png;base64,abc",
+            ),
+            patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError(
+                    '{"error":{"code":"moderation_input_blocked",'
+                    '"type":"content_policy_violation","message":"内容不合规"}}'
+                ),
+            ),
+        ):
+            result = json.loads(
+                await vision_analyze_tool(str(img), "describe this", "test/model")
+            )
+
+        assert result["success"] is False
+        assert result.get("moderation_blocked") is True
+
+    @pytest.mark.asyncio
+    async def test_generic_vision_failure_is_not_moderation_blocked(self, tmp_path):
+        # A real vision outage (timeout, 402, "does not support") must fail OPEN
+        # to a benign note (HR2), never be mistaken for a moderation refusal.
+        img = tmp_path / "x.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        with (
+            patch(
+                "tools.vision_tools._image_to_base64_data_url",
+                return_value="data:image/png;base64,abc",
+            ),
+            patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                side_effect=TimeoutError("request timed out"),
+            ),
+        ):
+            result = json.loads(
+                await vision_analyze_tool(str(img), "describe this", "test/model")
+            )
+
+        assert result["success"] is False
+        assert result.get("moderation_blocked") is not True
+
+
 class TestVisionSafetyGuards:
     @pytest.mark.asyncio
     async def test_local_non_image_file_rejected_before_llm_call(self, tmp_path):

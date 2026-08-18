@@ -57,6 +57,8 @@ import json
 import logging
 import mimetypes
 import os
+import tempfile
+import shutil
 import re
 import threading
 import time
@@ -66,7 +68,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -120,6 +122,7 @@ FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    log_media_intake_failure,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -202,6 +205,8 @@ _DOCUMENT_MIME_TO_EXT = {mime: ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.ite
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
 _FEISHU_OPUS_UPLOAD_EXTENSIONS = {".ogg", ".opus"}
+#: 转码用。⭐ 与 whatsapp_cloud:132 同形（``shutil.which`` 在导入时解析一次）。
+_FEISHU_FFMPEG_PATH = shutil.which("ffmpeg")
 _FEISHU_MEDIA_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v"}
 _FEISHU_DOC_UPLOAD_TYPES = {
     ".pdf": "pdf",
@@ -282,6 +287,9 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
 _FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
+# 长任务完成提醒（ZET-2111）的待发标记；正常在本轮 on_processing_complete 里
+# 被 pop 掉，上限只是防「turn 异常终止、hook 没跑到」时无界增长的安全网。
+_FEISHU_LONG_RUNNING_CACHE_SIZE = 1024
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -1539,6 +1547,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # ZET-2111：gateway 发过「仍在处理」心跳的轮次，成功收口后补一个 ✅。
+        self._long_running_turns: "OrderedDict[tuple, bool]" = OrderedDict()
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1947,9 +1957,20 @@ class FeishuAdapter(BasePlatformAdapter):
         # uses ``post``. See #26841.
         prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
+        first_success_response = None
+        failed_chunks = 0
+        failed_indices: List[int] = []
+        pending_retry: List[Tuple[int, str, str, Optional[Dict[str, Any]]]] = []
+        chunk_index = 0
 
         try:
+            quote_available = bool(reply_to or (metadata or {}).get("reply_to_message_id"))
             for chunk in chunks:
+                chunk_reply_to = reply_to if quote_available else None
+                chunk_metadata = metadata
+                if not quote_available and metadata and metadata.get("reply_to_message_id"):
+                    chunk_metadata = dict(metadata)
+                    chunk_metadata.pop("reply_to_message_id", None)
                 msg_type, payload = self._build_outbound_payload(
                     chunk, prefer_post=prefer_post,
                 )
@@ -1958,8 +1979,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type=msg_type,
                         payload=payload,
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        reply_to=chunk_reply_to,
+                        metadata=chunk_metadata,
                     )
                 except Exception as exc:
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
@@ -1969,8 +1990,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        reply_to=chunk_reply_to,
+                        metadata=chunk_metadata,
                     )
                 if (
                     msg_type == "post"
@@ -1982,15 +2003,173 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        reply_to=chunk_reply_to,
+                        metadata=chunk_metadata,
                     )
                 last_response = response
+                if self._response_succeeded(response):
+                    if first_success_response is None:
+                        first_success_response = response
+                    if quote_available:
+                        quote_available = False
+                else:
+                    failed_chunks += 1
+                    failed_indices.append(chunk_index)
+                    # 留下重发所需的材料（RH 复审 P1-1：只重试失败块）
+                    pending_retry.append((chunk_index, msg_type, payload, chunk_metadata))
+                chunk_index += 1
 
-            return self._finalize_send_result(last_response, "send failed")
+            # 🔴 成败判据必须看「有没有任何一块真的送达」，⛔ 不是「最后一块」。
+            # 首块成功、末块失败时，用户【已经看到】内容、引用也已经消费掉；
+            # 若这里按最后一块报整体失败，上层会把 quote lease 退回并可能重发
+            # 整段 —— 用户看到的是重复刷屏，比缺最后一块严重得多。
+            # ⇒ 有任何一块成功就按成功收口（用首个成功响应的 message_id，它是
+            #   用户实际看到的那条），失败的块单独留痕，⛔ 不静默。
+            #
+            # ⚠️ 这是**权衡后的次优解，⛔ 不是正解**。仓里的正解是 Telegram
+            # （`telegram/adapter.py:5168`）：部分送达时返回
+            # ``success=False`` + ``raw_response["partial_overflow"]`` +
+            # ``delivered_prefix``，由消费侧**只补缺失的那一段** —— 既不丢尾
+            # 也不重复。这里之所以没照抄：
+            #   `gateway/stream_consumer.py:2309` 是**唯一**消费
+            #   ``partial_overflow`` 的地方，而它在 **edit** 路径上；
+            #   ``adapter.send()`` 的 **7 个**调用点（`:1273 :1494 :1601
+            #   :1806 :1849 :2001 :2408`）一个都不读它。
+            # ⇒ 只在这边返回 ``success=False`` 等于**半条链**：没人消费那份
+            #   元数据，而 success 语义一变，上层就会重发全文 —— 恰好制造出
+            #   本注释开头要避免的那种重复刷屏。
+            # ⇒ 消费侧那半属于 stream_consumer 的面，⛔ 不在本 lane 上；
+            #   这里先把「缺了哪几块」记全，让它可被诊断、也让将来接线时
+            #   数据是现成的。
+            # ───── 只重发失败的那几块（RH 复审 P1-1）─────
+            #
+            # 🔴 为什么这一层有必要：``_feishu_send_with_retry`` 的重试
+            # **只覆盖抛异常**（``except Exception`` 分支），平台**返回失败
+            # 响应**（限流、临时 5xx）时它直接 ``return response`` ——
+            # 那一块**一次都没重试过**。
+            #
+            # 前提「至少有一块成功」是刻意的：全失败说明是全局故障
+            # （鉴权失效 / 群被解散 / 网络断），重发只会拖延并再失败一轮。
+            # ⇒ ⛔ 只在「连接明显是通的、只是个别块掉了」时才补发。
+            #
+            # 退避 ``2 ** attempt`` **照抄同文件 ``_feishu_send_with_retry``
+            # :5171 的既有推导**，⛔ 不另定一套。这里只做**一轮**补发
+            # （attempt=1 ⇒ 等 2s）：每块在第一轮里已经历过 3 次带退避的
+            # 异常重试，再多轮的边际收益很低，而用户在等。
+            #
+            # ⚠️ **顺序取舍（明写）**：补发的块会排在已送达内容**之后**，
+            # 用户看到的顺序可能是「1、3、2」。权衡后仍然补发 ——
+            # 乱序的完整内容用户读得懂，缺失的内容读不懂；而且缺哪几块
+            # 已在下面的日志里留痕。
+            if pending_retry and first_success_response is not None:
+                await asyncio.sleep(2)
+                still_failed: List[int] = []
+                for idx, r_msg_type, r_payload, r_metadata in pending_retry:
+                    # 🔴 光传 ``reply_to=None`` **挡不住**引用:
+                    # ``_feishu_send_with_retry`` 里是
+                    #   active_reply_to = reply_to or (metadata or {}).get("reply_to_message_id")
+                    # ⇒ metadata 里只要还留着它,就会被恢复出来,同一条用户消息
+                    # **被可见引用两次**。⭐ 参数和 metadata 是同一件事的两个入口,
+                    # **只关一个等于没关**。
+                    if r_metadata and "reply_to_message_id" in r_metadata:
+                        r_metadata = {
+                            k: v for k, v in r_metadata.items()
+                            if k != "reply_to_message_id"
+                        }
+                    try:
+                        retry_resp = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=r_msg_type,
+                            payload=r_payload,
+                            reply_to=None,          # ⛔ 引用已被第一轮消费
+                            metadata=r_metadata,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[Feishu] 第 %d 块补发抛错（chat_id=%s）: %s",
+                            idx, chat_id, exc,
+                        )
+                        still_failed.append(idx)
+                        continue
+                    if self._response_succeeded(retry_resp):
+                        failed_chunks -= 1
+                        if first_success_response is None:
+                            first_success_response = retry_resp
+                        logger.info(
+                            "[Feishu] 第 %d 块补发成功（chat_id=%s）", idx, chat_id)
+                    else:
+                        still_failed.append(idx)
+                failed_indices = still_failed
+
+            if failed_chunks and first_success_response is not None:
+                # ⭐ 区分缺头 / 缺尾 / 中间缺失：缺头意味着用户看到的内容
+                # **从中间开始**，比缺尾更容易被误读成"模型答非所问"。
+                if 0 in failed_indices:
+                    shape = "缺开头"
+                elif (len(chunks) - 1) in failed_indices:
+                    shape = "缺结尾"
+                else:
+                    shape = "中间缺失"
+                logger.warning(
+                    "[Feishu] 分块发送部分失败：共 %d 块，【补发一轮后】仍失败 %d 块"
+                    "（%s，失败块序号=%s）；已送达部分按成功收口，"
+                    "⚠️ 缺失部分不会再补（chat_id=%s）",
+                    len(chunks), failed_chunks, shape, failed_indices, chat_id,
+                )
+            effective = (
+                first_success_response
+                if first_success_response is not None
+                else last_response
+            )
+            return self._finalize_send_result(effective, "send failed")
         except Exception as exc:
+            # 🔴 「先成功、后抛异常」：已经有 N 块送达了，但这里返回
+            # ``success=False`` 且**不带任何已送达信息** ⇒ 上层可能重发整段，
+            # 用户看到前半部分出现两次。⛔ 无法在本 lane 闭合（同上：消费侧
+            # 不读 partial 元数据），但**必须留痕**，否则线上只能看到一条
+            # "Send error" 而不知道用户其实已经看到了一半。
+            if first_success_response is not None:
+                logger.error(
+                    "[Feishu] 分块发送中途抛错：共 %d 块，已送达 %d 块后失败；"
+                    "⚠️ 上层若重发整段，用户会看到重复内容（chat_id=%s）: %s",
+                    len(chunks), chunk_index - failed_chunks, chat_id, exc,
+                )
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> bool:
+        """发送媒体批次，只让首个成功送达的附件保留引用。"""
+        if not metadata or not metadata.get("reply_to_message_id"):
+            return await self._send_multiple_images_with_result(
+                chat_id=chat_id,
+                images=images,
+                metadata=metadata,
+                human_delay=human_delay,
+            )
+
+        quote_available = True
+        sent_any = False
+        for image in images:
+            item_metadata = metadata
+            if not quote_available:
+                item_metadata = dict(metadata)
+                item_metadata.pop("reply_to_message_id", None)
+            image_sent = await self._send_multiple_images_with_result(
+                chat_id=chat_id,
+                images=[image],
+                metadata=item_metadata,
+                human_delay=human_delay,
+            )
+            sent_any = sent_any or image_sent
+            if quote_available and image_sent:
+                quote_available = False
+        return sent_any
 
     async def edit_message(
         self,
@@ -2225,7 +2404,56 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio to Feishu as a file attachment plus optional caption."""
+        """作为**原生语音**发给飞书；非 opus 音频先转码。
+
+        🔴 原先这里直接把 ``audio_path`` 交给 ``_send_uploaded_file_message``,
+        而它的分派 ``_resolve_outbound_file_routing`` **只看扩展名**:
+        ``.ogg/.opus`` ⇒ audio,其余一律 ⇒ **file**。
+        ⇒ ``send_voice("x.mp3")`` 被**静默降级成一个普通文件附件**,
+        用户发的是语音、收到的是文件,而链路上**没有任何一层告诉他为什么**。
+        ⚠️ 注意 ``outbound_message_type="audio"`` 这个参数形同虚设 ——
+        分派函数只在最后两个分支用到它,而那两个分支返回的是同一个结果。
+
+        官方逐字（[上传文件](https://open.feishu.cn/document/server-docs/im-v1/file/create)）：
+        ``"OPUS 音频文件。其他格式的音频文件，请转为 OPUS 格式后上传。"``
+        ⇒ 这**不是**「我们没实现」,是平台确实只收 opus ⇒ 必须转码。
+
+        ⭐ 转码照抄 ``gateway/platforms/whatsapp_cloud.py:1263`` 的
+        ``_convert_to_opus``（同样的 ``libopus / 32k / vbr / voip`` 参数）,
+        但**失败分支刻意不同**:
+          · WhatsApp 转码失败 ⇒ 降级发 mp3,**仍然是 audio 消息**,只差一个
+            波形气泡 ⇒ 降级可接受。
+          · 飞书降级只会变成 **file**,语义整个丢掉 ⇒ **⛔ 不许降级**,
+            必须显式返回可行动错误。
+        ⭐ 照抄第四问「它那样分依据的判据在我这边还成立吗」= **不成立**。
+        """
+        if Path(audio_path).suffix.lower() not in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
+            opus_path = await self._transcode_to_opus(audio_path)
+            if opus_path is None:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "发送语音需要 ffmpeg（飞书只接受 opus 格式音频）。"
+                        "请在设备上安装 ffmpeg 后重试。"
+                        if _FEISHU_FFMPEG_PATH is None
+                        else "音频转码失败，无法作为语音发送。请换一个音频文件重试。"
+                    ),
+                )
+            try:
+                return await self._send_uploaded_file_message(
+                    chat_id=chat_id,
+                    file_path=opus_path,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                    caption=caption,
+                    outbound_message_type="audio",
+                )
+            finally:
+                try:
+                    os.unlink(opus_path)
+                except OSError:
+                    pass
+        # ⛔ opus / ogg 原路径**逐字不变**。
         return await self._send_uploaded_file_message(
             chat_id=chat_id,
             file_path=audio_path,
@@ -2234,6 +2462,66 @@ class FeishuAdapter(BasePlatformAdapter):
             caption=caption,
             outbound_message_type="audio",
         )
+
+    async def _transcode_to_opus(self, src: str) -> Optional[str]:
+        """把任意音频转成 OGG/Opus。返回临时文件路径，失败返回 ``None``。
+
+        ⭐ ffmpeg 参数逐字照抄 ``whatsapp_cloud._convert_to_opus``:
+        ``-c:a libopus -b:a 32k -vbr on -application voip``
+        （voip 调优语音、32k 匹配原生语音条的码率）。
+
+        ⚠️ **一处刻意偏离**:输出走 ``tempfile``,⛔ 不像先例那样写在**源文件
+        旁边**。理由:这条路径会收到 kanban artifact 等**可能位于只读目录**的
+        文件,旁路写会直接失败;而且 ``a.mp3`` → ``a.ogg`` 会**覆盖同名用户文件**。
+        """
+        if _FEISHU_FFMPEG_PATH is None:
+            logger.warning(
+                "[feishu] 未找到 ffmpeg —— 语音只能以 opus 格式发送，"
+                "非 opus 音频将返回明确错误而不是降级成文件附件")
+            return None
+        from tools.bounded_media_exec import (
+            TranscodeTimeout,
+            run_media_subprocess,
+        )
+
+        fd, out_path = tempfile.mkstemp(suffix=".ogg", prefix="feishu-voice-")
+        os.close(fd)
+        # ⭐ 产物清理收进 ``finally`` 的单一出口:上一版把 ``os.unlink`` 抄在
+        # 两条分支里,而 ``CancelledError`` 走的是**第三条**(它继承自
+        # ``BaseException``,``except Exception`` 接不到)—— 于是会话一被取消,
+        # 临时文件和 ffmpeg 子进程一起泄漏。半条链的典型形态。
+        keep = False
+        try:
+            try:
+                rc, stderr = await run_media_subprocess([
+                    _FEISHU_FFMPEG_PATH, "-y", "-i", src,
+                    "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+                    "-application", "voip", out_path,
+                ])
+            except TranscodeTimeout as exc:
+                # ⛔ 只记 basename —— 源路径可能含用户目录结构。
+                logger.error(
+                    "[feishu] ffmpeg 转 opus 超时,已杀掉整个进程组 (src=%s): %s",
+                    os.path.basename(src), exc)
+                return None
+            if rc != 0 or os.path.getsize(out_path) == 0:
+                # ⛔ 只记 basename 与 returncode —— 源路径可能含用户目录结构。
+                logger.error(
+                    "[feishu] ffmpeg 转 opus 失败 (rc=%s, src=%s): %s",
+                    rc, os.path.basename(src),
+                    (stderr or b"").decode("utf-8", errors="replace")[:300])
+                return None
+            keep = True
+            return out_path
+        except Exception:
+            logger.exception("[feishu] ffmpeg 子进程异常")
+            return None
+        finally:
+            if not keep:
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
 
     async def send_document(
         self,
@@ -2332,7 +2620,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
             return self._finalize_send_result(message_response, "image send failed")
         except Exception as exc:
-            logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
+            # 🔴 原版把 **image_path 原文 + 原始异常 + traceback** 一起写进日志。
+            # 飞书媒体 url 带鉴权参数,``ClientResponseError.__str__`` 会把整条
+            # url 带出来,``exc_info=True`` 还会让 logging 重新格式化原始异常
+            # ⇒ 一次失败就把渠道凭据**持久化**进 agent.log。
+            # ⭐ 照抄 ``gateway/platforms/weixin.py`` 做对的那份:只记异常**类型名**
+            #   + host 摘要(``.hostname`` 而非 ``.netloc`` —— netloc 含 userinfo)。
+            log_media_intake_failure(
+                logger, "feishu", "image", "send_failed", url="", exc=exc)
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -2351,7 +2646,8 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             image_path = await self._download_remote_image(image_url)
         except Exception as exc:
-            logger.error("[Feishu] Failed to download image %s: %s", image_url, exc, exc_info=True)
+            log_media_intake_failure(
+                logger, "feishu", "image", "download_failed", url=image_url, exc=exc)
             return await super().send_image(
                 chat_id=chat_id,
                 image_url=image_url,
@@ -2383,7 +2679,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 preferred_name="animation.gif",
             )
         except Exception as exc:
-            logger.error("[Feishu] Failed to download animation %s: %s", animation_url, exc, exc_info=True)
+            log_media_intake_failure(
+                logger, "feishu", "animation", "download_failed", url=animation_url, exc=exc)
             return await super().send_animation(
                 chat_id=chat_id,
                 animation_url=animation_url,
@@ -3228,9 +3525,89 @@ class FeishuAdapter(BasePlatformAdapter):
         if reaction_id:
             self._remember_processing_reaction(message_id, reaction_id)
 
+    def _long_running_key(self, source) -> tuple:
+        """标记的粒度。
+
+        🔴 上一版是 ``(chat_id, thread_id)`` —— **同一个群里两个人并发就会串**:
+        A 的长任务打了标记,B 的短问答一完成就把它 ``pop`` 掉 ⇒
+        **B 收到不属于他的 ✅,而 A 跑完反而没有提醒**(RH 复审 P2-1 运行时复现)。
+        ⇒ 必须带上 ``user_id``。
+        ⚠️ 两侧(``note_`` 与 ``_notify_``)取到的 user_id 必须是同一个值,
+        否则标记永远匹配不上 = 功能整个失效,**比原 bug 更坏** ——
+        由 test_long_running_key_is_stable_across_both_sides 钉住。
+        """
+        return (
+            getattr(source, "chat_id", None),
+            getattr(source, "thread_id", None),
+            getattr(source, "user_id", None),
+        )
+
+    def note_long_running_turn(self, source) -> None:
+        """记下「这一轮已经发过心跳」（ZET-2111）。
+
+        ⛔ 这里不判阈值也不判开关 —— 被调到就说明 gateway 已经判过了
+        （见 BasePlatformAdapter.note_long_running_turn 的说明）。
+        """
+        key = self._long_running_key(source)
+        if key[0] is None:
+            return
+        cache = self._long_running_turns
+        cache[key] = True
+        cache.move_to_end(key)
+        while len(cache) > _FEISHU_LONG_RUNNING_CACHE_SIZE:
+            cache.popitem(last=False)
+
+    async def _notify_long_running_done(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """长任务成功收口后补一个完成标记（ZET-2111）。
+
+        现场：飞书里长任务跑完没有任何推送提醒，用户不知道好了没有。
+        ⛔ 只在「真发过心跳」+「本轮成功」时发，且只发一次。短问答不发（没发过
+        心跳）、失败/取消不发（那两种已有各自的反馈）。
+        ⛔ 只发一个语言无关的 ✅：成功态不配文字，⛔ 不复制答案内容（那会变成
+        另一种刷屏），⛔ 零新增翻译文案。
+        ⛔ 平铺发送：不引用、不进话题 —— 它是状态消息，不是会话正文。
+        """
+        key = self._long_running_key(getattr(event, "source", None))
+        # 🔴 标记的生命周期【就是这一轮】—— 进来先判、走时必清,⛔ 不留过夜。
+        #
+        # ⚠️ 我上一版为了"发送失败还能重试"改成先 get 后 pop。**那是错的**:
+        # 生产里每轮只调一次 ``on_processing_complete``,**根本没有下一次机会**。
+        # 于是失败的标记残留下来,被同一用户的**下一轮短问答**消费掉 ——
+        # 那一轮凭空收到一个 ✅,而它压根没发过心跳。
+        # ⭐ 比原 bug 更坏:原来只是少一个提醒,改完变成给错人发提醒。
+        # ⭐ 教训:"消费提交要在动作成功之后"是一条好规则,但它的前提是
+        #    **存在下一次尝试**。没有重试调度时套用它,就变成了跨轮泄漏。
+        if not self._long_running_turns.pop(key, None):
+            return
+        if outcome is not ProcessingOutcome.SUCCESS:
+            # 失败/取消有各自的反馈,这一轮的标记已经作废。
+            return
+        chat_id = key[0]
+        if not chat_id:
+            return
+        try:
+            result = await self.send(chat_id, "✅", reply_to=None, metadata=None)
+        except Exception:
+            # 完成标记发不出去不许把已经成功的一轮改判成失败 —— 正文早已送达。
+            # ⛔ 也不许把标记留给下一轮(见上)。这里只留痕。
+            logger.warning("Feishu 长任务完成标记发送失败", exc_info=True)
+            return
+        if getattr(result, "success", True) is False:
+            logger.warning(
+                "Feishu 长任务完成标记被平台拒收(chat_id=%s): %s",
+                chat_id, getattr(result, "error", None) or "unknown",
+            )
+
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
+        # ⚠️ 放在 reaction 逻辑之前、且不受 _reactions_enabled() 早退影响：
+        # 完成提醒是「推送」，reaction 是 UI 徽章，两件事。关掉 reaction 的用户
+        # 仍然需要知道长任务结束了（ZET-2111 的诉求本身）。
+        await self._notify_long_running_done(event, outcome)
+
         if not self._reactions_enabled():
             return
         message_id = event.message_id
@@ -3964,7 +4341,8 @@ class FeishuAdapter(BasePlatformAdapter):
             media_type = self._normalize_media_type(content_type, default=self._default_image_media_type(ext))
             return cached_path, media_type
         except Exception:
-            logger.warning("[Feishu] Failed to cache image resource %s", image_key, exc_info=True)
+            log_media_intake_failure(
+                logger, "feishu", "image", "cache_failed", image_key=str(image_key))
             return "", ""
 
     async def _download_feishu_message_resource(
@@ -4037,12 +4415,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.info("[Feishu] Cached message document resource at %s", cached_path)
                 return cached_path, (media_type or self._guess_document_media_type(filename))
             except Exception:
-                logger.warning(
-                    "[Feishu] Failed to cache message resource %s/%s",
-                    message_id,
-                    file_key,
-                    exc_info=True,
-                )
+                log_media_intake_failure(
+                logger, "feishu", "resource", "cache_failed",
+                message_id=str(message_id), file_key=str(file_key))
         return "", ""
 
     # =========================================================================
@@ -4734,62 +5109,107 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
-                # Audio messages may fail with 99992402 when using thread_id routing.
-                # Try replying to the last message in the thread, then fall back to chat_id.
+                # 音频可能返回 99992402(thread_id 路由下的已知返回码)。
+                #
+                # 🔴 **这是 `bd994a9a2`(恢复通用 thread 路由)的兄弟调用点,当时没跟上。**
+                # 上一版这里最后一步用 ``metadata=None`` 回退 —— **把 ``thread_id``
+                # 一起丢掉** ⇒ 只属于话题的语音被发到**群主时间线**:
+                # ①错位回复 ②**扩大内容可见范围**(私密话题内容进了整个群)。
+                #
+                # ⭐ 「照抄」三问 —— 先例是 merge-base 上的同一段(逐分支对照):
+                #   ① 先例:门槛 = 失败 ∧ code==99992402 ∧ audio ∧ **thread_id 存在**;
+                #      锚点 = 显式 ``reply_to_message_id``,**没有就去
+                #      ``_fetch_last_message_in_thread(thread_id)`` 取**;
+                #      拿到锚点 ⇒ reply 重试(带 metadata);仍失败 ⇒ 退 chat_id。
+                #   ② 我这版(修前):**少了 thread_id 门槛**(非线程音频也进这块)、
+                #      **少了锚点获取**(该函数被 8e0a8dd2b3 一并删掉)。
+                #   ③ 差异逐条消除:门槛补回、锚点获取补回。
+                #      **唯一刻意保留的差异**:线程内的最后一步 ⛔ 不再退到群顶层。
+                #      先例那样写是因为**当时 create 分支还带 thread 路由**,
+                #      ``metadata=None`` 是有意退到群顶层的最后手段;而今天的判据是
+                #      「⛔ 把线程发送失败降级成群顶层发送不可接受」——
+                #      ⇒ 线程内改为**保留 thread metadata 再试一次**,仍失败就**返回失败**。
                 if (not self._response_succeeded(message_response)
                         and getattr(message_response, "code", None) == 99992402
-                        and resolved_message_type == "audio"
-                        and (metadata or {}).get("thread_id")):
-                    # Try reply API with thread_id as reply anchor
-                    thread_msg_id = (metadata or {}).get("reply_to_message_id")
-                    if not thread_msg_id:
-                        thread_msg_id = await self._fetch_last_message_in_thread(
-                            (metadata or {}).get("thread_id")
-                        )
-                    if thread_msg_id:
-                        logger.info("[Feishu] Audio: retrying via reply API in thread")
+                        and resolved_message_type == "audio"):
+                    # ⭐⭐ **「引用」和「路由」是两件事 —— 混为一谈就会二选一。**
+                    #
+                    # 本仓有两条**都成立**的既有契约,表面上打架:
+                    #   (A) ⛔ 不许**发明引用**:用户没给锚点时,不许从线程里
+                    #       捞一条当 quote(测试
+                    #       ``test_audio_99992402_flat_retry_does_not_invent_reply_from_thread``,
+                    #       与 H④「显式 reply_to=None 就是不要引用」同族)。
+                    #   (B) ⛔ 不许把话题内容发到**群主时间线**(本轮 finding:
+                    #       错位回复 + 扩大内容可见范围)。
+                    # ⇒ 解法不是二选一:**引用只由显式锚点决定;路由由 metadata
+                    #   里的 thread_id 决定**,两者互不代替。
+                    #
+                    # ⚠️ 机器人建议「取得线程内锚点后重试」——**那会违反 (A)**。
+                    #   ⭐ finding 的**现象**是对的,它给的**修法**不能照做。
+                    #   ⇒ ``_fetch_last_message_in_thread`` 不恢复(会变成发明引用)。
+                    thread_id = (metadata or {}).get("thread_id")
+                    anchor = (metadata or {}).get("reply_to_message_id")
+                    if anchor:
+                        # 显式锚点与线程与否**无关** —— 非线程也要用它重试。
+                        # (契约:``..._reply_id_without_thread_recovers_with_quote``)
+                        logger.info("[Feishu] Audio: retrying via reply API with explicit anchor")
                         message_response = await self._feishu_send_with_retry(
                             chat_id=chat_id,
                             msg_type=resolved_message_type,
                             payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                            reply_to=thread_msg_id,
+                            reply_to=anchor,
                             metadata=metadata,
                         )
                     if not self._response_succeeded(message_response):
-                        logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
-                        message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type=resolved_message_type,
-                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                            reply_to=None,
-                            metadata=None,
-                        )
+                        if thread_id:
+                            # 🔴 **保住路由,⛔ 不发明引用。**
+                            # ``metadata`` 原样带上 ⇒ ``_send_raw_message`` 的 create
+                            # 分支会以 ``thread_id`` 作 receive_id(``bd994a9a2``
+                            # 恢复的那条路由)⇒ 仍然落在话题里,且没有可见引用。
+                            # ⚠️ **⛔ 不许原样回传整个 metadata。**
+                            # ``_send_raw_message`` 的第①件事是「metadata 恢复引用
+                            # **只在线程内**生效」—— 原样传回去会把
+                            # ``reply_to_message_id`` **重新装上**,而这第三次重试
+                            # 存在的全部理由就是「**不带引用**重发一次」
+                            # (带引用的上一次刚失败)⇒ 大概率再撞同一个 99992402,
+                            # 这条重试就白设了。
+                            # ⇒ **保留 thread_id,摘掉 reply_to_message_id** ——
+                            #   作用域刚好等于缺陷作用域。
+                            flat_metadata = {
+                                k: v for k, v in (metadata or {}).items()
+                                if k != "reply_to_message_id"
+                            }
+                            logger.warning(
+                                "[Feishu] Audio send failed in thread, retrying flat **inside** the thread"
+                            )
+                            message_response = await self._feishu_send_with_retry(
+                                chat_id=chat_id,
+                                msg_type=resolved_message_type,
+                                payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                                reply_to=None,
+                                metadata=flat_metadata,
+                            )
+                            if not self._response_succeeded(message_response):
+                                # ⛔ **不降级到群顶层。** 把只属于话题的语音发到群主
+                                # 时间线 = 扩大内容可见范围;发失败比发错地方轻。
+                                logger.error(
+                                    "[Feishu] Audio could not be delivered inside the thread —— "
+                                    "⛔ refusing to fall back to the chat timeline"
+                                )
+                        else:
+                            # 🔴 **必须保持不变**:非线程语音与先例逐字相同 —— 退 chat_id。
+                            logger.warning("[Feishu] Audio send failed, retrying with chat_id")
+                            message_response = await self._feishu_send_with_retry(
+                                chat_id=chat_id,
+                                msg_type=resolved_message_type,
+                                payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                                reply_to=None,
+                                metadata=None,
+                            )
             return self._finalize_send_result(message_response, "file send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
-
-    async def _fetch_last_message_in_thread(self, thread_id: str) -> Optional[str]:
-        """Fetch the last message_id in a thread for reply-based routing."""
-        if not self._client or not thread_id:
-            return None
-        try:
-            from lark_oapi.api.im.v1 import ListMessageRequest
-            request = (
-                ListMessageRequest.builder()
-                .container_id_type("thread")
-                .container_id(thread_id)
-                .page_size(1)
-                .build()
-            )
-            response = await asyncio.to_thread(self._client.im.v1.message.list, request)
-            if response and getattr(response, "success", lambda: False)():
-                items = getattr(getattr(response, "data", None), "items", None)
-                if items and len(items) > 0:
-                    return getattr(items[0], "message_id", None)
-        except Exception as exc:
-            logger.debug("[Feishu] Failed to fetch last message in thread %s: %s", thread_id, exc)
-        return None
 
     async def _send_raw_message(
         self,
@@ -4800,48 +5220,63 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        # 🔴🔴 **本分支 commit 8e0a8dd2b3 把这里的 thread 路由整块删掉了,现恢复。**
+        #
+        # 那个 commit 的本意是换成原生 audio 发送(顺带拿掉 audio 的 99992402
+        # thread 绕行),但**作用域大过缺陷**:通用的 thread 路由一起没了。后果是
+        # 线程里的回答在 reply 锚点失效时回退成 create,而 create 直接对**整个
+        # chat_id** 发顶层消息 ⇒ **错位回复 + 扩大内容可见范围**。
+        # ⛔ 把「线程发送失败」降级成「群顶层发送」是不可接受的降级。
+        #
+        # 恢复的是 merge-base 上原本就有的三件事(逐字对照过):
+        #   ① metadata 恢复引用**只在线程内**生效
+        #   ② ``reply_in_thread`` 跟随 ``thread_id``,⛔ 不是硬编码 False
+        #   ③ 回退 create 时以 ``thread_id`` 作 receive_id,落在话题里
+        thread_id = (metadata or {}).get("thread_id")
+
         effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
+        # ⭐ 只在线程内才从 metadata 恢复引用。
+        # 无条件恢复正是「显式传 reply_to=None 却仍被引用」那一类缺陷的根
+        # (本轮 H④ 在调用方摘键是同一问题的另一半;两处并存不冲突)。
+        if not effective_reply_to and thread_id and metadata:
             effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
-                reply_in_thread=reply_in_thread,
+                reply_in_thread=bool(thread_id),
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
 
-        # For topic/thread messages that fell back from reply→create, use
-        # thread_id as receive_id so the message lands in the topic instead of
-        # the main chat.
-        _thread_id = (metadata or {}).get("thread_id")
-        if _thread_id:
+        if thread_id:
+            # 从 reply 回退到 create 的话题消息:以 thread_id 作 receive_id,
+            # ⛔ 不许落到群主时间线。
             body = self._build_create_message_body(
-                receive_id=_thread_id,
+                receive_id=thread_id,
                 msg_type=msg_type,
                 content=payload,
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_create_message_request("thread_id", body)
-        else:
-            receive_id = chat_id
-            receive_id_type = "chat_id"
-            if chat_id.startswith("feishu_user_id:"):
-                receive_id = chat_id.split(":", 1)[1]
-                receive_id_type = "user_id"
-            elif chat_id.startswith("ou_"):
-                receive_id_type = "open_id"
+            return await self._run_blocking(self._client.im.v1.message.create, request)
 
-            body = self._build_create_message_body(
-                receive_id=receive_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request(receive_id_type, body)
+        receive_id = chat_id
+        receive_id_type = "chat_id"
+        if chat_id.startswith("feishu_user_id:"):
+            receive_id = chat_id.split(":", 1)[1]
+            receive_id_type = "user_id"
+        elif chat_id.startswith("ou_"):
+            receive_id_type = "open_id"
+
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod
@@ -4977,7 +5412,7 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         last_error: Optional[Exception] = None
-        active_reply_to = reply_to
+        active_reply_to = reply_to or (metadata or {}).get("reply_to_message_id")
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
             try:
                 response = await self._send_raw_message(
@@ -4992,15 +5427,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
-                        if (metadata or {}).get("thread_id"):
-                            logger.warning(
-                                "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
-                                "skipping top-level fallback to avoid creating a new topic",
-                                active_reply_to,
-                                (metadata or {}).get("thread_id"),
-                                code,
-                            )
-                            return response
                         logger.warning(
                             "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
                             "falling back to new message in chat %s",
@@ -5009,12 +5435,14 @@ class FeishuAdapter(BasePlatformAdapter):
                             chat_id,
                         )
                         active_reply_to = None
+                        flat_metadata = dict(metadata or {})
+                        flat_metadata.pop("reply_to_message_id", None)
                         response = await self._send_raw_message(
                             chat_id=chat_id,
                             msg_type=msg_type,
                             payload=payload,
                             reply_to=None,
-                            metadata=metadata,
+                            metadata=flat_metadata or None,
                         )
                 return response
             except Exception as exc:

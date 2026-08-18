@@ -49,16 +49,124 @@ _ATTESTATION_MAX_ENTRIES = 64
 _VIDEO_EDIT_SKILL_PATH = "skills/video-edit-workflow-mini/SKILL.md"
 _VIDEO_EDIT_DIRECT_TOOLS = frozenset({"clarify", "terminal", "todo"})
 _CAMERA_SKILL_PATH = "skills/camsnap/SKILL.md"
-_CAMERA_DIRECT_TOOLS = frozenset({"terminal"})
+_CAMERA_DIRECT_TOOLS = frozenset({"terminal", "vision_analyze"})
+_CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_PRINTER3D_SKILL_PATHS = frozenset({
+    "skills/printer3d/SKILL.md",
+    "skills/printer3d-control/SKILL.md",
+})
+_PRINTER3D_DIRECT_TOOLS = frozenset({"terminal"})
 _CAMERA_INTENT_RE = re.compile(
-    r"(?:摄像头|镜头|camera).{0,32}(?:查看|看看|列出|截图|快照|短视频|录像|诊断|状态|view|list|snap|snapshot|clip|doctor)"
-    r"|(?:查看|看看|列出|截图|快照|短视频|录像|诊断|状态|view|list|snap|snapshot|clip|doctor).{0,32}(?:摄像头|镜头|camera)",
+    r"(?:摄像头|镜头|camera).{0,48}(?:查看|看下|看看|获取|列出|截图|快照|画面|短视频|录像|统计|分析|识别|人数|多少人|有没有人|view|list|snap|snapshot|image|frame|clip|doctor|analy[sz]e|count|people|person)"
+    r"|(?:查看|看下|看看|获取|列出|截图|快照|画面|短视频|录像|统计|分析|识别|人数|多少人|有没有人|view|list|snap|snapshot|image|frame|clip|doctor|analy[sz]e|count|people|person).{0,48}(?:摄像头|镜头|camera)",
     re.IGNORECASE | re.DOTALL,
+)
+# Inventory/status requests intentionally receive a narrower capability than
+# media requests: they may list normalized state, but may not capture media.
+_CAMERA_INVENTORY_INTENT_RE = re.compile(
+    r"(?:摄像头|镜头|camera).{0,48}(?:检查|状态|连接情况|是否连接|是否可用|可用状态|check|status|connected|available|online)"
+    r"|(?:检查|状态|连接情况|是否连接|是否可用|可用状态|check|status|connected|available|online).{0,48}(?:摄像头|镜头|camera)",
+    re.IGNORECASE | re.DOTALL,
+)
+_HARDWARE_INVENTORY_INTENT_RE = re.compile(
+    r"(?:(?:所有|全部|当前|整体|已连接(?:的)?)(?:硬件|设备|连接器).{0,32}(?:检查|查看|列出|有哪些|状态|连接情况|是否可用)"
+    r"|(?:检查|查看|列出).{0,32}(?:所有|全部|当前|整体|已连接(?:的)?)(?:硬件|设备|连接器)"
+    r"|(?:硬件|设备|连接器)(?:总览|列表|状态|连接情况|有哪些)"
+    r"|(?:(?:all|current|connected)\s+(?:hardware|devices?|connectors?).{0,32}(?:check|show|list|status|available)"
+    r"|(?:check|show|list).{0,32}(?:all|current|connected)\s+(?:hardware|devices?|connectors?)"
+    r"|(?:hardware|devices?|connectors?)\s+(?:overview|list|status)))",
+    re.IGNORECASE | re.DOTALL,
+)
+# A camera noun is optional only for a whole-message, high-confidence snapshot
+# command. Anchoring prevents quoted instructions or surrounding document text
+# from minting visual-data authority.
+_CAMERA_DIRECT_SNAPSHOT_INTENT_RE = re.compile(
+    r"^(?:(?:请|麻烦)(?:帮我)?|帮我|给我)?"
+    r"(?:拍|抓取|获取|截取)(?:一张|张|一个|个)?(?:当前|最新)?快照"
+    r"(?:吧|一下|看看)?[。！？!?]?$",
+    re.IGNORECASE,
+)
+_CAMERA_CONTINUATION_INTENT_RE = re.compile(
+    r"^(?:(?:请|麻烦)(?:帮我)?|帮我|给我)?"
+    r"(?:再|重新|继续|接着)"
+    r"(?:获取|查看|看下|看看|抓取|截取|分析|统计|识别)?"
+    r"(?:一下|下)?(?:当前|最新|刚才|这张)?(?:的)?"
+    r"(?:画面|图片|图像|快照|截图)"
+    r"(?:[，,\s]*(?:并|然后|再)?(?:分析|统计|识别|看看|看下)?"
+    r"(?:一下|下)?(?:当前)?(?:画面中?|图中)?(?:有|的)?(?:多少(?:个)?人|人数|有没有人|人员))?"
+    r"(?:吧|一下)?[。！？!?，,\s]*$",
+    re.IGNORECASE,
+)
+_PRINTER3D_INTENT_RE = re.compile(
+    r"(?:3d\s*打印机|三维打印机|printer).{0,32}(?:查看|列出|状态|进度|暂停|继续|恢复|取消|list|status|progress|pause|resume|cancel)"
+    r"|(?:查看|列出|状态|进度|暂停|继续|恢复|取消|list|status|progress|pause|resume|cancel).{0,32}(?:3d\s*打印机|三维打印机|printer)",
+    re.IGNORECASE | re.DOTALL,
+)
+_HARDWARE_ENROLLMENT_FENCE = "zettlab-hardware-enrollment-intent"
+_HARDWARE_ENROLLMENT_BLOCK_RE = re.compile(
+    r"\s*```zettlab-hardware-enrollment-intent\s*\r?\n[\s\S]*?\r?\n```",
+    re.IGNORECASE,
+)
+_LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE = re.compile(
+    r"\s*```zettlab-hardware-camera-intent\s*\r?\n[\s\S]*?\r?\n```",
+    re.IGNORECASE,
+)
+_HARDWARE_ENROLLMENT_ACTION_RE = re.compile(
+    r"(?:接入|连接|添加|安装|配对|发现|配置|设置)"
+    r"|(?:\bconnect\b|\badd\b|\binstall\b|\benroll\b|\bdiscover\b|\bset\s*up\b|\bpair\b)"
+    r"|(?:接続|追加|セットアップ|検出|登録)"
+    r"|(?:연결|추가|설정|검색|등록)"
+    r"|(?:verbinden|hinzuf[uü]gen|einrichten|installieren|erkennen)"
+    r"|(?:connecter|ajouter|installer|configurer|d[ée]tecter)"
+    r"|(?:conectar|a[ñn]adir|agregar|instalar|configurar|detectar)"
+    r"|(?:collegare|connettere|aggiungere|installare|configurare|rilevare)",
+    re.IGNORECASE,
+)
+_HARDWARE_ENROLLMENT_CONNECTION_STATE_RE = re.compile(
+    r"(?:已(?:经)?|正在|正|当前|尚未|未|没有)连接(?:到|上|着|过|好|成功)?(?:的)?"
+    r"|连接(?:中|的|状态|列表|信息|详情)"
+    r"|\b(?:connected|connecting|connection)\b",
+    re.IGNORECASE,
+)
+_HARDWARE_ENROLLMENT_META_OR_DIAG_RE = re.compile(
+    r"(?:总结|翻译|解释|改写|这句话|示例|文档|代码|正则|失败|报错|错误|无法|不能)"
+    r"|(?:summari[sz]e|translate|explain|rewrite|example|documentation|regex|failed|error|cannot|can't)",
+    re.IGNORECASE,
+)
+_HARDWARE_ENROLLMENT_GENERIC_RE = re.compile(
+    r"(?:硬件|设备|hardware|devices?|ハードウェア|デバイス|하드웨어|장치)",
+    re.IGNORECASE,
+)
+_HARDWARE_ENROLLMENT_TYPE_RES = (
+    (
+        "camera",
+        re.compile(
+            r"(?:摄像头|攝像頭|局域网相机|局域網相機|camera|カメラ|카메라|kamera|cam[ée]ra|c[áa]mara|telecamera)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "printer3d",
+        re.compile(
+            r"(?:3d\s*打印机|3d\s*印表機|三维打印机|三維印表機|3d\s*printer|3d\s*プリンター|3d\s*프린터|3d[-\s]*drucker|imprimante\s*3d|impresora\s*3d|stampante\s*3d)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "pc_node",
+        re.compile(
+            r"(?:电脑节点|電腦節點|电脑端|電腦端|这台电脑|這台電腦|我的电脑|我的電腦|电脑|電腦|pc\s*node|computer\s*node|desktop\s*node|\bcomputer\b|\bdesktop\b|コンピューターノード|컴퓨터\s*노드)",
+            re.IGNORECASE,
+        ),
+    ),
 )
 _VIDEO_EDIT_POLICY_VIOLATION_RETRIES = 2
 _VIDEO_EDIT_RESUME_TTL_SECONDS = 3 * 60 * 60
 _VIDEO_EDIT_RESUME_MAX_SESSIONS = 8
 _OPAQUE_ACTION_TOKEN_MAX_BYTES = 4096
+_CAMERA_RESUME_TTL_SECONDS = 5 * 60
+_CAMERA_RESUME_MAX_SESSIONS = 8
+_CAMERA_ANALYSIS_QUESTION_LIMIT = 4096
 _VIDEO_EDIT_MEMORY_ACTIONS = frozenset(
     {"plan-forget", "plan-hard", "plan-migrate", "plan-reset", "plan-success"}
 )
@@ -205,6 +313,9 @@ class _SkillDirectTaskContext:
     camera_applicable: bool = False
     camera_explicit: bool = False
     trusted_skill_slug: str = ""
+    camera_inventory_only: bool = False
+    printer3d_applicable: bool = False
+    printer3d_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -236,6 +347,19 @@ class _SkillDirectScope:
     # omit target while copying a helper operation into the memory call; the
     # pair keeps that compatibility strictly bound to the helper result.
     memory_payload_shape_authorizations: frozenset[tuple[str, str]] = frozenset()
+    # Camera actions are intentionally two-step: a request-bound ``list``
+    # establishes the opaque IDs visible to this exact turn, then one of those
+    # IDs may be used by snap/clip/doctor. Keeping the response-size-bounded
+    # set in the capability prevents the model from guessing a display-name
+    # suffix such as ``2`` and accidentally targeting a different device.
+    camera_ids: frozenset[str] = frozenset()
+    # Only the exact attachment returned by a successful request-bound snap
+    # may be inspected. This keeps the camera capability from becoming a
+    # general local-file vision grant.
+    camera_attachment_paths: frozenset[str] = frozenset()
+    # A fleet/status turn may only execute ``list``. This prevents a broad
+    # health check from silently capturing media the user did not request.
+    camera_inventory_only: bool = False
     command_format_retries: int = 1
     policy_violation_retries: int = _VIDEO_EDIT_POLICY_VIOLATION_RETRIES
     policy_exhausted: bool = False
@@ -276,12 +400,23 @@ class _VideoEditResumeGrant:
     source_turn_id: str
 
 
+@dataclass(frozen=True)
+class _CameraResumeGrant:
+    expires_at: float
+    source_turn_id: str
+
+
 _TRUSTED_PRESETS_SNAPSHOT: _TrustedPresetsSnapshot | None = None
 _PENDING_ATTESTATIONS: OrderedDict[str, _PendingSkillAttestation] = OrderedDict()
 _VideoEditResumeKey = tuple[str, str]
 _VIDEO_EDIT_RESUME_SESSIONS: OrderedDict[
     _VideoEditResumeKey,
     _VideoEditResumeGrant | float,
+] = OrderedDict()
+_CameraResumeKey = tuple[str, str]
+_CAMERA_RESUME_SESSIONS: OrderedDict[
+    _CameraResumeKey,
+    _CameraResumeGrant,
 ] = OrderedDict()
 _ATTESTATION_LOCK = threading.Lock()
 _SKILL_DIRECT_LOCK = threading.Lock()
@@ -330,6 +465,46 @@ def _current_skill_direct_resume_key() -> _VideoEditResumeKey | None:
     if not profile_home:
         return None
     return profile_home, session_id
+
+
+def _camera_continuation_intent(normalized: str) -> bool:
+    if not normalized or len(normalized) > 160:
+        return False
+    return bool(_CAMERA_CONTINUATION_INTENT_RE.fullmatch(normalized))
+
+
+def _camera_resume_sessions_locked(
+    *,
+    now: float,
+) -> OrderedDict[_CameraResumeKey, _CameraResumeGrant]:
+    expired = [
+        resume_key
+        for resume_key, grant in _CAMERA_RESUME_SESSIONS.items()
+        if grant.expires_at <= now
+    ]
+    for resume_key in expired:
+        _CAMERA_RESUME_SESSIONS.pop(resume_key, None)
+    while len(_CAMERA_RESUME_SESSIONS) > _CAMERA_RESUME_MAX_SESSIONS:
+        _CAMERA_RESUME_SESSIONS.popitem(last=False)
+    return _CAMERA_RESUME_SESSIONS
+
+
+def _remember_camera_resume_locked(
+    *,
+    turn_identity: _TurnIdentity,
+    now: float,
+) -> None:
+    resume_key = _current_skill_direct_resume_key()
+    if resume_key is None:
+        return
+    sessions = _camera_resume_sessions_locked(now=now)
+    sessions[resume_key] = _CameraResumeGrant(
+        expires_at=now + _CAMERA_RESUME_TTL_SECONDS,
+        source_turn_id=str(turn_identity[0] or "").strip(),
+    )
+    sessions.move_to_end(resume_key)
+    while len(sessions) > _CAMERA_RESUME_MAX_SESSIONS:
+        sessions.popitem(last=False)
 
 
 def _video_edit_continuation_intent(normalized: str) -> bool:
@@ -404,9 +579,15 @@ def _capture_trusted_execution_receipt(
     relative_path: str = _VIDEO_EDIT_SKILL_PATH,
 ) -> _TrustedExecutionReceipt | None:
     """Freeze request-bound execution claims before later tool boundaries."""
-    if relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH}:
+    if relative_path not in {
+        _VIDEO_EDIT_SKILL_PATH,
+        _CAMERA_SKILL_PATH,
+        *_PRINTER3D_SKILL_PATHS,
+    }:
         return None
     camera_skill = relative_path == _CAMERA_SKILL_PATH
+    printer3d_skill = relative_path in _PRINTER3D_SKILL_PATHS
+    hardware_skill = camera_skill or printer3d_skill
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
@@ -432,11 +613,11 @@ def _capture_trusted_execution_receipt(
             hardware_execution_token,
         )
 
-        business_action = business_execution_action() if not camera_skill else ""
+        business_action = business_execution_action() if not hardware_skill else ""
         bound_action_version = (
-            business_execution_action_version() if not camera_skill else ""
+            business_execution_action_version() if not hardware_skill else ""
         )
-        hardware_token = hardware_execution_token() if camera_skill else ""
+        hardware_token = hardware_execution_token() if hardware_skill else ""
         bound_execution_policy = execution_policy()
         gateway_session_key = execution_session_key() or get_session_env(
             "HERMES_SESSION_KEY"
@@ -455,7 +636,7 @@ def _capture_trusted_execution_receipt(
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
         action_token=(
-            _profile_value("ZETTLAB_AGENT_ACTION_TOKEN") if camera_skill else ""
+            _profile_value("ZETTLAB_AGENT_ACTION_TOKEN") if hardware_skill else ""
         ),
         hardware_execution_token=str(hardware_token or "").strip(),
         business_execution_action=str(business_action or "").strip(),
@@ -471,7 +652,7 @@ def _capture_trusted_execution_receipt(
         "agent_id": bool(receipt.agent_id),
         "turn_id": bool(receipt.turn_id),
     }
-    if camera_skill:
+    if hardware_skill:
         present.update(
             {
                 "action_token": bool(receipt.action_token),
@@ -492,14 +673,14 @@ def _capture_trusted_execution_receipt(
             present,
         )
         return None
-    if camera_skill and (
+    if hardware_skill and (
         not _is_opaque_action_token(receipt.action_token)
         or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
         is None
     ):
         logger.warning("zet_agent: hardware execution receipt is malformed")
         return None
-    if not camera_skill and (
+    if not hardware_skill and (
         re.fullmatch(r"[0-9a-f]{64}", receipt.business_execution_action)
         is None
         or receipt.business_execution_action_version != "1"
@@ -508,7 +689,7 @@ def _capture_trusted_execution_receipt(
         logger.warning("zet_agent: business execution action is malformed")
         return None
     if (
-        not camera_skill
+        not hardware_skill
         and receipt.execution_policy == "silent_automation"
         and not receipt.business_execution_action
     ):
@@ -593,6 +774,11 @@ def trusted_camera_runtime_receipt() -> Mapping[str, str]:
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
     }
+
+
+def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
+    """Return the private one-operation receipt for signed printer helpers."""
+    return trusted_camera_runtime_receipt()
 
 
 def trusted_video_edit_manifest_digests() -> Mapping[str, str]:
@@ -934,6 +1120,10 @@ def _capture_trusted_presets_snapshot(
             expected_trusted_skill_hashes[_CAMERA_SKILL_PATH] = (
                 expected_camera_sha256
             )
+        for printer_skill_path in _PRINTER3D_SKILL_PATHS:
+            expected_printer_sha256 = expected_hashes.get(printer_skill_path)
+            if expected_printer_sha256:
+                expected_trusted_skill_hashes[printer_skill_path] = expected_printer_sha256
         video_edit_scripts_root = Path(_VIDEO_EDIT_SKILL_PATH).parent / "scripts"
         video_edit_script_digests = tuple(sorted(
             (relative_path, digest)
@@ -1363,6 +1553,7 @@ def _skill_direct_task_context(
         normalized_skill_slug == "video-edit-workflow-mini"
     )
     camera_transport_selection = normalized_skill_slug == "camsnap"
+    printer3d_transport_selection = normalized_skill_slug in {"printer3d", "printer3d-control"}
     # A slash token inside user-authored text is display/content, not a trusted
     # transport selection. Ignore the token itself for semantic intent while
     # preserving the remaining natural-language request.
@@ -1401,19 +1592,56 @@ def _skill_direct_task_context(
     )
     if resumed and resume_key is not None and resume_key in resume_sessions:
         resume_sessions.move_to_end(resume_key)
+    camera_resume_sessions = _camera_resume_sessions_locked(now=now)
+    camera_resume_key = _current_skill_direct_resume_key()
+    camera_continuation = _camera_continuation_intent(intent_normalized)
+    camera_resumed = bool(
+        not camera_transport_selection
+        and camera_continuation
+        and camera_resume_key is not None
+        and camera_resume_key in camera_resume_sessions
+    )
+    if camera_resumed and camera_resume_key is not None:
+        camera_resume_sessions.move_to_end(camera_resume_key)
     task_binding = (
         f"skill:{normalized_skill_slug}\n{normalized}"
-        if explicit_transport_selection or camera_transport_selection
+        if explicit_transport_selection or camera_transport_selection or printer3d_transport_selection
         else normalized
+    )
+    hardware_inventory = bool(
+        _HARDWARE_INVENTORY_INTENT_RE.search(intent_normalized)
     )
     return _SkillDirectTaskContext(
         task_sha256=hashlib.sha256(task_binding.encode("utf-8")).hexdigest(),
         turn_identity=_current_skill_direct_turn_identity(),
         video_edit_applicable=explicit or resumed,
         video_edit_explicit=explicit,
-        camera_applicable=camera_transport_selection or bool(_CAMERA_INTENT_RE.search(normalized)),
+        camera_applicable=(
+            camera_transport_selection
+            or bool(_CAMERA_INTENT_RE.search(intent_normalized))
+            or bool(_CAMERA_INVENTORY_INTENT_RE.search(intent_normalized))
+            or hardware_inventory
+            or bool(
+                _CAMERA_DIRECT_SNAPSHOT_INTENT_RE.fullmatch(intent_normalized)
+            )
+            or camera_resumed
+        ),
         camera_explicit=camera_transport_selection,
         trusted_skill_slug=normalized_skill_slug,
+        camera_inventory_only=bool(
+            not camera_transport_selection
+            and (
+                _CAMERA_INVENTORY_INTENT_RE.search(intent_normalized)
+                or hardware_inventory
+            )
+            and not _CAMERA_INTENT_RE.search(intent_normalized)
+        ),
+        printer3d_applicable=(
+            printer3d_transport_selection
+            or bool(_PRINTER3D_INTENT_RE.search(normalized))
+            or hardware_inventory
+        ),
+        printer3d_explicit=printer3d_transport_selection,
     )
 
 
@@ -1484,6 +1712,8 @@ def _trusted_skill_view_refresh_required(
         task_paths.add(_VIDEO_EDIT_SKILL_PATH)
     if task.camera_applicable:
         task_paths.add(_CAMERA_SKILL_PATH)
+    if task.printer3d_applicable:
+        task_paths.update(_PRINTER3D_SKILL_PATHS)
     if requested_path not in task_paths:
         return False
 
@@ -1545,7 +1775,11 @@ def _activate_trusted_skill_scope(
     """Activate the existing request-bound scope after a trusted byte read."""
     if (getattr(agent, "platform", "") or "") != "zet_agent":
         return False
-    if relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH}:
+    if relative_path not in {
+        _VIDEO_EDIT_SKILL_PATH,
+        _CAMERA_SKILL_PATH,
+        *_PRINTER3D_SKILL_PATHS,
+    }:
         return False
 
     task = getattr(agent, "_zet_agent_skill_direct_task", None)
@@ -1559,6 +1793,10 @@ def _activate_trusted_skill_scope(
             or (
                 relative_path == _CAMERA_SKILL_PATH
                 and task.camera_applicable
+            )
+            or (
+                relative_path in _PRINTER3D_SKILL_PATHS
+                and task.printer3d_applicable
             )
         )
     )
@@ -1604,6 +1842,8 @@ def _activate_trusted_skill_scope(
     allowed_tools = (
         _CAMERA_DIRECT_TOOLS
         if relative_path == _CAMERA_SKILL_PATH
+        else _PRINTER3D_DIRECT_TOOLS
+        if relative_path in _PRINTER3D_SKILL_PATHS
         else _VIDEO_EDIT_DIRECT_TOOLS
     )
 
@@ -1615,6 +1855,10 @@ def _activate_trusted_skill_scope(
             turn_identity=current_turn_identity,
             allowed_tools=allowed_tools,
             execution_receipt=execution_receipt,
+            camera_inventory_only=bool(
+                relative_path == _CAMERA_SKILL_PATH
+                and task.camera_inventory_only
+            ),
         )
         _activate_execution_policy_tools(agent, allowed_tools)
     logger.info(
@@ -1759,7 +2003,12 @@ def _camera_runtime_argv(
     return list(argv)
 
 
-def _camera_command_policy(function_args: Mapping[str, Any]) -> bool:
+def _camera_command_policy(
+    function_args: Mapping[str, Any],
+    *,
+    camera_ids: frozenset[str] = frozenset(),
+    inventory_only: bool = False,
+) -> bool:
     if any(
         bool(function_args.get(field))
         for field in (
@@ -1768,11 +2017,161 @@ def _camera_command_policy(function_args: Mapping[str, Any]) -> bool:
             "notify_on_complete",
             "pty",
             "watch_patterns",
-            "workdir",
         )
     ):
         return False
-    return _camera_runtime_argv(function_args) is not None
+    from tools.runtime_workdir import AGENT_OUTPUT_WORKDIR
+
+    workdir = function_args.get("workdir")
+    if workdir not in (None, "", AGENT_OUTPUT_WORKDIR):
+        return False
+    argv = _camera_runtime_argv(function_args)
+    if argv is None:
+        return False
+    arguments = argv[2:]
+    if arguments == ["list"]:
+        return True
+    if inventory_only:
+        return False
+    return bool(
+        len(arguments) >= 3
+        and arguments[1] == "--camera-id"
+        and arguments[2] in camera_ids
+    )
+
+
+def _camera_ids_from_terminal_result(
+    result: Mapping[str, Any],
+) -> frozenset[str] | None:
+    """Extract one response-size-bounded, validated camera-ID snapshot."""
+    output = result.get("output")
+    if not isinstance(output, str) or len(output.encode("utf-8")) > 1024 * 1024:
+        return None
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError):
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    cameras = data.get("cameras") if isinstance(data, dict) else None
+    if (
+        not isinstance(data, dict)
+        or data.get("action") != "list"
+        or data.get("status") != "ok"
+        or not isinstance(cameras, list)
+    ):
+        return None
+    camera_ids: set[str] = set()
+    for camera in cameras:
+        camera_id = camera.get("camera_id") if isinstance(camera, dict) else None
+        if (
+            not isinstance(camera_id, str)
+            or _CAMERA_ID_RE.fullmatch(camera_id) is None
+        ):
+            return None
+        camera_ids.add(camera_id)
+    return frozenset(camera_ids)
+
+
+def _trusted_camera_attachment_path(raw_path: Any) -> str | None:
+    """Resolve one regular snapshot under the active profile output root."""
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    try:
+        from tools.runtime_workdir import agent_output_dir
+
+        output_root = agent_output_dir()
+        if not output_root:
+            return None
+        candidate = os.path.abspath(raw_path.strip())
+        root = os.path.realpath(output_root)
+        resolved = os.path.realpath(candidate)
+        if os.path.commonpath((root, resolved)) != root:
+            return None
+        value = os.lstat(candidate)
+        if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+            return None
+        return resolved
+    except (OSError, ValueError):
+        return None
+
+
+def _camera_attachment_path_from_terminal_result(
+    result: Mapping[str, Any],
+) -> str | None:
+    """Extract the exact trusted attachment emitted by one successful snap."""
+    output = result.get("output")
+    if not isinstance(output, str) or len(output.encode("utf-8")) > 1024 * 1024:
+        return None
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError):
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if (
+        not isinstance(data, dict)
+        or data.get("action") != "snap"
+        or data.get("status") != "ok"
+    ):
+        return None
+    return _trusted_camera_attachment_path(data.get("attachment_path"))
+
+
+def _camera_vision_policy(
+    function_args: Mapping[str, Any],
+    *,
+    attachment_paths: frozenset[str],
+) -> bool:
+    """Allow one bounded question about only the current trusted snapshot."""
+    if set(function_args) != {"image_url", "question"}:
+        return False
+    image_url = function_args.get("image_url")
+    question = function_args.get("question")
+    trusted_image_path = _trusted_camera_attachment_path(image_url)
+    return bool(
+        isinstance(image_url, str)
+        and image_url in attachment_paths
+        and trusted_image_path == image_url
+        and isinstance(question, str)
+        and question.strip()
+        and len(question) <= _CAMERA_ANALYSIS_QUESTION_LIMIT
+    )
+
+
+def _printer3d_runtime_argv(function_args: Mapping[str, Any]) -> list[str] | None:
+    command = function_args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        from tools.terminal_tool import _parse_printer3d_runtime_command
+
+        parsed = _parse_printer3d_runtime_command(command)
+    except Exception:
+        return None
+    argv = getattr(parsed, "argv", None)
+    if not isinstance(argv, list) or len(argv) < 3 or not all(isinstance(value, str) for value in argv):
+        return None
+    return list(argv)
+
+
+def _printer3d_command_policy(
+    function_args: Mapping[str, Any],
+    *,
+    relative_path: str,
+) -> bool:
+    if any(
+        bool(function_args.get(field))
+        for field in ("background", "force", "notify_on_complete", "pty", "watch_patterns", "workdir")
+    ):
+        return False
+    argv = _printer3d_runtime_argv(function_args)
+    if argv is None:
+        return False
+    script_name = os.path.basename(argv[1])
+    if relative_path == "skills/printer3d/SKILL.md":
+        return script_name == "printer3d_connector.py"
+    if relative_path == "skills/printer3d-control/SKILL.md":
+        return script_name == "printer3d_control.py"
+    return False
 
 
 def _video_edit_command_policy(
@@ -2275,6 +2674,18 @@ def trusted_skill_operation_block_message(
                     "scope minted by the attested `camsnap` skill_view result. "
                     "Load that trusted skill and retry the exact operation."
                 )
+            if (
+                function_name == "terminal"
+                and _printer3d_runtime_argv(function_args) is not None
+            ):
+                logger.warning(
+                    "zet_agent: blocked printer3d runtime command without a current trusted scope"
+                )
+                return (
+                    "Trusted 3D-printer commands require a current request-bound "
+                    "scope minted by an attested printer skill. Load the matching "
+                    "trusted skill and retry the exact operation."
+                )
             return None
 
         if scope.policy_exhausted:
@@ -2298,7 +2709,16 @@ def trusted_skill_operation_block_message(
                 allowed = False
             else:
                 if scope.relative_path == _CAMERA_SKILL_PATH:
-                    allowed = _camera_command_policy(normalized_args)
+                    allowed = _camera_command_policy(
+                        normalized_args,
+                        camera_ids=scope.camera_ids,
+                        inventory_only=scope.camera_inventory_only,
+                    )
+                elif scope.relative_path in _PRINTER3D_SKILL_PATHS:
+                    allowed = _printer3d_command_policy(
+                        normalized_args,
+                        relative_path=scope.relative_path,
+                    )
                 else:
                     allowed, may_authorize_memory = _video_edit_command_policy(
                         normalized_args
@@ -2311,6 +2731,26 @@ def trusted_skill_operation_block_message(
                 and scope.execution_receipt is not None
                 and authorized_args_sha256
             )
+        elif allowed and function_name == "vision_analyze":
+            normalized_args = _normalized_registry_tool_args(
+                function_name,
+                function_args,
+            )
+            if normalized_args is None:
+                allowed = False
+            else:
+                allowed = bool(
+                    scope.relative_path == _CAMERA_SKILL_PATH
+                    and scope.execution_receipt is not None
+                    and _camera_vision_policy(
+                        normalized_args,
+                        attachment_paths=scope.camera_attachment_paths,
+                    )
+                )
+                authorized_args_sha256 = _canonical_tool_args_sha256(
+                    normalized_args
+                )
+                allowed = bool(allowed and authorized_args_sha256)
         elif allowed and function_name == "memory":
             memory_digest, authorized_memory_target = _memory_authorization_for_scope(
                 function_args,
@@ -2367,6 +2807,27 @@ def trusted_skill_operation_block_message(
                     scope,
                     policy_violation_retries=scope.policy_violation_retries - 1,
                 )
+                if scope.relative_path == _CAMERA_SKILL_PATH:
+                    logger.warning(
+                        "zet_agent: blocked out-of-policy trusted camera operation "
+                        "and kept one bounded trusted retry"
+                    )
+                    if function_name == "vision_analyze":
+                        return (
+                            "The trusted camera analysis was blocked before "
+                            "execution. Analyze only the exact attachment_path "
+                            "returned by the current turn's successful snapshot, "
+                            "with one bounded visual question. This is a "
+                            "snapshot-binding error, not a Connector permission "
+                            "failure."
+                        )
+                    return (
+                        "The trusted camera operation was blocked before execution. "
+                        "Run the pinned camera helper directly with no prerequisite "
+                        "terminal command and no custom workdir. Start with `list`, "
+                        "then use only a camera_id returned by that list. This is a "
+                        "command-policy error, not a Connector permission failure."
+                    )
                 logger.warning(
                     "zet_agent: blocked out-of-policy trusted video operation and "
                     "kept one bounded trusted retry"
@@ -2383,8 +2844,9 @@ def trusted_skill_operation_block_message(
                 policy_exhausted=True,
             )
             logger.warning(
-                "zet_agent: exhausted bounded trusted video corrections before "
+                "zet_agent: exhausted bounded trusted %s corrections before "
                 "out-of-policy tool %s",
+                "camera" if scope.relative_path == _CAMERA_SKILL_PATH else "video",
                 function_name or "<missing>",
             )
             return (
@@ -2508,6 +2970,7 @@ def _claim_trusted_terminal_dispatch(
             if (
                 _video_edit_runtime_argv(function_args) is not None
                 or _camera_runtime_argv(function_args) is not None
+                or _printer3d_runtime_argv(function_args) is not None
             ):
                 return None, (
                     "Trusted runtime commands require a current "
@@ -2547,7 +3010,17 @@ def _claim_trusted_terminal_dispatch(
         if normalized_args is None:
             allowed, may_authorize_memory = False, False
         elif scope.relative_path == _CAMERA_SKILL_PATH:
-            allowed = _camera_command_policy(normalized_args)
+            allowed = _camera_command_policy(
+                normalized_args,
+                camera_ids=scope.camera_ids,
+                inventory_only=scope.camera_inventory_only,
+            )
+            may_authorize_memory = False
+        elif scope.relative_path in _PRINTER3D_SKILL_PATHS:
+            allowed = _printer3d_command_policy(
+                normalized_args,
+                relative_path=scope.relative_path,
+            )
             may_authorize_memory = False
         else:
             allowed, may_authorize_memory = _video_edit_command_policy(
@@ -2576,6 +3049,77 @@ def _claim_trusted_terminal_dispatch(
             execution_claimed=True,
         )
         return receipt, None
+
+
+def _claim_trusted_camera_vision_dispatch(
+    agent: Any,
+    function_args: Mapping[str, Any],
+) -> str | None:
+    """Revalidate one exact snapshot-analysis call after all middleware."""
+    turn_identity = _current_skill_direct_turn_identity()
+    with _SKILL_DIRECT_LOCK:
+        operation = getattr(agent, "_zet_agent_skill_direct_operation", None)
+        if not isinstance(operation, _SkillDirectOperation):
+            return None
+        if (
+            operation.function_name != "vision_analyze"
+            or operation.execution_claimed
+        ):
+            agent._zet_agent_skill_direct_operation = None
+            return (
+                "The trusted camera analysis operation was already claimed "
+                "or belongs to another tool. It was revoked before dispatch."
+            )
+
+        scope = operation.scope
+        task = getattr(agent, "_zet_agent_skill_direct_task", None)
+        if (
+            turn_identity is None
+            or scope.turn_identity != turn_identity
+            or scope.relative_path != _CAMERA_SKILL_PATH
+            or not isinstance(task, _SkillDirectTaskContext)
+            or task.turn_identity != turn_identity
+            or task.task_sha256 != scope.task_sha256
+        ):
+            agent._zet_agent_skill_direct_operation = None
+            return (
+                "The trusted camera analysis operation belongs to another "
+                "task-local turn. It was revoked before dispatch."
+            )
+
+        normalized_args = _normalized_registry_tool_args(
+            "vision_analyze",
+            function_args,
+        )
+        final_digest = (
+            _canonical_tool_args_sha256(normalized_args)
+            if normalized_args is not None
+            else ""
+        )
+        if (
+            normalized_args is None
+            or not _camera_vision_policy(
+                normalized_args,
+                attachment_paths=scope.camera_attachment_paths,
+            )
+            or not final_digest
+            or final_digest != operation.authorized_args_sha256
+        ):
+            agent._zet_agent_skill_direct_operation = None
+            logger.warning(
+                "zet_agent: blocked trusted camera analysis args changed after "
+                "exact authorization"
+            )
+            return (
+                "The trusted camera analysis arguments changed after exact "
+                "authorization. The operation was revoked before dispatch."
+            )
+
+        agent._zet_agent_skill_direct_operation = replace(
+            operation,
+            execution_claimed=True,
+        )
+        return None
 
 
 def dispatch_trusted_skill_operation(
@@ -2612,6 +3156,11 @@ def dispatch_trusted_skill_operation(
     block_message: str | None = None
     if function_name == "terminal":
         receipt, block_message = _claim_trusted_terminal_dispatch(
+            agent,
+            function_args,
+        )
+    elif function_name == "vision_analyze":
+        block_message = _claim_trusted_camera_vision_dispatch(
             agent,
             function_args,
         )
@@ -2728,16 +3277,15 @@ def _rearm_skill_direct_scope_after_success(
             except (TypeError, ValueError):
                 result = None
             exit_code = result.get("exit_code") if isinstance(result, dict) else None
-            runtime_direct_field = (
-                "camera_runtime_direct"
-                if scope.relative_path == _CAMERA_SKILL_PATH
-                else "video_edit_runtime_direct"
-            )
-            runtime_blocked_field = (
-                "camera_runtime_blocked"
-                if scope.relative_path == _CAMERA_SKILL_PATH
-                else "video_edit_runtime_blocked"
-            )
+            if scope.relative_path == _CAMERA_SKILL_PATH:
+                runtime_direct_field = "camera_runtime_direct"
+                runtime_blocked_field = "camera_runtime_blocked"
+            elif scope.relative_path in _PRINTER3D_SKILL_PATHS:
+                runtime_direct_field = "printer3d_runtime_direct"
+                runtime_blocked_field = "printer3d_runtime_blocked"
+            else:
+                runtime_direct_field = "video_edit_runtime_direct"
+                runtime_blocked_field = "video_edit_runtime_blocked"
             successful = bool(
                 isinstance(result, dict)
                 and result.get(runtime_direct_field) is True
@@ -2765,6 +3313,16 @@ def _rearm_skill_direct_scope_after_success(
                 )
                 else frozenset()
             )
+            listed_camera_ids = (
+                _camera_ids_from_terminal_result(result)
+                if successful and scope.relative_path == _CAMERA_SKILL_PATH
+                else None
+            )
+            camera_attachment_path = (
+                _camera_attachment_path_from_terminal_result(result)
+                if successful and scope.relative_path == _CAMERA_SKILL_PATH
+                else None
+            )
             allowed_tools = scope.allowed_tools - {"memory"}
             if memory_hashes:
                 allowed_tools = allowed_tools | {"memory"}
@@ -2773,10 +3331,25 @@ def _rearm_skill_direct_scope_after_success(
                 allowed_tools=allowed_tools,
                 memory_payload_sha256=memory_hashes,
                 memory_payload_shape_authorizations=memory_shape_authorizations,
+                camera_ids=(
+                    listed_camera_ids
+                    if listed_camera_ids is not None
+                    else scope.camera_ids
+                ),
+                camera_attachment_paths=(
+                    frozenset({camera_attachment_path})
+                    if camera_attachment_path is not None
+                    else scope.camera_attachment_paths
+                ),
                 command_format_retries=1,
                 policy_violation_retries=_VIDEO_EDIT_POLICY_VIOLATION_RETRIES,
                 policy_exhausted=False,
             )
+            if camera_attachment_path is not None:
+                _remember_camera_resume_locked(
+                    turn_identity=turn_identity,
+                    now=time.monotonic(),
+                )
         if not successful:
             return False
 
@@ -2788,6 +3361,97 @@ def request_response_mode(agent: Any) -> str:
     """Return the only structured response mode owned by the App plan flow."""
     mode = str(getattr(agent, "_zet_agent_response_mode", "") or "").strip().lower()
     return "plan" if mode == "plan" else ""
+
+
+def _hardware_enrollment_requested_types(user_message: Any) -> tuple[str, ...]:
+    """Recognize only short, direct hardware enrollment requests.
+
+    Skill selection remains the primary semantic path. This bounded classifier
+    is a delivery guard for models that answer with settings prose instead of
+    the credential-free client intent promised by ``connector-setup``.
+    """
+    task_text, _ = _task_text_and_video_asset(user_message)
+    normalized = " ".join(_strip_gateway_model_switch_note(task_text).split())
+    # A connected-state noun phrase is not an enrollment action.  Remove it
+    # before matching action verbs so requests such as “查看硬件连接中的电脑” or
+    # “show connected computers” cannot append a setup card after a successful
+    # PC-file operation.  Explicit actions such as “重新连接电脑” remain intact.
+    action_text = _HARDWARE_ENROLLMENT_CONNECTION_STATE_RE.sub(" ", normalized)
+    if (
+        not normalized
+        or len(normalized) > 320
+        or not _HARDWARE_ENROLLMENT_ACTION_RE.search(action_text)
+        or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
+    ):
+        return ()
+
+    positioned_types: list[tuple[int, str]] = []
+    for hardware_type, pattern in _HARDWARE_ENROLLMENT_TYPE_RES:
+        match = pattern.search(normalized)
+        if match is not None:
+            positioned_types.append((match.start(), hardware_type))
+    if positioned_types:
+        positioned_types.sort(key=lambda item: item[0])
+        return tuple(hardware_type for _, hardware_type in positioned_types)
+    if _HARDWARE_ENROLLMENT_GENERIC_RE.search(normalized):
+        return ("camera", "printer3d", "pc_node")
+    return ()
+
+
+def ensure_hardware_enrollment_intent(
+    agent: Any,
+    *,
+    user_message: Any,
+    response_text: str,
+    completed: bool,
+    failed: bool,
+    interrupted: bool,
+    structured_output: bool,
+) -> str:
+    """Append a canonical, secret-free hardware enrollment intent when needed.
+
+    The transform never discovers hardware or accepts addresses/credentials. It
+    only gives first-party App/Web clients enough information to render the
+    explicit user-confirmation card. Existing model-authored intent blocks are
+    replaced so malformed or credential-bearing fields cannot suppress the
+    trusted canonical card.
+    """
+    text = str(response_text or "")
+    if (
+        (getattr(agent, "platform", "") or "") != "zet_agent"
+        or not completed
+        or failed
+        or interrupted
+        or structured_output
+        or not text.strip()
+    ):
+        return text
+    visible_text = _HARDWARE_ENROLLMENT_BLOCK_RE.sub("", text)
+    visible_text = _LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE.sub("", visible_text)
+    removed_model_intent = visible_text != text
+    if removed_model_intent:
+        visible_text = visible_text.strip()
+    requested_types = _hardware_enrollment_requested_types(user_message)
+    if not requested_types:
+        # A model-authored setup block is not authoritative. Remove stale or
+        # over-eager hardware cards from status/usage turns even when no new
+        # canonical enrollment intent needs to be appended.
+        return visible_text if removed_model_intent else text
+
+    payload = json.dumps(
+        {
+            "schema_version": "1",
+            "kind": "hardware",
+            "requested_types": list(requested_types),
+            "discovery_requested": True,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return (
+        f"{visible_text}\n\n```{_HARDWARE_ENROLLMENT_FENCE}\n"
+        f"{payload}\n```"
+    )
 
 
 def reset_trusted_skill_execution(

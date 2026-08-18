@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import json
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,17 @@ PLUGIN_PATH = (
 
 
 def _load_plugin():
+    # Import the leaf response-filter module without executing gateway/__init__.py,
+    # whose full runtime dependency graph is unrelated to this plugin unit test.
+    if "gateway.response_filters" not in sys.modules:
+        response_filters_path = PLUGIN_PATH.parents[2] / "gateway" / "response_filters.py"
+        response_filters_spec = importlib.util.spec_from_file_location(
+            "gateway.response_filters", response_filters_path
+        )
+        response_filters = importlib.util.module_from_spec(response_filters_spec)
+        assert response_filters_spec.loader is not None
+        response_filters_spec.loader.exec_module(response_filters)
+        sys.modules["gateway.response_filters"] = response_filters
     spec = importlib.util.spec_from_file_location(
         "creation_governor_plugin", PLUGIN_PATH
     )
@@ -29,7 +41,9 @@ def _load_plugin():
 
 def _candidate(
     *,
-    decision="agent",
+    # agent 品类在本部署禁用（AGENT_RECOMMENDATION_ENABLED=False，落地工具缺失），
+    # 通用用例改用 skill 承载"任一创建品类"的语义，不影响被测行为。
+    decision="skill",
     suggested_name="Google Ads Analyst",
     reason="Retained account context and judgment will improve future analysis.",
     confidence=0.82,
@@ -55,9 +69,9 @@ def _recommendation_response(
         "type": "creation_recommendation_response",
         "action": action,
         "proposal_id": proposal_id,
-        "creation_type": "agent",
+        "creation_type": "skill",
         "title": title,
-        "dedup_key": "agent:google-ads-analyst",
+        "dedup_key": "skill:google-ads-analyst",
         "evidence_turn_ids": ["evidence-1"],
     }
     return (
@@ -131,6 +145,243 @@ def _decode_envelope(text):
     encoded = text.split(prefix, 1)[1].split("-->", 1)[0].strip()
     encoded += "=" * (-len(encoded) % 4)
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+
+
+def _onboarding_welcome_marker(payload):
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"<!--zettlab-onboarding-welcome {encoded}-->"
+
+
+def test_onboarding_profile_skips_governor_checkpoint_entirely():
+    plugin = _load_plugin()
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    result = plugin._on_pre_llm_call(
+        profile_name="onboarding",
+        session_id="onboarding-session",
+        user_message="Frank",
+        conversation_history=[],
+    )
+
+    assert result is None
+    assert llm.calls == []
+    assert plugin._session_states == {}
+
+
+def test_final_onboarding_welcome_emits_existing_cards_without_auxiliary_model(monkeypatch):
+    plugin = _load_plugin()
+    llm = _FakeLlm([])
+    context = _Context(llm)
+    emitted = []
+    context.emit_attachment = lambda attachment: emitted.append(attachment) or True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": ["feishu", "wecom"],
+            "channels_recommendable": ["feishu", "wecom"],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {
+                "title": "持续跟进产品进展",
+                "reason": "让变化中的进展保持更新。",
+                "proposalText": "要现在设置吗？",
+            },
+            "artifact": {
+                "title": "产品工作台",
+                "reason": "集中查看资料和进展。",
+                "artifactType": "app",
+            },
+        }
+    )
+
+    hook_context = plugin._on_pre_llm_call(
+        # Older mixed deployments may still route the final handoff through the
+        # onboarding profile; the explicit marker is the only allowed exception.
+        profile_name="onboarding",
+        session_id="welcome-session",
+        turn_id="turn-welcome",
+        user_message=f"Please welcome the user.\n{marker}",
+        conversation_history=[],
+    )
+    transformed = plugin._transform_llm_output(
+        session_id="welcome-session",
+        response_text="Frank，很高兴认识你。",
+        completed=True,
+    )
+
+    assert llm.calls == []
+    assert "final onboarding welcome" in hook_context["context"]
+    assert [attachment["kind"] for attachment in emitted] == [
+        "channel.connect",
+        "artifact.recommendation",
+    ]
+    assert emitted[0]["payload"] == {"channel_kind": "feishu"}
+    assert emitted[1]["payload"]["artifact_type"] == "app"
+    task = _decode_envelope(transformed)
+    assert task["creation_type"] == "task"
+    assert task["title"] == "持续跟进产品进展"
+    assert plugin._session_states[next(iter(plugin._session_states))]["last_proposal"]["proposal_id"] == task["proposal_id"]
+
+
+def test_onboarding_welcome_channel_is_omitted_when_inventory_has_no_supported_target(monkeypatch):
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    emitted = []
+    context.emit_attachment = lambda attachment: emitted.append(attachment) or True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": ["feishu"],
+            "channels_available": [],
+            "channels_recommendable": [],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {"title": "跟进进展", "reason": "持续更新。", "proposalText": "要设置吗？"},
+            "artifact": {"title": "工作台", "reason": "集中查看。", "artifactType": "app"},
+        }
+    )
+
+    pre = plugin._on_pre_llm_call(
+        session_id="no-channel", user_message=marker, conversation_history=[]
+    )
+    transformed = plugin._transform_llm_output(
+        session_id="no-channel", response_text="欢迎，随时可以开始。", completed=True
+    )
+
+    assert [attachment["kind"] for attachment in emitted] == ["artifact.recommendation"]
+    assert _decode_envelope(transformed)["creation_type"] == "task"
+    # 不发卡还不够：App 的 brief 是在拿到实时 inventory 之前写好的，已经命令模型
+    # 「引导用户点击本消息末尾的 IM 连接卡」。必须在同一轮显式否决，否则新用户
+    # 的第一条消息就指向一个永远不会出现的卡片。
+    assert "NO IM connection card will be attached this turn" in pre["context"]
+    assert "do not tell them to tap a connection card" in pre["context"]
+    # 否决只针对「指向卡片」，不禁止解释 IM 的价值——那是 onboarding 需求本身，
+    # 没有卡片时依然成立。
+    assert "You may still briefly explain what connecting an IM channel would do" in pre["context"]
+
+
+def test_onboarding_welcome_keeps_channel_promotion_when_target_exists(monkeypatch):
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    context.emit_attachment = lambda attachment: True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": ["feishu"],
+            "channels_recommendable": ["feishu"],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {"title": "跟进进展", "reason": "持续更新。", "proposalText": "要设置吗？"},
+        }
+    )
+
+    pre = plugin._on_pre_llm_call(
+        session_id="has-channel", user_message=marker, conversation_history=[]
+    )
+
+    assert "NO IM connection card" not in pre["context"]
+
+
+def test_onboarding_welcome_emits_real_agent_template_cards(monkeypatch):
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    emitted = []
+    context.emit_attachment = lambda attachment: emitted.append(attachment) or True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": [],
+            "channels_recommendable": [],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": True},
+            "task": {"title": "跟进 SEO", "reason": "持续更新。", "proposalText": "要设置吗？"},
+            "agentTemplates": [
+                {
+                    "templateId": "cn/seo-advisor",
+                    "title": "SEO 顾问",
+                    "reason": "持续完成技术 SEO 审计和内容优化。",
+                },
+                {
+                    "templateId": "cn/competitor-analysis",
+                    "title": "竞品分析",
+                    "reason": "持续跟踪和比较竞品。",
+                },
+            ],
+        }
+    )
+
+    plugin._on_pre_llm_call(
+        session_id="agent-template-welcome",
+        turn_id="turn-template",
+        user_message=marker,
+        conversation_history=[],
+    )
+    transformed = plugin._transform_llm_output(
+        session_id="agent-template-welcome",
+        response_text="欢迎回来。",
+        completed=True,
+    )
+
+    assert [attachment["kind"] for attachment in emitted] == [
+        "agent-template.recommendation",
+        "agent-template.recommendation",
+    ]
+    assert emitted[0]["payload"] == {
+        "template_id": "cn/seo-advisor",
+        "title": "SEO 顾问",
+        "reason": "持续完成技术 SEO 审计和内容优化。",
+    }
+    assert emitted[0]["actions"] == [
+        {"id": "dismiss"},
+        {"id": "open", "style": "primary"},
+    ]
+    assert _decode_envelope(transformed)["creation_type"] == "task"
 
 
 def test_first_turn_and_every_third_turn_run_bounded_json_checks():
@@ -302,29 +553,32 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
     )
     assert transformed.startswith("Campaign A had the strongest ROAS.")
     assert "<!--creation-recommendation:start " in transformed
-    assert "This could become a reusable Agent" in transformed
+    assert "This could become a reusable Skill" in transformed
     payload = _decode_envelope(transformed)
     assert payload == {
         "version": 1,
         "type": "creation_recommendation",
         "proposal_id": payload["proposal_id"],
         "expires_at": payload["expires_at"],
-        "creation_type": "agent",
+        "creation_type": "skill",
         "title": "Google Ads Analyst",
+        # 保留 main 新增的 proposal_text / action_label / action_consequence 三个
+        # 字段，但措辞取 skill：agent 品类在本部署禁用（见 _candidate 注释），
+        # 这条链路实际产出的是 Skill 文案。
         "reason": (
             "Retained account context and judgment will improve future analysis. "
-            "Accepting opens the native assistant creation flow and asks you to "
+            "Accepting opens the native Skill creation flow and asks you to "
             "confirm the configuration before creation."
         ),
         "proposal_text": (
             "Would you like me to create this Google Ads Analyst Agent?"
         ),
-        "action_label": "Create assistant",
+        "action_label": "Create Skill",
         "action_consequence": (
-            "Accepting opens the native assistant creation flow and asks you to "
+            "Accepting opens the native Skill creation flow and asks you to "
             "confirm the configuration before creation."
         ),
-        "dedup_key": "agent:google-ads-analyst",
+        "dedup_key": "skill:google-ads-analyst",
         "confidence": 0.82,
         "evidence_turn_ids": ["evidence-1"],
         "source_turn_id": "turn-1",
@@ -534,7 +788,7 @@ def test_dismissal_latches_the_same_semantic_candidate():
         session_id="dismiss-session",
         response_text="分析完成。",
     )
-    assert "可以沉淀为一个 Agent" in shown
+    assert "可以沉淀为一个 Skill" in shown
 
     action = plugin._on_pre_llm_call(
         session_id="dismiss-session",
@@ -719,7 +973,7 @@ def test_optional_tool_accepts_none_and_rejects_invalid_or_low_confidence():
     ) == {"status": "no_candidate", "reason": "none"}
     assert json.loads(
         plugin._detect_creation_opportunity(
-            _candidate(decision="artifact"), session_id="invalid"
+            _candidate(decision="workflow"), session_id="invalid"
         )
     ) == {"status": "not_proposed", "reason": "unsupported_creation_type"}
     assert json.loads(
@@ -766,12 +1020,17 @@ def test_tool_schema_is_zero_shot_and_supports_all_outcomes():
     assert "Missing connectors" in description
     assert "Meta" not in description
     assert "AI news" not in description
-    assert schema["parameters"]["properties"]["decision"]["enum"] == [
-        "agent",
+    # agent 品类由 AGENT_RECOMMENDATION_ENABLED 开关控制：关闭时不出现在 enum 里，
+    # 模型看不到这个选项（事后硬闸另有一道）。
+    assert schema["parameters"]["properties"]["decision"]["enum"] == (
+        (["agent"] if plugin.AGENT_RECOMMENDATION_ENABLED else []) + [
         "skill",
         "task",
+        "channel",
+        "connector",
+        "artifact",
         "none",
-    ]
+    ])
 
 
 def test_registers_region_safe_fast_auxiliary_model_alias():
@@ -792,7 +1051,7 @@ def test_registers_region_safe_fast_auxiliary_model_alias():
     ]
 
 
-@pytest.mark.parametrize("decision", ["agent", "skill", "task"])
+@pytest.mark.parametrize("decision", ["skill", "task"])
 def test_all_creation_types_share_the_same_envelope(decision):
     plugin = _load_plugin()
     candidate = _candidate(decision=decision, dedup_key=f"{decision}-example")

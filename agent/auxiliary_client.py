@@ -1559,7 +1559,14 @@ class _CodexCompletionsAdapter:
                     attempt_stream.clear()
 
             if final is None:
-                raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
+                # ⭐ 同一模式的兄弟(见 codex_responses_adapter 的两处):流没有终止帧
+                # 是**上游协议异常**,裸构造会抹掉出身 ⇒ 被判成我们的 bug、不重试
+                # 不 fallback。⇒ 由抹掉出身的人显式声明。
+                from agent.error_classifier import declare_upstream_origin
+
+                raise declare_upstream_origin(RuntimeError(
+                    "Codex auxiliary Responses stream did not return a final response"
+                ))
 
             # Extract text and tool calls from the Responses output.
             # Items may be SimpleNamespace (raw-event path) or dicts

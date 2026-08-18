@@ -119,5 +119,3 @@ def test_split_text_respects_cap_and_preserves_content():
     joined = " ".join(pieces)
     for word in text.replace(".", "").split():
         assert word in joined
-
-

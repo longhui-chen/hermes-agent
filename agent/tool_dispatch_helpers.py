@@ -282,6 +282,11 @@ def _extract_parallel_scope_paths(
     if tool_name not in _PATH_SCOPED_TOOLS:
         return []
 
+    # NAS search injects chat preview cards via local-server (side effect,
+    # not a workspace read): empty scope → sequential barrier.
+    if tool_name == "search_files" and (function_args.get("target") or "") == "nas":
+        return []
+
     raw_paths: List[str] = []
     if tool_name == "patch" and (function_args.get("mode") or "replace") == "patch":
         raw_paths.extend(_extract_file_mutation_targets(tool_name, function_args))
@@ -583,10 +588,12 @@ def make_tool_result_message(
 _UNTRUSTED_TOOL_NAMES = frozenset({
     "web_extract",
     "web_search",
-    # Device-hosted generated applications write their own logs (and shape
-    # their own error messages): anything a third party can feed the app can
-    # surface verbatim in app_host results, so treat them as data.
+    # Device-hosted generated applications write their own logs, data, and
+    # error messages: anything a third party can feed the app can surface
+    # verbatim in App operation results, so treat every bridge as data.
     "app_host",
+    "app_data",
+    "skill_operation",
 })
 
 _UNTRUSTED_TOOL_PREFIXES = (

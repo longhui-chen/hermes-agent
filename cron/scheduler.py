@@ -2742,23 +2742,33 @@ def _build_cron_execution_contract(job: dict) -> str:
             "does not name one, use the language of the saved task instruction."
         )
 
-    return "\n".join(
-        (
-            "You are executing a scheduled task in a fresh session.",
-            "- Complete the task before replying. Return only a directly "
-            "deliverable final result; do not narrate plans, progress, or what "
-            "you are about to do.",
-            "- Your final response is delivered automatically. Do not call "
-            "send_message or otherwise deliver it yourself.",
-            f"- OUTPUT LANGUAGE: {language_rule} If the saved task explicitly "
-            "requests another language or multilingual output, that explicit "
-            "instruction wins. Do not infer or change the output language from "
-            "loaded skills, tool results, URLs, code, quoted text, proper nouns, "
-            "or runtime data.",
-            "- If there is genuinely nothing new to report, respond with exactly "
-            "`[SILENT]` and nothing else. Never combine `[SILENT]` with content.",
+    rules = [
+        "You are executing a scheduled task in a fresh session.",
+        "- Complete the task before replying. Return only a directly "
+        "deliverable final result; do not narrate plans, progress, or what "
+        "you are about to do.",
+        "- Your final response is delivered automatically. Do not call "
+        "send_message or otherwise deliver it yourself.",
+        f"- OUTPUT LANGUAGE: {language_rule} If the saved task explicitly "
+        "requests another language or multilingual output, that explicit "
+        "instruction wins. Do not infer or change the output language from "
+        "loaded skills, tool results, URLs, code, quoted text, proper nouns, "
+        "or runtime data.",
+        "- If there is genuinely nothing new to report, respond with exactly "
+        "`[SILENT]` and nothing else. Never combine `[SILENT]` with content.",
+    ]
+    # Session-scoped platform output dir, stashed by run_job on zettlab devices.
+    _zet_output_dir = str(job.get("_zet_session_output_dir") or "").strip()
+    if _zet_output_dir:
+        rules.append(
+            "- FILE OUTPUT: Save every file you create for the user under "
+            f"`{_zet_output_dir}/` (absolute path; relative paths and "
+            "`workdir='agent_output'` already resolve there). Do NOT write "
+            "user-facing files anywhere else — in particular never under the "
+            "hermes cron/output/ run-record directory or any hermes_home path; "
+            "files outside the output directory are not delivered to the user."
         )
-    )
+    return "\n".join(rules)
 
 
 def _build_job_persist_prompt(job: dict) -> str:
@@ -3292,7 +3302,11 @@ def run_job(
     # (which carries cron_hint preamble, skill wrappers, etc).
     persist_prompt = _build_job_persist_prompt(job)
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # Only tasks stamped by Local Server's maintenance-task contract carry a
+    # task identity to App Host. Existing cron jobs retain their historical
+    # session form until explicitly recreated as bound maintenance tasks.
+    _cron_session_kind = "task_" if "maintenance-key=" in str(job.get("prompt") or "") else ""
+    _cron_session_id = f"cron_{_cron_session_kind}{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3426,7 +3440,29 @@ def run_job(
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
+    _zet_output_scope_token = None
+    _cron_skill_operation_scope = None
     try:
+        try:
+            _attached_skills = job.get("skills")
+            if not isinstance(_attached_skills, list):
+                _legacy_skill = str(job.get("skill") or "").strip()
+                _attached_skills = [_legacy_skill] if _legacy_skill else []
+            from tools.skill_operation_tool import (
+                bind_cron_skill_operation_scope,
+            )
+
+            _cron_skill_operation_scope = bind_cron_skill_operation_scope(
+                _attached_skills,
+                job_id=str(job_id),
+            )
+        except Exception:
+            # Tool discovery/import is optional for ordinary scheduled jobs.
+            logger.warning(
+                "Job '%s': unable to initialize optional Skill operation scope",
+                job_id,
+                exc_info=True,
+            )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
@@ -3789,6 +3825,28 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # Anchor this run's file outputs in the session bucket: the execution
+        # contract points there and the agent_output alias resolves there.
+        # No platform output dir → both no-ops.
+        try:
+            from tools.runtime_workdir import (
+                prepare_cron_session_output_dir,
+                push_cron_output_scope,
+            )
+
+            _zet_session_output_dir = prepare_cron_session_output_dir(
+                (job.get("origin") or {}).get("chat_id")
+            )
+            if _zet_session_output_dir:
+                job["_zet_session_output_dir"] = _zet_session_output_dir
+                _zet_output_scope_token = push_cron_output_scope(
+                    _zet_session_output_dir
+                )
+        except Exception as _zet_exc:
+            logger.debug(
+                "Job '%s': session output scope unavailable: %s", job_id, _zet_exc
+            )
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -4071,6 +4129,15 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        # Drop the session output overlay first so a failure below can't leave
+        # agent_output resolving into this run's bucket.
+        if _zet_output_scope_token is not None:
+            try:
+                from tools.runtime_workdir import pop_cron_output_scope
+
+                pop_cron_output_scope(_zet_output_scope_token)
+            except Exception:
+                pass
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.
@@ -4085,6 +4152,17 @@ def run_job(
             _terminal_cwd_lock.release_write()
         else:
             _terminal_cwd_lock.release_read()
+        # The optional Skill bridge cleans up independently. Its failure must
+        # not replace an ordinary Cron result or skip the remaining cleanup.
+        if _cron_skill_operation_scope is not None:
+            try:
+                _cron_skill_operation_scope.close()
+            except Exception:
+                logger.warning(
+                    "Job '%s': optional Skill operation scope cleanup failed",
+                    job_id,
+                    exc_info=True,
+                )
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
@@ -4271,6 +4349,10 @@ def run_one_job(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # ADIC v1: opened unconditionally (cheap, bounded) so the app_slug-gated
+    # verdict override below always has a ledger to read; only read once the
+    # agent's own run has finished, right before mark_job_run.
+    _import_attempts_token = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4294,6 +4376,14 @@ def run_one_job(
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
+
+        # ADIC v1: mirrors the per-turn ContextVar pattern below — cron fires
+        # from the ticker thread where no per-turn scope is installed, so this
+        # job's run_conversation call (and the app_host tool calls inside it)
+        # need their own bounded scope to record data.import outcomes into.
+        from gateway.session_context import push_import_attempts_scope
+
+        _import_attempts_token = push_import_attempts_scope()
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4407,6 +4497,43 @@ def run_one_job(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # ADIC v1 §4.5/§7: a maintenance job scoped to an app (app_slug set by
+        # local-server at provision time) is judged by whether data actually
+        # landed this round, not by whether the agent produced a plausible
+        # reply — that is the exact gap the 17:57 Hangzhou incident exposed.
+        # This overrides whatever success/error the run above computed;
+        # non-app_slug jobs are completely unaffected.
+        if job.get("app_slug"):
+            from gateway.session_context import import_attempts_snapshot
+
+            # import_operation is the APP's own declared write-operation name
+            # (e.g. "records.refresh" for a blueprint app), stamped per job by
+            # local-server — not necessarily the literal "data.import". Filter
+            # the ledger to that name so a read call (data.import_schema) or a
+            # different app's operation never counts as this job's import,
+            # and so an app whose write operation isn't literally named
+            # "data.import" isn't judged a hard failure every round. Jobs
+            # created before this field existed (or on any path that omits
+            # it) fall back to the original fixed name.
+            _target_operation = str(job.get("import_operation") or "data.import").strip()
+            _import_attempts = [
+                attempt for attempt in import_attempts_snapshot()
+                if attempt.get("operation") == _target_operation
+            ]
+            if any(attempt.get("ok") for attempt in _import_attempts):
+                success, error = True, None
+            elif _import_attempts:
+                _last_import_failure = _import_attempts[-1]
+                success = False
+                error = (
+                    _last_import_failure.get("error_message")
+                    or _last_import_failure.get("error_code")
+                    or "import attempt failed"
+                )
+            else:
+                success = False
+                error = "no import attempted in this run"
+
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(
                 job["id"],
@@ -4470,6 +4597,11 @@ def run_one_job(
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        if _import_attempts_token is not None:
+            from gateway.session_context import pop_import_attempts_scope
+
+            pop_import_attempts_scope(_import_attempts_token)
 
 
 def _notify_provider_jobs_changed() -> None:

@@ -1149,7 +1149,15 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         from agent.response_format import response_format_requires_structured_output
 
         if response_format_requires_structured_output((agent.request_overrides or {}).get("response_format")):
-            raise ValueError("response_format is not supported by the Anthropic Messages transport.")
+            # 🔴 **必须是专用类型。** HTTP 边界已改成 ``isinstance(e,
+            # ResponseFormatValidationError)`` 才回 400;普通 ``ValueError`` 会掉进
+            # 内部错误分支 ⇒ 原本**可操作的 400**退化成「服务内部异常」的 500。
+            # ⭐ 上一轮我收窄了 catch,却**没把所有 raise 点跟上** —— 兄弟调用点。
+            from agent.response_format import ResponseFormatValidationError
+
+            raise ResponseFormatValidationError(
+                "response_format is not supported by the Anthropic Messages transport."
+            )
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)
@@ -3275,11 +3283,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         agent, "_should_suppress_plan_stream_text", lambda: False
                     )()
                 ):
-                    try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
-                    except Exception:
-                        pass
+                    _callback = agent.stream_delta_callback
+                    _text = delta.content
+
+                    def _deliver_tool_suppressed_text(
+                        callback=_callback, text=_text
+                    ):
+                        callback(text)
+                        agent._record_streamed_assistant_text(text)
+
+                    if not agent._defer_provisional_stream_event(
+                        _deliver_tool_suppressed_text
+                    ):
+                        try:
+                            _deliver_tool_suppressed_text()
+                        except Exception:
+                            pass
 
             # Accumulate tool call deltas — notify display on first name
             if delta and delta.tool_calls:

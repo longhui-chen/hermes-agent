@@ -7,10 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agent.credential_broker import request_agentcomputer_token, request_lark_cli
+from agent.credential_broker import (
+    request_agentcomputer_token,
+    request_app_auto_refresh_token,
+    request_lark_cli,
+)
 
 
-def _serve_once(path, response):
+def _serve_once(path, response, *, purpose="agentcomputer"):
     ready = threading.Event()
 
     def run():
@@ -24,7 +28,7 @@ def _serve_once(path, response):
                 request = json.loads(connection.recv(size))
                 assert request == {
                     "agent_id": "agent-1",
-                    "purpose": "agentcomputer",
+                    "purpose": purpose,
                 }
                 payload = json.dumps(response, separators=(",", ":")).encode()
                 connection.sendall(struct.pack(">I", len(payload)) + payload)
@@ -41,6 +45,16 @@ def test_request_agentcomputer_token_uses_bounded_unix_protocol():
         token = "a" * 64
         thread = _serve_once(path, {"token": token})
         assert request_agentcomputer_token("agent-1", socket_path=path) == token
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+def test_request_app_auto_refresh_token_uses_dedicated_purpose():
+    with tempfile.TemporaryDirectory(prefix="acb-", dir="/tmp") as directory:
+        path = Path(directory) / "credential.sock"
+        token = "b" * 64
+        thread = _serve_once(path, {"token": token}, purpose="app-auto-refresh")
+        assert request_app_auto_refresh_token("agent-1", socket_path=path) == token
         thread.join(timeout=2)
         assert not thread.is_alive()
 

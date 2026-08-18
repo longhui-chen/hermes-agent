@@ -143,6 +143,15 @@ class TestStoredPromptReuse:
 
 
 class TestLegitimateFreshBuild:
+    def test_missing_session_row_stages_prompt_for_post_create_retry(self):
+        db = MagicMock()
+        db.update_system_prompt.return_value = False
+        agent = _make_agent(session_db=db)
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        assert agent._system_prompt_persist_pending is True
+
     def test_no_history_skips_db_and_builds_fresh(self, caplog):
         """First turn with empty history → build fresh, don't touch the DB."""
         db = MagicMock()

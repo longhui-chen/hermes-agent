@@ -40,6 +40,7 @@ import sys
 import signal
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -91,6 +92,11 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+# 中间播报(``interim_assistant_messages``)单次 adapter.send 的硬上限。
+# ⛔ 不许拍脑袋:**逐字沿用上面那条**的推导 —— 同一形状(一条可有可无的旁路
+# 播报绝不能有权限吊死主流程),只是那条护 stall-watcher,这条护 agent turn 本身。
+# ⚠️ 这里更严重:worker 线程上的裸 ``Future.result()`` 卡住 ⇒ 用户连最终回答都收不到。
+_INTERIM_SEND_TIMEOUT = _STALL_NOTIFY_SEND_TIMEOUT_SECONDS
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -346,12 +352,20 @@ def _non_conversational_metadata(
     *,
     platform: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    """Mark Discord lifecycle/status sends without changing other platforms."""
-    if _gateway_platform_value(platform) != "discord":
+    """让状态类消息保持原平台路由，但不消耗飞书可见引用。"""
+    platform_value = _gateway_platform_value(platform)
+    if platform_value == "feishu":
+        return _flat_feishu_metadata(metadata)
+    if platform_value != "discord":
         return metadata
     merged = dict(metadata or {})
     merged["non_conversational"] = True
     return merged
+
+
+def _non_conversational_reply_to(reply_to: Any, *, platform: Any = None) -> Any:
+    """飞书状态消息不用显式 reply API；其他平台保持原行为。"""
+    return None if _gateway_platform_value(platform) == "feishu" else reply_to
 
 
 def _seed_hygiene_system_prompt(
@@ -1775,7 +1789,7 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
         try:
             from hermes_cli import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
-        except Exception:
+        except Exception as e:
             pass
     except Exception:
         return
@@ -1895,6 +1909,10 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
+class _ProfileAdapterCleanupError(RuntimeError):
+    """Secondary startup 在释放未发布 adapter 时失败。"""
+
+
 class TransientRouteResolutionError(RuntimeError):
     """Routing lookup for a completion event failed TRANSIENTLY.
 
@@ -1943,6 +1961,119 @@ def _profile_runtime_scope(profile_home: "Path"):
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
+
+
+async def _deliver_heartbeat_and_note(
+    *,
+    adapter,
+    source,
+    text: str,
+    heartbeat_msg_id: "str | None",
+    status_metadata,
+) -> "tuple[Any, str | None]":
+    """发一次「仍在处理」心跳，成功就把这一轮记进 adapter 的账（ZET-2111）。
+
+    返回 ``(notify_res, fresh_msg_id)``：``fresh_msg_id`` 非 ``None`` 表示这次
+    是**首发**、拿到了新的消息 id，由调用方负责登记进 cleanup 列表
+    —— ⛔ 那份状态**不**搬进来，它不属于这个决策。
+
+    ⭐ 为什么提出来：这段原先内联在 ``start_gateway`` → ``_run_agent_inner``
+    → ``_notify_long_running`` 的**三层闭包**里，外部根本驱动不了。于是
+    ZET-2111 的 10 条测试只能**直接调 adapter**，把 gateway 这一侧整个跳过 ——
+    RH 复审实测：**把这段接线切断，10 条照样全绿**。那是一条已知假绿，
+    而假绿门比没有门更坏（它冒充保护）。
+    ⭐ 代码不可测本身就是缺陷的一部分；提取它⛔ 不算扩散。
+    ⚠️ 提取时签名/行为逐字未改，调用点唯一。
+
+    ⚠️ 记账必须挂在【两条发送路径**共同**的成功判定】上：上面 edit 复用已有
+    心跳消息、下面 send 首发，任一成功都算"发过心跳"。只挂 send 那半会让
+    **第二次之后的心跳漏记** —— 用户的长任务跑完就没有完成提醒。
+    ⛔ hook 失败不许影响心跳本身：它只是记账。
+    """
+    notify_res = None
+    fresh_msg_id = None
+
+    if heartbeat_msg_id:
+        try:
+            notify_res = await adapter.edit_message(
+                source.chat_id,
+                heartbeat_msg_id,
+                text,
+            )
+        except Exception as _ee:
+            logger.debug("Heartbeat edit failed: %s", _ee)
+            notify_res = None
+
+    if not (notify_res and getattr(notify_res, "success", False)):
+        notify_res = await adapter.send(
+            source.chat_id,
+            text,
+            metadata=_non_conversational_metadata(status_metadata, platform=source.platform),
+        )
+        if getattr(notify_res, "success", False) and getattr(
+            notify_res, "message_id", None
+        ):
+            fresh_msg_id = str(notify_res.message_id)
+
+    if notify_res and getattr(notify_res, "success", False):
+        try:
+            adapter.note_long_running_turn(source)
+        except Exception:
+            logger.debug("note_long_running_turn hook failed", exc_info=True)
+
+    return notify_res, fresh_msg_id
+
+
+def _spawn_mcp_discovery(*, logger, multiplex: bool):
+    """把 MCP discovery 起到**后台线程**，返回它所用的 profile home（无则 None）。
+
+    ⭐ 之所以从 ``start_gateway`` 里提出来:原先它是 723 行大函数里的闭包,
+    依赖 ``runner`` / ``logger`` / 两个模块级 helper ⇒ **外部根本调不动**。
+    于是那道门只能用 AST 判「源码里出现过 start_background_mcp_discovery 吗」
+    —— 而 AST **不管可达性**:把真实调用塞进 ``if False:`` 门照样绿
+    (RH 复审 P2-4 实证)。
+    ⭐ **一个无法被驱动的分支 = 一个无法被验证的承诺** ⇒ 可测性本身是缺陷的
+    一部分,提取纯函数不算扩散。行为逐字未变,只是把决策搬到可驱动的位置。
+
+    ⛔ 这里只负责「用哪种方式 spawn」,⛔ 不碰 task 生命周期(那仍在调用侧)。
+    """
+    from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+    if not multiplex:
+        start_background_mcp_discovery(logger=logger, thread_name="mcp-discovery")
+        return None
+
+    from hermes_cli.profiles import get_profile_dir, profiles_to_serve
+
+    # 🔴 **半条链**:本 PR 把 ``_servers`` / ``_mcp_tool_handlers`` / lazy schema
+    # cache 全部改成了 **profile-scoped**(那是对的),但**启动侧还是单 profile**
+    # ⇒ 除启动时选中的那个 profile 外,其余 profile 配置的 MCP 工具**一个都不会注册**,
+    # 用户通常只能手动 ``/reload-mcp`` 才恢复。
+    # ⇒ 三格都要答:**谁启动**(下面逐 profile)· **谁跟踪**(``_mcp_discovery_homes``)
+    #   · **谁回收**(profile unload 时由 ``clear_profile_generation`` 那条链销账)。
+    active = _multiplex_active_profile_name() or "default"
+    # ⚠️ ``profiles_to_serve`` 返回的是 **(name, Path) 元组**,⛔ 不是名字列表 ——
+    #   我第一版按名字用,会整条走进 except 兜底、**静默**退化成单 profile。
+    #   ⭐ 实查签名才发现:``(multiplex: bool) -> List[Tuple[str, Path]]``。
+    try:
+        pairs = [(str(n), h) for n, h in profiles_to_serve(multiplex=True)]
+    except Exception:
+        logger.warning("multiplex profile 列表取不到 —— 退回只为 active profile 启动 discovery")
+        pairs = []
+    if not pairs:
+        pairs = [(active, get_profile_dir(active))]
+    # active 先跑,其余按序 —— 保持既有「启动时那个 profile 最先就绪」的行为。
+    pairs.sort(key=lambda kv: kv[0] != active)
+
+    started: list = []
+    for name, home in pairs:
+        with _profile_runtime_scope(home):
+            start_background_mcp_discovery(
+                logger=logger, thread_name=f"mcp-discovery-{name}")
+        started.append(home)
+    # ⭐ **谁跟踪**:登记已启动的 profile,供 reload / 诊断消费。
+    globals()["_mcp_discovery_homes"] = tuple(started)
+    return started[0] if started else get_profile_dir(active)
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -2357,9 +2488,13 @@ from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    FeishuQuoteLease,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
+    _consume_feishu_quote,
+    _flat_feishu_metadata,
+    _feishu_quote_metadata,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
@@ -2520,7 +2655,16 @@ def _resolve_runtime_agent_kwargs() -> dict:
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
-    except Exception as exc:
+    except ValueError as exc:
+        # ⛔ 只包 ``ValueError`` —— 它和上面的 ``AuthError`` 是 runtime_provider
+        # **有意**抛出的、面向用户的两类失败(未知 provider / 凭据)。
+        # 🔴 这里原来是 ``except Exception``:任何内部 bug 都被格式化成字符串、
+        # 包成 RuntimeError,再被 zet_agent.py 接住包成
+        # ``_ProviderAuthResolutionError`` ⇒ 以 **HTTP 200** 当作 assistant 的
+        # 回答送出「⚠️ Provider authentication failed: … /volume1/…」。
+        # ⭐ 这条是**生产实际走的默认路径**;上一轮我只收窄了请求覆盖那条
+        #    (api_server._resolve_request_runtime_agent_kwargs),兄弟点没跟上。
+        # 其余异常照原样上抛,由 HTTP 边界的 _boundary_error_text 收口。
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()
@@ -2559,12 +2703,15 @@ def _resolve_runtime_agent_kwargs() -> dict:
 def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
+        AuthError,
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
     try:
         runtime = resolve_runtime_provider(requested=provider)
-    except Exception as exc:
+    except (AuthError, ValueError) as exc:
+        # 同 _resolve_runtime_agent_kwargs:只包 runtime_provider 有意抛出的两类,
+        # 其余原样上抛(⛔ 内部 bug 不许冒充 provider 认证失败)。
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
         "api_key": runtime.get("api_key"),
@@ -2695,7 +2842,28 @@ def _event_media_is_video(event, index: int) -> bool:
     return getattr(event, "message_type", None) == MessageType.VIDEO
 
 
-def _build_media_placeholder(event) -> str:
+def _is_remote_media_ref(ref: str) -> bool:
+    """这条 ``media_urls`` 项是**远程 URL** 还是本地路径?
+
+    ⭐ 判据是 ``urlparse().scheme`` —— 闭集、且与「长得像不像路径」无关。
+    ⛔ 不用形状判据:``resolve_image_source`` 里那条注释记着,路径形状门曾把
+    ``pic.png`` 这类合法相对名一起挡掉。
+
+    ⚠️ ``file://`` **不算远程** —— 它指的就是本地文件,该走可读性校验。
+    Windows 盘符(形如 ``C:``)会被 urlparse 解析出单字母 scheme,显式排除。
+    """
+    from urllib.parse import urlparse
+
+    try:
+        scheme = (urlparse(str(ref)).scheme or "").lower()
+    except (ValueError, AttributeError):
+        return False
+    if not scheme or len(scheme) == 1:   # 无 scheme / Windows 盘符
+        return False
+    return scheme not in {"file"}
+
+
+async def _build_media_placeholder(event) -> str:
     """Build a text placeholder for media-only events so they aren't dropped.
 
     When a photo/document is queued during active processing and later
@@ -2703,17 +2871,83 @@ def _build_media_placeholder(event) -> str:
     the media would be silently lost.  This builds a placeholder that
     the vision enrichment pipeline will replace with a real description.
     """
+    from gateway.model_readability import (
+        _MESSAGE_PROBE_BUDGET_S,
+        verify_artifact_readable_async,
+    )
+
+    # 🔴 **整条消息一个总预算,⛔ 不是每个附件各一份。**
+    # 否则 N 个异常附件 = N × deadline 的累计停顿(即使每个都已异步,
+    # 用户侧的这条消息仍然要等 N 倍)。预算耗尽后余下附件**直接降级**。
+    _probe_deadline = time.monotonic() + _MESSAGE_PROBE_BUDGET_S
+
     parts = []
     media_urls = getattr(event, "media_urls", None) or []
     for i, url in enumerate(media_urls):
+        # 🔴 **模型文件可读性契约的接线点**
+        # （`SPEC-MODEL-FILE-READABILITY-CONTRACT.md` §1.1）。
+        #
+        # 原先这里只做一次路径**字符串翻译**（``to_agent_visible_cache_path``）
+        # 就把它拼进提示。翻译只回答「按声明的 mount 该映射成什么」，
+        # ⛔ 不回答「模型那边真的打得开吗」——路径不存在时模型只会自己编或说
+        # 「读不到」，而**链路上没有任何一层报错**。这正是族 A 的现场：
+        # 每层看自己都正常，缺的是层与层之间那一跳的**回执**。
+        #
+        # ⇒ 现在必须先拿到回执（``open`` + ``regular-file`` + ``read`` 成功）
+        #   才允许把路径写进提示。
+        # ⚠️ ⛔ 不许在失败时退回用原始 ``url`` 拼一句 —— 那就是原缺陷本身。
+        # 🔴 **远程 URL ⛔ 不许跑本地文件可读性校验。**
+        #
+        # Discord 缓存失败时,``plugins/platforms/discord/adapter.py:7862-7879``
+        # 按**既有降级契约**把 ``att.url``(``https://…`` CDN 链接)放进
+        # ``media_urls``。这条消息若恰好在活动 turn 期间排队,后面就会走到这里,
+        # 而 ``verify_artifact_readable()`` 判的是**本地文件** ⇒ 对一个合法 URL
+        # **必然**返回不可读 ⇒ 附件被换成「读不到」,而它原本**仍可**由
+        # vision / 下载路径处理。⭐ 这是本批的可读性契约**弄坏了既有降级路径**。
+        #
+        # ⛔ 不在这里新造下载逻辑(那会变成第二套 SSRF 面):远程 URL 原样交给
+        # 下游 —— vision / 媒体缓存那条链本来就认 URL,并且带 SSRF 门。
+        # ⭐ 判据用 ``urlparse().scheme``,⛔ 不用「像不像路径」这类形状判据。
+        if _is_remote_media_ref(url):
+            agent_url = url
+            if _event_media_is_image(event, i):
+                parts.append(f"[User sent an image: {agent_url}]")
+            elif _event_media_is_video(event, i):
+                parts.append(f"[User sent a video: {agent_url}]")
+            else:
+                parts.append(f"[User sent a file: {agent_url}]")
+            continue
+
+        receipt = await verify_artifact_readable_async(
+            url, budget_s=max(0.0, _probe_deadline - time.monotonic()))
+        if not receipt.ok:
+            # 告诉模型「有这么个附件、但读不到、为什么」，
+            # ⛔ 而不是给它一条读不到的路径让它去猜。
+            # ⛔ 一个字都不含原始路径 / 原始 error（那些在日志与 receipt 里）。
+            logger.warning(
+                "[model-readability] artifact unreadable: code=%s runtime=%s "
+                "checks=%s detail=%s path=%s",
+                receipt.failure_code, receipt.runtime_id,
+                ",".join(receipt.checks), receipt.failure_detail,
+                receipt.source_path,
+            )
+            parts.append(
+                f"[User sent an attachment that could not be read "
+                f"({receipt.failure_code}); it is not available to you]"
+            )
+            continue
+
+        # ⚠️ local 后端下 ``model_path`` 与原路径**逐字相同** ——
+        # 板端/云机的既有行为一个字节都不变（由门钉住）。
+        agent_url = receipt.model_path
         if _event_media_is_image(event, i):
-            parts.append(f"[User sent an image: {url}]")
+            parts.append(f"[User sent an image: {agent_url}]")
         elif _event_media_is_audio(event, i):
-            parts.append(f"[User sent audio: {url}]")
+            parts.append(f"[User sent audio: {agent_url}]")
         elif _event_media_is_video(event, i):
-            parts.append(f"[User sent a video: {url}]")
+            parts.append(f"[User sent a video: {agent_url}]")
         else:
-            parts.append(f"[User sent a file: {url}]")
+            parts.append(f"[User sent a file: {agent_url}]")
     return "\n".join(parts)
 
 
@@ -4500,7 +4734,7 @@ class TurnRunner:
                         adapter=_adapter,
                         chat_id=ctx.source.chat_id,
                         config=_consumer_cfg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=ctx._conversation_thread_metadata,
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",)))
                             if ctx.progress_queue is not None
@@ -4541,16 +4775,61 @@ class TurnRunner:
                 return
             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
                 return
-            safe_schedule_threadsafe(
+            _interim_metadata = _feishu_quote_metadata(
+                ctx._conversation_thread_metadata
+            )
+            _interim_fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    metadata=_interim_metadata,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
                 log_message="interim_assistant_callback scheduling error",
             )
+            if _interim_fut is None:
+                _consume_feishu_quote(_interim_metadata, False)
+            else:
+                try:
+                    # 🔴 **必须带上限。** 这里跑在 **agent worker 线程**上,
+                    # ``_interim_fut`` 是 ``run_coroutine_threadsafe`` 的
+                    # ``concurrent.futures.Future``:裸 ``.result()`` **无限等**。
+                    # 飞书 SDK 发送卡住 / 内部重试打转 ⇒ **整个 turn 永久阻塞**,
+                    # 用户提问后连最终回答都生不出来 —— 而这只是一条**中间**播报。
+                    _interim_result = _interim_fut.result(
+                        timeout=_INTERIM_SEND_TIMEOUT
+                    )
+                    _consume_feishu_quote(
+                        _interim_metadata, _interim_result
+                    )
+                except concurrent.futures.TimeoutError:
+                    # 超时 ⇒ 放弃**等待**,但⛔ 不在这里结算引用租约。
+                    #
+                    # 🔴 上一版在这里 ``_consume_feishu_quote(..., False)`` —— 而
+                    # 底层发送**仍在跑**(我们刻意不取消它:它可能已经送达)。
+                    # 于是:租约按"失败"释放 ⇒ 最终回答又能取到同一个
+                    # ``reply_to_message_id``,而迟到的 interim 带着原引用也送达了
+                    # ⇒ **同一条用户消息被可见引用两次**。
+                    # ⭐ 「不取消底层发送」和「立刻按失败结算」是矛盾的两件事,
+                    #    上一版同时做了。
+                    #
+                    # ⇒ 把结算挂成**完成回调**,按**真实结果**释放;超时分支只负责
+                    # 停止阻塞 worker。⛔ 回调里不碰其它状态,作用域刚好等于租约。
+                    _interim_fut.add_done_callback(
+                        lambda f, _m=_interim_metadata: _consume_feishu_quote(
+                            _m, bool(f.exception() is None and f.result())
+                        )
+                    )
+                    logger.warning(
+                        "Interim assistant send exceeded %.1fs; no longer waiting "
+                        "(the send continues; the quote lease settles on its real "
+                        "result)",
+                        _INTERIM_SEND_TIMEOUT,
+                    )
+                except Exception:
+                    _consume_feishu_quote(_interim_metadata, False)
+                    logger.warning("Interim assistant send failed", exc_info=True)
 
         turn_route = self._runner._resolve_turn_agent_config(
             ctx.message,
@@ -4784,6 +5063,12 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent
+            from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+
+            ensure_mcp_discovery_before_agent_build(
+                logger=logger,
+                thread_name="gateway-profile-mcp-discovery",
+            )
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -5030,6 +5315,9 @@ class TurnRunner:
                 )
 
             send_ok = False
+            _clarify_metadata = _feishu_quote_metadata(
+                ctx._conversation_thread_metadata
+            )
             fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send_clarify(
                     chat_id=ctx._status_chat_id,
@@ -5037,19 +5325,22 @@ class TurnRunner:
                     choices=list(choices) if choices else None,
                     clarify_id=clarify_id,
                     session_key=ctx.session_key or "",
-                    metadata=ctx._status_thread_metadata,
+                    metadata=_clarify_metadata,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
                 log_message="Clarify send failed to schedule",
             )
             if fut is None:
+                _consume_feishu_quote(_clarify_metadata, False)
                 send_ok = False
             else:
                 try:
                     result = fut.result(timeout=15)
                     send_ok = bool(getattr(result, "success", False))
+                    _consume_feishu_quote(_clarify_metadata, result)
                 except Exception as exc:
+                    _consume_feishu_quote(_clarify_metadata, False)
                     logger.warning("Clarify send failed: %s", exc)
                     send_ok = False
 
@@ -5179,6 +5470,9 @@ class TurnRunner:
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+                _approval_metadata = _feishu_quote_metadata(
+                    ctx._conversation_thread_metadata
+                )
                 try:
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
@@ -5186,7 +5480,7 @@ class TurnRunner:
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -5198,6 +5492,9 @@ class TurnRunner:
                     if _approval_fut is None:
                         raise RuntimeError("send_exec_approval: loop unavailable")
                     _approval_result = _approval_fut.result(timeout=15)
+                    _consume_feishu_quote(
+                        _approval_metadata, _approval_result
+                    )
                     if _approval_result.success:
                         return
                     logger.warning(
@@ -5205,6 +5502,7 @@ class TurnRunner:
                         _approval_result.error,
                     )
                 except Exception as _e:
+                    _consume_feishu_quote(_approval_metadata, False)
                     logger.warning(
                         "Button-based approval failed, falling back to text: %s", _e
                     )
@@ -5222,20 +5520,29 @@ class TurnRunner:
                 allow_session=approval_data.get("allow_session", True),
                 smart_denied=approval_data.get("smart_denied", False),
             )
+            _approval_text_metadata = _feishu_quote_metadata(
+                ctx._conversation_thread_metadata
+            )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
                     ctx._status_adapter.send(
                         ctx._status_chat_id,
                         msg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=_approval_text_metadata,
                     ),
                     ctx._loop_for_step,
                     logger=logger,
                     log_message="Approval text-send scheduling error",
                 )
                 if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                    _approval_result = _approval_send_fut.result(timeout=15)
+                    _consume_feishu_quote(
+                        _approval_text_metadata, _approval_result
+                    )
+                else:
+                    _consume_feishu_quote(_approval_text_metadata, False)
             except Exception as _e:
+                _consume_feishu_quote(_approval_text_metadata, False)
                 logger.error("Failed to send approval request: %s", _e)
 
         # Keep real user text separate from API-only recovery guidance.  If
@@ -5243,6 +5550,7 @@ class TurnRunner:
         # message so stale guidance never replays as user-authored text.
         _persist_user_message_override: Optional[Any] = ctx.persist_user_message
         _persist_user_timestamp_override: Optional[float] = ctx.persist_user_timestamp
+        _user_authored_message = ctx.user_authored_message
 
         # Prepend pending model switch note so the model knows about the switch
         _pending_notes = getattr(self._runner, '_pending_model_notes', {})
@@ -5424,6 +5732,17 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
+            _wire_has_image = bool(
+                isinstance(_run_message, list)
+                and any(
+                    isinstance(part, dict)
+                    and part.get("type") in {"image", "image_url", "input_image"}
+                    for part in _run_message
+                )
+            )
+            if _wire_has_image:
+                _conversation_kwargs["user_authored_message"] = _user_authored_message
+                _conversation_kwargs["user_message_has_image"] = True
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -5895,6 +6214,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._profile_runtime_unloads: Dict[str, object] = {}
+        self._profile_runtime_unload_retry: set[str] = set()
+        self._retiring_adapter_cleanups: Dict[tuple[str, Platform], BasePlatformAdapter] = {}
+        self._partial_adapter_cleanup_retry: Dict[
+            tuple[str, Platform], BasePlatformAdapter
+        ] = {}
+        self._partial_adapter_cleanup_tasks: Dict[
+            tuple[str, Platform], asyncio.Task
+        ] = {}
+        self._published_adapter_cleanup_retry: Dict[
+            tuple[str, Platform], tuple[BasePlatformAdapter, Dict]
+        ] = {}
+        self._published_adapter_cleanup_tasks: Dict[
+            tuple[str, Platform], asyncio.Task
+        ] = {}
+        self._agent_resource_cleanup_progress: Dict[int, tuple[Any, set[str]]] = {}
+        self._profile_adapter_operations: Dict[str, set[asyncio.Task]] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -6502,6 +6838,471 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.cancel()
         task.add_done_callback(consume_detached_task_result)
         return False
+
+    async def _await_adapter_cleanup_strict(
+        self, cleanup: Awaitable[Any], timeout: float
+    ) -> None:
+        """严格等待 cleanup 真正结束；取消也不能把仍运行的 worker 遗失。"""
+        worker = asyncio.ensure_future(cleanup)
+        try:
+            if timeout <= 0:
+                await asyncio.shield(worker)
+                return
+            done, _pending = await asyncio.wait({worker}, timeout=timeout)
+            if worker in done:
+                await worker
+                return
+            worker.cancel()
+            # 🔴 **取消之后必须有第二道硬期限。**
+            # 上一版是裸 ``await asyncio.shield(worker)`` —— worker 忽略取消
+            # (transport / 子进程卡住)时它**无限等**,于是
+            # ``HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT`` **根本不是硬上限**:
+            # profile 卸载、乃至整个网关重启会永久挂在这一行。
+            # ⭐「设了 timeout」≠「有防护」—— 超时分支自己无限等,等于没设。
+            await self._reap_cancelled_cleanup(worker, timeout)
+            raise TimeoutError(f"adapter cleanup timed out after {timeout:.1f}s")
+        except asyncio.CancelledError as cancelled:
+            worker.cancel()
+            # 同上:``while not worker.done(): await shield(worker)`` 是无界循环。
+            await self._reap_cancelled_cleanup(worker, timeout)
+            raise cancelled
+
+    @staticmethod
+    async def _reap_cancelled_cleanup(worker, timeout: float) -> None:
+        """给「已 cancel 但可能不理会」的 worker 一个**有界**收尸窗口。
+
+        ⛔ 不再无限等。窗口用完就放手 —— worker 变成 detached task,由
+        ``consume_detached_task_result`` 吃掉结果,⛔ 不留 "Task exception was
+        never retrieved" 噪声,也⛔ 不让它继续绑架调用方。
+        ⛔ 上限不许拍脑袋:沿用同一个 ``timeout``(调用方已经等过一轮同样长的
+        时间),量纲一致、⛔ 不另引入第二个可调参数。
+        """
+        grace = timeout if timeout and timeout > 0 else _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT
+        try:
+            await asyncio.wait({worker}, timeout=grace)
+        except asyncio.CancelledError:
+            pass
+        if worker.done():
+            try:
+                worker.result()
+            except BaseException:
+                pass
+            return
+        logger.error(
+            "adapter cleanup ignored cancellation for %.1fs; detaching it so "
+            "unload/restart can proceed (the transport may still be alive)",
+            grace,
+        )
+        worker.add_done_callback(consume_detached_task_result)
+
+    def _profile_runtime_unload_blocked(self, profile_name: str) -> bool:
+        aliases = GatewayRunner._profile_runtime_aliases(profile_name)
+        unloads = getattr(self, "_profile_runtime_unloads", {})
+        retries = getattr(self, "_profile_runtime_unload_retry", set())
+        return any(alias in unloads or alias in retries for alias in aliases)
+
+    @staticmethod
+    def _profile_runtime_aliases(profile_name: Optional[str]) -> tuple[str, ...]:
+        """把 default profile 的**两种**入口名归为同一个 lifecycle identity。
+
+        🔴 上一版把 ``"main"`` 也并了进来。但 ``hermes_cli/profiles.py`` 的
+        ``validate_profile_name`` **并没有保留 ``main``**,``profiles_to_serve()``
+        会把用户自建的 named profile ``main`` 与内建 ``default`` 作为**两个独立
+        目录**同时服务 ⇒ 合并之后:
+          · ``unload_profile_runtime("main")`` 会把 **default** 的 adapter
+            operation / cleanup 一起拖进 drain 或 retry;
+          · 反向卸载 default 时也会干扰 named ``main``。
+        ⇒ **无关 profile 的消息渠道会在配置重载或 cron reconcile 时被取消/断开。**
+
+        ⭐ 只合并「空名称」与 ``"default"`` —— 这两个确实是同一个东西的两种写法。
+        历史 session key 里的 ``agent:main`` 映射属于 **session 命名层**的事,
+        ⛔ 不该在 lifecycle identity 这一层解决。
+        """
+        normalized = (profile_name or "").strip()
+        if normalized in {"", "default"}:
+            return ("", "default")
+        return (normalized,)
+
+    async def _disconnect_published_adapter(
+        self,
+        *,
+        profile_name: str,
+        platform: Platform,
+        adapter: BasePlatformAdapter,
+        owner_map: Dict[Platform, BasePlatformAdapter],
+    ) -> None:
+        """关闭已发布 adapter，成功后按 exact identity 提交删除。"""
+        retiring = getattr(self, "_retiring_adapter_cleanups", None)
+        if retiring is None:
+            retiring = self._retiring_adapter_cleanups = {}
+        key = (profile_name, platform)
+        retries = getattr(self, "_published_adapter_cleanup_retry", None)
+        if retries is None:
+            retries = self._published_adapter_cleanup_retry = {}
+        pending = retries.get(key)
+        if pending is not None and (
+            pending[0] is not adapter or pending[1] is not owner_map
+        ):
+            raise RuntimeError(
+                f"prior adapter cleanup pending for {profile_name or 'default'}"
+            )
+        current = retiring.get(key)
+        if current is adapter:
+            raise RuntimeError(
+                f"adapter cleanup already in progress for {profile_name or 'default'}"
+            )
+        if current is not None:
+            raise RuntimeError(
+                f"adapter cleanup already in progress for {profile_name or 'default'}"
+            )
+        if owner_map.get(platform) is not adapter:
+            raise RuntimeError(
+                f"adapter ownership changed for {profile_name or 'default'}"
+            )
+        retries[key] = (adapter, owner_map)
+        retiring[key] = adapter
+
+        async def _cleanup_and_commit() -> None:
+            await adapter.disconnect()
+            if owner_map.get(platform) is not adapter:
+                raise RuntimeError(
+                    f"adapter ownership changed during cleanup for {profile_name or 'default'}"
+                )
+            owner_map.pop(platform, None)
+            retry_owner = retries.get(key)
+            if (
+                retry_owner is not None
+                and retry_owner[0] is adapter
+                and retry_owner[1] is owner_map
+            ):
+                retries.pop(key, None)
+
+        try:
+            await self._await_adapter_cleanup_strict(
+                _cleanup_and_commit(), self._adapter_disconnect_timeout_secs()
+            )
+        finally:
+            if retiring.get(key) is adapter:
+                retiring.pop(key, None)
+
+    def _register_profile_adapter_task(
+        self, profile_name: str, task: asyncio.Task
+    ) -> None:
+        """登记独立 operation owner，完成后按 task identity 删除。"""
+        operations = getattr(self, "_profile_adapter_operations", None)
+        if operations is None:
+            operations = self._profile_adapter_operations = {}
+        owned = operations.setdefault(profile_name, set())
+        owned.add(task)
+
+        def _remove_owner(_done: asyncio.Task) -> None:
+            current = operations.get(profile_name)
+            if current is None:
+                return
+            current.discard(task)
+            if not current and operations.get(profile_name) is current:
+                operations.pop(profile_name, None)
+
+        task.add_done_callback(_remove_owner)
+
+    async def _run_published_adapter_cleanup_retry(
+        self,
+        profile_name: str,
+        platform: Platform,
+        adapter: BasePlatformAdapter,
+        owner_map: Dict[Platform, BasePlatformAdapter],
+    ) -> None:
+        """只重试旧 owner cleanup；认证等 fatal 不因此创建 replacement。"""
+        attempts = 0
+        while owner_map.get(platform) is adapter:
+            if self._profile_runtime_unload_blocked(profile_name):
+                return
+            if attempts:
+                await asyncio.sleep(_reconnect_backoff(attempts))
+            try:
+                await self._disconnect_published_adapter(
+                    profile_name=profile_name,
+                    platform=platform,
+                    adapter=adapter,
+                    owner_map=owner_map,
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                attempts += 1
+                logger.error(
+                    "Published %s adapter cleanup retry %d failed (profile: %s)",
+                    platform.value,
+                    attempts,
+                    profile_name or "default",
+                    exc_info=True,
+                )
+
+    def _schedule_published_adapter_cleanup_retry(
+        self,
+        profile_name: str,
+        platform: Platform,
+        adapter: BasePlatformAdapter,
+        owner_map: Dict[Platform, BasePlatformAdapter],
+    ) -> None:
+        """为不可业务重连的 fatal 保留独立 cleanup retry owner。"""
+        if not (
+            getattr(self, "_running", False)
+            or getattr(self, "_startup_restore_in_progress", False)
+        ):
+            return
+        tasks = getattr(self, "_published_adapter_cleanup_tasks", None)
+        if tasks is None:
+            tasks = self._published_adapter_cleanup_tasks = {}
+        key = (profile_name, platform)
+        current = tasks.get(key)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._run_published_adapter_cleanup_retry(
+                profile_name, platform, adapter, owner_map
+            ),
+            name=f"adapter-cleanup:{profile_name or 'default'}:{platform.value}",
+        )
+        tasks[key] = task
+        self._register_profile_adapter_task(profile_name, task)
+        background_tasks = getattr(self, "_background_tasks", None)
+        if isinstance(background_tasks, set):
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+
+        def _remove_task(_done: asyncio.Task) -> None:
+            if tasks.get(key) is task:
+                tasks.pop(key, None)
+
+        task.add_done_callback(_remove_task)
+
+    async def _cleanup_unpublished_adapter(
+        self,
+        adapter: BasePlatformAdapter,
+        platform: Platform,
+        *,
+        profile_name: str = "",
+    ) -> None:
+        """严格清理未发布 adapter；失败对象留在 retry ledger。"""
+        retries = getattr(self, "_partial_adapter_cleanup_retry", None)
+        if retries is None:
+            retries = self._partial_adapter_cleanup_retry = {}
+        tasks = getattr(self, "_partial_adapter_cleanup_tasks", None)
+        if tasks is None:
+            tasks = self._partial_adapter_cleanup_tasks = {}
+        key = (profile_name, platform)
+        pending = retries.get(key)
+        if pending is not None and pending is not adapter:
+            raise RuntimeError(
+                f"prior adapter cleanup pending for {profile_name or 'default'}"
+            )
+        in_flight = tasks.get(key)
+        if in_flight is not None:
+            if not in_flight.done():
+                # 第二个 waiter 不拥有共享 cleanup，取消或超时都不得反向取消 owner。
+                # 🔴 **后续进入也必须有硬期限。**
+                #
+                # 上一版是裸 ``await asyncio.shield(in_flight)`` —— 无期限。
+                # 我为「首次进入」加的硬超时只护到 ``_await_adapter_cleanup_strict``
+                # 那一次;而 ``_reap_cancelled_cleanup`` 在 owner 忽略取消时会把它
+                # **detach 并留在 ``tasks`` 里**(下面 ``finally`` 的
+                # ``operation.done()`` 为假 ⇒ 记录不会被清)。于是**下一次** profile
+                # unload / restart 命中这里,又进入另一条无界等待。
+                # ⭐ 兄弟调用点这次不在「另一个文件」,而在「**另一个时间点**」——
+                #   首次 / 后续 / 重试 / 重启后。按文件 grep 天然找不到它。
+                #
+                # ⛔ **不许塌缩到另一端**:超时后**不取消** owner、**不清**记录 ——
+                # ``shield`` 的本意就是「第二个 waiter 不拥有它,不得反向取消」,
+                # 而清掉记录会让下一次**重复发起** disconnect。
+                # ⇒ 只把「等待」变成有界:每次调用最多等一个期限,超时**显式失败**,
+                #   retry ledger 原样保留,由调用方决定重试还是放弃。
+                grace = self._adapter_disconnect_timeout_secs()
+                await asyncio.wait({in_flight}, timeout=grace)
+                if not in_flight.done():
+                    raise TimeoutError(
+                        f"shared adapter cleanup for "
+                        f"{profile_name or 'default'} still running after "
+                        f"{grace:.1f}s"
+                    )
+                if tasks.get(key) is in_flight:
+                    tasks.pop(key, None)
+                return
+            if tasks.get(key) is in_flight:
+                tasks.pop(key, None)
+        retries[key] = adapter
+
+        async def _cleanup_and_commit() -> None:
+            await adapter.disconnect()
+            if retries.get(key) is not adapter:
+                raise RuntimeError(
+                    f"partial adapter ownership changed for {profile_name or 'default'}"
+                )
+            retries.pop(key, None)
+
+        operation = asyncio.create_task(_cleanup_and_commit())
+        tasks[key] = operation
+        try:
+            await self._await_adapter_cleanup_strict(
+                operation, self._adapter_disconnect_timeout_secs()
+            )
+        finally:
+            if tasks.get(key) is operation and operation.done():
+                tasks.pop(key, None)
+
+    async def _retry_unpublished_adapter_cleanup(
+        self, profile_name: str, platform: Platform
+    ) -> None:
+        retries = getattr(self, "_partial_adapter_cleanup_retry", {})
+        pending = retries.get((profile_name, platform))
+        if pending is not None:
+            await self._cleanup_unpublished_adapter(
+                pending,
+                platform,
+                profile_name=profile_name,
+            )
+
+    async def _await_existing_adapter_tasks(
+        self, tasks: list[asyncio.Task], *, cancel: bool
+    ) -> None:
+        """等待已有 task 到达终态；调用方取消不能反向遗失这些 owner。"""
+        if not tasks:
+            return
+        if cancel:
+            for task in tasks:
+                task.cancel()
+
+        async def _collect():
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        worker = asyncio.create_task(_collect())
+        # 🔴 **第三个入口。** 前两次(H② 首次进入 / :7014 重试入口)各自加了硬期限,
+        # 但 ``_drain_profile_adapter_operations()`` 以 ``cancel=False`` 把同一批
+        # 共享 task 传到这里,在 ``asyncio.shield(worker)`` 上**无限等待**
+        # ⇒ **绕过了那两道期限**。⭐ 每修一个入口就冒下一个 —— 这正是「按实例枚举
+        # 是开集」;本轮同时建了 ``tests/gateway/test_no_unbounded_lifecycle_wait.py``
+        # 那道全仓强制登记门来终结它。
+        # ⛔ 不取消 worker(它 shield 的是共享 owner);超时只**显式失败**,
+        #   owner / retry ledger 原样保留,由调用方决定重试还是放弃。
+        drain_deadline = self._adapter_disconnect_timeout_secs()
+        cancelled = None
+        while True:
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.shield(worker), timeout=drain_deadline
+                )
+            except asyncio.TimeoutError:
+                # 🔴 上一版引用了本作用域**不存在**的 ``profile_name`` ⇒ 超时分支
+                # 一触发就 ``NameError``,把「drain 超时」伪装成内部异常
+                # (指错方向 + 真因被吞)。⭐ 是我在本 PR 引入的,而这条分支平时
+                # 驱动不到 —— **跑不到的分支 = 没被验证的承诺**。
+                # ⇒ 只用本作用域**真实存在**的信息。
+                raise TimeoutError(
+                    f"{len(tasks)} adapter operation(s) still draining after "
+                    f"{drain_deadline:.1f}s"
+                ) from None
+            except asyncio.CancelledError as exc:
+                if worker.cancelled():
+                    raise
+                if cancelled is None:
+                    cancelled = exc
+            else:
+                if cancelled is not None:
+                    raise cancelled
+                failures = [
+                    result
+                    for result in results
+                    if isinstance(result, BaseException)
+                    and not (cancel and isinstance(result, asyncio.CancelledError))
+                ]
+                if failures:
+                    raise RuntimeError(
+                        f"adapter operation failed in {len(failures)} task(s)"
+                    ) from failures[0]
+                return
+
+    async def _track_profile_adapter_operation(
+        self, profile_name: str, operation: Awaitable[Any]
+    ) -> Any:
+        task = asyncio.create_task(operation)
+        self._register_profile_adapter_task(profile_name, task)
+        cancelled = None
+        while True:
+            try:
+                result = await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+                current = asyncio.current_task()
+                if (
+                    not task.done()
+                    and current is not None
+                    and current.cancelling()
+                ):
+                    task.cancel()
+                if not task.done():
+                    continue
+                if task.cancelled():
+                    raise cancelled
+                result = task.result()
+            if cancelled is not None:
+                raise cancelled
+            return result
+
+    async def _drain_profile_adapter_operations(self, profile_name: str) -> int:
+        aliases = self._profile_runtime_aliases(profile_name)
+        operations = getattr(self, "_profile_adapter_operations", {})
+        current = asyncio.current_task()
+        active = {
+            task
+            for alias in aliases
+            for task in operations.get(alias, set())
+            if task is not current and not task.done()
+        }
+        await self._await_existing_adapter_tasks(list(active), cancel=True)
+
+        partial = getattr(self, "_partial_adapter_cleanup_tasks", {})
+        cleanups = {
+            task
+            for (owner_profile, _platform), task in partial.items()
+            if owner_profile in aliases and not task.done()
+        }
+        await self._await_existing_adapter_tasks(list(cleanups), cancel=False)
+
+        # 被取消的 operation 可能在 cleanup worker 失败后只留下 retry ledger。
+        # unload 必须重放它，而不能因 task 已到终态就把残留误判为成功。
+        retries = getattr(self, "_partial_adapter_cleanup_retry", {})
+        pending = [
+            (owner_profile, platform, adapter)
+            for (owner_profile, platform), adapter in list(retries.items())
+            if owner_profile in aliases
+        ]
+        for owner_profile, platform, adapter in pending:
+            await self._cleanup_unpublished_adapter(
+                adapter,
+                platform,
+                profile_name=owner_profile,
+            )
+
+        published = getattr(self, "_published_adapter_cleanup_retry", {})
+        published_pending = [
+            (owner_profile, platform, adapter, owner_map)
+            for (owner_profile, platform), (adapter, owner_map) in list(
+                published.items()
+            )
+            if owner_profile in aliases
+        ]
+        published_cleaned = 0
+        for owner_profile, platform, adapter, owner_map in published_pending:
+            await self._disconnect_published_adapter(
+                profile_name=owner_profile,
+                platform=platform,
+                adapter=adapter,
+                owner_map=owner_map,
+            )
+            published_cleaned += 1
+        return published_cleaned
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
         """Call adapter.disconnect() defensively, swallowing any error.
@@ -7240,14 +8041,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
 
-        The notification arrives on the failing adapter's own polling task,
-        and the disconnect inside the handler can cancel that task mid-flight:
-        disconnect()'s current-task guard misses it because
-        _safe_adapter_disconnect runs the close in a wrapper task. A cancelled
-        handler dies between the fatal log and the reconnect queue, silently
-        stranding the platform (observed 2026-07-21: telegram popped from
-        adapters but never queued after a travel network outage). Run the real
-        work in a detached task that adapter teardown cannot cancel.
+        通知来自故障 adapter 自己的 polling task；disconnect 可能在执行中取消该
+        task。把真实处理放进独立 task，并用 shield 隔离调用方取消，确保严格
+        cleanup 完成后才进入重连队列。
         """
         tasks = getattr(self, "_fatal_handler_tasks", None)
         if tasks is None:
@@ -7276,6 +8072,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Fatal-error handling for %s raised unexpectedly",
                 adapter.platform.value,
             )
+            raise
         finally:
             platform = adapter.platform
             shutdown_event = getattr(self, "_shutdown_event", None)
@@ -7339,35 +8136,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         if existing is adapter:
-            # Claim this adapter for teardown before awaiting disconnect() —
-            # a second fatal-error notification for the same adapter (e.g.
-            # from a concurrent recovery path) would otherwise still see
-            # itself as "existing" during the await below and disconnect()
-            # the same object twice.
-            self.adapters.pop(adapter.platform, None)
-            self.delivery_router.adapters = self.adapters
-            # A half-closed transport can wedge an adapter's native close()
-            # indefinitely. Reuse the shutdown-path timeout so this runtime
-            # fatal handler always reaches the reconnect queue.
-            await self._safe_adapter_disconnect(adapter, adapter.platform)
+            try:
+                await self._disconnect_published_adapter(
+                    profile_name="",
+                    platform=adapter.platform,
+                    adapter=adapter,
+                    owner_map=self.adapters,
+                )
+                self.delivery_router.adapters = self.adapters
+            except BaseException:
+                if adapter.fatal_error_retryable:
+                    self._queue_primary_adapter_reconnect(adapter.platform)
+                else:
+                    self._schedule_published_adapter_cleanup_retry(
+                        "", adapter.platform, adapter, self.adapters
+                    )
+                raise
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
-            platform_config = self.config.platforms.get(adapter.platform)
-            if platform_config and adapter.platform not in self._failed_platforms:
-                self._failed_platforms[adapter.platform] = {
-                    "config": platform_config,
-                    "attempts": 0,
-                    "next_retry": time.monotonic(),
-                }
-                logger.info(
-                    "%s queued for background reconnection",
-                    adapter.platform.value,
-                )
-                # Ensure the reconnect watcher is alive — if it died (e.g. from
-                # exhausting its restart budget), respawn it so queued platforms
-                # are not permanently stranded (#70344).
-                self._ensure_reconnect_watcher_running()
+            self._queue_primary_adapter_reconnect(adapter.platform)
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
@@ -7394,6 +8182,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "retry in background.",
                 len(self._failed_platforms),
             )
+
+    def _queue_primary_adapter_reconnect(self, platform: Platform) -> None:
+        """保留 retry owner；重连前会先重试旧 published adapter cleanup。"""
+        platform_config = self.config.platforms.get(platform)
+        if not platform_config or platform in self._failed_platforms:
+            return
+        self._failed_platforms[platform] = {
+            "config": platform_config,
+            "attempts": 0,
+            "next_retry": time.monotonic(),
+        }
+        logger.info("%s queued for background reconnection", platform.value)
+        self._ensure_reconnect_watcher_running()
 
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True
@@ -8788,7 +9589,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
 
             reply_anchor = self._reply_anchor_for_event(event)
-            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            thread_meta = _non_conversational_metadata(
+                self._thread_metadata_for_source(event.source, reply_anchor),
+                platform=event.source.platform,
+            )
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
@@ -8798,12 +9602,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                reply_to=_non_conversational_reply_to(
+                    (
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    platform=event.source.platform,
                 ),
                 metadata=thread_meta,
             )
@@ -9043,7 +9850,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         log_context="Voice-busy-interrupt",
                     )
                 elif not _interrupt_text and _media_urls:
-                    _interrupt_text = _build_media_placeholder(event)
+                    _interrupt_text = await _build_media_placeholder(event)
                 running_agent.interrupt(_interrupt_text)
             except Exception:
                 pass  # don't let interrupt failure block the ack
@@ -9187,17 +9994,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
         reply_anchor = self._reply_anchor_for_event(event)
-        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        thread_meta = _non_conversational_metadata(
+            self._thread_metadata_for_source(event.source, reply_anchor),
+            platform=event.source.platform,
+        )
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                reply_to=_non_conversational_reply_to(
+                    (
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    platform=event.source.platform,
                 ),
                 metadata=thread_meta,
             )
@@ -9366,6 +10179,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_message_id=reply_to_message_id,
                     adapter=adapter,
                 )
+                metadata = _non_conversational_metadata(
+                    metadata, platform=platform
+                )
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
@@ -9446,6 +10262,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.chat_id,
                     home.thread_id,
                     adapter=adapter,
+                )
+                metadata = _non_conversational_metadata(
+                    metadata, platform=platform
                 )
                 if metadata:
                     result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
@@ -9658,12 +10477,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cleanup_exc,
             )
 
-    def _cleanup_agent_resources(self, agent: Any) -> None:
+    def _cleanup_agent_resources(
+        self,
+        agent: Any,
+        *,
+        raise_on_error: bool = False,
+        completed_steps: Optional[set[str]] = None,
+    ) -> None:
         """Best-effort cleanup for temporary or cached agent instances."""
         if agent is None:
             return
-        try:
-            if hasattr(agent, "shutdown_memory_provider"):
+        completed = completed_steps if completed_steps is not None else set()
+        failures = []
+        if "memory_flush" not in completed:
+            try:
                 # Drain queued memory writes BEFORE tearing the provider down.
                 # The memory manager persists per-turn sync and end-of-session
                 # extraction on a single serialized background worker.
@@ -9678,10 +10505,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # never block teardown.
                 _mm = getattr(agent, "_memory_manager", None)
                 if _mm is not None and hasattr(_mm, "flush_pending"):
-                    try:
-                        _mm.flush_pending(timeout=10)
-                    except Exception:
-                        pass
+                    _mm.flush_pending(timeout=10)
+                completed.add("memory_flush")
+            except Exception as exc:
+                failures.append(exc)
+        if (
+            "memory_shutdown" not in completed
+            and hasattr(agent, "shutdown_memory_provider")
+        ):
+            try:
                 # Pass the agent's own conversation transcript so memory
                 # providers' ``on_session_end`` hooks see the real messages
                 # instead of the empty default (#15165). ``_session_messages``
@@ -9697,25 +10529,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent.shutdown_memory_provider(session_messages)
                 else:
                     agent.shutdown_memory_provider()
-        except Exception:
-            pass
+                completed.add("memory_shutdown")
+            except Exception as exc:
+                failures.append(exc)
         # Close tool resources (terminal sandboxes, browser daemons,
         # background processes, httpx clients) to prevent zombie
         # process accumulation.
-        try:
-            if hasattr(agent, "close"):
+        if "agent_close" not in completed and hasattr(agent, "close"):
+            try:
                 agent.close()
-        except Exception:
-            pass
+                completed.add("agent_close")
+            except Exception as exc:
+                failures.append(exc)
         # Auxiliary async clients (session_search/web/vision/etc.) live in a
         # process-global cache and are created inside worker threads. Clean up
         # any entries whose event loop is now dead so their httpx transports do
         # not accumulate across gateway turns.
-        try:
-            from agent.auxiliary_client import cleanup_stale_async_clients
-            cleanup_stale_async_clients()
-        except Exception:
-            pass
+        if "auxiliary" not in completed:
+            try:
+                from agent.auxiliary_client import cleanup_stale_async_clients
+                cleanup_stale_async_clients()
+                completed.add("auxiliary")
+            except Exception as exc:
+                failures.append(exc)
+        if failures and raise_on_error:
+            raise RuntimeError(
+                f"agent resource cleanup failed in {len(failures)} step(s)"
+            ) from failures[0]
 
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
@@ -10633,7 +11473,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.cancel_background_tasks()
             except Exception as e:
                 logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
-            await self._safe_adapter_disconnect(adapter, platform)
+            await self._cleanup_unpublished_adapter(adapter, platform)
         stop_task = self._stop_task
         current_task = asyncio.current_task()
         if stop_task is not None and stop_task is not current_task:
@@ -11098,6 +11938,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             if not platform_config.enabled:
                 continue
+            await self._retry_unpublished_adapter_cleanup("", platform)
             # Under multiplexing, a platform may be enabled on the default
             # profile's config.yaml while its bot token lives only in a
             # secondary profile's .env. Starting that primary adapter with an
@@ -11153,10 +11994,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error_code=None,
                 error_message=None,
             )
+            cleanup_attempted = False
             try:
                 success = await self._connect_initial_adapter_with_timeout(
                     adapter, platform
                 )
+                if self._startup_should_abort():
+                    cleanup_attempted = True
                 if await self._abort_startup_if_shutdown_requested(adapter, platform):
                     return True
                 if success:
@@ -11184,7 +12028,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # process exit. Adapter disconnect() implementations
                     # are expected to be idempotent and tolerate
                     # partial-init state.
-                    await self._safe_adapter_disconnect(adapter, platform)
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(adapter, platform)
                     if adapter.has_fatal_error:
                         self._update_platform_runtime_status(
                             platform.value,
@@ -11237,10 +12082,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         }
             except Exception as e:
                 logger.error("✗ %s error: %s", platform.value, e)
+                if cleanup_attempted:
+                    raise RuntimeError(
+                        f"adapter cleanup failed for {platform.value}"
+                    ) from e
                 # Same defensive cleanup path for exceptions — an adapter
                 # that raised mid-connect may still have a live
                 # aiohttp.ClientSession or child subprocess.
-                await self._safe_adapter_disconnect(adapter, platform)
+                if not cleanup_attempted:
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(adapter, platform)
                 self._update_platform_runtime_status(
                     platform.value,
                     platform_state="retrying",
@@ -11270,6 +12121,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             _secondary_connected = await self._start_secondary_profile_adapters()
             connected_count += _secondary_connected
+        except _ProfileAdapterCleanupError:
+            raise
         except MultiplexConfigError as e:
             # Invalid multiplexer config — abort startup cleanly so the operator
             # fixes config.yaml rather than running a half-wired gateway.
@@ -12320,10 +13173,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 notified_map.pop(session_key, None)
                 continue
             try:
-                metadata = (
-                    self._thread_metadata_for_source(source)
-                    if source is not None and hasattr(self, "_thread_metadata_for_source")
-                    else None
+                metadata = _non_conversational_metadata(
+                    (
+                        self._thread_metadata_for_source(source)
+                        if source is not None
+                        and hasattr(self, "_thread_metadata_for_source")
+                        else None
+                    ),
+                    platform=getattr(source, "platform", None),
                 )
                 # Round-2 #2: bound the send. A wedged adapter transport
                 # (network hang, dead websocket) must not block the whole
@@ -12477,6 +13334,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if now < info["next_retry"]:
                     continue  # not time yet
 
+                if info.get("cleanup_only"):
+                    attempt = info["attempts"] + 1
+                    try:
+                        await self._retry_unpublished_adapter_cleanup("", platform)
+                    except Exception:
+                        backoff = _reconnect_backoff(attempt)
+                        info["attempts"] = attempt
+                        info["next_retry"] = time.monotonic() + backoff
+                        logger.error(
+                            "Reconnect %s terminal cleanup retry failed; retry in %ds",
+                            platform.value,
+                            backoff,
+                            exc_info=True,
+                        )
+                    else:
+                        if self._failed_platforms.get(platform) is info:
+                            self._failed_platforms.pop(platform, None)
+                    continue
+
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
                 # Empty-token primary configs can never reconnect; drop them so
@@ -12496,7 +13372,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 adapter = None
+                cleanup_attempted = False
                 try:
+                    failed_owner = self.adapters.get(platform)
+                    if failed_owner is not None:
+                        await self._disconnect_published_adapter(
+                            profile_name="",
+                            platform=platform,
+                            adapter=failed_owner,
+                            owner_map=self.adapters,
+                        )
+                        self.delivery_router.adapters = self.adapters
+                    await self._retry_unpublished_adapter_cleanup("", platform)
                     adapter = self._create_adapter(platform, platform_config)
                     if not adapter:
                         logger.warning(
@@ -12562,6 +13449,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
+                        info["cleanup_only"] = True
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="fatal",
@@ -12580,8 +13468,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # APIServerAdapter, etc.) leak 2 fds each. The
                         # gateway hits the 2560-fd limit after ~12h of
                         # failed reconnects at the 300s backoff cap (#37011).
-                        await _dispose_unused_adapter(adapter)
-                        del self._failed_platforms[platform]
+                        cleanup_attempted = True
+                        await self._cleanup_unpublished_adapter(adapter, platform)
+                        if self._failed_platforms.get(platform) is info:
+                            self._failed_platforms.pop(platform, None)
                     else:
                         self._update_platform_runtime_status(
                             platform.value,
@@ -12603,7 +13493,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # the next GC pass — and aiohttp/SQLite handles
                         # don't get GC'd promptly, so 2 fds/retry leak at
                         # 300s backoff cap = ~12 fds/hour (#37011).
-                        await _dispose_unused_adapter(adapter)
+                        cleanup_attempted = True
+                        await self._cleanup_unpublished_adapter(adapter, platform)
                         # Retryable failures (network/DNS blips) keep retrying
                         # at the backoff cap indefinitely — they self-heal once
                         # connectivity returns. We do NOT auto-pause them: a
@@ -12613,14 +13504,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # `not fatal_error_retryable` branch above, so anything
                         # reaching here is by definition retryable.
                 except Exception as e:
-                    if adapter is not None:
+                    terminal = bool(
+                        adapter is not None
+                        and getattr(adapter, "has_fatal_error", False)
+                        and not getattr(adapter, "fatal_error_retryable", True)
+                    )
+                    if terminal:
+                        info["cleanup_only"] = True
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="fatal",
+                            error_code=adapter.fatal_error_code,
+                            error_message=adapter.fatal_error_message,
+                        )
+                    pending_cleanup = getattr(
+                        self, "_partial_adapter_cleanup_retry", {}
+                    ).get(("", platform))
+                    cleanup_error = (
+                        e if terminal and pending_cleanup is adapter else None
+                    )
+                    if adapter is not None and not cleanup_attempted:
                         # An exception escaping the connect call path
                         # (DNS timeout, aiohttp server.start() crash, etc.)
                         # leaves the adapter in the same unowned state as
                         # the two branches above. Dispose so __init__
                         # resources don't accumulate while the watcher
                         # keeps retrying.
-                        await _dispose_unused_adapter(adapter)
+                        cleanup_attempted = True
+                        try:
+                            await self._cleanup_unpublished_adapter(adapter, platform)
+                        except Exception as exc:
+                            cleanup_error = exc
+                    if terminal:
+                        if cleanup_error is None:
+                            if self._failed_platforms.get(platform) is info:
+                                self._failed_platforms.pop(platform, None)
+                        else:
+                            backoff = _reconnect_backoff(attempt)
+                            info["attempts"] = attempt
+                            info["next_retry"] = time.monotonic() + backoff
+                            logger.error(
+                                "Reconnect %s terminal cleanup failed; retry in %ds",
+                                platform.value,
+                                backoff,
+                                exc_info=(
+                                    type(cleanup_error),
+                                    cleanup_error,
+                                    cleanup_error.__traceback__,
+                                ),
+                            )
+                        continue
+                    if cleanup_error is not None:
+                        e = cleanup_error
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="retrying",
@@ -12882,6 +13817,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _api_at_start = self._active_api_run_count()
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
+
+            # 🔴 **必须排在 drain 之后。**
+            # 本批(commit ``ef82131eac``)最初把它放在 drain **之前**。这个标记同时
+            # 被 ``MCPServerTask._transport_admission_open()`` 和 lazy / reconnect
+            # 入口读取 ⇒ 在排空窗口内,**尚未首次连接的 lazy MCP 工具**、以及**刚好
+            # 掉线的 MCP server**会被立刻拒绝建立 transport。对应 turn 收到
+            # "not connected" 后可能"正常"结束,预写的 ``resume_pending`` 随之被清掉,
+            # **用户的工作在重启后接不上** —— drain 的可靠性承诺被这一行破坏。
+            # ⭐ 两件事要分开:「禁止**后台** discovery」与「禁止**活动 turn** 建立
+            # transport」。前者本就是这个标记的本意,后者只该在活动工作排空之后生效。
+            # ⇒ 移到这里:drain 已经结束,此后任何新 transport 都确实不该再建。
+            from hermes_cli.mcp_startup import begin_mcp_discovery_teardown
+            begin_mcp_discovery_teardown()
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
@@ -13096,6 +14044,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the new gateway tries to open the same file.
             # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
             # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
+            try:
+                from hermes_cli.mcp_startup import join_all_mcp_discovery
+                from tools.mcp_tool import shutdown_mcp_servers
+
+                discovery_stopped = await self._run_in_executor_with_context(
+                    join_all_mcp_discovery, 5.0
+                )
+                if not discovery_stopped:
+                    raise TimeoutError("MCP discovery did not stop before shutdown")
+                await self._run_in_executor_with_context(shutdown_mcp_servers)
+                self._mcp_shutdown_completed = True
+            except Exception:
+                logger.error(
+                    "MCP discovery/server shutdown failed before executor close",
+                    exc_info=True,
+                )
+
             _self_db = getattr(self, "_session_db", None)
             _self_db = getattr(_self_db, "_db", _self_db)
             for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
@@ -13246,6 +14211,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         active = get_active_profile_name() or "default"
         connected = 0
+        cleanup_failures = []
         # Resource claim -> profile that owns it. Credential claims prevent two
         # profiles polling the same account; listener claims prevent sidecars
         # with distinct credentials from binding the same endpoint.
@@ -13273,6 +14239,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
                 )
+            except _ProfileAdapterCleanupError as exc:
+                logger.error(
+                    "Secondary profile '%s' cleanup failed during startup",
+                    profile_name,
+                    exc_info=True,
+                )
+                cleanup_failures.append(exc)
             except SecondaryPortBindingConfigError as e:
                 logger.warning(
                     "Skipping secondary profile '%s' due to port-binding config error: %s",
@@ -13307,13 +14280,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not record served_profiles", exc_info=True)
 
+        if cleanup_failures:
+            raise _ProfileAdapterCleanupError(
+                f"secondary profile cleanup failed for {len(cleanup_failures)} profile(s)"
+            ) from cleanup_failures[0]
         return connected
 
     async def _start_one_profile_adapters(
         self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
     ) -> int:
+        try:
+            return await self._track_profile_adapter_operation(
+                profile_name,
+                self._start_one_profile_adapters_owned(
+                    profile_name, profile_home, claimed
+                ),
+            )
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if (
+                self._profile_runtime_unload_blocked(profile_name)
+                and (current is None or not current.cancelling())
+            ):
+                return 0
+            raise
+        except Exception as exc:
+            retries = getattr(self, "_partial_adapter_cleanup_retry", {})
+            if any(
+                owner_profile == profile_name
+                for owner_profile, _platform in retries
+            ):
+                raise _ProfileAdapterCleanupError(
+                    f"profile adapter cleanup failed for {profile_name}"
+                ) from exc
+            raise
+
+    async def _start_one_profile_adapters_owned(
+        self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
+    ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.config import load_gateway_config
+
+        if self._profile_runtime_unload_blocked(profile_name):
+            raise RuntimeError(
+                f"profile adapter startup rejected during unload for {profile_name}"
+            )
+
+        # 旧 runtime 的 partial owner 必须先于新配置校验完成 cleanup；即使配置
+        # 已损坏、禁用平台或违反 multiplex 规则，也不能让旧进程永久留在 ledger。
+        pending_partial = [
+            (pending_platform, pending_adapter)
+            for (owner_profile, pending_platform), pending_adapter in list(
+                getattr(self, "_partial_adapter_cleanup_retry", {}).items()
+            )
+            if owner_profile == profile_name
+        ]
+        for pending_platform, pending_adapter in pending_partial:
+            await self._cleanup_unpublished_adapter(
+                pending_adapter,
+                pending_platform,
+                profile_name=profile_name,
+            )
 
         with _profile_runtime_scope(profile_home):
             profile_cfg = load_gateway_config()
@@ -13349,6 +14376,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
+            await self._retry_unpublished_adapter_cleanup(profile_name, platform)
             # Process-shared ingress is owned by the active gateway instance.
             # URL prefixes / connector stamps route inbound turns to the
             # secondary profile without another listener or relay connection.
@@ -13372,6 +14400,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     profile_name,
                 )
                 continue
+            cleanup_attempted = False
             try:
                 with _profile_runtime_scope(profile_home):
                     adapter = self._create_adapter(platform, platform_config)
@@ -13440,6 +14469,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter, platform
                     )
                 if success:
+                    if self._profile_runtime_unload_blocked(profile_name):
+                        cleanup_attempted = True
+                        await self._cleanup_unpublished_adapter(
+                            adapter, platform, profile_name=profile_name
+                        )
+                        continue
                     profile_map[platform] = adapter
                     if credential_claim is not None:
                         claimed[credential_claim] = profile_name
@@ -13449,10 +14484,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
                 else:
                     logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
-                    await self._safe_adapter_disconnect(adapter, platform)
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(
+                        adapter, platform, profile_name=profile_name
+                    )
+            except asyncio.CancelledError:
+                if not cleanup_attempted:
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(
+                        adapter, platform, profile_name=profile_name
+                    )
+                raise
             except Exception as e:
                 logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)
-                await self._safe_adapter_disconnect(adapter, platform)
+                if cleanup_attempted:
+                    raise RuntimeError(
+                        f"profile adapter cleanup failed for {profile_name}"
+                    ) from e
+                if not cleanup_attempted:
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(
+                        adapter, platform, profile_name=profile_name
+                    )
         return connected
 
     def _configure_profile_adapter(
@@ -13480,72 +14533,193 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _run_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform
     ) -> None:
-        """Reconnect a retryable secondary adapter under its own profile scope."""
-        attempts = 0
         current_task = asyncio.current_task()
         try:
-            while self._running:
-                adapter = None
+            await self._track_profile_adapter_operation(
+                profile_name,
+                self._run_secondary_profile_reconnect_owned(profile_name, platform),
+            )
+        finally:
+            pending = self._profile_failed_platforms
+            if isinstance(pending, dict):
+                profile_pending = pending.get(profile_name)
+                task = (
+                    profile_pending.get(platform)
+                    if isinstance(profile_pending, dict)
+                    else None
+                )
+                if not isinstance(task, asyncio.Task) or task is current_task:
+                    if isinstance(profile_pending, dict):
+                        profile_pending.pop(platform, None)
+                        if not profile_pending:
+                            pending.pop(profile_name, None)
+
+    def _secondary_reconnect_window_active(self) -> bool:
+        """统一判定 secondary reconnect 是否仍可发布或继续重试。"""
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if (
+            getattr(self, "_restart_requested", False)
+            or getattr(self, "_draining", False)
+            or (shutdown_event is not None and shutdown_event.is_set())
+        ):
+            return False
+        return bool(
+            getattr(self, "_running", False)
+            or getattr(self, "_startup_restore_in_progress", False)
+        )
+
+    async def _run_secondary_profile_reconnect_owned(
+        self, profile_name: str, platform: Platform
+    ) -> None:
+        """Reconnect a retryable secondary adapter under its own profile scope."""
+        attempts = 0
+        terminal_cleanup_only = False
+        while self._secondary_reconnect_window_active():
+            if self._profile_runtime_unload_blocked(profile_name):
+                return
+            if terminal_cleanup_only:
                 try:
-                    from hermes_cli.profiles import get_profile_dir
-                    from gateway.config import load_gateway_config
-
-                    profile_home = get_profile_dir(profile_name)
-                    with _profile_runtime_scope(profile_home):
-                        profile_config = load_gateway_config().platforms.get(platform)
-                        if profile_config is None or not profile_config.enabled:
-                            return
-                        adapter = self._create_adapter(platform, profile_config)
-                        if adapter is None:
-                            logger.warning(
-                                "Secondary %s reconnect skipped: adapter unavailable (profile: %s)",
-                                platform.value,
-                                profile_name,
-                            )
-                            return
-                        self._configure_profile_adapter(
-                            adapter, profile_name, platform
-                        )
-                        success = await self._connect_adapter_with_timeout(
-                            adapter, platform, is_reconnect=True
-                        )
-
-                    if success and self._running:
-                        profile_map = self._profile_adapters.setdefault(profile_name, {})
-                        if platform not in profile_map:
-                            profile_map[platform] = adapter
-                            self._sync_voice_mode_state_to_adapter(adapter)
-                            logger.info(
-                                "✓ %s reconnected (profile: %s)",
-                                platform.value,
-                                profile_name,
-                            )
-                            return
-                        # A newer reconnect already won the slot while this
-                        # attempt was awaiting connect; do not replace it.
-                        await self._safe_adapter_disconnect(adapter, platform)
-                        return
-
-                    # Shutdown can begin while connect() is in flight. Do not
-                    # republish a newly connected adapter after the registry has
-                    # been drained; release its partial resources instead.
-                    if success:
-                        await self._safe_adapter_disconnect(adapter, platform)
-                        return
-
-                    await self._safe_adapter_disconnect(adapter, platform)
-                    if (
-                        getattr(adapter, "has_fatal_error", False)
-                        and not getattr(adapter, "fatal_error_retryable", True)
-                    ):
-                        return
-                except asyncio.CancelledError:
-                    if adapter is not None:
-                        await self._safe_adapter_disconnect(adapter, platform)
-                    raise
+                    await self._retry_unpublished_adapter_cleanup(
+                        profile_name, platform
+                    )
                 except Exception:
-                    if adapter is not None:
-                        await self._safe_adapter_disconnect(adapter, platform)
+                    logger.error(
+                        "Secondary %s terminal cleanup retry failed (profile: %s)",
+                        platform.value,
+                        profile_name,
+                        exc_info=True,
+                    )
+                else:
+                    return
+                attempts += 1
+                await asyncio.sleep(_reconnect_backoff(attempts))
+                continue
+            adapter = None
+            cleanup_attempted = False
+            terminal = False
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                from gateway.config import load_gateway_config
+
+                profile_home = get_profile_dir(profile_name)
+                profile_map = self._profile_adapters.get(profile_name, {})
+                failed_owner = profile_map.get(platform)
+                if failed_owner is not None:
+                    await self._disconnect_published_adapter(
+                        profile_name=profile_name,
+                        platform=platform,
+                        adapter=failed_owner,
+                        owner_map=profile_map,
+                    )
+                await self._retry_unpublished_adapter_cleanup(
+                    profile_name, platform
+                )
+                with _profile_runtime_scope(profile_home):
+                    profile_config = load_gateway_config().platforms.get(platform)
+                    if profile_config is None or not profile_config.enabled:
+                        return
+                    adapter = self._create_adapter(platform, profile_config)
+                    if adapter is None:
+                        logger.warning(
+                            "Secondary %s reconnect skipped: adapter unavailable (profile: %s)",
+                            platform.value,
+                            profile_name,
+                        )
+                        return
+                    self._configure_profile_adapter(
+                        adapter, profile_name, platform
+                    )
+                    success = await self._connect_adapter_with_timeout(
+                        adapter, platform, is_reconnect=True
+                    )
+
+                if success and self._secondary_reconnect_window_active():
+                    if self._profile_runtime_unload_blocked(profile_name):
+                        cleanup_attempted = True
+                        await self._cleanup_unpublished_adapter(
+                            adapter, platform, profile_name=profile_name
+                        )
+                        return
+                    profile_map = self._profile_adapters.setdefault(profile_name, {})
+                    if platform not in profile_map:
+                        profile_map[platform] = adapter
+                        self._sync_voice_mode_state_to_adapter(adapter)
+                        logger.info(
+                            "✓ %s reconnected (profile: %s)",
+                            platform.value,
+                            profile_name,
+                        )
+                        return
+                    # A newer reconnect already won the slot while this
+                    # attempt was awaiting connect; do not replace it.
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(
+                        adapter, platform, profile_name=profile_name
+                    )
+                    return
+
+                # Shutdown can begin while connect() is in flight. Do not
+                # republish a newly connected adapter after the registry has
+                # been drained; release its partial resources instead.
+                if success:
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(
+                        adapter, platform, profile_name=profile_name
+                    )
+                    return
+
+                cleanup_attempted = True
+                terminal = bool(
+                    getattr(adapter, "has_fatal_error", False)
+                    and not getattr(adapter, "fatal_error_retryable", True)
+                )
+                await self._cleanup_unpublished_adapter(
+                    adapter, platform, profile_name=profile_name
+                )
+                if terminal:
+                    return
+            except asyncio.CancelledError:
+                if adapter is not None and not cleanup_attempted:
+                    cleanup_attempted = True
+                    await self._cleanup_unpublished_adapter(
+                        adapter, platform, profile_name=profile_name
+                    )
+                raise
+            except Exception as error:
+                terminal = terminal or bool(
+                    adapter is not None
+                    and getattr(adapter, "has_fatal_error", False)
+                    and not getattr(adapter, "fatal_error_retryable", True)
+                )
+                pending_cleanup = getattr(
+                    self, "_partial_adapter_cleanup_retry", {}
+                ).get((profile_name, platform))
+                cleanup_error = (
+                    error if terminal and pending_cleanup is adapter else None
+                )
+                if adapter is not None and not cleanup_attempted:
+                    cleanup_attempted = True
+                    try:
+                        await self._cleanup_unpublished_adapter(
+                            adapter, platform, profile_name=profile_name
+                        )
+                    except Exception as exc:
+                        cleanup_error = exc
+                if terminal:
+                    if cleanup_error is None:
+                        return
+                    terminal_cleanup_only = True
+                    logger.error(
+                        "Secondary %s terminal cleanup failed (profile: %s)",
+                        platform.value,
+                        profile_name,
+                        exc_info=(
+                            type(cleanup_error),
+                            cleanup_error,
+                            cleanup_error.__traceback__,
+                        ),
+                    )
+                else:
                     logger.debug(
                         "Secondary %s reconnect attempt failed (profile: %s)",
                         platform.value,
@@ -13553,33 +14727,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
 
-                if not self._running:
-                    return
-                attempts += 1
-                backoff = _reconnect_backoff(attempts)
-                logger.info(
-                    "Secondary %s reconnect retry in %ds (profile: %s)",
-                    platform.value,
-                    backoff,
-                    profile_name,
-                )
-                await asyncio.sleep(backoff)
-        finally:
-            pending = self._profile_failed_platforms
-            if isinstance(pending, dict):
-                profile_pending = pending.get(profile_name)
-                task = profile_pending.get(platform) if isinstance(profile_pending, dict) else None
-                if not isinstance(task, asyncio.Task) or task is current_task:
-                    if isinstance(profile_pending, dict):
-                        profile_pending.pop(platform, None)
-                        if not profile_pending:
-                            pending.pop(profile_name, None)
+            if not self._secondary_reconnect_window_active():
+                return
+            attempts += 1
+            backoff = _reconnect_backoff(attempts)
+            logger.info(
+                "Secondary %s reconnect retry in %ds (profile: %s)",
+                platform.value,
+                backoff,
+                profile_name,
+            )
+            await asyncio.sleep(backoff)
 
     def _schedule_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform, adapter: BasePlatformAdapter
     ) -> None:
         """Schedule one runner-owned reconnect without sharing primary secrets."""
-        if not self._running or not adapter.fatal_error_retryable:
+        if (
+            not self._secondary_reconnect_window_active()
+            or not adapter.fatal_error_retryable
+            or self._profile_runtime_unload_blocked(profile_name)
+        ):
             return
         pending = self._profile_failed_platforms
         if not isinstance(pending, dict):
@@ -13630,11 +14798,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profile_name,
             )
             return
-        profile_map.pop(platform, None)
-        await self._safe_adapter_disconnect(adapter, platform)
-        if not self._running:
-            return
-        self._schedule_secondary_profile_reconnect(profile_name, platform, adapter)
+        try:
+            await self._disconnect_published_adapter(
+                profile_name=profile_name,
+                platform=platform,
+                adapter=adapter,
+                owner_map=profile_map,
+            )
+        except BaseException:
+            if adapter.fatal_error_retryable:
+                self._schedule_secondary_profile_reconnect(
+                    profile_name, platform, adapter
+                )
+            else:
+                self._schedule_published_adapter_cleanup_retry(
+                    profile_name, platform, adapter, profile_map
+                )
+            raise
+        if adapter.fatal_error_retryable:
+            self._schedule_secondary_profile_reconnect(
+                profile_name, platform, adapter
+            )
         logger.error(
             "Fatal %s adapter error for multiplexed profile %s (%s)",
             platform.value,
@@ -13974,7 +15158,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if config and hasattr(config, "get_notice_delivery"):
             notice_delivery = config.get_notice_delivery(source.platform)
 
-        metadata = self._thread_metadata_for_source(source)
+        metadata = _non_conversational_metadata(
+            self._thread_metadata_for_source(source),
+            platform=source.platform,
+        )
         if notice_delivery == "private" and getattr(source, "user_id", None):
             try:
                 result = await adapter.send_private_notice(
@@ -15021,7 +16208,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_context="Voice-priority-interrupt",
                 )
             elif not _interrupt_text and _media_urls:
-                _interrupt_text = _build_media_placeholder(event)
+                _interrupt_text = await _build_media_placeholder(event)
             running_agent.interrupt(_interrupt_text)
             # NOTE: self._pending_messages was write-only (never consumed).
             # The actual interrupt message is delivered via adapter._pending_messages
@@ -15215,7 +16402,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    _ack_meta = self._thread_metadata_for_source(source)
+                    _ack_meta = _non_conversational_metadata(
+                        self._thread_metadata_for_source(source),
+                        platform=source.platform,
+                    )
                     await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
             except Exception:
                 logger.debug("learn ack send failed", exc_info=True)
@@ -15246,7 +16436,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    _ack_meta = self._thread_metadata_for_source(source)
+                    _ack_meta = _non_conversational_metadata(
+                        self._thread_metadata_for_source(source),
+                        platform=source.platform,
+                    )
                     await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
             except Exception:
                 logger.debug("init ack send failed", exc_info=True)
@@ -15300,7 +16493,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         adapter = self._adapter_for_source(source)
                         if adapter:
-                            _ack_meta = self._thread_metadata_for_source(source)
+                            _ack_meta = _non_conversational_metadata(
+                                self._thread_metadata_for_source(source),
+                                platform=source.platform,
+                            )
                             await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
                     except Exception:
                         logger.debug("blueprint ack send failed", exc_info=True)
@@ -15729,6 +16925,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        source_profile = str(getattr(source, "profile", None) or "").strip()
+        if self._profile_runtime_unload_blocked(source_profile):
+            logger.info(
+                "Refusing new turn for session %s: profile %s is unloading",
+                _quick_key,
+                source_profile,
+            )
+            return "This profile is being reloaded. Retry shortly."
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -16000,9 +17205,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from agent.auxiliary_client import scoped_runtime_main
 
                     with scoped_runtime_main(vision_runtime):
-                        message_text = await self._enrich_message_with_vision(
-                            message_text,
-                            image_paths,
+                        message_text, _vision_moderation_blocked = (
+                            await self._enrich_message_with_vision(
+                                message_text,
+                                image_paths,
+                            )
+                        )
+                    if _vision_moderation_blocked:
+                        # The image was refused by content moderation during
+                        # pre-analysis. Re-attach it inline (like the native path)
+                        # so the main-model call is refused by the gateway too →
+                        # content_policy_blocked terminates the turn and the model
+                        # never runs. Text-only models now honour the same image
+                        # gate as vision-capable ones.
+                        self._session_state(
+                            session_key
+                        ).persistent.native_image_paths = list(image_paths)
+                        logger.info(
+                            "Image routing: text-path pre-analysis was refused by "
+                            "content moderation; re-attaching %d image(s) inline so "
+                            "the main-model call is refused and the turn terminates.",
+                            len(image_paths),
                         )
 
             if audio_paths:
@@ -16016,7 +17239,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # receive the transcription.
                 if _successful_transcripts and self._should_echo_stt_transcripts():
                     _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    _echo_meta = _non_conversational_metadata(
+                        self._thread_metadata_for_source(
+                            source, self._reply_anchor_for_event(event)
+                        ),
+                        platform=source.platform,
+                    )
                     if _echo_adapter:
                         for _tx in _successful_transcripts:
                             try:
@@ -16357,6 +17585,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        # Preserve platform-authored text before sender, channel, reply, skill,
+        # or attachment context is injected into the model-facing message.
+        _event_authored_message = getattr(event, "user_authored_message", None)
+        _user_authored_message = (
+            event.text or ""
+            if _event_authored_message is None
+            else _event_authored_message
+        )
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -16602,7 +17838,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             pass
                         await adapter.send(
                             source.chat_id, notice,
-                            metadata=self._thread_metadata_for_source(source),
+                            metadata=_non_conversational_metadata(
+                                self._thread_metadata_for_source(source),
+                                platform=source.platform,
+                            ),
                         )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
@@ -16931,7 +18170,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"{_compress_token_threshold:,}",
                     )
 
-                    _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    _hyg_meta = _non_conversational_metadata(
+                        self._thread_metadata_for_source(
+                            source, self._reply_anchor_for_event(event)
+                        ),
+                        platform=source.platform,
+                    )
 
                     try:
                         from agent.conversation_compression import CompressionCommitFence
@@ -17602,6 +18846,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
+                user_authored_message=_user_authored_message,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
@@ -18213,7 +19458,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                metadata=_non_conversational_metadata(
+                                    self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                    platform=source.platform,
+                                ),
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
@@ -18781,7 +20029,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         try:
-            metadata = self._thread_metadata_for_source(source)
+            metadata = _non_conversational_metadata(
+                self._thread_metadata_for_source(source),
+                platform=source.platform,
+            )
         except Exception:
             metadata = None
 
@@ -19266,6 +20517,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+                if _gateway_platform_value(event.source.platform) == "feishu":
+                    thread_meta = _non_conversational_metadata(thread_meta, platform=event.source.platform)
                 # Mark the auto voice reply as notify-worthy.  Mirrors the
                 # final-text path in gateway/platforms/base.py which sets
                 # ``notify=True`` so platform adapters that gate push
@@ -19281,7 +20534,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 send_kwargs: Dict[str, Any] = {
                     "chat_id": event.source.chat_id,
                     "audio_path": actual_path,
-                    "reply_to": reply_anchor,
+                    "reply_to": None if _gateway_platform_value(event.source.platform) == "feishu" else reply_anchor,
                     "metadata": thread_meta,
                 }
                 await adapter.send_voice(**send_kwargs)
@@ -19346,6 +20599,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.extract_images(cleaned)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            if event.source.platform == Platform.FEISHU:
+                _thread_meta = _non_conversational_metadata(
+                    _thread_meta,
+                    platform=event.source.platform,
+                )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -19453,6 +20711,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        _flat_thread_metadata = _non_conversational_metadata(
+            _thread_metadata,
+            platform=source.platform,
+        )
 
         try:
             user_config = _load_gateway_config()
@@ -19466,7 +20728,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                    metadata=_flat_thread_metadata,
                 )
                 return
 
@@ -19500,7 +20762,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if image_paths:
                     try:
                         self._install_turn_auxiliary_runtime(turn_route)
-                        enriched_prompt = await self._enrich_message_with_vision(
+                        # Background path: a moderation refusal drops the image
+                        # (returns the prompt text only), so the violating image
+                        # never reaches the model even without a user-facing turn.
+                        enriched_prompt, _ = await self._enrich_message_with_vision(
                             prompt, image_paths,
                         )
                     except Exception as e:
@@ -19564,8 +20829,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
+                text_result = None
                 if text_content:
-                    await adapter.send(
+                    text_result = await adapter.send(
                         chat_id=source.chat_id,
                         content=header + text_content,
                         metadata=_thread_metadata,
@@ -19574,18 +20840,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await adapter.send(
                         chat_id=source.chat_id,
                         content=header + "(No response generated)",
-                        metadata=_thread_metadata,
+                        metadata=_flat_thread_metadata,
                     )
+
+                media_metadata = _thread_metadata
+                if source.platform == Platform.FEISHU and text_result is not None and getattr(text_result, "success", False):
+                    media_metadata = _flat_thread_metadata
+                quote_available = bool(
+                    source.platform == Platform.FEISHU
+                    and media_metadata
+                    and media_metadata.get("reply_to_message_id")
+                )
+
+                def next_media_metadata():
+                    nonlocal quote_available
+                    current = media_metadata if quote_available else _flat_thread_metadata
+                    return current
+
+                def consume_media_quote(result):
+                    nonlocal quote_available
+                    if quote_available and getattr(result, "success", False) is True:
+                        quote_available = False
 
                 # Send extracted images
                 for image_url, alt_text in (images or []):
                     try:
-                        await adapter.send_image(
+                        image_result = await adapter.send_image(
                             chat_id=source.chat_id,
                             image_url=image_url,
                             caption=alt_text,
-                            metadata=_thread_metadata,
+                            metadata=next_media_metadata(),
                         )
+                        consume_media_quote(image_result)
                     except Exception:
                         pass
 
@@ -19601,29 +20887,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
+                            media_result = await adapter.send_voice(
                                 chat_id=source.chat_id,
                                 audio_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=next_media_metadata(),
                             )
                         elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
+                            media_result = await adapter.send_video(
                                 chat_id=source.chat_id,
                                 video_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=next_media_metadata(),
                             )
                         elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
+                            media_result = await adapter.send_image_file(
                                 chat_id=source.chat_id,
                                 image_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=next_media_metadata(),
                             )
                         else:
-                            await adapter.send_document(
+                            media_result = await adapter.send_document(
                                 chat_id=source.chat_id,
                                 file_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=next_media_metadata(),
                             )
+                        consume_media_quote(media_result)
                     except Exception:
                         pass
             else:
@@ -19631,7 +20918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.send(
                     chat_id=source.chat_id,
                     content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                    metadata=_flat_thread_metadata,
                 )
 
         except Exception as e:
@@ -19640,7 +20927,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.send(
                     chat_id=source.chat_id,
                     content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
+                    metadata=_flat_thread_metadata,
                 )
             except Exception:
                 pass
@@ -20322,16 +21609,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
         """
+        from hermes_cli.mcp_startup import mcp_discovery_in_flight
+
+        # 两个来源都问，它们各自 gate 不同的东西：
+        #   · mcp_discovery_in_flight() —— hermes_cli.mcp_startup 里的
+        #     threading.Thread 是否还活着。start_gateway 现在正是通过
+        #     start_background_mcp_discovery 起 discovery（见
+        #     _start_mcp_discovery_task），所以这一条【已经覆盖】gateway 路径；
+        #     desktop app / dashboard / ws sidecar 也走同一个模块。
+        #   · self._mcp_discovery_task —— 包住那次 join 的 asyncio.Task。它是
+        #     【独立于线程状态的第二判据】：线程状态由 mcp_startup 的模块级
+        #     字典维护，一旦那边的 owner/profile 归属算错（本轮已经在
+        #     discovery 归属上踩过），in_flight() 会静默返回 False；这条不依赖
+        #     那套簿记，也让任何仍按旧机制直接挂 _mcp_discovery_task 的调用方
+        #     继续被挡下。
+        # ⚠️ 现状是【冗余】而非【互补】—— 正常路径下两者同真同假。留着是为了
+        # 单点失效时还有一层，⛔ 不要据此以为 in_flight() 覆盖不到 gateway。
         discovery_task = getattr(self, "_mcp_discovery_task", None)
-        if discovery_task is not None and not discovery_task.done():
+        gateway_discovery_running = (
+            discovery_task is not None and not discovery_task.done()
+        )
+        if mcp_discovery_in_flight() or gateway_discovery_running:
             return (
                 "MCP discovery is still initializing in the background. "
                 "Please retry `/reload-mcp` after it finishes."
             )
 
-        loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                _lock,
+                _servers,
+                discover_mcp_tools,
+                shutdown_mcp_profile,
+            )
 
             # Capture old server names before shutdown
             with _lock:
@@ -20339,10 +21649,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            await self._run_in_executor_with_context(shutdown_mcp_profile)
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
 
             # Compute what changed
             with _lock:
@@ -20375,13 +21685,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache = getattr(self, "_agent_cache", None)
                 _cache_lock = getattr(self, "_agent_cache_lock", None)
                 if _cache_lock is not None and _cache:
+                    _profile_prefix = self._profile_session_key_prefix(
+                        getattr(event.source, "profile", None)
+                    )
+                    _running_ids = {
+                        id(_running)
+                        for _running in getattr(self, "_running_agents", {}).values()
+                        if _running is not None
+                        and _running is not _AGENT_PENDING_SENTINEL
+                    }
                     with _cache_lock:
                         for _sess_key, _entry in list(_cache.items()):
+                            if not str(_sess_key).startswith(_profile_prefix):
+                                continue
                             try:
                                 _agent = _entry[0] if isinstance(_entry, tuple) else _entry
                             except Exception:
                                 continue
-                            if _agent is None:
+                            if (
+                                _agent is None
+                                or _agent is _AGENT_PENDING_SENTINEL
+                                or id(_agent) in _running_ids
+                            ):
+                                # 运行中的 agent 保持本 turn 的工具快照；registry
+                                # generation 已进入 cache signature，下一 turn 会重建。
                                 continue
                             # Preserve each cached agent's build-time toolset
                             # selection EXACTLY: a gateway session built with a
@@ -20425,9 +21752,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             return "\n".join(lines)
 
-        except Exception as e:
-            logger.warning("MCP reload failed: %s", e)
-            return t("gateway.reload_mcp.failed", error=e)
+        except Exception:
+            correlation_id = uuid.uuid4().hex[:12]
+            logger.exception(
+                "MCP reload failed (correlation_id=%s)", correlation_id
+            )
+            return t(
+                "gateway.reload_mcp.failed",
+                error=(
+                    "工具暂时无法刷新，请稍后重试；若持续失败，请提供参考号 "
+                    f"{correlation_id}"
+                ),
+            )
 
 
 
@@ -20658,6 +21994,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        if getattr(source, "platform", None) == Platform.FEISHU:
+            lease = getattr(source, "_feishu_quote_lease", None)
+            if isinstance(lease, FeishuQuoteLease):
+                metadata = dict(metadata or {})
+                metadata["_feishu_quote_lease"] = lease
+            anchor = reply_to_message_id or getattr(source, "message_id", None)
+            if anchor is not None:
+                metadata["reply_to_message_id"] = str(anchor)
         return metadata
 
     def _thread_metadata_for_target(
@@ -20671,7 +22015,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build thread metadata for synthetic sends that only have routing state."""
-        if thread_id is None:
+        if thread_id is None and not (
+            platform == Platform.FEISHU and reply_to_message_id
+        ):
             return None
         metadata: Dict[str, Any] = {"thread_id": thread_id}
         if self._is_telegram_dm_topic_target(
@@ -20694,6 +22040,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Slack's reply_in_thread=false path uses message_id to distinguish
             # real existing threads from synthetic top-level session keys.
             metadata["message_id"] = str(reply_to_message_id)
+        if platform == Platform.FEISHU and reply_to_message_id is not None:
+            metadata["reply_to_message_id"] = str(reply_to_message_id)
         return metadata
 
     @staticmethod
@@ -21350,6 +22698,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             *args,
         )
 
+    async def _run_in_executor_with_context_completion_barrier(self, func, *args):
+        """请求取消时等待不可取消的 executor worker 真正结束。"""
+        worker = asyncio.create_task(
+            self._run_in_executor_with_context(func, *args)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError as cancelled:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            try:
+                worker.result()
+            except BaseException:
+                pass
+            raise cancelled
+
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""
         lock = getattr(self, "_executor_lock", None)
@@ -21497,7 +22866,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         image_paths: List[str],
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
         Auto-analyze user-attached images with the vision tool and prepend
         the descriptions to the message text.
@@ -21512,7 +22881,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             image_paths: List of local file paths to cached images.
 
         Returns:
-            The enriched message string with vision descriptions prepended.
+            ``(enriched_text, moderation_blocked)``. ``moderation_blocked`` is
+            True when content moderation REFUSED one of the images — the caller
+            must refuse the whole turn (re-attach the image inline so the
+            main-model call is refused and the model never runs) instead of
+            letting the model answer around a benign "couldn't see it" note.
         """
         from tools.vision_tools import vision_analyze_tool
         from agent.memory_manager import sanitize_context
@@ -21532,6 +22905,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     user_prompt=analysis_prompt,
                 )
                 result = json.loads(result_json)
+                if result.get("moderation_blocked"):
+                    # Content moderation refused this image. Do NOT swallow it
+                    # into a benign note — signal the caller to refuse the turn so
+                    # the image never reaches the main model. Short-circuit: the
+                    # turn is already refused, the other images don't matter.
+                    logger.info(
+                        "Vision pre-analysis: image refused by content moderation; "
+                        "turn will be refused so the image never reaches the model."
+                    )
+                    return user_text, True
                 if result.get("success"):
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
@@ -21558,9 +22941,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if enriched_parts:
             prefix = "\n\n".join(enriched_parts)
             if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+                return f"{prefix}\n\n{user_text}", False
+            return prefix, False
+        return user_text, False
 
     async def _enrich_message_with_transcription(
         self,
@@ -21810,10 +23193,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 text,
             )
-            echo_meta = self._thread_metadata_for_source(
-                source,
-                self._reply_anchor_for_event(event),
-            ) if metadata is _UNSET else metadata
+            echo_meta = (
+                self._thread_metadata_for_source(
+                    source,
+                    self._reply_anchor_for_event(event),
+                )
+                if metadata is _UNSET
+                else metadata
+            )
+            echo_meta = _non_conversational_metadata(
+                echo_meta, platform=source.platform
+            )
             await self._echo_pending_stt_transcripts_once(
                 event,
                 adapter,
@@ -22699,7 +24089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.registry import registry
 
-            out["tools.registry_generation"] = getattr(registry, "_generation", None)
+            out["tools.registry_generation"] = registry.cache_generation()
         except Exception:
             out["tools.registry_generation"] = None
 
@@ -23691,31 +25081,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return count
 
     def _evict_cached_agents_for_profile(self, profile: Optional[str]) -> int:
-        """Drop cached agents and session model overrides owned by one profile."""
+        """Clean and then drop cached state owned by one profile."""
         prefix = self._profile_session_key_prefix(profile)
         _lock = getattr(self, "_agent_cache_lock", None)
-        evicted_entries = []
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache is None:
+            return 0
         if _lock is not None:
             with _lock:
-                keys = [
-                    key
-                    for key in list(self._agent_cache.keys())
+                entries = {
+                    key: value
+                    for key, value in _cache.items()
                     if str(key).startswith(prefix)
-                ]
-                for key in keys:
-                    evicted_entries.append(self._agent_cache.pop(key, None))
+                }
         else:
-            _cache = getattr(self, "_agent_cache", None)
-            if _cache is not None:
-                keys = [key for key in list(_cache.keys()) if str(key).startswith(prefix)]
-                for key in keys:
-                    evicted_entries.append(_cache.pop(key, None))
+            entries = {
+                key: value
+                for key, value in _cache.items()
+                if str(key).startswith(prefix)
+            }
 
         running_ids = {
             id(agent)
             for agent in getattr(self, "_running_agents", {}).values()
             if agent is not None and agent is not _AGENT_PENDING_SENTINEL
         }
+        cleaned = 0
+        for key, entry in entries.items():
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                continue
+            if id(agent) in running_ids:
+                raise RuntimeError(
+                    "profile-unload cannot evict a running cached agent for "
+                    f"profile {profile or 'default'}"
+                )
+            progress = getattr(self, "_agent_resource_cleanup_progress", None)
+            if progress is None:
+                progress = self._agent_resource_cleanup_progress = {}
+            owner_id = id(agent)
+            progress_owner = progress.get(owner_id)
+            if progress_owner is None:
+                progress_owner = (agent, set())
+                progress[owner_id] = progress_owner
+            elif progress_owner[0] is not agent:
+                raise RuntimeError("agent cleanup identity collision")
+            self._cleanup_agent_resources(
+                agent,
+                raise_on_error=True,
+                completed_steps=progress_owner[1],
+            )
+            if progress.get(owner_id) is progress_owner:
+                progress.pop(owner_id, None)
+            def _commit_one() -> None:
+                if _cache.get(key) is not entry:
+                    raise RuntimeError(
+                        "profile-unload cache ownership changed for "
+                        f"profile {profile or 'default'}"
+                    )
+                _cache.pop(key, None)
+
+            if _lock is not None:
+                with _lock:
+                    _commit_one()
+            else:
+                _commit_one()
+            cleaned += 1
 
         overrides = getattr(self, "_session_model_overrides", None)
         if overrides is not None:
@@ -23724,40 +25155,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     overrides.pop(key, None)
 
         # SessionState consolidation replaced the old dicts with live mapping
-        # views. Once a profile is inactive and being unloaded, drop the whole
-        # container row so conversation/persistent fields cannot survive the
-        # profile directory being deleted and recreated.
+        # views. Drop the row only after every owned resource is closed.
         sessions = self.__dict__.get("_sessions")
         if sessions is not None:
             for key in list(sessions.keys()):
                 if str(key).startswith(prefix):
                     sessions.pop(key, None)
-
-        cleaned = 0
-        for entry in evicted_entries:
-            agent = entry[0] if isinstance(entry, tuple) and entry else entry
-            if agent is None or agent is _AGENT_PENDING_SENTINEL:
-                continue
-            if id(agent) in running_ids:
-                logger.warning(
-                    "profile-unload: cached agent for profile %s is still running; "
-                    "removed from cache but deferred resource cleanup",
-                    profile,
-                )
-                continue
-            try:
-                self._cleanup_agent_resources(agent)
-                cleaned += 1
-            except Exception:
-                logger.warning(
-                    "profile-unload: cleanup failed for profile %s",
-                    profile,
-                    exc_info=True,
-                )
         return cleaned
 
-    async def unload_profile_runtime(self, profile: Optional[str]) -> dict:
+    async def unload_profile_runtime(
+        self,
+        profile: Optional[str],
+        *,
+        profile_home: Optional[Path] = None,
+    ) -> dict:
         """Release in-process runtime state owned by a multiplex profile."""
+        profile_name = (profile or "").strip()
+        profile_aliases = self._profile_runtime_aliases(profile_name)
+        unloads = getattr(self, "_profile_runtime_unloads", None)
+        if unloads is None:
+            unloads = self._profile_runtime_unloads = {}
+        retries = getattr(self, "_profile_runtime_unload_retry", None)
+        if retries is None:
+            retries = self._profile_runtime_unload_retry = set()
+        if any(alias in unloads for alias in profile_aliases):
+            raise RuntimeError(
+                f"profile unload already in progress for {profile_name or 'default'}"
+            )
+        unload_owner = object()
+        for alias in profile_aliases:
+            unloads[alias] = unload_owner
         prefix = self._profile_session_key_prefix(profile)
         active_sessions = [
             key
@@ -23771,26 +25198,96 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profile,
                 len(active_sessions),
             )
-            return {
+            result = {
                 "blocked": True,
                 "active_sessions": len(active_sessions),
                 "evicted_sessions": 0,
                 "disconnected_adapters": 0,
             }
-        cleaned_agents = self._evict_cached_agents_for_profile(profile)
-        disconnected_adapters = 0
-        profile_name = (profile or "").strip()
-        adapter_map = None
-        if profile_name:
-            adapter_map = getattr(self, "_profile_adapters", {}).pop(profile_name, None)
-        if adapter_map:
+            for alias in profile_aliases:
+                if unloads.get(alias) is unload_owner:
+                    unloads.pop(alias, None)
+            return result
+        if profile_home is None:
+            from hermes_cli.profiles import get_profile_dir
+
+            profile_home = get_profile_dir(profile or "default")
+        exact_profile_home = Path(profile_home)
+        try:
+          disconnected_adapters = await self._drain_profile_adapter_operations(
+              profile_name
+          )
+          adapter_map = (
+              getattr(self, "_profile_adapters", {}).get(profile_name)
+              if profile_name
+              else None
+          )
+          with _profile_runtime_scope(Path(exact_profile_home)):
+            from agent.lsp import shutdown_service
+            from hermes_cli.mcp_startup import clear_mcp_discovery_profile
+            from tools.mcp_tool import shutdown_mcp_profile
+
+            cleanup_errors = []
+            try:
+                await self._run_in_executor_with_context_completion_barrier(
+                    shutdown_mcp_profile
+                )
+                clear_mcp_discovery_profile(exact_profile_home)
+            except Exception as exc:
+                logger.error(
+                    "profile-unload: MCP cleanup failed for profile %s",
+                    profile,
+                    exc_info=True,
+                )
+                cleanup_errors.append(exc)
+            try:
+                await self._run_in_executor_with_context_completion_barrier(
+                    lambda: shutdown_service(raise_on_error=True)
+                )
+            except Exception as exc:
+                logger.error(
+                    "profile-unload: LSP cleanup failed for profile %s",
+                    profile,
+                    exc_info=True,
+                )
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                raise RuntimeError(
+                    f"failed to unload {len(cleanup_errors)} runtime resource "
+                    f"group(s) for profile {profile or 'default'}"
+                ) from cleanup_errors[0]
+          if adapter_map:
             for platform, adapter in list(adapter_map.items()):
-                await self._safe_adapter_disconnect(adapter, platform)
+                await self._disconnect_published_adapter(
+                    profile_name=profile_name,
+                    platform=platform,
+                    adapter=adapter,
+                    owner_map=adapter_map,
+                )
                 disconnected_adapters += 1
-        return {
-            "evicted_sessions": cleaned_agents,
-            "disconnected_adapters": disconnected_adapters,
-        }
+          if profile_name:
+            profile_adapters = getattr(self, "_profile_adapters", {})
+            if profile_adapters.get(profile_name) is not adapter_map:
+                raise RuntimeError(
+                    f"profile adapter ownership changed during unload for {profile_name}"
+                )
+            if adapter_map is not None:
+                profile_adapters.pop(profile_name, None)
+          from tools.registry import registry as tool_registry
+          tool_registry.clear_profile_generation(exact_profile_home)
+          cleaned_agents = self._evict_cached_agents_for_profile(profile)
+          retries.difference_update(profile_aliases)
+          return {
+              "evicted_sessions": cleaned_agents,
+              "disconnected_adapters": disconnected_adapters,
+          }
+        except BaseException:
+            retries.update(profile_aliases)
+            raise
+        finally:
+            for alias in profile_aliases:
+                if unloads.get(alias) is unload_owner:
+                    unloads.pop(alias, None)
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
@@ -24472,6 +25969,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
+        user_authored_message: Optional[Any] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
@@ -24491,6 +25989,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
+                user_authored_message=user_authored_message,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
@@ -24503,6 +26002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
+                user_authored_message=user_authored_message,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
@@ -24625,6 +26125,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
+        user_authored_message: Optional[Any] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
@@ -24910,6 +26411,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             moa_config=moa_config,
+            user_authored_message=user_authored_message,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
         )
@@ -24979,6 +26481,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not source.thread_id
             else None
         )
+        if source.platform == Platform.FEISHU:
+            source._feishu_quote_lease = FeishuQuoteLease(event_message_id)
+            turn_ctx._feishu_quote_lease = source._feishu_quote_lease
+
         _progress_metadata = (
             self._thread_metadata_for_source(source, event_message_id)
             if _progress_thread_id == source.thread_id
@@ -25005,6 +26511,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or _relay_prospective_thread_id
             else None
         )
+        if source.platform == Platform.FEISHU:
+            _progress_reply_to = None
 
         async def write_tool_log():
             """Drain log_queue and append tool-call lines to tool_calls.log.
@@ -25130,12 +26638,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _status_thread_metadata = {
                     "reply_to_message_id": event_message_id
                 }
+        _conversation_thread_metadata = _status_thread_metadata
+        if source.platform == Platform.FEISHU:
+            _conversation_thread_metadata = dict(
+                _conversation_thread_metadata or {}
+            )
+            _conversation_thread_metadata[
+                "_feishu_quote_lease"
+            ] = source._feishu_quote_lease
+        _status_thread_metadata = _non_conversational_metadata(
+            _conversation_thread_metadata,
+            platform=source.platform,
+        )
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the
         # exact original binding site.
         turn_ctx._status_adapter = _status_adapter
         turn_ctx._status_chat_id = _status_chat_id
+        turn_ctx._conversation_thread_metadata = _conversation_thread_metadata
         turn_ctx._status_thread_metadata = _status_thread_metadata
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
 
@@ -25294,7 +26815,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not pending_text and _media_urls:
-                                    pending_text = _build_media_placeholder(_peek_event)
+                                    pending_text = await _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
                             agent.interrupt(pending_text)
                             _interrupt_detected.set()
@@ -25390,29 +26911,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
                 try:
-                    _notify_res = None
-                    if _heartbeat_msg_id:
-                        try:
-                            _notify_res = await _notify_adapter.edit_message(
-                                source.chat_id,
-                                _heartbeat_msg_id,
-                                _heartbeat_text,
-                            )
-                        except Exception as _ee:
-                            logger.debug("Heartbeat edit failed: %s", _ee)
-                            _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
-                        _notify_res = await _notify_adapter.send(
-                            source.chat_id,
-                            _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
-                        )
-                        if getattr(_notify_res, "success", False) and getattr(
-                            _notify_res, "message_id", None
-                        ):
-                            _heartbeat_msg_id = str(_notify_res.message_id)
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(_heartbeat_msg_id)
+                    _notify_res, _fresh_msg_id = await _deliver_heartbeat_and_note(
+                        adapter=_notify_adapter,
+                        source=source,
+                        text=_heartbeat_text,
+                        heartbeat_msg_id=_heartbeat_msg_id,
+                        status_metadata=_status_thread_metadata,
+                    )
+                    if _fresh_msg_id:
+                        _heartbeat_msg_id = _fresh_msg_id
+                        if _cleanup_progress:
+                            _cleanup_msg_ids.append(_heartbeat_msg_id)
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -25575,7 +27084,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not _bp_text and _bp_media_urls:
-                                    _bp_text = _build_media_placeholder(_bp_event)
+                                    _bp_text = await _build_media_placeholder(_bp_event)
                             logger.info(
                                 "Backup interrupt detected for session %s "
                                 "(monitor task state: %s)",
@@ -25677,7 +27186,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not _bp_text and _bp_media_urls:
-                                    _bp_text = _build_media_placeholder(_bp_event)
+                                    _bp_text = await _build_media_placeholder(_bp_event)
                             logger.info(
                                 "Backup interrupt detected for session %s "
                                 "(monitor task state: %s)",
@@ -25863,9 +27372,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata={"thread_id": source.thread_id} if source.thread_id else None,
                         )
                         if not pending:
-                            pending = _build_media_placeholder(pending_event)
+                            pending = await _build_media_placeholder(pending_event)
                     else:
-                        pending = _pending_text or _build_media_placeholder(pending_event)
+                        pending = _pending_text or await _build_media_placeholder(pending_event)
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
@@ -25980,17 +27489,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                         )
                     elif first_response and not _already_streamed:
+                        _queued_metadata = None
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
+                            _queued_metadata = _feishu_quote_metadata(
+                                _conversation_thread_metadata
+                            )
+                            _queued_result = await adapter.send(
                                 source.chat_id,
                                 first_response,
-                                metadata=_status_thread_metadata,
+                                metadata=_queued_metadata,
+                            )
+                            _consume_feishu_quote(
+                                _queued_metadata, _queued_result
                             )
                         except Exception as e:
+                            _consume_feishu_quote(_queued_metadata, False)
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
                         logger.info(
@@ -26036,8 +27553,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                next_user_authored_message = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    _pending_authored_message = getattr(
+                        pending_event, "user_authored_message", None
+                    )
+                    next_user_authored_message = (
+                        pending_event.text or ""
+                        if _pending_authored_message is None
+                        else _pending_authored_message
+                    )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -26122,6 +27648,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    user_authored_message=next_user_authored_message,
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
@@ -26777,19 +28304,52 @@ def _ensure_profile_cron_adapters(
     *,
     loop=None,
     stop_event: Optional[threading.Event] = None,
-) -> Dict:
+) -> Optional[Dict]:
     """Ensure a mux profile has its adapter map before cron fires jobs."""
     if profile_name == _multiplex_active_profile_name():
         return runner.adapters
+    if GatewayRunner._profile_runtime_unload_blocked(runner, profile_name):
+        logger.warning(
+            "Cannot start adapters for mux profile %s during profile unload",
+            profile_name,
+        )
+        return None
     adapters = runner._profile_adapters.get(profile_name)
-    if adapters is not None:
+    pending_partial_cleanup = any(
+        owner_profile == profile_name
+        for owner_profile, _platform in getattr(
+            runner, "_partial_adapter_cleanup_retry", {}
+        )
+    )
+    pending_published_cleanup = any(
+        owner_profile == profile_name
+        for owner_profile, _platform in getattr(
+            runner, "_published_adapter_cleanup_retry", {}
+        )
+    )
+    pending_retiring_cleanup = any(
+        owner_profile == profile_name
+        for owner_profile, _platform in getattr(
+            runner, "_retiring_adapter_cleanups", {}
+        )
+    )
+    pending_operations = bool(
+        getattr(runner, "_profile_adapter_operations", {}).get(profile_name)
+    )
+    if pending_published_cleanup or pending_retiring_cleanup or pending_operations:
+        logger.warning(
+            "Cannot start adapters for mux profile %s while adapter cleanup is pending",
+            profile_name,
+        )
+        return None
+    if adapters is not None and not pending_partial_cleanup:
         return adapters
     if loop is None:
         logger.warning(
             "Cannot start adapters for mux profile %s before cron: gateway loop missing",
             profile_name,
         )
-        return {}
+        return None
 
     claims = _multiplex_adapter_claims(runner, exclude_profile=profile_name)
     future = safe_schedule_threadsafe(
@@ -26799,7 +28359,7 @@ def _ensure_profile_cron_adapters(
         log_message=f"Mux profile adapter startup scheduling failed for {profile_name}",
     )
     if future is None:
-        return {}
+        return None
     try:
         _wait_future_interruptibly(
             future,
@@ -26808,8 +28368,16 @@ def _ensure_profile_cron_adapters(
             profile_name=profile_name,
             action="start adapters",
         )
+    except _ProfileAdapterCleanupError:
+        logger.error(
+            "Profile %s cron adapter cleanup is pending; scheduler not started",
+            profile_name,
+            exc_info=True,
+        )
+        raise
     except Exception:
         logger.exception("Failed to start adapters for mux profile %s", profile_name)
+        return None
     return runner._profile_adapters.get(profile_name, {})
 
 
@@ -26817,37 +28385,45 @@ def _unload_profile_cron_adapters(
     runner: "GatewayRunner",
     profile_name: str,
     *,
+    profile_home: Path,
     loop=None,
     stop_event: Optional[threading.Event] = None,
-) -> None:
+) -> bool:
     if profile_name == _multiplex_active_profile_name():
-        return
-    if profile_name not in getattr(runner, "_profile_adapters", {}):
-        return
+        return True
     if loop is None:
         logger.warning(
             "Cannot unload adapters for mux profile %s: gateway loop missing",
             profile_name,
         )
-        return
+        return False
     future = safe_schedule_threadsafe(
-        runner.unload_profile_runtime(profile_name),
+        runner.unload_profile_runtime(profile_name, profile_home=profile_home),
         loop,
         logger=logger,
         log_message=f"Mux profile adapter unload scheduling failed for {profile_name}",
     )
     if future is None:
-        return
+        return False
     try:
-        _wait_future_interruptibly(
+        result = _wait_future_interruptibly(
             future,
             stop_event=stop_event,
             timeout=30,
             profile_name=profile_name,
             action="unload adapters",
         )
+        if isinstance(result, dict) and result.get("blocked"):
+            logger.warning(
+                "Cannot unload adapters for mux profile %s: %d session(s) still running",
+                profile_name,
+                int(result.get("active_sessions", 0) or 0),
+            )
+            return False
+        return True
     except Exception:
         logger.exception("Failed to unload adapters for mux profile %s", profile_name)
+        return False
 
 
 def _wait_future_interruptibly(
@@ -26857,7 +28433,7 @@ def _wait_future_interruptibly(
     timeout: float,
     profile_name: str,
     action: str,
-) -> None:
+) -> Any:
     deadline = time.monotonic() + timeout
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -26867,7 +28443,9 @@ def _wait_future_interruptibly(
                 action,
                 profile_name,
             )
-            return
+            raise InterruptedError(
+                f"Stopped waiting to {action} for mux profile {profile_name}"
+            )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             future.cancel()
@@ -26875,8 +28453,7 @@ def _wait_future_interruptibly(
                 f"Timed out waiting to {action} for mux profile {profile_name}"
             )
         try:
-            future.result(timeout=min(0.5, remaining))
-            return
+            return future.result(timeout=min(0.5, remaining))
         except TimeoutError:
             if future.done():
                 raise
@@ -26891,7 +28468,7 @@ def _start_profile_cron_scheduler_thread(
     *,
     loop=None,
     shutdown_event: Optional[threading.Event] = None,
-) -> tuple[threading.Thread, threading.Event]:
+) -> Optional[tuple[threading.Thread, threading.Event]]:
     adapters = _ensure_profile_cron_adapters(
         runner,
         profile_name,
@@ -26899,6 +28476,8 @@ def _start_profile_cron_scheduler_thread(
         loop=loop,
         stop_event=shutdown_event,
     )
+    if adapters is None:
+        return None
     failed_event = threading.Event()
     thread = threading.Thread(
         target=_run_profile_cron_scheduler,
@@ -26955,16 +28534,18 @@ def _run_multiplex_cron_reconciler(
                     if existing:
                         home_changed = existing[0] != profile_home
                         _stop_profile_cron_scheduler(profile_name, existing, timeout=1)
-                        if home_changed:
-                            _unload_profile_cron_adapters(
+                        if home_changed and not _unload_profile_cron_adapters(
                                 runner,
                                 profile_name,
+                                profile_home=existing[0],
                                 loop=loop,
                                 stop_event=stop_event,
-                            )
+                            ):
+                            existing[3].set()
+                            continue
 
                     profile_stop = threading.Event()
-                    thread, failed_event = _start_profile_cron_scheduler_thread(
+                    started = _start_profile_cron_scheduler_thread(
                         runner,
                         profile_name,
                         profile_home,
@@ -26972,6 +28553,9 @@ def _run_multiplex_cron_reconciler(
                         loop=loop,
                         shutdown_event=stop_event,
                     )
+                    if started is None:
+                        continue
+                    thread, failed_event = started
                     entries[profile_name] = (
                         profile_home,
                         profile_stop,
@@ -26982,17 +28566,22 @@ def _run_multiplex_cron_reconciler(
 
                 for profile_name in list(entries):
                     if profile_name not in profiles:
+                        removed_entry = entries[profile_name]
                         _stop_profile_cron_scheduler(
                             profile_name,
-                            entries.pop(profile_name),
+                            removed_entry,
                             timeout=5,
                         )
-                        _unload_profile_cron_adapters(
+                        if not _unload_profile_cron_adapters(
                             runner,
                             profile_name,
+                            profile_home=removed_entry[0],
                             loop=loop,
                             stop_event=stop_event,
-                        )
+                        ):
+                            removed_entry[3].set()
+                            continue
+                        entries.pop(profile_name, None)
                         logger.info("Stopped mux profile cron scheduler for %s", profile_name)
             except Exception:
                 logger.exception("Mux profile cron reconciliation failed")
@@ -27616,33 +29205,19 @@ async def start_gateway(
     # Schedule it after the gateway HTTP surface is listening so /health
     # readiness and normal chat are not coupled to optional MCP startup.
     def _start_mcp_discovery_task() -> asyncio.Task:
-        task_loop = asyncio.get_running_loop()
-        discovery_done = task_loop.create_future()
+        from hermes_cli.mcp_startup import join_mcp_discovery
 
-        def _mark_discovery_done() -> None:
-            if not discovery_done.done():
-                discovery_done.set_result(None)
-
-        def _discover_mcp_tools_thread() -> None:
-            try:
-                from tools.mcp_tool import discover_mcp_tools
-                discover_mcp_tools()
-            except Exception:
-                logger.warning("MCP tool discovery failed", exc_info=True)
-            finally:
-                try:
-                    task_loop.call_soon_threadsafe(_mark_discovery_done)
-                except RuntimeError:
-                    pass
-
-        threading.Thread(
-            target=_discover_mcp_tools_thread,
-            daemon=True,
-            name="mcp-discovery",
-        ).start()
+        discovery_profile_home = _spawn_mcp_discovery(
+            logger=logger,
+            multiplex=bool(getattr(runner.config, "multiplex_profiles", False)),
+        )
 
         async def _wait_for_discovery() -> None:
-            await discovery_done
+            if discovery_profile_home is None:
+                await runner._run_in_executor_with_context(join_mcp_discovery)
+            else:
+                with _profile_runtime_scope(discovery_profile_home):
+                    await runner._run_in_executor_with_context(join_mcp_discovery)
 
         return asyncio.create_task(_wait_for_discovery())
 
@@ -27713,16 +29288,33 @@ async def start_gateway(
             except Exception:
                 pass
 
+        if not mcp_discovery_still_running and not getattr(
+            runner, "_mcp_shutdown_completed", False
+        ):
+            try:
+                from hermes_cli.mcp_startup import join_all_mcp_discovery
+
+                mcp_discovery_still_running = not await asyncio.to_thread(
+                    join_all_mcp_discovery, 5.0
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to inspect profile MCP discovery during shutdown",
+                    exc_info=True,
+                )
+                mcp_discovery_still_running = True
+
         # Close MCP server connections.
-        try:
-            if mcp_discovery_still_running:
-                from tools.mcp_tool import _kill_orphaned_mcp_children
-                _kill_orphaned_mcp_children(include_active=True)
-            else:
-                from tools.mcp_tool import shutdown_mcp_servers
-                shutdown_mcp_servers()
-        except Exception:
-            pass
+        if not getattr(runner, "_mcp_shutdown_completed", False):
+            try:
+                if mcp_discovery_still_running:
+                    from tools.mcp_tool import _kill_orphaned_mcp_children
+                    _kill_orphaned_mcp_children(include_active=True)
+                else:
+                    from tools.mcp_tool import shutdown_mcp_servers
+                    shutdown_mcp_servers()
+            except Exception:
+                pass
 
     try:
         from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive

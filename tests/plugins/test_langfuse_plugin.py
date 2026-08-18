@@ -31,7 +31,8 @@ class TestManifest:
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
         }
-        # Required env vars are the user-facing HERMES_ prefixed keys.
+        # Direct-mode CLI setup keeps its existing credential prompts. Device
+        # relay mode is enabled through config.yaml and does not read them.
         assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
         assert "HERMES_LANGFUSE_SECRET_KEY" in data["requires_env"]
 
@@ -120,6 +121,75 @@ class TestRuntimeGate:
             f"_get_langfuse() re-read env {called['n']} times after cache miss — "
             "it should short-circuit via _INIT_FAILED"
         )
+
+    def test_relay_mode_ignores_project_keys_and_uses_loopback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_MODE", "relay")
+        monkeypatch.setenv("HERMES_LANGFUSE_BASE_URL", "http://127.0.0.1:19092")
+        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-stale-device-key")
+        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-stale-device-key")
+        monkeypatch.setenv("LANGFUSE_BASIC_AUTH", "Basic YTpi")
+        monkeypatch.setenv("LANGFUSE_OTEL_TRACES_EXPORT_PATH", "wrong/path")
+        plugin = self._fresh_plugin()
+        _FakeLangfuse.instances.clear()
+        monkeypatch.setattr(plugin, "Langfuse", _FakeLangfuse, raising=False)
+
+        client = plugin._get_langfuse()
+
+        assert client is _FakeLangfuse.instances[0]
+        assert client.kwargs["base_url"] == "http://127.0.0.1:19092"
+        assert client.kwargs["public_key"].startswith("relay-public-")
+        assert client.kwargs["secret_key"].startswith("relay-secret-")
+        assert "stale-device-key" not in repr(client.kwargs)
+        assert "LANGFUSE_BASIC_AUTH" not in plugin.os.environ
+        assert "LANGFUSE_OTEL_TRACES_EXPORT_PATH" not in plugin.os.environ
+
+    def test_managed_gateway_forces_relay_even_with_direct_credentials(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_LANGFUSE_MODE", "direct")
+        monkeypatch.setenv("HERMES_LANGFUSE_BASE_URL", "http://127.0.0.1:19092")
+        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-device-key")
+        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-device-key")
+        plugin = self._fresh_plugin()
+        _FakeLangfuse.instances.clear()
+        monkeypatch.setattr(plugin, "Langfuse", _FakeLangfuse, raising=False)
+
+        client = plugin._get_langfuse()
+
+        assert client is _FakeLangfuse.instances[0]
+        assert client.kwargs["base_url"] == "http://127.0.0.1:19092"
+        assert client.kwargs["public_key"].startswith("relay-public-")
+        assert client.kwargs["secret_key"].startswith("relay-secret-")
+        assert "device-key" not in repr(client.kwargs)
+
+    def test_managed_gateway_rejects_direct_remote_url(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_LANGFUSE_MODE", "direct")
+        monkeypatch.setenv("HERMES_LANGFUSE_BASE_URL", "https://langfuse.example")
+        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-device-key")
+        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-device-key")
+        plugin = self._fresh_plugin()
+        _FakeLangfuse.instances.clear()
+        monkeypatch.setattr(plugin, "Langfuse", _FakeLangfuse, raising=False)
+
+        assert plugin._get_langfuse() is None
+        assert _FakeLangfuse.instances == []
+
+    @pytest.mark.parametrize("base_url", [
+        "https://127.0.0.1:19092",
+        "http://localhost:19092",
+        "http://192.168.1.5:19092",
+        "http://127.0.0.1:19092/other",
+        "http://user@127.0.0.1:19092",
+    ])
+    def test_relay_mode_rejects_noncanonical_base_url(self, monkeypatch, base_url):
+        monkeypatch.setenv("HERMES_LANGFUSE_MODE", "relay")
+        monkeypatch.setenv("HERMES_LANGFUSE_BASE_URL", base_url)
+        plugin = self._fresh_plugin()
+        _FakeLangfuse.instances.clear()
+        monkeypatch.setattr(plugin, "Langfuse", _FakeLangfuse, raising=False)
+
+        assert plugin._get_langfuse() is None
+        assert _FakeLangfuse.instances == []
 
 
 # ---------------------------------------------------------------------------

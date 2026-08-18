@@ -55,10 +55,13 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "call_agent",  # anonymous workers may not consult real agents — that
         # would bypass the server-side call-chain/quota guardrails with a
         # principal that has no identity to authorize
-        "app_host",  # same principle: workers inherit the parent's secret
-        # scope, so an anonymous child could install/delete/restart device
-        # applications with the parent's action token — device-state verbs
-        # stay with the identified agent the user is actually talking to
+        "app_host",  # workers inherit the parent's secret scope, so an
+        # anonymous child must not use the parent's action token for device
+        # application lifecycle mutations
+        "app_data",  # same scope: children must not access owner-scoped
+        # application data with the parent's action token
+        "app_workspace",  # fixed App Host workspace mutations stay
+        # with the dedicated maintainer, never an anonymous delegated child
     ]
 )
 

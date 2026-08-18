@@ -20,6 +20,7 @@ PROTECTED_TREES = (
     "optional-skills",
     "plugins",
     "skills",
+    "tools",
     "venv",
 )
 
@@ -125,6 +126,7 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
         "plugins/hermes-achievements/docs/runtime-note.md",
         "plugins/hermes-achievements/tests/test_runtime_contract.py",
         "skills/software-development/plan/SKILL.md",
+        "tools/pc_ui_tool.py",
         "venv/lib/python3.11/site-packages/botocore/data/endpoints.json",
         "venv/lib/python3.11/site-packages/slack_sdk/web/client.py",
     ):
@@ -162,12 +164,13 @@ def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs
         "plugins/hermes-achievements/docs/runtime-note.md",
         "plugins/hermes-achievements/tests/test_runtime_contract.py",
         "skills/software-development/plan/SKILL.md",
+        "tools/pc_ui_tool.py",
         "venv/lib/python3.11/site-packages/botocore/data/endpoints.json",
         "venv/lib/python3.11/site-packages/slack_sdk/web/client.py",
     ):
-        assert (
-            staged / runtime_path
-        ).is_file(), f"runtime path was excluded: {runtime_path}"
+        assert (staged / runtime_path).is_file(), (
+            f"runtime path was excluded: {runtime_path}"
+        )
 
 
 def test_find_missing_runtime_paths_reports_files_removed_from_protected_trees(
@@ -176,11 +179,18 @@ def test_find_missing_runtime_paths_reports_files_removed_from_protected_trees(
     source = tmp_path / "source"
     staged = tmp_path / "staged"
     kept_path = "plugins/web/exa/provider.py"
+    missing_tool_path = "tools/pc_ui_tool.py"
     missing_path = "venv/lib/python3.11/site-packages/botocore/data/endpoints.json"
     ignored_path = "venv/lib/python3.11/site-packages/demo/__pycache__/module.pyc"
     missing_plugin_path = "plugins/hermes-achievements/dashboard/dist/index.js"
 
-    for relative_path in (kept_path, missing_path, ignored_path, missing_plugin_path):
+    for relative_path in (
+        kept_path,
+        missing_path,
+        ignored_path,
+        missing_plugin_path,
+        missing_tool_path,
+    ):
         _write_file(source, relative_path)
     _write_file(staged, kept_path)
     _create_protected_trees(source)
@@ -192,6 +202,7 @@ def test_find_missing_runtime_paths_reports_files_removed_from_protected_trees(
 
     assert module.find_missing_runtime_paths(source, staged) == [
         Path(missing_plugin_path),
+        Path(missing_tool_path),
         Path(missing_path),
     ]
 

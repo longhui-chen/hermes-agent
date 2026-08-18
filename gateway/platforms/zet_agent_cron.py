@@ -213,6 +213,223 @@ def _post_channel_chunk(url: str, token: str, kind: str, text: str, job_id: str)
     return f"channel:{kind} delivery failed: {detail or body[:200]}"
 
 
+_REFRESH_PERMIT_PATH = "/api/v1/internal/apps/refresh_permit"
+# How long a "this agent has no bound app" answer is trusted. Bindings change
+# rarely, but a profile can BECOME a maintainer's after app creation, so the
+# negative answer must expire rather than last the gateway's lifetime.
+_REFRESH_PERMIT_NEG_TTL = 600.0
+_REFRESH_PERMIT_TIMEOUT = 3.0
+# The permit answer is a tiny JSON decision; a larger body means local-server
+# is misbehaving or the request was misrouted, so fail open instead of buffering
+# an unbounded stream on a 2 GB device.
+_REFRESH_PERMIT_MAX_BODY = 8192
+_refresh_permit_neg_cache: dict = {}
+
+
+def _resolve_local_server_origin() -> str:
+    """Derive local-server's origin from ZET_CHAT_APPEND_URL (same derivation
+    as _resolve_channel_send_url, minus the path)."""
+    raw = _scoped_env("ZET_CHAT_APPEND_URL").strip()
+    if not raw:
+        return ""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+def _read_permit_body_bounded(resp, max_bytes: int) -> Optional[bytes]:
+    """Read a tiny permit response with a hard wall-clock deadline.
+
+    ``urlopen(timeout=...)`` sets a per-recv socket timeout, NOT a total
+    deadline: a server that drips one byte per window keeps recv from timing
+    out and can hold this cron worker open indefinitely. A worker thread does
+    the (possibly blocked) read while the caller waits on the deadline; on
+    expiry the response is closed, which unblocks the read (OSError) and we
+    fail open. Returns None on overrun/oversize/error.
+    """
+    import threading
+    result: dict = {}
+
+    def _read() -> None:
+        raw = b""
+        try:
+            while len(raw) <= max_bytes:
+                chunk = resp.read(min(4096, max_bytes + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw += chunk
+            result["raw"] = raw
+        except Exception as exc:  # fail-open boundary
+            result["err"] = exc
+
+    worker = threading.Thread(target=_read, daemon=True)
+    worker.start()
+    worker.join(_REFRESH_PERMIT_TIMEOUT)
+    if worker.is_alive():
+        # Deadline exceeded: close the response so the blocked read raises and
+        # the worker exits; fail open.
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return None
+    if "err" in result:
+        return None
+    raw = result.get("raw", b"")
+    if len(raw) > max_bytes:
+        return None
+    return raw
+
+
+def _governor_refresh_defer(job: Optional[dict]) -> Optional[tuple]:
+    """Ask local-server whether this maintainer profile may refresh now.
+
+    Runs BEFORE an agent turn is spent: under memory pressure local-server's
+    governor answers defer with a retry interval, and the caller postpones
+    the job (defer_job) instead of running into a wall. Returns
+    (retry_seconds, reason) when the run should be deferred, None to run.
+
+    Fail-open everywhere — no token/URL, unreachable server, unparsable
+    answer all mean "run": the gate is an optimization for pressured
+    devices, never a dependency. An agent with no bound app (404) is cached
+    negatively so ordinary agents pay one lookup per TTL, not one per fire.
+    """
+    if not isinstance(job, dict) or not job.get("id"):
+        return None
+    token = _scoped_env("ZETTLAB_AGENT_ACTION_TOKEN").strip()
+    origin = _resolve_local_server_origin()
+    if not token or not origin:
+        return None
+    agent_key = _scoped_env("ZET_AGENT_ID").strip() or "?"
+    try:
+        import time as _time
+        cached = _refresh_permit_neg_cache.get(agent_key)
+        if cached and (_time.monotonic() - cached) < _REFRESH_PERMIT_NEG_TTL:
+            return None
+    except Exception:
+        pass
+    try:
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            origin + _REFRESH_PERMIT_PATH,
+            data=b"{}",
+            headers={_ACTION_TOKEN_HEADER: token, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_REFRESH_PERMIT_TIMEOUT) as resp:
+                cl = resp.headers.get("Content-Length")
+                if cl is not None:
+                    try:
+                        if int(cl) > _REFRESH_PERMIT_MAX_BODY:
+                            return None
+                    except ValueError:
+                        pass
+                raw = _read_permit_body_bounded(resp, _REFRESH_PERMIT_MAX_BODY)
+                if raw is None:
+                    return None
+                body = raw.decode("utf-8", errors="replace")
+                status = resp.status
+        except urllib.error.HTTPError as http_err:
+            body = ""
+            try:
+                raw = _read_permit_body_bounded(http_err, _REFRESH_PERMIT_MAX_BODY)
+                if raw is not None:
+                    body = raw.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            status = http_err.code
+        if status == 404:
+            # Not a maintainer profile: nothing to gate, remember for a while.
+            # Sweep expired entries on every 404 write and cap the dict so
+            # profile churn cannot grow this resident cache without bound.
+            import time as _time
+            now = _time.monotonic()
+            for k in [k for k, ts in _refresh_permit_neg_cache.items()
+                      if now - ts >= _REFRESH_PERMIT_NEG_TTL]:
+                _refresh_permit_neg_cache.pop(k, None)
+            _refresh_permit_neg_cache[agent_key] = now
+            while len(_refresh_permit_neg_cache) > 256:
+                _refresh_permit_neg_cache.pop(next(iter(_refresh_permit_neg_cache)), None)
+            return None
+        if status != 200:
+            return None
+        parsed = json.loads(body)
+        if not isinstance(parsed, dict) or parsed.get("decision") != "defer":
+            return None
+        retry_s = parsed.get("retry_in_seconds") or 60
+        reason = str(parsed.get("reason") or "governor")
+        return (max(30.0, float(retry_s)), reason)
+    except Exception:
+        return None
+
+
+def _gate_run_one_job(orig_run_one_job, job, **kwargs):
+    """Governor refresh gate around one job firing.
+
+    On a defer decision the run is skipped entirely — no agent turn, no
+    output file, no chat card — and the next slot is pushed out via
+    defer_job. Returns True ("processed") for the skip; otherwise the
+    original firing body decides. Extracted so the gate is unit-testable
+    against a stub original.
+    """
+    # Only the app-refresh job is governed. An AppDedicated profile can also
+    # host ordinary reminder/report cron jobs (created via the standard cronjob
+    # tool) that must never be postponed by a profile-level governor decision —
+    # a defer would silently skip time-sensitive one-shots. The refresh job is
+    # tagged ``source="app_refresh"`` by local-server at creation.
+    if not (isinstance(job, dict) and job.get("source") == "app_refresh"):
+        return orig_run_one_job(job, **kwargs)
+    defer_info = _governor_refresh_defer(job)
+    if defer_info is not None:
+        retry_s, reason = defer_info
+        try:
+            from cron.jobs import defer_job as _defer_job
+
+            deferred = _defer_job(
+                job["id"],
+                seconds=retry_s,
+                reason=f"governor:{reason}",
+                # This gate consumed the occurrence without running it: the
+                # claim must be terminated here (not deferred to update_job's
+                # trigger-identity check, which is a no-op when next_run_at
+                # doesn't move).
+                clear_claim=True,
+            )
+            if deferred is None:
+                _dbg(
+                    f"governor defer: job {job.get('id')} vanished; "
+                    "slot folds away"
+                )
+        except Exception as defer_err:
+            # The gate decided to defer but the push failed (lock/CAS contention
+            # or a transient jobs.json write error). Fail open: run the job via
+            # the original body — its execution was already claimed, so the run
+            # completes normally instead of losing a one-shot to a stale
+            # next_run_at + reused dedup key.
+            _dbg(
+                f"governor defer: defer_job failed for "
+                f"{job.get('id')}: {defer_err!r}; failing open"
+            )
+            return orig_run_one_job(job, **kwargs)
+        # The execution was already created (claimed) before the gate; a
+        # defer skips the run entirely, so terminalize it here or it stays
+        # claimed forever (the ledger only prunes terminal rows, and
+        # same-process recovery skips our own claimed rows).
+        execution_id = job.get("execution_id")
+        if execution_id:
+            try:
+                from cron.executions import finish_execution
+                finish_execution(execution_id, success=True, delivery_outcome="suppressed")
+            except Exception:
+                _dbg(f"governor defer: finish_execution failed for {execution_id!r}")
+        return True  # processed: nothing ran, nothing to deliver
+    return orig_run_one_job(job, **kwargs)
+
+
 def _send_to_channel(kind: str, content: str, job_id: str):
     """Deliver a cron result to a bound IM channel via local-server. Returns an
     error string on failure, or None on success — the caller folds the error
@@ -841,6 +1058,26 @@ def install() -> None:
             _dbg("install() patched run_job OK")
     except Exception as _e:
         _dbg(f"install() run_job patch FAILED: {_e!r}")
+
+    # ── governor refresh gate — defer BEFORE an agent turn is spent ────────
+    # run_one_job is the shared firing body for both the built-in ticker and
+    # an external provider's fire_due, so gating here covers every dispatch
+    # path. A deferral skips the whole run (no agent, no output file, no
+    # chat card — a postponed refresh is invisible by design) and pushes the
+    # next slot out; the already-advanced current slot folds away, so a
+    # month of deferrals is one catch-up run later, never a backlog burst.
+    try:
+        if not getattr(_sched.run_one_job, _PATCH_SENTINEL, False):
+            _orig_run_one_job = _sched.run_one_job
+
+            def _gated_run_one_job(job, **kwargs):
+                return _gate_run_one_job(_orig_run_one_job, job, **kwargs)
+
+            setattr(_gated_run_one_job, _PATCH_SENTINEL, True)
+            _sched.run_one_job = _gated_run_one_job
+            _dbg("install() patched run_one_job (governor gate) OK")
+    except Exception as _e:
+        _dbg(f"install() run_one_job patch FAILED: {_e!r}")
 
     # ── scheduler delivery patch — keep Zettlab-specific delivery out of
     # upstream cron/scheduler.py. App cron output is persisted below in
@@ -1877,6 +2114,9 @@ def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dic
     agent_ids = _cron_agent_ids(job)
     path_hints = _cron_path_hints(messages)
     output_roots = _cron_output_bucket_roots(path_hints, agent_ids)
+    anchored = _anchored_session_root(job)
+    if anchored is not None and all(anchored != r for r in output_roots):
+        output_roots.append(anchored)
 
     seen: set[str] = set()
     produced: List[Dict[str, Any]] = []
@@ -2002,6 +2242,33 @@ def _clean_cron_path_hint(raw: str) -> str:
     if value.startswith("///"):
         value = "/" + value.lstrip("/")
     return value
+
+
+def _anchored_session_root(job: Optional[dict]) -> Optional[Path]:
+    """run_job 锚定的 session 桶（与其同一纯函数重建），无 hint 也能扫到。
+
+    纯相对路径写入不会在消息里留下绝对路径 hint，桶扫描就不会启动；这里用
+    origin.chat_id + 平台目录确定性重建同一个桶。只收 session 桶，agent 根
+    （suffix 不可推导时的回落值）不做扫描根。multiplex 下 delivery 阶段无
+    secret scope 时平台目录不可得，静默退回 hint 行为。
+    """
+    try:
+        from tools.runtime_workdir import (
+            agent_output_dir,
+            prepare_cron_session_output_dir,
+        )
+
+        base = agent_output_dir()
+        if not base:
+            return None
+        anchor = prepare_cron_session_output_dir(
+            ((job or {}).get("origin") or {}).get("chat_id")
+        )
+        if not anchor or anchor == base:
+            return None
+        return Path(anchor).resolve()
+    except Exception:
+        return None
 
 
 def _cron_output_bucket_roots(path_hints: Iterable[str], agent_ids: set[str]) -> List[Path]:

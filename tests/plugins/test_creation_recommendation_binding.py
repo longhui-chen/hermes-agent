@@ -4,7 +4,21 @@ import base64
 import json
 import re
 
-from tests.plugins.test_creation_governor_plugin import _Context, _FakeLlm, _load_plugin
+from tests.plugins.test_creation_governor_plugin import _Context, _FakeLlm
+from tests.plugins.test_creation_governor_plugin import _load_plugin as _load_plugin_module
+
+
+def _load_plugin():
+    """本文件钉的是 agent 原生创建流程的绑定语义，因此显式打开 agent 品类。
+
+    该品类在本部署默认关闭（AGENT_RECOMMENDATION_ENABLED=False，落地工具缺失），
+    但这些用例要验的是「接受推荐后如何绑定到原生创建流程」，与开关无关。开关在
+    _normalize_candidate / _detector_instructions 里都是调用时读取，加载后改写即可；
+    schema enum 虽在 exec 时定死，但这些用例走 _FakeLlm 灌固定候选，不过 schema。
+    """
+    module = _load_plugin_module()
+    module.AGENT_RECOMMENDATION_ENABLED = True
+    return module
 
 
 def _candidate() -> dict[str, object]:

@@ -2792,6 +2792,148 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
 
+def collect_memory_citations(agent, raw) -> None:
+    """memory.citations 采集（需求 3.1）：search_memory 命中条目记到 agent 的
+    有界去重容器，zet_agent 在 turn 收尾汇总为一张 memory.citations 附件
+    （同 turn 恒定 id upsert）。两条工具派发路径共用：tool_executor 的通用
+    registry 分派（生产主路径）与 invoke_tool 的内置分支。采集失败静默——
+    引用展示是旁路产物，绝不影响工具结果本身。"""
+    try:
+        parsed = json.loads(raw)
+        items = parsed.get("items") if isinstance(parsed, dict) else None
+        if not isinstance(items, list) or not items:
+            return
+        sink = getattr(agent, "_zet_memory_citations", None)
+        if sink is None:
+            sink = {}
+            agent._zet_memory_citations = sink
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            if not item_id or len(sink) >= 32:
+                continue
+            sink.setdefault(item_id, {
+                "id": item_id[:64],
+                "source": str(item.get("source") or "")[:120],
+                "excerpt": str(item.get("excerpt") or "")[:240],
+            })
+    except Exception:
+        pass
+
+
+def collect_prefetch_citations(agent, parts) -> None:
+    """memory.citations 预取路径采集（需求 3 边界补全，真机反馈：预取注入的
+    记忆回答不显示引用角标是反直觉的）。prefetch 注入的每个 provider 分块登
+    记为一条引用（provider 粒度，id 取内容摘要哈希保证同轮幂等），与
+    search_memory 工具命中共用同一容器与 turn 收尾发射通道。静默失败。"""
+    try:
+        import hashlib
+        items = []
+        for name, text in parts or []:
+            trimmed = str(text or "").strip()
+            if not trimmed:
+                continue
+            digest = hashlib.sha1(trimmed.encode("utf-8", "ignore")).hexdigest()[:12]
+            items.append({
+                "id": f"prefetch-{name}-{digest}",
+                "source": str(name or "memory"),
+                "excerpt": trimmed[:240],
+            })
+        if items:
+            collect_memory_citations(agent, json.dumps({"items": items}, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def collect_memory_saves(agent, tool_args, raw_result) -> None:
+    """memory.saved 采集（写方向透明化）：memory 工具写入成功后，把本轮
+    新增/更新的条目记到有界容器，zet_agent 在 turn 收尾汇总为一张
+    memory.saved 附件（「记住了 N 条」角标）。只登记 add/replace 的新内容
+    （remove 无展示意义）；静默失败——透明化是旁路，绝不影响工具结果。"""
+    try:
+        parsed = json.loads(raw_result)
+        if not isinstance(parsed, dict) or not parsed.get("success"):
+            return
+        args = tool_args if isinstance(tool_args, dict) else {}
+        ops = args.get("operations")
+        if not isinstance(ops, list):
+            ops = [{
+                "action": args.get("action"),
+                "target": args.get("target"),
+                "content": args.get("content"),
+            }]
+        sink = getattr(agent, "_zet_memory_saves", None)
+        if sink is None:
+            sink = {}
+            agent._zet_memory_saves = sink
+        import hashlib
+        default_target = str(args.get("target") or "memory")
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            if str(op.get("action") or "") not in ("add", "replace"):
+                continue
+            content = str(op.get("content") or "").strip()
+            if not content or len(sink) >= 16:
+                continue
+            digest = hashlib.sha1(content.encode("utf-8", "ignore")).hexdigest()[:12]
+            sink.setdefault(digest, {
+                "id": digest,
+                "source": str(op.get("target") or default_target),
+                "excerpt": content[:240],
+            })
+    except Exception:
+        pass
+
+
+def collect_answer_attribution_citations(agent, answer_text) -> None:
+    """系统提示常驻记忆的事后归因（需求 3 第三通道，真机缺口）：MEMORY.md/
+    USER.md 全文常驻系统提示，模型不调 search_memory 也能答出记忆内容，此时
+    本轮没有任何引用可显示。turn 收尾若本轮无引用且回答非平凡，用 curated
+    打分器拿回答文本反查记忆条目；中文按单字分词，虚词与任何条目都有重叠，
+    须用相对阈值（命中数 ≥ max(6, 35% 答案去重 token 数)）压误报，宁缺勿滥。
+    静默失败——归因是旁路装饰，绝不影响回答与既有引用。"""
+    try:
+        text = str(answer_text or "").strip()
+        if len(text) < 20:
+            return
+        if getattr(agent, "_zet_memory_citations", None):
+            return  # 工具/预取路径已有引用，事后归因让位
+        from tools.search_memory_tool import _TOKEN_RE, search_memory_tool as _smt
+        query = text[:400]
+        token_count = len(set(_TOKEN_RE.findall(query.lower())))
+        if token_count < 8:
+            return
+        raw = _smt({"query": query, "top_k": 4},
+                   memory_manager=getattr(agent, "_memory_manager", None))
+        parsed = json.loads(raw)
+        items = parsed.get("items") if isinstance(parsed, dict) else None
+        if not isinstance(items, list):
+            return
+        # 判据 = 条目覆盖率：score 是"答案 token 命中条目"的计数，上限受条目
+        # 长度约束（短条目永远到不了答案 token 的 35%——首版阈值把真命中卡死，
+        # 真机复测抓到）。改为"条目自身去重 token 的一半以上被答案覆盖"，
+        # 保底 6 个字符命中。
+        kept = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            score = float(it.get("score", 0) or 0)
+            entry_tokens = len(set(_TOKEN_RE.findall(str(it.get("excerpt") or "").lower())))
+            floor = max(6.0, 0.5 * entry_tokens)
+            if score >= floor:
+                kept.append(it)
+        logging.getLogger(__name__).warning(
+            "[citations-attr] answer_tokens=%s candidates=%s kept=%s",
+            token_count, [round(float(i.get("score", 0) or 0), 1) for i in items if isinstance(i, dict)],
+            len(kept))
+        if kept:
+            collect_memory_citations(agent, json.dumps({"items": kept}, ensure_ascii=False))
+    except Exception:
+        logging.getLogger(__name__).warning("[citations-attr] failed", exc_info=True)
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
@@ -2890,6 +3032,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
+            # hermes.todo 快照不在 worker 里推：由 tool_executor 的并发收集
+            # 点在 canonical 结果落盘成功后统一推送（codex P1——先推后写会
+            # 在 DB busy 时 fail-open，App 看到的清单下一轮 hydrate 不回来）。
             return _finish_agent_tool(
                 _todo_tool(
                     todos=next_args.get("todos"),
@@ -2945,6 +3090,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
+    elif function_name == "search_memory":
+        def _execute(next_args: dict) -> Any:
+            # Thread the live memory manager so the tool can proxy to an
+            # activated provider's optional search() (same seam as the memory
+            # tool's store=). None (no external provider) falls back to the
+            # built-in curated MEMORY.md/USER.md search inside the tool.
+            from tools.search_memory_tool import search_memory_tool as _search_memory_tool
+            raw = _search_memory_tool(next_args, memory_manager=agent._memory_manager)
+            collect_memory_citations(agent, raw)
+            return _finish_agent_tool(raw, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
@@ -2973,9 +3128,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "present_plan":
         def _execute(next_args: dict) -> Any:
-            from tools.plan_tool import present_plan as _present_plan
+            from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 
-            result = _present_plan(
+            result, plan_meta = _present_plan_with_meta(
                 title=next_args.get("title", ""),
                 groups=next_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
@@ -2994,6 +3149,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 agent._zet_agent_plan_presented = True
                 if getattr(agent, "plan_emit_callback", None) is None:
                     agent._zet_agent_plan_fallback_response = result
+                if plan_meta is not None:
+                    # 与顺序路径一致：播种延迟到批次收尾统一执行
+                    # （agent/plan_seeding.seed_pending_plan_todos）。
+                    agent._pending_plan_seed = plan_meta
             return _finish_agent_tool(result, next_args)
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:

@@ -1835,6 +1835,7 @@ registry.register(
 _skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
 _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
+_TRUSTED_SKILL_ATTESTATION_FIELD = "_zet_agent_trusted_skill_attestation"
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
     "Skill content unchanged since it was loaded earlier in this "

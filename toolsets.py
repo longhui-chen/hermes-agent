@@ -80,6 +80,13 @@ _HERMES_CORE_TOOLS = [
     # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
     "list_my_channels",
     "send_channel_message",
+    # Read-only device meeting library bridge; exposed only when local-server
+    # injects the loopback callback URL and action token.
+    "device_meetings",
+    # List the user's authorized business-data connectors (gated on zet_agent
+    # env via check_fn). Has a zettlab_connectors catalog entry so the
+    # non-configurable recovery walk keeps it reachable on the real path.
+    "list_my_connectors",
     # Main-only, session-bound read-only unified calendar.
     "get_personal_calendar",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -301,8 +308,58 @@ TOOLSETS = {
     # reverse-mapping silently drops — registered, gate open, yet absent from
     # the model's schema (found on a real device).
     "zettlab_apphost": {
-        "description": "Manage device-hosted generated applications via the local App Host (zettlab)",
-        "tools": ["app_host"],
+        "description": "Manage device-hosted generated applications and their owner-scoped data (zettlab)",
+        "tools": ["app_host", "app_data"],
+        "includes": []
+    },
+
+    "zettlab_app_workspace": {
+        "description": "Edit a dedicated maintainer's bounded App Host workspace (zettlab)",
+        "tools": ["app_workspace"],
+        "includes": []
+    },
+
+    "zettlab_skill_runtime": {
+        "description": "Profile-local Agent application operations and device evidence reads",
+        "tools": ["skill_operation", "device_meetings"],
+        "includes": []
+    },
+
+    # Chat reachability alias for the read-only meeting bridge. Keep
+    # zettlab_skill_runtime unchanged because existing Cron jobs explicitly bind
+    # that broader toolset for skill_operation. The Zet Agent resolver recovers
+    # non-configurable toolsets only when every authored tool is present in its
+    # platform composite; skill_operation is intentionally Cron-only, so the
+    # broader entry cannot be recovered on Chat even though device_meetings is
+    # part of hermes-zet-agent.
+    "zettlab_device_meetings": {
+        "description": "Read-only access to meetings stored on the local Zettlab device",
+        "tools": ["device_meetings"],
+        "includes": []
+    },
+
+    # Same load-bearing pattern as zettlab_apphost above: without this catalog
+    # entry the reverse-mapping in _get_platform_tools would silently drop the
+    # tool from the zet_agent real path (see the zettlab_channels /
+    # personal_calendar known gaps in tests/test_toolsets.py).
+    "zettlab_connectors": {
+        "description": "List the user's authorized business-data connectors via local-server (zettlab)",
+        "tools": ["list_my_connectors"],
+        "includes": []
+    },
+
+    "zettlab_pc": {
+        "description": "Use locally approved files and semantic Computer Use on the connected desktop",
+        "tools": ["pc_node_status", "pc_file", "pc_ui"],
+        "includes": []
+    },
+
+    # Load-bearing catalog entry for the same reverse-mapping path as
+    # zettlab_apphost/zettlab_pc. Without it, hermes-zet-agent contains the
+    # tool statically but _get_platform_tools drops it before model assembly.
+    "zettlab_ssh": {
+        "description": "Use SSH connections trusted for the current Agent and Chat",
+        "tools": ["ssh_control"],
         "includes": []
     },
 
@@ -516,13 +573,12 @@ TOOLSETS = {
         # session (_own_session_id), so only THIS platform can use it — other
         # platforms would show the model a tool local-server always rejects.
         # Still schema-gated by ZET_AGENT_CALL_URL via check_fn.
-        # app_host likewise: local-server's App Host internal face (base URL +
-        # action token) only exists in a zet_agent profile, and installing
-        # generated applications on the device is a device-agent capability —
-        # not something telegram/slack/cron schemas should ever advertise.
-        # Still gated by ZET_APPHOST_BASE_URL + the action token via check_fn.
+        # app_host/app_data likewise: local-server's App Host internal face
+        # (base URL + action token) only exists in a zet_agent profile. Both
+        # tools are scoped to the active generated-app profile and must not be
+        # advertised by messaging or Cron platforms.
         "tools": _HERMES_CORE_TOOLS + [
-            "call_agent", "app_host", "desktop_pet_creator"
+            "call_agent", "app_host", "app_data", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "ssh_control"
         ],
         "includes": []
     },
@@ -534,7 +590,7 @@ TOOLSETS = {
         # homeassistant) are excluded by _get_platform_tools() unless
         # the user explicitly enables them.
         "description": "Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["skill_operation"],
         "includes": []
     },
 

@@ -273,6 +273,44 @@ class TestWeixinChunkDelivery:
 
 class TestWeixinOutboundMedia:
 
+    @pytest.mark.asyncio
+    async def test_remote_image_forbidden_is_non_retryable(self, caplog):
+        class ForbiddenDownload(RuntimeError):
+            status_code = 403
+
+        signed = "https://cdn.example/image.png?token=TOP_SECRET"
+        adapter = _make_adapter()
+        adapter._download_remote_media = AsyncMock(
+            side_effect=ForbiddenDownload(f"403 while downloading {signed}")
+        )
+
+        with caplog.at_level("ERROR"):
+            result = await adapter.send_image("wxid_test", signed, "")
+
+        adapter._download_remote_media.assert_awaited_once_with(signed)
+        assert not result.success and result.retryable is False
+        assert result.error == "Weixin could not access the image link. Please resend the image."
+        assert "TOP_SECRET" not in caplog.text and "TOP_SECRET" not in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_remote_image_failure_is_safe_and_actionable(self, caplog):
+        signed = "https://cdn.example/image.png?token=TOP_SECRET"
+        adapter = _make_adapter()
+        adapter._download_remote_media = AsyncMock(
+            side_effect=RuntimeError(f"403 while downloading {signed}")
+        )
+
+        try:
+            with caplog.at_level("ERROR"):
+                result = await adapter.send_image("wxid_test", signed, "")
+        except Exception as exc:  # pragma: no cover - 仅用于给逆改提供定点断言
+            pytest.fail(f"远程图片下载失败必须返回安全 SendResult，不能向上抛出: {type(exc).__name__}")
+
+        adapter._download_remote_media.assert_awaited_once_with(signed)
+        assert "TOP_SECRET" not in caplog.text and signed not in caplog.text
+        assert "TOP_SECRET" not in (result.error or "")
+        assert "resend the image" in (result.error or "")
+
 
     def test_send_file_uses_post_for_upload_full_url_and_hex_encoded_aes_key(self, tmp_path):
         class _UploadResponse:
@@ -827,4 +865,3 @@ class TestWeixinVoiceGatewayHandoff:
             "VOICE event body leaked Tencent's STT text — runner would trust "
             "the wrong transcript instead of re-transcribing (#27300)."
         )
-

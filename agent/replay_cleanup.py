@@ -71,13 +71,14 @@ def strip_interrupted_tool_tails(
                 calls = msg.get("tool_calls") or []
                 if any(
                     tool_may_have_side_effect(
-                        str((call.get("function") or {}).get("name") or "")
+                        str((call.get("function") or {}).get("name") or ""),
+                        (call.get("function") or {}).get("arguments"),
                     )
                     for call in calls
                 ):
-                    call_names = {
-                        str(call.get("id") or call.get("call_id") or ""): str(
-                            (call.get("function") or {}).get("name") or ""
+                    call_fns = {
+                        str(call.get("id") or call.get("call_id") or ""): (
+                            call.get("function") or {}
                         )
                         for call in calls
                     }
@@ -87,9 +88,13 @@ def strip_interrupted_tool_tails(
                             cleaned.append(tool_result)
                             continue
                         recovered = dict(tool_result)
-                        name = call_names.get(str(tool_result.get("tool_call_id") or ""), "")
+                        fn = call_fns.get(str(tool_result.get("tool_call_id") or ""), {})
                         recovered["effect_disposition"] = (
-                            "unknown" if tool_may_have_side_effect(name) else "none"
+                            "unknown"
+                            if tool_may_have_side_effect(
+                                str(fn.get("name") or ""), fn.get("arguments")
+                            )
+                            else "none"
                         )
                         recovered["content"] = (
                             "[Orphan recovery: interrupted side-effecting tool may have "
@@ -155,7 +160,8 @@ def strip_dangling_tool_call_tail(
     tool_calls = last.get("tool_calls") or []
     if any(
         tool_may_have_side_effect(
-            str((call.get("function") or {}).get("name") or "")
+            str((call.get("function") or {}).get("name") or ""),
+            (call.get("function") or {}).get("arguments"),
         )
         for call in tool_calls
     ):
@@ -164,7 +170,11 @@ def strip_dangling_tool_call_tail(
             function = call.get("function") or {}
             name = str(function.get("name") or "unknown")
             call_id = str(call.get("id") or call.get("call_id") or "")
-            disposition = "unknown" if tool_may_have_side_effect(name) else "none"
+            disposition = (
+                "unknown"
+                if tool_may_have_side_effect(name, function.get("arguments"))
+                else "none"
+            )
             content = (
                 "[Orphan recovery: this tool may have executed before Hermes stopped; "
                 "its effect is UNKNOWN. Inspect current state before retrying.]"

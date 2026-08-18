@@ -377,6 +377,10 @@ SNAPSHOT_SUMMARIZE_THRESHOLD = 15000
 # read_file paging and must not write unbounded bytes to disk.
 MAX_STORED_SNAPSHOT_CHARS = 2_000_000
 
+# Web Host already bounds image extraction; keep a second cheap tool-boundary
+# ceiling so a malformed or mismatched managed response cannot grow work here.
+MAX_MANAGED_PAGE_IMAGES = 512
+
 # Commands that legitimately return empty stdout (e.g. close, record).
 _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})
 
@@ -2906,10 +2910,10 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
         return None
 
 
-def _extract_relevant_content(
+def _extract_relevant_content_with_provenance(
     snapshot_text: str,
     user_task: Optional[str] = None
-) -> str:
+) -> tuple[str, str]:
     """Use LLM to extract relevant content from a snapshot based on the user's task.
 
     The full snapshot is stored to cache/web first (summarization is lossy —
@@ -2966,11 +2970,20 @@ def _extract_relevant_content(
         if not extracted:
             # _truncate_snapshot stores its own pointer (dedupes to the same
             # cache file by content hash), so return it without stored_note.
-            return _truncate_snapshot(snapshot_text)
+            return _truncate_snapshot(snapshot_text), "page_text"
         # Redact any secrets the auxiliary LLM may have echoed back.
-        return redact_sensitive_text(extracted) + stored_note
+        return redact_sensitive_text(extracted) + stored_note, "task_extraction"
     except Exception:
-        return _truncate_snapshot(snapshot_text)
+        return _truncate_snapshot(snapshot_text), "page_text"
+
+
+def _extract_relevant_content(
+    snapshot_text: str,
+    user_task: Optional[str] = None,
+) -> str:
+    """Compatibility wrapper for callers that only need model-facing text."""
+    content, _ = _extract_relevant_content_with_provenance(snapshot_text, user_task)
+    return content
 
 
 def _truncate_snapshot(snapshot_text: str, max_chars: int = SNAPSHOT_SUMMARIZE_THRESHOLD) -> str:
@@ -3147,6 +3160,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         if safety_error:
             _close_unsafe_managed_page()
             return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        if isinstance(managed_payload.get("snapshot"), str):
+            managed_payload["_browser_content_provenance"] = "page_text"
         return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
@@ -3271,7 +3286,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                 refs = snap_data.get("refs", {})
                 if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
                     snapshot_text = _truncate_snapshot(snapshot_text)
+                    response["_browser_content_source_truncated"] = True
                 response["snapshot"] = _redact_browser_output(snapshot_text)
+                response["_browser_content_provenance"] = "page_text"
                 response["element_count"] = len(refs) if refs else 0
                 if snap_result.get("fallback_warning") and not response.get("fallback_warning"):
                     _copy_fallback_warning(response, snap_result)
@@ -3315,13 +3332,18 @@ def browser_snapshot(
             _close_unsafe_managed_page()
             return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
         snapshot_text = managed_payload.get("snapshot", "")
+        provenance = "page_text"
         if isinstance(snapshot_text, str) and len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-            snapshot_text = (
-                _extract_relevant_content(snapshot_text, user_task)
-                if user_task
-                else _truncate_snapshot(snapshot_text)
-            )
+            if user_task:
+                snapshot_text, provenance = _extract_relevant_content_with_provenance(
+                    snapshot_text, user_task
+                )
+            else:
+                snapshot_text = _truncate_snapshot(snapshot_text)
             managed_payload["snapshot"] = snapshot_text
+            managed_payload["_browser_content_source_truncated"] = True
+        if isinstance(snapshot_text, str):
+            managed_payload["_browser_content_provenance"] = provenance
         return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
@@ -3377,16 +3399,23 @@ def browser_snapshot(
                 logger.debug("browser_snapshot: URL safety check failed (%s)", _url_exc)
 
         # Check if snapshot needs summarization
-        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
-            snapshot_text = _extract_relevant_content(snapshot_text, user_task)
+        provenance = "page_text"
+        source_truncated = len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD
+        if source_truncated and user_task:
+            snapshot_text, provenance = _extract_relevant_content_with_provenance(
+                snapshot_text, user_task
+            )
         elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
             snapshot_text = _truncate_snapshot(snapshot_text)
 
         response = {
             "success": True,
             "snapshot": _redact_browser_output(snapshot_text),
+            "_browser_content_provenance": provenance,
             "element_count": len(refs) if refs else 0
         }
+        if source_truncated:
+            response["_browser_content_source_truncated"] = True
         _copy_fallback_warning(response, result)
 
         # Merge supervisor state (pending dialogs + frame tree) when a CDP
@@ -3589,6 +3618,29 @@ def browser_back(task_id: Optional[str] = None) -> str:
         JSON string with navigation result
     """
     managed_route = _route_browser_action("back")
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        if managed_payload.get("success") is not True:
+            return json.dumps(
+                _redact_browser_output(managed_payload), ensure_ascii=False
+            )
+        current_url = str(managed_payload.get("url") or "").strip()
+        if not current_url:
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed desktop back result omitted the landed page URL.",
+            }, ensure_ascii=False)
+        safety_error = _managed_page_safety_error(current_url)
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps(
+                {"success": False, "error": safety_error}, ensure_ascii=False
+            )
+        return json.dumps(
+            _redact_browser_output({"success": True, "url": current_url}),
+            ensure_ascii=False,
+        )
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
         return managed_result
@@ -4357,6 +4409,48 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         JSON string with list of images (src and alt)
     """
     managed_route = _route_browser_action("get_images")
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        if managed_payload.get("success") is not True:
+            return json.dumps(
+                _redact_browser_output(managed_payload), ensure_ascii=False
+            )
+        current_url = str(managed_payload.get("url") or "").strip()
+        if not current_url:
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed desktop image result omitted the page URL.",
+            }, ensure_ascii=False)
+        safety_error = _managed_page_safety_error(current_url)
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps(
+                {"success": False, "error": safety_error}, ensure_ascii=False
+            )
+        raw_images = managed_payload.get("images")
+        images = []
+        if isinstance(raw_images, list):
+            for image in raw_images[:MAX_MANAGED_PAGE_IMAGES]:
+                if not isinstance(image, dict):
+                    continue
+                src = image.get("src")
+                if (
+                    not isinstance(src, str)
+                    or not src
+                    or src.lower().startswith("data:")
+                ):
+                    continue
+                images.append(image)
+        redacted_images = _redact_browser_output(images)
+        if not isinstance(redacted_images, list):
+            redacted_images = []
+        response = {
+            "success": True,
+            "images": redacted_images,
+            "count": len(redacted_images),
+        }
+        return json.dumps(response, ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
         return managed_result

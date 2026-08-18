@@ -105,6 +105,8 @@ def test_portable_credential_scanner_keeps_placeholders(value):
         '{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNzd29yZA=="}}}',
         '{"identitytoken":"dXNlcjpwYXNzd29yZDEyMzQ1"}',
         '{"registrytoken":"dXNlcjpwYXNzd29yZDEyMzQ1"}',
+        '{"auth": "correcthorsebatterystaple"}',
+        "_auth=qwertyzxcvbnasdfghjklm",
     ],
     ids=[
         "kubeconfig-client-key-data",
@@ -113,6 +115,8 @@ def test_portable_credential_scanner_keeps_placeholders(value):
         "docker-config-auth",
         "docker-config-identitytoken",
         "docker-config-registrytoken",
+        "docker-config-auth-lowercase-passphrase",
+        "npmrc-auth-lowercase-token",
     ],
 )
 def test_portable_credential_scanner_rejects_encoded_credential_field_shapes(value):
@@ -126,12 +130,16 @@ def test_portable_credential_scanner_rejects_encoded_credential_field_shapes(val
         "the auth mode discussion text continues here",
         '{"auth": true}',
         "_auth=${NPM_AUTH_TOKEN}",
+        "auth: authentication",
+        "auth: client-certificate-required",
     ],
     ids=[
         "auth-enabled-prose",
         "auth-mode-discussion-prose",
         "auth-boolean-json",
         "npmrc-auth-placeholder",
+        "auth-single-word-prose",
+        "auth-kebab-config-enum",
     ],
 )
 def test_portable_credential_scanner_keeps_benign_auth_lookalikes(value):

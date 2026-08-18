@@ -20,6 +20,7 @@ PROTECTED_TREES = (
     "optional-skills",
     "plugins",
     "skills",
+    "tools",
     "venv",
 )
 IGNORED_DIRECTORY_NAMES = {

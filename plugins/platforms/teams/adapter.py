@@ -89,10 +89,56 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_url,
     cache_media_bytes,
+    log_media_intake_failure,
+    safe_exc,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _classify_media_send_failure(exc: BaseException, media_label: str) -> SendResult:
+    """把媒体发送异常翻译成稳定、可行动且不泄漏底层详情的结果。"""
+    if isinstance(exc, FileNotFoundError):
+        return SendResult(
+            success=False,
+            error=f"Teams {media_label} file was not found. Regenerate or re-upload it, then try again.",
+            retryable=False,
+            error_kind="unknown",
+        )
+    if isinstance(exc, PermissionError):
+        return SendResult(
+            success=False,
+            error=f"Teams could not read the {media_label} file. Check file permissions and try again.",
+            retryable=False,
+            # 本地文件权限失败不代表 Teams 目标不可达，不能误标为 forbidden。
+            error_kind="unknown",
+        )
+
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    detail = safe_exc(exc).lower()
+    if status in {401, 403} or "unauthorized" in detail or "forbidden" in detail:
+        return SendResult(
+            success=False,
+            error=f"Teams is not authorized to send this {media_label}. Reconnect Teams or contact an administrator.",
+            retryable=False,
+            error_kind="forbidden",
+        )
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timed out" in detail or "timeout" in detail:
+        return SendResult(
+            success=False,
+            error=f"Teams {media_label} delivery timed out. Check the network and try again.",
+            retryable=True,
+            error_kind="transient",
+        )
+    return SendResult(
+        success=False,
+        error=f"Teams {media_label} delivery failed; please try again.",
+        retryable=True,
+        error_kind="unknown",
+    )
 
 
 def _get_scoped_secret(name, default=None):
@@ -976,12 +1022,18 @@ class TeamsAdapter(BasePlatformAdapter):
                         media_types.append(cached.media_type)
                         media_kinds.append(cached.kind)
                     else:
-                        logger.warning(
-                            "[teams] Unsupported document type for attachment '%s', skipping",
-                            filename,
-                        )
+                        logger.warning("[teams] Unsupported document type; skipping attachment")
                 except Exception as e:
-                    logger.warning("[teams] Failed to cache file attachment '%s': %s", filename, e)
+                    # 🔴 ⛔ 不再裸 `%s` 异常:本文件 `_fetch_attachment_bytes` 的
+                    # docstring 自己写着 Teams 附件带的是**预授权** SharePoint
+                    # downloadUrl(`?tempauth=<JWT>`)—— 即「URL 本身就是凭据」。
+                    # `httpx.HTTPStatusError.__str__` 会把整条 URL 写进日志。
+                    # 照抄 weixin `_note_media_failure` 的机制:只记
+                    # kind/reason/url_host/异常类型名。
+                    log_media_intake_failure(
+                        logger, "teams", "file", "download_failed",
+                        url=download_url, exc=e, filename=filename,
+                    )
                 continue
 
             if content_url and content_type.startswith("image/"):
@@ -992,7 +1044,10 @@ class TeamsAdapter(BasePlatformAdapter):
                         media_types.append(content_type)
                         media_kinds.append("image")
                 except Exception as e:
-                    logger.warning("[teams] Failed to cache image attachment: %s", e)
+                    log_media_intake_failure(
+                        logger, "teams", "image", "download_failed",
+                        url=content_url, exc=e,
+                    )
                 continue
 
             if content_url:
@@ -1007,9 +1062,18 @@ class TeamsAdapter(BasePlatformAdapter):
                         media_types.append(cached.media_type)
                         media_kinds.append(cached.kind)
                 except Exception as e:
-                    logger.warning(
-                        "[teams] Failed to cache attachment '%s' (%s): %s",
-                        att_name or content_url, content_type, e,
+                    # ⛔ 原写法把 `content_url` 作为 fallback 直接进日志 ——
+                    # 那是预授权 URL 本身。这里只留 host + 文件名。
+                    # kind 只取 image/video/audio 三个已知前缀,其余一律 "file"
+                    # —— ⛔ 不许把 `application` 这种 MIME 顶级类型当 kind 写进
+                    # 日志(它不是本仓约定的 kind 词表)。
+                    _top = content_type.split("/", 1)[0]
+                    log_media_intake_failure(
+                        logger, "teams",
+                        _top if _top in ("image", "video", "audio") else "file",
+                        "download_failed",
+                        url=content_url, exc=e,
+                        filename=att_name or "-", content_type=content_type or "-",
                     )
 
         # Classification: DOCUMENT wins over PHOTO/VIDEO/AUDIO for mixed
@@ -1296,8 +1360,12 @@ class TeamsAdapter(BasePlatformAdapter):
 
             return SendResult(success=True, message_id=getattr(result, "id", None))
         except Exception as e:
-            logger.error("[teams] send_%s failed: %s", media_label, e, exc_info=True)
-            return SendResult(success=False, error=str(e), retryable=True)
+            # ⛔ 不许 `%s` + `exc_info=True`:本函数把**本地文件整份 base64**
+            # 塞进 `content_url`(data URI),而 Bot Framework 的异常在失败时
+            # 可能回显整条 activity ⇒ 一次发送失败就把文件内容写进 agent.log。
+            # ⚠️ 这是出站面；日志只保留清洗后的诊断，用户边界按真实根因分类。
+            logger.error("[teams] send_%s failed: %s", media_label, safe_exc(e))
+            return _classify_media_send_failure(e, media_label)
 
     async def send_image(
         self,
