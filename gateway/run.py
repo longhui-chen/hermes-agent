@@ -2995,7 +2995,7 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     platform adapter, so the note just confirms that and records the path.
 
     Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
-    must tell the agent to *extract* the text itself before answering — earlier
+    must tell the agent to read the runtime's canonical artifact before answering — earlier
     wording ("Ask the user what they'd like you to do with it") steered the
     model into punting back to the user, which is why attached PDFs/DOCX looked
     "unreadable" to the agent even though it has the tools to read them.
@@ -3009,8 +3009,8 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
         f"Its text is not inlined here (it's a binary format such as PDF or DOCX). "
-        f"To read it, extract the document's text yourself — for example with the "
-        f"terminal tool or the ocr-and-documents skill — before answering, instead "
+        f"To read it, use read_file on the saved path; the runtime resolves its "
+        f"canonical parsed content. Do not run another parser or OCR tool. Answer instead "
         f"of asking the user to paste the contents.]"
     )
 
