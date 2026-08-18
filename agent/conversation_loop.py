@@ -89,7 +89,9 @@ from agent.retry_utils import (
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.zet_agent_response_mode import (
+    activate_transport_selected_trusted_skill,
     reset_trusted_skill_execution,
+    transport_attested_skill_instruction,
     trusted_skill_allowed_tool_names,
     trusted_skill_scope_active,
 )
@@ -508,6 +510,16 @@ def _seal_video_edit_provider_request(
     elif scope_active:
         changed = _apply_zet_agent_plan_tool_visibility(agent, api_kwargs) or changed
 
+    transport_instruction = transport_attested_skill_instruction(agent)
+    if transport_instruction:
+        changed = (
+            _append_api_system_instruction_once(
+                api_kwargs,
+                transport_instruction,
+            )
+            or changed
+        )
+
     # The provider rejects a follow-up containing an assistant tool call when
     # thinking mode is enabled but no reasoning_content is echoed back.  The
     # same route/model predicate used by the bootstrap applies to every
@@ -918,6 +930,30 @@ def _append_api_system_instruction(
         "content": instruction,
     })
     api_kwargs["messages"] = patched
+
+
+def _append_api_system_instruction_once(
+    api_kwargs: Dict[str, Any], instruction: str
+) -> bool:
+    """Append an API-only instruction once across repeated provider sealing."""
+    messages = api_kwargs.get("messages")
+    if not instruction or not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and instruction in content:
+            return False
+        if isinstance(content, list) and any(
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and instruction in str(part.get("text") or "")
+            for part in content
+        ):
+            return False
+    _append_api_system_instruction(api_kwargs, instruction)
+    return True
 
 
 def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
@@ -2430,6 +2466,8 @@ def run_conversation(
         explicit_skill_slug=trusted_skill_slug,
         tool_execution_allowed=not tools_disabled_for_request,
     )
+    agent._zet_agent_transport_attested_skill = None
+    activate_transport_selected_trusted_skill(agent)
     # Zettlab App plan 模式：本轮每次模型调用只允许 clarify / present_plan。
     agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(
         agent, original_user_message
@@ -3315,6 +3353,10 @@ def run_conversation(
                 _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
                 _apply_forced_present_plan_tool_choice(agent, api_kwargs)
                 _apply_forced_video_edit_skill_view(agent, api_kwargs)
+                _append_api_system_instruction_once(
+                    api_kwargs,
+                    transport_attested_skill_instruction(agent),
+                )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":

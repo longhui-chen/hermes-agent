@@ -260,6 +260,17 @@ class _SkillDirectOperation:
 
 
 @dataclass(frozen=True)
+class _TransportAttestedSkill:
+    """Request-local signed skill bytes loaded without a provider round trip."""
+
+    relative_path: str
+    task_sha256: str
+    turn_identity: _TurnIdentity
+    raw_sha256: str
+    content: str = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
 class _VideoEditResumeGrant:
     expires_at: float
     source_turn_id: str
@@ -1525,6 +1536,187 @@ def _activate_execution_policy_tools(
     agent.valid_tool_names = scoped_names
 
 
+def _activate_trusted_skill_scope(
+    agent: Any,
+    *,
+    relative_path: str,
+    attested_turn_identity: _TurnIdentity,
+) -> bool:
+    """Activate the existing request-bound scope after a trusted byte read."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    if relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH}:
+        return False
+
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    task_matches_skill = bool(
+        isinstance(task, _SkillDirectTaskContext)
+        and (
+            (
+                relative_path == _VIDEO_EDIT_SKILL_PATH
+                and task.video_edit_applicable
+            )
+            or (
+                relative_path == _CAMERA_SKILL_PATH
+                and task.camera_applicable
+            )
+        )
+    )
+    if not task_matches_skill:
+        logger.warning(
+            "zet_agent: trusted skill %s did not match the current user task",
+            relative_path,
+        )
+        return False
+
+    current_turn_identity = _current_skill_direct_turn_identity()
+    if (
+        current_turn_identity is None
+        or task.turn_identity != current_turn_identity
+        or attested_turn_identity != current_turn_identity
+    ):
+        logger.warning(
+            "zet_agent: trusted skill %s rejected for mismatched turn identity",
+            relative_path,
+        )
+        return False
+    if (
+        getattr(agent, "_zet_agent_execution_policy", "")
+        == "silent_automation"
+        and _trusted_skill_path_for_slug(
+            getattr(task, "trusted_skill_slug", "")
+        )
+        != relative_path
+    ):
+        logger.warning(
+            "zet_agent: silent skill %s does not match the trusted slug %r",
+            relative_path,
+            getattr(task, "trusted_skill_slug", ""),
+        )
+        return False
+
+    execution_receipt = _capture_trusted_execution_receipt(
+        current_turn_identity,
+        relative_path,
+    )
+    if execution_receipt is None:
+        return False
+    allowed_tools = (
+        _CAMERA_DIRECT_TOOLS
+        if relative_path == _CAMERA_SKILL_PATH
+        else _VIDEO_EDIT_DIRECT_TOOLS
+    )
+
+    with _SKILL_DIRECT_LOCK:
+        agent._zet_agent_skill_direct_operation = None
+        agent._zet_agent_skill_direct_scope = _SkillDirectScope(
+            relative_path=relative_path,
+            task_sha256=task.task_sha256,
+            turn_identity=current_turn_identity,
+            allowed_tools=allowed_tools,
+            execution_receipt=execution_receipt,
+        )
+        _activate_execution_policy_tools(agent, allowed_tools)
+    logger.info(
+        "zet_agent: trusted skill %s activated bounded execution scope",
+        relative_path,
+    )
+    return True
+
+
+def activate_transport_selected_trusted_skill(agent: Any) -> bool:
+    """Attest a silent transport-selected skill before the provider call.
+
+    The local-server request has already bound the exact ActionV1, turn,
+    session, execution policy, and signed skill slug.  Re-read the immutable
+    startup snapshot in this request context and reuse the normal bounded
+    scope; no provider-returned token or additional authorization is minted.
+    """
+    if getattr(agent, "_zet_agent_execution_policy", "") != "silent_automation":
+        return False
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    if (
+        not isinstance(task, _SkillDirectTaskContext)
+        or not task.video_edit_explicit
+        or task.trusted_skill_slug != "video-edit-workflow-mini"
+        or task.turn_identity is None
+        or task.turn_identity != turn_identity
+    ):
+        return False
+
+    relative_path = _trusted_skill_path_for_slug(task.trusted_skill_slug)
+    if relative_path != _VIDEO_EDIT_SKILL_PATH:
+        return False
+    snapshot = _TRUSTED_PRESETS_SNAPSHOT
+    if snapshot is None:
+        logger.warning(
+            "zet_agent: transport-selected trusted skill has no startup snapshot"
+        )
+        return False
+
+    content, evidence = read_skill_source_with_trusted_execution_evidence(
+        Path(snapshot.resolved_root) / relative_path
+    )
+    if (
+        content is None
+        or evidence is None
+        or evidence.generation != snapshot.generation
+        or evidence.relative_path != relative_path
+    ):
+        logger.warning(
+            "zet_agent: transport-selected trusted skill attestation failed"
+        )
+        return False
+    if not _activate_trusted_skill_scope(
+        agent,
+        relative_path=relative_path,
+        attested_turn_identity=turn_identity,
+    ):
+        return False
+
+    agent._zet_agent_transport_attested_skill = _TransportAttestedSkill(
+        relative_path=relative_path,
+        task_sha256=task.task_sha256,
+        turn_identity=turn_identity,
+        raw_sha256=evidence.raw_sha256,
+        content=content,
+    )
+    logger.info(
+        "zet_agent: transport-selected trusted skill attested before provider call"
+    )
+    return True
+
+
+def transport_attested_skill_instruction(agent: Any) -> str:
+    """Return signed skill bytes only for their current request-local scope."""
+    attested = getattr(agent, "_zet_agent_transport_attested_skill", None)
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    scope = getattr(agent, "_zet_agent_skill_direct_scope", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    if (
+        not isinstance(attested, _TransportAttestedSkill)
+        or not isinstance(task, _SkillDirectTaskContext)
+        or not isinstance(scope, _SkillDirectScope)
+        or turn_identity is None
+        or attested.turn_identity != turn_identity
+        or task.turn_identity != turn_identity
+        or scope.turn_identity != turn_identity
+        or attested.task_sha256 != task.task_sha256
+        or scope.task_sha256 != task.task_sha256
+        or attested.relative_path != scope.relative_path
+        or hashlib.sha256(attested.content.encode("utf-8")).hexdigest()
+        != attested.raw_sha256
+        or not scope.allowed_tools
+    ):
+        return ""
+    return (
+        "Zettlab transport-attested signed skill instructions "
+        "(request-local; follow exactly):\n\n"
+        f"{attested.content}"
+    )
+
+
 def _video_edit_runtime_argv(
     function_args: Mapping[str, Any],
 ) -> list[str] | None:
@@ -2673,80 +2865,11 @@ def apply_trusted_skill_execution(
     if pending is None:
         return False
 
-    if (getattr(agent, "platform", "") or "") != "zet_agent":
-        return False
-
-    if pending.relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH}:
-        return False
-    task = getattr(agent, "_zet_agent_skill_direct_task", None)
-    task_matches_skill = bool(
-        isinstance(task, _SkillDirectTaskContext)
-        and (
-            (
-                pending.relative_path == _VIDEO_EDIT_SKILL_PATH
-                and task.video_edit_applicable
-            )
-            or (
-                pending.relative_path == _CAMERA_SKILL_PATH
-                and task.camera_applicable
-            )
-        )
+    return _activate_trusted_skill_scope(
+        agent,
+        relative_path=pending.relative_path,
+        attested_turn_identity=pending.turn_identity,
     )
-    if not task_matches_skill:
-        logger.warning(
-            "zet_agent: trusted skill %s did not match the current user task",
-            pending.relative_path,
-        )
-        return False
-    current_turn_identity = _current_skill_direct_turn_identity()
-    if (
-        current_turn_identity is None
-        or task.turn_identity != current_turn_identity
-        or pending.turn_identity != current_turn_identity
-    ):
-        logger.warning(
-            "zet_agent: trusted skill %s rejected for mismatched turn identity",
-            pending.relative_path,
-        )
-        return False
-    if (
-        getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation"
-        and _trusted_skill_path_for_slug(getattr(task, "trusted_skill_slug", ""))
-        != pending.relative_path
-    ):
-        logger.warning(
-            "zet_agent: silent skill %s does not match the trusted slug %r",
-            pending.relative_path,
-            getattr(task, "trusted_skill_slug", ""),
-        )
-        return False
-    execution_receipt = _capture_trusted_execution_receipt(
-        current_turn_identity,
-        pending.relative_path,
-    )
-    if execution_receipt is None:
-        return False
-    allowed_tools = (
-        _CAMERA_DIRECT_TOOLS
-        if pending.relative_path == _CAMERA_SKILL_PATH
-        else _VIDEO_EDIT_DIRECT_TOOLS
-    )
-
-    with _SKILL_DIRECT_LOCK:
-        agent._zet_agent_skill_direct_operation = None
-        agent._zet_agent_skill_direct_scope = _SkillDirectScope(
-            relative_path=pending.relative_path,
-            task_sha256=task.task_sha256,
-            turn_identity=current_turn_identity,
-            allowed_tools=allowed_tools,
-            execution_receipt=execution_receipt,
-        )
-        _activate_execution_policy_tools(agent, allowed_tools)
-    logger.info(
-        "zet_agent: trusted skill %s activated bounded execution scope",
-        pending.relative_path,
-    )
-    return True
 
 
 # Production gateways set ZETTLAB_PRESETS_DIR in the process environment before

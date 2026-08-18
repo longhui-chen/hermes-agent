@@ -1625,6 +1625,155 @@ def test_silent_attestation_rejects_skill_path_mismatch(
         clear_turn_vars(turn_tokens)
 
 
+def test_silent_transport_attestation_rebuilds_scope_after_process_restart_flow(
+    tmp_path,
+    monkeypatch,
+):
+    """A fresh Hermes process must not wait for a provider skill_view call."""
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import (
+        clear_session_vars,
+        pop_execution_session_key,
+        push_execution_session_key,
+        set_session_vars,
+    )
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted proactive video skill after restart\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+
+    # A process restart loses every pending one-shot skill_view attestation.
+    response_mode._PENDING_ATTESTATIONS.clear()
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    secret_token = secret_scope_module.set_secret_scope(
+        {"ZET_AGENT_ID": "main"}
+    )
+    session_tokens = set_session_vars(
+        session_key="proactive-pvm-restart",
+        session_id="api-lineage-after-restart",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="pvm-restart-turn",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        execution_policy="silent_automation",
+    )
+    execution_session_token = push_execution_session_key(
+        "proactive-pvm-restart"
+    )
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        agent._zet_agent_execution_policy = "silent_automation"
+        agent._zet_agent_execution_policy_tools = [
+            {"type": "function", "function": {"name": "skill_view"}},
+            {"type": "function", "function": {"name": "terminal"}},
+        ]
+        agent._zet_agent_execution_policy_valid_tool_names = {
+            "skill_view",
+            "terminal",
+        }
+        agent.tools = list(agent._zet_agent_execution_policy_tools[:1])
+        agent.valid_tool_names = {"skill_view"}
+        reset_trusted_skill_execution(
+            agent,
+            '{"proactive_manifest_id":"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"trigger_id":"pvm-aaaaaaaaaaaaaaaaaaaaaaaa"}',
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+
+        assert response_mode.activate_transport_selected_trusted_skill(agent)
+        assert response_mode.trusted_skill_scope_active(agent)
+        assert [
+            tool["function"]["name"] for tool in agent.tools
+        ] == ["terminal"]
+        assert agent.valid_tool_names == {"terminal"}
+        assert (
+            "trusted proactive video skill after restart"
+            in response_mode.transport_attested_skill_instruction(agent)
+        )
+        # The deterministic runtime path does not mint a replayable/provider-
+        # returned attestation token.
+        assert response_mode._PENDING_ATTESTATIONS == {}
+    finally:
+        pop_execution_session_key(execution_session_token)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+        response_mode._PENDING_ATTESTATIONS.clear()
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+
+
+def test_silent_transport_attestation_keeps_terminal_hidden_after_snapshot_drift(
+    tmp_path,
+    monkeypatch,
+):
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# original signed proactive video skill\n"
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    agent._zet_agent_execution_policy = "silent_automation"
+    agent._zet_agent_execution_policy_tools = [
+        {"type": "function", "function": {"name": "skill_view"}},
+        {"type": "function", "function": {"name": "terminal"}},
+    ]
+    agent._zet_agent_execution_policy_valid_tool_names = {
+        "skill_view",
+        "terminal",
+    }
+    agent.tools = list(agent._zet_agent_execution_policy_tools[:1])
+    agent.valid_tool_names = {"skill_view"}
+    turn_tokens = set_turn_vars(
+        turn_id="pvm-snapshot-drift",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        execution_policy="silent_automation",
+    )
+    try:
+        reset_trusted_skill_execution(
+            agent,
+            '{"proactive_manifest_id":"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"trigger_id":"pvm-aaaaaaaaaaaaaaaaaaaaaaaa"}',
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+        skill_path.write_text("# changed after startup\n", encoding="utf-8")
+
+        assert not response_mode.activate_transport_selected_trusted_skill(agent)
+        assert not response_mode.trusted_skill_scope_active(agent)
+        assert [
+            tool["function"]["name"] for tool in agent.tools
+        ] == ["skill_view"]
+        assert agent.valid_tool_names == {"skill_view"}
+        assert response_mode.transport_attested_skill_instruction(agent) == ""
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
 def test_clarify_requires_nonempty_user_response_to_rearm_trusted_scope_flow():
     turn_tokens = set_turn_vars(turn_id="clarify-turn")
     try:

@@ -501,6 +501,125 @@ def test_video_edit_plain_text_is_bounded_to_two_protocol_retries():
     )
 
 
+def test_silent_transport_attestation_accepts_terminal_when_provider_ignores_tool_choice(
+    monkeypatch,
+):
+    """The provider is no longer responsible for returning exact skill_view."""
+    agent = _runtime_agent(("skill_view", "terminal"))
+    policy_tools = [_tool("skill_view"), _tool("terminal")]
+    agent._zet_agent_execution_policy = "silent_automation"
+    agent._zet_agent_execution_policy_tools = policy_tools
+    agent._zet_agent_execution_policy_valid_tool_names = {
+        "skill_view",
+        "terminal",
+    }
+    agent.tools = [policy_tools[0]]
+    agent.valid_tool_names = {"skill_view"}
+    agent._zet_agent_trusted_user_message = (
+        '{"proactive_manifest_id":"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        '"trigger_id":"pvm-aaaaaaaaaaaaaaaaaaaaaaaa"}'
+    )
+    agent._zet_agent_trusted_skill_slug = _VIDEO_EDIT_SKILL
+
+    def attest_transport_scope(runtime_agent):
+        task = runtime_agent._zet_agent_skill_direct_task
+        runtime_agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
+            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+            task_sha256=task.task_sha256,
+            turn_identity=task.turn_identity,
+            allowed_tools=response_mode._VIDEO_EDIT_DIRECT_TOOLS,
+            execution_receipt=response_mode._TrustedExecutionReceipt(
+                agent_id="main",
+                action_token="",
+                hardware_execution_token="",
+                business_execution_action="a" * 64,
+                business_execution_action_version="1",
+                turn_id="provider-ignored-tool-choice",
+                session_id="api-lineage",
+                gateway_session_key="proactive-provider-ignore",
+                execution_policy="silent_automation",
+            ),
+        )
+        response_mode._activate_execution_policy_tools(
+            runtime_agent,
+            response_mode._VIDEO_EDIT_DIRECT_TOOLS,
+        )
+        return True
+
+    monkeypatch.setattr(
+        "agent.conversation_loop.activate_transport_selected_trusted_skill",
+        attest_transport_scope,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.transport_attested_skill_instruction",
+        lambda _agent: "# signed proactive video skill",
+    )
+    terminal = _tool_response(
+        "terminal",
+        json.dumps(
+            {
+                "command": (
+                    'python3 "$ZETTLAB_PRESETS_DIR/skills/'
+                    'video-edit-workflow-mini/scripts/proactive_video.py" '
+                    '--agent-id "main" resolve --manifest-id '
+                    '"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+                )
+            }
+        ),
+    )
+    completed = _text_response("done")
+
+    def execute_terminal(assistant_message, messages, *_args):
+        call = assistant_message.tool_calls[0]
+        assert call.function.name == "terminal"
+        messages.append(
+            {
+                "role": "tool",
+                "name": "terminal",
+                "tool_call_id": call.id,
+                "content": '{"output":"{}","exit_code":0}',
+            }
+        )
+
+    turn_tokens = set_turn_vars(turn_id="provider-ignored-tool-choice")
+    try:
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=[terminal, completed],
+            ) as api_call,
+            patch.object(
+                agent,
+                "_execute_tool_calls",
+                side_effect=execute_terminal,
+            ) as execute,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("ignored provider bootstrap")
+    finally:
+        clear_turn_vars(turn_tokens)
+
+    assert api_call.call_count == 2
+    first_request = api_call.call_args_list[0].args[0]
+    assert [
+        tool["function"]["name"] for tool in first_request["tools"]
+    ] == ["terminal"]
+    assert "tool_choice" not in first_request
+    assert "signed proactive video skill" in first_request["messages"][0][
+        "content"
+    ]
+    execute.assert_called_once()
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+    assert all(
+        "signed proactive video skill" not in str(message.get("content") or "")
+        for message in result["messages"]
+    )
+
+
 def test_trusted_video_memory_schema_is_scoped_even_when_platform_omits_it(
     monkeypatch,
 ):
