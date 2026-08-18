@@ -685,39 +685,49 @@ DENIED_CREATION_TOOL_ACTIONS = {
     "cronjob": {"create"},
 }
 MAX_DENIED_CREATION_TURNS = 256
-_denied_creation_turns: "OrderedDict[str, bool]" = OrderedDict()
-# 同一个 turn_id 上已经有一次动作被真正接管。双击或传输重发会让两个并发请求
-# 复用同一个 turn_id：先到的原子消费掉 proposal 拿到 accepted，后到的因为
-# proposal 已被消费而落 deny——闸门只按 turn_id 记的话，会把先到那个请求真实
-# 的创建也挡掉，客户端收到 accepted、资源却没建出来。接管优先于拒绝。
-_accepted_creation_turns: "OrderedDict[str, bool]" = OrderedDict()
+
+# 闸门是**配额**，不是布尔开关：这个 turn 上允许落地的创建次数，等于被真正
+# 接管的动作次数。
+#
+# 为什么不能用布尔。双击或传输重发会让两个并发请求复用同一个 turn_id：先到的
+# 原子消费掉 proposal 拿到 accepted，后到的因为 proposal 已被消费而判无效。
+#   - 只按 turn_id 记「拒绝」→ 后到那个的拒绝会把先到那个真实的创建也挡掉，
+#     客户端收到 accepted 而资源没建出来；
+#   - 反过来让「接管」全局压过「拒绝」→ 后到那个重放请求的创建也被放行，
+#     重复创建又回来了。
+# 两者都是拿一个 turn 级的开关去表达一个请求级的事实。配额能同时挡住两边：
+# 一次 accepted 只买一张票，谁先用掉都行，但总共只有一张。
+#
+# 键存在 = 这个 turn 上出现过推荐动作、进入配额管控；键不存在 = 普通轮次，
+# 用户直接说「帮我建个 skill」不受影响。
+_creation_turn_quota: "OrderedDict[str, int]" = OrderedDict()
 
 
-def _mark_creation_turn_accepted(turn_id: str) -> None:
+def _trim_creation_turn_quota_locked() -> None:
+    while len(_creation_turn_quota) > MAX_DENIED_CREATION_TURNS:
+        _creation_turn_quota.popitem(last=False)
+
+
+def _enter_creation_quota_for_turn(turn_id: str) -> None:
+    """这一轮出现了推荐动作：从此刻起创建工具受配额管控。"""
     key = _pending_turn_key(turn_id)
     if not key:
         return
     with _state_lock:
-        _accepted_creation_turns[key] = True
-        _accepted_creation_turns.move_to_end(key)
-        while len(_accepted_creation_turns) > MAX_DENIED_CREATION_TURNS:
-            _accepted_creation_turns.popitem(last=False)
-        # 接管可能比拒绝后到（两个并发请求的顺序不受控），此时要把已经落下的
-        # 闸门撤掉，而不是让它挡住这次真实的创建。
-        _denied_creation_turns.pop(key, None)
+        _creation_turn_quota.setdefault(key, 0)
+        _creation_turn_quota.move_to_end(key)
+        _trim_creation_turn_quota_locked()
 
 
-def _deny_creation_tools_for_turn(turn_id: str) -> None:
+def _grant_creation_for_turn(turn_id: str) -> None:
+    """一次动作被真正接管，发一张创建票。"""
     key = _pending_turn_key(turn_id)
     if not key:
         return
     with _state_lock:
-        if key in _accepted_creation_turns:
-            return
-        _denied_creation_turns[key] = True
-        _denied_creation_turns.move_to_end(key)
-        while len(_denied_creation_turns) > MAX_DENIED_CREATION_TURNS:
-            _denied_creation_turns.popitem(last=False)
+        _creation_turn_quota[key] = _creation_turn_quota.get(key, 0) + 1
+        _creation_turn_quota.move_to_end(key)
+        _trim_creation_turn_quota_locked()
 
 
 def _release_creation_deny(turn_id: str) -> None:
@@ -725,16 +735,25 @@ def _release_creation_deny(turn_id: str) -> None:
     if not key:
         return
     with _state_lock:
-        _denied_creation_turns.pop(key, None)
-        _accepted_creation_turns.pop(key, None)
+        _creation_turn_quota.pop(key, None)
 
 
-def _creation_tools_denied(turn_id: str) -> bool:
+def _consume_creation_quota(turn_id: str) -> bool:
+    """这次创建能不能放行。有票就消耗一张放行，没票就挡。
+
+    不受管控的普通轮次（键不存在）永远放行——这道闸门只针对推荐动作那条路径。
+    """
     key = _pending_turn_key(turn_id)
     if not key:
-        return False
+        return True
     with _state_lock:
-        return key in _denied_creation_turns
+        remaining = _creation_turn_quota.get(key)
+        if remaining is None:
+            return True
+        if remaining <= 0:
+            return False
+        _creation_turn_quota[key] = remaining - 1
+        return True
 
 
 def _on_pre_tool_call(
@@ -744,7 +763,7 @@ def _on_pre_tool_call(
     **_: Any,
 ) -> dict[str, str] | None:
     denied_actions = DENIED_CREATION_TOOL_ACTIONS.get(tool_name)
-    if not denied_actions or not _creation_tools_denied(turn_id):
+    if not denied_actions:
         return None
     if isinstance(args, str):
         try:
@@ -758,6 +777,10 @@ def _on_pre_tool_call(
         action = str(args.get("action") or "").strip().lower()
         if action and action not in denied_actions:
             return None
+    # 配额在这里消耗：判定「是不是一次创建」之后、放行之前。放在更早会让
+    # list / patch 这类调用白白吃掉一张票。
+    if _consume_creation_quota(turn_id):
+        return None
     return {
         "action": "block",
         "message": (
@@ -1974,16 +1997,17 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                 and current_proposal.get("action_receipts") is True
             )
         if receipt_required and not receipt_transport:
-            _deny_creation_tools_for_turn(outer_turn_id)
+            _enter_creation_quota_for_turn(outer_turn_id)
             return _join_context(
                 "[Creation governor internal action: Ignore this invalid or expired "
                 "recommendation action. Do not create anything from it and do not expose this block.]"
             )
+        # 从这里起这一轮进入配额管控：出现过推荐动作，创建工具就不能再无条件
+        # 放行。接管成功会往下发一张票，被拒则一张都没有。
+        _enter_creation_quota_for_turn(outer_turn_id)
         outcome = _handle_previous_proposal_action(session_id, user_message, now)
         if outcome.receipt is not None and outcome.receipt.status == "accepted":
-            # 这一轮真的接管了动作。记下来，好让同 turn_id 的并发请求（双击 /
-            # 传输重发）落下的拒绝闸门不会把这次真实的创建挡掉。
-            _mark_creation_turn_accepted(outer_turn_id)
+            _grant_creation_for_turn(outer_turn_id)
         if outcome.receipt is not None and receipt_transport:
             with _state_lock:
                 state = _state_locked(session_id, now)
@@ -1992,8 +2016,6 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
                     outer_turn_id,
                     outcome.receipt,
                 )
-        if not outcome.context:
-            _deny_creation_tools_for_turn(outer_turn_id)
         return _join_context(
             outcome.context
             or "[Creation governor internal action: Ignore this invalid or expired "
