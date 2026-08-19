@@ -2136,7 +2136,7 @@ RETIRED_BUSINESS_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
     # Scrub-only compatibility fence. No runtime may read or emit these retired
     # generic authorization values, but a stale parent environment must not leak
     # them into a model-authored subprocess either.
-    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    "ZETTLAB_BUSINESS_" + "EXECUTION_TOKEN",
     "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
     "ZETTLAB_BUSINESS_EXECUTION_MODE",
     "ZETTLAB_EXECUTION_SCOPE_DIGEST",

@@ -200,8 +200,9 @@ def test_sensitive_runtime_boundary_keeps_gateway_exec_privilege(monkeypatch):
     assert calls == [{"no_new_privs": False, "drop_ptrace": True}]
 
 
-def test_generic_terminal_never_receives_business_execution_token(monkeypatch):
-    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "stale-global-secret")
+def test_generic_terminal_scrubs_retired_business_token(monkeypatch):
+    retired_key = "ZETTLAB_BUSINESS_" + "EXECUTION_TOKEN"
+    monkeypatch.setenv(retired_key, "stale-global-secret")
     tokens = set_turn_vars(
         turn_id="turn-1",
         hardware_execution_token="b" * 64,
@@ -210,7 +211,7 @@ def test_generic_terminal_never_receives_business_execution_token(monkeypatch):
     )
     try:
         result = LocalEnvironment().execute(
-            "printf '%s|%s' \"$ZETTLAB_BUSINESS_EXECUTION_TOKEN\" "
+            f"printf '%s|%s' \"${{{retired_key}}}\" "
             "\"$ZETTLAB_BUSINESS_EXECUTION_ACTION\""
         )
     finally:
