@@ -2275,13 +2275,19 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     return env
 
 
-def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[str, str]:
+def build_agent_creator_runtime_env(
+    *,
+    app_auto_refresh: bool = False,
+    app_auto_refresh_operation: object | None = None,
+) -> dict[str, str]:
     """Build the minimal env for the trusted agent-creator preset runner.
 
     The action token is never read from process env or a profile ``.env``.
     After command validation and mutation approval, the trusted gateway process
     obtains a short-lived AgentComputer-only token from local-server's Unix
-    broker. The direct runner then gives it to the CLI over a one-shot FD.
+    broker. For an app-agent request it forwards the already parsed operation
+    object; local-server alone derives the binding and issues the capability. The direct
+    runner then gives the resulting token to the CLI over a one-shot FD.
     """
 
     from agent.credential_broker import (
@@ -2299,12 +2305,34 @@ def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[s
     ).strip()
     if not agent_id:
         raise RuntimeError("agent creator profile identity unavailable")
-    request_token = (
-        request_app_auto_refresh_token
-        if app_auto_refresh
-        else request_agentcomputer_token
-    )
-    token = request_token(agent_id)
+    if app_auto_refresh:
+        if app_auto_refresh_operation is None:
+            raise RuntimeError("agent creator operation binding unavailable")
+        try:
+            from gateway.session_context import (
+                get_session_env,
+                zettlab_auth_principal,
+                zettlab_turn_id,
+            )
+
+            turn_id = str(zettlab_turn_id() or "").strip()
+            session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+            owner_principal = str(zettlab_auth_principal() or "").strip()
+        except Exception as exc:
+            raise RuntimeError("agent creator operation context unavailable") from exc
+        if not turn_id or not session_id or not owner_principal:
+            raise RuntimeError("agent creator operation context unavailable")
+        token = request_app_auto_refresh_token(
+            agent_id,
+            operation_kind="app_dedicated_create_v1",
+            operation=app_auto_refresh_operation,
+            owner_principal=owner_principal,
+            owner_agent_id=agent_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+    else:
+        token = request_agentcomputer_token(agent_id)
     if (
         "\x00" in token
         or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
@@ -2312,12 +2340,13 @@ def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[s
         raise RuntimeError("agent creator action token invalid")
 
     env = {"ZETTLAB_AGENT_ACTION_TOKEN": token}
-    try:
-        from gateway.session_context import zettlab_turn_id
+    if not app_auto_refresh:
+        try:
+            from gateway.session_context import zettlab_turn_id
 
-        turn_id = zettlab_turn_id()
-    except Exception:
-        turn_id = ""
+            turn_id = zettlab_turn_id()
+        except Exception:
+            turn_id = ""
     if turn_id:
         turn_id = str(turn_id)
         if (
