@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 import queue
 import re
@@ -1615,3 +1616,131 @@ def test_short_plain_session_key_keeps_its_original_scope():
     assert plugin._raw_session_key({"conversation_session_id": "conv-1"}) == "conv-1"
     assert plugin._raw_session_key({"session_id": "sess-2"}) == "sess-2"
     assert plugin._raw_session_key({}) == ""
+
+
+# delegate_task 的后台子任务经 tools/thread_context.py 的 propagate_context_to_thread
+# 起线程，那个 helper 用 contextvars.copy_context().run(...)，于是子任务继承父请求的
+# **整份** ContextVars，并且在父请求还没收尾时用另一个 turn_id 进 pre_llm_call。
+# 子任务不能因此把父请求的配额条目撤掉——撤掉之后父请求再调 skill_manage(create)
+# 会因为「不受管控」被当普通轮次连续放行，重复资源就建出来了。
+def test_delegated_subtask_does_not_release_the_parent_request_quota(two_requests):
+    parent, _second = two_requests
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "delegation-scope", creation_type="skill")
+
+    def _parent_turn_with_delegation():
+        plugin._on_pre_llm_call(
+            session_id="delegation-scope",
+            sender_id="owner-a",
+            turn_id="parent-turn",
+            user_message=_action(payload),
+            conversation_history=[],
+            creation_action_receipt_transport=RECEIPT_TRANSPORT,
+        )
+        # 子任务：继承父 context，换个 turn_id 起自己的一轮。
+        contextvars.copy_context().run(
+            plugin._on_pre_llm_call,
+            session_id="delegation-scope",
+            sender_id="owner-a",
+            turn_id="child-turn",
+            user_message="继续把这份数据整理一下",
+            conversation_history=[],
+            creation_action_receipt_transport=RECEIPT_TRANSPORT,
+        )
+        # 父请求现在才落地创建：它买的那张票必须还在。
+        first_create = plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="parent-turn",
+        )
+        # 票只有一张，第二次必须被挡——闸门被子任务撤掉的话这里会照样放行。
+        second_create = plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="parent-turn",
+        )
+        return first_create, second_create
+
+    first_create, second_create = parent.run(_parent_turn_with_delegation)
+    assert first_create is None, "子任务把父请求买的票弄丢了"
+    assert second_create is not None and second_create["action"] == "block", (
+        "子任务撤掉了父请求的闸门，创建变成不受管控"
+    )
+
+
+# canonical-final-v1 允许 turn_id 长到 200 字符（api_server 的
+# MAX_CANONICAL_FINAL_TURN_ID_LEN）。请求身份不能按 160 截断——截断之后两个并发
+# 请求会重新落回同一个共享键，被拒的那个又能花掉已接管请求的票。
+def test_request_identity_survives_a_turn_id_longer_than_the_scope_text_limit(
+    two_requests,
+):
+    first, second = two_requests
+    plugin = _load_plugin()
+    long_turn_id = "t" * 180
+    payload = _show_card(plugin, "long-turn-id", creation_type="skill")
+
+    _accept_action(first, plugin, "long-turn-id", payload, long_turn_id)
+    replay = _accept_action(second, plugin, "long-turn-id", payload, long_turn_id)
+    assert "invalid or expired" in replay["context"]
+
+    blocked = second.run(
+        plugin._on_pre_tool_call,
+        tool_name="skill_manage",
+        args={"action": "create"},
+        turn_id=long_turn_id,
+    )
+    assert blocked is not None and blocked["action"] == "block", (
+        "长 turn_id 被截断，两个请求又共用了同一份配额"
+    )
+    assert (
+        first.run(
+            plugin._on_pre_tool_call,
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id=long_turn_id,
+        )
+        is None
+    )
+
+
+# 释放闸门和领取回执必须在同一把锁里。分两次拿锁的话，同 turn 的两个请求可能都先
+# 释放完、再都判定「没有别的在途请求了」，于是都去 pop：先到的拿到回执，后到的拿到
+# None，那个响应就不含 receipt。
+#
+# 这条按「锁获取次数」断言：并发交错本身没法在单次运行里稳定复现，而「一次拿锁内
+# 完成」正是排除那个时序窗口的充要条件。
+def test_release_and_receipt_claim_happen_in_a_single_lock_acquisition(monkeypatch):
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "atomic-claim", creation_type="skill")
+    plugin._on_pre_llm_call(
+        session_id="atomic-claim",
+        sender_id="owner-a",
+        turn_id="claim-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+    real_lock = plugin._state_lock
+    acquisitions = {"count": 0}
+
+    class _CountingLock:
+        def __enter__(self):
+            acquisitions["count"] += 1
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
+
+    monkeypatch.setattr(plugin, "_state_lock", _CountingLock())
+    receipt = plugin._release_and_claim_action_result(
+        plugin._session_key({"session_id": "atomic-claim", "sender_id": "owner-a"}),
+        plugin._pending_turn_key("claim-turn"),
+        plugin._quota_key(plugin._pending_turn_key("claim-turn")),
+        0.0,
+    )
+
+    assert receipt is not None and receipt.status == "accepted"
+    assert acquisitions["count"] == 1, (
+        "释放闸门和领取回执分成了两次拿锁，中间留出了并发窗口"
+    )
