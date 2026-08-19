@@ -2492,6 +2492,7 @@ from gateway.platforms.base import (
     FeishuQuoteLease,
     MessageEvent,
     MessageType,
+    PENDING_EVENT_QUEUE_MAX,
     _prefix_within_utf16_limit,
     _consume_feishu_quote,
     _flat_feishu_metadata,
@@ -2499,6 +2500,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    pending_message_event_depth,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -8597,8 +8599,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
         depth = len(_q_state.conversation.queued_events) if _q_state else 0
-        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
-            depth += 1
+        if adapter is not None:
+            pending = getattr(adapter, "_pending_messages", {}).get(session_key)
+            depth += pending_message_event_depth(pending)
         return depth
 
     @staticmethod
@@ -9521,7 +9524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # could grow the overflow list unboundedly.  32 turns of queued
     # follow-ups is far beyond any realistic conversational backlog while
     # still small enough to never threaten memory.
-    _BUSY_QUEUE_MAX_PENDING = 32
+    _BUSY_QUEUE_MAX_PENDING = PENDING_EVENT_QUEUE_MAX
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)

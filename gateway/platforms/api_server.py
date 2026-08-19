@@ -1861,8 +1861,11 @@ class ResponseStore:
         if self._json_upper_bound(data, stop_after=self._max_bytes) > self._max_bytes:
             logger.warning("Response %s exceeds response-store byte cap", response_id)
             return False
-        payload = json.dumps(data, default=str)
-        if len(payload.encode("utf-8")) > self._max_bytes:
+        # ensure_ascii=True guarantees one UTF-8 byte per output character, so
+        # measuring the string is exact and does not allocate a second
+        # response-sized bytes object.
+        payload = json.dumps(data, default=str, ensure_ascii=True)
+        if len(payload) > self._max_bytes:
             logger.warning("Response %s exceeds response-store byte cap", response_id)
             return False
         self._conn.execute(

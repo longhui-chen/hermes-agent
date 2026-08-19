@@ -320,6 +320,16 @@ def _make_adapter():
     return adapter
 
 
+@pytest.mark.parametrize("configured", ["0", "-1"])
+def test_matrix_nonpositive_media_limit_uses_bounded_default(monkeypatch, configured):
+    """非正配置不能把 Matrix 入站媒体的累计字节门关掉。"""
+    monkeypatch.setenv("MATRIX_MAX_MEDIA_BYTES", configured)
+    adapter = _make_adapter()
+
+    assert adapter._max_media_bytes == 100 * 1024 * 1024
+    assert adapter._max_media_bytes > 0
+
+
 # ---------------------------------------------------------------------------
 # Typing indicator
 # ---------------------------------------------------------------------------

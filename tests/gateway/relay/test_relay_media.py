@@ -186,6 +186,19 @@ def test_rehost_auth_is_scoped_to_the_configured_origin():
     assert not c.is_relay_media_url("https://conn.example.evil/relay/media/steal")
 
 
+def test_rehost_auth_preserves_the_configured_connector_base_path():
+    base_url = media_base_url("wss://conn.example/hermes/relay")
+    assert base_url == "https://conn.example/hermes", (
+        "夹具必须真实经过带前缀的 relay dial URL 解析链"
+    )
+    c = RelayMediaClient(base_url, "gw1", "sec")
+    generated_shape = "https://conn.example/hermes/relay/media/ok"
+
+    assert generated_shape == f"{c._base_url}/relay/media/ok"
+    assert c.is_relay_media_url(generated_shape)
+    assert not c.is_relay_media_url("https://conn.example/relay/media/wrong-root")
+
+
 @pytest.mark.asyncio
 async def test_oversize_upload_is_rejected_before_full_file_read(tmp_path, monkeypatch):
     from gateway.relay import media as relay_media

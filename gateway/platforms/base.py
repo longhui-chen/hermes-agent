@@ -46,6 +46,8 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# 与 GatewayRunner 的 busy queue 共用同一硬上限；head event 也计一格。
+PENDING_EVENT_QUEUE_MAX = 32
 # 🔴 **引用租约的等待必须有独立硬期限。**
 # interim 发送在 ``gateway/run.py`` 里已被 ``_INTERIM_SEND_TIMEOUT`` 兜住,
 # 但那只放开了 **agent worker** —— 租约的释放走 ``consume()``,而 ``consume()``
@@ -2782,7 +2784,7 @@ def merge_pending_message_event(
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> bool:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -2814,9 +2816,15 @@ def merge_pending_message_event(
             # 共享群 session 不能把 B 的内容并进 A 的 MessageEvent；挂到
             # A 的 FIFO 尾部，drain 后逐条按各自 source 重新走共享鉴权。
             queue = list(getattr(existing, "_gateway_pending_event_queue", []))
+            if pending_message_event_depth(existing) >= PENDING_EVENT_QUEUE_MAX:
+                logger.warning(
+                    "Dropping cross-sender follow-up — pending queue at cap (%d).",
+                    PENDING_EVENT_QUEUE_MAX,
+                )
+                return False
             queue.append(event)
             setattr(existing, "_gateway_pending_event_queue", queue)
-            return
+            return True
 
         def _aligned_media_types(item: MessageEvent) -> List[str]:
             urls = list(item.media_urls or [])
@@ -2835,7 +2843,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if existing_has_media or incoming_has_media:
             if incoming_has_media:
@@ -2855,7 +2863,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if (
             merge_text
@@ -2864,7 +2872,7 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            return
+            return True
 
         queued_after_existing = list(
             getattr(existing, "_gateway_pending_event_queue", [])
@@ -2872,9 +2880,28 @@ def merge_pending_message_event(
         if queued_after_existing:
             setattr(event, "_gateway_pending_event_queue", queued_after_existing)
         pending_messages[session_key] = event
-        return
+        return True
 
     pending_messages[session_key] = event
+    return True
+
+
+def pending_message_event_depth(event: Optional[MessageEvent]) -> int:
+    """Return bounded depth for a head event, including legacy nested tails."""
+    if event is None:
+        return 0
+    depth = 0
+    stack = [event]
+    seen = set()
+    while stack and depth < PENDING_EVENT_QUEUE_MAX:
+        item = stack.pop()
+        marker = id(item)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        depth += 1
+        stack.extend(getattr(item, "_gateway_pending_event_queue", []))
+    return depth
 
 
 def pop_pending_message_event(
@@ -4689,8 +4716,8 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> bool:
-        return await self._send_multiple_images_with_result(
+    ) -> None:
+        await self._send_multiple_images_with_result(
             chat_id=chat_id,
             images=images,
             metadata=metadata,
@@ -5006,15 +5033,20 @@ class BasePlatformAdapter(ABC):
         example Discord accepted the message but attached nothing), the user
         must see a failure notice instead of a silent drop (#66797).
         """
-        ext = Path(media_path).suffix.lower()
+        parsed_path = urlsplit(media_path).path if "://" in media_path else media_path
+        ext = Path(parsed_path).suffix.lower()
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         if is_voice or should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
             text = "⚠️ Couldn't deliver the audio attachment."
         elif ext in _VIDEO_EXTS:
             text = "⚠️ Couldn't deliver the video attachment."
         else:
-            file_name = os.path.basename(media_path)
-            text = f"⚠️ Couldn't deliver the file attachment ({file_name})."
+            file_name = os.path.basename(parsed_path)
+            text = (
+                f"⚠️ Couldn't deliver the file attachment ({file_name})."
+                if file_name
+                else "⚠️ Couldn't deliver the file attachment."
+            )
         try:
             notice = await self.send(chat_id=chat_id, content=text, metadata=metadata)
             if not notice.success:
@@ -6932,6 +6964,22 @@ class BasePlatformAdapter(ABC):
                     if _feishu_media_quote_available and sent_any is True:
                         _feishu_media_quote_available = False
 
+                async def _send_image_batch(batch, metadata):
+                    sender = self.send_multiple_images
+                    if getattr(sender, "__func__", None) is BasePlatformAdapter.send_multiple_images:
+                        return await self._send_multiple_images_with_result(
+                            chat_id=event.source.chat_id,
+                            images=batch,
+                            metadata=metadata,
+                            human_delay=human_delay,
+                        )
+                    return await sender(
+                        chat_id=event.source.chat_id,
+                        images=batch,
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    )
+
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
@@ -6940,17 +6988,12 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     _image_metadata = await _next_media_metadata()
                     try:
-                        image_sent = await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=images,
-                            metadata=_image_metadata,
-                            human_delay=human_delay,
-                        )
+                        image_sent = await _send_image_batch(images, _image_metadata)
                         _consume_feishu_batch_quote(_image_metadata, image_sent)
                         if image_sent is False:
                             await self._notify_media_delivery_failure(
                                 event.source.chat_id,
-                                _image_paths[0],
+                                images[0][0],
                                 metadata=_final_thread_metadata,
                             )
                     except asyncio.CancelledError:
@@ -6959,6 +7002,11 @@ class BasePlatformAdapter(ABC):
                     except Exception as batch_err:
                         _consume_feishu_batch_quote(_image_metadata, False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            images[0][0],
+                            metadata=_final_thread_metadata,
+                        )
 
 
                 # Send extracted media files — route by file type
@@ -6994,19 +7042,25 @@ class BasePlatformAdapter(ABC):
                     _image_metadata = await _next_media_metadata()
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        image_sent = await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=_batch,
-                            metadata=_image_metadata,
-                            human_delay=human_delay,
-                        )
+                        image_sent = await _send_image_batch(_batch, _image_metadata)
                         _consume_feishu_batch_quote(_image_metadata, image_sent)
+                        if image_sent is False:
+                            await self._notify_media_delivery_failure(
+                                event.source.chat_id,
+                                _image_paths[0],
+                                metadata=_final_thread_metadata,
+                            )
                     except asyncio.CancelledError:
                         _consume_feishu_batch_quote(_image_metadata, False)
                         raise
                     except Exception as batch_err:
                         _consume_feishu_batch_quote(_image_metadata, False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            _image_paths[0],
+                            metadata=_final_thread_metadata,
+                        )
 
                 if _non_image_media:
                     logger.info(
@@ -7064,6 +7118,12 @@ class BasePlatformAdapter(ABC):
                     except Exception as media_err:
                         _consume_feishu_media_quote(_media_metadata, False)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            media_path,
+                            is_voice=is_voice,
+                            metadata=_final_thread_metadata,
+                        )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -7107,6 +7167,11 @@ class BasePlatformAdapter(ABC):
                     except Exception as file_err:
                         _consume_feishu_media_quote(_file_metadata, False)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            file_path,
+                            metadata=_final_thread_metadata,
+                        )
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.

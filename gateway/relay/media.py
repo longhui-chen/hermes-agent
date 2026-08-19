@@ -80,6 +80,8 @@ class RelayMediaClient:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._base_origin = self._origin(self._base_url)
+        base_path = urllib.parse.urlsplit(self._base_url).path.rstrip("/")
+        self._media_path_prefix = f"{base_path}/relay/media/"
         self._gateway_id = gateway_id or ""
         self._secret = secret or ""
 
@@ -112,7 +114,7 @@ class RelayMediaClient:
         return (
             self._base_origin is not None
             and self._origin(url) == self._base_origin
-            and parsed.path.startswith("/relay/media/")
+            and parsed.path.startswith(self._media_path_prefix)
         )
 
     async def upload(

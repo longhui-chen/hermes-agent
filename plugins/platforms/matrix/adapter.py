@@ -163,6 +163,8 @@ _MATRIX_MEDIA_KIND = {
     MessageType.DOCUMENT: "file",
 }
 
+DEFAULT_MATRIX_MAX_MEDIA_BYTES = 100 * 1024 * 1024
+
 _MATRIX_VOICE_WAVEFORM_BINS = 30
 
 
@@ -1228,9 +1230,18 @@ class MatrixAdapter(BasePlatformAdapter):
                 "Matrix: proxy configured — %s", safe_url_for_log(self._proxy_url)
             )
         try:
-            self._max_media_bytes = int(os.getenv("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
+            configured_media_limit = int(
+                os.getenv("MATRIX_MAX_MEDIA_BYTES", str(DEFAULT_MATRIX_MAX_MEDIA_BYTES))
+            )
         except ValueError:
-            self._max_media_bytes = 100 * 1024 * 1024
+            configured_media_limit = DEFAULT_MATRIX_MAX_MEDIA_BYTES
+        # 共享流 reader 把非正数解释为“不限”，不能让一个环境变量关闭
+        # Matrix 入站媒体的累计字节门。
+        self._max_media_bytes = (
+            configured_media_limit
+            if configured_media_limit > 0
+            else DEFAULT_MATRIX_MAX_MEDIA_BYTES
+        )
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # Matrix clients split long messages around 4000 chars.

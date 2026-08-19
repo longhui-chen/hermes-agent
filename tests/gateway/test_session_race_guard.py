@@ -235,6 +235,10 @@ def test_cross_sender_fifo_and_queue_overflow_do_not_overwrite_each_other():
     merge_pending_message_event(adapter._pending_messages, session_key, b)
     runner._session_state(session_key).conversation.queued_events.append(c)
 
+    assert runner._queue_depth(session_key, adapter=adapter) == 3, (
+        "busy queue 深度必须同时统计 head、跨 sender tail 与 overflow"
+    )
+
     first = pop_pending_message_event(adapter._pending_messages, session_key)
     first = runner._promote_queued_event(session_key, adapter, first)
     second = pop_pending_message_event(adapter._pending_messages, session_key)
@@ -245,6 +249,42 @@ def test_cross_sender_fifo_and_queue_overflow_do_not_overwrite_each_other():
     )
 
     assert [first.text, second.text, third.text] == ["A", "C", "B"]
+
+
+def test_cross_sender_fifo_is_bounded_and_counted_by_busy_queue():
+    runner = _make_runner()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "telegram:shared-group"
+    cap = GatewayRunner._BUSY_QUEUE_MAX_PENDING
+
+    for index in range(cap + 5):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="shared-group",
+            chat_type="group",
+            user_id=f"sender-{index}",
+        )
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            MessageEvent(
+                text=f"message-{index}",
+                message_type=MessageType.TEXT,
+                source=source,
+            ),
+        )
+
+    head = adapter._pending_messages[session_key]
+    assert len(getattr(head, "_gateway_pending_event_queue", [])) > 0, (
+        "夹具必须真实进入跨 sender FIFO，不能只测普通 pending slot"
+    )
+    assert runner._queue_depth(session_key, adapter=adapter) == cap
+
+    drained = []
+    while session_key in adapter._pending_messages:
+        drained.append(pop_pending_message_event(adapter._pending_messages, session_key).text)
+    assert len(drained) == cap
+    assert drained[-1] == f"message-{cap - 1}"
 
 
 def test_same_sender_head_replacement_preserves_cross_sender_tail():

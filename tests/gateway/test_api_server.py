@@ -381,6 +381,26 @@ class TestResponseStore:
         assert store.put("emoji", {"output": "😀" * 10}) is False
         assert store.get("emoji") is None
 
+    def test_put_does_not_copy_serialized_payload_just_to_measure_bytes(self, monkeypatch):
+        import gateway.platforms.api_server as api_server
+
+        real_dumps = api_server.json.dumps
+
+        class PayloadWithoutEncode(str):
+            def encode(self, *_args, **_kwargs):
+                raise AssertionError("长度检查不得复制整份序列化响应")
+
+        def dumps_without_encode(*args, **kwargs):
+            payload = PayloadWithoutEncode(real_dumps(*args, **kwargs))
+            assert payload and payload.isascii(), "夹具必须进入 JSON ASCII 字节等长路径"
+            return payload
+
+        monkeypatch.setattr(api_server.json, "dumps", dumps_without_encode)
+        store = ResponseStore(max_size=10, max_bytes=1_000)
+
+        assert store.put("resp_no_copy", {"output": "hello"}) is True
+        assert store.get("resp_no_copy") == {"output": "hello"}
+
 
     def test_delete_clears_conversation_mapping(self):
         """Deleting a response also removes conversation mappings that reference it."""
