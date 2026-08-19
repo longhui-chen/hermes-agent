@@ -386,8 +386,30 @@ def _video_edit_skill_load_required(agent: Any) -> bool:
     task = getattr(agent, "_zet_agent_skill_direct_task", None)
     return bool(
         getattr(task, "video_edit_applicable", False)
+        and _video_edit_action_bound(agent)
         and not trusted_skill_scope_active(agent)
     )
+
+
+def _video_edit_action_bound(_agent: Any) -> bool:
+    """Return whether transport bound a local-server-issued ActionV1.
+
+    This is only a provider-routing signal. Hermes does not validate, mint, or
+    upgrade the capability; local-server remains the sole admission authority.
+    """
+    try:
+        from gateway.session_context import (
+            business_execution_action,
+            business_execution_action_version,
+        )
+
+        return bool(
+            business_execution_action()
+            and business_execution_action_version() == "1"
+        )
+    except Exception:
+        logger.debug("ActionV1 transport binding lookup failed", exc_info=True)
+        return False
 
 
 def _video_edit_skill_load_error(agent: Any) -> Optional[str]:

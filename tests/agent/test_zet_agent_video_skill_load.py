@@ -10,6 +10,8 @@ from agent.conversation_loop import (
     _apply_zet_agent_plan_tool_visibility,
     _enforce_single_plan_interaction_tool_call,
     _seal_video_edit_provider_request,
+    _video_edit_action_bound,
+    _video_edit_skill_load_required,
     _valid_tool_names_for_response,
 )
 from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
@@ -145,12 +147,31 @@ def _runtime_agent(
     return agent
 
 
+def test_video_edit_action_binding_comes_only_from_turn_transport():
+    agent = _agent(_zet_agent_video_action_bound=True)
+    assert not _video_edit_action_bound(agent)
+
+    tokens = set_turn_vars(
+        turn_id="bound-video-action",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
+    try:
+        assert _video_edit_action_bound(agent)
+    finally:
+        clear_turn_vars(tokens)
+
+
 def test_video_edit_first_request_forces_exact_skill_view_without_mutating_registry(
     monkeypatch,
 ):
     monkeypatch.setattr(
         "agent.conversation_loop.trusted_skill_scope_active",
         lambda _agent: False,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._video_edit_action_bound",
+        lambda _agent: True,
     )
     skill_tool = _tool("skill_view")
     original_skill_parameters = skill_tool["function"]["parameters"].copy()
@@ -199,6 +220,10 @@ def test_video_edit_skill_force_recovers_skill_view_from_policy_snapshot(
         "agent.conversation_loop.trusted_skill_scope_active",
         lambda _agent: False,
     )
+    monkeypatch.setattr(
+        "agent.conversation_loop._video_edit_action_bound",
+        lambda _agent: True,
+    )
     policy_skill_tool = _tool("skill_view")
     agent = _agent(
         # The active scope narrowed the live set to execution tools before it
@@ -239,6 +264,10 @@ def test_video_edit_skill_force_does_not_restore_unauthorized_policy_tool(
         "agent.conversation_loop.trusted_skill_scope_active",
         lambda _agent: False,
     )
+    monkeypatch.setattr(
+        "agent.conversation_loop._video_edit_action_bound",
+        lambda _agent: True,
+    )
     agent = _agent(
         tools=[_tool("terminal")],
         valid_tool_names={"terminal"},
@@ -267,6 +296,106 @@ def test_video_edit_skill_force_stops_after_trusted_scope_activates(monkeypatch)
     assert "tool_choice" not in api_kwargs
 
 
+def test_unbound_video_intent_does_not_force_or_rewrite_provider_request(
+    monkeypatch,
+):
+    """An unbound task stays on the ordinary model/tool path."""
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: False,
+    )
+    agent = _agent(
+        valid_tool_names={"skill_view", "terminal", "search_files", "clarify"},
+    )
+    api_kwargs = {
+        "messages": [
+            {"role": "system", "content": "base"},
+            {"role": "user", "content": "继续处理这个任务"},
+        ],
+        "tools": [
+            _tool("skill_view"),
+            _tool("terminal"),
+            _tool("search_files"),
+            _tool("clarify"),
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "terminal"}},
+        "toolConfig": {
+            "tools": [_tool("terminal"), _tool("search_files")],
+            "toolChoice": {"tool": {"name": "terminal"}},
+        },
+    }
+
+    assert not _video_edit_skill_load_required(agent)
+    assert not _seal_video_edit_provider_request(agent, api_kwargs)
+    assert [tool["function"]["name"] for tool in api_kwargs["tools"]] == [
+        "skill_view",
+        "terminal",
+        "search_files",
+        "clarify",
+    ]
+    assert [
+        tool["function"]["name"] for tool in api_kwargs["toolConfig"]["tools"]
+    ] == ["terminal", "search_files"]
+    assert api_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "terminal"},
+    }
+    assert api_kwargs["toolConfig"]["toolChoice"] == {
+        "tool": {"name": "terminal"}
+    }
+    assert _valid_tool_names_for_response(agent) == {
+        "skill_view",
+        "terminal",
+        "search_files",
+        "clarify",
+    }
+    assert api_kwargs["messages"] == [
+        {"role": "system", "content": "base"},
+        {"role": "user", "content": "继续处理这个任务"},
+    ]
+
+
+def test_provider_boundary_keeps_unbound_video_request_generic(monkeypatch):
+    """The final provider payload preserves ordinary model latitude."""
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: False,
+    )
+    agent = _agent(
+        valid_tool_names={"skill_view", "terminal", "search_files", "clarify"},
+    )
+    request = {
+        "messages": [{"role": "user", "content": "继续处理这个任务"}],
+        "tools": [
+            _tool("skill_view"),
+            _tool("terminal"),
+            _tool("search_files"),
+            _tool("clarify"),
+        ],
+        "tool_choice": "required",
+    }
+    client = MagicMock()
+    client.chat.completions.create.return_value = _text_response("我会继续处理。")
+
+    _dispatch_nonstreaming_api_request(
+        agent,
+        request,
+        make_client=lambda *_args, **_kwargs: client,
+    )
+
+    sent = client.chat.completions.create.call_args.kwargs
+    assert [tool["function"]["name"] for tool in sent["tools"]] == [
+        "skill_view",
+        "terminal",
+        "search_files",
+        "clarify",
+    ]
+    assert sent["tool_choice"] == "required"
+    assert sent["messages"] == [
+        {"role": "user", "content": "继续处理这个任务"}
+    ]
+
+
 def test_provider_boundary_reseals_bootstrap_after_middleware_replacement(
     monkeypatch,
 ):
@@ -274,6 +403,10 @@ def test_provider_boundary_reseals_bootstrap_after_middleware_replacement(
     monkeypatch.setattr(
         "agent.conversation_loop.trusted_skill_scope_active",
         lambda _agent: False,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._video_edit_action_bound",
+        lambda _agent: True,
     )
     skill_tool = _tool("skill_view")
     agent = _agent(
@@ -397,6 +530,10 @@ def test_video_edit_skill_force_drops_wrong_or_parallel_calls_before_execution(
         "agent.conversation_loop.trusted_skill_scope_active",
         lambda _agent: False,
     )
+    monkeypatch.setattr(
+        "agent.conversation_loop._video_edit_action_bound",
+        lambda _agent: True,
+    )
     wrong = SimpleNamespace(
         content="先问一下",
         tool_calls=[_tool_call("todo", '{"content":"unsafe"}')],
@@ -425,14 +562,38 @@ def test_video_edit_skill_force_drops_wrong_or_parallel_calls_before_execution(
     assert parallel.tool_calls == [exact]
 
 
-def test_video_edit_skill_load_reports_missing_tool_without_calling_provider():
+def test_unbound_video_edit_without_discovery_tool_accepts_ordinary_response():
     agent = _runtime_agent(("clarify", "todo"))
+    response = _text_response("我会继续处理当前任务。")
 
     with (
-        patch.object(agent, "_interruptible_api_call") as api_call,
+        patch.object(agent, "_interruptible_api_call", return_value=response) as api_call,
         patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
     ):
         result = agent.run_conversation("剪辑\n[file: /data/input.mp4]")
+
+    api_call.assert_called_once()
+    assert result["completed"] is True
+    assert result["final_response"] == "我会继续处理当前任务。"
+
+
+def test_bound_video_edit_reports_missing_skill_view_without_calling_provider():
+    agent = _runtime_agent(("clarify", "todo"))
+    tokens = set_turn_vars(
+        turn_id="bound-video-missing-skill",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
+    try:
+        with (
+            patch.object(agent, "_interruptible_api_call") as api_call,
+            patch.object(agent, "_persist_session"),
+        ):
+            result = agent.run_conversation("剪辑\n[file: /data/input.mp4]")
+    finally:
+        clear_turn_vars(tokens)
 
     api_call.assert_not_called()
     assert result["failed"] is True
@@ -467,7 +628,7 @@ def test_tool_choice_none_video_edit_returns_plain_text_without_skill_bootstrap(
     assert not agent._zet_agent_skill_direct_task.video_edit_explicit
 
 
-def test_video_edit_plain_text_is_bounded_to_two_protocol_retries():
+def test_unbound_video_edit_plain_text_is_accepted_without_protocol_retries():
     agent = _runtime_agent(("skill_view", "clarify", "todo"))
     plain_text = _text_response("你想把这些视频剪成什么样的成片？")
 
@@ -475,13 +636,42 @@ def test_video_edit_plain_text_is_bounded_to_two_protocol_retries():
         patch.object(
             agent,
             "_interruptible_api_call",
-            side_effect=[plain_text, plain_text, plain_text],
+            return_value=plain_text,
         ) as api_call,
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
         result = agent.run_conversation("剪辑\n[file: /data/input.mp4]")
+
+    assert api_call.call_count == 1
+    assert result["failed"] is False
+    assert result["completed"] is True
+    assert result["final_response"] == "你想把这些视频剪成什么样的成片？"
+
+
+def test_bound_video_edit_plain_text_is_bounded_to_two_protocol_retries():
+    agent = _runtime_agent(("skill_view", "clarify", "todo"))
+    plain_text = _text_response("你想把这些视频剪成什么样的成片？")
+    tokens = set_turn_vars(
+        turn_id="bound-video-protocol-retry",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
+    try:
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=[plain_text, plain_text, plain_text],
+            ) as api_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("剪辑\n[file: /data/input.mp4]")
+    finally:
+        clear_turn_vars(tokens)
 
     assert api_call.call_count == 3
     assert all(
