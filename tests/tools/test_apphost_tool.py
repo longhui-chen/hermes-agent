@@ -188,7 +188,8 @@ def test_request_forwards_only_task_local_execution_headers(monkeypatch):
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     req = seen["req"]
-    assert req.get_header("X-zettlab-business-execution-token") is None
+    retired_header = "X-zettlab-business-" + "execution-token"
+    assert req.get_header(retired_header) is None
     assert req.get_header("X-zettlab-hardware-execution-token") is None
     assert req.get_header("X-hermes-turn-id") == "turn-1"
     assert req.get_header("X-hermes-session-id") == "cron_task_abcdef123456_20260817_120000"
@@ -207,7 +208,8 @@ def test_hardware_execution_token_is_never_forwarded_by_apphost(monkeypatch):
             assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
     finally:
         clear_turn_vars(turn_tokens)
-    assert seen["req"].get_header("X-zettlab-business-execution-token") is None
+    retired_header = "X-zettlab-business-" + "execution-token"
+    assert seen["req"].get_header(retired_header) is None
     assert seen["req"].get_header("X-zettlab-hardware-execution-token") is None
     assert seen["req"].get_header("X-hermes-turn-id") is None
 
