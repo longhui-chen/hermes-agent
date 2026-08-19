@@ -91,6 +91,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.zet_agent_response_mode import (
     activate_transport_selected_trusted_skill,
+    hardware_enrollment_preflight_response,
     reset_trusted_skill_execution,
     transport_attested_skill_instruction,
     trusted_skill_allowed_tool_names,
@@ -2842,6 +2843,33 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+
+    # Subnet discovery is a trusted-client workflow. Return its actionable
+    # card before Codex/provider/tool execution; the scan starts only after the
+    # user confirms in the first-party client.
+    _hardware_preflight_response = hardware_enrollment_preflight_response(
+        agent,
+        original_user_message,
+    )
+    if _hardware_preflight_response:
+        messages.append({"role": "assistant", "content": _hardware_preflight_response})
+        from agent.turn_finalizer import finalize_turn as _finalize_preflight_turn
+
+        return _finalize_preflight_turn(
+            agent,
+            final_response=_hardware_preflight_response,
+            api_call_count=0,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(hardware_enrollment_preflight)",
+        )
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
