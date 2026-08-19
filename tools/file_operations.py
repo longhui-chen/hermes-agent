@@ -2180,15 +2180,17 @@ class ShellFileOperations(FileOperations):
         return result
 
     def nas_search(self, pattern: str, limit: int = 60,
-                   semantic: bool = False, path_prefix: str = "") -> SearchResult:
+                   semantic: bool = False, video_semantic: bool = False,
+                   path_prefix: str = "") -> SearchResult:
         """First-class NAS library search (search_files target='nas').
 
         Same wire path as the empty-workspace fallback, but callable directly
         so the model can search the user's NAS files/photos without first
-        running a doomed workspace search, can opt into the semantic
-        (image-embedding) leg for photo/visual queries, and can scope hits to
-        one folder via path_prefix (server validates it against SearchRoots;
-        older local-server builds ignore the field — unscoped results).
+        running a doomed workspace search, can opt into either the semantic
+        (image-embedding) leg for photo/visual queries or the video-semantic
+        leg for actions/objects inside videos, and can scope hits to one folder
+        via path_prefix (server validates it against SearchRoots; older
+        local-server builds ignore the field — unscoped results).
         Unlike the fallback, unavailability and zero hits return a
         SearchResult the model can act on instead of a silent None.
         """
@@ -2202,14 +2204,15 @@ class ShellFileOperations(FileOperations):
                 "credential (not running on a Zettlab device?)."
             ))
         result = self._zettlab_nas_fallback(
-            query, limit, semantic=semantic, path_prefix=path_prefix,
-            explicit=True)
+            query, limit, semantic=semantic, video_semantic=video_semantic,
+            path_prefix=path_prefix, explicit=True)
         if result is not None:
             return result
         return SearchResult(total_count=0, note=(
             "No NAS files matched this query (or the device search service "
             "did not respond). Try different keywords"
-            + ("" if semantic else ", or semantic=true for photo/visual queries")
+            + ("" if semantic or video_semantic
+               else ", or semantic=true for photo/visual queries")
             + "."
         ))
 
@@ -2252,6 +2255,7 @@ class ShellFileOperations(FileOperations):
 
     def _zettlab_nas_fallback(self, pattern: str, limit: int,
                               semantic: bool = False,
+                              video_semantic: bool = False,
                               path_prefix: str = "",
                               explicit: bool = False) -> Optional[SearchResult]:
         """Query local-server NAS agent-search; returns None on any error.
@@ -2275,11 +2279,13 @@ class ShellFileOperations(FileOperations):
         if not token or not query or not url:
             return None
         # Default to name+content only (matches local-server's own default).
-        # Semantic is opt-in: forcing it here would drag every empty-workspace
-        # search behind the c-engine cold start (~30s) instead of returning the
-        # fast FTS hits. nas_search passes semantic=True for photo/visual
-        # queries, which also needs the longer timeout for that cold start.
-        modes = ["name", "content"] + (["semantic"] if semantic else [])
+        # Semantic legs are opt-in: forcing one here would drag every
+        # empty-workspace search behind the c-engine cold start (~30s) instead
+        # of returning the fast FTS hits. Video semantic is intentionally a
+        # video-only query: filename/document hits would dilute content-based
+        # video retrieval and do not carry a matching timestamp.
+        modes = (["video_semantic"] if video_semantic else
+                 ["name", "content"] + (["semantic"] if semantic else []))
         payload_req = {
             "q": query,
             "modes": modes,
@@ -2311,7 +2317,8 @@ class ShellFileOperations(FileOperations):
             headers=headers,
         )
         try:
-            with urlopen_hardened(req, timeout=45 if semantic else 10) as resp:
+            with urlopen_hardened(
+                    req, timeout=45 if semantic or video_semantic else 10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             # Parse inside the try so any malformed reply (non-dict payload,
             # non-dict items, non-numeric total_count) degrades to None rather

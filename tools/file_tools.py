@@ -2429,7 +2429,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
-                semantic: bool = False, path_prefix: str = "",
+                semantic: bool = False, video_semantic: bool = False,
+                path_prefix: str = "",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
@@ -2447,6 +2448,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             limit,
             offset,
             bool(semantic),
+            bool(video_semantic),
             str(path_prefix or ""),
         )
         with _read_tracker_lock:
@@ -2482,6 +2484,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 )
             result = nas_search(pattern=pattern, limit=limit,
                                 semantic=bool(semantic),
+                                video_semantic=bool(video_semantic),
                                 path_prefix=str(path_prefix or ""))
             return json.dumps(result.to_dict(densify=True), ensure_ascii=False)
 
@@ -2660,13 +2663,14 @@ PATCH_SCHEMA = {
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.\n\nNAS library search (target='nas', Zettlab devices only): searches the user's personal NAS files/photos/videos/documents by filename + parsed document content in one call. Hits render automatically as tappable preview cards in the chat — do NOT re-list them; reply with a short summary only. Set semantic=true for photo/visual queries (e.g. \"photos of birds\") — image-only AI matching, first call may take ~30s. pattern is plain keywords (not regex); path/file_glob/output_mode/context are ignored.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g. '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.\n\nNAS library search (target='nas', Zettlab devices only): searches the user's personal NAS files/photos/videos/documents. Hits render automatically as tappable preview cards in the chat — do NOT re-list them; reply with a short summary only. Set semantic=true for image-only visual matching. Set video_semantic=true, without semantic, when the query describes actions or objects inside videos; this searches videos only and returns the best matching timestamp. The first semantic call may take ~30s. pattern is plain keywords (not regex); path/file_glob/output_mode/context are ignored.",
     "parameters": {
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Regex pattern for content search, glob pattern (e.g., '*.py') for file search, or plain keywords for NAS search"},
             "target": {"type": "string", "enum": ["content", "files", "nas"], "description": "'content' searches inside file contents, 'files' searches for files by name, 'nas' searches the user's NAS library (Zettlab devices; results become chat preview cards)", "default": "content"},
             "semantic": {"type": "boolean", "description": "NAS search only: also run on-device AI visual matching (images). Use for photo/visual queries; first call may take ~30s.", "default": False},
+            "video_semantic": {"type": "boolean", "description": "NAS search only: search videos by actions or objects in their visual content and return the best matching timestamp. Use without semantic; first call may take ~30s.", "default": False},
             "path_prefix": {"type": "string", "description": "NAS search only: absolute directory to scope hits to (e.g. the folder you just located), so the preview cards match exactly what you told the user. Must be inside the device's search roots."},
             "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
             "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
@@ -2733,6 +2737,7 @@ def _handle_search_files(args, **kw):
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
         semantic=bool(args.get("semantic", False)),
+        video_semantic=bool(args.get("video_semantic", False)),
         path_prefix=str(args.get("path_prefix") or ""), task_id=tid)
 
 
