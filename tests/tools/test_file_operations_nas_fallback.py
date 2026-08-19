@@ -319,6 +319,22 @@ def test_nas_search_semantic_sends_semantic_mode_and_long_timeout(monkeypatch, f
     assert captured["timeout"] == 45
 
 
+def test_nas_search_video_semantic_sends_video_only_mode_and_long_timeout(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    captured = {}
+    payload = {"data": {"items": [{
+        "path": "/nas/cube.mp4",
+        "video_search": {"chunk_start": 30, "chunk_end": 56},
+    }], "total_count": 1, "carded": True}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
+        result = file_ops.nas_search("还原魔方", limit=60, video_semantic=True)
+
+    assert result.total_count == 1
+    sent = json.loads(captured["req"].data.decode("utf-8"))
+    assert sent["modes"] == ["video_semantic"]
+    assert captured["timeout"] == 45
+
+
 def test_nas_search_default_keeps_fast_modes(monkeypatch, file_ops):
     _zettlab_env(monkeypatch)
     captured = {}
@@ -478,9 +494,45 @@ def test_search_tool_nas_target_dispatches_to_nas_search():
                                      semantic=True, path_prefix="/v/d",
                                      task_id="t-nas-1"))
     fake_ops.nas_search.assert_called_once_with(pattern="鸟", limit=60,
-                                                semantic=True, path_prefix="/v/d")
+                                                semantic=True, video_semantic=False,
+                                                path_prefix="/v/d")
     assert out["total_count"] == 3
     assert out["note"] == "cards rendered"
+
+
+def test_search_tool_nas_video_semantic_dispatches_end_to_end():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import search_tool
+
+    fake_ops = MagicMock()
+    fake_ops.nas_search.return_value = SearchResult(total_count=1, note="cards rendered")
+    with _patch("tools.file_tools._get_file_ops", return_value=fake_ops):
+        out = json.loads(search_tool(
+            "还原魔方", target="nas", limit=60, video_semantic=True,
+            task_id="t-nas-video",
+        ))
+
+    fake_ops.nas_search.assert_called_once_with(
+        pattern="还原魔方", limit=60, semantic=False,
+        video_semantic=True, path_prefix="",
+    )
+    assert out["total_count"] == 1
+
+
+def test_search_files_schema_and_handler_expose_video_semantic():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import SEARCH_FILES_SCHEMA, _handle_search_files
+
+    properties = SEARCH_FILES_SCHEMA["parameters"]["properties"]
+    assert properties["video_semantic"]["type"] == "boolean"
+
+    with _patch("tools.file_tools.search_tool", return_value="{}") as mocked:
+        _handle_search_files({
+            "pattern": "还原魔方",
+            "target": "nas",
+            "video_semantic": True,
+        }, task_id="t-handler-video")
+    assert mocked.call_args.kwargs["video_semantic"] is True
 
 
 def test_search_tool_nas_target_unavailable_env_is_tool_error():

@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
@@ -103,6 +104,22 @@ _invocation_scope: ContextVar[
     "creation_governor_invocation_scope",
     default=None,
 )
+# turn_key → invocation_id：把创建配额绑到**这一次请求**而不是 turn_id 上。同一个
+# turn_id 可能有两个并发在途请求（双击 / 传输重发），结局天然相反。
+#
+# 为什么单独一个 ContextVar、而且按 turn 分条，不塞进 _invocation_scope：一个
+# context 里可以同时活着多个 turn。delegate_task 的子任务经
+# ``tools/thread_context.py`` 的 propagate_context_to_thread 继承父请求的**整份**
+# ContextVars（``ctx.run``），然后在父请求还没收尾时用另一个 turn_id 进
+# pre_llm_call。按 turn 分条之后，子任务只会给自己那个 turn 建 id，读不到也动不了
+# 父请求那条；ContextVar 的写又是 context-local 的，子任务的 set() 不会回灌父
+# context。
+_invocation_turn_ids: ContextVar[dict[str, str] | None] = ContextVar(
+    "creation_governor_invocation_turn_ids",
+    default=None,
+)
+# 一个 context 里同时活着的 turn 数量上限。正常是 1（父请求）或 2（父 + 子任务）。
+MAX_INVOCATION_TURNS_PER_CONTEXT = 32
 
 _SELF_QUERY_RE = re.compile(
     r"(?:creation[\s_-]*governor|detect_creation_opportunity|propose_creation)",
@@ -693,48 +710,113 @@ CREATION_TOOL_TYPES = {
     "skill_manage": "skill",
     "cronjob": "task",
 }
-MAX_DENIED_CREATION_TURNS = 256
+MAX_CREATION_INVOCATIONS = 256
 
-# 闸门是**配额**，不是布尔开关：这个 turn 上允许落地的创建次数，等于被真正
-# 接管的动作次数。
+# 闸门是**配额**，不是布尔开关：允许落地的创建次数，等于被真正接管的动作次数。
+# 一次 accepted 只买一张票，票绑定品类，谁先用掉都行，但总共只有一张。
 #
-# 为什么不能用布尔。双击或传输重发会让两个并发请求复用同一个 turn_id：先到的
-# 原子消费掉 proposal 拿到 accepted，后到的因为 proposal 已被消费而判无效。
-#   - 只按 turn_id 记「拒绝」→ 后到那个的拒绝会把先到那个真实的创建也挡掉，
-#     客户端收到 accepted 而资源没建出来；
-#   - 反过来让「接管」全局压过「拒绝」→ 后到那个重放请求的创建也被放行，
-#     重复创建又回来了。
-# 两者都是拿一个 turn 级的开关去表达一个请求级的事实。配额能同时挡住两边：
-# 一次 accepted 只买一张票，谁先用掉都行，但总共只有一张。
+# 配额的键是**这一次请求**（invocation），不是 turn_id。双击或传输重发会让两个
+# 并发请求复用同一个 turn_id：先到的原子消费掉 proposal 拿到 accepted，后到的
+# 因为 proposal 已被消费而判无效。一个 turn 级的键要同时表达这两件相反的事实，
+# 怎么摆都会在某个时序下失真：
+#   - 只记「拒绝」→ 后到那个的拒绝把先到那个真实的创建也挡掉；
+#   - 让「接管」压过「拒绝」→ 后到那个重放请求的创建也被放行，重复创建又回来；
+#   - 改成 turn 级配额 → 先跑完的请求撤掉闸门，还在途的那个命中「键不存在」被
+#     当普通轮次放行，只好再加一层引用计数。
+# 每个请求一条独立条目之后，「先完成的请求撤掉了还在途那个的闸门」从结构上不
+# 可能发生，引用计数因此不再需要。跨 profile / owner 撞同一个 turn_id 也不再
+# 互相消耗配额——条目本来就不共享。
 #
-# 键存在 = 这个 turn 上出现过推荐动作、进入配额管控；键不存在 = 普通轮次，
-# 用户直接说「帮我建个 skill」不受影响。
-_creation_turn_quota: "OrderedDict[str, dict[str, int]]" = OrderedDict()
-# 同一个 turn_id 上还有几个在途请求。见 _enter_creation_quota_for_turn 的说明。
-_creation_turn_refs: "OrderedDict[str, int]" = OrderedDict()
+# invocation id 从 _invocation_scope 取。api_server 的 _run_agent 把整轮对话
+# （pre_llm_call → 工具循环 → transform_llm_output）跑在同一个 executor 线程
+# 里，ContextVar 因此天然按请求隔离，并发请求落在不同线程上互相看不见。
+#
+# 条目存在 = 这次请求出现过推荐动作、进入配额管控；不存在 = 普通轮次，用户直接
+# 说「帮我建个 skill」不受影响。
+#
+# invocation_id → {"turn_key": str, "quota": {creation_type: 剩余票数}}
+_creation_invocations: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+# turn_key → 该 turn 上还在途的 invocation id 集合。工具链万一读不到 invocation
+# scope 时靠它兜底定位，同时也是「回执还能不能删」的判据。
+_creation_turn_invocations: dict[str, set[str]] = {}
 
 
-def _trim_creation_turn_quota_locked() -> None:
-    while len(_creation_turn_quota) > MAX_DENIED_CREATION_TURNS:
-        evicted, _ = _creation_turn_quota.popitem(last=False)
-        _creation_turn_refs.pop(evicted, None)
+def _bind_invocation_to_turn(turn_key: str) -> str:
+    """给这一次请求在 ``turn_key`` 这一轮上取一个稳定的身份。
+
+    同一个 turn 内 pre_llm_call 会反复触发（工具循环每转一圈一次），已经绑过就
+    沿用，否则新生成——每次都换的话，工具链读到的 id 会跟建闸门时用的那个对不上。
+    """
+    if not turn_key:
+        return ""
+    mapping = _invocation_turn_ids.get()
+    if mapping and mapping.get(turn_key):
+        return str(mapping[turn_key])
+    updated = dict(mapping or {})
+    invocation_id = uuid.uuid4().hex
+    updated[turn_key] = invocation_id
+    while len(updated) > MAX_INVOCATION_TURNS_PER_CONTEXT:
+        updated.pop(next(iter(updated)))
+    _invocation_turn_ids.set(updated)
+    return invocation_id
+
+
+def _unbind_invocation_from_turn(turn_key: str) -> None:
+    mapping = _invocation_turn_ids.get()
+    if not mapping or turn_key not in mapping:
+        return
+    updated = dict(mapping)
+    updated.pop(turn_key, None)
+    _invocation_turn_ids.set(updated or None)
+
+
+def _quota_key(turn_key: str) -> str:
+    """这次请求在 ``turn_key`` 这一轮上的配额条目键。
+
+    绑过就是那个 invocation id；没绑过（这条 context 没在这一轮开过闸门）退回
+    turn 级键——退化后的语义就是本次改动之前的老行为，而不是「闸门直接消失」。
+    """
+    mapping = _invocation_turn_ids.get()
+    invocation_id = str((mapping or {}).get(turn_key) or "") if turn_key else ""
+    if invocation_id:
+        return invocation_id
+    return f"turn:{turn_key}" if turn_key else ""
+
+
+def _drop_turn_index_locked(turn_key: str, quota_key: str) -> None:
+    holders = _creation_turn_invocations.get(turn_key)
+    if not holders:
+        return
+    holders.discard(quota_key)
+    if not holders:
+        _creation_turn_invocations.pop(turn_key, None)
+
+
+def _trim_creation_invocations_locked() -> None:
+    while len(_creation_invocations) > MAX_CREATION_INVOCATIONS:
+        evicted, entry = _creation_invocations.popitem(last=False)
+        _drop_turn_index_locked(str(entry.get("turn_key") or ""), evicted)
+
+
+def _open_creation_quota_locked(quota_key: str, turn_key: str) -> dict[str, Any]:
+    entry = _creation_invocations.get(quota_key)
+    if entry is None:
+        entry = {"turn_key": turn_key, "quota": {}}
+        _creation_invocations[quota_key] = entry
+    _creation_invocations.move_to_end(quota_key)
+    _creation_turn_invocations.setdefault(turn_key, set()).add(quota_key)
+    _trim_creation_invocations_locked()
+    return entry
 
 
 def _enter_creation_quota_for_turn(turn_id: str) -> None:
-    """这一轮出现了推荐动作：从此刻起创建工具受配额管控。
-
-    同一个 turn_id 可能有多个在途请求（双击 / 传输重发），所以记引用计数——
-    先完成的那个请求不能把还在等模型返回工具调用的那个的闸门一起撤掉，
-    否则后者会因为「键不存在」被当成不受管控的普通轮次，创建照样放行。
-    """
-    key = _pending_turn_key(turn_id)
-    if not key:
+    """这一次请求出现了推荐动作：从此刻起它的创建工具受配额管控。"""
+    turn_key = _pending_turn_key(turn_id)
+    if not turn_key:
         return
+    quota_key = _bind_invocation_to_turn(turn_key) or f"turn:{turn_key}"
     with _state_lock:
-        _creation_turn_quota.setdefault(key, {})
-        _creation_turn_quota.move_to_end(key)
-        _creation_turn_refs[key] = _creation_turn_refs.get(key, 0) + 1
-        _trim_creation_turn_quota_locked()
+        _open_creation_quota_locked(quota_key, turn_key)
 
 
 def _grant_creation_for_turn(turn_id: str, creation_type: str) -> None:
@@ -746,52 +828,89 @@ def _grant_creation_for_turn(turn_id: str, creation_type: str) -> None:
 
     票绑定品类：接受一张 Skill 卡换来的票不该放行一次 cronjob(create)。
     """
-    key = _pending_turn_key(turn_id)
+    turn_key = _pending_turn_key(turn_id)
     normalized = _normalize_creation_type(creation_type)
-    if not key or not normalized:
+    if not turn_key or not normalized:
         return
+    quota_key = _bind_invocation_to_turn(turn_key) or f"turn:{turn_key}"
     with _state_lock:
-        quota = _creation_turn_quota.setdefault(key, {})
+        entry = _open_creation_quota_locked(quota_key, turn_key)
+        quota = entry["quota"]
         quota[normalized] = quota.get(normalized, 0) + 1
-        _creation_turn_quota.move_to_end(key)
-        _trim_creation_turn_quota_locked()
 
 
-def _release_creation_deny(turn_id: str) -> None:
-    """一个请求收尾。同 turn 还有在途请求时不撤闸门，等最后一个再撤。"""
-    key = _pending_turn_key(turn_id)
-    if not key:
+def _release_creation_deny_locked(turn_key: str, quota_key: str) -> None:
+    """这一次请求收尾，撤掉**它自己**的闸门。
+
+    同 turn 的其它在途请求各有各的条目，不受影响——这正是引用计数被取消的原因。
+    """
+    if not quota_key:
         return
+    entry = _creation_invocations.pop(quota_key, None)
+    _drop_turn_index_locked(
+        str(entry.get("turn_key") or "") if entry is not None else turn_key,
+        quota_key,
+    )
+
+
+def _release_and_claim_action_result(
+    session_id: str, turn_key: str, quota_key: str, now: float
+) -> Any:
+    """释放本请求的闸门，并领走本轮回执。两件事必须在同一把锁里完成。
+
+    分两次拿锁的话，同 turn 的两个请求可能都先释放完、再都判定「没有别的在途请求
+    了」，于是都去 pop：先到的拿到回执，后到的拿到 None，那个响应就不含 receipt。
+    Local Server 恰好采用了那一个，已经接管的创建就会被标成不确定且不可重试。
+
+    回执是 **turn 级**事实：同一个 turn 的每个在途请求都要拿到同一份权威结果，所以
+    还有别人在途时只读不删，最后一个收尾的才真正删掉。
+    """
     with _state_lock:
-        remaining = _creation_turn_refs.get(key)
-        if remaining is None:
-            # 从没进过配额管控的普通轮次，或者已经被容量淘汰了。
-            _creation_turn_quota.pop(key, None)
-            return
-        if remaining > 1:
-            _creation_turn_refs[key] = remaining - 1
-            return
-        _creation_turn_refs.pop(key, None)
-        _creation_turn_quota.pop(key, None)
+        _release_creation_deny_locked(turn_key, quota_key)
+        if not turn_key:
+            return None
+        pending = _state_locked(session_id, now)["pending_action_results"]
+        if _creation_turn_invocations.get(turn_key):
+            return pending.get(turn_key)
+        return pending.pop(turn_key, None)
+
+
+def _take_quota_locked(entry: dict[str, Any], creation_type: str) -> bool:
+    quota = entry["quota"]
+    remaining = quota.get(creation_type, 0)
+    if remaining <= 0:
+        return False
+    quota[creation_type] = remaining - 1
+    return True
 
 
 def _consume_creation_quota(turn_id: str, creation_type: str) -> bool:
     """这次创建能不能放行。该品类有票就消耗一张放行，没票就挡。
 
-    不受管控的普通轮次（键不存在）永远放行——这道闸门只针对推荐动作那条路径。
+    不受管控的普通轮次（没有条目）永远放行——这道闸门只针对推荐动作那条路径。
     """
-    key = _pending_turn_key(turn_id)
-    if not key:
+    turn_key = _pending_turn_key(turn_id)
+    if not turn_key:
         return True
+    # _quota_key 已经是按 turn 精确解析过的，不会拿 A 轮的键去查 B 轮。
+    quota_key = _quota_key(turn_key)
     with _state_lock:
-        quota = _creation_turn_quota.get(key)
-        if quota is None:
+        entry = _creation_invocations.get(quota_key) if quota_key else None
+        if entry is not None:
+            return _take_quota_locked(entry, creation_type)
+        # 本次调用在这一轮上没有自己的条目：可能是闸门建立时这条 context 还没绑过
+        # id。不能就此放行，继续走下面的 turn 兜底。
+        holders = _creation_turn_invocations.get(turn_key)
+        if not holders:
             return True
-        remaining = quota.get(creation_type, 0)
-        if remaining <= 0:
+        if len(holders) > 1:
+            # 同一个 turn_id 上有多个在途请求，而这次工具调用又认不出自己属于
+            # 哪一个——票是谁的判不了。拦下来：漏建可以让用户重来，重复建不能撤。
             return False
-        quota[creation_type] = remaining - 1
-        return True
+        entry = _creation_invocations.get(next(iter(holders)))
+        if entry is None:
+            return True
+        return _take_quota_locked(entry, creation_type)
 
 
 def _on_pre_tool_call(
@@ -1730,7 +1849,12 @@ def _parse_recommendation_response(user_message: str) -> dict[str, Any] | None:
 
 
 def _handle_previous_proposal_action(
-    session_id: str, user_message: str, now: float
+    session_id: str,
+    user_message: str,
+    now: float,
+    *,
+    turn_id: str = "",
+    receipt_transport: str = "",
 ) -> _ActionHandlingOutcome:
     structured = _parse_recommendation_response(user_message)
     if structured is None and "[creation_recommendation_response]" in user_message:
@@ -1756,6 +1880,19 @@ def _handle_previous_proposal_action(
                 _discard_staged_proposal_locked(
                     session_id, state, release_claim=False
                 )
+                # 消费 proposal 和发布 accepted 回执必须在**同一个**临界区。分开
+                # 的话中间有个窗口：并发重放读到「proposal 已被消费」、写下
+                # rejected，而它的响应可能在 accepted 落库之前就把 rejected 带回
+                # 客户端——一次已经接管的创建被显示成失败，用户重试就是重复创建。
+                # 赢下这次状态跃迁的请求必然一路走到 accepted（下面 create 分支没
+                # 有别的出口），所以在这里发布是安全的；外层随后那次存储是同值
+                # 重放，被单调规则吃掉。
+                if turn_id and receipt_transport:
+                    _store_pending_action_result_locked(
+                        state,
+                        turn_id,
+                        _ActionReceipt(structured["proposal_id"], action, "accepted"),
+                    )
             elif current and action == "dismiss":
                 state["last_proposal"] = None
                 state["proposal_stage"] = None
@@ -2058,7 +2195,13 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         # 从这里起这一轮进入配额管控：出现过推荐动作，创建工具就不能再无条件
         # 放行。接管成功会往下发一张票，被拒则一张都没有。
         _enter_creation_quota_for_turn(outer_turn_id)
-        outcome = _handle_previous_proposal_action(session_id, user_message, now)
+        outcome = _handle_previous_proposal_action(
+            session_id,
+            user_message,
+            now,
+            turn_id=outer_turn_id,
+            receipt_transport=receipt_transport,
+        )
         if (
             outcome.receipt is not None
             and outcome.receipt.status == "accepted"
@@ -2401,23 +2544,25 @@ def _on_attachment_action(**kwargs: Any) -> None:
 
 def _transform_llm_output(**kwargs: Any) -> str | None:
     session_id = _session_key(kwargs)
+    turn_id = str(kwargs.get("turn_id") or "")
+    turn_key = _pending_turn_key(turn_id)
+    # 闸门键要在解绑 / 清 scope **之前**取。
+    release_key = _quota_key(turn_key)
     _invocation_scope.set(None)
     original_response = str(kwargs.get("response_text") or "")
     if not session_id:
         return None
-    turn_id = str(kwargs.get("turn_id") or "")
-    # 本轮的工具派发已经结束，deny 闸门到此失效。不释放也有条数上限兜着，
-    # 但留着会让同一个 turn_id 的后续复用被莫名挡掉。
-    _release_creation_deny(turn_id)
+    # 本轮的工具派发已经结束，deny 闸门到此失效；本轮回执也在这里一并领走——
+    # 释放和领取必须原子，理由见 _release_and_claim_action_result。
+    action_result = _release_and_claim_action_result(
+        session_id, turn_key, release_key, time.monotonic()
+    )
+    _unbind_invocation_from_turn(turn_key)
     if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
         "structured_output"
     ):
-        if turn_id:
-            with _state_lock:
-                state = _state_locked(session_id, time.monotonic())
-                state["pending_action_results"].pop(
-                    _pending_turn_key(turn_id), None
-                )
+        # 回执已经在上面领走了（同 turn 还有在途请求时是只读不删，留给它们）。
+        # 这条路径本来就不发回执，领到什么都丢掉。
         return None
 
     response_text = _ACTION_RESULT_ENVELOPE_RE.sub("", original_response).rstrip()
@@ -2432,13 +2577,6 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         or kwargs.get("completed") is False
     )
     now = time.monotonic()
-    with _state_lock:
-        state = _state_locked(session_id, now)
-        pending = state["pending_action_results"]
-        action_result = (
-            pending.pop(_pending_turn_key(turn_id), None) if turn_id else None
-        )
-
     require_canonical_response = kwargs.get("require_canonical_response")
     if (
         stripped_forged_result or isinstance(action_result, _ActionReceipt)
@@ -2459,6 +2597,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
 
     if turn_id:
         with _state_lock:
+            state = _state_locked(session_id, now)
             if state.get("proposal_stage") == "create_action_pending":
                 return response_text or ("\n" if stripped_forged_result else None)
 
@@ -2706,11 +2845,12 @@ def _reset_state_for_tests() -> None:
         _emitted_connection_proposals.clear()
         # 这两个是进程级的，不清会在测试之间泄漏（同 turn_id 复用时表现成
         # 「闸门莫名已经在了」）。
-        _creation_turn_quota.clear()
-        _creation_turn_refs.clear()
+        _creation_invocations.clear()
+        _creation_turn_invocations.clear()
     _plugin_llm = None
     _plugin_ctx = None
     _invocation_scope.set(None)
+    _invocation_turn_ids.set(None)
 
 
 def register(ctx: Any) -> None:
