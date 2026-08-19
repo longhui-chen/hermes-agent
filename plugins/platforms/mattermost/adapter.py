@@ -28,6 +28,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    read_aiohttp_body_with_limit,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -561,7 +562,9 @@ class MattermostAdapter(BasePlatformAdapter):
                             continue
                     if resp.status >= 400:
                         return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
-                    file_data = await resp.read()
+                    file_data = await read_aiohttp_body_with_limit(
+                        resp, media_type="Mattermost outbound media",
+                    )
                     ct = resp.content_type or "application/octet-stream"
                     break
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -694,7 +697,9 @@ class MattermostAdapter(BasePlatformAdapter):
                                         resp.status, image_url[:80],
                                     )
                                     continue
-                                file_data = await resp.read()
+                                file_data = await read_aiohttp_body_with_limit(
+                                    resp, media_type="Mattermost outbound image",
+                                )
                                 ct = resp.content_type or "image/png"
                         except Exception as dl_err:
                             logger.warning("Mattermost: download failed for %s: %s", image_url[:80], dl_err)
@@ -944,7 +949,9 @@ class MattermostAdapter(BasePlatformAdapter):
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status < 400:
-                        file_data = await resp.read()
+                        file_data = await read_aiohttp_body_with_limit(
+                            resp, media_type="Mattermost inbound attachment",
+                        )
                         from gateway.platforms.base import cache_image_from_bytes, cache_document_from_bytes
                         if mime.startswith("image/"):
                             local_path = cache_image_from_bytes(file_data, ext or ".png")

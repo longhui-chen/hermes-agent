@@ -529,6 +529,7 @@ class TestMediaDeliveryPathValidation:
         """Strict mode trusts durable attachments without trusting scratch."""
         self._patch_roots(monkeypatch)
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "research")
         monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
         board_root = tmp_path / "hermes" / "kanban" / "boards" / "research"
         board_root.mkdir(parents=True)
@@ -587,9 +588,8 @@ class TestMediaDeliveryDefaultMode:
             "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
             tuple(roots),
         )
-        # Pin strict OFF — the public default. Tests that exercise the
-        # strict path live in TestMediaDeliveryPathValidation.
-        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        # This class explicitly exercises the legacy opt-out.
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
         monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
 
     def test_accepts_stale_file_outside_allowlist(self, tmp_path, monkeypatch):
@@ -606,6 +606,17 @@ class TestMediaDeliveryDefaultMode:
         os.utime(notes, (old_mtime, old_mtime))
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(notes)) == str(notes.resolve())
+
+    def test_secure_default_rejects_stale_file_outside_active_scope(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", ())
+        stale = tmp_path / "other-profile-secret.txt"
+        stale.write_text("secret")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(stale)) is None
 
 
     @pytest.mark.parametrize(
@@ -755,6 +766,10 @@ class TestMediaDeliveryDefaultMode:
         )
         monkeypatch.setattr(
             "gateway.platforms.base._HERMES_ROOT", hermes_root
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_hermes_home",
+            lambda: hermes_root / "profiles" / "myprof",
         )
 
         assert (

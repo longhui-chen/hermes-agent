@@ -361,6 +361,17 @@ class TestResponseStore:
         assert store.get("resp_2") is not None
         assert len(store) == 3
 
+    def test_total_serialized_bytes_evicts_oldest_history(self):
+        store = ResponseStore(max_size=10, max_bytes=140)
+        store.put("resp_1", {"output": "a" * 60})
+        assert store.get("resp_1") is not None, "夹具第一条必须能单独落盘"
+
+        store.put("resp_2", {"output": "b" * 60})
+
+        assert store.get("resp_1") is None
+        assert store.get("resp_2") is not None
+        assert len(store) == 1
+
 
     def test_delete_clears_conversation_mapping(self):
         """Deleting a response also removes conversation mappings that reference it."""
@@ -2310,7 +2321,10 @@ class TestChatCompletionsEndpoint:
                 # delta.content — prevents model from learning to imitate
                 # markers instead of calling tools (#6972).
                 assert "event: hermes.tool.progress" in body
-                assert '"tool": "terminal"' in body
+                progress_payload = body.split(
+                    "event: hermes.tool.progress\ndata: ", 1
+                )[1].split("\n", 1)[0]
+                assert json.loads(progress_payload)["tool"] == "terminal"
                 # ``label`` is now derived by ``build_tool_preview`` from the
                 # tool args rather than passed by the caller, so we assert
                 # only that *some* label exists rather than a literal value.

@@ -151,6 +151,67 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.media_types == ["image/png"]
 
 
+def test_merge_preserves_url_to_mime_alignment_when_types_are_sparse():
+    pending = {}
+    source = SessionSource(
+        platform=Platform("teams"),
+        chat_id="chat",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+    first = MessageEvent(
+        text="first",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=["/a.png", "/unknown.bin"],
+        media_types=["image/png"],
+    )
+    second = MessageEvent(
+        text="second",
+        message_type=MessageType.AUDIO,
+        source=source,
+        media_urls=["/song.mp3"],
+        media_types=["audio/mpeg"],
+    )
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, second, merge_text=True)
+
+    merged = pending[session_key]
+    assert merged.media_urls == ["/a.png", "/unknown.bin", "/song.mp3"]
+    assert merged.media_types == ["image/png", "", "audio/mpeg"], (
+        "稀疏 MIME 必须先补空位再合并，不能把 song 的 MIME 错配给前一个文件"
+    )
+
+
+def test_pending_merge_never_inherits_another_senders_authorization():
+    pending = {}
+    source_a = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="A",
+    )
+    source_b = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="B",
+    )
+    session_key = build_session_key(source_a)
+    first = MessageEvent(
+        text="A", message_type=MessageType.PHOTO, source=source_a,
+        media_urls=["/a.png"], media_types=["image/png"],
+    )
+    second = MessageEvent(
+        text="B", message_type=MessageType.PHOTO, source=source_b,
+        media_urls=["/b.png"], media_types=["image/png"],
+    )
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, second, merge_text=True)
+
+    assert pending[session_key].source.user_id == "B"
+    assert pending[session_key].media_urls == ["/b.png"], (
+        "B 的内容不能并入 A 的 MessageEvent 后借用 A 的授权身份"
+    )
+
+
 @pytest.mark.asyncio
 async def test_recent_telegram_followups_append_in_pending_queue():
     runner = _make_runner()

@@ -2838,10 +2838,17 @@ def _event_media_is_stt_input(event, index: int) -> bool:
     message_type = getattr(event, "message_type", None)
     if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
         return False
-    return (
-        message_type == MessageType.VOICE
-        or _event_media_type_at(event, index).startswith("audio/")
-    )
+    if message_type == MessageType.VOICE:
+        return True
+    # 只有录音容器进入自动 STT；MP3/M4A/WAV 等普通音频附件交给 agent，
+    # 避免 PHOTO+MP3 被当语音转录。未知 adapter 仍可用 VOICE 明确标记。
+    return _event_media_type_at(event, index) in {
+        "audio/amr",
+        "audio/ogg",
+        "audio/opus",
+        "audio/silk",
+        "audio/x-opus+ogg",
+    }
 
 
 def _event_media_is_video(event, index: int) -> bool:
@@ -17146,7 +17153,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     image_paths.append(path)
                 # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
                 # MessageType.VOICE = voice message (Opus/OGG) — always STT
-                if event.message_type == MessageType.AUDIO:
+                if (
+                    _event_media_is_audio(event, i)
+                    and not _event_media_is_stt_input(event, i)
+                ):
                     audio_file_paths.append(path)
                 elif not _pending_stt_prepared and _event_media_is_stt_input(event, i):
                     audio_paths.append(path)
@@ -20768,10 +20778,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enriched_prompt = prompt
             if media_urls:
                 image_paths = []
+                other_paths = []
+                other_types = []
                 for i, path in enumerate(media_urls):
                     mtype = media_types[i] if i < len(media_types) else ""
                     if mtype.startswith("image/"):
                         image_paths.append(path)
+                    else:
+                        other_paths.append(path)
+                        other_types.append(mtype)
+                if other_paths:
+                    from types import SimpleNamespace
+
+                    media_context = await _build_media_placeholder(
+                        SimpleNamespace(
+                            media_urls=other_paths,
+                            media_types=other_types,
+                            message_type=MessageType.TEXT,
+                        )
+                    )
+                    if media_context:
+                        enriched_prompt = f"{media_context}\n\n{prompt}"
                 if image_paths:
                     try:
                         self._install_turn_auxiliary_runtime(turn_route)
@@ -20779,7 +20806,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # (returns the prompt text only), so the violating image
                         # never reaches the model even without a user-facing turn.
                         enriched_prompt, _ = await self._enrich_message_with_vision(
-                            prompt, image_paths,
+                            enriched_prompt, image_paths,
                         )
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
@@ -25841,6 +25868,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
         _start = time.time()
+        from gateway.platforms.base import safe_exc, safe_url_for_log
+        _safe_proxy_url = safe_url_for_log(proxy_url)
 
         try:
             _timeout = ClientTimeout(total=0, sock_read=1800)
@@ -25852,12 +25881,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
+                        safe_error_text = safe_exc(RuntimeError(error_text))
                         logger.warning(
                             "Proxy error (%d) from %s: %s",
-                            resp.status, proxy_url, error_text[:500],
+                            resp.status, _safe_proxy_url, safe_error_text,
                         )
                         return {
-                            "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
+                            "final_response": (
+                                f"⚠️ Proxy error ({resp.status}). Check the remote "
+                                "agent logs and try again."
+                            ),
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
@@ -25914,10 +25947,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Proxy connection error to %s: %s", proxy_url, e)
+            logger.error(
+                "Proxy connection error to %s: %s",
+                _safe_proxy_url, safe_exc(e),
+            )
             if not full_response:
                 return {
-                    "final_response": f"⚠️ Proxy connection error: {e}",
+                    "final_response": "⚠️ Proxy connection error. Check the proxy URL and credentials, then try again.",
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -25951,7 +25987,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
-            proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
+            _safe_proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
         return {

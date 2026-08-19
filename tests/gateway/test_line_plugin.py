@@ -141,6 +141,29 @@ class TestRequestCache:
         assert c.get(rid).payload == "first"
         assert c.get(rid).state is State.DELIVERED
 
+    def test_expired_entry_is_not_returned(self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(_line.time, "time", lambda: now[0])
+        c = RequestCache(ttl_seconds=1, pending_ttl_seconds=1)
+        rid = c.register_pending("Uchat")
+        assert rid and c.get(rid) is not None, "夹具必须先创建真实 cache entry"
+        c.set_ready(rid, "secret response")
+
+        now[0] = 102.0
+
+        assert c.get(rid) is None, "TTL 到期后旧按钮不能无限期取回缓存正文"
+
+    def test_full_cache_refuses_new_button_without_evicting_pending(self):
+        c = RequestCache(max_entries=2)
+        first = c.register_pending("U1")
+        second = c.register_pending("U2")
+        assert first and second and c.get(first).state is State.PENDING
+
+        assert c.register_pending("U3") is None
+        assert c.get(first).state is State.PENDING, (
+            "达到上限必须降级为不发新按钮，不能挤掉仍在计算的旧请求"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 6. Markdown stripping + chunking
@@ -161,11 +184,11 @@ class TestMarkdownAndChunking:
         assert all(len(c) <= 8 for c in chunks), chunks
         assert len(chunks) >= 2
 
-    def test_split_caps_at_five_chunks(self):
-        # 1000 paragraphs of 100 chars each — must cap at 5 LINE bubbles.
+    def test_split_keeps_content_beyond_first_api_batch(self):
         text = "\n\n".join(["x" * 100 for _ in range(1000)])
         chunks = split_for_line(text)
-        assert len(chunks) <= 5
+        assert len(chunks) > 5
+        assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
 
 
 # ---------------------------------------------------------------------------

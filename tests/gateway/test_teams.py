@@ -499,6 +499,7 @@ class TestTeamsAttachmentClassification:
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
         adapter.handle_message = AsyncMock()
+        adapter.set_authorization_check(lambda *_args: True)
         return adapter
 
     def _make_activity(self, attachments, text="see attached"):
@@ -626,6 +627,56 @@ class TestTeamsAttachmentClassification:
 
         with pytest.raises(ValueError, match="11 bytes > 10 bytes"):
             await adapter._fetch_attachment_bytes("https://files.example/a.bin")
+
+    @pytest.mark.anyio
+    async def test_file_only_download_failure_reaches_user_turn(self):
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(
+            side_effect=httpx.HTTPError("expired pre-authorized URL")
+        )
+        activity = self._make_activity(
+            [self._file_download_attachment()], text="",
+        )
+
+        await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args.args[0]
+        assert not event.media_urls, "夹具必须真实进入附件下载失败分支"
+        assert "attachment unavailable" in event.text.lower()
+        assert "send" in event.text.lower(), (
+            "文件唯一内容下载失败时必须告诉用户可行动的下一步，不能交空 turn"
+        )
+
+    @pytest.mark.anyio
+    async def test_unauthorized_sender_reaches_pairing_without_downloading_media(self):
+        adapter = self._make_adapter()
+        adapter.set_authorization_check(lambda *_args: False)
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"secret file")
+        activity = self._make_activity(
+            [self._file_download_attachment()], text="",
+        )
+
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter._fetch_attachment_bytes.assert_not_awaited()
+        assert not adapter._conv_refs, "未授权会话不能占用 proactive reference cache"
+        adapter.handle_message.assert_awaited_once(), (
+            "未授权消息仍要交给共享鉴权/配对链，不能为省下载而静默丢弃"
+        )
+
+
+def test_conversation_reference_cache_is_bounded_and_keeps_newest():
+    adapter = TeamsAdapter(_make_config(
+        client_id="bot-id", client_secret="secret", tenant_id="tenant",
+    ))
+    for idx in range(_teams_mod.TEAMS_CONVERSATION_REF_MAX + 1):
+        adapter._remember_conversation_ref(f"chat-{idx}", f"ref-{idx}")
+
+    assert len(adapter._conv_refs) == _teams_mod.TEAMS_CONVERSATION_REF_MAX
+    assert "chat-0" not in adapter._conv_refs
+    assert adapter._conv_refs[f"chat-{_teams_mod.TEAMS_CONVERSATION_REF_MAX}"] == (
+        f"ref-{_teams_mod.TEAMS_CONVERSATION_REF_MAX}"
+    )
 
 
 # ── _standalone_send (out-of-process cron delivery) ──────────────────────
@@ -777,6 +828,20 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_local_media_is_rejected_before_unbounded_base64_copy(
+        self, tmp_path, monkeypatch,
+    ):
+        adapter = self._make_adapter()
+        doc = tmp_path / "large.pdf"
+        doc.write_bytes(b"1234")
+        monkeypatch.setattr(_teams_mod, "get_inbound_media_max_bytes", lambda: 3)
+
+        result = await adapter.send_document("19:abc@thread.v2", str(doc))
+
+        assert not result.success
+        adapter._app.send.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_local_media_failure_never_exposes_the_data_uri(
