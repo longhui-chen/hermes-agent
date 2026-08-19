@@ -551,6 +551,12 @@ def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
     return False
 
 
+# MAX_CANONICAL_FINAL_TURN_ID_LEN 限住会被 governor 当作 pending receipt 键、
+# 并驻留到 TTL 到期的那个 turn_id。正常值是 local-server 的 UUID 类关联令牌，
+# 200 已经很宽松；不设上限则少量请求就能长期占住设备内存。
+MAX_CANONICAL_FINAL_TURN_ID_LEN = 200
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -585,6 +591,134 @@ def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
     if re.fullmatch(r"[A-Za-z0-9_-]{43}", capability) is None:
         return ""
     return capability
+
+
+def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("creation_action_receipt_transport")
+    if raw == "canonical_final_v1":
+        return "canonical_final_v1"
+    return ""
+
+
+# 与 _handle_chat_completions 收进 conversation_messages 的那组 role 保持同源。
+# 两处不一致就会出现「门禁看的那条」和「Agent 收到的那条」不是同一条。
+_AGENT_INPUT_MESSAGE_ROLES = frozenset({"user", "assistant"})
+
+
+def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
+    """正文里是否出现了创建建议动作信封——不看内容是否合法。
+
+    降级边界要用这个宽判据，不能复用下面那个严格解析器：严格解析要求 action
+    小写、creation_type 属于固定三项，而 creation-governor 会先做规范化
+    （`CREATE` → `create`、`scheduled-task` → `task` 之类）再接受动作。两边判据
+    不一致时，一个「严格解析不认、governor 认」的 payload 打到普通端点上，
+    transport 不会被清除，于是普通端点也能改 proposal、拉起原生创建流程并产出
+    可信回执——版本化端点这道门就白设了。
+
+    判据放宽到「有没有这个 wrapper」之后，governor 将来新增多少种规范化写法都
+    不会开出新口子：可信回执只可能从版本化 handler 显式放行的请求里出来。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    # 看的是**实际送进 Agent 的那条消息**，不按 role 过滤也不向前搜索：
+    # _handle_chat_completions 无条件取 conversation_messages[-1] 当 user_message，
+    # governor 解析的就是它。若这里只看最后一条 user 消息，一个「末条是 assistant
+    # 且正文带 wrapper」的普通请求就会漏判——transport 不被清除，governor 照样
+    # 解析那个 wrapper、消费 proposal 并产出可信回执，版本化端点的门禁被绕过。
+    # 判据必须跟 _handle_chat_completions 真正喂给 Agent 的那条消息是同一条：
+    # 它只把 role 为 user / assistant 的收进 conversation_messages，其余（tool、
+    # 以及任何将来新增的 role）整条忽略。这里若按「最后一条非 system」来选，
+    # 在正文带 wrapper 的 user 消息后面追加一条 tool 消息就能骗过门禁——门禁看
+    # 到的是那条 tool、判定没有 wrapper 而保留 transport，而 Agent 实际收到的
+    # 仍是前面那条 user，governor 照样消费 proposal 并产出可信回执。
+    last_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict)
+            and message.get("role") in _AGENT_INPUT_MESSAGE_ROLES
+        ),
+        None,
+    )
+    last_content = last_message.get("content") if isinstance(last_message, dict) else None
+    # 多模态 content 是 API 正式接受的形态：wrapper 藏在 parts 数组的某个 text
+    # part 里时，只看标量字符串就会漏判。_normalize_multimodal_content() 会保留
+    # 这些文本 part，governor 对整个列表做 str() 之后照样能解析出 JSON wrapper。
+    for _text in _iter_message_text_parts(last_content):
+        if "[creation_recommendation_response]" in _text:
+            return True
+    return False
+
+
+def _iter_message_text_parts(content: Any):
+    """Yield every text fragment a message content field can carry."""
+    if isinstance(content, str):
+        yield content
+        return
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if isinstance(part, str):
+            yield part
+        elif isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                yield text
+
+
+def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    # 必须是**最后一条**对话消息本身携带动作，不能向前搜索：
+    # _handle_chat_completions 取 conversation_messages[-1] 当 user_message，
+    # 如果动作后面还跟着一条 assistant 消息，向前搜索会放行准入，但 governor
+    # 拿到的是那条 assistant——它看不到动作，既不接管也不产回执，请求却以普通
+    # 模型结果收尾，Web 因此把创建永久标成「不确定且不可重试」。准入判据必须
+    # 和后续真正喂给 Agent 的那条消息是同一条。
+    last_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") != "system"
+        ),
+        None,
+    )
+    if not isinstance(last_message, dict) or last_message.get("role") != "user":
+        return False
+    last_user_content = last_message.get("content")
+    if not isinstance(last_user_content, str):
+        return False
+    match = re.search(
+        r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+        r"\[/creation_recommendation_response\]\s*$",
+        last_user_content,
+        re.DOTALL,
+    )
+    if match is None:
+        return False
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("version") == 1
+        and payload.get("type") == "creation_recommendation_response"
+        and payload.get("action")
+        in {"create", "dismiss", "mute_session", "unmute_session"}
+        and payload.get("creation_type") in {"agent", "skill", "task"}
+        and isinstance(payload.get("proposal_id"), str)
+        and payload["proposal_id"].strip()
+        and isinstance(payload.get("title"), str)
+        and payload["title"].strip()
+        and isinstance(payload.get("dedup_key"), str)
+        and payload["dedup_key"].strip()
+    )
 
 
 def _extract_skill_slug(body: Dict[str, Any]) -> str:
@@ -627,19 +761,44 @@ def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
     return _strip_skill_display_token(user_message, skill_slug)
 
 
-def _extract_business_execution_token(raw: Any) -> str:
-    """Accept only local-server's fixed-width opaque capability format."""
-    token = str(raw or "").strip()
-    return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
+_ACTION_VERSION = "1"
+_ACTION_HEADER = "X-Zettlab-Business-Execution-Action"
+_ACTION_VERSION_HEADER = "X-Zettlab-Business-Execution-Action-Version"
+_ACTION_RE = re.compile(r"[0-9a-f]{64}")
+_HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
 
 
-def _business_execution_scope_digest(token: str) -> str:
-    """Derive a non-secret cache scope from a validated capability token."""
-    if not token:
+def _extract_business_execution_action(request: Any) -> Optional[Dict[str, str]]:
+    """Parse the opaque ActionV1 relay envelope without semantic auth."""
+    if request is None:
+        return None
+    raw = str(request.headers.get(_ACTION_HEADER, "") or "").strip()
+    version = str(request.headers.get(_ACTION_VERSION_HEADER, "") or "").strip()
+    if not raw and not version:
+        return None
+    if version != _ACTION_VERSION or _ACTION_RE.fullmatch(raw) is None:
+        return {}
+    return {"action_version": version, "action": raw}
+
+
+def _extract_hardware_execution_token(request: Any) -> str:
+    """Relay the dedicated capability only to trusted hardware helpers."""
+    if request is None:
         return ""
-    return hashlib.sha256(
-        b"zettlab-business-execution-scope-v1\0" + token.encode("ascii")
-    ).hexdigest()
+    token = str(
+        request.headers.get(_HARDWARE_EXECUTION_TOKEN_HEADER, "") or ""
+    ).strip()
+    return token if _ACTION_RE.fullmatch(token) is not None else ""
+
+
+def _extract_requested_execution_policy(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("execution_policy", metadata.get("executionPolicy", ""))
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip().lower()
 
 
 def _normalize_chat_content(
@@ -1023,12 +1182,20 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
-def _content_has_image(content: Any) -> bool:
-    return isinstance(content, list) and any(
+def _content_has_image_payload(content: Any) -> bool:
+    """Return whether normalized content carries an image attachment."""
+    if not isinstance(content, list):
+        return False
+    return any(
         isinstance(part, dict)
         and str(part.get("type") or "").strip().lower() in _IMAGE_PART_TYPES
         for part in content
     )
+
+
+def _content_has_image(content: Any) -> bool:
+    """Compatibility name used by provider image fallback paths."""
+    return _content_has_image_payload(content)
 
 
 def _extract_current_turn_reference_image(content: Any) -> str:
@@ -1655,6 +1822,20 @@ class ResponseStore:
     @staticmethod
     def _json_upper_bound(value: Any, *, stop_after: int) -> int:
         """Conservative JSON byte bound without allocating the serialized copy."""
+        def string_bytes(text: str) -> int:
+            size = 2
+            for char in text:
+                code = ord(char)
+                if char in {'"', "\\"} or code < 0x20:
+                    size += 6
+                elif code <= 0x7F:
+                    size += 1
+                elif code <= 0xFFFF:
+                    size += 6
+                else:
+                    size += 12
+            return size
+
         total = 0
         stack = [value]
         while stack and total <= stop_after:
@@ -1662,17 +1843,17 @@ class ResponseStore:
             if item is None or isinstance(item, (bool, int, float)):
                 total += 24
             elif isinstance(item, str):
-                total += 2 + 2 * len(item)
+                total += string_bytes(item)
             elif isinstance(item, dict):
                 total += 2 + 2 * len(item)
                 for key, child in item.items():
-                    total += 2 + 2 * len(str(key))
+                    total += string_bytes(str(key))
                     stack.append(child)
             elif isinstance(item, (list, tuple, set)):
                 total += 2 + len(item)
                 stack.extend(item)
             else:
-                total += 2 + 2 * len(str(item))
+                total += string_bytes(str(item))
         return total
 
     def put(self, response_id: str, data: Dict[str, Any]) -> bool:
@@ -1756,12 +1937,14 @@ class ResponseStore:
 # CORS middleware
 # ---------------------------------------------------------------------------
 
+# ActionV1, HardwareExecutionToken, and X-Zettlab-Agent-Action-Token headers are
+# intentionally absent. They are loopback capability transport, not a
+# browser/App contract; omission makes browser preflight fail closed even for
+# an allowed origin.
+
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": (
-        "Authorization, Content-Type, Idempotency-Key, "
-        "X-Zettlab-Business-Execution-Token"
-    ),
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
 }
 
 
@@ -1800,6 +1983,14 @@ _MEDIA_MIME = {
     ".bmp": "image/bmp",
 }
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
+_ANY_MEDIA_TAG_RE = re.compile(
+    r"media:\s*(?:"
+    r"`(?:~/|/|[A-Za-z]:[/\\])[^`\r\n]+`|"
+    r"\"(?:~/|/|[A-Za-z]:[/\\])[^\"\r\n]+\"|"
+    r"'(?:~/|/|[A-Za-z]:[/\\])[^'\r\n]+'|"
+    r"(?:~/|/|[A-Za-z]:[/\\])[^\s\r\n]+)",
+    re.IGNORECASE,
+)
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -1853,9 +2044,10 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return "⚠️ Couldn't deliver the attachment."
 
     try:
-        return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+        resolved = MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+        return _ANY_MEDIA_TAG_RE.sub("⚠️ Couldn't deliver the attachment.", resolved)
     except Exception:
-        return text
+        return _ANY_MEDIA_TAG_RE.sub("⚠️ Couldn't deliver the attachment.", text)
 
 
 class _StreamingMediaDeltaFilter:
@@ -2255,16 +2447,74 @@ def _make_request_fingerprint(
     body: Dict[str, Any],
     keys: List[str],
     *,
-    execution_scope_digest: str = "",
+    business_execution_action: str = "",
+    hardware_execution_token: str = "",
+    admission_scope: str = "",
+    identity_scope: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
-    material = repr(subset).encode("utf-8")
-    if execution_scope_digest:
-        material += (
-            b"\0zettlab-business-execution-scope-v1:"
-            + execution_scope_digest.encode("ascii")
+    body_fingerprint = hashlib.sha256(repr(subset).encode("utf-8")).hexdigest()
+    action = str(business_execution_action or "").strip()
+    hardware_token = str(hardware_execution_token or "").strip()
+    capability_digests: List[bytes] = []
+    if _ACTION_RE.fullmatch(action) is not None:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-business-execution-action-v1\0" + action.encode("ascii")
+            ).hexdigest().encode("ascii")
         )
-    return hashlib.sha256(material).hexdigest()
+    if _ACTION_RE.fullmatch(hardware_token) is not None:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-hardware-execution-token-v1\0"
+                + hardware_token.encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    # admission_scope 把「这份 body 是从哪条路由、以什么准入模式进来的」并进
+    # 指纹。少了它，同一个 Idempotency-Key + 同一份 body 会在普通端点和
+    # canonical-final-v1 之间共用缓存：普通端点先缓存的无回执结果会让版本化
+    # 重试直接命中缓存、跳过 governor 和动作接管。
+    if admission_scope:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-admission-scope-v1\0" + admission_scope.encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    # identity_scope 把「这份 body 属于谁、属于哪个会话」并进指纹。_idem_cache
+    # 是进程全局的，少了它，两个不同 profile / owner / session key 的请求只要
+    # Idempotency-Key 和 body 相同就会互相命中——后到的那个直接复用前一个会话的
+    # agent 结果，跳过 governor 的 owner / proposal 校验，甚至拿到别人会话的
+    # accepted 回执和正文。只并进摘要，不并原值。
+    if identity_scope:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-identity-scope-v1\0"
+                + hashlib.sha256(identity_scope.encode("utf-8")).hexdigest().encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    if not capability_digests:
+        return body_fingerprint
+    return hashlib.sha256(
+        b"zettlab-request-idempotency-v4\0"
+        + body_fingerprint.encode("ascii")
+        + b"\0"
+        + b"\0".join(capability_digests)
+    ).hexdigest()
+
+
+def _make_silent_automation_fingerprint(
+    authorization: Dict[str, Any],
+) -> str:
+    """Bind retries to stable authorization identity, not mutable request bytes."""
+    action = str(authorization.get("action", "") or "").strip()
+    if (
+        authorization.get("action_version") != _ACTION_VERSION
+        or _ACTION_RE.fullmatch(action) is None
+    ):
+        return ""
+    return hashlib.sha256(
+        b"zettlab-silent-automation-action-v1\0" + action.encode("ascii")
+    ).hexdigest()
 
 
 def _derive_chat_session_id(
@@ -3113,6 +3363,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            (
+                "POST",
+                "/v1/chat/completions/canonical-final-v1",
+                self._handle_canonical_final_chat_completions,
+            ),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -3893,6 +4148,10 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
         router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
         router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+        router.add_post(
+            "/p/{profile}/v1/chat/completions/canonical-final-v1",
+            self._profile_handler(self._handle_canonical_final_chat_completions),
+        )
 
         router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
         router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
@@ -4335,6 +4594,14 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
         """
+        if str(
+            (request_overrides or {}).get("_zet_execution_policy", "") or ""
+        ).strip().lower() == "silent_automation":
+            # Reject before resolving provider credentials or touching SessionDB;
+            # this path is not authorized to construct a silent agent.
+            raise PermissionError(
+                "silent_automation requires the zet_agent adapter"
+            )
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs,
@@ -4600,6 +4867,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Consumed only by the ZetAgent subclass; never forward this private
         # plan policy hint into AIAgent or an LLM request body.
         agent_request_overrides.pop("_zet_plan_auto_execute", None)
+        agent_request_overrides.pop("_zet_execution_policy", None)
 
         agent_kwargs = {
             "model": model,
@@ -5783,6 +6051,74 @@ class APIServerAdapter(BasePlatformAdapter):
             on_settled()
         return user_message
 
+    async def _handle_canonical_final_chat_completions(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                _openai_error("Invalid JSON in request body"), status=400
+            )
+        if not isinstance(body, dict) or (
+            _extract_creation_action_receipt_transport(body)
+            != "canonical_final_v1"
+        ) or not _extract_turn_id(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires exact receipt metadata and turn id"
+                ),
+                status=400,
+            )
+        if not _is_canonical_final_creation_action(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires a valid creation recommendation action"
+                ),
+                status=400,
+            )
+        # 结构化输出与可信回执互斥：governor 的 _on_pre_llm_call() 遇到
+        # structured_output 会直接进入 suppression，既不消费动作也不生成回执，
+        # 而 HTTP 请求照常以普通模型结果收尾。放行这类请求等于让 Web 收到一个
+        # 「没接管、也没法重试」的死状态。宁可在进 Agent 前明确拒绝。
+        from agent.response_format import response_format_requires_structured_output
+
+        if response_format_requires_structured_output(body.get("response_format")):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot be combined with a structured "
+                    "response_format: the receipt would never be produced"
+                ),
+                status=400,
+            )
+        # turn_id 会成为 pending_action_results 的键并驻留到 TTL 到期。不设上限
+        # 的话，少量携带超长 turn_id 的请求就能把设备上的 Hermes 撑爆（端侧
+        # 2 GB 硬预算）。正常的 turn_id 是 local-server 的 UUID 类关联令牌。
+        if len(_extract_turn_id(body)) > MAX_CANONICAL_FINAL_TURN_ID_LEN:
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 turn_id exceeds "
+                    f"{MAX_CANONICAL_FINAL_TURN_ID_LEN} characters"
+                ),
+                status=400,
+            )
+        # 禁用了工具的 create 动作永远走不到原生创建流程（skill_manage / cronjob
+        # 都是工具），但 governor 会照常消费 proposal 并回 accepted——Web 结算成
+        # 「已接管」，资源却根本不会被创建。宁可在进 Agent 前拒掉。
+        if str(body.get("tool_choice") or "").strip().lower() == "none":
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot run with tool_choice=none: the "
+                    "native creation flow would never execute"
+                ),
+                status=400,
+            )
+        request["canonical_final_creation_action_admitted"] = True
+        return await self._handle_chat_completions(request)
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -5821,9 +6157,32 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
         connector_route_capability = _extract_connector_route_capability(body)
-        business_execution_token = _extract_business_execution_token(
-            request.headers.get("X-Zettlab-Business-Execution-Token", "")
+        creation_action_receipt_transport = (
+            _extract_creation_action_receipt_transport(body)
         )
+        if _has_creation_recommendation_wrapper(body) and not request.get(
+            "canonical_final_creation_action_admitted", False
+        ):
+            creation_action_receipt_transport = ""
+        business_execution_action = _extract_business_execution_action(request)
+        hardware_execution_token = _extract_hardware_execution_token(request)
+        requested_execution_policy = _extract_requested_execution_policy(body)
+        requested_silent_automation = (
+            requested_execution_policy == "silent_automation"
+        )
+        execution_policy = ""
+        execution_authorization: Dict[str, Any] = {}
+        if business_execution_action == {}:
+            return web.json_response(
+                _openai_error(
+                    "invalid business execution action",
+                    param=_ACTION_HEADER,
+                    code="invalid_business_execution_action",
+                ),
+                status=403,
+            )
+        if business_execution_action is not None:
+            execution_authorization = dict(business_execution_action)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -5840,11 +6199,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
-            elif role in {"user", "assistant"}:
+            elif role in _AGENT_INPUT_MESSAGE_ROLES:
                 try:
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
+                if requested_silent_automation and _content_has_image_payload(content):
+                    return web.json_response(
+                        _openai_error(
+                            "silent_automation does not accept multimodal input",
+                            param=f"messages[{idx}].content",
+                            code="silent_automation_multimodal_unsupported",
+                        ),
+                        status=400,
+                    )
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
@@ -5871,7 +6239,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return key_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
+        # Validate the lineage before authorization; history is loaded only after
+        # the execution policy is known so trusted silent turns never read request
+        # or SessionDB conversation history.
         #
         # Security: session continuation exposes conversation history, so it is
         # only allowed when the API key is configured and the request is
@@ -5909,13 +6279,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -5929,8 +6292,79 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
-        # Explicit skill invocation (zet_agent hook; base no-op): triggered
-        # ONLY by metadata.skill_slug — never by sniffing the message text.
+        skill_slug = _extract_skill_slug(body)
+        trusted_task_message = _trusted_skill_task_message(user_message, skill_slug)
+
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if requested_silent_automation and stream:
+            return web.json_response(
+                _openai_error(
+                    "silent_automation requires stream=false so retries remain idempotent",
+                    param="stream",
+                ),
+                status=400,
+            )
+        if requested_silent_automation and not str(
+            idempotency_key or ""
+        ).strip():
+            return web.json_response(
+                _openai_error(
+                    "silent_automation requires a non-empty Idempotency-Key",
+                    param="Idempotency-Key",
+                    code="silent_automation_idempotency_required",
+                ),
+                status=400,
+            )
+
+        if requested_silent_automation:
+            if business_execution_action is None:
+                # A silent request is an internal capability boundary. Never
+                # downgrade an invalid receipt to an ordinary turn: that would
+                # expose the caller's history/memory and interactive tools.
+                return web.json_response(
+                    _openai_error(
+                        "silent_automation authorization failed",
+                        param="metadata.execution_policy",
+                        code="invalid_silent_automation_authorization",
+                    ),
+                    status=403,
+                )
+            execution_policy = "silent_automation"
+
+        if execution_policy == "silent_automation":
+            # Silent receipts authorize one server-owned workflow. UI/API
+            # controls are not part of that receipt and must not widen the
+            # workflow after authorization.
+            response_mode = ""
+            plan_ack = {}
+            plan_auto_execute = False
+
+        trusted_business_execution_action = (
+            str(business_execution_action.get("action", "") or "")
+            if business_execution_action is not None
+            else ""
+        )
+
+        if execution_policy == "silent_automation":
+            # A silent authorization is a self-contained task receipt, not permission
+            # to expose either caller-supplied or persisted chat context.
+            history = []
+            system_prompt = None
+            current_turn_reference_image = ""
+        elif provided_session_id:
+            try:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            except Exception as e:
+                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                history = []
+
+        # Explicit skill selection is triggered ONLY by metadata.skill_slug —
+        # never by sniffing the message text. Ordinary turns may pre-expand the
+        # selected Skill through the zet_agent hook. Verified silent turns keep
+        # the trusted task/slug but skip pre-expansion entirely: their first
+        # model action must load the startup-snapshotted bytes through skill_view.
         # The expansion runs LATE on purpose; the placement is load-bearing:
         #   - AFTER session_id is final, so skill templates resolve
         #     ${HERMES_SESSION_ID} against the real session (session_id is
@@ -5943,12 +6377,19 @@ class APIServerAdapter(BasePlatformAdapter):
         #     tools this turn" boundary (request_overrides strips every agent
         #     tool) and expansion injects tool-driving instructions — the
         #     message passes through unexpanded instead.
-        skill_slug = _extract_skill_slug(body)
         skill_selection_enabled = bool(
-            skill_slug and body.get("tool_choice") != "none"
+            skill_slug
+            and (
+                body.get("tool_choice") != "none"
+                or requested_silent_automation
+            )
+            and (not requested_silent_automation or execution_policy == "silent_automation")
+        )
+        skill_expansion_enabled = bool(
+            skill_selection_enabled and execution_policy != "silent_automation"
         )
         trusted_user_message = (
-            _trusted_skill_task_message(user_message, skill_slug)
+            trusted_task_message
             if skill_selection_enabled
             else user_message
         )
@@ -5959,23 +6400,30 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _expanded_user_message(on_settled=None):
-            if not skill_slug or body.get("tool_choice") == "none":
+            if not skill_expansion_enabled:
                 if on_settled is not None:
                     on_settled()
-                return user_message
+                return trusted_user_message
             return await self._expand_inbound_skill_invocation(
-                user_message, skill_slug, session_id=session_id,
+                user_message, trusted_skill_slug, session_id=session_id,
                 on_settled=on_settled,
             )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", self._model_name)
+        # Silent receipts authorize the server-side workflow and its configured
+        # route. Request-level model/provider/options must not become an
+        # unbound exfiltration or cost-control switch.
+        model_name = (
+            self._model_name
+            if execution_policy == "silent_automation"
+            else body.get("model", self._model_name)
+        )
         created = int(time.time())
         request_overrides: Dict[str, Any] = {}
-        if body.get("tool_choice") == "none":
+        if execution_policy != "silent_automation" and body.get("tool_choice") == "none":
             request_overrides["tool_choice"] = "none"
         response_format = body.get("response_format")
-        if response_format is not None:
+        if execution_policy != "silent_automation" and response_format is not None:
             response_format_error = _validate_chat_response_format(response_format)
             if response_format_error:
                 return web.json_response(
@@ -5990,11 +6438,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # Per-client model routing: if the requested model matches a
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
-        route = self._resolve_route(model_name)
-        agent_overrides = _request_agent_overrides(
-            body,
-            virtual_model=self._model_name,
-            allow_bare_model=self._direct_model_requests,
+        route = (
+            None
+            if execution_policy == "silent_automation"
+            else self._resolve_route(model_name)
+        )
+        agent_overrides = (
+            {}
+            if execution_policy == "silent_automation"
+            else _request_agent_overrides(
+                body,
+                virtual_model=self._model_name,
+                allow_bare_model=self._direct_model_requests,
+            )
         )
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
@@ -6127,7 +6583,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
-                business_execution_token=business_execution_token,
+                creation_action_receipt_transport=creation_action_receipt_transport,
+                hardware_execution_token=hardware_execution_token,
+                business_execution_action=trusted_business_execution_action,
+                business_execution_action_version=(
+                    _ACTION_VERSION if trusted_business_execution_action else ""
+                ),
+                execution_policy=execution_policy,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
                 trusted_user_message=trusted_user_message,
@@ -6188,7 +6650,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
-                    business_execution_token=business_execution_token,
+                    creation_action_receipt_transport=creation_action_receipt_transport,
+                    hardware_execution_token=hardware_execution_token,
+                    business_execution_action=trusted_business_execution_action,
+                    business_execution_action_version=(
+                        _ACTION_VERSION if trusted_business_execution_action else ""
+                    ),
+                    execution_policy=execution_policy,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
@@ -6197,24 +6665,38 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 self._end_profile_chat_run(profile_run_key)
 
-        idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(
-                body,
-                keys=[
-                    "model",
-                    "provider",
-                    "model_options",
-                    "messages",
-                    "tools",
-                    "tool_choice",
-                    "response_format",
-                    "stream",
-                    "metadata",
-                ],
-                execution_scope_digest=_business_execution_scope_digest(
-                    business_execution_token
-                ),
+            fp = (
+                _make_silent_automation_fingerprint(execution_authorization)
+                if execution_policy == "silent_automation"
+                else _make_request_fingerprint(
+                    body,
+                    keys=[
+                        "model",
+                        "provider",
+                        "model_options",
+                        "messages",
+                        "tools",
+                        "tool_choice",
+                        "response_format",
+                        "stream",
+                        "metadata",
+                    ],
+                    business_execution_action=trusted_business_execution_action,
+                    hardware_execution_token=hardware_execution_token,
+                    admission_scope=(
+                        "canonical_final_v1"
+                        if request.get("canonical_final_creation_action_admitted", False)
+                        else "plain"
+                    ),
+                    identity_scope="\0".join(
+                        (
+                            str(request.get("hermes_profile_home") or ""),
+                            str(gateway_session_key or ""),
+                            str(session_id or ""),
+                        )
+                    ),
+                )
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
@@ -6542,6 +7024,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            hermes_terminal: Dict[str, Any] = {}
+            if result_dict.get("response_transformed") or result_dict.get(
+                "canonical_response_required"
+            ):
+                hermes_terminal["canonical_final_response"] = str(
+                    result_dict.get("final_response") or ""
+                )
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
                 _wire_code = _hermes_error_code(result_dict, finish_reason)
@@ -6550,13 +7039,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": err_msg,
                         "type": _wire_code,
                     }
-                finish_chunk["hermes"] = {
+                hermes_terminal.update({
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": _wire_code,
-                }
+                })
+            if hermes_terminal:
+                finish_chunk["hermes"] = hermes_terminal
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -8656,7 +9147,11 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
-        business_execution_token: Optional[str] = None,
+        creation_action_receipt_transport: str = "",
+        hardware_execution_token: Optional[str] = None,
+        business_execution_action: Optional[str] = None,
+        business_execution_action_version: Optional[str] = None,
+        execution_policy: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
@@ -8736,6 +9231,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     resolved_plan_auto_execute = _resolve_plan_auto_execute(plan_auto_execute)
                     create_overrides = dict(request_overrides or {})
                     create_overrides["_zet_plan_auto_execute"] = resolved_plan_auto_execute
+                    create_overrides["_zet_execution_policy"] = execution_policy or ""
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -8760,6 +9256,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent._zet_agent_response_mode = response_mode or ""
                     agent._zet_agent_plan_ack = dict(plan_ack or {})
                     agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
+                    agent._creation_action_receipt_transport = (
+                        creation_action_receipt_transport
+                    )
                     if trusted_user_message is not None:
                         agent._zet_agent_trusted_user_message = trusted_user_message
                     agent._zet_agent_trusted_skill_slug = trusted_skill_slug

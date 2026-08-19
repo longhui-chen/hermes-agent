@@ -546,6 +546,28 @@ class TestMediaDeliveryPathValidation:
         )
         assert BasePlatformAdapter.validate_media_delivery_path(str(scratch)) is None
 
+    def test_allows_current_named_kanban_board_without_env_pin(
+        self, tmp_path, monkeypatch,
+    ):
+        """``kanban/current`` 选中的 board 也是 strict delivery 的活动根。"""
+        self._patch_roots(monkeypatch)
+        kanban_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+        board_root = kanban_home / "kanban" / "boards" / "research"
+        board_root.mkdir(parents=True)
+        (board_root / "kanban.db").touch()
+        current = kanban_home / "kanban" / "current"
+        current.write_text("research\n", encoding="utf-8")
+        attachment = board_root / "attachments" / "t_12345678" / "report.pdf"
+        attachment.parent.mkdir(parents=True)
+        attachment.write_bytes(b"%PDF")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(attachment)) == str(
+            attachment.resolve()
+        )
+
 
     def test_recency_trust_denies_system_paths_even_when_fresh(self, tmp_path, monkeypatch):
         """A freshly-touched file under /etc must NOT be uploaded.

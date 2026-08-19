@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    merge_pending_message_event,
+    pop_pending_message_event,
+)
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
 
@@ -206,10 +211,61 @@ def test_pending_merge_never_inherits_another_senders_authorization():
     merge_pending_message_event(pending, session_key, first, merge_text=True)
     merge_pending_message_event(pending, session_key, second, merge_text=True)
 
-    assert pending[session_key].source.user_id == "B"
-    assert pending[session_key].media_urls == ["/b.png"], (
-        "B 的内容不能并入 A 的 MessageEvent 后借用 A 的授权身份"
+    first_out = pop_pending_message_event(pending, session_key)
+    second_out = pop_pending_message_event(pending, session_key)
+    assert first_out.source.user_id == "A" and first_out.media_urls == ["/a.png"]
+    assert second_out.source.user_id == "B" and second_out.media_urls == ["/b.png"]
+    assert session_key not in pending
+
+
+def test_cross_sender_fifo_and_queue_overflow_do_not_overwrite_each_other():
+    runner = _make_runner()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    source_a = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="group", chat_type="group", user_id="A",
     )
+    source_b = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="group", chat_type="group", user_id="B",
+    )
+    session_key = build_session_key(source_a)
+    a = MessageEvent(text="A", message_type=MessageType.TEXT, source=source_a)
+    b = MessageEvent(text="B", message_type=MessageType.TEXT, source=source_b)
+    c = MessageEvent(text="C", message_type=MessageType.TEXT, source=source_a)
+    merge_pending_message_event(adapter._pending_messages, session_key, a)
+    merge_pending_message_event(adapter._pending_messages, session_key, b)
+    runner._session_state(session_key).conversation.queued_events.append(c)
+
+    first = pop_pending_message_event(adapter._pending_messages, session_key)
+    first = runner._promote_queued_event(session_key, adapter, first)
+    second = pop_pending_message_event(adapter._pending_messages, session_key)
+    second = runner._promote_queued_event(session_key, adapter, second)
+    third = runner._promote_queued_event(
+        session_key, adapter,
+        pop_pending_message_event(adapter._pending_messages, session_key),
+    )
+
+    assert [first.text, second.text, third.text] == ["A", "C", "B"]
+
+
+def test_same_sender_head_replacement_preserves_cross_sender_tail():
+    pending = {}
+    source_a = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="A",
+    )
+    source_b = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="B",
+    )
+    session_key = build_session_key(source_a)
+    a1 = MessageEvent(text="A1", message_type=MessageType.TEXT, source=source_a)
+    b = MessageEvent(text="B", message_type=MessageType.TEXT, source=source_b)
+    a2 = MessageEvent(text="A2", message_type=MessageType.TEXT, source=source_a)
+
+    merge_pending_message_event(pending, session_key, a1, merge_text=False)
+    merge_pending_message_event(pending, session_key, b, merge_text=False)
+    merge_pending_message_event(pending, session_key, a2, merge_text=False)
+
+    assert pop_pending_message_event(pending, session_key).text == "A2"
+    assert pop_pending_message_event(pending, session_key).text == "B"
 
 
 @pytest.mark.asyncio

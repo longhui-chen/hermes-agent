@@ -14,7 +14,7 @@ from agent.credential_broker import (
 )
 
 
-def _serve_once(path, response, *, purpose="agentcomputer"):
+def _serve_once(path, response, *, purpose="agentcomputer", expected=None):
     ready = threading.Event()
 
     def run():
@@ -26,10 +26,13 @@ def _serve_once(path, response, *, purpose="agentcomputer"):
             with connection:
                 size = struct.unpack(">I", connection.recv(4))[0]
                 request = json.loads(connection.recv(size))
-                assert request == {
+                expected_request = {
                     "agent_id": "agent-1",
                     "purpose": purpose,
                 }
+                if expected:
+                    expected_request.update(expected)
+                assert request == expected_request
                 payload = json.dumps(response, separators=(",", ":")).encode()
                 connection.sendall(struct.pack(">I", len(payload)) + payload)
 
@@ -53,8 +56,14 @@ def test_request_app_auto_refresh_token_uses_dedicated_purpose():
     with tempfile.TemporaryDirectory(prefix="acb-", dir="/tmp") as directory:
         path = Path(directory) / "credential.sock"
         token = "b" * 64
-        thread = _serve_once(path, {"token": token}, purpose="app-auto-refresh")
-        assert request_app_auto_refresh_token("agent-1", socket_path=path) == token
+        binding = {
+            "operation_digest": "a" * 64,
+            "owner_agent_id": "agent-1",
+            "turn_id": "turn-1",
+            "session_id": "session-1",
+        }
+        thread = _serve_once(path, {"token": token}, purpose="app-auto-refresh", expected=binding)
+        assert request_app_auto_refresh_token("agent-1", socket_path=path, **binding) == token
         thread.join(timeout=2)
         assert not thread.is_alive()
 

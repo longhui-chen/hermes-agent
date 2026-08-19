@@ -145,7 +145,7 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
-LINE_REQUEST_CACHE_MAX_CHARS = 50_000
+LINE_REQUEST_CACHE_MAX_TOTAL_CHARS = 8_000_000
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -458,13 +458,15 @@ class RequestCache:
         ttl_seconds: int = 3600,
         pending_ttl_seconds: int = 86400,
         max_entries: int = 128,
+        max_total_chars: int = LINE_REQUEST_CACHE_MAX_TOTAL_CHARS,
     ) -> None:
         self._entries: Dict[str, _CacheEntry] = {}
         self._ttl = ttl_seconds
         self._pending_ttl = pending_ttl_seconds
-        # 128 × 50k 字符 × Python 最坏 4 bytes/char ≈ 24.4 MiB payload；
-        # 达到上限时不发新按钮，正常回复仍会走 push。
+        # 8M 字符 × Python 最坏 4 bytes/char ≈ 30.5 MiB payload；超预算的
+        # 单条答案不缓存，调用方改走完整 push，不能静默截尾。
         self._max_entries = max(1, max_entries)
+        self._max_total_chars = max(1, max_total_chars)
 
     def register_pending(self, chat_id: str) -> Optional[str]:
         self.prune()
@@ -481,16 +483,22 @@ class RequestCache:
     def delete(self, request_id: str) -> None:
         self._entries.pop(request_id, None)
 
-    def set_ready(self, request_id: str, payload: Any) -> None:
+    def set_ready(self, request_id: str, payload: Any) -> bool:
         entry = self.get(request_id)
         if entry is None or entry.state is not State.PENDING:
-            return
-        entry.state = State.READY
-        entry.payload = (
-            str(payload)[:LINE_REQUEST_CACHE_MAX_CHARS]
-            if payload is not None else None
+            return False
+        rendered = str(payload) if payload is not None else None
+        current_chars = sum(
+            len(str(item.payload))
+            for item in self._entries.values()
+            if item.payload is not None and item is not entry
         )
+        if rendered is not None and current_chars + len(rendered) > self._max_total_chars:
+            return False
+        entry.state = State.READY
+        entry.payload = rendered
         entry.updated_at = time.time()
+        return True
 
     def set_error(self, request_id: str, message: str) -> None:
         entry = self.get(request_id)
@@ -521,7 +529,7 @@ class RequestCache:
         entry = self.get(request_id)
         if entry is not None and entry.state is State.DELIVERING:
             if payload is not None:
-                entry.payload = str(payload)[:LINE_REQUEST_CACHE_MAX_CHARS]
+                entry.payload = str(payload)
             entry.state = State.READY
             entry.updated_at = time.time()
 
@@ -925,6 +933,7 @@ class LineAdapter(BasePlatformAdapter):
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
         self._media_temp_paths: Set[str] = set()
         self._media_temp_sizes: Dict[str, int] = {}
+        self._media_temp_pools: Dict[str, str] = {}
         self._media_expiry_handles: Dict[str, asyncio.TimerHandle] = {}
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
 
@@ -1060,6 +1069,7 @@ class LineAdapter(BasePlatformAdapter):
                 pass
         self._media_temp_paths.clear()
         self._media_temp_sizes.clear()
+        self._media_temp_pools.clear()
         self._media_tokens.clear()
 
         if self._lock_key:
@@ -1427,8 +1437,10 @@ class LineAdapter(BasePlatformAdapter):
         if pending_rid:
             entry = self._cache.get(pending_rid)
             if entry is not None and entry.state is State.PENDING:
-                self._cache.set_ready(pending_rid, content)
-                return SendResult(success=True, message_id=pending_rid)
+                if self._cache.set_ready(pending_rid, content):
+                    return SendResult(success=True, message_id=pending_rid)
+                self._pending_buttons.pop(chat_id, None)
+                self._cache.delete(pending_rid)
             # READY/ERROR/DELIVERED 属于上一 turn；不能让旧按钮吞掉新答案。
             self._pending_buttons.pop(chat_id, None)
 
@@ -1605,6 +1617,7 @@ class LineAdapter(BasePlatformAdapter):
         cleanup: bool = False,
         max_count: Optional[int] = None,
         max_total_bytes: Optional[int] = None,
+        pool: str = "image",
     ) -> Optional[str]:
         """Register a local file for HTTPS serving; return the URL token."""
         # Evict expired tokens first.
@@ -1627,6 +1640,7 @@ class LineAdapter(BasePlatformAdapter):
                 incoming_bytes,
                 max_count=max_count,
                 max_total_bytes=max_total_bytes,
+                pool=pool,
             ):
                 logger.warning(
                     "LINE: image snapshot capacity full; rejecting new snapshot "
@@ -1642,6 +1656,7 @@ class LineAdapter(BasePlatformAdapter):
         if cleanup:
             self._media_temp_paths.add(resolved)
             self._media_temp_sizes[resolved] = incoming_bytes
+            self._media_temp_pools[resolved] = pool
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1658,15 +1673,20 @@ class LineAdapter(BasePlatformAdapter):
         *,
         max_count: Optional[int] = None,
         max_total_bytes: Optional[int] = None,
+        pool: str = "image",
     ) -> bool:
         max_count = LINE_IMAGE_SNAPSHOT_MAX_COUNT if max_count is None else max_count
         max_total_bytes = (
             LINE_IMAGE_SNAPSHOT_MAX_TOTAL_BYTES
             if max_total_bytes is None else max_total_bytes
         )
+        pool_paths = {
+            path for path, path_pool in self._media_temp_pools.items()
+            if path_pool == pool
+        }
         return (
-            len(self._media_temp_sizes) < max_count
-            and sum(self._media_temp_sizes.values()) + incoming_bytes
+            len(pool_paths) < max_count
+            and sum(self._media_temp_sizes[path] for path in pool_paths) + incoming_bytes
             <= max_total_bytes
         )
 
@@ -1681,6 +1701,7 @@ class LineAdapter(BasePlatformAdapter):
         if path in self._media_temp_paths:
             self._media_temp_paths.discard(path)
             self._media_temp_sizes.pop(path, None)
+            self._media_temp_pools.pop(path, None)
             try:
                 os.unlink(path)
             except OSError:
@@ -1962,6 +1983,7 @@ class LineAdapter(BasePlatformAdapter):
             size,
             max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
             max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
         ):
             return SendResult(
                 success=False,
@@ -1975,6 +1997,7 @@ class LineAdapter(BasePlatformAdapter):
             cleanup=True,
             max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
             max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
         )
         if token is None:
             return SendResult(
@@ -2027,6 +2050,7 @@ class LineAdapter(BasePlatformAdapter):
             video_size,
             max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
             max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
         ):
             return SendResult(
                 success=False, error="LINE video snapshot capacity is full",
@@ -2082,6 +2106,7 @@ class LineAdapter(BasePlatformAdapter):
             cleanup=True,
             max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
             max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
         )
         if video_token is None:
             self._discard_media_token(preview_token)

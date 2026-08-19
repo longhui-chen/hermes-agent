@@ -898,9 +898,11 @@ DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
 MEDIA_CACHE_MAX_TOTAL_BYTES = 4 * DEFAULT_INBOUND_MEDIA_MAX_BYTES
 MEDIA_CACHE_MAX_FILES = 1024
 MEDIA_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
-# 活跃缓存整个 24 小时 TTL 内不做容量淘汰；预算满时拒绝新附件，避免
-# pending/长任务仍引用的路径被后续会话挤掉。
-MEDIA_CACHE_EVICTION_GRACE_SECONDS = MEDIA_CACHE_MAX_AGE_SECONDS
+# 24 小时是低流量场景的保留期，不是容量满后停止接收附件的理由。当前
+# message 路径在写入后短时间内最可能仍被消费；10 分钟与既有的媒体交付
+# recency 窗口一致。超过该宽限期的条目按 LRU 让位，避免 1024 个文件或
+# 512 MiB 在一天内耗尽后把所有渠道的新附件拒绝到次日。
+MEDIA_CACHE_EVICTION_GRACE_SECONDS = 10 * 60
 _MEDIA_CACHE_WRITE_LOCK = threading.Lock()
 # 默认单附件 128 MiB × 4 = 512 MiB 最大同时读体预算；按 event loop
 # 分 semaphore，避免测试/嵌入式多 loop 复用 asyncio primitive。
@@ -1568,7 +1570,19 @@ def _profile_cache_roots() -> List[Path]:
 
 
 def _kanban_attachment_roots() -> List[Path]:
-    """Return durable Kanban attachment roots without importing kanban_db."""
+    """Return the canonical active Kanban attachment root."""
+    try:
+        # ``attachments_root`` owns the board resolution chain: explicit root
+        # → env board → ``kanban/current`` → default. Duplicating only the env
+        # branch here made a named board selected by ``boards switch`` lose its
+        # durable attachments under strict media delivery.
+        from hermes_cli.kanban_db import attachments_root
+
+        return [attachments_root()]
+    except Exception:
+        # Keep the legacy default-root fallback available if Kanban's optional
+        # module cannot load during early startup.
+        pass
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
     if override:
         return [Path(override).expanduser()]
@@ -2797,9 +2811,11 @@ def merge_pending_message_event(
             getattr(incoming_source, "profile", None),
         )
         if existing_sender != incoming_sender:
-            # 共享群 session 不能把 B 的内容并进 A 的 MessageEvent；替换后
-            # drain 会按 B 的真实 source 重新走共享鉴权。
-            pending_messages[session_key] = event
+            # 共享群 session 不能把 B 的内容并进 A 的 MessageEvent；挂到
+            # A 的 FIFO 尾部，drain 后逐条按各自 source 重新走共享鉴权。
+            queue = list(getattr(existing, "_gateway_pending_event_queue", []))
+            queue.append(event)
+            setattr(existing, "_gateway_pending_event_queue", queue)
             return
 
         def _aligned_media_types(item: MessageEvent) -> List[str]:
@@ -2850,7 +2866,34 @@ def merge_pending_message_event(
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
 
+        queued_after_existing = list(
+            getattr(existing, "_gateway_pending_event_queue", [])
+        )
+        if queued_after_existing:
+            setattr(event, "_gateway_pending_event_queue", queued_after_existing)
+        pending_messages[session_key] = event
+        return
+
     pending_messages[session_key] = event
+
+
+def pop_pending_message_event(
+    pending_messages: Dict[str, MessageEvent],
+    session_key: str,
+) -> Optional[MessageEvent]:
+    """FIFO pop；跨发送者事件保持各自 MessageEvent/source。"""
+    event = pending_messages.pop(session_key, None)
+    if event is None:
+        return None
+    queue = list(getattr(event, "_gateway_pending_event_queue", []))
+    if hasattr(event, "_gateway_pending_event_queue"):
+        delattr(event, "_gateway_pending_event_queue")
+    if queue:
+        next_event = queue.pop(0)
+        if queue:
+            setattr(next_event, "_gateway_pending_event_queue", queue)
+        pending_messages[session_key] = next_event
+    return event
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -6166,7 +6209,7 @@ class BasePlatformAdapter(ABC):
         command was running — spawns a fresh processing task for it.
         """
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = pop_pending_message_event(self._pending_messages, session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -7103,7 +7146,9 @@ class BasePlatformAdapter(ABC):
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+                pending_event = pop_pending_message_event(
+                    self._pending_messages, session_key,
+                )
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -7226,7 +7271,9 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = pop_pending_message_event(
+                self._pending_messages, session_key,
+            )
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -7242,6 +7289,13 @@ class BasePlatformAdapter(ABC):
                     # (#17758 follow-up: prevents the create_task path
                     # from racing with itself across the in-band/finally
                     # boundary).
+                    staged = self._pending_messages.pop(session_key, None)
+                    if staged is not None:
+                        queue = list(getattr(
+                            late_pending, "_gateway_pending_event_queue", [],
+                        ))
+                        queue.insert(0, staged)
+                        setattr(late_pending, "_gateway_pending_event_queue", queue)
                     self._pending_messages[session_key] = late_pending
                 else:
                     logger.debug(
@@ -7374,7 +7428,7 @@ class BasePlatformAdapter(ABC):
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        return pop_pending_message_event(self._pending_messages, session_key)
     
     def build_source(
         self,

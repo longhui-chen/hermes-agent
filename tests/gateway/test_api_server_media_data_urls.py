@@ -60,6 +60,15 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         out = _resolve_media_to_data_urls("media:/nonexistent/private.png")
         self.assertNotIn("/nonexistent/private.png", out)
 
+    def test_extensionless_host_path_is_never_exposed(self):
+        out = _resolve_media_to_data_urls("MEDIA:/etc/passwd")
+        self.assertNotIn("/etc/passwd", out)
+        self.assertIn("Couldn't deliver", out)
+
+    def test_natural_language_media_label_is_untouched(self):
+        text = "Preferred media: print and Media: Reuters"
+        self.assertEqual(_resolve_media_to_data_urls(text), text)
+
 
 def test_stream_filter_handles_marker_split_across_deltas(tmp_path):
     image = tmp_path / "stream.png"

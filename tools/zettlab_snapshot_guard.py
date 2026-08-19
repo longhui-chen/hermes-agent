@@ -1145,6 +1145,7 @@ _TRUSTED_VIDEO_EDIT_SCRIPT_NAMES = frozenset({
     "workflow_state.py",
     "cloud_render_business.py",
     "normalize.py",
+    "proactive_video.py",
 })
 _TRUSTED_VIDEO_EDIT_WRITE_OPTIONS = frozenset({
     "--output",
@@ -1153,6 +1154,10 @@ _TRUSTED_VIDEO_EDIT_WRITE_OPTIONS = frozenset({
     "--workflow-state",
 })
 _TRUSTED_CAMERA_SCRIPT_NAME = "camera_connector.py"
+_TRUSTED_PRINTER3D_SCRIPT_NAMES = frozenset({
+    "printer3d_connector.py",
+    "printer3d_control.py",
+})
 
 
 def _trusted_video_edit_write_paths(
@@ -1257,6 +1262,37 @@ def _trusted_camera_write_paths(command: str) -> Optional[list[str]]:
     return []
 
 
+def _trusted_printer3d_write_paths(command: str) -> Optional[list[str]]:
+    """Return no user-file writes for an exact trusted printer action.
+
+    The read and control helpers only exchange bounded JSON with the loopback
+    Printer3DService.  They never receive a filesystem path, and the control
+    argv is restricted to pause/resume/cancel plus opaque IDs.  Reuse the
+    runtime parser so wrappers, unsupported actions, and injected shell syntax
+    retain the generic cwd snapshot path.
+    """
+    if not any(name in command for name in _TRUSTED_PRINTER3D_SCRIPT_NAMES):
+        return None
+    try:
+        from tools.terminal_tool import _parse_printer3d_runtime_command
+
+        parsed = _parse_printer3d_runtime_command(command)
+    except Exception as exc:
+        logger.debug(
+            "zettlab snapshot guard: trusted printer3d parse unavailable: %s",
+            exc,
+        )
+        return None
+    if (
+        parsed is None
+        or len(parsed.argv) < 2
+        or os.path.basename(str(parsed.argv[1]))
+        not in _TRUSTED_PRINTER3D_SCRIPT_NAMES
+    ):
+        return None
+    return []
+
+
 def _extract_v4a_paths(patch_body: str) -> list[str]:
     """按 patch_parser 的等价规则抽取 V4A patch 触达的所有路径。"""
     paths: list[str] = []
@@ -1288,6 +1324,9 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
 
     if tool_name == "terminal":
         command = str(arguments.get("command") or "")
+        trusted_printer3d_paths = _trusted_printer3d_write_paths(command)
+        if trusted_printer3d_paths is not None:
+            return trusted_printer3d_paths
         trusted_camera_paths = _trusted_camera_write_paths(command)
         if trusted_camera_paths is not None:
             return trusted_camera_paths

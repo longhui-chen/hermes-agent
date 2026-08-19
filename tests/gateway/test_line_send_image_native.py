@@ -55,6 +55,44 @@ def _adapter(monkeypatch):
 
 class TestLineSendImageNative:
     @pytest.mark.asyncio
+    async def test_slow_cache_over_budget_pushes_full_answer_instead_of_truncating(
+        self, monkeypatch,
+    ):
+        ad = _adapter(monkeypatch)
+        ad._cache = _line.RequestCache(max_total_chars=3)
+        ad._client.push = AsyncMock()
+        rid = ad._cache.register_pending("C1")
+        ad._pending_buttons["C1"] = rid
+
+        result = await ad.send("C1", "完整答案")
+
+        assert result.success and ad._client.push.await_count == 1
+        assert "C1" not in ad._pending_buttons and ad._cache.get(rid) is None
+
+    @pytest.mark.asyncio
+    async def test_postback_pushes_chunks_beyond_reply_api_batch(self, monkeypatch):
+        ad = _adapter(monkeypatch)
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        rid = ad._cache.register_pending("C1")
+        payload = "x" * (_line.LINE_SAFE_BUBBLE_CHARS * 6)
+        assert ad._cache.set_ready(rid, payload)
+        ad._pending_buttons["C1"] = rid
+        event = {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "C1", "userId": "U1"},
+            "postback": {"data": _line.json.dumps({
+                "action": "show_response", "request_id": rid,
+            })},
+        }
+
+        await ad._handle_postback_event(event)
+
+        assert ad._client.reply.await_count == 1
+        assert ad._client.push.await_count >= 1
+        assert ad._cache.get(rid).state is _line.State.DELIVERED
+
+    @pytest.mark.asyncio
     async def test_voice_uses_snapshot_that_survives_caller_cleanup(
         self, monkeypatch, tmp_path,
     ):
@@ -502,6 +540,14 @@ class TestLineSendImageNative:
 
 
 class TestLineImageSnapshotBudget:
+    def test_large_av_snapshot_does_not_consume_image_preview_pool(
+        self, monkeypatch,
+    ):
+        ad = _adapter(monkeypatch)
+        ad._media_temp_sizes["/av.mp4"] = 100 * 1024 * 1024
+        ad._media_temp_pools["/av.mp4"] = "av"
+
+        assert ad._has_media_snapshot_capacity(512 * 1024, pool="image")
     def test_limits_follow_repo_precedent_and_real_image_measurement(self):
         count = getattr(_line, "LINE_IMAGE_SNAPSHOT_MAX_COUNT", None)
         total = getattr(_line, "LINE_IMAGE_SNAPSHOT_MAX_TOTAL_BYTES", None)

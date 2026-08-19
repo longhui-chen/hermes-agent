@@ -179,6 +179,27 @@ class TestSharedMediaCacheBudget:
 
         assert inflight.exists(), "容量满时不得删除仍在 24 小时 TTL 内的附件"
 
+    def test_capacity_evicts_idle_file_after_short_grace(self, monkeypatch):
+        """容量回收不能被 24 小时保留期永久禁用。"""
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_CACHE_MAX_TOTAL_BYTES", 6,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_CACHE_MAX_FILES", 2,
+            raising=False,
+        )
+        idle = Path(cache_document_from_bytes(b"1111", "idle.bin"))
+        stale_for_grace = time.time() - 10 * 60 - 1
+        os.utime(idle, (stale_for_grace, stale_for_grace))
+
+        incoming = Path(cache_document_from_bytes(b"2222", "incoming.bin"))
+
+        assert incoming.exists()
+        assert not idle.exists(), (
+            "超过短宽限期的空闲缓存必须让位；不能让 24 小时 TTL 变成全局入口拒绝"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestSupportedDocumentTypes
