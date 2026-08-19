@@ -526,6 +526,37 @@ def test_accepted_action_survives_a_concurrent_replay_deny():
     )
 
 
+# 同一个 turn_id 上的回执是**单调**的：接管过就接管过了。双击 / 传输重发会让两个
+# 请求复用同一个 turn_id，先到的拿 accepted、后到的必然判无效；后者把前者盖掉之后，
+# 先结束的那个请求会取走 rejected，客户端把一次已经接管的创建显示成失败，用户重来
+# 一次就是重复创建。
+def test_pending_receipt_is_monotonic_across_concurrent_replays():
+    plugin = _load_plugin()
+    state = {"pending_action_results": __import__("collections").OrderedDict()}
+    accepted = plugin._ActionReceipt("proposal-1", "create", "accepted")
+    rejected = plugin._ActionReceipt(
+        "proposal-1", "create", "rejected", "proposal_not_actionable"
+    )
+
+    plugin._store_pending_action_result_locked(state, "shared-turn", accepted)
+    plugin._store_pending_action_result_locked(state, "shared-turn", rejected)
+    stored = state["pending_action_results"][plugin._pending_turn_key("shared-turn")]
+    assert stored.status == "accepted", "重放请求的 rejected 盖掉了已经接管的 accepted"
+
+    # 反向：还没接管过时，rejected 正常写入——单调只保护 accepted。
+    plugin._store_pending_action_result_locked(state, "other-turn", rejected)
+    assert (
+        state["pending_action_results"][plugin._pending_turn_key("other-turn")].status
+        == "rejected"
+    )
+    # 反向：accepted 可以覆盖先前的 rejected（真正的接管后到）。
+    plugin._store_pending_action_result_locked(state, "other-turn", accepted)
+    assert (
+        state["pending_action_results"][plugin._pending_turn_key("other-turn")].status
+        == "accepted"
+    )
+
+
 # 票只给 create。dismiss / mute_session / unmute_session 同样拿到 accepted 回执，
 # 但用户表达的恰恰是「别建」或「只改偏好」——给它们发票等于模型无视内部提示去调
 # create 时闸门主动让路。
