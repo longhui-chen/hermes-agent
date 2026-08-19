@@ -55,6 +55,69 @@ def _adapter(monkeypatch):
 
 class TestLineSendImageNative:
     @pytest.mark.asyncio
+    async def test_slow_cache_over_budget_pushes_full_answer_instead_of_truncating(
+        self, monkeypatch,
+    ):
+        ad = _adapter(monkeypatch)
+        ad._cache = _line.RequestCache(max_total_chars=3)
+        ad._client.push = AsyncMock()
+        rid = ad._cache.register_pending("C1")
+        ad._pending_buttons["C1"] = rid
+
+        result = await ad.send("C1", "完整答案")
+
+        assert result.success and ad._client.push.await_count == 1
+        assert "C1" not in ad._pending_buttons and ad._cache.get(rid) is None
+
+    @pytest.mark.asyncio
+    async def test_postback_pushes_chunks_beyond_reply_api_batch(self, monkeypatch):
+        ad = _adapter(monkeypatch)
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        rid = ad._cache.register_pending("C1")
+        payload = "x" * (_line.LINE_SAFE_BUBBLE_CHARS * 6)
+        assert ad._cache.set_ready(rid, payload)
+        ad._pending_buttons["C1"] = rid
+        event = {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "C1", "userId": "U1"},
+            "postback": {"data": _line.json.dumps({
+                "action": "show_response", "request_id": rid,
+            })},
+        }
+
+        await ad._handle_postback_event(event)
+
+        assert ad._client.reply.await_count == 1
+        assert ad._client.push.await_count >= 1
+        assert ad._cache.get(rid).state is _line.State.DELIVERED
+
+    @pytest.mark.asyncio
+    async def test_voice_uses_snapshot_that_survives_caller_cleanup(
+        self, monkeypatch, tmp_path,
+    ):
+        ad = _adapter(monkeypatch)
+        ad.public_base_url = "https://tunnel.example.com"
+        ad._send_messages = AsyncMock(return_value=_line.SendResult(success=True))
+        original = tmp_path / "tts.mp3"
+        original.write_bytes(b"ID3-voice")
+
+        result = await ad.send_voice("C1", str(original))
+
+        assert result.success
+        (token, (snapshot, _expiry)), = ad._media_tokens.items()
+        assert Path(snapshot).resolve() != original.resolve()
+        original.write_bytes(b"ID3-changed-after-send")
+        assert Path(snapshot).read_bytes() == b"ID3-voice", (
+            "快照必须冻结字节，不能只是指向同一 inode 的硬链接"
+        )
+        original.unlink()
+        assert Path(snapshot).read_bytes() == b"ID3-voice", (
+            "send_voice 返回后调用方会删 TTS 原文件，LINE 回拉快照必须仍可读"
+        )
+        ad._discard_media_token(token)
+
+    @pytest.mark.asyncio
     async def test_force_push_preserves_fresh_reply_token_for_next_turn(self, monkeypatch):
         ad = _adapter(monkeypatch)
         ad._client.push = AsyncMock()
@@ -477,6 +540,14 @@ class TestLineSendImageNative:
 
 
 class TestLineImageSnapshotBudget:
+    def test_large_av_snapshot_does_not_consume_image_preview_pool(
+        self, monkeypatch,
+    ):
+        ad = _adapter(monkeypatch)
+        ad._media_temp_sizes["/av.mp4"] = 100 * 1024 * 1024
+        ad._media_temp_pools["/av.mp4"] = "av"
+
+        assert ad._has_media_snapshot_capacity(512 * 1024, pool="image")
     def test_limits_follow_repo_precedent_and_real_image_measurement(self):
         count = getattr(_line, "LINE_IMAGE_SNAPSHOT_MAX_COUNT", None)
         total = getattr(_line, "LINE_IMAGE_SNAPSHOT_MAX_TOTAL_BYTES", None)
@@ -719,13 +790,13 @@ class TestLineOutboundSiblingsUnchanged:
         ad = _adapter(monkeypatch)
         ad.public_base_url = "https://tunnel.example.com"
         video = tmp_path / "clip.mp4"
-        video.write_bytes(b"video")
+        video.write_bytes(b"\x00\x00\x00\x18ftypmp42video")
         registered = []
         real_register = ad._register_media
 
-        def capture_register(path, *, cleanup=False):
+        def capture_register(path, *, cleanup=False, **kwargs):
             registered.append((path, cleanup))
-            return real_register(path, cleanup=cleanup)
+            return real_register(path, cleanup=cleanup, **kwargs)
 
         monkeypatch.setattr(ad, "_register_media", capture_register)
         if raises:
@@ -739,9 +810,13 @@ class TestLineOutboundSiblingsUnchanged:
             result = await ad.send_video("C1", str(video))
             assert not result.success
 
-        preview_paths = [Path(path) for path, cleanup in registered if cleanup]
-        assert len(preview_paths) == 1, "夹具必须真的注册自动 video preview snapshot"
+        snapshot_paths = [Path(path) for path, cleanup in registered if cleanup]
+        assert len(snapshot_paths) == 2, (
+            "夹具必须真的注册 video 与自动 preview 两份异步回拉快照"
+        )
         assert not ad._media_tokens, "视频未送达时 video/preview token 都必须释放"
-        assert not ad._media_temp_paths and not preview_paths[0].exists(), (
-            "视频未送达时自动 preview 不能继续占 snapshot 池"
+        assert not ad._media_temp_paths and not any(
+            path.exists() for path in snapshot_paths
+        ), (
+            "视频未送达时 video/preview 都不能继续占 snapshot 池"
         )

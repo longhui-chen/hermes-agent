@@ -116,6 +116,37 @@ async def test_audio_attachment_context_note_format():
     assert "ask the user what they'd like" not in result.lower()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", [MessageType.DOCUMENT, MessageType.PHOTO])
+async def test_mp3_in_mixed_message_reaches_agent_as_file_not_stt(
+    tmp_path, message_type,
+):
+    runner = _make_runner(stt_enabled=True)
+    source = SessionSource(platform=Platform("teams"), chat_id="1", chat_type="dm")
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"ID3-song")
+    event = MessageEvent(
+        text="请处理附件",
+        message_type=message_type,
+        source=source,
+        media_urls=[str(song)],
+        media_types=["audio/mpeg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=AssertionError("普通 MP3 附件不能自动进 STT"),
+    ), patch(
+        "tools.credential_files.to_agent_visible_cache_path",
+        side_effect=lambda p: p,
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event, source=source, history=[],
+        )
+
+    assert str(song) in result and "audio file attachment" in result.lower()
+
+
 # ---------------------------------------------------------------------------
 # 3. STT disabled still results in no transcription for audio file attachments
 # ---------------------------------------------------------------------------
@@ -124,4 +155,3 @@ async def test_audio_attachment_context_note_format():
 # ---------------------------------------------------------------------------
 # 4. Telegram gateway: msg.audio → MessageType.AUDIO (not VOICE)
 # ---------------------------------------------------------------------------
-

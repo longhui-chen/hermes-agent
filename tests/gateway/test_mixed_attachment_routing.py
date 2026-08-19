@@ -72,3 +72,20 @@ def test_placeholder_document_in_photo_message_is_not_an_image(tmp_path):
     assert f"[User sent a file: {md}]" in out
 
 
+def test_parameterized_mixed_case_image_mime_reaches_model_as_image(tmp_path):
+    """Matrix/Teams 可带大小写和参数；模型最终仍必须看到 image，而不是 file。"""
+    image = tmp_path / "actual.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    evt = _evt(
+        [str(image)],
+        [" Image/PNG; charset=binary "],
+        MessageType.DOCUMENT,
+    )
+
+    assert evt.media_types[0] != "image/png", "夹具必须真的进入未规范化 MIME 分支"
+    out = _build_media_placeholder(evt)
+
+    assert f"[User sent an image: {image}]" in out, (
+        "合法的大小写/带参数 MIME 不能让图片退化成普通文件，导致模型看不到像素"
+    )
+

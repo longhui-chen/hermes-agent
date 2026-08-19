@@ -98,6 +98,22 @@ class TestTheConsumerDispatchesPerAttachment:
         assert _event_media_is_image(ev, 0) and not _event_media_is_image(ev, 1)
         assert _event_media_is_audio(ev, 1) and not _event_media_is_audio(ev, 0)
 
+    def test_mime_tokens_are_normalized_once_for_all_media_gates(self):
+        from gateway.run import (
+            _event_media_is_audio,
+            _event_media_is_video,
+            _event_media_type_at,
+        )
+
+        ev = self._event([
+            " Audio/OGG; codecs=opus ",
+            " VIDEO/MP4; charset=binary ",
+        ])
+        assert _event_media_type_at(ev, 0) == "audio/ogg"
+        assert _event_media_type_at(ev, 1) == "video/mp4"
+        assert _event_media_is_audio(ev, 0)
+        assert _event_media_is_video(ev, 1)
+
     def test_a_missing_per_attachment_mime_falls_back_to_the_message_type(self):
         """🔴 **必须保持不变**:拿不到逐附件 MIME 时仍落回消息级 —— 那是既有兜底。"""
         from gateway.platforms.base import MessageType

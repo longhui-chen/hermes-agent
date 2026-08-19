@@ -164,6 +164,12 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
+# 100 条 LRU 之外再加总字节硬顶；否则 previous_response_id 链会在每条记录
+# 重复整段历史，带 data URI 时按三角形速度占满磁盘。
+MAX_RESPONSE_STORE_BYTES = 512 * 1024 * 1024
+RESPONSE_STORE_FAILURE_MESSAGE = (
+    "Response could not be stored. Retry with store=false or start a new conversation."
+)
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
@@ -1724,8 +1730,14 @@ class ResponseStore:
     if the on-disk path is unavailable.
     """
 
-    def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
+    def __init__(
+        self,
+        max_size: int = MAX_STORED_RESPONSES,
+        db_path: str = None,
+        max_bytes: int = MAX_RESPONSE_STORE_BYTES,
+    ):
         self._max_size = max_size
+        self._max_bytes = max(1, int(max_bytes))
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -1810,36 +1822,83 @@ class ResponseStore:
             self._conn.commit()
             return None
 
-    def put(self, response_id: str, data: Dict[str, Any]) -> None:
-        """Store a response, evicting the oldest if at capacity."""
+    @staticmethod
+    def _json_upper_bound(value: Any, *, stop_after: int) -> int:
+        """Conservative JSON byte bound without allocating the serialized copy."""
+        def string_bytes(text: str) -> int:
+            size = 2
+            for char in text:
+                code = ord(char)
+                if char in {'"', "\\"} or code < 0x20:
+                    size += 6
+                elif code <= 0x7F:
+                    size += 1
+                elif code <= 0xFFFF:
+                    size += 6
+                else:
+                    size += 12
+            return size
+
+        total = 0
+        stack = [value]
+        while stack and total <= stop_after:
+            item = stack.pop()
+            if item is None or isinstance(item, (bool, int, float)):
+                total += 24
+            elif isinstance(item, str):
+                total += string_bytes(item)
+            elif isinstance(item, dict):
+                total += 2 + 2 * len(item)
+                for key, child in item.items():
+                    total += string_bytes(str(key))
+                    stack.append(child)
+            elif isinstance(item, (list, tuple, set)):
+                total += 2 + len(item)
+                stack.extend(item)
+            else:
+                total += string_bytes(str(item))
+        return total
+
+    def put(self, response_id: str, data: Dict[str, Any]) -> bool:
+        """Store a response within count/byte caps; False means not persisted."""
+        if self._json_upper_bound(data, stop_after=self._max_bytes) > self._max_bytes:
+            logger.warning("Response %s exceeds response-store byte cap", response_id)
+            return False
+        # ensure_ascii=True guarantees one UTF-8 byte per output character, so
+        # measuring the string is exact and does not allocate a second
+        # response-sized bytes object.
+        payload = json.dumps(data, default=str, ensure_ascii=True)
+        if len(payload) > self._max_bytes:
+            logger.warning("Response %s exceeds response-store byte cap", response_id)
+            return False
         self._conn.execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
+            (response_id, payload, time.time()),
         )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
-        if count > self._max_size:
-            # Collect IDs that will be evicted
-            evict_ids = [
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
-                    (count - self._max_size,),
-                ).fetchall()
-            ]
-            if evict_ids:
-                placeholders = ",".join("?" for _ in evict_ids)
-                # Clear conversation mappings pointing to evicted responses
-                self._conn.execute(
-                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-                # Delete evicted responses
-                self._conn.execute(
-                    f"DELETE FROM responses WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
+        rows = self._conn.execute(
+            "SELECT response_id, length(CAST(data AS BLOB)) "
+            "FROM responses ORDER BY accessed_at ASC"
+        ).fetchall()
+        total_bytes = sum(int(row[1] or 0) for row in rows)
+        evict_ids = []
+        while rows and (
+            len(rows) > self._max_size or total_bytes > self._max_bytes
+        ):
+            response_id_oldest, size_oldest = rows.pop(0)
+            evict_ids.append(response_id_oldest)
+            total_bytes -= int(size_oldest or 0)
+        if evict_ids:
+            placeholders = ",".join("?" for _ in evict_ids)
+            self._conn.execute(
+                f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+                evict_ids,
+            )
+            self._conn.execute(
+                f"DELETE FROM responses WHERE response_id IN ({placeholders})",
+                evict_ids,
+            )
         self._conn.commit()
+        return True
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
@@ -1930,6 +1989,14 @@ _MEDIA_MIME = {
     ".bmp": "image/bmp",
 }
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
+_ANY_MEDIA_TAG_RE = re.compile(
+    r"media:\s*(?:"
+    r"`(?:~/|/|[A-Za-z]:[/\\])[^`\r\n]+`|"
+    r"\"(?:~/|/|[A-Za-z]:[/\\])[^\"\r\n]+\"|"
+    r"'(?:~/|/|[A-Za-z]:[/\\])[^'\r\n]+'|"
+    r"(?:~/|/|[A-Za-z]:[/\\])[^\s\r\n]+)",
+    re.IGNORECASE,
+)
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -1951,7 +2018,7 @@ def _resolve_media_to_data_urls(text: str) -> str:
     process could see was base64-exfiltrated to the API caller if its path
     merely appeared in the model's own final reply text.
     """
-    if not text or "MEDIA:" not in text:
+    if not text or "media:" not in text.lower():
         return text
     import base64
 
@@ -1975,12 +2042,83 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return f"![image](data:{_MEDIA_MIME[suffix]};base64,{b64})"
 
     def _repl(m: "re.Match[str]") -> str:
-        return _to_data_url(m.group("path")) or m.group(0)
+        data_url = _to_data_url(m.group("path"))
+        if data_url:
+            return data_url
+        if validate_media_delivery_path(m.group("path")):
+            return "⚠️ Attachment is available only through native messaging delivery."
+        return "⚠️ Couldn't deliver the attachment."
 
     try:
-        return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+        resolved = MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+        return _ANY_MEDIA_TAG_RE.sub("⚠️ Couldn't deliver the attachment.", resolved)
     except Exception:
-        return text
+        return _ANY_MEDIA_TAG_RE.sub("⚠️ Couldn't deliver the attachment.", text)
+
+
+class _StreamingMediaDeltaFilter:
+    """流式保留最多 5 字符前瞻，绝不把宿主 ``MEDIA:`` 路径发到线外。"""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    @staticmethod
+    def _resolve_segment(segment: str) -> str:
+        resolved = _resolve_media_to_data_urls(segment)
+        if resolved != segment:
+            return resolved
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media, cleaned = BasePlatformAdapter.extract_media(segment)
+        if media:
+            safe_media = BasePlatformAdapter.filter_media_delivery_paths(media)
+            notice = (
+                "⚠️ Attachment is available only in the completed response."
+                if safe_media
+                else "⚠️ Couldn't deliver the attachment."
+            )
+            return f"{cleaned}\n{notice}".strip()
+        return cleaned
+
+    def feed(self, delta: str) -> List[str]:
+        self._buffer += delta
+        return self._drain(final=False)
+
+    def finish(self) -> List[str]:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> List[str]:
+        out: List[str] = []
+        while self._buffer:
+            lower_buffer = self._buffer.lower()
+            marker = lower_buffer.find("media:")
+            if marker < 0:
+                if final:
+                    out.append(self._buffer)
+                    self._buffer = ""
+                else:
+                    keep = 0
+                    for size in range(1, min(5, len(self._buffer)) + 1):
+                        if lower_buffer.endswith("media:"[:size]):
+                            keep = size
+                    if len(self._buffer) > keep:
+                        out.append(self._buffer[:-keep] if keep else self._buffer)
+                        self._buffer = self._buffer[-keep:] if keep else ""
+                break
+            if marker > 0:
+                out.append(self._buffer[:marker])
+                self._buffer = self._buffer[marker:]
+            newline = self._buffer.find("\n")
+            if newline < 0 and not final:
+                break
+            end = len(self._buffer) if newline < 0 else newline
+            segment = self._buffer[:end]
+            out.append(self._resolve_segment(segment))
+            self._buffer = self._buffer[end:]
+            if self._buffer.startswith("\n"):
+                out.append("\n")
+                self._buffer = self._buffer[1:]
+        return [part for part in out if part]
 
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
@@ -5694,6 +5832,7 @@ class APIServerAdapter(BasePlatformAdapter):
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
         seq = 0
+        media_delta_filter = _StreamingMediaDeltaFilter()
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
@@ -5720,7 +5859,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _delta(delta: str) -> None:
             if delta:
-                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+                for safe_delta in media_delta_filter.feed(delta):
+                    _enqueue(
+                        "assistant.delta",
+                        {"message_id": message_id, "delta": safe_delta},
+                    )
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -5752,6 +5895,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
+                for safe_delta in media_delta_filter.finish():
+                    _enqueue(
+                        "assistant.delta",
+                        {"message_id": message_id, "delta": safe_delta},
+                    )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
@@ -6334,6 +6482,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            media_delta_filter = _StreamingMediaDeltaFilter()
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -6344,7 +6493,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the final answer after tool calls.  The SSE loop detects
                 # completion via agent_task.done() instead.
                 if delta is not None:
-                    _stream_q.put(delta)
+                    for safe_delta in media_delta_filter.feed(delta):
+                        _stream_q.put(safe_delta)
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
@@ -6453,7 +6603,12 @@ class APIServerAdapter(BasePlatformAdapter):
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            def _finish_chat_stream(_fut):
+                for safe_delta in media_delta_filter.finish():
+                    _stream_q.put(safe_delta)
+                _stream_q.put(None)
+
+            agent_task.add_done_callback(_finish_chat_stream)
             agent_task.add_done_callback(
                 lambda _fut, key=profile_run_key: self._end_profile_chat_run(key)
             )
@@ -7052,20 +7207,21 @@ class APIServerAdapter(BasePlatformAdapter):
             *,
             conversation_history_snapshot: Optional[List[Dict[str, Any]]] = None,
             session_id_snapshot: Optional[str] = None,
-        ) -> None:
+        ) -> bool:
             if not store:
-                return
+                return True
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
-            self._response_store.put(response_id, {
+            stored = self._response_store.put(response_id, {
                 "response": response_env,
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id_snapshot or session_id,
             })
-            if conversation:
+            if conversation and stored:
                 self._response_store.set_conversation(conversation, response_id)
+            return stored
 
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
@@ -7353,7 +7509,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # delta so Responses clients still receive a live text part.
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
                 if agent_final and not final_text_parts:
-                    await _emit_text_delta(agent_final)
+                    await _emit_text_delta(_resolve_media_to_data_urls(agent_final))
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
@@ -7442,11 +7598,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "role": "assistant",
                         "content": final_response_text or _redact_api_error_text(agent_error),
                     })
-                _persist_response_snapshot(
+                stored = _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
                 )
-                terminal_snapshot_persisted = True
+                terminal_snapshot_persisted = stored
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -7470,16 +7626,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 # here we only propagate a compression-rotated session_id so
                 # previous_response_id chaining resumes the child session.
                 _result_sid = result.get("session_id") if isinstance(result, dict) else None
-                _persist_response_snapshot(
+                stored = _persist_response_snapshot(
                     completed_env,
                     conversation_history_snapshot=full_history,
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
-                terminal_snapshot_persisted = True
-                await _write_event("response.completed", {
-                    "type": "response.completed",
-                    "response": completed_env,
-                })
+                terminal_snapshot_persisted = stored
+                if store and not stored:
+                    failed_env = _envelope("failed")
+                    failed_env["output"] = final_items
+                    failed_env["error"] = {
+                        "message": RESPONSE_STORE_FAILURE_MESSAGE,
+                        "type": "server_error",
+                    }
+                    failed_env["usage"] = completed_env["usage"]
+                    await _write_event("response.failed", {
+                        "type": "response.failed",
+                        "response": failed_env,
+                    })
+                else:
+                    await _write_event("response.completed", {
+                        "type": "response.completed",
+                        "response": completed_env,
+                    })
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
@@ -7684,13 +7853,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # calls in real time.  See _write_sse_responses for details.
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            media_delta_filter = _StreamingMediaDeltaFilter()
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
                 # Forwarding would kill the SSE stream prematurely; the
                 # SSE writer detects completion via agent_task.done().
                 if delta is not None:
-                    _stream_q.put(delta)
+                    for safe_delta in media_delta_filter.feed(delta):
+                        _stream_q.put(safe_delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Queue non-start tool progress events if needed in future.
@@ -7735,7 +7906,12 @@ class APIServerAdapter(BasePlatformAdapter):
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            def _finish_responses_stream(_fut):
+                for safe_delta in media_delta_filter.finish():
+                    _stream_q.put(safe_delta)
+                _stream_q.put(None)
+
+            agent_task.add_done_callback(_finish_responses_stream)
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)
@@ -7860,7 +8036,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
-            self._response_store.put(response_id, {
+            stored = self._response_store.put(response_id, {
                 "response": response_data,
                 "conversation_history": full_history,
                 "instructions": instructions,
@@ -7868,8 +8044,17 @@ class APIServerAdapter(BasePlatformAdapter):
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
-            if conversation:
+            if conversation and stored:
                 self._response_store.set_conversation(conversation, response_id)
+            if not stored:
+                return web.json_response(
+                    _openai_error(
+                        RESPONSE_STORE_FAILURE_MESSAGE,
+                        err_type="server_error",
+                    ),
+                    status=500,
+                    headers={"X-Hermes-Session-Id": _effective_session_id},
+                )
 
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:

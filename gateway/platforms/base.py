@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -46,6 +47,8 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# 与 GatewayRunner 的 busy queue 共用同一硬上限；head event 也计一格。
+PENDING_EVENT_QUEUE_MAX = 32
 # 🔴 **引用租约的等待必须有独立硬期限。**
 # interim 发送在 ``gateway/run.py`` 里已被 ``_INTERIM_SEND_TIMEOUT`` 兜住,
 # 但那只放开了 **agent worker** —— 租约的释放走 ``consume()``,而 ``consume()``
@@ -627,7 +630,7 @@ def proxy_kwargs_for_bot(proxy_url: str | None) -> dict:
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
-                proxy_url,
+                safe_url_for_log(proxy_url),
             )
             return {}
     return {"proxy": proxy_url}
@@ -665,7 +668,7 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
-                proxy_url,
+                safe_url_for_log(proxy_url),
             )
             return {}, {}
         return {}, {"proxy": proxy_url}
@@ -892,6 +895,48 @@ def _resolve_cache_dir(constant_name: str, new_subpath: str, old_name: str) -> P
 # photos/voice notes/short clips while still bounding a hostile upload.
 # ---------------------------------------------------------------------------
 DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+# 共享媒体缓存最多保留 4 个“单附件上限”的总量；四类目录合计计算，
+# ⛔ 不是每类各放 512 MiB。1024 文件是同一预算下的小文件/inode 后门：
+# 512 MiB / 512 KiB = 1024。达到任一上限都淘汰最旧文件。
+MEDIA_CACHE_MAX_TOTAL_BYTES = 4 * DEFAULT_INBOUND_MEDIA_MAX_BYTES
+MEDIA_CACHE_MAX_FILES = 1024
+MEDIA_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+# 24 小时是低流量场景的保留期，不是容量满后停止接收附件的理由。当前
+# message 路径在写入后短时间内最可能仍被消费；10 分钟与既有的媒体交付
+# recency 窗口一致。超过该宽限期的条目按 LRU 让位，避免 1024 个文件或
+# 512 MiB 在一天内耗尽后把所有渠道的新附件拒绝到次日。
+MEDIA_CACHE_EVICTION_GRACE_SECONDS = 10 * 60
+_MEDIA_CACHE_WRITE_LOCK = threading.Lock()
+# 默认单附件 128 MiB × 4 = 512 MiB 最大同时读体预算；按 event loop
+# 分 semaphore，避免测试/嵌入式多 loop 复用 asyncio primitive。
+INBOUND_MEDIA_MAX_CONCURRENT_READS = 4
+_INBOUND_MEDIA_READ_SEMAPHORES: "weakref.WeakKeyDictionary[Any, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+_INBOUND_MEDIA_READ_SEMAPHORES_LOCK = threading.Lock()
+
+
+def _inbound_media_read_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    with _INBOUND_MEDIA_READ_SEMAPHORES_LOCK:
+        semaphore = _INBOUND_MEDIA_READ_SEMAPHORES.get(loop)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(INBOUND_MEDIA_MAX_CONCURRENT_READS)
+            _INBOUND_MEDIA_READ_SEMAPHORES[loop] = semaphore
+        return semaphore
+
+
+@asynccontextmanager
+async def inbound_media_download_permit():
+    """Reserve one media download slot before opening an HTTP response."""
+    semaphore = _inbound_media_read_semaphore()
+    if semaphore.locked():
+        raise ValueError("Inbound media download concurrency limit reached")
+    await semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
 
 
 def get_inbound_media_max_bytes() -> int:
@@ -928,14 +973,109 @@ def validate_inbound_media_size(
     the limit once and reuse it across an incremental read.
     """
     limit = get_inbound_media_max_bytes() if max_bytes is None else max_bytes
-    if limit and size > limit:
+    if limit > 0 and size > limit:
         raise ValueError(
             f"Inbound {media_type} payload is too large "
             f"({size} bytes > {limit} bytes)"
         )
 
 
-async def read_aiohttp_body_with_limit(response, *, media_type: str) -> bytearray:
+def _write_bounded_media_cache_file(filepath: "Path", data: bytes) -> None:
+    """在四类入站媒体缓存的共享字节/文件预算内写一个文件。"""
+    incoming = len(data)
+    if incoming > MEDIA_CACHE_MAX_TOTAL_BYTES:
+        raise ValueError(
+            f"Media cache item is too large ({incoming} bytes > "
+            f"{MEDIA_CACHE_MAX_TOTAL_BYTES} bytes)"
+        )
+    with _MEDIA_CACHE_WRITE_LOCK:
+        dirs = _process_media_cache_dirs(filepath)
+        now = time.time()
+        files: list[tuple[float, int, Path]] = []
+        for cache_dir in dirs:
+            for candidate in cache_dir.iterdir():
+                if not candidate.is_file() or candidate == filepath:
+                    continue
+                try:
+                    stat_result = candidate.stat()
+                except OSError:
+                    continue
+                if now - stat_result.st_mtime > MEDIA_CACHE_MAX_AGE_SECONDS:
+                    try:
+                        candidate.unlink()
+                    except OSError:
+                        pass
+                    continue
+                files.append((stat_result.st_mtime, stat_result.st_size, candidate))
+
+        files.sort(key=lambda item: (item[0], str(item[2])))
+        total = sum(size for _mtime, size, _path in files)
+        evictable = [
+            item for item in files
+            if now - item[0] >= MEDIA_CACHE_EVICTION_GRACE_SECONDS
+        ]
+        while evictable and (
+            total + incoming > MEDIA_CACHE_MAX_TOTAL_BYTES
+            or len(files) + 1 > MEDIA_CACHE_MAX_FILES
+        ):
+            item = evictable.pop(0)
+            _mtime, size, oldest = item
+            try:
+                oldest.unlink()
+            except OSError:
+                continue
+            files.remove(item)
+            total -= size
+
+        if (
+            total + incoming > MEDIA_CACHE_MAX_TOTAL_BYTES
+            or len(files) + 1 > MEDIA_CACHE_MAX_FILES
+        ):
+            raise ValueError("Media cache capacity is full")
+        filepath.write_bytes(data)
+
+
+def _process_media_cache_dirs(filepath: "Path") -> tuple["Path", ...]:
+    """Return every media cache directory sharing this process's disk budget."""
+    root = get_default_hermes_root()
+    try:
+        filepath.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        # Tests and embedders may inject an isolated cache outside HERMES_HOME;
+        # never let that test-only budget sweep the real process cache.
+        return (filepath.parent,)
+    homes = [root]
+    profiles_dir = root / "profiles"
+    try:
+        homes.extend(
+            child for child in profiles_dir.iterdir()
+            if not child.is_symlink() and child.is_dir()
+        )
+    except OSError:
+        pass
+
+    dirs = {filepath.parent}
+    layouts = (
+        ("cache/images", "image_cache"),
+        ("cache/audio", "audio_cache"),
+        ("cache/videos", "video_cache"),
+        ("cache/documents", "document_cache"),
+    )
+    for home in homes:
+        for new_subpath, old_name in layouts:
+            for candidate in (home / new_subpath, home / old_name):
+                if not candidate.is_symlink() and candidate.is_dir():
+                    dirs.add(candidate)
+    return tuple(sorted(dirs, key=str))
+
+
+async def read_aiohttp_body_with_limit(
+    response,
+    *,
+    media_type: str,
+    max_bytes: Optional[int] = None,
+    permit_acquired: bool = False,
+) -> bytearray:
     """aiohttp 版的「有上限地读响应体」。
 
     ⭐ 判据结构逐字照抄下面的 httpx 版 ``_read_httpx_body_with_limit``:
@@ -950,7 +1090,7 @@ async def read_aiohttp_body_with_limit(response, *, media_type: str) -> bytearra
     之后才轮到落盘处的大小校验 —— 在 1C2G 设备上单个超大附件就能把进程
     撑爆,大小门根本来不及生效。⭐「先读完再校验」= 没有校验。
     """
-    max_bytes = get_inbound_media_max_bytes()
+    max_bytes = get_inbound_media_max_bytes() if max_bytes is None else max_bytes
     content_length = response.headers.get("content-length")
     if content_length:
         try:
@@ -968,18 +1108,23 @@ async def read_aiohttp_body_with_limit(response, *, media_type: str) -> bytearra
     # ``chunks`` 已持有完整响应体(N 字节),``b"".join(chunks)`` **再分配一份
     # 同样大小** ⇒ 默认 128 MiB 上限下瞬时驻留约 **256 MiB**,在 ~2GB 共享设备上
     # 足以把进程连同别人的会话一起压垮。⭐ 有上限 ≠ 有界:上限管的是**一份**。
-    # ⇒ 累积进**单个** ``bytearray`` 并**直接返回**,⛔ 不做 ``bytes(buf)``
-    # (那正是要删掉的那份复制)。调用点全集两处
-    # (``weixin.py:627`` 入站 / ``:2403`` 出站),都交给 ``handle.write(...)``。
-    buf = bytearray()
-    total = 0
-    async for chunk in response.content.iter_chunked(65536):
-        total += len(chunk)
-        validate_inbound_media_size(
-            total, media_type=media_type, max_bytes=max_bytes,
-        )
-        buf.extend(chunk)
-    return buf
+    # ⇒ 累积进**单个** ``bytearray`` 并**直接返回**,⛔ 不做 ``bytes(buf)``。
+    # 生产调用点在打开 HTTP response 前统一获取 download permit；这里保留
+    # 默认申请仅兼容直接调用者，生产路径用 ``permit_acquired=True`` 避免二次申请。
+    async def _read_body() -> bytearray:
+        buf = bytearray()
+        total = 0
+        async for chunk in response.content.iter_chunked(65536):
+            total += len(chunk)
+            validate_inbound_media_size(
+                total, media_type=media_type, max_bytes=max_bytes,
+            )
+            buf.extend(chunk)
+        return buf
+    if permit_acquired:
+        return await _read_body()
+    async with _inbound_media_read_semaphore():
+        return await _read_body()
 
 
 async def _read_httpx_body_with_limit(
@@ -987,6 +1132,7 @@ async def _read_httpx_body_with_limit(
     *,
     media_type: str,
     max_bytes: Optional[int] = None,
+    permit_acquired: bool = False,
 ) -> bytearray:
     """Read an httpx streaming response body without exceeding the media cap.
 
@@ -1010,15 +1156,20 @@ async def _read_httpx_body_with_limit(
             )
 
     # ⭐ 兄弟调用点:与上面 aiohttp 版**同一缺陷**。⛔ 不留一处旧写法。
-    # 调用点全集两处(:1080 image / :1222 audio),都交给 ``cache_*_from_bytes``
-    # → ``len()`` / 魔数比较 / 落盘,``bytearray`` 全部支持。
-    buf = bytearray()
-    total = 0
-    async for chunk in response.aiter_bytes():
-        total += len(chunk)
-        validate_inbound_media_size(total, media_type=media_type, max_bytes=max_bytes)
-        buf.extend(chunk)
-    return buf
+    # 生产调用点在打开 HTTP response 前统一获取 download permit；这里保留
+    # 默认申请仅兼容直接调用者，生产路径用 ``permit_acquired=True`` 避免二次申请。
+    async def _read_body() -> bytearray:
+        buf = bytearray()
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            validate_inbound_media_size(total, media_type=media_type, max_bytes=max_bytes)
+            buf.extend(chunk)
+        return buf
+    if permit_acquired:
+        return await _read_body()
+    async with _inbound_media_read_semaphore():
+        return await _read_body()
 
 
 def get_image_cache_dir() -> Path:
@@ -1074,7 +1225,7 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     cache_dir = get_image_cache_dir()
     filename = f"img_{uuid.uuid4().hex[:12]}{ext}"
     filepath = cache_dir / filename
-    filepath.write_bytes(data)
+    _write_bounded_media_cache_file(filepath, data)
     return str(filepath)
 
 
@@ -1116,18 +1267,20 @@ async def cache_image_from_url(
     ) as client:
         for attempt in range(retries + 1):
             try:
-                async with client.stream(
-                    "GET",
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                        "Accept": "image/*,*/*;q=0.8",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    content = await _read_httpx_body_with_limit(
-                        response, media_type="image", max_bytes=max_bytes,
-                    )
+                async with inbound_media_download_permit():
+                    async with client.stream(
+                        "GET",
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                            "Accept": "image/*,*/*;q=0.8",
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        content = await _read_httpx_body_with_limit(
+                            response, media_type="image", max_bytes=max_bytes,
+                            permit_acquired=True,
+                        )
                 return cache_image_from_bytes(content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
@@ -1140,7 +1293,7 @@ async def cache_image_from_url(
                         retries,
                         safe_url_for_log(url),
                         wait,
-                        exc,
+                        safe_exc(exc),
                     )
                     await asyncio.sleep(wait)
                     continue
@@ -1222,7 +1375,7 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     sniffed_ext = _sniff_audio_ext(data, ext)
     filename = f"audio_{uuid.uuid4().hex[:12]}{sniffed_ext}"
     filepath = cache_dir / filename
-    filepath.write_bytes(data)
+    _write_bounded_media_cache_file(filepath, data)
     return str(filepath)
 
 
@@ -1258,18 +1411,19 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
     ) as client:
         for attempt in range(retries + 1):
             try:
-                async with client.stream(
-                    "GET",
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                        "Accept": "audio/*,*/*;q=0.8",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    content = await _read_httpx_body_with_limit(
-                        response, media_type="audio",
-                    )
+                async with inbound_media_download_permit():
+                    async with client.stream(
+                        "GET",
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                            "Accept": "audio/*,*/*;q=0.8",
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        content = await _read_httpx_body_with_limit(
+                            response, media_type="audio", permit_acquired=True,
+                        )
                 return cache_audio_from_bytes(content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
@@ -1282,7 +1436,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
                         retries,
                         safe_url_for_log(url),
                         wait,
-                        exc,
+                        safe_exc(exc),
                     )
                     await asyncio.sleep(wait)
                     continue
@@ -1329,7 +1483,7 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
     cache_dir = get_video_cache_dir()
     filename = f"video_{uuid.uuid4().hex[:12]}{ext}"
     filepath = cache_dir / filename
-    filepath.write_bytes(data)
+    _write_bounded_media_cache_file(filepath, data)
     return str(filepath)
 
 
@@ -1384,12 +1538,9 @@ _HERMES_ROOT = get_default_hermes_root()
 MEDIA_DELIVERY_ALLOW_DIRS_ENV = "HERMES_MEDIA_ALLOW_DIRS"
 MEDIA_DELIVERY_TRUST_RECENT_ENV = "HERMES_MEDIA_TRUST_RECENT_FILES"
 MEDIA_DELIVERY_TRUST_RECENT_SECONDS_ENV = "HERMES_MEDIA_TRUST_RECENT_SECONDS"
-# Strict mode toggles the original allowlist+recency path-validation behavior.
-# Off by default — symmetric with inbound (we accept any document type the
-# user uploads), and with the denylist still blocking obvious credential /
-# system paths. Operators running public-facing gateways where prompt
-# injection from one user could exfiltrate the host's secrets to that same
-# user should set this to true.
+# Strict mode is secure-by-default: model-emitted host paths need active-profile
+# provenance (managed cache/operator root/recent file). Explicit ``=0`` keeps
+# the legacy single-user behavior for operators who accept that risk.
 MEDIA_DELIVERY_STRICT_ENV = "HERMES_MEDIA_DELIVERY_STRICT"
 MEDIA_DELIVERY_SAFE_ROOTS = (
     IMAGE_CACHE_DIR,
@@ -1410,6 +1561,7 @@ MEDIA_DELIVERY_SAFE_ROOTS = (
     _HERMES_HOME / "cache" / "documents",
     _HERMES_HOME / "cache" / "screenshots",
 )
+_MEDIA_DELIVERY_SAFE_ROOTS_DEFAULT = MEDIA_DELIVERY_SAFE_ROOTS
 
 # Default recency window for trusting freshly-produced files (seconds).
 # The agent's actual work generally completes well inside 10 minutes; legitimate
@@ -1467,55 +1619,61 @@ _MEDIA_DELIVERY_CACHE_SUBDIRS = (
 
 
 def _profile_cache_roots() -> List[Path]:
-    """Return per-profile canonical cache roots under the shared Hermes root.
-
-    Profile gateways write generated artifacts to
-    ``<root>/profiles/<name>/cache/{images,audio,...}``. The static safe-roots
-    list only covers the *active* HERMES_HOME's cache, so a gateway running at
-    the root (e.g. ``HERMES_HOME=/opt/data``) while the model emits a
-    profile-scoped path silently fails delivery. Enumerated dynamically at
-    check time so profiles created after startup are covered, and so the
-    resolved profile path is allowlisted *before* the ``/root`` system denylist
-    is consulted (which otherwise wins when HERMES_HOME is symlinked under a
-    denied prefix and $HOME is not that prefix). See issue #31733.
-    """
-    roots: List[Path] = []
-    profiles_dir = _HERMES_ROOT / "profiles"
-    try:
-        profile_dirs = [p for p in profiles_dir.iterdir() if p.is_dir()]
-    except OSError:
-        return roots
-    for profile_dir in profile_dirs:
-        for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS:
-            roots.append(profile_dir / "cache" / subdir)
-    return roots
+    """Return only the active profile's canonical cache roots."""
+    active_home = Path(get_hermes_home())
+    return [
+        active_home / "cache" / subdir
+        for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS
+    ]
 
 
 def _kanban_attachment_roots() -> List[Path]:
-    """Return durable Kanban attachment roots without importing kanban_db."""
+    """Return the canonical active Kanban attachment root."""
+    try:
+        # ``attachments_root`` owns the board resolution chain: explicit root
+        # → env board → ``kanban/current`` → default. Duplicating only the env
+        # branch here made a named board selected by ``boards switch`` lose its
+        # durable attachments under strict media delivery.
+        from hermes_cli.kanban_db import attachments_root
+
+        return [attachments_root()]
+    except Exception:
+        # Keep the legacy default-root fallback available if Kanban's optional
+        # module cannot load during early startup.
+        pass
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
     if override:
         return [Path(override).expanduser()]
     home_override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
     root = Path(home_override).expanduser() if home_override else _HERMES_ROOT
     roots = [root / "kanban" / "attachments"]
-    boards_root = root / "kanban" / "boards"
-    try:
-        board_dirs = [
-            path for path in boards_root.iterdir()
-            if path.is_dir() and not path.is_symlink()
-            and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", path.name)
-            and (path / "kanban.db").is_file()
-        ]
-    except OSError:
-        return roots
-    roots.extend(path / "attachments" for path in board_dirs)
+    board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", board):
+        board_root = root / "kanban" / "boards" / board
+        if not board_root.is_symlink() and (board_root / "kanban.db").is_file():
+            roots.append(board_root / "attachments")
     return roots
 
 
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
-    roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
+    if MEDIA_DELIVERY_SAFE_ROOTS != _MEDIA_DELIVERY_SAFE_ROOTS_DEFAULT:
+        # Tests/operators may inject an explicit allowlist.
+        roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
+    else:
+        active_home = Path(get_hermes_home())
+        roots = [
+            get_image_cache_dir(),
+            get_audio_cache_dir(),
+            get_video_cache_dir(),
+            get_document_cache_dir(),
+            get_screenshot_cache_dir(),
+            active_home / "image_cache",
+            active_home / "audio_cache",
+            active_home / "video_cache",
+            active_home / "document_cache",
+            active_home / "browser_screenshots",
+        ]
     roots.extend(_profile_cache_roots())
     roots.extend(_kanban_attachment_roots())
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
@@ -1551,7 +1709,7 @@ def _media_delivery_recency_seconds() -> float:
 def _media_delivery_strict_mode() -> bool:
     """Return True when path validation should require allowlist/recency match.
 
-    Off by default. In non-strict mode, ``validate_media_delivery_path``
+    On by default. In non-strict mode, ``validate_media_delivery_path``
     accepts any existing regular file that isn't under the credential /
     system-path denylist — restoring the pre-#29523 behavior for the
     single-user case. Strict mode preserves the original
@@ -1559,7 +1717,7 @@ def _media_delivery_strict_mode() -> bool:
     gateways where prompt injection from one user shouldn't be able to
     exfiltrate the host's secrets to that same user.
     """
-    raw = os.environ.get(MEDIA_DELIVERY_STRICT_ENV, "0").strip().lower()
+    raw = os.environ.get(MEDIA_DELIVERY_STRICT_ENV, "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
@@ -1684,20 +1842,16 @@ def _path_is_within(path: Path, root: Path) -> bool:
 def validate_media_delivery_path(path: str) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
-    Default mode (single-user / private gateway): accept any existing regular
-    file that isn't under the credential / system-path denylist
-    (``_MEDIA_DELIVERY_DENIED_PREFIXES`` + ``~/.ssh``, ``~/.aws``, etc.).
-    This matches the symmetry of inbound delivery — Telegram/Discord/Slack
-    will hand the agent any file the user uploads, and the agent can hand
-    back any file that isn't a credential.
-
-    Strict mode (opt-in via ``gateway.strict`` in ``config.yaml`` or
-    ``HERMES_MEDIA_DELIVERY_STRICT=1``): the file MUST live under a
+    Strict mode (default; opt out with ``HERMES_MEDIA_DELIVERY_STRICT=0``):
+    the file MUST live under a
     Hermes-managed cache, under an operator-allowlisted root
     (``HERMES_MEDIA_ALLOW_DIRS``), or be freshly produced inside the
     configured recency window. Suitable for public-facing bots where
     prompt injection from one user shouldn't be able to exfiltrate the
-    host's secrets to that same user.
+    host's files across users/profiles.
+
+    Legacy non-strict mode accepts any existing regular file outside the
+    credential/system denylist.
 
     Symlinks are resolved before any containment / denylist check.
     """
@@ -2127,10 +2281,17 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     Raises:
         ValueError: If the sanitized path escapes the cache directory.
     """
+    validate_inbound_media_size(len(data), media_type="document")
     cache_dir = get_document_cache_dir()
     # Sanitize: strip directory components, null bytes, and control characters
     safe_name = Path(filename).name if filename else "document"
-    safe_name = safe_name.replace("\x00", "").strip()
+    safe_name = re.sub(r"[\x00-\x1f\x7f]", "", safe_name).strip()
+    if len(safe_name) > 150:
+        stem, dot, ext = safe_name.rpartition(".")
+        if dot and 0 < len(ext) <= 12:
+            safe_name = stem[: 150 - len(ext) - 1] + "." + ext
+        else:
+            safe_name = safe_name[:150]
     if not safe_name or safe_name in {".", ".."}:
         safe_name = "document"
     cached_name = f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
@@ -2138,7 +2299,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     # Final safety check: ensure path stays inside cache dir
     if not filepath.resolve().is_relative_to(cache_dir.resolve()):
         raise ValueError(f"Path traversal rejected: {filename!r}")
-    filepath.write_bytes(data)
+    _write_bounded_media_cache_file(filepath, data)
     return str(filepath)
 
 
@@ -2679,7 +2840,7 @@ def merge_pending_message_event(
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> bool:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -2693,23 +2854,58 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        existing_source = getattr(existing, "source", None)
+        incoming_source = getattr(event, "source", None)
+        existing_sender = (
+            getattr(existing_source, "platform", None),
+            getattr(existing_source, "user_id", None),
+            getattr(existing_source, "user_id_alt", None),
+            getattr(existing_source, "profile", None),
+        )
+        incoming_sender = (
+            getattr(incoming_source, "platform", None),
+            getattr(incoming_source, "user_id", None),
+            getattr(incoming_source, "user_id_alt", None),
+            getattr(incoming_source, "profile", None),
+        )
+        if existing_sender != incoming_sender:
+            # 共享群 session 不能把 B 的内容并进 A 的 MessageEvent；挂到
+            # A 的 FIFO 尾部，drain 后逐条按各自 source 重新走共享鉴权。
+            queue = list(getattr(existing, "_gateway_pending_event_queue", []))
+            if pending_message_event_depth(existing) >= PENDING_EVENT_QUEUE_MAX:
+                logger.warning(
+                    "Dropping cross-sender follow-up — pending queue at cap (%d).",
+                    PENDING_EVENT_QUEUE_MAX,
+                )
+                return False
+            queue.append(event)
+            setattr(existing, "_gateway_pending_event_queue", queue)
+            return True
+
+        def _aligned_media_types(item: MessageEvent) -> List[str]:
+            urls = list(item.media_urls or [])
+            types = list(item.media_types or [])[: len(urls)]
+            return types + ([""] * (len(urls) - len(types)))
+
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
         incoming_has_media = bool(event.media_urls)
 
         if existing_is_photo and incoming_is_photo:
+            existing.media_types = _aligned_media_types(existing)
             existing.media_urls.extend(event.media_urls)
-            existing.media_types.extend(event.media_types)
+            existing.media_types.extend(_aligned_media_types(event))
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if existing_has_media or incoming_has_media:
             if incoming_has_media:
+                existing.media_types = _aligned_media_types(existing)
                 existing.media_urls.extend(event.media_urls)
-                existing.media_types.extend(event.media_types)
+                existing.media_types.extend(_aligned_media_types(event))
             if event.text:
                 if existing.text:
                     existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
@@ -2723,7 +2919,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if (
             merge_text
@@ -2732,9 +2928,55 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            return
+            return True
+
+        queued_after_existing = list(
+            getattr(existing, "_gateway_pending_event_queue", [])
+        )
+        if queued_after_existing:
+            setattr(event, "_gateway_pending_event_queue", queued_after_existing)
+        pending_messages[session_key] = event
+        return True
 
     pending_messages[session_key] = event
+    return True
+
+
+def pending_message_event_depth(event: Optional[MessageEvent]) -> int:
+    """Return bounded depth for a head event, including legacy nested tails."""
+    if event is None:
+        return 0
+    depth = 0
+    stack = [event]
+    seen = set()
+    while stack and depth < PENDING_EVENT_QUEUE_MAX:
+        item = stack.pop()
+        marker = id(item)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        depth += 1
+        stack.extend(getattr(item, "_gateway_pending_event_queue", []))
+    return depth
+
+
+def pop_pending_message_event(
+    pending_messages: Dict[str, MessageEvent],
+    session_key: str,
+) -> Optional[MessageEvent]:
+    """FIFO pop；跨发送者事件保持各自 MessageEvent/source。"""
+    event = pending_messages.pop(session_key, None)
+    if event is None:
+        return None
+    queue = list(getattr(event, "_gateway_pending_event_queue", []))
+    if hasattr(event, "_gateway_pending_event_queue"):
+        delattr(event, "_gateway_pending_event_queue")
+    if queue:
+        next_event = queue.pop(0)
+        if queue:
+            setattr(next_event, "_gateway_pending_event_queue", queue)
+        pending_messages[session_key] = next_event
+    return event
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -2814,7 +3056,7 @@ def media_failure_reply_text(
 
 
 _SECRET_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s'\"<>]+")
-_DATA_URI_RE = re.compile(r"data:[^\s'\"<>]*,[^\s'\"<>]*", re.IGNORECASE)
+_DATA_URI_RE = re.compile(r"data:[^,'\"<>]*,[^'\"<>]*", re.IGNORECASE)
 _ABS_PATH_RE = re.compile(r"(?<![\w])/(?:[\w.\-]+/){1,}[\w.\-]+")
 _SAFE_EXC_MESSAGE_MAX_CHARS = 2048  # 与仓内约 2000 字符的诊断预览同量级
 
@@ -4847,15 +5089,20 @@ class BasePlatformAdapter(ABC):
         example Discord accepted the message but attached nothing), the user
         must see a failure notice instead of a silent drop (#66797).
         """
-        ext = Path(media_path).suffix.lower()
+        parsed_path = urlsplit(media_path).path if "://" in media_path else media_path
+        ext = Path(parsed_path).suffix.lower()
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         if is_voice or should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
             text = "⚠️ Couldn't deliver the audio attachment."
         elif ext in _VIDEO_EXTS:
             text = "⚠️ Couldn't deliver the video attachment."
         else:
-            file_name = os.path.basename(media_path)
-            text = f"⚠️ Couldn't deliver the file attachment ({file_name})."
+            file_name = os.path.basename(parsed_path)
+            text = (
+                f"⚠️ Couldn't deliver the file attachment ({file_name})."
+                if file_name
+                else "⚠️ Couldn't deliver the file attachment."
+            )
         try:
             notice = await self.send(chat_id=chat_id, content=text, metadata=metadata)
             if not notice.success:
@@ -6050,7 +6297,7 @@ class BasePlatformAdapter(ABC):
         command was running — spawns a fresh processing task for it.
         """
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = pop_pending_message_event(self._pending_messages, session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -6467,7 +6714,14 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
+                extracted_media_count = len(media_files)
                 media_files = self.filter_media_delivery_paths(media_files)
+                dropped_media_count = extracted_media_count - len(media_files)
+                if dropped_media_count:
+                    response = (
+                        f"{response}\n⚠️ Couldn't deliver "
+                        f"{dropped_media_count} attachment(s)."
+                    ).strip()
 
                 # Do NOT deduplicate MEDIA tags against prior turns here.
                 # The auto-append path in GatewayRunner._run_agent_inner already
@@ -6766,6 +7020,22 @@ class BasePlatformAdapter(ABC):
                     if _feishu_media_quote_available and sent_any is True:
                         _feishu_media_quote_available = False
 
+                async def _send_image_batch(batch, metadata):
+                    sender = self.send_multiple_images
+                    if getattr(sender, "__func__", None) is BasePlatformAdapter.send_multiple_images:
+                        return await self._send_multiple_images_with_result(
+                            chat_id=event.source.chat_id,
+                            images=batch,
+                            metadata=metadata,
+                            human_delay=human_delay,
+                        )
+                    return await sender(
+                        chat_id=event.source.chat_id,
+                        images=batch,
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    )
+
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
@@ -6774,19 +7044,25 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     _image_metadata = await _next_media_metadata()
                     try:
-                        image_sent = await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=images,
-                            metadata=_image_metadata,
-                            human_delay=human_delay,
-                        )
+                        image_sent = await _send_image_batch(images, _image_metadata)
                         _consume_feishu_batch_quote(_image_metadata, image_sent)
+                        if image_sent is False:
+                            await self._notify_media_delivery_failure(
+                                event.source.chat_id,
+                                images[0][0],
+                                metadata=_final_thread_metadata,
+                            )
                     except asyncio.CancelledError:
                         _consume_feishu_batch_quote(_image_metadata, False)
                         raise
                     except Exception as batch_err:
                         _consume_feishu_batch_quote(_image_metadata, False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            images[0][0],
+                            metadata=_final_thread_metadata,
+                        )
 
 
                 # Send extracted media files — route by file type
@@ -6822,19 +7098,25 @@ class BasePlatformAdapter(ABC):
                     _image_metadata = await _next_media_metadata()
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        image_sent = await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=_batch,
-                            metadata=_image_metadata,
-                            human_delay=human_delay,
-                        )
+                        image_sent = await _send_image_batch(_batch, _image_metadata)
                         _consume_feishu_batch_quote(_image_metadata, image_sent)
+                        if image_sent is False:
+                            await self._notify_media_delivery_failure(
+                                event.source.chat_id,
+                                _image_paths[0],
+                                metadata=_final_thread_metadata,
+                            )
                     except asyncio.CancelledError:
                         _consume_feishu_batch_quote(_image_metadata, False)
                         raise
                     except Exception as batch_err:
                         _consume_feishu_batch_quote(_image_metadata, False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            _image_paths[0],
+                            metadata=_final_thread_metadata,
+                        )
 
                 if _non_image_media:
                     logger.info(
@@ -6892,6 +7174,12 @@ class BasePlatformAdapter(ABC):
                     except Exception as media_err:
                         _consume_feishu_media_quote(_media_metadata, False)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            media_path,
+                            is_voice=is_voice,
+                            metadata=_final_thread_metadata,
+                        )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -6935,6 +7223,11 @@ class BasePlatformAdapter(ABC):
                     except Exception as file_err:
                         _consume_feishu_media_quote(_file_metadata, False)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        await self._notify_media_delivery_failure(
+                            event.source.chat_id,
+                            file_path,
+                            metadata=_final_thread_metadata,
+                        )
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
@@ -6974,7 +7267,9 @@ class BasePlatformAdapter(ABC):
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+                pending_event = pop_pending_message_event(
+                    self._pending_messages, session_key,
+                )
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -7097,7 +7392,9 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = pop_pending_message_event(
+                self._pending_messages, session_key,
+            )
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -7113,6 +7410,13 @@ class BasePlatformAdapter(ABC):
                     # (#17758 follow-up: prevents the create_task path
                     # from racing with itself across the in-band/finally
                     # boundary).
+                    staged = self._pending_messages.pop(session_key, None)
+                    if staged is not None:
+                        queue = list(getattr(
+                            late_pending, "_gateway_pending_event_queue", [],
+                        ))
+                        queue.insert(0, staged)
+                        setattr(late_pending, "_gateway_pending_event_queue", queue)
                     self._pending_messages[session_key] = late_pending
                 else:
                     logger.debug(
@@ -7229,7 +7533,11 @@ class BasePlatformAdapter(ABC):
         # Flush pending messages to disk before clearing (#72680).
         try:
             from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+            flush_pending_to_file(
+                self._pending_messages,
+                reason="adapter_shutdown",
+                session_store=getattr(self, "_session_store", None),
+            )
         except Exception:
             pass
         self._pending_messages.clear()
@@ -7245,7 +7553,7 @@ class BasePlatformAdapter(ABC):
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        return pop_pending_message_event(self._pending_messages, session_key)
     
     def build_source(
         self,
