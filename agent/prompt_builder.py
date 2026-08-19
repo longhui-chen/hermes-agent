@@ -858,6 +858,42 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm",
 # Short on purpose.  This block is shipped to every user, every session,
 # in the cached system prompt — token cost is paid once at install and
 # then amortised across all sessions via prefix caching.  Keep it tight.
+#: 🔴 用户在 IM 里看到过模型把内部任务状态写进回答正文:
+#:     Progress
+#:     ・✕ 👁 请识别并描述这张图片中的内容,回答用户"这是?" (failed)
+#:     ———
+#:     图片这次还是没有传到我这里…
+#: 归属:那段文本**是模型自己写的**(全仓 `git grep -F` 找不到任何一处能拼出
+#: `・` / `———` / `Progress` 表头 + `(failed)` 后缀的代码;阳性对照 `✕`/`👁`
+#: 同法有命中 ⇒ 量具有效)。⇒ 只能在提示词层约束。
+#:
+#: ⭐ 作用域**刚好等于**「未经用户请求的内部进度旁白」这一格:
+#:   砍的是 —— 自发的 Progress 表头、内部任务/工具名、逐步状态标记。
+#:   ⛔ **不砍** —— 用户明确请求的教程/计划/命令与工具清单/最终验证报告；
+#:   错误提示的分类与可行动性、破坏性操作确认、可访问性文本。
+#: ⚠️ 「失败时闭嘴」比旁白更坏 ⇒ 明确要求失败仍要给**一句可行动的话**。
+USER_FACING_NARRATION_GUIDANCE = (
+    "# What the user sees\n"
+    "Your reply is a product surface, not a work log. Do not volunteer internal "
+    "execution state the user did not ask for: no self-generated \"Progress\" section, "
+    "internal task/subtask names, internal tool-call names, or per-step status markers "
+    "(queued / running / failed / completed). The client already renders live progress "
+    "on its own structured channel; repeating it in the reply body duplicates it and "
+    "buries the one sentence that actually matters.\n"
+    "When the user explicitly asks for a tutorial, plan, step list, command or tool "
+    "list, or final verification report, provide it directly. That requested content "
+    "is not internal narration; do not use this rule to omit the answer they asked for.\n"
+    "This is NOT permission to go quiet when something fails. Silence is worse "
+    "than narration. When a step fails in a way that changes what the user "
+    "gets, say in one plain sentence what did not work and what they can do "
+    "about it (retry, re-upload, grant access, rephrase, contact support). "
+    "Keep that sentence — drop the step list around it.\n"
+    "Unchanged, and never to be trimmed for brevity: error messages stay "
+    "specific and actionable (do not collapse distinct causes into one generic "
+    "failure), confirmations for destructive or irreversible actions stay, and "
+    "accessibility text stays."
+)
+
 TASK_COMPLETION_GUIDANCE = (
     "# Finishing the job\n"
     "When the user asks you to build, run, or verify something, the deliverable is "

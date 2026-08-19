@@ -241,6 +241,34 @@ def test_camera_runtime_direct_runner_flow_uses_secret_fds(monkeypatch, tmp_path
     )
 
 
+def test_terminal_flow_routes_camera_to_trusted_direct_runner(monkeypatch, tmp_path):
+    _write_camera_runtime(tmp_path)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    tokens = _bind_receipt()
+    try:
+        result = json.loads(terminal_tool_module.terminal_tool(
+            command=(
+                'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/'
+                'camera_connector.py" list'
+            ),
+            task_id="camera-runtime-terminal-flow",
+        ))
+    finally:
+        _clear_receipt(tokens)
+
+    assert result["camera_runtime_direct"] is True
+    assert result["exit_code"] == 0
+    assert ACTION_TOKEN not in result["output"]
+    assert BUSINESS_TOKEN not in result["output"]
+    payload = json.loads(result["output"])
+    assert payload["argv"] == ["list"]
+    assert payload["action"] == "[REDACTED]"
+    assert payload["business"] == "[REDACTED]"
+    assert payload["action_plain"] == ""
+    assert payload["business_plain"] == ""
+
+
 def test_camera_runtime_flow_fails_closed_without_capability(monkeypatch, tmp_path):
     _write_camera_runtime(tmp_path)
     manifest = tmp_path / "presets" / "skills" / "camsnap" / "manifest.yaml"

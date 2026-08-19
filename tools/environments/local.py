@@ -2471,6 +2471,36 @@ def build_camera_runtime_env() -> dict[str, str]:
     return env
 
 
+def build_printer3d_runtime_env() -> dict[str, str]:
+    """Reuse the request-scoped receipt without exposing it to terminal."""
+    try:
+        from agent.zet_agent_response_mode import trusted_printer3d_runtime_receipt
+
+        frozen_receipt = dict(trusted_printer3d_runtime_receipt())
+    except Exception:
+        frozen_receipt = {}
+    session_id = str(frozen_receipt.get("HERMES_SESSION_KEY", "") or "").strip()
+    env = {
+        "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
+        "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
+        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "") or "").strip(),
+        "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
+        "HERMES_SESSION_ID": session_id,
+        "HERMES_SESSION_KEY": session_id,
+    }
+    limits = {
+        "ZET_AGENT_ID": 128,
+        "ZETTLAB_AGENT_ACTION_TOKEN": 128,
+        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
+        "HERMES_TURN_ID": 256,
+        "HERMES_SESSION_ID": 1024,
+        "HERMES_SESSION_KEY": 1024,
+    }
+    if any(not value or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
+        raise PermissionError("trusted printer3d execution receipt unavailable")
+    return env
+
+
 def _sanitize_subprocess_env(
     base_env: Mapping[str, str] | None,
     extra_env: Mapping[str, str] | None = None,

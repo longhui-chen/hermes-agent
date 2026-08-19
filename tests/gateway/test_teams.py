@@ -1,5 +1,6 @@
 """Tests for the Microsoft Teams platform adapter plugin."""
 
+import base64
 import json
 import sys
 import types
@@ -738,4 +739,83 @@ class TestTeamsMediaAttachments:
         assert result.success
         adapter._app.send.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_local_media_failure_never_exposes_the_data_uri(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        marker = b"TEAMS-LOCAL-FILE-SECRET-"
+        doc = tmp_path / "secret.pdf"
+        doc.write_bytes(marker * 1000)
+        encoded_marker = base64.b64encode(marker).decode()[:24]
+        captured = {}
 
+        class CaptureAttachment:
+            def __init__(self, *, content_type, content_url):
+                captured["content_url"] = content_url
+
+        class CaptureActivity:
+            def add_attachments(self, _attachment):
+                return self
+
+            def add_text(self, _caption):
+                return self
+
+            def __str__(self):
+                return f"activity={captured['content_url']}"
+
+        monkeypatch.setattr(sys.modules["microsoft_teams.api"], "Attachment", CaptureAttachment)
+        monkeypatch.setattr(
+            sys.modules["microsoft_teams.api"], "MessageActivityInput", CaptureActivity,
+        )
+        adapter = self._make_adapter()
+        adapter._app.send = AsyncMock(side_effect=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError(str(_args[-1]))
+        ))
+
+        with caplog.at_level("ERROR"):
+            result = await adapter.send_document("19:abc@thread.v2", str(doc))
+
+        assert captured["content_url"].startswith("data:application/pdf;base64,")
+        assert encoded_marker in captured["content_url"], "夹具没有真的生成 data URI"
+        assert encoded_marker not in caplog.text and "data:application/pdf;base64" not in caplog.text
+        assert encoded_marker not in (result.error or "")
+        assert result.error == "Teams document delivery failed; please try again."
+
+    @pytest.mark.asyncio
+    async def test_missing_file_error_is_actionable(self, tmp_path):
+        adapter = self._make_adapter()
+        missing = tmp_path / "missing.pdf"
+        assert not missing.exists(), "夹具必须真的进入本地文件不存在分支"
+
+        result = await adapter.send_document("19:abc@thread.v2", str(missing))
+
+        assert not result.success and result.retryable is False
+        assert "file was not found" in (result.error or "")
+        assert "re-upload" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_auth_error_is_actionable(self):
+        class AuthError(RuntimeError):
+            status_code = 401
+
+        adapter = self._make_adapter()
+        adapter._app.send = AsyncMock(side_effect=AuthError("401 unauthorized"))
+
+        result = await adapter.send_image("19:abc@thread.v2", "https://cdn.example/image.png")
+
+        adapter._app.send.assert_awaited_once()
+        assert not result.success and result.retryable is False
+        assert result.error_kind == "forbidden"
+        assert "Reconnect Teams" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_is_actionable(self):
+        adapter = self._make_adapter()
+        adapter._app.send = AsyncMock(side_effect=TimeoutError("send timed out"))
+
+        result = await adapter.send_image("19:abc@thread.v2", "https://cdn.example/image.png")
+
+        adapter._app.send.assert_awaited_once()
+        assert not result.success and result.retryable is True
+        assert result.error_kind == "transient"
+        assert "timed out" in (result.error or "")

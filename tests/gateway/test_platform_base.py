@@ -75,6 +75,12 @@ class TestSafeUrlForLog:
         assert "token=abc" not in result
         assert "user:pass@" not in result
 
+    def test_invalid_url_never_falls_back_to_raw_secret_text(self):
+        malformed = "https://[bad?token=TOP_SECRET"
+        result = safe_url_for_log(malformed)
+        assert result == "<invalid-url>"
+        assert "TOP_SECRET" not in result and malformed not in result
+
 
 class TestCacheAudioFromBytes:
     def test_sniffs_mp4_quicktime_audio_even_when_ext_is_ogg(self, tmp_path):

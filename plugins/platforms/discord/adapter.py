@@ -161,6 +161,8 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
+    log_media_intake_failure,
+    safe_exc,
     utf16_len,
     validate_inbound_media_size,
 )
@@ -7534,10 +7536,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             raw_bytes = await reader()
         except Exception as e:
-            logger.warning(
-                "[Discord] Authenticated attachment read failed for %s: %s",
-                getattr(att, "filename", None) or getattr(att, "url", "<unknown>"),
-                e,
+            # 🔴 原写法在 `filename` 缺失时把 `att.url` 整条写进日志 —— 2023 起
+            # Discord CDN 链接一律带签名参数 `?ex=&is=&hm=<hmac>`,任何拿到它的人
+            # 都能下载该附件(本文件 7846 行注释也写着「CDN URLs can expire」)。
+            # 加上裸 `%s` 异常。⇒ 改走共享记账,只留 host + 异常类型名。
+            log_media_intake_failure(
+                logger, "discord", media_type, "authenticated_read_failed",
+                url=getattr(att, "url", "") or "",
+                exc=e,
+                filename=getattr(att, "filename", None) or "-",
             )
             return None
         validate_inbound_media_size(len(raw_bytes), media_type=media_type)
@@ -7558,7 +7565,7 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug(
                     "[Discord] cache_image_from_bytes rejected att.read() data; falling back to URL: %s",
-                    e,
+                    safe_exc(e),
                 )
         return await cache_image_from_url(att.url, ext=ext)
 
@@ -7577,7 +7584,7 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug(
                     "[Discord] cache_audio_from_bytes failed; falling back to URL: %s",
-                    e,
+                    safe_exc(e),
                 )
         return await cache_audio_from_url(att.url, ext=ext)
 
@@ -7860,7 +7867,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     media_types.append(content_type)
                     print(f"[Discord] Cached user image: {cached_path}", flush=True)
                 except Exception as e:
-                    print(f"[Discord] Failed to cache image attachment: {e}", flush=True)
+                    # ⛔ 原写法是 `print(f"...{e}")` —— ①stdout 同样落进
+                    # `agent.log` ②`httpx`/`aiohttp` 异常的 __str__ 含整条签名
+                    # CDN URL。⇒ 走共享记账。
+                    # ⭐ 下面「回退到 CDN URL 交给下游」是既有行为,⛔ 不动 ——
+                    #    那是投递面,不是日志面,不在本次缺陷作用域内。
+                    log_media_intake_failure(
+                        logger, "discord", "image", "cache_failed",
+                        url=att.url, exc=e,
+                    )
                     # Fall back to the CDN URL if caching fails
                     media_urls.append(att.url)
                     media_types.append(content_type)
@@ -7874,7 +7889,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     media_types.append(content_type)
                     print(f"[Discord] Cached user audio: {cached_path}", flush=True)
                 except Exception as e:
-                    print(f"[Discord] Failed to cache audio attachment: {e}", flush=True)
+                    log_media_intake_failure(
+                        logger, "discord", "audio", "cache_failed",
+                        url=att.url, exc=e,
+                    )
                     media_urls.append(att.url)
                     media_types.append(content_type)
             else:
@@ -7955,9 +7973,10 @@ class DiscordAdapter(BasePlatformAdapter):
                         # ``to_agent_visible_cache_path()`` (important for
                         # Docker/Modal terminal backends).
                     except Exception as e:
-                        logger.warning(
-                            "[Discord] Failed to cache document %s: %s",
-                            att.filename, e, exc_info=True,
+                        log_media_intake_failure(
+                            logger, "discord", "file", "cache_failed",
+                            url=getattr(att, "url", "") or "", exc=e,
+                            filename=att.filename or "-",
                         )
 
         # Use normalized_content (saved before auto-threading) instead of message.content,
