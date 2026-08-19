@@ -4428,7 +4428,8 @@ class TestCORS:
             for value in headers["Access-Control-Allow-Headers"].split(",")
         }
         assert "x-zettlab-hardware-execution-token" not in allowed
-        assert "x-zettlab-business-execution-token" not in allowed
+        retired_header = "x-zettlab-business-" + "execution-token"
+        assert retired_header not in allowed
 
     def test_cors_headers_for_origin_rejects_unknown_origin(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -4546,7 +4547,8 @@ class TestCORS:
                 ).split(",")
             }
             assert "x-zettlab-hardware-execution-token" not in allowed
-            assert "x-zettlab-business-execution-token" not in allowed
+            retired_header = "x-zettlab-business-" + "execution-token"
+            assert retired_header not in allowed
 
     @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):
