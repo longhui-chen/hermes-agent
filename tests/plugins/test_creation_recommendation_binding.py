@@ -88,10 +88,12 @@ def _show_card(
     session_id: str,
     creation_type: str = "agent",
     receipt_transport: str = RECEIPT_TRANSPORT,
+    dedup_suffix: str = "",
+    owner: str = "owner-a",
 ) -> dict[str, object]:
     plugin._on_pre_llm_call(
         session_id=session_id,
-        sender_id="owner-a",
+        sender_id=owner,
         turn_id="turn-1",
         user_message="分析近期广告效果",
         conversation_history=[],
@@ -99,16 +101,16 @@ def _show_card(
     )
     candidate = _candidate()
     candidate["decision"] = creation_type
-    candidate["dedup_key"] = f"{creation_type}:ads-analyst"
+    candidate["dedup_key"] = f"{creation_type}:ads-analyst{dedup_suffix}"
     result = plugin._detect_creation_opportunity(
         candidate,
         session_id=session_id,
-        sender_id="owner-a",
+        sender_id=owner,
     )
     assert json.loads(result)["status"] == "proposal_ready"
     transformed = plugin._transform_llm_output(
         session_id=session_id,
-        sender_id="owner-a",
+        sender_id=owner,
         response_text="分析完成。",
         completed=True,
         failed=False,
@@ -677,7 +679,13 @@ def test_quota_is_not_shared_across_owners_on_a_colliding_turn_id(two_requests):
     first, second = two_requests
     plugin = _load_plugin()
     mine = _show_card(plugin, "collide-mine", creation_type="skill")
-    theirs = _show_card(plugin, "collide-theirs", creation_type="skill")
+    theirs = _show_card(
+        plugin,
+        "collide-theirs",
+        creation_type="skill",
+        dedup_suffix="-theirs",
+        owner="owner-b",
+    )
 
     _accept_action(first, plugin, "collide-mine", mine, "same-turn-id")
     # 另一个会话在同一个 turn_id 上被判无效重放：它一张票都不该有。
@@ -718,10 +726,29 @@ def test_tool_call_without_invocation_scope_fails_closed_when_the_turn_is_ambigu
 ):
     first, second = two_requests
     plugin = _load_plugin()
-    payload = _show_card(plugin, "ambiguous-fallback", creation_type="skill")
-
-    _accept_action(first, plugin, "ambiguous-fallback", payload, "shared-turn")
-    _accept_action(second, plugin, "ambiguous-fallback", payload, "shared-turn")
+    # 两个不同会话各自接管了自己的卡，于是**两边都有票**，只是撞在同一个 turn_id
+    # 上。这样构造的意义在于：没有歧义闸门时兜底一定会拿到一张能用的票、一定放行，
+    # 而不是「看它随手挑中哪一条」。
+    mine = _show_card(plugin, "ambiguous-mine", creation_type="skill")
+    # dedup_key 是跨会话的去重闩：两张卡共用同一个 key 时，第二次接管会被当成
+    # 重复动作直接判无效，那样这个用例就只是在验去重、验不到歧义闸门。
+    theirs = _show_card(
+        plugin,
+        "ambiguous-theirs",
+        creation_type="skill",
+        dedup_suffix="-theirs",
+        owner="owner-b",
+    )
+    _accept_action(first, plugin, "ambiguous-mine", mine, "shared-turn")
+    second.run(
+        plugin._on_pre_llm_call,
+        session_id="ambiguous-theirs",
+        sender_id="owner-b",
+        turn_id="shared-turn",
+        user_message=_action(theirs),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
 
     # 主线程没有任何 invocation scope，正是「读不到」的那种情形。
     assert plugin._invocation_scope.get() is None
@@ -731,6 +758,17 @@ def test_tool_call_without_invocation_scope_fails_closed_when_the_turn_is_ambigu
         turn_id="shared-turn",
     )
     assert blocked is not None and blocked["action"] == "block"
+    # 两边的票都还在，一张也没被这次判不出归属的调用花掉。
+    for request in (first, second):
+        assert (
+            request.run(
+                plugin._on_pre_tool_call,
+                tool_name="skill_manage",
+                args={"action": "create"},
+                turn_id="shared-turn",
+            )
+            is None
+        )
 
 
 # 回执是 turn 级事实：同一个 turn 的每个在途请求都要拿到同一份权威结果。谁先跑完
