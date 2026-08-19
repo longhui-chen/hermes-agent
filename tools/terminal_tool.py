@@ -60,9 +60,40 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Mapping
 
+from agent.trusted_tool_result import TrustedToolResult
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+_NON_RETRYABLE_VIDEO_EDIT_FAILURE_REASONS = frozenset(
+    {
+        "workflow_checkpoint_ambiguous",
+        "workflow_checkpoint_identity_invalid",
+        "workflow_checkpoint_not_found",
+        "workflow_state_not_found",
+    }
+)
+
+
+def _trusted_video_edit_terminal_failure_reason(
+    output: str,
+    returncode: int,
+) -> str:
+    """Classify signed-helper failures before output enters model-visible hooks."""
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    reason = payload.get("reason") or payload.get("error")
+    if not isinstance(reason, str):
+        reason = ""
+    if payload.get("terminal_failure") is True:
+        return reason or "trusted_runtime_terminal_failure"
+    if returncode == 2 and reason in _NON_RETRYABLE_VIDEO_EDIT_FAILURE_REASONS:
+        return reason
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1085,6 +1116,7 @@ _VIDEO_EDIT_RUNTIME_SCRIPTS = frozenset({
     "preference_resolver.py",
     "workflow_state.py",
     "cloud_render_business.py",
+    "proactive_video.py",
     "normalize.py",
 })
 _CAMERA_RUNTIME_SCRIPT = "camera_connector.py"
@@ -1315,6 +1347,8 @@ _VIDEO_EDIT_WORKER_FACTORY_SEED_START_MAX_ATTEMPTS = 2
 _VIDEO_EDIT_WORKER_BROKER_START_MAX_ATTEMPTS = 2
 _VIDEO_EDIT_WORKER_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 _VIDEO_EDIT_UPLOAD_TIMEOUT_SECONDS = 3700
+_PROACTIVE_VIDEO_UPLOAD_TIMEOUT_SECONDS = 10800
+_PROACTIVE_VIDEO_COMPLETE_TIMEOUT_SECONDS = 3700
 _VIDEO_EDIT_WORKER_SOURCE_LIMIT_BYTES = 512 * 1024
 _VIDEO_EDIT_WORKER_INTERPRETER_LIMIT_BYTES = 32 * 1024 * 1024
 _TRUSTED_RUNTIME_SOURCE_CACHE_MAX_BYTES = 8 * 1024 * 1024
@@ -1496,7 +1530,8 @@ def _factory_loop(factory_channel, parent_guard, ready_channel, supervisor_pid):
                 ):
                     raise PermissionError("seed parent-death boundary is unavailable")
                 os.setsid()
-                sys.argv = [worker_path, str(seed_channel.fileno())]
+                seed_fd = seed_channel.detach()
+                sys.argv = [worker_path, str(seed_fd)]
                 returncode = worker.main()
             except BaseException:
                 returncode = 1
@@ -4015,10 +4050,9 @@ def _shutdown_video_edit_worker_seed() -> None:
     _discard_video_edit_worker_seed()
     channel = _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
     process = _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-    _VIDEO_EDIT_WORKER_FACTORY_CHANNEL = None
-    _VIDEO_EDIT_WORKER_FACTORY_PROCESS = None
     _VIDEO_EDIT_WORKER_SEED_CHANNEL = None
     _VIDEO_EDIT_WORKER_SEED_PROCESS = None
+    parent_reaped = False
     if channel is not None and process is not None and process.poll() is None:
         try:
             channel.sendall(b"Q")
@@ -4028,6 +4062,13 @@ def _shutdown_video_edit_worker_seed() -> None:
             )
         except (EOFError, OSError, socket.timeout, ValueError):
             pass
+    if process is not None:
+        parent_reaped = _request_video_edit_worker_parent_reap(
+            process,
+            parent_control="supervisor",
+        )
+    _VIDEO_EDIT_WORKER_FACTORY_CHANNEL = None
+    _VIDEO_EDIT_WORKER_FACTORY_PROCESS = None
     if channel is not None:
         try:
             channel.close()
@@ -4036,7 +4077,7 @@ def _shutdown_video_edit_worker_seed() -> None:
     if process is None:
         return
     try:
-        if process.poll() is None:
+        if not parent_reaped and process.poll() is None:
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -4891,6 +4932,16 @@ def _video_edit_runtime_timeout(
         and _cloud_render_business_subcommand(parsed.argv[2:]) == "upload"
     ):
         return max(requested_timeout, _VIDEO_EDIT_UPLOAD_TIMEOUT_SECONDS)
+    if (
+        Path(parsed.argv[1]).name == "proactive_video.py"
+        and _cloud_render_business_subcommand(parsed.argv[2:]) == "upload"
+    ):
+        return max(requested_timeout, _PROACTIVE_VIDEO_UPLOAD_TIMEOUT_SECONDS)
+    if (
+        Path(parsed.argv[1]).name == "proactive_video.py"
+        and _cloud_render_business_subcommand(parsed.argv[2:]) == "complete"
+    ):
+        return max(requested_timeout, _PROACTIVE_VIDEO_COMPLETE_TIMEOUT_SECONDS)
     return requested_timeout
 
 
@@ -4916,15 +4967,158 @@ def _cloud_render_business_subcommand(arguments: list[str]) -> Optional[str]:
     return arguments[position]
 
 
+_PROACTIVE_VIDEO_MANIFEST_ID_RE = re.compile(r"pvm_[A-Za-z0-9_-]{32}")
+
+
+def _exact_cli_option(
+    arguments: list[str],
+    position: int,
+    name: str,
+) -> tuple[Optional[str], int]:
+    """Read one exact long option without argparse abbreviations."""
+    if position >= len(arguments):
+        return None, position
+    token = arguments[position]
+    if token == name:
+        if position + 1 >= len(arguments):
+            return None, position
+        return arguments[position + 1], position + 2
+    prefix = name + "="
+    if token.startswith(prefix):
+        return token[len(prefix) :], position + 1
+    return None, position
+
+
+def _proactive_video_arguments_match_receipt(
+    arguments: list[str],
+    *,
+    expected_agent_id: str,
+    turn_id: str,
+) -> bool:
+    """Allow only the manifest-bound proactive helper CLI grammar."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", expected_agent_id):
+        return False
+    agent_id, position = _exact_cli_option(arguments, 0, "--agent-id")
+    if agent_id != expected_agent_id or position >= len(arguments):
+        return False
+    subcommand = arguments[position]
+    if subcommand not in {
+        "resolve",
+        "upload",
+        "create-project",
+        "complete",
+        "report",
+    }:
+        return False
+    manifest_id, position = _exact_cli_option(
+        arguments,
+        position + 1,
+        "--manifest-id",
+    )
+    if not manifest_id or not _PROACTIVE_VIDEO_MANIFEST_ID_RE.fullmatch(manifest_id):
+        return False
+    if subcommand != "report":
+        return position == len(arguments)
+    workflow_state, position = _exact_cli_option(
+        arguments,
+        position,
+        "--workflow-state",
+    )
+    expected_state = _proactive_video_workflow_state_path(
+        expected_agent_id,
+        turn_id,
+    )
+    return workflow_state == expected_state and position == len(arguments)
+
+
+def _proactive_video_workflow_state_path(agent_id: str, turn_id: str) -> str:
+    return str(
+        Path("/volume1/subvol/agents/data")
+        / agent_id
+        / "output"
+        / f"proactive-{turn_id}"
+        / ".video-edit-workflow-mini"
+        / "workflow_state.json"
+    )
+
+
+def _proactive_preference_finalizer_arguments_match_receipt(
+    arguments: list[str],
+    *,
+    expected_agent_id: str,
+    turn_id: str,
+) -> bool:
+    """Accept the one no-memory finalizer form owned by proactive runs."""
+    return arguments == [
+        "finalize-success",
+        "--workflow-state",
+        _proactive_video_workflow_state_path(expected_agent_id, turn_id),
+        "--memory-commit-state",
+        "skipped",
+        "--sidecar-state",
+        "skipped",
+    ]
+
+
 def _video_edit_runtime_claims_match_receipt(
     parsed: _VideoEditRuntimeCommand,
     trusted_env: Mapping[str, str],
 ) -> bool:
     """Bind model-supplied business routing claims to the frozen receipt."""
-    if Path(parsed.argv[1]).name != "cloud_render_business.py":
+    script_name = Path(parsed.argv[1]).name
+    execution_policy = str(
+        trusted_env.get("HERMES_EXECUTION_POLICY", "") or ""
+    ).strip().lower()
+    turn_id = str(trusted_env.get("HERMES_TURN_ID", "") or "").strip()
+    gateway_session_key = str(
+        trusted_env.get("HERMES_GATEWAY_SESSION_KEY", "") or ""
+    ).strip()
+    proactive_receipt = bool(
+        re.fullmatch(r"pvm-[0-9a-f]{24}", turn_id)
+        and gateway_session_key == f"proactive-{turn_id}"
+    )
+    expected_agent_id = str(trusted_env.get("ZET_AGENT_ID", "") or "").strip()
+    if script_name == "proactive_video.py":
+        return proactive_receipt and _proactive_video_arguments_match_receipt(
+            parsed.argv[2:],
+            expected_agent_id=expected_agent_id,
+            turn_id=turn_id,
+        )
+    if execution_policy == "silent_automation":
+        # Silent turns have no interactive fallback.  Every terminal operation
+        # must stay inside the proactive manifest wrapper; otherwise a valid
+        # proof with an ordinary/stale session key could reach the legacy
+        # normalize, preference, or cloud upload helpers.
+        if script_name == "preference_resolver.py" and proactive_receipt:
+            return _proactive_preference_finalizer_arguments_match_receipt(
+                parsed.argv[2:],
+                expected_agent_id=expected_agent_id,
+                turn_id=turn_id,
+            )
+        return False
+    if proactive_receipt:
+        if script_name == "normalize.py":
+            return False
+        if script_name == "preference_resolver.py":
+            # The proactive wrapper owns preference reads and upload strategy.
+            # The model only needs the deterministic success finalizer after
+            # the verified download; every other resolver subcommand could
+            # re-read or mutate user memory outside the frozen manifest flow.
+            return _proactive_preference_finalizer_arguments_match_receipt(
+                parsed.argv[2:],
+                expected_agent_id=expected_agent_id,
+                turn_id=turn_id,
+            )
+        if (
+            script_name == "cloud_render_business.py"
+            and _cloud_render_business_subcommand(parsed.argv[2:])
+            in {"upload", "create-project"}
+        ):
+            return False
+
+    if script_name != "cloud_render_business.py":
         return True
 
-    expected_agent_id = str(trusted_env.get("ZET_AGENT_ID", "") or "").strip()
     if not expected_agent_id:
         return False
 
@@ -6164,14 +6358,24 @@ def _run_video_edit_runtime_command_if_allowed(
         if not _video_edit_runtime_claims_match_receipt(parsed, trusted_env):
             return _video_edit_runtime_shell_guard_result(command)
         secret_values = [
-            trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
-            trusted_env.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
+            trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", ""),
         ]
         trusted_secrets = {
             key: trusted_env.pop(key)
             for key in (
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
-                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_BUSINESS_EXECUTION_ACTION",
+            )
+            if trusted_env.get(key)
+        }
+        trusted_context = {
+            key: trusted_env[key]
+            for key in (
+                "ZET_AGENT_ID",
+                "HERMES_TURN_ID",
+                "HERMES_SESSION_KEY",
+                "HERMES_SESSION_ID",
+                "HERMES_GATEWAY_SESSION_KEY",
+                "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
             )
             if trusted_env.get(key)
         }
@@ -6180,6 +6384,7 @@ def _run_video_edit_runtime_command_if_allowed(
             "script": parsed.argv[1],
             "argv": parsed.argv[1:],
             "env": trusted_env,
+            "context": trusted_context,
             "secrets": trusted_secrets,
             "cwd": run_cwd,
             "source_bundle": _trusted_video_edit_source_bundle(
@@ -6206,7 +6411,19 @@ def _run_video_edit_runtime_command_if_allowed(
         ))
         result.pop("connector_runtime_direct", None)
         result["video_edit_runtime_direct"] = True
-        return json.dumps(result, ensure_ascii=False)
+        visible_result = json.dumps(result, ensure_ascii=False)
+        terminal_failure_reason = _trusted_video_edit_terminal_failure_reason(
+            result.get("output", ""),
+            returncode,
+        )
+        if terminal_failure_reason:
+            result["terminal_failure"] = True
+            result["reason"] = terminal_failure_reason
+            return TrustedToolResult(
+                json.dumps(result, ensure_ascii=False),
+                terminal_failure_reason=terminal_failure_reason,
+            )
+        return visible_result
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
         stderr = exc.stderr or ""
@@ -6293,7 +6510,7 @@ def _run_camera_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())
@@ -6389,7 +6606,7 @@ def _run_printer3d_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())

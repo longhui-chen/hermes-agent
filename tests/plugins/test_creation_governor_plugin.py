@@ -671,9 +671,9 @@ def test_api_server_never_evaluates_or_transforms_recommendations():
     assert llm.calls == []
     assert plugin._transform_llm_output(
         session_id="openai-client-session",
-            platform="api_server",
-            response_text="Here is the analysis.",
-            creation_action_receipt_transport="",
+        platform="api_server",
+        response_text="Here is the analysis.",
+        creation_action_receipt_transport="",
     ) is None
 
 
@@ -745,6 +745,25 @@ def test_api_server_receipt_transport_covers_optional_tool_in_same_turn():
     )
 
     assert result["status"] == "proposal_ready"
+
+
+def test_silent_automation_never_evaluates_or_transforms_recommendations():
+    plugin = _load_plugin()
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    assert plugin._on_pre_llm_call(
+        session_id="silent-automation-session",
+        execution_policy="silent_automation",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    ) is None
+    assert llm.calls == []
+    assert plugin._transform_llm_output(
+        session_id="silent-automation-session",
+        execution_policy="silent_automation",
+        response_text="Here is the analysis.",
+    ) is None
 
 
 def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
