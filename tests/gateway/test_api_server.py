@@ -1465,7 +1465,7 @@ class TestToolsetsEndpoint:
 
 class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
-    async def test_idempotency_is_scoped_by_business_execution_token(
+    async def test_idempotency_is_scoped_by_business_execution_action(
         self, adapter, monkeypatch, caplog
     ):
         cache = _IdempotencyCache()
@@ -1480,7 +1480,7 @@ class TestChatCompletionsEndpoint:
         calls = []
 
         async def run_agent(**kwargs):
-            token = kwargs["business_execution_token"]
+            token = kwargs["business_execution_action"]
             calls.append(token)
             return (
                 {
@@ -1503,7 +1503,8 @@ class TestChatCompletionsEndpoint:
                     json=body,
                     headers={
                         "Idempotency-Key": "same-key",
-                        "X-Zettlab-Business-Execution-Token": token_a,
+                        "X-Zettlab-Business-Execution-Action": token_a,
+                        "X-Zettlab-Business-Execution-Action-Version": "1",
                     },
                 )
                 first_body = await first.json()
@@ -1512,7 +1513,8 @@ class TestChatCompletionsEndpoint:
                     json=body,
                     headers={
                         "Idempotency-Key": "same-key",
-                        "X-Zettlab-Business-Execution-Token": token_a,
+                        "X-Zettlab-Business-Execution-Action": token_a,
+                        "X-Zettlab-Business-Execution-Action-Version": "1",
                     },
                 )
                 same_scope_body = await same_scope.json()
@@ -1521,7 +1523,8 @@ class TestChatCompletionsEndpoint:
                     json=body,
                     headers={
                         "Idempotency-Key": "same-key",
-                        "X-Zettlab-Business-Execution-Token": token_b,
+                        "X-Zettlab-Business-Execution-Action": token_b,
+                        "X-Zettlab-Business-Execution-Action-Version": "1",
                     },
                 )
                 other_scope_body = await other_scope.json()
@@ -3602,7 +3605,7 @@ class TestCORS:
         assert headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
         assert "POST" in headers["Access-Control-Allow-Methods"]
 
-    def test_cors_headers_allow_business_execution_token_unit(self):
+    def test_cors_headers_allow_business_execution_action_unit(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         headers = adapter._cors_headers_for_origin("http://localhost:3000")
         assert headers is not None
@@ -3610,7 +3613,8 @@ class TestCORS:
             value.strip().lower()
             for value in headers["Access-Control-Allow-Headers"].split(",")
         }
-        assert "x-zettlab-business-execution-token" in allowed
+        assert "x-zettlab-business-execution-action" in allowed
+        assert "x-zettlab-business-execution-action-version" in allowed
 
     def test_cors_headers_for_origin_rejects_unknown_origin(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -3652,7 +3656,7 @@ class TestCORS:
             assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
 
     @pytest.mark.asyncio
-    async def test_cors_business_execution_token_preflight_flow(self):
+    async def test_cors_business_execution_action_preflight_flow(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3662,7 +3666,7 @@ class TestCORS:
                     "Origin": "http://localhost:3000",
                     "Access-Control-Request-Method": "POST",
                     "Access-Control-Request-Headers": (
-                        "Content-Type, X-Zettlab-Business-Execution-Token"
+                        "Content-Type, X-Zettlab-Business-Execution-Action"
                     ),
                 },
             )
@@ -3677,7 +3681,8 @@ class TestCORS:
                     "",
                 ).split(",")
             }
-            assert "x-zettlab-business-execution-token" in allowed
+            assert "x-zettlab-business-execution-action" in allowed
+            assert "x-zettlab-business-execution-action-version" in allowed
 
     @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):

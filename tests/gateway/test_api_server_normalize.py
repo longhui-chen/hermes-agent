@@ -2,7 +2,7 @@
 
 from gateway.platforms import api_server
 from gateway.platforms.api_server import (
-    _extract_business_execution_token,
+    _extract_business_execution_action,
     _extract_plan_ack,
     _extract_plan_auto_execute,
     _extract_response_mode,
@@ -12,14 +12,29 @@ from gateway.platforms.api_server import (
 )
 
 
-class TestExtractBusinessExecutionToken:
+class TestExtractBusinessExecutionAction:
     def test_valid_opaque_token_is_preserved(self):
-        assert _extract_business_execution_token("a" * 64) == "a" * 64
+        request = type("Request", (), {"headers": {
+            "X-Zettlab-Business-Execution-Action": "a" * 64,
+            "X-Zettlab-Business-Execution-Action-Version": "1",
+        }})()
+        assert _extract_business_execution_action(request) == {
+            "action": "a" * 64,
+            "action_version": "1",
+        }
 
     def test_malformed_or_header_injected_token_is_dropped(self):
-        assert _extract_business_execution_token("short") == ""
-        assert _extract_business_execution_token("a" * 64 + "\r\nX-Evil: 1") == ""
-        assert _extract_business_execution_token("A" * 64) == ""
+        for action, version in (
+            ("short", "1"),
+            ("a" * 64 + "\r\nX-Evil: 1", "1"),
+            ("A" * 64, "1"),
+            ("a" * 64, "2"),
+        ):
+            request = type("Request", (), {"headers": {
+                "X-Zettlab-Business-Execution-Action": action,
+                "X-Zettlab-Business-Execution-Action-Version": version,
+            }})()
+            assert _extract_business_execution_action(request) == {}
 
 
 class TestExtractResponseMode:
@@ -224,5 +239,4 @@ class TestNormalizeChatContent:
             {"type": "text", "text": ""},
         ]
         assert _normalize_chat_content(content) == "actual"
-
 

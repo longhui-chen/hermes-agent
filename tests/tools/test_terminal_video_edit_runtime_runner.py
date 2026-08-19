@@ -28,8 +28,8 @@ def _reset_runtime_anchor(monkeypatch):
         "trusted_video_edit_runtime_receipt",
         lambda: {
             "ZET_AGENT_ID": "agent-1",
-            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "capability-secret",
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
             "HERMES_TURN_ID": "turn-1",
             "HERMES_SESSION_KEY": "session-1",
         },
@@ -69,7 +69,7 @@ def _write_trusted_script(tmp_path, name="workflow_state.py"):
         import os
         from _zettlab_video_runtime_context import get as runtime_value
 
-        print("execution=" + runtime_value("ZETTLAB_BUSINESS_EXECUTION_TOKEN"))
+        print("execution=" + runtime_value("ZETTLAB_BUSINESS_EXECUTION_ACTION"))
         print("agent=" + os.environ.get("ZET_AGENT_ID", ""))
         print("turn=" + os.environ.get("HERMES_TURN_ID", ""))
         print("connector-token=" + os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""))
@@ -152,12 +152,16 @@ def test_sensitive_runtime_boundary_keeps_gateway_exec_privilege(monkeypatch):
     assert calls == [{"no_new_privs": False, "drop_ptrace": True}]
 
 
-def test_generic_terminal_never_receives_business_execution_token(monkeypatch):
-    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "stale-global-secret")
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
+def test_generic_terminal_never_receives_business_execution_action(monkeypatch):
+    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_ACTION", "stale-global-secret")
+    tokens = set_turn_vars(
+        turn_id="turn-1",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
     try:
         result = LocalEnvironment().execute(
-            "printf '%s' \"$ZETTLAB_BUSINESS_EXECUTION_TOKEN\""
+            "printf '%s' \"$ZETTLAB_BUSINESS_EXECUTION_ACTION\""
         )
     finally:
         clear_turn_vars(tokens)
@@ -175,7 +179,11 @@ def test_trusted_video_runner_receives_only_current_scoped_capability(monkeypatc
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
     )
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
+    tokens = set_turn_vars(
+        turn_id="turn-1",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
     try:
         result = json.loads(terminal_tool_module._run_video_edit_runtime_command_if_allowed(
             'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/scripts/workflow_state.py"',
@@ -327,7 +335,11 @@ def test_trusted_video_runner_keeps_capability_out_of_wrapper_process_env(monkey
         return {"stdout": "ok", "stderr": "", "returncode": 0}
 
     monkeypatch.setattr(terminal_tool_module, "_run_video_edit_worker", fake_run)
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
+    tokens = set_turn_vars(
+        turn_id="turn-1",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
     try:
         result = json.loads(terminal_tool_module._run_video_edit_runtime_command_if_allowed(
             'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/scripts/cloud_render_business.py" '
@@ -338,11 +350,12 @@ def test_trusted_video_runner_keeps_capability_out_of_wrapper_process_env(monkey
     finally:
         clear_turn_vars(tokens)
     assert result["video_edit_runtime_direct"] is True
-    assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in captured["env"]
+    assert "ZETTLAB_BUSINESS_EXECUTION_ACTION" not in captured["env"]
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in captured["env"]
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
     assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
-    assert captured["secrets"]["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] == "capability-secret"
+    assert captured["secrets"]["ZETTLAB_BUSINESS_EXECUTION_ACTION"] == "a" * 64
+    assert captured["context"]["ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION"] == "1"
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["secrets"]
     assert "ZETTLAB_CONNECTORS_URL" not in captured["secrets"]
     assert "pythonpath" not in captured
@@ -472,7 +485,7 @@ def test_trusted_video_runner_dependency_isolation_flow_ignores_writable_argpars
     marker = tmp_path / "stolen-token.txt"
     (attacker_dir / "argparse.py").write_text(
         "from _zettlab_video_runtime_context import get\n"
-        f"open({str(marker)!r}, 'w').write(get('ZETTLAB_BUSINESS_EXECUTION_TOKEN'))\n"
+        f"open({str(marker)!r}, 'w').write(get('ZETTLAB_BUSINESS_EXECUTION_ACTION'))\n"
         "ATTACKER = True\n"
     )
     script.write_text(
@@ -486,7 +499,11 @@ def test_trusted_video_runner_dependency_isolation_flow_ignores_writable_argpars
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
     )
-    tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
+    tokens = set_turn_vars(
+        turn_id="turn-1",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
     try:
         result = json.loads(
             terminal_tool_module._run_video_edit_runtime_command_if_allowed(
@@ -850,14 +867,14 @@ def test_video_worker_idle_recycle_keeps_profile_payloads_isolated_flow(monkeypa
             "from _zettlab_video_runtime_context import get\n"
             "print(os.environ.get('HERMES_HOME', ''))\n"
             "print(os.environ.get('PROFILE_ONLY_VALUE', ''))\n"
-            "print(get('ZETTLAB_BUSINESS_EXECUTION_TOKEN'))\n"
+            "print(get('ZETTLAB_BUSINESS_EXECUTION_ACTION'))\n"
         )
         payload["env"] = {
             "HERMES_HOME": f"/profiles/{profile}",
             "PROFILE_ONLY_VALUE": profile,
         }
         payload["secrets"] = {
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": f"secret-{profile}",
+            "ZETTLAB_BUSINESS_EXECUTION_ACTION": f"secret-{profile}",
         }
         result = terminal_tool_module._run_video_edit_worker(payload, timeout=5)
         supervisor = terminal_tool_module._VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
@@ -2648,7 +2665,7 @@ def test_video_worker_success_kills_background_descendants_before_reply_flow(tmp
         import time
         from _zettlab_video_runtime_context import get
 
-        assert get("ZETTLAB_BUSINESS_EXECUTION_TOKEN") == {business_token!r}
+        assert get("ZETTLAB_BUSINESS_EXECUTION_ACTION") == {business_token!r}
         child = subprocess.Popen([sys.executable, "-I", "-S", "-c", {child_source!r}])
         deadline = time.monotonic() + 5
         while not os.path.exists({str(marker)!r}) and time.monotonic() < deadline:
@@ -2660,7 +2677,7 @@ def test_video_worker_success_kills_background_descendants_before_reply_flow(tmp
     )
     payload = _worker_payload(source)
     payload["env"] = {"ZETTLAB_CONNECTORS_AUTH_TOKEN": connector_token}
-    payload["secrets"] = {"ZETTLAB_BUSINESS_EXECUTION_TOKEN": business_token}
+    payload["secrets"] = {"ZETTLAB_BUSINESS_EXECUTION_ACTION": business_token}
     descendant_pid = 0
     try:
         result = terminal_tool_module._run_video_edit_worker(payload, timeout=8)
@@ -3212,7 +3229,8 @@ def test_generic_terminal_then_first_trusted_video_uses_frozen_image_and_receipt
 
     tokens = set_turn_vars(
         turn_id="turn-after-terminal",
-        business_execution_token="capability-after-terminal",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     try:
         video = json.loads(

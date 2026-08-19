@@ -509,11 +509,13 @@ def _execution_headers():
     """Forward server-issued execution context; model arguments never shape it."""
     try:
         from gateway.session_context import (
-            business_execution_token,
+            business_execution_action,
+            business_execution_action_version,
             current_turn_identity,
             get_session_env,
         )
-        token = str(business_execution_token() or "").strip()
+        token = str(business_execution_action() or "").strip()
+        version = str(business_execution_action_version() or "").strip()
         identity = current_turn_identity()
         turn_id = identity[0] if identity else ""
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
@@ -521,7 +523,8 @@ def _execution_headers():
         return {}
     headers = {}
     if token:
-        headers["X-Zettlab-Business-Execution-Token"] = token
+        headers["X-Zettlab-Business-Execution-Action"] = token
+        headers["X-Zettlab-Business-Execution-Action-Version"] = version
     if turn_id:
         headers["X-Hermes-Turn-Id"] = str(turn_id)
     if session_id:
@@ -552,7 +555,8 @@ def _auto_refresh_scope_token(action, body, execution_headers):
         return None
 
     required_execution_headers = {
-        "X-Zettlab-Business-Execution-Token",
+        "X-Zettlab-Business-Execution-Action",
+        "X-Zettlab-Business-Execution-Action-Version",
         "X-Hermes-Turn-Id",
         "X-Hermes-Session-Id",
     }

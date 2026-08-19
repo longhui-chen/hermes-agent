@@ -6164,23 +6164,27 @@ def _run_video_edit_runtime_command_if_allowed(
         if not _video_edit_runtime_claims_match_receipt(parsed, trusted_env):
             return _video_edit_runtime_shell_guard_result(command)
         secret_values = [
-            trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
-            trusted_env.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
+            trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", ""),
         ]
         trusted_secrets = {
             key: trusted_env.pop(key)
             for key in (
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
-                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_BUSINESS_EXECUTION_ACTION",
             )
             if trusted_env.get(key)
         }
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        trusted_context = {
+            key: trusted_env[key]
+            for key in ("ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",)
+            if trusted_env.get(key)
+        }
         payload = {
             "script": parsed.argv[1],
             "argv": parsed.argv[1:],
             "env": trusted_env,
             "secrets": trusted_secrets,
+            "context": trusted_context,
             "cwd": run_cwd,
             "source_bundle": _trusted_video_edit_source_bundle(
                 script=script,
@@ -6293,7 +6297,7 @@ def _run_camera_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())
@@ -6389,7 +6393,7 @@ def _run_printer3d_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())

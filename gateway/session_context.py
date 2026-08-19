@@ -154,7 +154,7 @@ def cron_attached_skills() -> tuple[str, ...]:
 # fixed name here would make every app whose write operation isn't literally
 # named "data.import" fail every single round (the mirror-image bug this
 # ledger exists to prevent: false failure instead of false success). Not part
-# of _VAR_MAP: like _BUSINESS_EXECUTION_TOKEN, this must never mirror into
+# of _VAR_MAP: like _BUSINESS_EXECUTION_ACTION, this must never mirror into
 # os.environ or forward to generic terminal/plugin/model-driving subprocesses,
 # and it must stay absent (not merely empty) for interactive turns that never
 # push a scope, so app_host's call() two-layer status is completely untouched.
@@ -217,8 +217,16 @@ _PLAN_ACK_REVISION_REQUESTED: ContextVar = ContextVar(
     "HERMES_PLAN_ACK_REVISION_REQUESTED",
     default=_UNSET,
 )
-_BUSINESS_EXECUTION_TOKEN: ContextVar = ContextVar(
-    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+_BUSINESS_EXECUTION_ACTION: ContextVar = ContextVar(
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION",
+    default=_UNSET,
+)
+_BUSINESS_EXECUTION_ACTION_VERSION: ContextVar = ContextVar(
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
+    default=_UNSET,
+)
+_HARDWARE_EXECUTION_TOKEN: ContextVar = ContextVar(
+    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
     default=_UNSET,
 )
 _ZETTLAB_AUTH_PRINCIPAL: ContextVar = ContextVar(
@@ -384,7 +392,9 @@ def set_turn_vars(
     plan_ack_status: str = "",
     plan_ack_turn_id: str = "",
     plan_ack_revision_requested: str = "",
-    business_execution_token: str = "",
+    business_execution_action: str = "",
+    business_execution_action_version: str = "",
+    hardware_execution_token: str = "",
 ) -> list:
     """Bind one request's turn identity and plan receipt task-locally."""
     global _session_context_engaged
@@ -395,7 +405,11 @@ def set_turn_vars(
         _PLAN_ACK_STATUS.set(plan_ack_status),
         _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
         _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
-        _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
+        _BUSINESS_EXECUTION_ACTION.set(business_execution_action),
+        _BUSINESS_EXECUTION_ACTION_VERSION.set(
+            str(business_execution_action_version or "").strip()
+        ),
+        _HARDWARE_EXECUTION_TOKEN.set(hardware_execution_token),
     ]
 
 
@@ -408,7 +422,9 @@ def clear_turn_vars(tokens: list) -> None:
             _PLAN_ACK_STATUS,
             _PLAN_ACK_TURN_ID,
             _PLAN_ACK_REVISION_REQUESTED,
-            _BUSINESS_EXECUTION_TOKEN,
+            _BUSINESS_EXECUTION_ACTION,
+            _BUSINESS_EXECUTION_ACTION_VERSION,
+            _HARDWARE_EXECUTION_TOKEN,
         ),
         tokens,
     ):
@@ -433,13 +449,34 @@ def current_turn_identity() -> tuple[str, object] | None:
     return normalized_turn_id, binding
 
 
-def business_execution_token() -> str:
-    """Return the task-local capability for the trusted video executor only.
+def business_execution_action() -> str:
+    """Return the task-local opaque ActionV1 for the trusted video executor.
 
     This value intentionally lives outside ``_VAR_MAP`` so generic terminal,
     execute-code, plugin, and model-driving subprocesses cannot inherit it.
     """
-    value = _BUSINESS_EXECUTION_TOKEN.get()
+    value = _BUSINESS_EXECUTION_ACTION.get()
+    if value is _UNSET or value is None:
+        return ""
+    normalized = str(value).strip()
+    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
+
+
+def business_execution_action_version() -> str:
+    """Return the frozen ActionV1 transport version for this turn."""
+    value = _BUSINESS_EXECUTION_ACTION_VERSION.get()
+    if value is _UNSET or value is None:
+        return ""
+    return str(value).strip()
+
+
+def hardware_execution_token() -> str:
+    """Return the task-local capability for trusted hardware helpers only.
+
+    Like the business capability, this stays outside ``_VAR_MAP`` so generic
+    terminal, plugin, and model-driving subprocesses cannot inherit it.
+    """
+    value = _HARDWARE_EXECUTION_TOKEN.get()
     if value is _UNSET or value is None:
         return ""
     return str(value).strip()
@@ -666,7 +703,9 @@ def reset_session_vars() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
-    _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
+    _BUSINESS_EXECUTION_ACTION.set(_UNSET)
+    _BUSINESS_EXECUTION_ACTION_VERSION.set(_UNSET)
+    _HARDWARE_EXECUTION_TOKEN.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.

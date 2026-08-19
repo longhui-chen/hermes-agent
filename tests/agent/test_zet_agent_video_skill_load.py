@@ -567,15 +567,17 @@ def test_trusted_video_receipt_and_rearm_ignore_plugin_result_rewrite(
     )
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
-        action_token="action-secret",
-        business_execution_token="business-secret",
+        action_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        hardware_execution_token="",
         turn_id="trusted-terminal-plugin-boundary",
         session_id="session-1",
     )
     expected_receipt = {
         "ZET_AGENT_ID": "agent-1",
-        "ZETTLAB_AGENT_ACTION_TOKEN": "action-secret",
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-secret",
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
         "HERMES_TURN_ID": "trusted-terminal-plugin-boundary",
         "HERMES_SESSION_KEY": "session-1",
     }
@@ -684,8 +686,10 @@ def test_trusted_video_terminal_authorization_normalizes_registry_args(
     }
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
-        action_token="action-secret",
-        business_execution_token="business-secret",
+        action_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        hardware_execution_token="",
         turn_id="trusted-terminal-coercion",
         session_id="session-1",
     )
@@ -747,10 +751,12 @@ def test_trusted_skill_scope_uses_final_displayed_skill_view_result(
     monkeypatch.setattr(
         response_mode,
         "_capture_trusted_execution_receipt",
-        lambda _turn_identity: response_mode._TrustedExecutionReceipt(
+        lambda _turn_identity, *, hardware_skill: response_mode._TrustedExecutionReceipt(
             agent_id="agent-1",
-            action_token="action-secret",
-            business_execution_token="business-secret",
+            action_token="" if not hardware_skill else "action-secret",
+            business_execution_action="a" * 64 if not hardware_skill else "",
+            business_execution_action_version="1" if not hardware_skill else "",
+            hardware_execution_token="" if not hardware_skill else "b" * 64,
             turn_id="final-skill-view-result",
             session_id="session-1",
         ),
@@ -836,8 +842,10 @@ def test_trusted_video_blocks_terminal_args_changed_after_preflight(monkeypatch)
     rewritten_args = {"command": "python3 trusted-helper.py finalize"}
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
-        action_token="action-secret",
-        business_execution_token="business-secret",
+        action_token="",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        hardware_execution_token="",
         turn_id="trusted-terminal-args",
         session_id="session-1",
     )

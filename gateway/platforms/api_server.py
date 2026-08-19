@@ -624,8 +624,27 @@ def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
     return _strip_skill_display_token(user_message, skill_slug)
 
 
-def _extract_business_execution_token(raw: Any) -> str:
-    """Accept only local-server's fixed-width opaque capability format."""
+_ACTION_VERSION = "1"
+_ACTION_HEADER = "X-Zettlab-Business-Execution-Action"
+_ACTION_VERSION_HEADER = "X-Zettlab-Business-Execution-Action-Version"
+_ACTION_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _extract_business_execution_action(request: Any) -> Optional[Dict[str, str]]:
+    """Parse the opaque ActionV1 relay envelope without semantic auth."""
+    if request is None:
+        return None
+    raw = str(request.headers.get(_ACTION_HEADER, "") or "").strip()
+    version = str(request.headers.get(_ACTION_VERSION_HEADER, "") or "").strip()
+    if not raw and not version:
+        return None
+    if version != _ACTION_VERSION or _ACTION_RE.fullmatch(raw) is None:
+        return {}
+    return {"action": raw, "action_version": version}
+
+
+def _extract_hardware_execution_token(raw: Any) -> str:
+    """Accept only local-server's independent hardware capability format."""
     token = str(raw or "").strip()
     return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
 
@@ -1721,7 +1740,9 @@ _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": (
         "Authorization, Content-Type, Idempotency-Key, "
-        "X-Zettlab-Business-Execution-Token"
+        "X-Zettlab-Business-Execution-Action, "
+        "X-Zettlab-Business-Execution-Action-Version, "
+        "X-Zettlab-Hardware-Execution-Token"
     ),
 }
 
@@ -5702,8 +5723,24 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
         connector_route_capability = _extract_connector_route_capability(body)
-        business_execution_token = _extract_business_execution_token(
-            request.headers.get("X-Zettlab-Business-Execution-Token", "")
+        business_execution_envelope = _extract_business_execution_action(request)
+        if business_execution_envelope == {}:
+            return web.json_response(
+                {"error": {"message": "invalid business execution action", "type": "invalid_request_error", "param": _ACTION_HEADER, "code": "invalid_business_execution_action"}},
+                status=403,
+            )
+        business_execution_action = (
+            str(business_execution_envelope.get("action", "") or "")
+            if business_execution_envelope is not None
+            else ""
+        )
+        business_execution_action_version = (
+            str(business_execution_envelope.get("action_version", "") or "")
+            if business_execution_envelope is not None
+            else ""
+        )
+        hardware_execution_token = _extract_hardware_execution_token(
+            request.headers.get("X-Zettlab-Hardware-Execution-Token", "")
         )
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -6006,7 +6043,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
-                business_execution_token=business_execution_token,
+                business_execution_action=business_execution_action,
+                business_execution_action_version=business_execution_action_version,
+                hardware_execution_token=hardware_execution_token,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
                 trusted_user_message=trusted_user_message,
@@ -6062,7 +6101,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
-                    business_execution_token=business_execution_token,
+                    business_execution_action=business_execution_action,
+                    business_execution_action_version=business_execution_action_version,
+                    hardware_execution_token=hardware_execution_token,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
@@ -6087,7 +6128,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "metadata",
                 ],
                 execution_scope_digest=_business_execution_scope_digest(
-                    business_execution_token
+                    business_execution_action or hardware_execution_token
                 ),
             )
             try:
@@ -8523,7 +8564,9 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
-        business_execution_token: Optional[str] = None,
+        business_execution_action: Optional[str] = None,
+        business_execution_action_version: Optional[str] = None,
+        hardware_execution_token: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,

@@ -240,7 +240,8 @@ async def test_boundary_failure_does_not_read_or_parse_token_flow(monkeypatch):
         (),
         {
             "headers": {
-                "X-Zettlab-Business-Execution-Token": "a" * 64,
+                "X-Zettlab-Business-Execution-Action": "a" * 64,
+                "X-Zettlab-Business-Execution-Action-Version": "1",
             },
             "read": AsyncMock(
                 side_effect=AssertionError("request must not be read")

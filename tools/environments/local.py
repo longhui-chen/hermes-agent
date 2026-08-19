@@ -2132,10 +2132,14 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
+_RETIRED_BUSINESS_CAPABILITY_ENV_KEY = "ZETTLAB_BUSINESS_EXECUTION_" + "TOKEN"
 VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # Turn-scoped side-effect capability. Generic subprocesses must not
     # inherit either a live ContextVar or a stale process-global fallback.
-    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION",
+    "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
+    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+    _RETIRED_BUSINESS_CAPABILITY_ENV_KEY,
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -2330,6 +2334,14 @@ def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]
         frozen_receipt = {}
     if not frozen_receipt:
         raise PermissionError("trusted video-edit execution receipt unavailable")
+    action = str(
+        frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", "") or ""
+    ).strip()
+    if (
+        frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION") != "1"
+        or re.fullmatch(r"[0-9a-f]{64}", action) is None
+    ):
+        raise PermissionError("trusted video-edit ActionV1 receipt unavailable")
     env.update(frozen_receipt)
     return env
 
@@ -2338,7 +2350,7 @@ def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
     Camera credentials never enter Hermes. The helper receives only the
-    profile action token and the current request's business capability so the
+    profile action token and the current request's hardware capability so the
     device-local CameraService can bind the call to one Agent, user, turn, and
     session. Generic subprocesses continue to have all of these values
     stripped by :func:`_apply_profile_secret_scope_env`.
@@ -2355,8 +2367,8 @@ def build_camera_runtime_env() -> dict[str, str]:
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
             frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
         ).strip(),
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": str(
-            frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "") or ""
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(
+            frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or ""
         ).strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
@@ -2366,7 +2378,7 @@ def build_camera_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
@@ -2393,7 +2405,7 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     env = {
         "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "") or "").strip(),
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
         "HERMES_SESSION_KEY": session_id,
@@ -2401,7 +2413,7 @@ def build_printer3d_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,

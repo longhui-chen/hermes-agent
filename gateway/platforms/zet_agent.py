@@ -3769,7 +3769,9 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
-        business_execution_token: Optional[str] = None,
+        business_execution_action: Optional[str] = None,
+        business_execution_action_version: Optional[str] = None,
+        hardware_execution_token: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
@@ -3813,7 +3815,7 @@ class ZetAgentAdapter(APIServerAdapter):
             request_overrides["_zet_onboarding_received_mono"] = time.monotonic()
 
         if (
-            business_execution_token
+            (business_execution_action or hardware_execution_token)
             and not gateway_sensitive_process_boundary_ready()
         ):
             raise PermissionError(
@@ -3830,12 +3832,25 @@ class ZetAgentAdapter(APIServerAdapter):
             ack_revision_requested = (
                 "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
             )
-        scoped_business_execution_token = str(business_execution_token or "")
+        scoped_business_execution_action = str(business_execution_action or "").strip()
+        scoped_business_execution_action_version = str(
+            business_execution_action_version or ""
+        ).strip()
+        scoped_hardware_execution_token = str(hardware_execution_token or "")
+        if bool(scoped_business_execution_action) != bool(
+            scoped_business_execution_action_version
+        ) or (
+            scoped_business_execution_action_version
+            and scoped_business_execution_action_version != "1"
+        ):
+            raise PermissionError("invalid business execution ActionV1 envelope")
         if ack_status == "cancelled" or (ack_status and not ack_turn_id):
             # Legacy receipts remain visible to released clients, but cannot
             # carry the newer turn-bound side-effect capability. Cancellation
             # similarly preserves the receipt while revoking execution.
-            scoped_business_execution_token = ""
+            scoped_business_execution_action = ""
+            scoped_business_execution_action_version = ""
+            scoped_hardware_execution_token = ""
 
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
@@ -3937,7 +3952,9 @@ class ZetAgentAdapter(APIServerAdapter):
             plan_ack_status=ack_status,
             plan_ack_turn_id=ack_turn_id,
             plan_ack_revision_requested=ack_revision_requested,
-            business_execution_token=scoped_business_execution_token,
+            business_execution_action=scoped_business_execution_action,
+            business_execution_action_version=scoped_business_execution_action_version,
+            hardware_execution_token=scoped_hardware_execution_token,
         )
         # This turn's ledger card title (X-Task-Title). Bound here, before the
         # base adapter's copy_context() hands the request to its executor, so
@@ -3999,7 +4016,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
-                business_execution_token=scoped_business_execution_token,
+                business_execution_action=scoped_business_execution_action,
+                business_execution_action_version=scoped_business_execution_action_version,
+                hardware_execution_token=scoped_hardware_execution_token,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
@@ -7029,7 +7048,7 @@ class ZetAgentAdapter(APIServerAdapter):
         them — we only pay one read.
         """
         raw_business_token = request.headers.get(
-            "X-Zettlab-Business-Execution-Token",
+            "X-Zettlab-Business-Execution-Action",
             "",
         )
         if raw_business_token and not gateway_sensitive_process_boundary_ready():

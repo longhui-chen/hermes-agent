@@ -350,7 +350,9 @@ class _SkillDirectTaskContext:
 class _TrustedExecutionReceipt:
     agent_id: str = field(repr=False)
     action_token: str = field(repr=False)
-    business_execution_token: str = field(repr=False)
+    business_execution_action: str = field(repr=False)
+    business_execution_action_version: str = field(repr=False)
+    hardware_execution_token: str = field(repr=False)
     turn_id: str
     session_id: str
 
@@ -576,6 +578,8 @@ def _confirmed_video_edit_plan_resume(
 
 def _capture_trusted_execution_receipt(
     turn_identity: _TurnIdentity,
+    *,
+    hardware_skill: bool,
 ) -> _TrustedExecutionReceipt | None:
     """Freeze request-bound execution claims before later tool boundaries."""
     try:
@@ -595,37 +599,64 @@ def _capture_trusted_execution_receipt(
 
     try:
         from gateway.session_context import (
-            business_execution_token,
+            business_execution_action,
+            business_execution_action_version,
             get_session_env,
+            hardware_execution_token,
         )
 
-        business_token = business_execution_token()
-        session_id = get_session_env("HERMES_SESSION_ID") or get_session_env(
-            "HERMES_SESSION_KEY"
+        business_action = business_execution_action() if not hardware_skill else ""
+        business_action_version = (
+            business_execution_action_version() if not hardware_skill else ""
         )
+        hardware_token = hardware_execution_token() if hardware_skill else ""
+        session_id = (
+            get_session_env("HERMES_SESSION_ID")
+            if hardware_skill
+            else get_session_env("HERMES_SESSION_KEY")
+        ) or get_session_env("HERMES_SESSION_KEY")
     except Exception:
-        business_token = ""
+        business_action = ""
+        business_action_version = ""
+        hardware_token = ""
         session_id = ""
 
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
-        action_token=_profile_value("ZETTLAB_AGENT_ACTION_TOKEN"),
-        business_execution_token=str(business_token or "").strip(),
+        action_token=(
+            _profile_value("ZETTLAB_AGENT_ACTION_TOKEN") if hardware_skill else ""
+        ),
+        business_execution_action=str(business_action or "").strip(),
+        business_execution_action_version=str(
+            business_action_version or ""
+        ).strip(),
+        hardware_execution_token=str(hardware_token or "").strip(),
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
     )
-    present = {
-        "agent_id": bool(receipt.agent_id),
-        "action_token": bool(receipt.action_token),
-        "business_execution_token": bool(receipt.business_execution_token),
-        "turn_id": bool(receipt.turn_id),
-        "session_id": bool(receipt.session_id),
-    }
+    present = {"agent_id": bool(receipt.agent_id), "turn_id": bool(receipt.turn_id)}
+    if hardware_skill:
+        present.update({
+            "action_token": bool(receipt.action_token),
+            "hardware_token": bool(receipt.hardware_execution_token),
+            "session_id": bool(receipt.session_id),
+        })
+    else:
+        present.update({
+            "business_action": bool(receipt.business_execution_action),
+            "action_version": receipt.business_execution_action_version == "1",
+            "session_id": bool(receipt.session_id),
+        })
     if not all(present.values()):
         logger.warning(
             "zet_agent: trusted video execution receipt incomplete: %s",
             present,
         )
+        return None
+    if not hardware_skill and re.fullmatch(
+        r"[0-9a-f]{64}", receipt.business_execution_action
+    ) is None:
+        logger.warning("zet_agent: business execution action is malformed")
         return None
     return receipt
 
@@ -633,12 +664,19 @@ def _capture_trusted_execution_receipt(
 def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the dedicated worker."""
     receipt = _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.get()
-    if receipt is None:
+    if (
+        receipt is None
+        or receipt.hardware_execution_token
+        or receipt.business_execution_action_version != "1"
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.business_execution_action) is None
+    ):
         return {}
     return {
         "ZET_AGENT_ID": receipt.agent_id,
-        "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": receipt.business_execution_token,
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION": receipt.business_execution_action,
+        "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": (
+            receipt.business_execution_action_version
+        ),
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
     }
@@ -646,12 +684,25 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
 
 def trusted_camera_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the camsnap helper."""
-    return trusted_video_edit_runtime_receipt()
+    receipt = _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.get()
+    if (
+        receipt is None
+        or receipt.business_execution_action
+        or not receipt.hardware_execution_token
+    ):
+        return {}
+    return {
+        "ZET_AGENT_ID": receipt.agent_id,
+        "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": receipt.hardware_execution_token,
+        "HERMES_TURN_ID": receipt.turn_id,
+        "HERMES_SESSION_KEY": receipt.session_id,
+    }
 
 
 def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for signed printer helpers."""
-    return trusted_video_edit_runtime_receipt()
+    return trusted_camera_runtime_receipt()
 
 
 def trusted_video_edit_manifest_digests() -> Mapping[str, str]:
@@ -2916,7 +2967,10 @@ def apply_trusted_skill_execution(
             pending.relative_path,
         )
         return False
-    execution_receipt = _capture_trusted_execution_receipt(current_turn_identity)
+    execution_receipt = _capture_trusted_execution_receipt(
+        current_turn_identity,
+        hardware_skill=pending.relative_path != _VIDEO_EDIT_SKILL_PATH,
+    )
     if execution_receipt is None:
         return False
     allowed_tools = (
