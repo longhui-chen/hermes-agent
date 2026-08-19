@@ -25,7 +25,13 @@ def _serve_once(path, response, *, purpose="agentcomputer", expected=None):
             connection, _ = server.accept()
             with connection:
                 size = struct.unpack(">I", connection.recv(4))[0]
-                request = json.loads(connection.recv(size))
+                received = bytearray()
+                while len(received) < size:
+                    chunk = connection.recv(size - len(received))
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+                request = json.loads(received)
                 expected_request = {
                     "agent_id": "agent-1",
                     "purpose": purpose,
@@ -57,13 +63,41 @@ def test_request_app_auto_refresh_token_uses_dedicated_purpose():
         path = Path(directory) / "credential.sock"
         token = "b" * 64
         binding = {
-            "operation_digest": "a" * 64,
+            "operation_kind": "apphost_publish_v1",
+            "operation": {"operation_id": "op-1", "data_refresh": "user_confirmed_auto"},
+            "owner_principal": "iam:user-1",
             "owner_agent_id": "agent-1",
             "turn_id": "turn-1",
             "session_id": "session-1",
         }
         thread = _serve_once(path, {"token": token}, purpose="app-auto-refresh", expected=binding)
         assert request_app_auto_refresh_token("agent-1", socket_path=path, **binding) == token
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+def test_request_app_auto_refresh_token_preserves_one_megabyte_business_limit():
+    with tempfile.TemporaryDirectory(prefix="acb-", dir="/tmp") as directory:
+        path = Path(directory) / "credential.sock"
+        token = "c" * 64
+        binding = {
+            "operation_kind": "app_dedicated_create_v1",
+            "operation": {"soul_identity": "x" * (300 * 1024)},
+            "owner_principal": "iam:user-1",
+            "owner_agent_id": "agent-1",
+            "turn_id": "turn-1",
+            "session_id": "session-1",
+        }
+        thread = _serve_once(
+            path,
+            {"token": token},
+            purpose="app-auto-refresh",
+            expected=binding,
+        )
+        assert (
+            request_app_auto_refresh_token("agent-1", socket_path=path, **binding)
+            == token
+        )
         thread.join(timeout=2)
         assert not thread.is_alive()
 

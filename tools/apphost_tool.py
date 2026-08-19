@@ -16,7 +16,6 @@ remain available for devices and skills that still stage through App Host.
 """
 
 import json
-import hashlib
 import os
 import re
 import urllib.error
@@ -512,10 +511,12 @@ def _execution_headers():
         from gateway.session_context import (
             current_turn_identity,
             get_session_env,
+            zettlab_auth_principal,
         )
         identity = current_turn_identity()
         turn_id = identity[0] if identity else ""
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+        owner_principal = str(zettlab_auth_principal() or "").strip()
     except Exception:
         return {}
     headers = {}
@@ -523,6 +524,8 @@ def _execution_headers():
         headers["X-Hermes-Turn-Id"] = str(turn_id)
     if session_id:
         headers["X-Hermes-Session-Id"] = session_id
+    if owner_principal:
+        headers["X-Zettlab-Auth-Principal-Id"] = owner_principal
     # Bound scheduler sessions are server-generated as
     # cron_task_<job-id>_<UTC timestamp>.
     # The task id is therefore derived from trusted execution context, never
@@ -538,9 +541,11 @@ def _auto_refresh_scope_token(action, body, execution_headers):
 
     ``user_confirmed_auto`` is durable user intent in the immutable operation;
     the execution headers bind this particular publication to the active user
-    turn.  The model never receives the resulting bearer: it is sent once to
-    App Host, which claims it against the operation fingerprint before it can
-    provision the maintainer and cron job.
+    turn. Hermes forwards the same request object to local-server's broker and
+    then to App Host; local-server computes and verifies the operation binding.
+    Hermes never derives a digest or decides whether a capability matches.
+    The model never receives the resulting bearer: it is sent once to App
+    Host, which claims it before it can provision the maintainer and cron job.
     """
     if action != "publish" or not isinstance(body, dict):
         return None
@@ -551,6 +556,7 @@ def _auto_refresh_scope_token(action, body, execution_headers):
     required_execution_headers = {
         "X-Hermes-Turn-Id",
         "X-Hermes-Session-Id",
+        "X-Zettlab-Auth-Principal-Id",
     }
     if not required_execution_headers.issubset(execution_headers):
         raise _AutoRefreshScopeUnavailable(
@@ -562,13 +568,11 @@ def _auto_refresh_scope_token(action, body, execution_headers):
             "当前 Agent 身份不可用，无法授权自动维护；未发送发布请求"
         )
     try:
-        canonical = json.dumps(
-            operation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        operation_digest = hashlib.sha256(canonical).hexdigest()
         token = request_app_auto_refresh_token(
             agent_id,
-            operation_digest=operation_digest,
+            operation_kind="apphost_publish_v1",
+            operation=body,
+            owner_principal=execution_headers.get("X-Zettlab-Auth-Principal-Id", ""),
             owner_agent_id=agent_id,
             turn_id=execution_headers["X-Hermes-Turn-Id"],
             session_id=execution_headers["X-Hermes-Session-Id"],

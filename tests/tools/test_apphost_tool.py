@@ -512,13 +512,15 @@ def test_data_import_outside_a_pushed_scope_is_a_silent_noop(monkeypatch):
 
 def test_publish_operation_is_passed_through_unchanged(monkeypatch):
     from gateway.session_context import (
-        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+        clear_session_vars, clear_turn_vars, pop_zettlab_auth_principal,
+        push_zettlab_auth_principal, set_session_vars, set_turn_vars,
     )
 
     seen = {}
     operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "user_confirmed_auto", "maintenance": {"schedule": "0 9 * * *"}}
     session_tokens = set_session_vars(session_id="session-1")
     turn_tokens = set_turn_vars(turn_id="turn-1")
+    principal_token = push_zettlab_auth_principal("iam:user-1")
     try:
         with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
             "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
@@ -531,6 +533,7 @@ def test_publish_operation_is_passed_through_unchanged(monkeypatch):
                 "data_refresh": "user_confirmed_auto", "operation": operation,
             }))
     finally:
+        pop_zettlab_auth_principal(principal_token)
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     assert out["ok"] is True
@@ -538,7 +541,14 @@ def test_publish_operation_is_passed_through_unchanged(monkeypatch):
     assert mint.call_args.kwargs["owner_agent_id"] == "main"
     assert mint.call_args.kwargs["turn_id"] == "turn-1"
     assert mint.call_args.kwargs["session_id"] == "session-1"
-    assert len(mint.call_args.kwargs["operation_digest"]) == 64
+    assert mint.call_args.kwargs["operation_kind"] == "apphost_publish_v1"
+    assert mint.call_args.kwargs["operation"] == {
+        "mode": "install",
+        "source_subdir": "runs/app",
+        "data_refresh": "user_confirmed_auto",
+        "operation": operation,
+    }
+    assert mint.call_args.kwargs["owner_principal"] == "iam:user-1"
     assert json.loads(seen["req"].data)["operation"] == operation
     assert seen["req"].get_header("X-zettlab-agent-action-token") == "a" * 64
 
@@ -604,7 +614,8 @@ def test_operation_enabled_publish_200_returns_verified_terminal_receipt(monkeyp
 
 def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent(monkeypatch):
     from gateway.session_context import (
-        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+        clear_session_vars, clear_turn_vars, pop_zettlab_auth_principal,
+        push_zettlab_auth_principal, set_session_vars, set_turn_vars,
     )
 
     seen = {}
@@ -612,6 +623,7 @@ def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent
     response = {"operation": {"operation_id": "op-reload", "terminal": "succeeded"}}
     session_tokens = set_session_vars(session_id="session-1")
     turn_tokens = set_turn_vars(turn_id="turn-1")
+    principal_token = push_zettlab_auth_principal("iam:user-1")
     try:
         with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
             "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
@@ -621,6 +633,7 @@ def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent
                 "operation": operation,
             }))
     finally:
+        pop_zettlab_auth_principal(principal_token)
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     assert out["ok"] is True

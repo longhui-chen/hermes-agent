@@ -6005,6 +6005,32 @@ def _request_agentcomputer_mutation_approval(
     }, ensure_ascii=False)
 
 
+def _agent_creator_operation_payload(
+    parsed: _AgentCreatorCommand,
+) -> Optional[dict]:
+    """Return the app-agent object that the pinned script will POST.
+
+    Hermes deliberately does not canonicalize or digest this value. The
+    local-server broker is the sole authority for operation binding; this
+    helper only decodes the already validated command payload so the same
+    object can be forwarded to that broker before the script runs. The probe
+    sentinel is translated to the empty object because the preset sends
+    ``{}`` on the wire for its read-only capability probe.
+    """
+    if len(parsed.argv) < 5 or parsed.argv[2] != "create-app-agent":
+        return None
+    raw = parsed.stdin_text if parsed.argv[4] == "-" else parsed.argv[4]
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value == {"probe": True}:
+        return {}
+    return value
+
+
 def _read_verified_agent_creator_file(
     path: Path,
     *,
@@ -6265,13 +6291,31 @@ def _run_agent_creator_command_if_allowed(
             direct=True,
         )
 
+    app_auto_refresh = (
+        len(parsed.argv) >= 3 and parsed.argv[2] == "create-app-agent"
+    )
+    app_operation = (
+        _agent_creator_operation_payload(parsed)
+        if app_auto_refresh
+        else None
+    )
+    if app_auto_refresh and app_operation is None:
+        return _agent_creator_blocked_result(
+            "agent_creator_operation_binding_unavailable",
+            "Agent Creator operation payload could not be forwarded to local-server.",
+            direct=True,
+        )
+
     try:
         from tools.environments.local import build_agent_creator_runtime_env
 
         creator_env = build_agent_creator_runtime_env(
-            app_auto_refresh=(
-                len(parsed.argv) >= 3 and parsed.argv[2] == "create-app-agent"
-            )
+            app_auto_refresh=app_auto_refresh,
+            **(
+                {"app_auto_refresh_operation": app_operation}
+                if app_auto_refresh
+                else {}
+            ),
         )
     except Exception:
         return _agent_creator_blocked_result(
