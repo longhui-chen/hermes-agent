@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import queue
 import re
+import threading
 
 import pytest
 
@@ -526,35 +528,83 @@ def test_accepted_action_survives_a_concurrent_replay_deny():
     )
 
 
+class _Request:
+    """把一次请求跑在自己的线程里。
+
+    api_server 的 ``_run_agent`` 用 ``run_in_executor`` 把整轮对话（pre_llm_call →
+    工具循环 → transform_llm_output）放在一个 executor 线程上跑，所以并发请求天然
+    各有各的 ContextVar 上下文。同 turn_id 并发这件事只有按线程建模才是真的——在
+    同一个线程里连着调两次 hook，模拟出来的是「一个请求里的两轮」，不是并发。
+    """
+
+    def __init__(self) -> None:
+        self._calls: "queue.Queue[tuple]" = queue.Queue()
+        self._results: "queue.Queue[tuple]" = queue.Queue()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            item = self._calls.get()
+            if item is None:
+                return
+            fn, args, kwargs = item
+            try:
+                self._results.put((True, fn(*args, **kwargs)))
+            except BaseException as exc:  # noqa: BLE001 - 原样带回主线程断言
+                self._results.put((False, exc))
+
+    def run(self, fn, *args, **kwargs):
+        self._calls.put((fn, args, kwargs))
+        ok, value = self._results.get(timeout=10)
+        if not ok:
+            raise value
+        return value
+
+    def close(self) -> None:
+        self._calls.put(None)
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def two_requests():
+    first, second = _Request(), _Request()
+    try:
+        yield first, second
+    finally:
+        first.close()
+        second.close()
+
+
+def _accept_action(request: _Request, plugin, session_id: str, payload, turn_id: str):
+    return request.run(
+        plugin._on_pre_llm_call,
+        session_id=session_id,
+        sender_id="owner-a",
+        turn_id=turn_id,
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+
 # 同一个 turn_id 可能有多个在途请求。先完成的那个不能把还在等模型返回工具调用
-# 的那个的闸门一起撤掉——否则后者会因为「键不存在」被当成不受管控的普通轮次，
-# 创建照样放行，同一次点击仍然建出两个资源。
-def test_creation_gate_survives_until_every_in_flight_request_finishes():
+# 的那个的闸门一起撤掉——否则后者会因为「不受管控」被当成普通轮次，创建照样放行，
+# 同一次点击仍然建出两个资源。
+def test_creation_gate_survives_until_every_in_flight_request_finishes(two_requests):
+    first, second = two_requests
     plugin = _load_plugin()
     payload = _show_card(plugin, "inflight-refs", creation_type="skill")
 
     # 两个并发请求都进入配额管控：先到的接管、后到的判无效重放。
-    plugin._on_pre_llm_call(
-        session_id="inflight-refs",
-        sender_id="owner-a",
-        turn_id="shared-turn",
-        user_message=_action(payload),
-        conversation_history=[],
-        creation_action_receipt_transport=RECEIPT_TRANSPORT,
-    )
-    replay = plugin._on_pre_llm_call(
-        session_id="inflight-refs",
-        sender_id="owner-a",
-        turn_id="shared-turn",
-        user_message=_action(payload),
-        conversation_history=[],
-        creation_action_receipt_transport=RECEIPT_TRANSPORT,
-    )
+    _accept_action(first, plugin, "inflight-refs", payload, "shared-turn")
+    replay = _accept_action(second, plugin, "inflight-refs", payload, "shared-turn")
     assert "invalid or expired" in replay["context"]
 
     # 先到那个请求把它买到的那张票用掉。
     assert (
-        plugin._on_pre_tool_call(
+        first.run(
+            plugin._on_pre_tool_call,
             tool_name="skill_manage",
             args={"action": "create"},
             turn_id="shared-turn",
@@ -563,7 +613,8 @@ def test_creation_gate_survives_until_every_in_flight_request_finishes():
     )
 
     # 它随后收尾——同 turn 还有一个在途请求，闸门不能就此撤掉。
-    plugin._transform_llm_output(
+    first.run(
+        plugin._transform_llm_output,
         session_id="inflight-refs",
         sender_id="owner-a",
         turn_id="shared-turn",
@@ -571,9 +622,9 @@ def test_creation_gate_survives_until_every_in_flight_request_finishes():
         completed=True,
     )
 
-    # 在途的那个重放请求现在才调创建：票已经用完，必须被挡。闸门被提前撤掉的话
-    # 这里会因为「键不存在」被当成不受管控的普通轮次而放行。
-    blocked = plugin._on_pre_tool_call(
+    # 在途的那个重放请求现在才调创建：它自己一张票都没有，必须被挡。
+    blocked = second.run(
+        plugin._on_pre_tool_call,
         tool_name="skill_manage",
         args={"action": "create"},
         turn_id="shared-turn",
@@ -581,6 +632,144 @@ def test_creation_gate_survives_until_every_in_flight_request_finishes():
     assert blocked is not None and blocked["action"] == "block", (
         "先完成的请求把还在途的那个的闸门一起撤了"
     )
+
+
+# #354 的核心：配额是**请求级**的，不是 turn 级的。被判无效重放的那个请求不能去
+# 花先到那个请求买的票——turn 级配额下这是可以的（谁先用掉都行），于是同一次点击
+# 会建出两个资源，而先到那个请求自己反而没票可用。
+def test_replay_request_cannot_spend_the_accepted_request_ticket(two_requests):
+    first, second = two_requests
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "cross-request-ticket", creation_type="skill")
+
+    _accept_action(first, plugin, "cross-request-ticket", payload, "shared-turn")
+    replay = _accept_action(
+        second, plugin, "cross-request-ticket", payload, "shared-turn"
+    )
+    assert "invalid or expired" in replay["context"]
+
+    # 重放请求先开口。此刻先到那个请求的票还一张没动。
+    blocked = second.run(
+        plugin._on_pre_tool_call,
+        tool_name="skill_manage",
+        args={"action": "create"},
+        turn_id="shared-turn",
+    )
+    assert blocked is not None and blocked["action"] == "block", (
+        "重放请求花掉了另一个请求买的票"
+    )
+
+    # 而真正被接管的那个请求不受影响，它的票还在。
+    assert (
+        first.run(
+            plugin._on_pre_tool_call,
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="shared-turn",
+        )
+        is None
+    )
+
+
+# 配额表是进程级的。两个不同 owner / 会话撞上同一个 turn_id 时，一边接管拿到的票
+# 不能被另一边花掉——否则后者能跑掉本该被挡的创建，而前者反被挡住。
+def test_quota_is_not_shared_across_owners_on_a_colliding_turn_id(two_requests):
+    first, second = two_requests
+    plugin = _load_plugin()
+    mine = _show_card(plugin, "collide-mine", creation_type="skill")
+    theirs = _show_card(plugin, "collide-theirs", creation_type="skill")
+
+    _accept_action(first, plugin, "collide-mine", mine, "same-turn-id")
+    # 另一个会话在同一个 turn_id 上被判无效重放：它一张票都不该有。
+    second.run(
+        plugin._on_pre_llm_call,
+        session_id="collide-theirs",
+        sender_id="owner-b",
+        turn_id="same-turn-id",
+        user_message=_action(theirs, proposal_id="stale-proposal"),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+    blocked = second.run(
+        plugin._on_pre_tool_call,
+        tool_name="skill_manage",
+        args={"action": "create"},
+        turn_id="same-turn-id",
+    )
+    assert blocked is not None and blocked["action"] == "block", (
+        "另一个 owner 的请求花掉了本会话买的票"
+    )
+    assert (
+        first.run(
+            plugin._on_pre_tool_call,
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="same-turn-id",
+        )
+        is None
+    )
+
+
+# 工具链万一读不到 invocation scope，就只剩 turn_id 可用。同 turn 上有多个在途请求
+# 时这张票归谁判不出来——此时必须拦，不能猜：漏建用户能重来，重复建撤不掉。
+def test_tool_call_without_invocation_scope_fails_closed_when_the_turn_is_ambiguous(
+    two_requests,
+):
+    first, second = two_requests
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "ambiguous-fallback", creation_type="skill")
+
+    _accept_action(first, plugin, "ambiguous-fallback", payload, "shared-turn")
+    _accept_action(second, plugin, "ambiguous-fallback", payload, "shared-turn")
+
+    # 主线程没有任何 invocation scope，正是「读不到」的那种情形。
+    assert plugin._invocation_scope.get() is None
+    blocked = plugin._on_pre_tool_call(
+        tool_name="skill_manage",
+        args={"action": "create"},
+        turn_id="shared-turn",
+    )
+    assert blocked is not None and blocked["action"] == "block"
+
+
+# 回执是 turn 级事实：同一个 turn 的每个在途请求都要拿到同一份权威结果。谁先跑完
+# 就把它取走的话，另一个响应必然不含 receipt——Local Server 恰好采用了那一个，
+# 已经接管的 create 就会被标成不确定且不可重试。
+def test_every_in_flight_request_of_the_turn_gets_the_same_receipt(two_requests):
+    first, second = two_requests
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "shared-receipt", creation_type="skill")
+
+    _accept_action(first, plugin, "shared-receipt", payload, "shared-turn")
+    _accept_action(second, plugin, "shared-receipt", payload, "shared-turn")
+
+    first_output = first.run(
+        plugin._transform_llm_output,
+        session_id="shared-receipt",
+        sender_id="owner-a",
+        turn_id="shared-turn",
+        response_text="已经交给我处理了。",
+        completed=True,
+        failed=False,
+    )
+    second_output = second.run(
+        plugin._transform_llm_output,
+        session_id="shared-receipt",
+        sender_id="owner-a",
+        turn_id="shared-turn",
+        response_text="已经交给我处理了。",
+        completed=True,
+        failed=False,
+    )
+
+    assert _decode_action_result(first_output)["status"] == "accepted"
+    assert _decode_action_result(second_output) == _decode_action_result(first_output)
+    # 最后一个在途请求收尾之后才真正删掉，不留残留。
+    state_key = plugin._session_key(
+        {"session_id": "shared-receipt", "sender_id": "owner-a"}
+    )
+    assert not plugin._session_states[state_key]["pending_action_results"]
 
 
 # 同一个 turn_id 上的回执是**单调**的：接管过就接管过了。双击 / 传输重发会让两个
