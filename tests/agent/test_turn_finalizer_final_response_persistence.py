@@ -501,6 +501,7 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     agent = FakeAgent()
     agent._user_id = "owner-a"
     agent._user_id_alt = "canonical-owner-a"
+    agent._zet_agent_execution_policy = "silent_automation"
     agent.request_overrides = {"response_format": {"type": "json_object"}}
     agent._supports_followup_turns = False
     agent.stream_delta_callback = lambda _delta: None
@@ -530,11 +531,13 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert transform_kwargs["interrupted"] is False
     assert transform_kwargs["turn_exit_reason"] == "error_near_max_iterations(provider error)"
     assert transform_kwargs["sender_id"] == "canonical-owner-a"
+    assert transform_kwargs["execution_policy"] == "silent_automation"
     assert transform_kwargs["structured_output"] is True
     assert transform_kwargs["supports_followup_turns"] is False
     assert transform_kwargs["streaming_output"] is True
     assert post_kwargs["assistant_response"] == "任务失败。"
     assert post_kwargs["sender_id"] == "canonical-owner-a"
+    assert post_kwargs["execution_policy"] == "silent_automation"
     assert post_kwargs["failed"] is True
     assert post_kwargs["supports_followup_turns"] is False
     assert post_kwargs["streaming_output"] is True
@@ -730,3 +733,282 @@ def test_interrupted_turn_runs_output_transform_without_losing_interrupt_history
     assert result["final_response"] == transformed_text
     assert result["messages"][-1]["content"] == "Operation interrupted.\n\n" + transformed_text
     assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_authoritative_identity_transform_requires_canonical_delivery(monkeypatch):
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            kwargs["require_canonical_response"]()
+            return [kwargs["response_text"]]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "创建它"},
+        {"role": "assistant", "content": "trusted receipt"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="trusted receipt",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "trusted receipt"
+    assert result["response_transformed"] is False
+    assert result["canonical_response_required"] is True
+
+
+def test_creation_governor_transform_hook_keeps_scope_after_session_rotation(monkeypatch):
+    transform_kwargs = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            transform_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    agent._creation_governor_conversation_session_id = "stable-app-conversation"
+    agent.session_id = "rotated-transcript-session"
+    messages = [
+        {"role": "user", "content": "继续"},
+        {"role": "assistant", "content": "已继续。"},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="已继续。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="继续",
+        original_user_message="继续",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert transform_kwargs["conversation_session_id"] == "stable-app-conversation"
+    assert transform_kwargs["session_id"] == "rotated-transcript-session"
+
+
+_RECEIPT_MARKER = "<!--creation-recommendation-action-result dGVzdA-->"
+
+
+def test_receipt_survives_a_later_hook_that_rewrites_the_response(monkeypatch):
+    """第三方 transform hook 洗掉回执后，finalizer 必须把它补回来。
+
+    invoke_hook 会把 governor 的结果继续交给后面注册的 hook，finalizer 采用链末
+    结果。后续 hook 整体重写响应时 marker 就没了，而 canonical_response_required
+    仍会让这段文本作为 canonical_final_response 发出——Web 关联不上回执，已经被
+    Hermes 接管的 create 会永久停在「不确定」，用户只能去别处核对。
+    """
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        kwargs["require_canonical_response"](_RECEIPT_MARKER)
+        # 链上第一段是 governor 产出的（带回执），第二段是后续 hook 的整体重写。
+        return [
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
+            "这段是第三方插件重写后的正文。",
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "创建它"},
+        {"role": "assistant", "content": "好的"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["canonical_response_required"] is True
+    assert _RECEIPT_MARKER in result["final_response"], (
+        "回执被后续 hook 洗掉且没有补回——canonical 终态会带着一段没有回执的文本发出"
+    )
+    assert "第三方插件重写后的正文" in result["final_response"], "补回执不该把后续 hook 的改写丢掉"
+
+
+def test_receipt_is_not_synthesised_when_no_canonical_response_was_required(monkeypatch):
+    """对照：没有回执要发的普通轮次，不能凭空往正文里塞 marker。"""
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        return [kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER, "重写后的正文。"]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "随便聊聊"},
+        {"role": "assistant", "content": "好的"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="随便聊聊",
+        original_user_message="随便聊聊",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["canonical_response_required"] is False
+    assert _RECEIPT_MARKER not in result["final_response"]
+
+
+_FOREIGN_RECEIPT = "<!--creation-recommendation-action-result b3RoZXI-->"
+
+
+def test_a_later_hook_cannot_swap_in_a_different_receipt(monkeypatch):
+    """后置 hook 换掉回执时，链末必须还原成 governor 那个原值。
+
+    marker 只要语法合法就能骗过「链末还有没有 marker」的判断。换成指向别的
+    proposal 的 marker，Web 会去结算另一张卡片。
+    """
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        kwargs["require_canonical_response"](_RECEIPT_MARKER)
+        return [
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
+            "第三方重写。\n\n" + _FOREIGN_RECEIPT,
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "创建它"}, {"role": "assistant", "content": "好的"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert _RECEIPT_MARKER in result["final_response"], "governor 的原始回执没有被还原"
+    assert _FOREIGN_RECEIPT not in result["final_response"], (
+        "后置 hook 塞进来的回执被当成可信值发了出去——Web 会去结算别的卡片"
+    )
+
+
+def test_a_later_hook_cannot_append_a_conflicting_receipt(monkeypatch):
+    """追加冲突 marker 同样要被清掉：两个回执并存会让 Web 永久失败关闭。"""
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        kwargs["require_canonical_response"](_RECEIPT_MARKER)
+        return [
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER,
+            kwargs["response_text"] + "\n\n" + _RECEIPT_MARKER + "\n\n" + _FOREIGN_RECEIPT,
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "创建它"}, {"role": "assistant", "content": "好的"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"].count("creation-recommendation-action-result") == 1
+    assert _RECEIPT_MARKER in result["final_response"]
+    assert _FOREIGN_RECEIPT not in result["final_response"]
+
+
+def test_sanitisation_only_turn_does_not_borrow_another_hooks_marker(monkeypatch):
+    """governor 只清洗、本轮没有回执时，链末不能从别的 hook 结果里补一个 marker。
+
+    伪造 marker 被剥掉的轮次同样会置 canonical_response_required。若此时后置
+    hook 追加了任意语法合法的 marker，把它当成权威回执发出去会让 Web 去结算
+    另一张卡片。
+    """
+
+    def invoke_hook(name, **kwargs):
+        if name != "transform_llm_output":
+            return []
+        # 只做清洗：没有回执可交，传 None。
+        kwargs["require_canonical_response"](None)
+        return [
+            kwargs["response_text"],
+            "第三方追加。\n\n" + _FOREIGN_RECEIPT,
+        ]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    result = finalize_turn(
+        agent,
+        final_response="好的",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "随便说说"}, {"role": "assistant", "content": "好的"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="随便说说",
+        original_user_message="随便说说",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["canonical_response_required"] is True
+    assert "creation-recommendation-action-result" not in result["final_response"], (
+        "本轮没有回执，却把后置 hook 的 marker 当成权威值发了出去"
+    )

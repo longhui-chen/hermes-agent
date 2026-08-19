@@ -1,8 +1,15 @@
-.PHONY: zpk-venv zpk-stage zpk-pack clean-zpk
+.PHONY: check-zpk-python zpk-venv zpk-stage zpk-pack clean-zpk
 
 UV ?= uv
 ZPK_OUTPUT ?= build/zettlab-claw.zpk
 ZPK_SRC_DIR := zpk/lib/hermes-agent
+# The device image provides Debian's system Python, not a self-contained
+# interpreter from the uv builder image.  Keep this explicit so a builder
+# cannot silently copy a /usr/local launcher that needs an unavailable
+# libpython shared object at runtime.  Release builders may override this
+# with another reviewed, target-compatible absolute path.
+ZPK_PYTHON ?= /usr/bin/python3.11
+ZPK_PYTHON_VERSION ?= 3.11
 # ZET-1399: `anthropic` left `[all]` on 2026-05-12 in favour of lazy install,
 # but on ZPK devices the lazy-install ladder (uv -> pip -> ensurepip) is fully
 # broken: no system uv, uv-created venvs ship without pip, and Debian splits
@@ -92,13 +99,16 @@ override ZPK_UV_ENV := env \
 	-u UV_VENV_RELOCATABLE \
 	-u UV_VENV_SEED \
 	-u UV_WORKING_DIR \
-	UV_NO_CONFIG=1 \
+	UV_CONFIG_FILE="$(CURDIR)/zpk/uv.toml" \
 	HERMES_ZPK_BUILD=1
 
 ZPK_GLOBAL_EXCLUDES := \
 	--exclude=.git \
 	--exclude=.gk \
 	--exclude=.worktrees \
+	--exclude=.env \
+	--exclude='.env.*' \
+	--exclude=.DS_Store \
 	--exclude=__pycache__ \
 	--exclude='*.pyc' \
 	--exclude=.venv \
@@ -113,6 +123,12 @@ ZPK_GLOBAL_EXCLUDES := \
 # an unanchored tar exclude also removes same-named runtime directories inside
 # plugins/ and venv/ (for example plugins/web and botocore/data).
 ZPK_ROOT_EXCLUDES := \
+	--exclude=./.omx \
+	--exclude=./.claude \
+	--exclude=./.codex \
+	--exclude=./.agents \
+	--exclude=./AGENTS.md \
+	--exclude=./CLAUDE.md \
 	--exclude=./build \
 	--exclude=./dist \
 	--exclude=./data \
@@ -135,29 +151,55 @@ ZPK_ROOT_EXCLUDES := \
 
 ZPK_EXCLUDES := $(ZPK_GLOBAL_EXCLUDES) $(ZPK_ROOT_EXCLUDES)
 
-zpk-venv:
+check-zpk-python:
+	@case "$(ZPK_PYTHON)" in \
+		/*) ;; \
+		*) echo "ZPK_PYTHON must be an absolute path: $(ZPK_PYTHON)" >&2; exit 1 ;; \
+	esac
+	@test -x "$(ZPK_PYTHON)" || { \
+		echo "ZPK_PYTHON must be an executable target interpreter: $(ZPK_PYTHON)" >&2; \
+		exit 1; \
+	}
+	@python_version=$$("$(ZPK_PYTHON)" --version 2>&1) || { \
+		echo "ZPK_PYTHON cannot start: $(ZPK_PYTHON)" >&2; \
+		exit 1; \
+	}; \
+	case "$$python_version" in \
+		"Python $(ZPK_PYTHON_VERSION)"*) ;; \
+		*) echo "ZPK_PYTHON version mismatch: expected $(ZPK_PYTHON_VERSION), got $$python_version" >&2; exit 1 ;; \
+	esac
+
+zpk-venv: check-zpk-python
 	@echo "Preparing zettlab-claw ZPK venv..."
 	@rm -rf venv python-runtime
 	@mkdir -p "$(ZPK_LOG_DIR)"
 	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
-		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv --python 3.11 --no-managed-python --no-python-downloads; \
+		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv --python "$(ZPK_PYTHON)" --no-managed-python --no-python-downloads; \
 	else \
-		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv --python 3.11 --no-managed-python --no-python-downloads >"$(ZPK_UV_VENV_LOG)" 2>&1 || { \
+		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv --python "$(ZPK_PYTHON)" --no-managed-python --no-python-downloads >"$(ZPK_UV_VENV_LOG)" 2>&1 || { \
 			echo "uv venv failed; showing last 120 log lines from $(ZPK_UV_VENV_LOG)"; \
 			tail -n 120 "$(ZPK_UV_VENV_LOG)" 2>/dev/null || true; \
 			exit 1; \
 		}; \
 	fi
+	@resolved_python=$$(readlink -f venv/bin/python); \
+	expected_python=$$(readlink -f "$(ZPK_PYTHON)"); \
+	[ "$$resolved_python" = "$$expected_python" ] || { \
+		echo "uv selected an unexpected ZPK interpreter: $$resolved_python (expected $$expected_python)" >&2; \
+		exit 1; \
+	}
 	@echo "Installing locked zettlab-claw dependencies ($(ZPK_INSTALL_SPEC))..."
 	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build $(ZPK_UV_SYNC_EXTRAS) && \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build \
+				$(ZPK_UV_SYNC_EXTRAS) && \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
 			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation \
 				--reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS); \
 	else \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build $(ZPK_UV_SYNC_EXTRAS) >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build \
+				$(ZPK_UV_SYNC_EXTRAS) >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
 			echo "uv locked dependency sync failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
 			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
 			exit 1; \
@@ -186,7 +228,9 @@ zpk-stage: zpk-venv
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@find "$(ZPK_SRC_DIR)" -type l -delete
-	@python3 scripts/check_zpk_stage.py "$(ZPK_SRC_DIR)"
+	@python3 scripts/check_zpk_stage.py "$(ZPK_SRC_DIR)" \
+		--target-arch arm64 --python-version "$(ZPK_PYTHON_VERSION)" \
+		--python-home "$$(dirname "$$(readlink -f "$(ZPK_PYTHON)")")"
 	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes \
 		zpk/libexec/hermes-secure-launcher.py zpk/zpk-systemd.sh \
 		zpk/prepare-claw-service.sh zpk/init.d/start.sh zpk/init.d/stop.sh

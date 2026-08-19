@@ -15,6 +15,7 @@ import stat
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -22,6 +23,8 @@ from typing import Any, Callable, Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from agent.response_format import response_format_requires_structured_output
 
 logger = logging.getLogger(__name__)
 
@@ -190,9 +193,27 @@ _CURRENT_PRIVATE_NETWORK_RE = re.compile(
     r"(?:当前|本机|现在所在的?)(?:局域网|网段|子网)|(?:current|local)\s+(?:private\s+)?(?:network|subnet|lan)\b",
     re.IGNORECASE,
 )
+_LOCAL_PRIVATE_NETWORK_RE = re.compile(
+    r"(?:局域网|區域網路|本地网络|本地網路)|\b(?:local\s+network|lan)\b",
+    re.IGNORECASE,
+)
+_SUBNET_DISCOVERY_ACTION_RE = re.compile(
+    r"(?:扫描|掃描|扫一下|掃一下|查找|搜索|搜尋|搜寻|发现|發現)"
+    r"|\b(?:scan|discover|find|search)\b",
+    re.IGNORECASE,
+)
+_SUBNET_UNSUPPORTED_TYPE_RE = re.compile(
+    r"(?:打印机|印表機|プリンター|프린터)|\bprinters?\b",
+    re.IGNORECASE,
+)
+_SUBNET_NON_HARDWARE_SCAN_RE = re.compile(
+    r"(?:端口|埠|主机|主機|网关|網關)|\b(?:ports?|hosts?|gateway|nmap)\b",
+    re.IGNORECASE,
+)
 _VIDEO_EDIT_POLICY_VIOLATION_RETRIES = 2
 _VIDEO_EDIT_RESUME_TTL_SECONDS = 3 * 60 * 60
 _VIDEO_EDIT_RESUME_MAX_SESSIONS = 8
+_OPAQUE_ACTION_TOKEN_MAX_BYTES = 4096
 _CAMERA_RESUME_TTL_SECONDS = 5 * 60
 _CAMERA_RESUME_MAX_SESSIONS = 8
 _CAMERA_ANALYSIS_QUESTION_LIMIT = 4096
@@ -212,9 +233,9 @@ _VIDEO_FILE_SUFFIXES = (
 )
 _VIDEO_EDIT_CN_RE = re.compile(r"(?:视频)?(?:剪辑|剪片|剪成|成片)|做(?:个|一条)?\s*(?:vlog|视频)", re.IGNORECASE)
 _VIDEO_EDIT_EN_RE = re.compile(
-    r"(?:\b(?:edit|trim|cut|render)\b.{0,32}\b(?:video|clip|footage|movie|vlog)\b"
-    r"|\b(?:video|clip|footage|movie|vlog)\b.{0,32}\b(?:edit|trim|cut|render)\b"
-    r"|\bmake\b.{0,32}\b(?:video|vlog|movie)\b)",
+    r"(?:\b(?:edit|trim|cut|render)\b.{0,32}\b(?:videos?|clips?|footage|movies?|vlogs?)\b"
+    r"|\b(?:videos?|clips?|footage|movies?|vlogs?)\b.{0,32}\b(?:edit|trim|cut|render)\b"
+    r"|\bmake\b.{0,32}\b(?:videos?|vlogs?|movies?)\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _VIDEO_EDIT_CONTINUATION_CN_RE = re.compile(
@@ -341,6 +362,7 @@ class _SkillDirectTaskContext:
     video_edit_explicit: bool = False
     camera_applicable: bool = False
     camera_explicit: bool = False
+    trusted_skill_slug: str = ""
     camera_inventory_only: bool = False
     printer3d_applicable: bool = False
     printer3d_explicit: bool = False
@@ -350,11 +372,13 @@ class _SkillDirectTaskContext:
 class _TrustedExecutionReceipt:
     agent_id: str = field(repr=False)
     action_token: str = field(repr=False)
-    business_execution_action: str = field(repr=False)
-    business_execution_action_version: str = field(repr=False)
     hardware_execution_token: str = field(repr=False)
+    business_execution_action: str = field(repr=False)
     turn_id: str
     session_id: str
+    gateway_session_key: str = ""
+    business_execution_action_version: str = ""
+    execution_policy: str = ""
 
 
 @dataclass(frozen=True)
@@ -369,6 +393,10 @@ class _SkillDirectScope:
         compare=False,
     )
     memory_payload_sha256: frozenset[str] = frozenset()
+    # (targetless operation digest, helper-captured target).  A provider may
+    # omit target while copying a helper operation into the memory call; the
+    # pair keeps that compatibility strictly bound to the helper result.
+    memory_payload_shape_authorizations: frozenset[tuple[str, str]] = frozenset()
     # Camera actions are intentionally two-step: a request-bound ``list``
     # establishes the opaque IDs visible to this exact turn, then one of those
     # IDs may be used by snap/clip/doctor. Keeping the response-size-bounded
@@ -397,7 +425,23 @@ class _SkillDirectOperation:
         repr=False,
         compare=False,
     )
+    authorized_memory_target: str = field(
+        default="",
+        repr=False,
+        compare=False,
+    )
     execution_claimed: bool = field(default=False, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class _TransportAttestedSkill:
+    """Request-local signed skill bytes loaded without a provider round trip."""
+
+    relative_path: str
+    task_sha256: str
+    turn_identity: _TurnIdentity
+    raw_sha256: str
+    content: str = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -429,6 +473,10 @@ _SKILL_DIRECT_LOCK = threading.Lock()
 _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT: ContextVar[
     _TrustedExecutionReceipt | None
 ] = ContextVar("_TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT", default=None)
+_TRUSTED_SKILL_VIEW_FRESH_READ: ContextVar[bool] = ContextVar(
+    "_TRUSTED_SKILL_VIEW_FRESH_READ",
+    default=False,
+)
 
 
 def _current_skill_direct_turn_identity() -> _TurnIdentity | None:
@@ -578,10 +626,18 @@ def _confirmed_video_edit_plan_resume(
 
 def _capture_trusted_execution_receipt(
     turn_identity: _TurnIdentity,
-    *,
-    hardware_skill: bool,
+    relative_path: str = _VIDEO_EDIT_SKILL_PATH,
 ) -> _TrustedExecutionReceipt | None:
     """Freeze request-bound execution claims before later tool boundaries."""
+    if relative_path not in {
+        _VIDEO_EDIT_SKILL_PATH,
+        _CAMERA_SKILL_PATH,
+        *_PRINTER3D_SKILL_PATHS,
+    }:
+        return None
+    camera_skill = relative_path == _CAMERA_SKILL_PATH
+    printer3d_skill = relative_path in _PRINTER3D_SKILL_PATHS
+    hardware_skill = camera_skill or printer3d_skill
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
@@ -601,64 +657,118 @@ def _capture_trusted_execution_receipt(
         from gateway.session_context import (
             business_execution_action,
             business_execution_action_version,
+            execution_session_key,
+            execution_policy,
             get_session_env,
             hardware_execution_token,
         )
 
         business_action = business_execution_action() if not hardware_skill else ""
-        business_action_version = (
+        bound_action_version = (
             business_execution_action_version() if not hardware_skill else ""
         )
         hardware_token = hardware_execution_token() if hardware_skill else ""
-        session_id = (
-            get_session_env("HERMES_SESSION_ID")
-            if hardware_skill
-            else get_session_env("HERMES_SESSION_KEY")
-        ) or get_session_env("HERMES_SESSION_KEY")
+        bound_execution_policy = execution_policy()
+        gateway_session_key = execution_session_key() or get_session_env(
+            "HERMES_SESSION_KEY"
+        )
+        session_id = get_session_env("HERMES_SESSION_ID")
+        if not session_id:
+            session_id = gateway_session_key
     except Exception:
         business_action = ""
-        business_action_version = ""
+        bound_action_version = ""
         hardware_token = ""
+        bound_execution_policy = ""
         session_id = ""
+        gateway_session_key = ""
 
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
         action_token=(
             _profile_value("ZETTLAB_AGENT_ACTION_TOKEN") if hardware_skill else ""
         ),
-        business_execution_action=str(business_action or "").strip(),
-        business_execution_action_version=str(
-            business_action_version or ""
-        ).strip(),
         hardware_execution_token=str(hardware_token or "").strip(),
+        business_execution_action=str(business_action or "").strip(),
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
+        gateway_session_key=str(gateway_session_key or "").strip(),
+        business_execution_action_version=str(
+            bound_action_version or ""
+        ).strip(),
+        execution_policy=str(bound_execution_policy or "").strip().lower(),
     )
-    present = {"agent_id": bool(receipt.agent_id), "turn_id": bool(receipt.turn_id)}
+    present = {
+        "agent_id": bool(receipt.agent_id),
+        "turn_id": bool(receipt.turn_id),
+    }
     if hardware_skill:
-        present.update({
-            "action_token": bool(receipt.action_token),
-            "hardware_token": bool(receipt.hardware_execution_token),
-            "session_id": bool(receipt.session_id),
-        })
+        present.update(
+            {
+                "action_token": bool(receipt.action_token),
+                "hardware_execution_token": bool(
+                    receipt.hardware_execution_token
+                ),
+                "session_id": bool(receipt.session_id),
+            }
+        )
     else:
-        present.update({
-            "business_action": bool(receipt.business_execution_action),
-            "action_version": receipt.business_execution_action_version == "1",
-            "session_id": bool(receipt.session_id),
-        })
+        present["session_key"] = bool(receipt.gateway_session_key)
+        present["action_version"] = (
+            receipt.business_execution_action_version == "1"
+        )
     if not all(present.values()):
         logger.warning(
-            "zet_agent: trusted video execution receipt incomplete: %s",
+            "zet_agent: trusted execution receipt incomplete: %s",
             present,
         )
         return None
-    if not hardware_skill and re.fullmatch(
-        r"[0-9a-f]{64}", receipt.business_execution_action
-    ) is None:
+    if hardware_skill and (
+        not _is_opaque_action_token(receipt.action_token)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
+        is None
+    ):
+        logger.warning("zet_agent: hardware execution receipt is malformed")
+        return None
+    if not hardware_skill and (
+        re.fullmatch(r"[0-9a-f]{64}", receipt.business_execution_action)
+        is None
+        or receipt.business_execution_action_version != "1"
+        or not receipt.gateway_session_key
+    ):
         logger.warning("zet_agent: business execution action is malformed")
         return None
+    if (
+        not hardware_skill
+        and receipt.execution_policy == "silent_automation"
+        and not receipt.business_execution_action
+    ):
+        logger.warning("zet_agent: silent video action is missing")
+        return None
     return receipt
+
+
+def _is_opaque_action_token(value: str) -> bool:
+    """Validate a profile action capability without imposing token syntax."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        if len(value.encode("utf-8")) > _OPAQUE_ACTION_TOKEN_MAX_BYTES:
+            return False
+    except UnicodeError:
+        return False
+    return not any(
+        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F
+        for char in value
+    )
+
+
+def _trusted_skill_path_for_slug(skill_slug: str) -> str:
+    """Derive the canonical signed skill path from an explicit slug."""
+    normalized = str(skill_slug or "").strip().lstrip("/").lower()
+    if not normalized or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", normalized) is None:
+        return ""
+    return f"skills/{normalized}/SKILL.md"
 
 
 def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
@@ -668,18 +778,31 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
         receipt is None
         or receipt.hardware_execution_token
         or receipt.business_execution_action_version != "1"
-        or re.fullmatch(r"[0-9a-f]{64}", receipt.business_execution_action) is None
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.business_execution_action)
+        is None
     ):
         return {}
-    return {
+    result = {
         "ZET_AGENT_ID": receipt.agent_id,
         "ZETTLAB_BUSINESS_EXECUTION_ACTION": receipt.business_execution_action,
         "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": (
             receipt.business_execution_action_version
         ),
         "HERMES_TURN_ID": receipt.turn_id,
-        "HERMES_SESSION_KEY": receipt.session_id,
+        "HERMES_SESSION_KEY": receipt.gateway_session_key,
     }
+    if receipt.session_id:
+        result["HERMES_SESSION_ID"] = receipt.session_id
+    if receipt.gateway_session_key:
+        # Preserve the caller's stable session key separately from the lineage
+        # session id. Terminal policy consumes this private correlation field
+        # before launching the helper.
+        result["HERMES_GATEWAY_SESSION_KEY"] = receipt.gateway_session_key
+    if receipt.execution_policy:
+        # Keep the policy in the frozen receipt so terminal authorization cannot
+        # be weakened by a later session-context mutation.
+        result["HERMES_EXECUTION_POLICY"] = receipt.execution_policy
+    return result
 
 
 def trusted_camera_runtime_receipt() -> Mapping[str, str]:
@@ -688,7 +811,10 @@ def trusted_camera_runtime_receipt() -> Mapping[str, str]:
     if (
         receipt is None
         or receipt.business_execution_action
-        or not receipt.hardware_execution_token
+        or not _is_opaque_action_token(receipt.action_token)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.hardware_execution_token)
+        is None
+        or not receipt.session_id
     ):
         return {}
     return {
@@ -1551,6 +1677,7 @@ def _skill_direct_task_context(
             or camera_resumed
         ),
         camera_explicit=camera_transport_selection,
+        trusted_skill_slug=normalized_skill_slug,
         camera_inventory_only=bool(
             not camera_transport_selection
             and (
@@ -1600,8 +1727,288 @@ def trusted_skill_scope_active(agent: Any) -> bool:
             and isinstance(task, _SkillDirectTaskContext)
             and task.turn_identity == turn_identity
             and task.task_sha256 == scope.task_sha256
-            and (scope.allowed_tools or scope.policy_exhausted)
+            # A bounded policy failure is a terminal capability state, not an
+            # active scope.  Treating ``policy_exhausted`` as active lets the
+            # request skip the fresh attested ``skill_view`` bootstrap and can
+            # leak a stale provider tool list into the next retry.
+            and bool(scope.allowed_tools)
         )
+
+
+def _trusted_skill_view_refresh_required(
+    agent: Any,
+    function_args: Mapping[str, Any],
+) -> bool:
+    """Require a new signed read only while rebuilding a trusted scope."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    if function_args.get("file_path") not in (None, ""):
+        return False
+    requested_path = _trusted_skill_path_for_slug(function_args.get("name", ""))
+    if not requested_path or trusted_skill_scope_active(agent):
+        return False
+
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    if (
+        not isinstance(task, _SkillDirectTaskContext)
+        or turn_identity is None
+        or task.turn_identity != turn_identity
+    ):
+        return False
+
+    task_paths = set()
+    if task.video_edit_applicable:
+        task_paths.add(_VIDEO_EDIT_SKILL_PATH)
+    if task.camera_applicable:
+        task_paths.add(_CAMERA_SKILL_PATH)
+    if task.printer3d_applicable:
+        task_paths.update(_PRINTER3D_SKILL_PATHS)
+    if requested_path not in task_paths:
+        return False
+
+    if getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation":
+        return (
+            _trusted_skill_path_for_slug(task.trusted_skill_slug)
+            == requested_path
+        )
+    return True
+
+
+def trusted_skill_view_fresh_read_required() -> bool:
+    """Expose the dispatch-local signed-read requirement to ``skill_view``."""
+    return _TRUSTED_SKILL_VIEW_FRESH_READ.get()
+
+
+def _activate_execution_policy_tools(
+    agent: Any,
+    allowed_tools: frozenset[str],
+) -> None:
+    """Restore only the intersection of policy and attested-skill tools."""
+    if getattr(agent, "_zet_agent_execution_policy", "") != "silent_automation":
+        return
+    policy_tools = list(
+        getattr(agent, "_zet_agent_execution_policy_tools", ()) or ()
+    )
+    policy_names = set(
+        getattr(
+            agent,
+            "_zet_agent_execution_policy_valid_tool_names",
+            (),
+        )
+        or ()
+    )
+
+    def _tool_name(tool: Any) -> str:
+        if not isinstance(tool, dict):
+            return ""
+        function = tool.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return str(tool.get("name") or "")
+
+    scoped_names = policy_names & set(allowed_tools)
+    agent.tools = [
+        copy.deepcopy(tool)
+        for tool in policy_tools
+        if _tool_name(tool) in scoped_names
+    ]
+    agent.valid_tool_names = scoped_names
+
+
+def _activate_trusted_skill_scope(
+    agent: Any,
+    *,
+    relative_path: str,
+    attested_turn_identity: _TurnIdentity,
+) -> bool:
+    """Activate the existing request-bound scope after a trusted byte read."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    if relative_path not in {
+        _VIDEO_EDIT_SKILL_PATH,
+        _CAMERA_SKILL_PATH,
+        *_PRINTER3D_SKILL_PATHS,
+    }:
+        return False
+
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    task_matches_skill = bool(
+        isinstance(task, _SkillDirectTaskContext)
+        and (
+            (
+                relative_path == _VIDEO_EDIT_SKILL_PATH
+                and task.video_edit_applicable
+            )
+            or (
+                relative_path == _CAMERA_SKILL_PATH
+                and task.camera_applicable
+            )
+            or (
+                relative_path in _PRINTER3D_SKILL_PATHS
+                and task.printer3d_applicable
+            )
+        )
+    )
+    if not task_matches_skill:
+        logger.warning(
+            "zet_agent: trusted skill %s did not match the current user task",
+            relative_path,
+        )
+        return False
+
+    current_turn_identity = _current_skill_direct_turn_identity()
+    if (
+        current_turn_identity is None
+        or task.turn_identity != current_turn_identity
+        or attested_turn_identity != current_turn_identity
+    ):
+        logger.warning(
+            "zet_agent: trusted skill %s rejected for mismatched turn identity",
+            relative_path,
+        )
+        return False
+    if (
+        getattr(agent, "_zet_agent_execution_policy", "")
+        == "silent_automation"
+        and _trusted_skill_path_for_slug(
+            getattr(task, "trusted_skill_slug", "")
+        )
+        != relative_path
+    ):
+        logger.warning(
+            "zet_agent: silent skill %s does not match the trusted slug %r",
+            relative_path,
+            getattr(task, "trusted_skill_slug", ""),
+        )
+        return False
+
+    execution_receipt = _capture_trusted_execution_receipt(
+        current_turn_identity,
+        relative_path,
+    )
+    if execution_receipt is None:
+        return False
+    allowed_tools = (
+        _CAMERA_DIRECT_TOOLS
+        if relative_path == _CAMERA_SKILL_PATH
+        else _PRINTER3D_DIRECT_TOOLS
+        if relative_path in _PRINTER3D_SKILL_PATHS
+        else _VIDEO_EDIT_DIRECT_TOOLS
+    )
+
+    with _SKILL_DIRECT_LOCK:
+        agent._zet_agent_skill_direct_operation = None
+        agent._zet_agent_skill_direct_scope = _SkillDirectScope(
+            relative_path=relative_path,
+            task_sha256=task.task_sha256,
+            turn_identity=current_turn_identity,
+            allowed_tools=allowed_tools,
+            execution_receipt=execution_receipt,
+            camera_inventory_only=bool(
+                relative_path == _CAMERA_SKILL_PATH
+                and task.camera_inventory_only
+            ),
+        )
+        _activate_execution_policy_tools(agent, allowed_tools)
+    logger.info(
+        "zet_agent: trusted skill %s activated bounded execution scope",
+        relative_path,
+    )
+    return True
+
+
+def activate_transport_selected_trusted_skill(agent: Any) -> bool:
+    """Attest a silent transport-selected skill before the provider call.
+
+    The local-server request has already bound the exact ActionV1, turn,
+    session, execution policy, and signed skill slug.  Re-read the immutable
+    startup snapshot in this request context and reuse the normal bounded
+    scope; no provider-returned token or additional authorization is minted.
+    """
+    if getattr(agent, "_zet_agent_execution_policy", "") != "silent_automation":
+        return False
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    if (
+        not isinstance(task, _SkillDirectTaskContext)
+        or not task.video_edit_explicit
+        or task.trusted_skill_slug != "video-edit-workflow-mini"
+        or task.turn_identity is None
+        or task.turn_identity != turn_identity
+    ):
+        return False
+
+    relative_path = _trusted_skill_path_for_slug(task.trusted_skill_slug)
+    if relative_path != _VIDEO_EDIT_SKILL_PATH:
+        return False
+    snapshot = _TRUSTED_PRESETS_SNAPSHOT
+    if snapshot is None:
+        logger.warning(
+            "zet_agent: transport-selected trusted skill has no startup snapshot"
+        )
+        return False
+
+    content, evidence = read_skill_source_with_trusted_execution_evidence(
+        Path(snapshot.resolved_root) / relative_path
+    )
+    if (
+        content is None
+        or evidence is None
+        or evidence.generation != snapshot.generation
+        or evidence.relative_path != relative_path
+    ):
+        logger.warning(
+            "zet_agent: transport-selected trusted skill attestation failed"
+        )
+        return False
+    if not _activate_trusted_skill_scope(
+        agent,
+        relative_path=relative_path,
+        attested_turn_identity=turn_identity,
+    ):
+        return False
+
+    agent._zet_agent_transport_attested_skill = _TransportAttestedSkill(
+        relative_path=relative_path,
+        task_sha256=task.task_sha256,
+        turn_identity=turn_identity,
+        raw_sha256=evidence.raw_sha256,
+        content=content,
+    )
+    logger.info(
+        "zet_agent: transport-selected trusted skill attested before provider call"
+    )
+    return True
+
+
+def transport_attested_skill_instruction(agent: Any) -> str:
+    """Return signed skill bytes only for their current request-local scope."""
+    attested = getattr(agent, "_zet_agent_transport_attested_skill", None)
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    scope = getattr(agent, "_zet_agent_skill_direct_scope", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    if (
+        not isinstance(attested, _TransportAttestedSkill)
+        or not isinstance(task, _SkillDirectTaskContext)
+        or not isinstance(scope, _SkillDirectScope)
+        or turn_identity is None
+        or attested.turn_identity != turn_identity
+        or task.turn_identity != turn_identity
+        or scope.turn_identity != turn_identity
+        or attested.task_sha256 != task.task_sha256
+        or scope.task_sha256 != task.task_sha256
+        or attested.relative_path != scope.relative_path
+        or hashlib.sha256(attested.content.encode("utf-8")).hexdigest()
+        != attested.raw_sha256
+        or not scope.allowed_tools
+    ):
+        return ""
+    return (
+        "Zettlab transport-attested signed skill instructions "
+        "(request-local; follow exactly):\n\n"
+        f"{attested.content}"
+    )
 
 
 def _video_edit_runtime_argv(
@@ -1860,16 +2267,150 @@ def _recoverable_video_edit_command_format_error(
     return any(script_name in command for script_name in _VIDEO_EDIT_RUNTIME_SCRIPTS)
 
 
+def _normalized_memory_payload(
+    function_args: Mapping[str, Any],
+    *,
+    inferred_target: str | None = None,
+) -> dict[str, Any] | None:
+    """Canonicalize either official memory-tool shape.
+
+    The built-in memory tool accepts both a batch ``operations`` shape and a
+    single-operation ``action`` shape.  The resolver always returns a batch,
+    so both forms are reduced to the same canonical representation before
+    authorization.  Missing targets are only filled by the exact helper
+    operation authorization passed by the caller.
+    """
+    fields = set(function_args)
+    if "operations" in fields:
+        if fields - {"operations", "target"}:
+            return None
+        raw_operations = function_args.get("operations")
+    elif "action" in fields:
+        if fields - {"action", "content", "old_text", "target"}:
+            return None
+        raw_operations = [
+            {
+                field: function_args[field]
+                for field in ("action", "content", "old_text")
+                if field in function_args
+            }
+        ]
+    else:
+        return None
+    if not isinstance(raw_operations, list) or not 1 <= len(raw_operations) <= 4:
+        return None
+
+    has_top_level_target = "target" in function_args
+    target = function_args.get("target") if has_top_level_target else None
+    if has_top_level_target and target not in {"memory", "user"}:
+        return None
+    if target is None and inferred_target not in {None, "memory", "user"}:
+        return None
+    if target is None:
+        target = inferred_target
+
+    normalized_operations: list[dict[str, Any]] = []
+    for raw_operation in raw_operations:
+        if not isinstance(raw_operation, dict):
+            return None
+        operation = dict(raw_operation)
+        operation_target = operation.pop("target", None)
+        if operation_target is not None:
+            if operation_target not in {"memory", "user"}:
+                return None
+            if target is None:
+                target = operation_target
+            elif operation_target != target:
+                return None
+        elif not has_top_level_target and target is None:
+            return None
+
+        action = operation.get("action")
+        if (
+            action not in {"add", "remove", "replace"}
+            or set(operation) - {"action", "content", "old_text"}
+        ):
+            return None
+        for field in ("content", "old_text"):
+            value = operation.get(field)
+            if value is not None and (
+                not isinstance(value, str) or len(value) > 16 * 1024
+            ):
+                return None
+        if action == "add" and not operation.get("content"):
+            return None
+        if action == "remove" and not operation.get("old_text"):
+            return None
+        if action == "replace" and not (
+            operation.get("content") and operation.get("old_text")
+        ):
+            return None
+        normalized_operations.append(operation)
+
+    if target not in {"memory", "user"}:
+        return None
+    return {"operations": normalized_operations, "target": target}
+
+
 def _canonical_memory_payload_sha256(function_args: Mapping[str, Any]) -> str:
-    if set(function_args) != {"operations", "target"}:
-        return ""
-    target = function_args.get("target")
-    operations = function_args.get("operations")
-    if target not in {"memory", "user"} or not isinstance(operations, list):
+    normalized = _normalized_memory_payload(function_args)
+    if normalized is None:
         return ""
     try:
         canonical = json.dumps(
-            {"operations": operations, "target": target},
+            normalized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonical_memory_shape_sha256(function_args: Mapping[str, Any]) -> str:
+    """Hash memory operations without their target field.
+
+    The resolver's helper emits target on each operation, while some model
+    providers copy only the operation body into the following ``memory`` call.
+    This alias is used only with a target captured from that exact helper
+    result; it is never sufficient on its own to authorize a write.
+    """
+    fields = set(function_args)
+    if "operations" in fields:
+        if fields - {"operations", "target"}:
+            return ""
+        operations = function_args.get("operations")
+    elif "action" in fields:
+        if fields - {"action", "content", "old_text", "target"}:
+            return ""
+        operations = [
+            {
+                field: function_args[field]
+                for field in ("action", "content", "old_text")
+                if field in function_args
+            }
+        ]
+    else:
+        return ""
+    if not isinstance(operations, list):
+        return ""
+    stripped: list[dict[str, Any]] = []
+    for raw_operation in operations:
+        if not isinstance(raw_operation, dict):
+            return ""
+        operation = dict(raw_operation)
+        operation.pop("target", None)
+        stripped.append(operation)
+    normalized = _normalized_memory_payload(
+        {"operations": stripped},
+        inferred_target="memory",
+    )
+    if normalized is None:
+        return ""
+    try:
+        canonical = json.dumps(
+            {"operations": normalized["operations"]},
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -1968,6 +2509,119 @@ def _memory_payload_hashes_from_terminal_result(
     return frozenset(hashes)
 
 
+def _memory_payload_shape_authorizations_from_terminal_result(
+    result: Mapping[str, Any],
+) -> frozenset[tuple[str, str]]:
+    """Return targetless operation hashes bound to helper-captured targets."""
+    output = result.get("output")
+    if not isinstance(output, str) or len(output) > 64 * 1024:
+        return frozenset()
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError):
+        return frozenset()
+    operations = payload.get("operations") if isinstance(payload, dict) else None
+    if not isinstance(operations, list) or not 1 <= len(operations) <= 4:
+        return frozenset()
+
+    grouped: dict[str, list[dict[str, Any]]] = {"memory": [], "user": []}
+    for raw_operation in operations:
+        if not isinstance(raw_operation, dict):
+            return frozenset()
+        operation = dict(raw_operation)
+        target = operation.pop("target", None)
+        if target not in grouped:
+            return frozenset()
+        grouped[target].append(operation)
+
+    authorizations: set[tuple[str, str]] = set()
+    for target, target_operations in grouped.items():
+        if not target_operations:
+            continue
+        digest = _canonical_memory_shape_sha256(
+            {"operations": target_operations}
+        )
+        if digest:
+            authorizations.add((digest, target))
+    return frozenset(authorizations)
+
+
+def _memory_authorization_for_scope(
+    function_args: Mapping[str, Any],
+    scope: _SkillDirectScope,
+) -> tuple[str, str]:
+    """Resolve an exact memory digest and any target inferred from a helper."""
+    normalized = _normalized_memory_payload(function_args)
+    digest = (
+        _canonical_memory_payload_sha256(normalized)
+        if normalized is not None
+        else ""
+    )
+    if digest and digest in scope.memory_payload_sha256:
+        return digest, ""
+
+    # Do not infer a target when the model supplied one (including on an
+    # individual operation); an explicit mismatch must fail closed.
+    if normalized is not None:
+        return "", ""
+    shape_digest = _canonical_memory_shape_sha256(function_args)
+    if not shape_digest:
+        return "", ""
+    matches = [
+        (candidate_digest, target)
+        for candidate_digest, target in scope.memory_payload_shape_authorizations
+        if candidate_digest == shape_digest
+    ]
+    if len(matches) != 1:
+        return "", ""
+    _, target = matches[0]
+    inferred = _normalized_memory_payload(
+        function_args,
+        inferred_target=target,
+    )
+    inferred_digest = (
+        _canonical_memory_payload_sha256(inferred)
+        if inferred is not None
+        else ""
+    )
+    if not inferred_digest or inferred_digest not in scope.memory_payload_sha256:
+        return "", ""
+    return inferred_digest, target
+
+
+def _silent_skill_view_scope_block_message(
+    agent: Any,
+    function_args: Mapping[str, Any],
+) -> str | None:
+    """Fail closed before a silent turn can read an unrelated skill."""
+    if getattr(agent, "_zet_agent_execution_policy", "") != "silent_automation":
+        return None
+
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    turn_identity = _current_skill_direct_turn_identity()
+    expected_path = (
+        _trusted_skill_path_for_slug(task.trusted_skill_slug)
+        if isinstance(task, _SkillDirectTaskContext)
+        else ""
+    )
+    requested_path = _trusted_skill_path_for_slug(function_args.get("name", ""))
+    if (
+        expected_path
+        and requested_path == expected_path
+        and turn_identity is not None
+        and task.turn_identity == turn_identity
+    ):
+        return None
+
+    logger.warning(
+        "zet_agent: blocked silent skill_view outside the transport-selected scope"
+    )
+    return (
+        "Silent automation may load only the transport-selected signed skill "
+        "for this request-bound turn. Do not inspect or load another skill."
+    )
+
+
 def trusted_skill_operation_block_message(
     agent: Any,
     *,
@@ -1981,6 +2635,13 @@ def trusted_skill_operation_block_message(
     before dispatch, so trusted helper authority cannot escape its task.
     """
     _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+    if function_name == "skill_view":
+        silent_scope_block = _silent_skill_view_scope_block_message(
+            agent,
+            function_args,
+        )
+        if silent_scope_block is not None:
+            return silent_scope_block
     turn_identity = _current_skill_direct_turn_identity()
     with _SKILL_DIRECT_LOCK:
         scope = getattr(agent, "_zet_agent_skill_direct_scope", None)
@@ -2024,6 +2685,18 @@ def trusted_skill_operation_block_message(
                     "operation in flight or did not complete successfully. "
                     "The scope was revoked before this call; reload the trusted "
                     "skill for this turn."
+                )
+            if (
+                function_name == "terminal"
+                and getattr(agent, "_zet_agent_execution_policy", "")
+                == "silent_automation"
+            ):
+                logger.warning(
+                    "zet_agent: blocked silent terminal without an attested skill scope"
+                )
+                return (
+                    "Silent automation terminal access requires a current "
+                    "request-bound scope minted by an attested `skill_view` result."
                 )
             if (
                 function_name == "terminal"
@@ -2076,6 +2749,7 @@ def trusted_skill_operation_block_message(
         operation_scope = scope
         may_authorize_memory = False
         authorized_args_sha256 = ""
+        authorized_memory_target = ""
         if allowed and function_name == "terminal":
             normalized_args = _normalized_registry_tool_args(
                 function_name,
@@ -2128,11 +2802,22 @@ def trusted_skill_operation_block_message(
                 )
                 allowed = bool(allowed and authorized_args_sha256)
         elif allowed and function_name == "memory":
-            memory_digest = _canonical_memory_payload_sha256(function_args)
-            allowed = bool(memory_digest and memory_digest in scope.memory_payload_sha256)
+            memory_digest, authorized_memory_target = _memory_authorization_for_scope(
+                function_args,
+                scope,
+            )
+            allowed = bool(memory_digest)
             if allowed:
                 authorized_args_sha256 = memory_digest
                 remaining = scope.memory_payload_sha256 - {memory_digest}
+                shape_authorizations = scope.memory_payload_shape_authorizations
+                shape_digest = _canonical_memory_shape_sha256(function_args)
+                if authorized_memory_target and shape_digest:
+                    shape_authorizations = frozenset(
+                        pair
+                        for pair in shape_authorizations
+                        if pair != (shape_digest, authorized_memory_target)
+                    )
                 allowed_tools = scope.allowed_tools
                 if not remaining:
                     allowed_tools = allowed_tools - {"memory"}
@@ -2140,6 +2825,7 @@ def trusted_skill_operation_block_message(
                     scope,
                     allowed_tools=allowed_tools,
                     memory_payload_sha256=remaining,
+                    memory_payload_shape_authorizations=shape_authorizations,
                 )
         if not allowed:
             agent._zet_agent_skill_direct_operation = None
@@ -2225,6 +2911,7 @@ def trusted_skill_operation_block_message(
             function_name=function_name,
             may_authorize_memory=may_authorize_memory,
             authorized_args_sha256=authorized_args_sha256,
+            authorized_memory_target=authorized_memory_target,
         )
         return None
 
@@ -2233,7 +2920,7 @@ def trusted_skill_operation_execution_block_message(
     agent: Any,
     *,
     function_name: str,
-    function_args: Mapping[str, Any],
+    function_args: MutableMapping[str, Any],
 ) -> str | None:
     """Revalidate the final trusted-memory payload after execution middleware."""
     if (
@@ -2279,7 +2966,17 @@ def trusted_skill_operation_execution_block_message(
                 "task-local turn. The operation was revoked before writing."
             )
 
-        final_digest = _canonical_memory_payload_sha256(function_args)
+        normalized_args = _normalized_memory_payload(function_args)
+        if normalized_args is None and operation.authorized_memory_target:
+            normalized_args = _normalized_memory_payload(
+                function_args,
+                inferred_target=operation.authorized_memory_target,
+            )
+        final_digest = (
+            _canonical_memory_payload_sha256(normalized_args)
+            if normalized_args is not None
+            else ""
+        )
         if (
             operation.execution_claimed
             or not final_digest
@@ -2295,6 +2992,15 @@ def trusted_skill_operation_execution_block_message(
                 "authorization. The operation was revoked before writing."
             )
 
+        if normalized_args is None:
+            agent._zet_agent_skill_direct_operation = None
+            return (
+                "The trusted video-edit memory payload could not be normalized "
+                "for dispatch. The operation was revoked before writing."
+            )
+        function_args.clear()
+        function_args["operations"] = normalized_args["operations"]
+        function_args["target"] = normalized_args["target"]
         agent._zet_agent_skill_direct_operation = replace(
             operation,
             execution_claimed=True,
@@ -2482,6 +3188,20 @@ def dispatch_trusted_skill_operation(
     ``skill_view`` scope is activated later from the final displayed result.
     """
     _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+    if function_name == "skill_view":
+        silent_scope_block = _silent_skill_view_scope_block_message(
+            agent,
+            function_args,
+        )
+        if silent_scope_block is not None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": silent_scope_block,
+                    "trusted_skill_scope_blocked": True,
+                },
+                ensure_ascii=False,
+            )
     receipt: _TrustedExecutionReceipt | None = None
     block_message: str | None = None
     if function_name == "terminal":
@@ -2516,6 +3236,15 @@ def dispatch_trusted_skill_operation(
 
     if receipt is not None:
         _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
+    fresh_read_required = (
+        function_name == "skill_view"
+        and _trusted_skill_view_refresh_required(agent, function_args)
+    )
+    if fresh_read_required:
+        logger.info(
+            "zet_agent: refreshing signed trusted skill view for a new scope"
+        )
+    fresh_read_token = _TRUSTED_SKILL_VIEW_FRESH_READ.set(fresh_read_required)
     try:
         result = dispatch()
     except BaseException:
@@ -2528,6 +3257,7 @@ def dispatch_trusted_skill_operation(
             )
         raise
     finally:
+        _TRUSTED_SKILL_VIEW_FRESH_READ.reset(fresh_read_token)
         _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
 
     if function_name != "skill_view":
@@ -2624,6 +3354,15 @@ def _rearm_skill_direct_scope_after_success(
                 )
                 else frozenset()
             )
+            memory_shape_authorizations = (
+                _memory_payload_shape_authorizations_from_terminal_result(result)
+                if (
+                    successful
+                    and scope.relative_path == _VIDEO_EDIT_SKILL_PATH
+                    and operation.may_authorize_memory
+                )
+                else frozenset()
+            )
             listed_camera_ids = (
                 _camera_ids_from_terminal_result(result)
                 if successful and scope.relative_path == _CAMERA_SKILL_PATH
@@ -2641,6 +3380,7 @@ def _rearm_skill_direct_scope_after_success(
                 scope,
                 allowed_tools=allowed_tools,
                 memory_payload_sha256=memory_hashes,
+                memory_payload_shape_authorizations=memory_shape_authorizations,
                 camera_ids=(
                     listed_camera_ids
                     if listed_camera_ids is not None
@@ -2696,6 +3436,84 @@ def _private_hardware_discovery_scope(user_message: Any) -> str:
     ):
         return ""
     return str(network)
+
+
+def _subnet_hardware_discovery_request(
+    user_message: Any,
+) -> tuple[tuple[str, ...], str, bool] | None:
+    """Recognize one explicit, bounded private-network discovery request."""
+    task_text, _ = _task_text_and_video_asset(user_message)
+    normalized = " ".join(_strip_gateway_model_switch_note(task_text).split())
+    if (
+        not normalized
+        or len(normalized) > 320
+        or not _SUBNET_DISCOVERY_ACTION_RE.search(normalized)
+        or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
+    ):
+        return None
+
+    network_scope = _private_hardware_discovery_scope(user_message)
+    if _IPV4_SCOPE_RE.search(normalized) and not network_scope:
+        return None
+    current_network = not network_scope and bool(
+        _CURRENT_PRIVATE_NETWORK_RE.search(normalized)
+        or _LOCAL_PRIVATE_NETWORK_RE.search(normalized)
+    )
+    if not network_scope and not current_network:
+        return None
+    if (
+        _SUBNET_UNSUPPORTED_TYPE_RE.search(normalized)
+        or _SUBNET_NON_HARDWARE_SCAN_RE.search(normalized)
+    ):
+        return None
+
+    positioned_types: list[tuple[int, str]] = []
+    for hardware_type, pattern in _HARDWARE_ENROLLMENT_TYPE_RES:
+        match = pattern.search(normalized)
+        if match is not None:
+            positioned_types.append((match.start(), hardware_type))
+    positioned_types.sort(key=lambda item: item[0])
+    requested_types = tuple(hardware_type for _, hardware_type in positioned_types)
+    if not requested_types:
+        requested_types = ("camera", "tv")
+    if any(
+        hardware_type not in _DISCOVERABLE_SUBNET_HARDWARE_TYPES
+        for hardware_type in requested_types
+    ):
+        return None
+    return requested_types, network_scope, current_network
+
+
+def _blocked_subnet_hardware_discovery_request(user_message: Any) -> bool:
+    """Return whether a scan-shaped request must stop before Agent tools."""
+    task_text, _ = _task_text_and_video_asset(user_message)
+    normalized = " ".join(_strip_gateway_model_switch_note(task_text).split())
+    if (
+        not normalized
+        or len(normalized) > 320
+        or not _SUBNET_DISCOVERY_ACTION_RE.search(normalized)
+        or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
+        or not (
+            _IPV4_SCOPE_RE.search(normalized)
+            or _CURRENT_PRIVATE_NETWORK_RE.search(normalized)
+            or _LOCAL_PRIVATE_NETWORK_RE.search(normalized)
+        )
+    ):
+        return False
+    if (
+        (
+            _IPV4_SCOPE_RE.search(normalized)
+            and not _private_hardware_discovery_scope(user_message)
+        )
+        or _SUBNET_UNSUPPORTED_TYPE_RE.search(normalized)
+        or _SUBNET_NON_HARDWARE_SCAN_RE.search(normalized)
+    ):
+        return True
+    return any(
+        pattern.search(normalized)
+        and hardware_type not in _DISCOVERABLE_SUBNET_HARDWARE_TYPES
+        for hardware_type, pattern in _HARDWARE_ENROLLMENT_TYPE_RES
+    )
 
 
 def _hardware_enrollment_requested_types(
@@ -2765,6 +3583,33 @@ def _strip_model_hardware_enrollment_blocks(text: str) -> str:
     return _CONNECTOR_ENROLLMENT_BLOCK_RE.sub(remove_hardware_v2, stripped)
 
 
+def _append_hardware_enrollment_intent(
+    visible_text: str,
+    requested_types: tuple[str, ...],
+    *,
+    network_scope: str = "",
+    current_network: bool = False,
+) -> str:
+    intent: dict[str, Any] = {
+        "schema_version": "2",
+        "kind": "connector_enrollment",
+        "items": [
+            {"resource_kind": hardware_type}
+            for hardware_type in requested_types
+        ],
+        "setup_requested": True,
+    }
+    if network_scope:
+        intent["network_scope"] = {"cidr": network_scope}
+    elif current_network:
+        intent["network_scope"] = {"mode": "current"}
+    payload = json.dumps(intent, ensure_ascii=False, indent=2)
+    return (
+        f"{visible_text}\n\n```{_CONNECTOR_ENROLLMENT_FENCE}\n"
+        f"{payload}\n```"
+    )
+
+
 def ensure_hardware_enrollment_intent(
     agent: Any,
     *,
@@ -2797,17 +3642,25 @@ def ensure_hardware_enrollment_intent(
     removed_model_intent = visible_text != text
     if removed_model_intent:
         visible_text = visible_text.strip()
-    network_scope = _private_hardware_discovery_scope(user_message)
+    if _blocked_subnet_hardware_discovery_request(user_message):
+        return visible_text if removed_model_intent else text
     task_text, _ = _task_text_and_video_asset(user_message)
-    current_network = not network_scope and bool(_CURRENT_PRIVATE_NETWORK_RE.search(task_text))
+    subnet_request = _subnet_hardware_discovery_request(user_message)
+    if subnet_request is not None:
+        requested_types, network_scope, current_network = subnet_request
+    else:
+        network_scope = _private_hardware_discovery_scope(user_message)
+        current_network = not network_scope and bool(
+            _CURRENT_PRIVATE_NETWORK_RE.search(task_text)
+        )
+        requested_types = _hardware_enrollment_requested_types(
+            user_message,
+            subnet_scoped=bool(network_scope) or current_network,
+        )
     if _IPV4_SCOPE_RE.search(task_text) and not network_scope:
         # An invalid, public, oversized or ambiguous range must not degrade to
         # broad unscoped discovery.
         return visible_text if removed_model_intent else text
-    requested_types = _hardware_enrollment_requested_types(
-        user_message,
-        subnet_scoped=bool(network_scope) or current_network,
-    )
     if requested_types and _CONNECTOR_ENROLLMENT_BLOCK_RE.search(visible_text):
         # A mixed hardware + protocol V2 intent is outside this hardware-only
         # canonicalizer. Preserve that single V2 block and suppress the legacy
@@ -2828,27 +3681,56 @@ def ensure_hardware_enrollment_intent(
         # account/pairing discovery instead.
         return visible_text if removed_model_intent else text
 
-    intent: dict[str, Any] = {
-        "schema_version": "2",
-        "kind": "connector_enrollment",
-        "items": [
-            {"resource_kind": hardware_type}
-            for hardware_type in requested_types
-        ],
-        "setup_requested": True,
-    }
-    if network_scope:
-        intent["network_scope"] = {"cidr": network_scope}
-    elif current_network:
-        intent["network_scope"] = {"mode": "current"}
-    payload = json.dumps(
-        intent,
-        ensure_ascii=False,
-        indent=2,
+    return _append_hardware_enrollment_intent(
+        visible_text,
+        requested_types,
+        network_scope=network_scope,
+        current_network=current_network,
     )
-    return (
-        f"{visible_text}\n\n```{_CONNECTOR_ENROLLMENT_FENCE}\n"
-        f"{payload}\n```"
+
+
+def hardware_enrollment_preflight_response(
+    agent: Any,
+    user_message: Any,
+) -> str:
+    """Return an immediate client card before the provider/tool loop."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return ""
+    subnet_request = _subnet_hardware_discovery_request(user_message)
+    if subnet_request is None:
+        if _blocked_subnet_hardware_discovery_request(user_message):
+            task_text, _ = _task_text_and_video_asset(user_message)
+            if re.search(r"[\u3400-\u9fff]", task_text):
+                return (
+                    "该请求不会执行 shell、nmap 或端口扫描。请使用私有 /24–/30 "
+                    "网段；当前网段发现仅支持 ONVIF 摄像头和 DLNA 电视。"
+                )
+            return (
+                "This request will not run shell, nmap, or a port scan. Use a "
+                "private /24–/30 subnet; discovery currently supports ONVIF "
+                "cameras and DLNA TVs."
+            )
+        return ""
+    if response_format_requires_structured_output(
+        (getattr(agent, "request_overrides", None) or {}).get("response_format")
+    ):
+        return ""
+    requested_types, network_scope, current_network = subnet_request
+    task_text, _ = _task_text_and_video_asset(user_message)
+    is_chinese = bool(re.search(r"[\u3400-\u9fff]", task_text))
+    intro = (
+        "点击卡片中的“发现附近设备”开始扫描；结果会显示在卡片内，且不会自动连接。"
+        if is_chinese
+        else (
+            "Select “Discover nearby devices” to scan. Results stay in the "
+            "card and are not connected automatically."
+        )
+    )
+    return _append_hardware_enrollment_intent(
+        intro,
+        requested_types,
+        network_scope=network_scope,
+        current_network=current_network,
     )
 
 
@@ -2927,78 +3809,11 @@ def apply_trusted_skill_execution(
     if pending is None:
         return False
 
-    if (getattr(agent, "platform", "") or "") != "zet_agent":
-        return False
-
-    if pending.relative_path not in {_VIDEO_EDIT_SKILL_PATH, _CAMERA_SKILL_PATH, *_PRINTER3D_SKILL_PATHS}:
-        return False
-    task = getattr(agent, "_zet_agent_skill_direct_task", None)
-    task_matches_skill = bool(
-        isinstance(task, _SkillDirectTaskContext)
-        and (
-            (
-                pending.relative_path == _VIDEO_EDIT_SKILL_PATH
-                and task.video_edit_applicable
-            )
-            or (
-                pending.relative_path == _CAMERA_SKILL_PATH
-                and task.camera_applicable
-            )
-            or (
-                pending.relative_path in _PRINTER3D_SKILL_PATHS
-                and task.printer3d_applicable
-            )
-        )
+    return _activate_trusted_skill_scope(
+        agent,
+        relative_path=pending.relative_path,
+        attested_turn_identity=pending.turn_identity,
     )
-    if not task_matches_skill:
-        logger.warning(
-            "zet_agent: trusted skill %s did not match the current user task",
-            pending.relative_path,
-        )
-        return False
-    current_turn_identity = _current_skill_direct_turn_identity()
-    if (
-        current_turn_identity is None
-        or task.turn_identity != current_turn_identity
-        or pending.turn_identity != current_turn_identity
-    ):
-        logger.warning(
-            "zet_agent: trusted skill %s rejected for mismatched turn identity",
-            pending.relative_path,
-        )
-        return False
-    execution_receipt = _capture_trusted_execution_receipt(
-        current_turn_identity,
-        hardware_skill=pending.relative_path != _VIDEO_EDIT_SKILL_PATH,
-    )
-    if execution_receipt is None:
-        return False
-    allowed_tools = (
-        _CAMERA_DIRECT_TOOLS
-        if pending.relative_path == _CAMERA_SKILL_PATH
-        else _PRINTER3D_DIRECT_TOOLS
-        if pending.relative_path in _PRINTER3D_SKILL_PATHS
-        else _VIDEO_EDIT_DIRECT_TOOLS
-    )
-
-    with _SKILL_DIRECT_LOCK:
-        agent._zet_agent_skill_direct_operation = None
-        agent._zet_agent_skill_direct_scope = _SkillDirectScope(
-            relative_path=pending.relative_path,
-            task_sha256=task.task_sha256,
-            turn_identity=current_turn_identity,
-            allowed_tools=allowed_tools,
-            execution_receipt=execution_receipt,
-            camera_inventory_only=bool(
-                pending.relative_path == _CAMERA_SKILL_PATH
-                and task.camera_inventory_only
-            ),
-        )
-    logger.info(
-        "zet_agent: trusted skill %s activated bounded execution scope",
-        pending.relative_path,
-    )
-    return True
 
 
 # Production gateways set ZETTLAB_PRESETS_DIR in the process environment before

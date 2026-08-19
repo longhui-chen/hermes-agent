@@ -32,8 +32,11 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import (
+    _EXECUTION_POLICY,
+    _EXECUTION_SESSION_KEY,
     _BUSINESS_EXECUTION_ACTION,
     _BUSINESS_EXECUTION_ACTION_VERSION,
+    _HARDWARE_EXECUTION_TOKEN,
     _SESSION_ASYNC_DELIVERY,
     _TURN_BINDING,
     _UNSET,
@@ -43,6 +46,8 @@ from gateway.session_context import (
     business_execution_action_version,
     clear_turn_vars,
     current_turn_identity,
+    execution_session_key,
+    hardware_execution_token,
     reset_session_vars,
     set_session_vars,
     set_turn_vars,
@@ -111,8 +116,9 @@ def _isolate_session_context():
     saved_ctx = {name: var.get() for name, var in _VAR_MAP.items()}
     saved_async = _SESSION_ASYNC_DELIVERY.get()
     saved_turn_binding = _TURN_BINDING.get()
-    saved_business_token = _BUSINESS_EXECUTION_ACTION.get()
-    saved_business_version = _BUSINESS_EXECUTION_ACTION_VERSION.get()
+    saved_action = _BUSINESS_EXECUTION_ACTION.get()
+    saved_action_version = _BUSINESS_EXECUTION_ACTION_VERSION.get()
+    saved_execution_policy = _EXECUTION_POLICY.get()
     saved_reference = sc._CURRENT_TURN_REFERENCE_IMAGE.get()
     saved_engaged = sc._session_context_engaged
     for var in _VAR_MAP.values():
@@ -121,6 +127,7 @@ def _isolate_session_context():
     _TURN_BINDING.set(_UNSET)
     _BUSINESS_EXECUTION_ACTION.set(_UNSET)
     _BUSINESS_EXECUTION_ACTION_VERSION.set(_UNSET)
+    _EXECUTION_POLICY.set(_UNSET)
     sc._CURRENT_TURN_REFERENCE_IMAGE.set("")
     sc._session_context_engaged = True  # a concurrent multi-session host is engaged
     try:
@@ -130,8 +137,9 @@ def _isolate_session_context():
             var.set(val)
         _SESSION_ASYNC_DELIVERY.set(saved_async)
         _TURN_BINDING.set(saved_turn_binding)
-        _BUSINESS_EXECUTION_ACTION.set(saved_business_token)
-        _BUSINESS_EXECUTION_ACTION_VERSION.set(saved_business_version)
+        _BUSINESS_EXECUTION_ACTION.set(saved_action)
+        _BUSINESS_EXECUTION_ACTION_VERSION.set(saved_action_version)
+        _EXECUTION_POLICY.set(saved_execution_policy)
         sc._CURRENT_TURN_REFERENCE_IMAGE.set(saved_reference)
         sc._session_context_engaged = saved_engaged
         for k, v in saved_env.items():
@@ -239,35 +247,22 @@ def test_reset_session_vars_drops_inherited_turn_binding():
     assert _TURN_BINDING.get() is _UNSET
 
 
-def test_reset_session_vars_resets_business_execution_action_to_unset():
+def test_reset_session_vars_drops_inherited_action_receipt():
     _BUSINESS_EXECUTION_ACTION.set("a" * 64)
     _BUSINESS_EXECUTION_ACTION_VERSION.set("1")
+    _HARDWARE_EXECUTION_TOKEN.set("b" * 64)
+    _EXECUTION_SESSION_KEY.set("foreign-stable-session")
 
     reset_session_vars()
 
     assert business_execution_action() == ""
     assert business_execution_action_version() == ""
+    assert hardware_execution_token() == ""
+    assert execution_session_key() == ""
     assert _BUSINESS_EXECUTION_ACTION.get() is _UNSET
     assert _BUSINESS_EXECUTION_ACTION_VERSION.get() is _UNSET
-
-
-def test_reset_session_vars_drops_inherited_business_execution_action_flow():
-    _BUSINESS_EXECUTION_ACTION.set("a" * 64)
-    _BUSINESS_EXECUTION_ACTION_VERSION.set("1")
-    captured = {}
-
-    async def child_turn():
-        reset_session_vars()
-        captured["token"] = business_execution_action()
-        captured["version"] = business_execution_action_version()
-        captured["raw"] = _BUSINESS_EXECUTION_ACTION.get()
-
-    async def run_child():
-        await asyncio.create_task(child_turn())
-
-    asyncio.run(run_child())
-
-    assert captured == {"token": "", "version": "", "raw": _UNSET}
+    assert _HARDWARE_EXECUTION_TOKEN.get() is _UNSET
+    assert _EXECUTION_SESSION_KEY.get() is _UNSET
 
 
 # ---------------------------------------------------------------------------
@@ -320,4 +315,5 @@ def test_reset_session_vars_closes_async_delivery_leak():
         "After reset, async delivery must default to supported; "
         f"got {captured['window']!r}"
     )
+
 

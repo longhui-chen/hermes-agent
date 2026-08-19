@@ -2132,14 +2132,22 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
-_RETIRED_BUSINESS_CAPABILITY_ENV_KEY = "ZETTLAB_BUSINESS_EXECUTION_" + "TOKEN"
+RETIRED_BUSINESS_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
+    # Scrub-only compatibility fence. No runtime may read or emit these retired
+    # generic authorization values, but a stale parent environment must not leak
+    # them into a model-authored subprocess either.
+    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
+    "ZETTLAB_BUSINESS_EXECUTION_MODE",
+    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
+})
 VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    # Turn-scoped side-effect capability. Generic subprocesses must not
-    # inherit either a live ContextVar or a stale process-global fallback.
     "ZETTLAB_BUSINESS_EXECUTION_ACTION",
     "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
+})
+HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
-    _RETIRED_BUSINESS_CAPABILITY_ENV_KEY,
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -2156,7 +2164,9 @@ _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
+    | RETIRED_BUSINESS_EXECUTION_ENV_KEYS
     | VIDEO_EDIT_RUNTIME_ENV_KEYS
+    | HARDWARE_RUNTIME_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
     | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
 )
@@ -2265,13 +2275,19 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     return env
 
 
-def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[str, str]:
+def build_agent_creator_runtime_env(
+    *,
+    app_auto_refresh: bool = False,
+    app_auto_refresh_operation: object | None = None,
+) -> dict[str, str]:
     """Build the minimal env for the trusted agent-creator preset runner.
 
     The action token is never read from process env or a profile ``.env``.
     After command validation and mutation approval, the trusted gateway process
     obtains a short-lived AgentComputer-only token from local-server's Unix
-    broker. The direct runner then gives it to the CLI over a one-shot FD.
+    broker. For an app-agent request it forwards the already parsed operation
+    object; local-server alone derives the binding and issues the capability. The direct
+    runner then gives the resulting token to the CLI over a one-shot FD.
     """
 
     from agent.credential_broker import (
@@ -2289,12 +2305,34 @@ def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[s
     ).strip()
     if not agent_id:
         raise RuntimeError("agent creator profile identity unavailable")
-    request_token = (
-        request_app_auto_refresh_token
-        if app_auto_refresh
-        else request_agentcomputer_token
-    )
-    token = request_token(agent_id)
+    if app_auto_refresh:
+        if app_auto_refresh_operation is None:
+            raise RuntimeError("agent creator operation binding unavailable")
+        try:
+            from gateway.session_context import (
+                get_session_env,
+                zettlab_auth_principal,
+                zettlab_turn_id,
+            )
+
+            turn_id = str(zettlab_turn_id() or "").strip()
+            session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+            owner_principal = str(zettlab_auth_principal() or "").strip()
+        except Exception as exc:
+            raise RuntimeError("agent creator operation context unavailable") from exc
+        if not turn_id or not session_id or not owner_principal:
+            raise RuntimeError("agent creator operation context unavailable")
+        token = request_app_auto_refresh_token(
+            agent_id,
+            operation_kind="app_dedicated_create_v1",
+            operation=app_auto_refresh_operation,
+            owner_principal=owner_principal,
+            owner_agent_id=agent_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+    else:
+        token = request_agentcomputer_token(agent_id)
     if (
         "\x00" in token
         or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
@@ -2302,12 +2340,13 @@ def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[s
         raise RuntimeError("agent creator action token invalid")
 
     env = {"ZETTLAB_AGENT_ACTION_TOKEN": token}
-    try:
-        from gateway.session_context import zettlab_turn_id
+    if not app_auto_refresh:
+        try:
+            from gateway.session_context import zettlab_turn_id
 
-        turn_id = zettlab_turn_id()
-    except Exception:
-        turn_id = ""
+            turn_id = zettlab_turn_id()
+        except Exception:
+            turn_id = ""
     if turn_id:
         turn_id = str(turn_id)
         if (
@@ -2334,9 +2373,7 @@ def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]
         frozen_receipt = {}
     if not frozen_receipt:
         raise PermissionError("trusted video-edit execution receipt unavailable")
-    action = str(
-        frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", "") or ""
-    ).strip()
+    action = str(frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", "") or "").strip()
     if (
         frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION") != "1"
         or re.fullmatch(r"[0-9a-f]{64}", action) is None
@@ -2349,11 +2386,10 @@ def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]
 def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
-    Camera credentials never enter Hermes. The helper receives only the
-    profile action token and the current request's hardware capability so the
-    device-local CameraService can bind the call to one Agent, user, turn, and
-    session. Generic subprocesses continue to have all of these values
-    stripped by :func:`_apply_profile_secret_scope_env`.
+    The helper receives the profile action token and the independently scoped
+    hardware capability plus turn/session correlation. Video ActionV1 is not
+    aliased into this path. Generic subprocesses continue to have all of these
+    values stripped by :func:`_apply_profile_secret_scope_env`.
     """
     try:
         from agent.zet_agent_response_mode import trusted_camera_runtime_receipt

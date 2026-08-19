@@ -27,6 +27,7 @@ import html
 import json
 import logging
 import os
+from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote
@@ -89,8 +90,12 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_url,
     cache_media_bytes,
+    get_inbound_media_max_bytes,
+    inbound_media_download_permit,
     log_media_intake_failure,
     safe_exc,
+    validate_inbound_media_size,
+    _read_httpx_body_with_limit,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -167,6 +172,9 @@ _DEFAULT_PORT = 3978
 # Bot Framework activities are JSON payloads well under 1 MiB; an explicit
 # aiohttp client_max_size keeps oversized/chunked request bodies bounded.
 _MAX_BODY_BYTES = 1_048_576
+# 与相邻 MessageDeduplicator 的 1000 个远端活动身份预算同量纲；当前聊天
+# 每次入站都会重新写入，因此淘汰最旧引用不会影响触发本轮回复的会话。
+TEAMS_CONVERSATION_REF_MAX = 1000
 # ``None`` → aiohttp/asyncio ``create_server`` binds one listening socket per
 # address family (IPv4 + IPv6). The old hardcoded "0.0.0.0" bound IPv4 ONLY
 # and was unreachable over IPv6-only private networks (e.g. Fly.io 6PN) —
@@ -811,7 +819,13 @@ class TeamsAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=1000)
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
-        self._conv_refs: Dict[str, Any] = {}
+        self._conv_refs: "OrderedDict[str, Any]" = OrderedDict()
+
+    def _remember_conversation_ref(self, chat_id: str, ref: Any) -> None:
+        self._conv_refs.pop(chat_id, None)
+        self._conv_refs[chat_id] = ref
+        while len(self._conv_refs) > TEAMS_CONVERSATION_REF_MAX:
+            self._conv_refs.popitem(last=False)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Lazy-install the Teams SDK on demand (parity with Slack/Discord/etc.),
@@ -925,12 +939,17 @@ class TeamsAdapter(BasePlatformAdapter):
             follow_redirects=True,
             event_hooks={"response": [_ssrf_redirect_guard]},
         ) as client:
-            response = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
-            )
-            response.raise_for_status()
-            return response.content
+            async with inbound_media_download_permit():
+                async with client.stream(
+                    "GET",
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
+                ) as response:
+                    response.raise_for_status()
+                    return await _read_httpx_body_with_limit(
+                        response, media_type="Teams inbound attachment",
+                        permit_acquired=True,
+                    )
 
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
         """Process an incoming Teams message and dispatch to the gateway."""
@@ -945,11 +964,6 @@ class TeamsAdapter(BasePlatformAdapter):
         msg_id = getattr(activity, "id", None)
         if msg_id and self._dedup.is_duplicate(msg_id):
             return
-
-        # Cache the conversation reference for proactive sends (approval cards, etc.)
-        conv_id = getattr(activity.conversation, "id", None)
-        if conv_id:
-            self._conv_refs[conv_id] = ctx.conversation_ref
 
         # Extract text — strip bot @mentions
         text = ""
@@ -986,10 +1000,27 @@ class TeamsAdapter(BasePlatformAdapter):
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
         )
 
+        if self._is_sender_authorized(str(user_id), chat_type, conv.id) is not True:
+            # 仍交给共享 handler 触发配对/未授权提示，但不替未授权发送者
+            # 下载任何外部附件。
+            await self.handle_message(MessageEvent(
+                text=text,
+                source=source,
+                message_type=MessageType.TEXT,
+                message_id=msg_id,
+            ))
+            return
+
+        # Cache only authorized conversation refs for proactive cards/media.
+        conv_id = getattr(activity.conversation, "id", None)
+        if conv_id:
+            self._remember_conversation_ref(conv_id, ctx.conversation_ref)
+
         # Handle attachments (images, documents, video, audio)
         media_urls = []
         media_types = []
         media_kinds = []
+        failed_media_kinds = []
         for att in getattr(activity, "attachments", None) or []:
             content_url = getattr(att, "content_url", None)
             content_type = (getattr(att, "content_type", None) or "").lower()
@@ -1012,6 +1043,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 download_url = content.get("downloadUrl") or content.get("download_url")
                 file_type = (content.get("fileType") or content.get("file_type") or "").lstrip(".")
                 if not download_url:
+                    failed_media_kinds.append("file")
                     continue
                 filename = att_name or (f"document.{file_type}" if file_type else "document")
                 try:
@@ -1023,7 +1055,9 @@ class TeamsAdapter(BasePlatformAdapter):
                         media_kinds.append(cached.kind)
                     else:
                         logger.warning("[teams] Unsupported document type; skipping attachment")
+                        failed_media_kinds.append("file")
                 except Exception as e:
+                    failed_media_kinds.append("file")
                     # 🔴 ⛔ 不再裸 `%s` 异常:本文件 `_fetch_attachment_bytes` 的
                     # docstring 自己写着 Teams 附件带的是**预授权** SharePoint
                     # downloadUrl(`?tempauth=<JWT>`)—— 即「URL 本身就是凭据」。
@@ -1043,7 +1077,10 @@ class TeamsAdapter(BasePlatformAdapter):
                         media_urls.append(cached)
                         media_types.append(content_type)
                         media_kinds.append("image")
+                    else:
+                        failed_media_kinds.append("image")
                 except Exception as e:
+                    failed_media_kinds.append("image")
                     log_media_intake_failure(
                         logger, "teams", "image", "download_failed",
                         url=content_url, exc=e,
@@ -1061,6 +1098,11 @@ class TeamsAdapter(BasePlatformAdapter):
                         media_urls.append(cached.path)
                         media_types.append(cached.media_type)
                         media_kinds.append(cached.kind)
+                    else:
+                        _top = content_type.split("/", 1)[0]
+                        failed_media_kinds.append(
+                            _top if _top in ("image", "video", "audio") else "file"
+                        )
                 except Exception as e:
                     # ⛔ 原写法把 `content_url` 作为 fallback 直接进日志 ——
                     # 那是预授权 URL 本身。这里只留 host + 文件名。
@@ -1068,6 +1110,9 @@ class TeamsAdapter(BasePlatformAdapter):
                     # —— ⛔ 不许把 `application` 这种 MIME 顶级类型当 kind 写进
                     # 日志(它不是本仓约定的 kind 词表)。
                     _top = content_type.split("/", 1)[0]
+                    failed_media_kinds.append(
+                        _top if _top in ("image", "video", "audio") else "file"
+                    )
                     log_media_intake_failure(
                         logger, "teams",
                         _top if _top in ("image", "video", "audio") else "file",
@@ -1075,6 +1120,13 @@ class TeamsAdapter(BasePlatformAdapter):
                         url=content_url, exc=e,
                         filename=att_name or "-", content_type=content_type or "-",
                     )
+
+        if failed_media_kinds:
+            kinds = ", ".join(sorted(set(failed_media_kinds)))
+            note = (
+                f"[{kinds} attachment unavailable: ask the user to send it again]"
+            )
+            text = f"{text}\n\n{note}".strip()
 
         # Classification: DOCUMENT wins over PHOTO/VIDEO/AUDIO for mixed
         # attachments — run.py's image handling keys off the per-path image/*
@@ -1344,8 +1396,25 @@ class TeamsAdapter(BasePlatformAdapter):
                 # Local path — encode as base64 data URI
                 path = source.removeprefix("file://")
                 mime_type = mimetypes.guess_type(path)[0] or default_mime
-                with open(path, "rb") as f:
-                    content_url = f"data:{mime_type};base64,{base64.b64encode(f.read()).decode()}"
+
+                def _bounded_data_uri() -> str:
+                    limit = get_inbound_media_max_bytes()
+                    size = os.path.getsize(path)
+                    validate_inbound_media_size(
+                        size,
+                        media_type=f"Teams outbound {media_label}",
+                        max_bytes=limit,
+                    )
+                    with open(path, "rb") as f:
+                        data = f.read(limit + 1) if limit > 0 else f.read()
+                    validate_inbound_media_size(
+                        len(data),
+                        media_type=f"Teams outbound {media_label}",
+                        max_bytes=limit,
+                    )
+                    return f"data:{mime_type};base64,{base64.b64encode(data).decode()}"
+
+                content_url = await asyncio.to_thread(_bounded_data_uri)
 
             attachment = Attachment(content_type=mime_type, content_url=content_url)
             activity = MessageActivityInput().add_attachments(attachment)

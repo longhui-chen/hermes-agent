@@ -429,6 +429,28 @@ async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
     assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
 
 
+@pytest.mark.asyncio
+async def test_non_streaming_remote_image_batch_failure_notifies_user():
+    adapter = _DiscordMediaFailureAdapter()
+    event = _event()
+    remote_image = "https://cdn.example/chart.png?signature=secret-token"
+    adapter._message_handler = AsyncMock(
+        return_value=f"![chart]({remote_image})"
+    )
+    adapter.send_multiple_images = AsyncMock(return_value=False)
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    sent_images = adapter.send_multiple_images.await_args.kwargs["images"]
+    assert sent_images == [(remote_image, "chart")], (
+        "夹具必须真实进入远程图片批量发送分支"
+    )
+    assert adapter.notices == [
+        "⚠️ Couldn't deliver the file attachment (chart.png)."
+    ]
+    assert "secret-token" not in adapter.notices[0]
+
+
 class _DiscordMediaFailureAdapter(BasePlatformAdapter):
     """Minimal adapter to exercise non-streaming MEDIA failure notification."""
 

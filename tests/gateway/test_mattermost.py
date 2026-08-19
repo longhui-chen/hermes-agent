@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -11,6 +12,11 @@ from gateway.run import (
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
 )
+
+
+async def _async_chunks(chunks):
+    for chunk in chunks:
+        yield chunk
 
 
 class TestMattermostProgressThreadRouting:
@@ -411,6 +417,10 @@ class TestMattermostFileUpload:
         mock_dl_resp = AsyncMock()
         mock_dl_resp.status = 200
         mock_dl_resp.read = AsyncMock(return_value=b"\x89PNG\x00fake-image-data")
+        mock_dl_resp.headers = {}
+        mock_dl_resp.content = SimpleNamespace(
+            iter_chunked=lambda _size: _async_chunks([b"\x89PNG\x00fake-image-data"])
+        )
         mock_dl_resp.content_type = "image/png"
         mock_dl_resp.__aenter__ = AsyncMock(return_value=mock_dl_resp)
         mock_dl_resp.__aexit__ = AsyncMock(return_value=False)
@@ -550,6 +560,10 @@ class TestMattermostMediaTypes:
         mock_resp = AsyncMock()
         mock_resp.status = 200
         mock_resp.read = AsyncMock(return_value=b"\x89PNG fake")
+        mock_resp.headers = {}
+        mock_resp.content = SimpleNamespace(
+            iter_chunked=lambda _size: _async_chunks([b"\x89PNG fake"])
+        )
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
         self.adapter._session = MagicMock()
@@ -592,5 +606,3 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.source.thread_id == "top_post_123"
     assert msg_event.source.message_id == "top_post_123"
     assert msg_event.message_id == "top_post_123"
-
-

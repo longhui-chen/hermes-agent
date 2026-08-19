@@ -108,6 +108,106 @@ def test_pc_ui_snapshot_uses_session_scoped_pc_action(monkeypatch):
     assert result == {"success": True, "result": {"pid": 42, "window_id": 7}}
 
 
+def test_pc_ui_injects_runtime_task_identity_without_exposing_scope_to_model(monkeypatch):
+    _configure(monkeypatch)
+
+    class _TaskClient(_Client):
+        def post(self, url, **kwargs):
+            body = kwargs["json"]
+            assert body["task_control"] == {
+                "task_id": module._wire_task_id("turn-1"),
+                "operation_id": module._task_control(
+                    {
+                        "snapshot_revision": 7,
+                        "user_input_epoch": 3,
+                        "postcondition": [{"window": {"exists": True}}],
+                    },
+                    "focus",
+                    {"pid": 42, "window_id": 7},
+                    "turn-1",
+                    "call-1",
+                )["operation_id"],
+                "snapshot_revision": 7,
+                "user_input_epoch": 3,
+                "postcondition": [{"window": {"exists": True}}],
+            }
+            assert body["params"] == {"pid": 42, "window_id": 7}
+            return _Response()
+
+    monkeypatch.setattr(module.requests, "Session", _TaskClient)
+    result = json.loads(module.pc_ui_tool(
+        {
+            "action": "focus",
+            "pid": 42,
+            "window_id": 7,
+            "snapshot_revision": 7,
+            "user_input_epoch": 3,
+            "postcondition": [{"window": {"exists": True}}],
+        },
+        task_id="turn-1",
+        tool_call_id="call-1",
+    ))
+    assert result["success"] is True
+
+
+def test_pc_ui_mutation_operation_id_is_stable_and_ignores_sensitive_text():
+    first = module._task_control(
+        {}, "type_text", {"pid": 42, "window_id": 7, "element": 3, "text": "secret-a"},
+        "turn-1", "call-1",
+    )
+    replay = module._task_control(
+        {}, "type_text", {"pid": 42, "window_id": 7, "element": 3, "text": "secret-b"},
+        "turn-1", "call-1",
+    )
+    different_call = module._task_control(
+        {}, "type_text", {"pid": 42, "window_id": 7, "element": 3, "text": "secret-a"},
+        "turn-1", "call-2",
+    )
+    assert first == replay
+    assert first["operation_id"] != different_call["operation_id"]
+    assert "secret" not in json.dumps(first)
+
+
+def test_pc_ui_mutation_fails_closed_without_runtime_tool_call_identity(monkeypatch):
+    called = False
+
+    def session():
+        nonlocal called
+        called = True
+        return _Client()
+
+    monkeypatch.setattr(module.requests, "Session", session)
+    result = json.loads(module.pc_ui_tool(
+        {"action": "focus", "pid": 42, "window_id": 7},
+        task_id="turn-1",
+    ))
+    assert result["code"] == "pc_task_identity_missing"
+    assert called is False
+
+
+def test_pc_ui_completes_only_the_runtime_task_without_a_mutation_receipt(monkeypatch):
+    _configure(monkeypatch)
+
+    class _CompleteClient(_Client):
+        def post(self, url, **kwargs):
+            body = kwargs["json"]
+            assert body == {
+                "session_id": "zettlab:alice:agent-a:chat-1",
+                "action": "ui.task-complete",
+                "params": {},
+                "task_control": {"task_id": module._wire_task_id("turn-1")},
+            }
+            return _Response()
+
+    monkeypatch.setattr(module.requests, "Session", _CompleteClient)
+    result = json.loads(module.pc_ui_tool(
+        {"action": "complete_task"},
+        task_id="turn-1",
+        tool_call_id="call-complete",
+    ))
+    assert result["success"] is True
+
+
 def test_pc_ui_launches_an_exact_app_without_accepting_urls(monkeypatch):
     _configure(monkeypatch)
     monkeypatch.setattr(module.requests, "Session", _LaunchClient)

@@ -61,6 +61,7 @@ def test_ssh_control_forwards_unrestricted_command_through_trusted_loopback(monk
     assert captured["json"]["command"] == "cd / && find . -type f | sort > /tmp/all-files"
     assert captured["headers"]["X-Zettlab-Agent-Action-Token"] == "action-token"
     assert captured["headers"]["X-Zettlab-Hardware-Execution-Token"] == "execution-token"
+    assert "X-Zettlab-Business-Execution-Token" not in captured["headers"]
     assert captured["timeout"] == 125
 
 

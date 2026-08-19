@@ -65,11 +65,15 @@ def _write_runtime(tmp_path: Path, *, control: bool) -> Path:
 def _bind_receipt():
     secret_token = set_secret_scope({"ZET_AGENT_ID": "agent-1", "ZETTLAB_AGENT_ACTION_TOKEN": ACTION_TOKEN})
     session_tokens = set_session_vars(session_key="zettlab:owner-1:agent-1:stable", session_id="session-1")
-    turn_tokens = set_turn_vars(turn_id="turn-1", hardware_execution_token=HARDWARE_TOKEN)
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1",
+        hardware_execution_token=HARDWARE_TOKEN,
+    )
     turn_identity = response_mode._current_skill_direct_turn_identity()
     assert turn_identity is not None
     receipt = response_mode._capture_trusted_execution_receipt(
-        turn_identity, hardware_skill=True
+        turn_identity,
+        "skills/printer3d-control/SKILL.md",
     )
     assert receipt is not None
     receipt_token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)

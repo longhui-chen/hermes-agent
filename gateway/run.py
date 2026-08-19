@@ -2097,7 +2097,8 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     if not getattr(cfg, "multiplex_profiles", False):
         return cfg
     try:
-        home = get_hermes_home()
+        from hermes_cli.profiles import get_profile_dir
+        home = get_profile_dir(_multiplex_active_profile_name() or "default")
     except Exception:
         return cfg
     try:
@@ -2491,6 +2492,7 @@ from gateway.platforms.base import (
     FeishuQuoteLease,
     MessageEvent,
     MessageType,
+    PENDING_EVENT_QUEUE_MAX,
     _prefix_within_utf16_limit,
     _consume_feishu_quote,
     _flat_feishu_metadata,
@@ -2498,6 +2500,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    pending_message_event_depth,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -2790,6 +2793,11 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
+def _normalize_media_type(value: Any) -> str:
+    """把调用方提供的 MIME 规范成所有媒体消费者共用的 token。"""
+    return str(value or "").split(";", 1)[0].strip().lower()
+
+
 def _event_media_type_at(event, index: int) -> str:
     """Return the per-attachment MIME for the attachment at *index*.
 
@@ -2797,7 +2805,12 @@ def _event_media_type_at(event, index: int) -> str:
     that slot (some adapters only set a message-level type).
     """
     media_types = getattr(event, "media_types", None) or []
-    return media_types[index] if index < len(media_types) else ""
+    if index >= len(media_types):
+        return ""
+    # MIME tokens are case-insensitive and may carry parameters. Normalize
+    # once at the shared consumer so Matrix/Teams/LINE and every future
+    # adapter reach the same image/audio/video gates.
+    return _normalize_media_type(media_types[index])
 
 
 def _event_media_is_image(event, index: int) -> bool:
@@ -2828,10 +2841,17 @@ def _event_media_is_stt_input(event, index: int) -> bool:
     message_type = getattr(event, "message_type", None)
     if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
         return False
-    return (
-        message_type == MessageType.VOICE
-        or _event_media_type_at(event, index).startswith("audio/")
-    )
+    if message_type == MessageType.VOICE:
+        return True
+    # 只有录音容器进入自动 STT；MP3/M4A/WAV 等普通音频附件交给 agent，
+    # 避免 PHOTO+MP3 被当语音转录。未知 adapter 仍可用 VOICE 明确标记。
+    return _event_media_type_at(event, index) in {
+        "audio/amr",
+        "audio/ogg",
+        "audio/opus",
+        "audio/silk",
+        "audio/x-opus+ogg",
+    }
 
 
 def _event_media_is_video(event, index: int) -> bool:
@@ -3460,7 +3480,17 @@ def _load_gateway_runtime_config() -> dict:
         return {}
     from hermes_cli.config import _expand_env_vars
 
-    expanded = _expand_env_vars(cfg)
+    # Process-level reads happen before an inbound turn installs a profile
+    # secret scope. In multiplex mode, resolve the config inside the active
+    # profile scope so harmless refs (for example ZETTLAB_PRESETS_DIR) do not
+    # make GatewayRunner crash while preserving fail-closed secret handling.
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        active = _multiplex_active_profile_name() or "default"
+        with _profile_runtime_scope(get_profile_dir(active)):
+            expanded = _expand_env_vars(cfg)
+    except Exception:
+        expanded = _expand_env_vars(cfg)
     return expanded if isinstance(expanded, dict) else {}
 
 
@@ -8553,6 +8583,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if pending_event is None:
             return next_queued
         if adapter is not None and hasattr(adapter, "_pending_messages"):
+            staged = adapter._pending_messages.get(session_key)
+            if staged is not None:
+                # pop_pending_message_event 可能刚把跨 sender FIFO 的下一条
+                # 放回 slot；先排 /queue 的旧 overflow，再把该条放回 overflow，
+                # ⛔ 不能用 next_queued 覆盖后静默丢失。
+                overflow.insert(0, staged)
             adapter._pending_messages[session_key] = next_queued
         else:
             # No adapter — push back so we don't silently drop the item.
@@ -8563,8 +8599,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
         depth = len(_q_state.conversation.queued_events) if _q_state else 0
-        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
-            depth += 1
+        if adapter is not None:
+            pending = getattr(adapter, "_pending_messages", {}).get(session_key)
+            depth += pending_message_event_depth(pending)
         return depth
 
     @staticmethod
@@ -9487,7 +9524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # could grow the overflow list unboundedly.  32 turns of queued
     # follow-ups is far beyond any realistic conversational backlog while
     # still small enough to never threaten memory.
-    _BUSY_QUEUE_MAX_PENDING = 32
+    _BUSY_QUEUE_MAX_PENDING = PENDING_EVENT_QUEUE_MAX
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
@@ -13994,7 +14031,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # without flushing causes permanent data loss.
             try:
                 from gateway.shutdown_flush import flush_pending_to_file
-                flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+                flush_pending_to_file(
+                    dict(self._pending_messages),
+                    reason="shutdown",
+                    session_store=getattr(self, "session_store", None),
+                )
             except Exception:
                 pass
             # On the real runner these are live SessionState views whose
@@ -17126,7 +17167,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             image_paths = []
             audio_paths = []
             for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                mtype = _event_media_type_at(event, i)
                 # Classify images per-attachment: trust this attachment's own
                 # MIME, and only honour the message-level PHOTO type when the
                 # per-attachment MIME is unknown. Otherwise a document (or any
@@ -17136,11 +17177,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     image_paths.append(path)
                 # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
                 # MessageType.VOICE = voice message (Opus/OGG) — always STT
-                if event.message_type == MessageType.AUDIO:
+                if (
+                    _event_media_is_audio(event, i)
+                    and not _event_media_is_stt_input(event, i)
+                ):
                     audio_file_paths.append(path)
                 elif not _pending_stt_prepared and _event_media_is_stt_input(event, i):
                     audio_paths.append(path)
-                if mtype.startswith("video/") or (not mtype and event.message_type == MessageType.VIDEO):
+                if _event_media_is_video(event, i):
                     video_paths.append(path)
 
             if image_paths:
@@ -17324,7 +17368,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or _event_media_is_video(event, i)
                 ):
                     continue
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                mtype = _event_media_type_at(event, i)
                 if mtype in {"", "application/octet-stream"}:
                     _ext = os.path.splitext(path)[1].lower()
                     if _ext in _TEXT_EXTENSIONS:
@@ -20703,7 +20747,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from run_agent import AIAgent
 
         media_urls = media_urls or []
-        media_types = media_types or []
+        # ``/background`` 绕过 MessageEvent 的普通消费链，必须在这个共同
+        # 入口复用同一 MIME 规则；否则 gate 能识别的合法 MIME 变体会在
+        # 真正视觉预处理处再次丢失。
+        media_types = [_normalize_media_type(value) for value in (media_types or [])]
 
         adapter = self._adapter_for_source(source)
         if not adapter:
@@ -20755,10 +20802,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enriched_prompt = prompt
             if media_urls:
                 image_paths = []
+                other_paths = []
+                other_types = []
                 for i, path in enumerate(media_urls):
                     mtype = media_types[i] if i < len(media_types) else ""
                     if mtype.startswith("image/"):
                         image_paths.append(path)
+                    else:
+                        other_paths.append(path)
+                        other_types.append(mtype)
+                if other_paths:
+                    from types import SimpleNamespace
+
+                    media_context = await _build_media_placeholder(
+                        SimpleNamespace(
+                            media_urls=other_paths,
+                            media_types=other_types,
+                            message_type=MessageType.TEXT,
+                        )
+                    )
+                    if media_context:
+                        enriched_prompt = f"{media_context}\n\n{prompt}"
                 if image_paths:
                     try:
                         self._install_turn_auxiliary_runtime(turn_route)
@@ -20766,7 +20830,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # (returns the prompt text only), so the violating image
                         # never reaches the model even without a user-facing turn.
                         enriched_prompt, _ = await self._enrich_message_with_vision(
-                            prompt, image_paths,
+                            enriched_prompt, image_paths,
                         )
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
@@ -25828,6 +25892,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
         _start = time.time()
+        from gateway.platforms.base import safe_exc, safe_url_for_log
+        _safe_proxy_url = safe_url_for_log(proxy_url)
 
         try:
             _timeout = ClientTimeout(total=0, sock_read=1800)
@@ -25839,12 +25905,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
+                        safe_error_text = safe_exc(RuntimeError(error_text))
                         logger.warning(
                             "Proxy error (%d) from %s: %s",
-                            resp.status, proxy_url, error_text[:500],
+                            resp.status, _safe_proxy_url, safe_error_text,
                         )
                         return {
-                            "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
+                            "final_response": (
+                                f"⚠️ Proxy error ({resp.status}). Check the remote "
+                                "agent logs and try again."
+                            ),
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
@@ -25901,10 +25971,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Proxy connection error to %s: %s", proxy_url, e)
+            logger.error(
+                "Proxy connection error to %s: %s",
+                _safe_proxy_url, safe_exc(e),
+            )
             if not full_response:
                 return {
-                    "final_response": f"⚠️ Proxy connection error: {e}",
+                    "final_response": "⚠️ Proxy connection error. Check the proxy URL and credentials, then try again.",
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -25938,7 +26011,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
-            proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
+            _safe_proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
         return {

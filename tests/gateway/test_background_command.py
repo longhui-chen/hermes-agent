@@ -168,6 +168,121 @@ class TestRunBackgroundTask:
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_parameterized_mixed_case_image_reaches_background_vision(self, monkeypatch):
+        """``/background`` 必须按同一 MIME 规则把真实图片交给视觉预处理。"""
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._resolve_session_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(return_value={
+            "model": "test-model", "runtime": {"api_key": "test-key"},
+            "request_overrides": None,
+        })
+        runner._install_turn_auxiliary_runtime = MagicMock()
+        runner._enrich_message_with_vision = AsyncMock(
+            return_value=("看到了背景图片", False)
+        )
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "完成", "messages": []}
+        )
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], "完成"))
+        adapter.extract_images = MagicMock(return_value=([], "完成"))
+        runner.adapters[Platform.MATRIX] = adapter
+        source = SessionSource(
+            platform=Platform.MATRIX,
+            user_id="@user:test",
+            chat_id="!room:test",
+            chat_type="dm",
+        )
+        image_path = "/cache/actual.png"
+        raw_mime = " Image/PNG; charset=binary "
+        assert raw_mime != "image/png", "夹具必须真的进入未规范化 MIME 分支"
+
+        await runner._run_background_task(
+            "分析附件",
+            source,
+            "bg_mime",
+            media_urls=[image_path],
+            media_types=[raw_mime],
+        )
+
+        runner._enrich_message_with_vision.assert_awaited_once_with(
+            "分析附件", [image_path]
+        )
+
+    @pytest.mark.asyncio
+    async def test_audio_video_and_document_reach_background_agent(
+        self, monkeypatch, tmp_path,
+    ):
+        """``/background`` 不能只转发图片后静默丢掉其余附件。"""
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._resolve_session_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(return_value={
+            "model": "test-model", "runtime": {"api_key": "test-key"},
+            "request_overrides": None,
+        })
+
+        async def run_inline(fn):
+            return fn()
+
+        runner._run_in_executor_with_context = run_inline
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], "完成"))
+        adapter.extract_images = MagicMock(return_value=([], "完成"))
+        runner.adapters[Platform.MATRIX] = adapter
+        source = SessionSource(
+            platform=Platform.MATRIX,
+            user_id="@user:test",
+            chat_id="!room:test",
+            chat_type="dm",
+        )
+        audio = tmp_path / "voice.ogg"
+        video = tmp_path / "clip.mp4"
+        document = tmp_path / "brief.pdf"
+        audio.write_bytes(b"OggS")
+        video.write_bytes(b"\x00\x00\x00 ftypmp42")
+        document.write_bytes(b"%PDF")
+
+        with patch("run_agent.AIAgent") as Agent:
+            instance = Agent.return_value
+            instance.run_conversation.return_value = {
+                "final_response": "完成", "messages": [],
+            }
+            instance.shutdown_memory_provider = MagicMock()
+            instance.close = MagicMock()
+
+            await runner._run_background_task(
+                "整理附件",
+                source,
+                "bg_non_image",
+                media_urls=[str(audio), str(video), str(document)],
+                media_types=["audio/ogg", "video/mp4", "application/pdf"],
+            )
+
+        user_message = instance.run_conversation.call_args.kwargs["user_message"]
+        assert "整理附件" in user_message
+        assert str(audio) in user_message and "audio" in user_message.lower()
+        assert str(video) in user_message and "video" in user_message.lower()
+        assert str(document) in user_message and "file" in user_message.lower()
+
+    @pytest.mark.asyncio
     async def test_media_files_routed_by_type(self, monkeypatch):
         """Result media is routed to the type-specific sender, not send_document.
 

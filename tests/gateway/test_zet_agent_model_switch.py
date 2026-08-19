@@ -1,10 +1,11 @@
 import os
+import queue
 import types
 from collections import OrderedDict
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
-import queue
 
 from gateway.config import PlatformConfig
 import gateway.platforms.zet_agent as zet_agent
@@ -282,6 +283,35 @@ async def test_run_agent_no_note_when_model_unchanged(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_silent_run_skips_model_identity_note_and_seen_state(monkeypatch):
+    adapter = _seen_adapter(
+        monkeypatch,
+        config_model="glm-5.1",
+        seen={"sess-1": "deepseek-v4"},
+    )
+    effective_model = MagicMock(side_effect=AssertionError("must not resolve"))
+    ensure_seen = MagicMock(side_effect=AssertionError("must not load seen state"))
+    save_seen = MagicMock(side_effect=AssertionError("must not persist seen state"))
+    monkeypatch.setattr(adapter, "_effective_model", effective_model)
+    monkeypatch.setattr(adapter, "_ensure_seen_models", ensure_seen)
+    monkeypatch.setattr(adapter, "_save_seen_models", save_seen)
+
+    captured = await _capture_run_agent(
+        monkeypatch,
+        adapter,
+        user_message="run the frozen task",
+        session_id="sess-1",
+        execution_policy="silent_automation",
+    )
+
+    assert captured["user_message"] == "run the frozen task"
+    assert adapter._seen_models == {"sess-1": "deepseek-v4"}
+    effective_model.assert_not_called()
+    ensure_seen.assert_not_called()
+    save_seen.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_run_agent_forwards_structured_plan_ack(monkeypatch):
     adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
     plan_ack = {
@@ -302,58 +332,7 @@ async def test_run_agent_forwards_structured_plan_ack(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_legacy_unbound_plan_ack_flow_has_no_execution_capability(
-    monkeypatch,
-):
-    from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_action, current_turn_identity
-    from tools.environments.local import build_video_edit_runtime_env
-
-    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    captured = {}
-    boundary_checks = []
-    monkeypatch.setattr(
-        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
-        lambda: boundary_checks.append(True) or True,
-    )
-
-    async def fake_super(self, **kwargs):
-        with pytest.raises(
-            PermissionError,
-            match="trusted video-edit execution receipt unavailable",
-        ):
-            build_video_edit_runtime_env({})
-        captured["runtime_rejected"] = True
-        captured["turn_identity"] = current_turn_identity()
-        captured["scoped_token"] = business_execution_action()
-        captured["forwarded_token"] = kwargs["business_execution_action"]
-        return ({}, {})
-
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-    await adapter._run_agent(
-        user_message="确认执行",
-        conversation_history=[],
-        session_id="legacy-plan-session",
-        turn_id="",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
-        plan_ack={
-            "status": "confirmed",
-            "revision_requested": False,
-        },
-    )
-
-    assert captured == {
-        "runtime_rejected": True,
-        "turn_identity": None,
-        "scoped_token": "",
-        "forwarded_token": "",
-    }
-    assert boundary_checks == [True]
-
-
-@pytest.mark.asyncio
-async def test_run_agent_direct_unbound_flow_preserves_business_capability(
+async def test_run_agent_plan_without_action_has_no_video_receipt(
     monkeypatch,
 ):
     from gateway.platforms.api_server import APIServerAdapter
@@ -374,8 +353,8 @@ async def test_run_agent_direct_unbound_flow_preserves_business_capability(
         ):
             build_video_edit_runtime_env({})
         captured["video_runtime_rejected"] = True
-        captured["scoped_token"] = business_execution_action()
-        captured["forwarded_token"] = kwargs["business_execution_action"]
+        captured["scoped_action"] = business_execution_action()
+        captured["forwarded_action"] = kwargs["business_execution_action"]
         return ({}, {})
 
     monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
@@ -384,24 +363,22 @@ async def test_run_agent_direct_unbound_flow_preserves_business_capability(
         conversation_history=[],
         session_id="direct-session",
         turn_id="",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
         plan_ack={},
     )
 
     assert captured == {
         "video_runtime_rejected": True,
-        "scoped_token": "a" * 64,
-        "forwarded_token": "a" * 64,
+        "scoped_action": "",
+        "forwarded_action": "",
     }
 
 
 @pytest.mark.asyncio
-async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
+async def test_run_agent_cancelled_plan_ack_drops_action_unit(
     monkeypatch,
 ):
     from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_action
+    from gateway.session_context import business_execution_action, execution_policy
 
     adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
     captured = {}
@@ -411,8 +388,10 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
     )
 
     async def fake_super(self, **kwargs):
-        captured["scoped_token"] = business_execution_action()
-        captured["forwarded_token"] = kwargs["business_execution_action"]
+        captured["scoped_action"] = business_execution_action()
+        captured["scoped_policy"] = execution_policy()
+        captured["forwarded_action"] = kwargs["business_execution_action"]
+        captured["execution_policy"] = kwargs["execution_policy"]
         return ({}, {})
 
     monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
@@ -423,6 +402,7 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
         turn_id="confirmation-turn-2",
         business_execution_action="a" * 64,
         business_execution_action_version="1",
+        execution_policy="silent_automation",
         plan_ack={
             "turn_id": "plan-turn-1",
             "status": "cancelled",
@@ -430,7 +410,12 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
         },
     )
 
-    assert captured == {"scoped_token": "", "forwarded_token": ""}
+    assert captured == {
+        "scoped_action": "",
+        "scoped_policy": "silent_automation",
+        "forwarded_action": "",
+        "execution_policy": "silent_automation",
+    }
 
 
 @pytest.mark.asyncio

@@ -66,6 +66,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    inbound_media_download_permit,
     log_media_intake_failure,
     safe_exc,
     safe_traceback,
@@ -621,12 +622,14 @@ async def _download_bytes(
     # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
     # "Timeout context manager should be used inside a task" errors.
     async def _do_download() -> bytes:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            # 🔴 ⛔ 不许裸 read():整个响应先进内存,落盘处的大小校验来不及生效,
-            # 1C2G 设备上单个超大入站附件即可 OOM。⭐「先读完再校验」= 没有校验。
-            return await read_aiohttp_body_with_limit(
-                response, media_type="weixin inbound media")
+        async with inbound_media_download_permit():
+            async with session.get(url) as response:
+                response.raise_for_status()
+                # 🔴 ⛔ 不许裸 read():整个响应先进内存,落盘处的大小校验来不及生效,
+                # 1C2G 设备上单个超大入站附件即可 OOM。⭐「先读完再校验」= 没有校验。
+                return await read_aiohttp_body_with_limit(
+                    response, media_type="weixin inbound media",
+                    permit_acquired=True)
     return await asyncio.wait_for(_do_download(), timeout=timeout_seconds)
 
 
@@ -2415,11 +2418,13 @@ class WeixinAdapter(BasePlatformAdapter):
         # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
         # "Timeout context manager should be used inside a task" errors.
         async def _do_fetch():
-            async with self._send_session.get(url) as response:
-                response.raise_for_status()
-                # 出站也一样:要发出去的媒体同样先落内存。⭐ 兄弟调用点。
-                return await read_aiohttp_body_with_limit(
-                    response, media_type="weixin outbound media")
+            async with inbound_media_download_permit():
+                async with self._send_session.get(url) as response:
+                    response.raise_for_status()
+                    # 出站也一样:要发出去的媒体同样先落内存。⭐ 兄弟调用点。
+                    return await read_aiohttp_body_with_limit(
+                        response, media_type="weixin outbound media",
+                        permit_acquired=True)
         data = await asyncio.wait_for(_do_fetch(), timeout=30)
         suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:

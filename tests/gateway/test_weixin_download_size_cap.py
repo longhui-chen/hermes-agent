@@ -9,6 +9,7 @@ RH 复审第六轮 P1[存量]：``_download_media_bytes`` 直接 ``await respons
 """
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 from gateway.platforms.base import (
@@ -121,6 +122,64 @@ async def test_invalid_content_length_header_does_not_break_download():
     r = _FakeResponse([b"ok"], content_length=None)
     r.headers["content-length"] = "not-a-number"
     assert await read_aiohttp_body_with_limit(r, media_type="test") == b"ok"
+
+
+@pytest.mark.asyncio
+async def test_negative_config_disables_per_file_cap_as_documented(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.platforms.base.get_inbound_media_max_bytes", lambda: -1,
+    )
+    r = _FakeResponse([b"normal attachment"], content_length=17)
+
+    assert await read_aiohttp_body_with_limit(r, media_type="test") == b"normal attachment"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_length", [11, None])
+async def test_callers_can_apply_a_smaller_platform_cap(content_length):
+    """LINE 图片 10 MiB 等平台上限必须能收紧全局默认值。"""
+    r = _FakeResponse([b"x" * 11], content_length=content_length)
+    with pytest.raises(ValueError, match="11 bytes > 10 bytes"):
+        await read_aiohttp_body_with_limit(
+            r, media_type="platform image", max_bytes=10,
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_media_reads_have_a_global_hard_limit():
+    active = 0
+    peak = 0
+    four_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Content:
+        async def iter_chunked(self, _size):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if active >= 4:
+                four_entered.set()
+            try:
+                await release.wait()
+                yield b"ok"
+            finally:
+                active -= 1
+
+    responses = [_FakeResponse([], content_length=2) for _ in range(5)]
+    for response in responses:
+        response.content = Content()
+    tasks = [
+        asyncio.create_task(
+            read_aiohttp_body_with_limit(response, media_type="concurrent")
+        )
+        for response in responses
+    ]
+    await asyncio.wait_for(four_entered.wait(), timeout=1)
+    await asyncio.sleep(0.02)
+
+    assert peak == 4, "第 5 个大附件必须等待，不能和前四个同时占读体内存"
+    release.set()
+    assert await asyncio.gather(*tasks) == [b"ok"] * 5
 
 
 def test_weixin_has_no_bare_read_on_media_paths():

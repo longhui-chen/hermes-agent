@@ -224,7 +224,7 @@ async def test_zet_boundary_failure_is_not_a_fatal_adapter_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_boundary_failure_does_not_read_or_parse_token_flow(monkeypatch):
+async def test_boundary_failure_does_not_read_or_parse_action_flow(monkeypatch):
     import gateway.platforms.zet_agent as zet_agent
 
     monkeypatch.setattr(
