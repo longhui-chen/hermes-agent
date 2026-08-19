@@ -526,6 +526,63 @@ def test_accepted_action_survives_a_concurrent_replay_deny():
     )
 
 
+# 同一个 turn_id 可能有多个在途请求。先完成的那个不能把还在等模型返回工具调用
+# 的那个的闸门一起撤掉——否则后者会因为「键不存在」被当成不受管控的普通轮次，
+# 创建照样放行，同一次点击仍然建出两个资源。
+def test_creation_gate_survives_until_every_in_flight_request_finishes():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "inflight-refs", creation_type="skill")
+
+    # 两个并发请求都进入配额管控：先到的接管、后到的判无效重放。
+    plugin._on_pre_llm_call(
+        session_id="inflight-refs",
+        sender_id="owner-a",
+        turn_id="shared-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+    replay = plugin._on_pre_llm_call(
+        session_id="inflight-refs",
+        sender_id="owner-a",
+        turn_id="shared-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+    assert "invalid or expired" in replay["context"]
+
+    # 先到那个请求把它买到的那张票用掉。
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"action": "create"},
+            turn_id="shared-turn",
+        )
+        is None
+    )
+
+    # 它随后收尾——同 turn 还有一个在途请求，闸门不能就此撤掉。
+    plugin._transform_llm_output(
+        session_id="inflight-refs",
+        sender_id="owner-a",
+        turn_id="shared-turn",
+        response_text="已经交给我处理了。",
+        completed=True,
+    )
+
+    # 在途的那个重放请求现在才调创建：票已经用完，必须被挡。闸门被提前撤掉的话
+    # 这里会因为「键不存在」被当成不受管控的普通轮次而放行。
+    blocked = plugin._on_pre_tool_call(
+        tool_name="skill_manage",
+        args={"action": "create"},
+        turn_id="shared-turn",
+    )
+    assert blocked is not None and blocked["action"] == "block", (
+        "先完成的请求把还在途的那个的闸门一起撤了"
+    )
+
+
 # 同一个 turn_id 上的回执是**单调**的：接管过就接管过了。双击 / 传输重发会让两个
 # 请求复用同一个 turn_id，先到的拿 accepted、后到的必然判无效；后者把前者盖掉之后，
 # 先结束的那个请求会取走 rejected，客户端把一次已经接管的创建显示成失败，用户重来

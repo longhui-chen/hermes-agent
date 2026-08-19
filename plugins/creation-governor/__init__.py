@@ -710,21 +710,30 @@ MAX_DENIED_CREATION_TURNS = 256
 # 键存在 = 这个 turn 上出现过推荐动作、进入配额管控；键不存在 = 普通轮次，
 # 用户直接说「帮我建个 skill」不受影响。
 _creation_turn_quota: "OrderedDict[str, dict[str, int]]" = OrderedDict()
+# 同一个 turn_id 上还有几个在途请求。见 _enter_creation_quota_for_turn 的说明。
+_creation_turn_refs: "OrderedDict[str, int]" = OrderedDict()
 
 
 def _trim_creation_turn_quota_locked() -> None:
     while len(_creation_turn_quota) > MAX_DENIED_CREATION_TURNS:
-        _creation_turn_quota.popitem(last=False)
+        evicted, _ = _creation_turn_quota.popitem(last=False)
+        _creation_turn_refs.pop(evicted, None)
 
 
 def _enter_creation_quota_for_turn(turn_id: str) -> None:
-    """这一轮出现了推荐动作：从此刻起创建工具受配额管控。"""
+    """这一轮出现了推荐动作：从此刻起创建工具受配额管控。
+
+    同一个 turn_id 可能有多个在途请求（双击 / 传输重发），所以记引用计数——
+    先完成的那个请求不能把还在等模型返回工具调用的那个的闸门一起撤掉，
+    否则后者会因为「键不存在」被当成不受管控的普通轮次，创建照样放行。
+    """
     key = _pending_turn_key(turn_id)
     if not key:
         return
     with _state_lock:
         _creation_turn_quota.setdefault(key, {})
         _creation_turn_quota.move_to_end(key)
+        _creation_turn_refs[key] = _creation_turn_refs.get(key, 0) + 1
         _trim_creation_turn_quota_locked()
 
 
@@ -749,10 +758,20 @@ def _grant_creation_for_turn(turn_id: str, creation_type: str) -> None:
 
 
 def _release_creation_deny(turn_id: str) -> None:
+    """一个请求收尾。同 turn 还有在途请求时不撤闸门，等最后一个再撤。"""
     key = _pending_turn_key(turn_id)
     if not key:
         return
     with _state_lock:
+        remaining = _creation_turn_refs.get(key)
+        if remaining is None:
+            # 从没进过配额管控的普通轮次，或者已经被容量淘汰了。
+            _creation_turn_quota.pop(key, None)
+            return
+        if remaining > 1:
+            _creation_turn_refs[key] = remaining - 1
+            return
+        _creation_turn_refs.pop(key, None)
         _creation_turn_quota.pop(key, None)
 
 
@@ -2684,6 +2703,10 @@ def _reset_state_for_tests() -> None:
         _muted_sessions.clear()
         _known_unmuted_sessions.clear()
         _emitted_connection_proposals.clear()
+        # 这两个是进程级的，不清会在测试之间泄漏（同 turn_id 复用时表现成
+        # 「闸门莫名已经在了」）。
+        _creation_turn_quota.clear()
+        _creation_turn_refs.clear()
     _plugin_llm = None
     _plugin_ctx = None
     _invocation_scope.set(None)
