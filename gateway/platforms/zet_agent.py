@@ -3869,6 +3869,7 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
+        creation_action_receipt_transport: str = "",
         hardware_execution_token: Optional[str] = None,
         business_execution_action: Optional[str] = None,
         business_execution_action_version: Optional[str] = None,
@@ -4137,6 +4138,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
+                creation_action_receipt_transport=creation_action_receipt_transport,
                 hardware_execution_token=scoped_hardware_execution_token,
                 business_execution_action=scoped_business_execution_action,
                 business_execution_action_version=(

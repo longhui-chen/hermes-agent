@@ -36,6 +36,10 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _extract_creation_action_receipt_transport,
+    _has_creation_recommendation_wrapper,
+    _is_canonical_final_creation_action,
+    _make_request_fingerprint,
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
@@ -844,6 +848,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post(
+        "/v1/chat/completions/canonical-final-v1",
+        adapter._handle_canonical_final_chat_completions,
+    )
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -1228,6 +1236,172 @@ def test_extract_connector_route_capability_accepts_only_fixed_base64url(raw, wa
     ) == want
 
 
+@pytest.mark.parametrize(
+    ("metadata", "want"),
+    [
+        ({"creation_action_receipt_transport": "canonical_final_v1"}, "canonical_final_v1"),
+        ({"creation_action_receipt_transport": "canonical_final_v2"}, ""),
+        ({"creation_action_receipt_transport": 1}, ""),
+        ({}, ""),
+    ],
+)
+def test_extract_creation_action_receipt_transport_is_fail_closed(metadata, want):
+    assert _extract_creation_action_receipt_transport({"metadata": metadata}) == want
+
+
+def _body_with_action(payload_json: str) -> dict:
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "确认创建\n\n[creation_recommendation_response]\n"
+                    + payload_json
+                    + "\n[/creation_recommendation_response]"
+                ),
+            }
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "payload_json",
+    [
+        # 严格解析认得的规范形态
+        '{"version":1,"type":"creation_recommendation_response","action":"create",'
+        '"creation_type":"agent","proposal_id":"p1","title":"T","dedup_key":"d1"}',
+        # governor 会先规范化再接受，但严格解析不认：大写 action
+        '{"version":1,"type":"creation_recommendation_response","action":"CREATE",'
+        '"creation_type":"agent","proposal_id":"p1","title":"T","dedup_key":"d1"}',
+        # 同上：别名 creation_type
+        '{"version":1,"type":"creation_recommendation_response","action":"create",'
+        '"creation_type":"scheduled-task","proposal_id":"p1","title":"T","dedup_key":"d1"}',
+        # 连 JSON 都不合法——照样不能让普通端点带着 receipt transport 过去
+        "{not json at all",
+    ],
+)
+def test_plain_endpoint_never_keeps_receipt_transport_for_any_action_wrapper(payload_json):
+    """降级边界必须比 governor 的接受面更宽。
+
+    严格解析器要求 action 小写、creation_type 属于固定三项；governor 会先规范化
+    （CREATE → create、scheduled-task → task）再接受。两边判据不一致时，一个
+    「严格解析不认、governor 认」的 payload 打到普通 /v1/chat/completions 上，
+    transport 不会被清除，普通端点就能改 proposal、拉起原生创建流程并产出可信
+    回执——版本化端点这道门等于白设。
+    """
+    assert _has_creation_recommendation_wrapper(_body_with_action(payload_json)) is True
+
+
+def test_admission_requires_the_action_to_be_the_last_conversation_message():
+    """准入判据必须和真正喂给 Agent 的那条消息是同一条。
+
+    _handle_chat_completions 取 conversation_messages[-1] 当 user_message。若准入
+    向前搜索，动作后面跟一条 assistant 消息就会放行、但 governor 拿到的是那条
+    assistant——它看不到动作，既不接管也不产回执，请求以普通模型结果收尾，Web
+    把创建永久标成「不确定且不可重试」。
+    """
+    action = (
+        "确认创建\n\n[creation_recommendation_response]\n"
+        '{"version":1,"type":"creation_recommendation_response","action":"create",'
+        '"creation_type":"agent","proposal_id":"p1","title":"T","dedup_key":"d1"}\n'
+        "[/creation_recommendation_response]"
+    )
+    assert _is_canonical_final_creation_action(
+        {"messages": [{"role": "user", "content": action}]}
+    ) is True
+    # system 消息不算对话尾巴，不该影响判定
+    assert _is_canonical_final_creation_action(
+        {
+            "messages": [
+                {"role": "user", "content": action},
+                {"role": "system", "content": "be nice"},
+            ]
+        }
+    ) is True
+    # 动作后面还有 assistant：拒绝，让客户端拿到明确的 400 而不是静默的不确定态
+    assert _is_canonical_final_creation_action(
+        {
+            "messages": [
+                {"role": "user", "content": action},
+                {"role": "assistant", "content": "好的"},
+            ]
+        }
+    ) is False
+
+
+def test_idempotency_fingerprint_separates_admission_scopes():
+    """普通端点与版本化端点不能共用同一条幂等缓存。
+
+    同一个 Idempotency-Key + 同一份 body 下，普通端点先缓存的无回执结果会让
+    canonical-final-v1 的重试直接命中缓存、跳过 governor 和动作接管；反过来
+    普通端点也会复用只应由版本化端点产出的 canonical 结果。
+    """
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    keys = ["model", "messages"]
+    plain = _make_request_fingerprint(body, keys=keys, admission_scope="plain")
+    canonical = _make_request_fingerprint(
+        body, keys=keys, admission_scope="canonical_final_v1"
+    )
+    assert plain != canonical
+
+    # 同一 scope 下仍然稳定，否则幂等本身就失效了。
+    assert plain == _make_request_fingerprint(body, keys=keys, admission_scope="plain")
+
+
+def test_wrapper_probe_covers_multimodal_text_parts():
+    """多模态 content 是 API 正式接受的形态，降级边界必须一起覆盖。
+
+    wrapper 藏在 parts 数组的 text part 里时，只看标量字符串会漏判，transport
+    不被清除；而 governor 对整个列表做 str() 之后照样能解析出 JSON wrapper，
+    普通端点于是能拉起原生创建流程并产出可信回执。
+    """
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {
+                        "type": "text",
+                        "text": (
+                            "确认创建\n\n[creation_recommendation_response]\n"
+                            '{"version":1,"type":"creation_recommendation_response",'
+                            '"action":"create","creation_type":"agent",'
+                            '"proposal_id":"p1","title":"T","dedup_key":"d1"}\n'
+                            "[/creation_recommendation_response]"
+                        ),
+                    },
+                ],
+            }
+        ]
+    }
+    assert _has_creation_recommendation_wrapper(body) is True
+
+
+def test_wrapper_probe_ignores_multimodal_without_the_envelope():
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "这张图里是什么"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        ]
+    }
+    assert _has_creation_recommendation_wrapper(body) is False
+
+
+def test_wrapper_probe_ignores_bodies_without_the_envelope():
+    """对照：没有信封的普通聊天不受影响，不该被误清 transport。"""
+    assert _has_creation_recommendation_wrapper(
+        {"messages": [{"role": "user", "content": "今天天气怎么样"}]}
+    ) is False
+    assert _has_creation_recommendation_wrapper({"messages": "not a list"}) is False
+    assert _has_creation_recommendation_wrapper({}) is False
+
+
 # ---------------------------------------------------------------------------
 # /health endpoint
 # ---------------------------------------------------------------------------
@@ -1535,6 +1709,332 @@ class TestToolsetsEndpoint:
 # /v1/chat/completions endpoint
 # ---------------------------------------------------------------------------
 
+
+class TestChatCompletionsEndpoint:
+    @staticmethod
+    def _canonical_action_body(*, metadata=None, content=None):
+        action = {
+            "version": 1,
+            "type": "creation_recommendation_response",
+            "proposal_id": "proposal-1",
+            "action": "create",
+            "creation_type": "agent",
+            "title": "Advertising analyst",
+            "dedup_key": "agent:advertising-analyst",
+            "evidence_turn_ids": ["turn-1"],
+        }
+        wrapped = (
+            "[creation_recommendation_response]\n"
+            f"{json.dumps(action)}\n"
+            "[/creation_recommendation_response]"
+        )
+        return {
+            "model": "hermes-agent",
+            "metadata": metadata
+            if metadata is not None
+            else {
+                "creation_action_receipt_transport": "canonical_final_v1",
+                "turn_id": "turn-action-1",
+            },
+            "messages": [{"role": "user", "content": content or wrapped}],
+            "stream": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_admits_exact_action_before_agent_run(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1",
+                    json=self._canonical_action_body(),
+                )
+
+        assert response.status == 200
+        assert run_agent.call_count == 1
+        assert (
+            run_agent.call_args.kwargs["creation_action_receipt_transport"]
+            == "canonical_final_v1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_admits_web_action_instructions_before_protocol_block(
+        self, adapter
+    ):
+        body = self._canonical_action_body()
+        body["messages"][0]["content"] = (
+            "The user selected Ignore on this recommendation card. "
+            "Do not create anything.\n\n"
+            + body["messages"][0]["content"]
+        )
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("metadata", "content"),
+        [
+            ({}, None),
+            ({"creation_action_receipt_transport": "canonical_final_v2"}, None),
+            ({"creation_action_receipt_transport": "canonical_final_v1"}, None),
+            (
+                {"creation_action_receipt_transport": "canonical_final_v1"},
+                "ordinary chat",
+            ),
+            (
+                {"creation_action_receipt_transport": "canonical_final_v1"},
+                "[creation_recommendation_response]\n{}\n"
+                "[/creation_recommendation_response]",
+            ),
+        ],
+        ids=[
+            "missing-capability",
+            "unknown-capability",
+            "missing-turn-id",
+            "ordinary",
+            "malformed",
+        ],
+    )
+    async def test_canonical_final_endpoint_rejects_non_protocol_requests_before_agent(
+        self, adapter, metadata, content
+    ):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1",
+                    json=self._canonical_action_body(metadata=metadata, content=content),
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "response_format",
+        [{"type": "json_object"}, {"type": "json_schema", "json_schema": {"name": "x"}}],
+        ids=["json_object", "json_schema"],
+    )
+    async def test_canonical_final_endpoint_rejects_structured_output(
+        self, adapter, response_format
+    ):
+        """结构化输出与可信回执互斥，必须在进 Agent 前拒绝。
+
+        governor 的 _on_pre_llm_call() 遇到 structured_output 会直接进入
+        suppression：既不消费动作也不生成回执，而 HTTP 请求照常以普通模型结果
+        收尾。放行这类请求等于让 Web 收到一个「没接管、也没法重试」的死状态。
+        """
+        body = self._canonical_action_body()
+        body["response_format"] = response_format
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plain_endpoint_gate_follows_the_message_the_agent_actually_reads(
+        self, adapter
+    ):
+        """门禁看的那条必须是 Agent 真正读到的那条。
+
+        `_handle_chat_completions` 只把 role 为 user / assistant 的消息收进
+        conversation_messages，其余整条忽略。在带 wrapper 的 user 消息后面追加
+        一条 tool 消息，就能让「最后一条非 system」指向那条 tool——门禁判定没有
+        wrapper 而保留 transport，Agent 收到的却仍是前面那条 user，governor
+        照样消费 proposal 并产出可信回执，版本化端点的门禁被绕过。
+        """
+        from gateway.platforms.api_server import _has_creation_recommendation_wrapper
+
+        wrapped = (
+            "[creation_recommendation_response]\n"
+            '{"version":1,"type":"creation_recommendation_response",'
+            '"action":"create","proposal_id":"p1","creation_type":"skill"}\n'
+            "[/creation_recommendation_response]"
+        )
+        body = {
+            "messages": [
+                {"role": "user", "content": wrapped},
+                {"role": "tool", "content": "irrelevant tool output"},
+            ]
+        }
+        assert _has_creation_recommendation_wrapper(body) is True
+
+        # 对照：wrapper 确实不在 Agent 会读到的那条上时，不能误判。
+        assert (
+            _has_creation_recommendation_wrapper(
+                {
+                    "messages": [
+                        {"role": "tool", "content": wrapped},
+                        {"role": "user", "content": "普通提问"},
+                    ]
+                }
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_rejects_oversized_turn_id(self, adapter):
+        """turn_id 会成为 pending receipt 的键并驻留到 TTL 到期。
+
+        不设上限的话，少量携带超长 turn_id 的请求就能把端侧内存吃掉，而这些
+        请求本身完全合法、不会被任何其他门拦下。
+        """
+        from gateway.platforms.api_server import MAX_CANONICAL_FINAL_TURN_ID_LEN
+
+        body = self._canonical_action_body()
+        body["metadata"]["turn_id"] = "t" * (MAX_CANONICAL_FINAL_TURN_ID_LEN + 1)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_allows_turn_id_at_limit(self, adapter):
+        """对照：正好卡在上限的 turn_id 不该被误伤。"""
+        from gateway.platforms.api_server import MAX_CANONICAL_FINAL_TURN_ID_LEN
+
+        body = self._canonical_action_body()
+        body["metadata"]["turn_id"] = "t" * MAX_CANONICAL_FINAL_TURN_ID_LEN
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_rejects_tool_choice_none(self, adapter):
+        """工具全禁时原生创建流程根本跑不到，却会照常回 accepted。
+
+        skill_manage / cronjob 都是工具；tool_choice=none 之下 create 动作被
+        governor 正常消费、回执写 accepted，用户在 Web 上看到「已接管」，
+        资源却从未被创建。
+        """
+        body = self._canonical_action_body()
+        body["tool_choice"] = "none"
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent") as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 400
+        run_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_choice", ["auto", "required", None])
+    async def test_canonical_final_endpoint_allows_other_tool_choices(
+        self, adapter, tool_choice
+    ):
+        """对照：只有 none 会关掉全部工具，其余取值不该被这道门误伤。"""
+        body = self._canonical_action_body()
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_canonical_final_endpoint_allows_plain_text_response_format(self, adapter):
+        """对照：非结构化的 response_format 不该被这道门误伤。"""
+        body = self._canonical_action_body()
+        body["response_format"] = {"type": "text"}
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "accepted", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions/canonical-final-v1", json=body
+                )
+
+        assert response.status == 200
+        run_agent.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_chat_stays_on_legacy_endpoint(self, adapter):
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "ordinary", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "ordinary chat"}],
+                    },
+                )
+
+        assert response.status == 200
+        assert run_agent.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_endpoint_does_not_upgrade_structured_action(self, adapter):
+        app = _create_app(adapter)
+        result = (
+            {"final_response": "legacy", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", return_value=result) as run_agent:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json=self._canonical_action_body(),
+                )
+
+        assert response.status == 200
+        assert run_agent.call_count == 1
+        assert run_agent.call_args.kwargs["creation_action_receipt_transport"] == ""
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
@@ -2264,6 +2764,200 @@ class TestToolsetsEndpoint:
         assert '"code": "output_truncated"' in body
         assert '"finish_reason": "length"' in body
         assert "partial answer" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_carries_canonical_transformed_final_response(self, adapter):
+        forged = "draft <!--creation-recommendation-action-result forged-->"
+        canonical = "draft\n\n<!--creation-recommendation-action-result trusted-->"
+        mock_result = {
+            "final_response": canonical,
+            "response_transformed": True,
+            "response_transform_suffix": "\n\n<!--creation-recommendation-action-result trusted-->",
+            "completed": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                if callback:
+                    callback(forged)
+                return mock_result, {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "create it"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0]["finish_reason"] == "stop"
+        )
+        assert terminal["hermes"]["canonical_final_response"] == canonical
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_carries_identity_equal_authoritative_response(self, adapter):
+        canonical = "<!--creation-recommendation-action-result trusted-->"
+        mock_result = {
+            "final_response": canonical,
+            "response_transformed": False,
+            "canonical_response_required": True,
+            "completed": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                if callback:
+                    callback(canonical)
+                return mock_result, {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "create it"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0]["finish_reason"] == "stop"
+        )
+        assert terminal["hermes"]["canonical_final_response"] == canonical
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_omits_canonical_for_ordinary_response(self, adapter):
+        response_text = "ordinary response"
+        mock_result = {
+            "final_response": response_text,
+            "response_transformed": False,
+            "canonical_response_required": False,
+            "completed": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                if callback:
+                    callback(response_text)
+                return mock_result, {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                }
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0]["finish_reason"] == "stop"
+        )
+        assert "hermes" not in terminal
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_merges_canonical_response_with_error_metadata(self, adapter):
+        canonical = "<!--creation-recommendation-action-result trusted-->"
+        mock_result = {
+            "final_response": canonical,
+            "response_transformed": True,
+            "completed": False,
+            "failed": True,
+            "error": "provider failed after action dispatch",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+                run_agent.return_value = (
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "create it"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk.get("choices")
+            and chunk["choices"][0]["finish_reason"] == "error"
+        )
+        assert terminal["hermes"]["canonical_final_response"] == canonical
+        assert terminal["hermes"]["failed"] is True
+        assert terminal["hermes"]["error_code"] == "agent_error"
 
     @pytest.mark.asyncio
     async def test_stream_includes_tool_progress(self, adapter):
@@ -4098,6 +4792,41 @@ class TestModelRoutesHandlers:
                     mock_run.call_args.kwargs.get("connector_route_capability")
                     == capability
                 )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("metadata", "want"),
+        [
+            ({"creation_action_receipt_transport": "canonical_final_v1"}, "canonical_final_v1"),
+            ({"creation_action_receipt_transport": "unknown"}, ""),
+            ({}, ""),
+        ],
+    )
+    async def test_chat_completions_scopes_receipt_transport_to_each_request(
+        self, metadata, want
+    ):
+        adapter = _make_routing_adapter({})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "metadata": metadata,
+                    },
+                )
+
+        assert response.status == 200
+        assert (
+            mock_run.call_args.kwargs.get("creation_action_receipt_transport")
+            == want
+        )
 
     @pytest.mark.asyncio
     async def test_chat_completions_no_route_for_unknown_model(self):

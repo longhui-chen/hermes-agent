@@ -548,6 +548,12 @@ def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
     return False
 
 
+# MAX_CANONICAL_FINAL_TURN_ID_LEN 限住会被 governor 当作 pending receipt 键、
+# 并驻留到 TTL 到期的那个 turn_id。正常值是 local-server 的 UUID 类关联令牌，
+# 200 已经很宽松；不设上限则少量请求就能长期占住设备内存。
+MAX_CANONICAL_FINAL_TURN_ID_LEN = 200
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -582,6 +588,134 @@ def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
     if re.fullmatch(r"[A-Za-z0-9_-]{43}", capability) is None:
         return ""
     return capability
+
+
+def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("creation_action_receipt_transport")
+    if raw == "canonical_final_v1":
+        return "canonical_final_v1"
+    return ""
+
+
+# 与 _handle_chat_completions 收进 conversation_messages 的那组 role 保持同源。
+# 两处不一致就会出现「门禁看的那条」和「Agent 收到的那条」不是同一条。
+_AGENT_INPUT_MESSAGE_ROLES = frozenset({"user", "assistant"})
+
+
+def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
+    """正文里是否出现了创建建议动作信封——不看内容是否合法。
+
+    降级边界要用这个宽判据，不能复用下面那个严格解析器：严格解析要求 action
+    小写、creation_type 属于固定三项，而 creation-governor 会先做规范化
+    （`CREATE` → `create`、`scheduled-task` → `task` 之类）再接受动作。两边判据
+    不一致时，一个「严格解析不认、governor 认」的 payload 打到普通端点上，
+    transport 不会被清除，于是普通端点也能改 proposal、拉起原生创建流程并产出
+    可信回执——版本化端点这道门就白设了。
+
+    判据放宽到「有没有这个 wrapper」之后，governor 将来新增多少种规范化写法都
+    不会开出新口子：可信回执只可能从版本化 handler 显式放行的请求里出来。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    # 看的是**实际送进 Agent 的那条消息**，不按 role 过滤也不向前搜索：
+    # _handle_chat_completions 无条件取 conversation_messages[-1] 当 user_message，
+    # governor 解析的就是它。若这里只看最后一条 user 消息，一个「末条是 assistant
+    # 且正文带 wrapper」的普通请求就会漏判——transport 不被清除，governor 照样
+    # 解析那个 wrapper、消费 proposal 并产出可信回执，版本化端点的门禁被绕过。
+    # 判据必须跟 _handle_chat_completions 真正喂给 Agent 的那条消息是同一条：
+    # 它只把 role 为 user / assistant 的收进 conversation_messages，其余（tool、
+    # 以及任何将来新增的 role）整条忽略。这里若按「最后一条非 system」来选，
+    # 在正文带 wrapper 的 user 消息后面追加一条 tool 消息就能骗过门禁——门禁看
+    # 到的是那条 tool、判定没有 wrapper 而保留 transport，而 Agent 实际收到的
+    # 仍是前面那条 user，governor 照样消费 proposal 并产出可信回执。
+    last_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict)
+            and message.get("role") in _AGENT_INPUT_MESSAGE_ROLES
+        ),
+        None,
+    )
+    last_content = last_message.get("content") if isinstance(last_message, dict) else None
+    # 多模态 content 是 API 正式接受的形态：wrapper 藏在 parts 数组的某个 text
+    # part 里时，只看标量字符串就会漏判。_normalize_multimodal_content() 会保留
+    # 这些文本 part，governor 对整个列表做 str() 之后照样能解析出 JSON wrapper。
+    for _text in _iter_message_text_parts(last_content):
+        if "[creation_recommendation_response]" in _text:
+            return True
+    return False
+
+
+def _iter_message_text_parts(content: Any):
+    """Yield every text fragment a message content field can carry."""
+    if isinstance(content, str):
+        yield content
+        return
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if isinstance(part, str):
+            yield part
+        elif isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                yield text
+
+
+def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    # 必须是**最后一条**对话消息本身携带动作，不能向前搜索：
+    # _handle_chat_completions 取 conversation_messages[-1] 当 user_message，
+    # 如果动作后面还跟着一条 assistant 消息，向前搜索会放行准入，但 governor
+    # 拿到的是那条 assistant——它看不到动作，既不接管也不产回执，请求却以普通
+    # 模型结果收尾，Web 因此把创建永久标成「不确定且不可重试」。准入判据必须
+    # 和后续真正喂给 Agent 的那条消息是同一条。
+    last_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") != "system"
+        ),
+        None,
+    )
+    if not isinstance(last_message, dict) or last_message.get("role") != "user":
+        return False
+    last_user_content = last_message.get("content")
+    if not isinstance(last_user_content, str):
+        return False
+    match = re.search(
+        r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+        r"\[/creation_recommendation_response\]\s*$",
+        last_user_content,
+        re.DOTALL,
+    )
+    if match is None:
+        return False
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("version") == 1
+        and payload.get("type") == "creation_recommendation_response"
+        and payload.get("action")
+        in {"create", "dismiss", "mute_session", "unmute_session"}
+        and payload.get("creation_type") in {"agent", "skill", "task"}
+        and isinstance(payload.get("proposal_id"), str)
+        and payload["proposal_id"].strip()
+        and isinstance(payload.get("title"), str)
+        and payload["title"].strip()
+        and isinstance(payload.get("dedup_key"), str)
+        and payload["dedup_key"].strip()
+    )
 
 
 def _extract_skill_slug(body: Dict[str, Any]) -> str:
@@ -2183,6 +2317,8 @@ def _make_request_fingerprint(
     *,
     business_execution_action: str = "",
     hardware_execution_token: str = "",
+    admission_scope: str = "",
+    identity_scope: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
     body_fingerprint = hashlib.sha256(repr(subset).encode("utf-8")).hexdigest()
@@ -2200,6 +2336,28 @@ def _make_request_fingerprint(
             hashlib.sha256(
                 b"zettlab-hardware-execution-token-v1\0"
                 + hardware_token.encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    # admission_scope 把「这份 body 是从哪条路由、以什么准入模式进来的」并进
+    # 指纹。少了它，同一个 Idempotency-Key + 同一份 body 会在普通端点和
+    # canonical-final-v1 之间共用缓存：普通端点先缓存的无回执结果会让版本化
+    # 重试直接命中缓存、跳过 governor 和动作接管。
+    if admission_scope:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-admission-scope-v1\0" + admission_scope.encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    # identity_scope 把「这份 body 属于谁、属于哪个会话」并进指纹。_idem_cache
+    # 是进程全局的，少了它，两个不同 profile / owner / session key 的请求只要
+    # Idempotency-Key 和 body 相同就会互相命中——后到的那个直接复用前一个会话的
+    # agent 结果，跳过 governor 的 owner / proposal 校验，甚至拿到别人会话的
+    # accepted 回执和正文。只并进摘要，不并原值。
+    if identity_scope:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-identity-scope-v1\0"
+                + hashlib.sha256(identity_scope.encode("utf-8")).hexdigest().encode("ascii")
             ).hexdigest().encode("ascii")
         )
     if not capability_digests:
@@ -3073,6 +3231,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            (
+                "POST",
+                "/v1/chat/completions/canonical-final-v1",
+                self._handle_canonical_final_chat_completions,
+            ),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -3853,6 +4016,10 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
         router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
         router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+        router.add_post(
+            "/p/{profile}/v1/chat/completions/canonical-final-v1",
+            self._profile_handler(self._handle_canonical_final_chat_completions),
+        )
 
         router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
         router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
@@ -5742,6 +5909,74 @@ class APIServerAdapter(BasePlatformAdapter):
             on_settled()
         return user_message
 
+    async def _handle_canonical_final_chat_completions(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                _openai_error("Invalid JSON in request body"), status=400
+            )
+        if not isinstance(body, dict) or (
+            _extract_creation_action_receipt_transport(body)
+            != "canonical_final_v1"
+        ) or not _extract_turn_id(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires exact receipt metadata and turn id"
+                ),
+                status=400,
+            )
+        if not _is_canonical_final_creation_action(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires a valid creation recommendation action"
+                ),
+                status=400,
+            )
+        # 结构化输出与可信回执互斥：governor 的 _on_pre_llm_call() 遇到
+        # structured_output 会直接进入 suppression，既不消费动作也不生成回执，
+        # 而 HTTP 请求照常以普通模型结果收尾。放行这类请求等于让 Web 收到一个
+        # 「没接管、也没法重试」的死状态。宁可在进 Agent 前明确拒绝。
+        from agent.response_format import response_format_requires_structured_output
+
+        if response_format_requires_structured_output(body.get("response_format")):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot be combined with a structured "
+                    "response_format: the receipt would never be produced"
+                ),
+                status=400,
+            )
+        # turn_id 会成为 pending_action_results 的键并驻留到 TTL 到期。不设上限
+        # 的话，少量携带超长 turn_id 的请求就能把设备上的 Hermes 撑爆（端侧
+        # 2 GB 硬预算）。正常的 turn_id 是 local-server 的 UUID 类关联令牌。
+        if len(_extract_turn_id(body)) > MAX_CANONICAL_FINAL_TURN_ID_LEN:
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 turn_id exceeds "
+                    f"{MAX_CANONICAL_FINAL_TURN_ID_LEN} characters"
+                ),
+                status=400,
+            )
+        # 禁用了工具的 create 动作永远走不到原生创建流程（skill_manage / cronjob
+        # 都是工具），但 governor 会照常消费 proposal 并回 accepted——Web 结算成
+        # 「已接管」，资源却根本不会被创建。宁可在进 Agent 前拒掉。
+        if str(body.get("tool_choice") or "").strip().lower() == "none":
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot run with tool_choice=none: the "
+                    "native creation flow would never execute"
+                ),
+                status=400,
+            )
+        request["canonical_final_creation_action_admitted"] = True
+        return await self._handle_chat_completions(request)
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -5780,6 +6015,13 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
         connector_route_capability = _extract_connector_route_capability(body)
+        creation_action_receipt_transport = (
+            _extract_creation_action_receipt_transport(body)
+        )
+        if _has_creation_recommendation_wrapper(body) and not request.get(
+            "canonical_final_creation_action_admitted", False
+        ):
+            creation_action_receipt_transport = ""
         business_execution_action = _extract_business_execution_action(request)
         hardware_execution_token = _extract_hardware_execution_token(request)
         requested_execution_policy = _extract_requested_execution_policy(body)
@@ -5815,7 +6057,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
-            elif role in {"user", "assistant"}:
+            elif role in _AGENT_INPUT_MESSAGE_ROLES:
                 try:
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
@@ -6197,6 +6439,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
+                creation_action_receipt_transport=creation_action_receipt_transport,
                 hardware_execution_token=hardware_execution_token,
                 business_execution_action=trusted_business_execution_action,
                 business_execution_action_version=(
@@ -6258,6 +6501,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
+                    creation_action_receipt_transport=creation_action_receipt_transport,
                     hardware_execution_token=hardware_execution_token,
                     business_execution_action=trusted_business_execution_action,
                     business_execution_action_version=(
@@ -6291,6 +6535,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     ],
                     business_execution_action=trusted_business_execution_action,
                     hardware_execution_token=hardware_execution_token,
+                    admission_scope=(
+                        "canonical_final_v1"
+                        if request.get("canonical_final_creation_action_admitted", False)
+                        else "plain"
+                    ),
+                    identity_scope="\0".join(
+                        (
+                            str(request.get("hermes_profile_home") or ""),
+                            str(gateway_session_key or ""),
+                            str(session_id or ""),
+                        )
+                    ),
                 )
             )
             try:
@@ -6619,6 +6875,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            hermes_terminal: Dict[str, Any] = {}
+            if result_dict.get("response_transformed") or result_dict.get(
+                "canonical_response_required"
+            ):
+                hermes_terminal["canonical_final_response"] = str(
+                    result_dict.get("final_response") or ""
+                )
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
                 _wire_code = _hermes_error_code(result_dict, finish_reason)
@@ -6627,13 +6890,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": err_msg,
                         "type": _wire_code,
                     }
-                finish_chunk["hermes"] = {
+                hermes_terminal.update({
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": _wire_code,
-                }
+                })
+            if hermes_terminal:
+                finish_chunk["hermes"] = hermes_terminal
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -8726,6 +8991,7 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
+        creation_action_receipt_transport: str = "",
         hardware_execution_token: Optional[str] = None,
         business_execution_action: Optional[str] = None,
         business_execution_action_version: Optional[str] = None,
@@ -8834,6 +9100,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent._zet_agent_response_mode = response_mode or ""
                     agent._zet_agent_plan_ack = dict(plan_ack or {})
                     agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
+                    agent._creation_action_receipt_transport = (
+                        creation_action_receipt_transport
+                    )
                     if trusted_user_message is not None:
                         agent._zet_agent_trusted_user_message = trusted_user_message
                     agent._zet_agent_trusted_skill_slug = trusted_skill_slug

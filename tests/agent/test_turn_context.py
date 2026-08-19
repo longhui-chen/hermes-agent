@@ -346,6 +346,70 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert ctx.conversation_history == compacted_history
     assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
+def test_governor_scope_follows_the_compression_child():
+    """推荐卡存进哪个 scope，必须跟响应头回给客户端的 session 一致。
+
+    压缩旋转恢复会把 agent.session_id 换成 canonical child。在恢复之前绑定
+    governor scope，卡片就存进了父 scope，客户端照响应头提交动作时 governor 在
+    子 scope 里找不到刚展示的 proposal，只能拒绝——那张卡从此点不动。
+    """
+    agent = _FakeAgent()
+
+    def _recover(_agent):
+        _agent.session_id = "compression-child"
+        return [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}]
+
+    with patch(
+        "agent.turn_context.recover_rotated_compression_session",
+        side_effect=_recover,
+    ):
+        _build(agent, conversation_history=[{"role": "user", "content": "stale parent"}])
+
+    assert agent._creation_governor_conversation_session_id == "compression-child"
+
+
+def test_governor_scope_binds_after_mid_turn_session_rotation():
+    """绑定必须发生在本轮所有会旋转 session 的动作之后。
+
+    turn-start 的旋转恢复、idle 压缩、preflight 压缩都可能把 agent.session_id
+    换成 canonical child，而响应头回给客户端的是 child。绑早了，推荐卡就存进
+    父 scope，客户端照响应头提交动作时 governor 在 child scope 里找不到刚展示
+    的 proposal，只能拒绝——那张卡从此点不动。
+
+    这里用「系统提示重建时旋转 session」模拟中途旋转：它排在 turn-start 恢复
+    之后，绑定点如果还留在恢复旁边就会读到旧值。
+    """
+    agent = _FakeAgent()
+    # 逼真实的系统提示重建路径跑起来（默认 fixture 直接给了缓存值就不调了）。
+    agent._cached_system_prompt = None
+
+    def _rotate_during_prompt_restore(*_args, **_kwargs):
+        agent.session_id = "rotated-child"
+        return "SYSTEM"
+
+    _build(agent, restore_or_build_system_prompt=_rotate_during_prompt_restore)
+
+    assert agent._creation_governor_conversation_session_id == "rotated-child"
+
+
+def test_explicit_gateway_session_key_survives_the_compression_child():
+    """对照：调用方显式指定的 gateway key 是稳定作用域，恢复不该动它。"""
+    agent = _FakeAgent()
+    agent._gateway_session_key = "app-conversation-42"
+
+    def _recover(_agent):
+        _agent.session_id = "compression-child"
+        return [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}]
+
+    with patch(
+        "agent.turn_context.recover_rotated_compression_session",
+        side_effect=_recover,
+    ):
+        _build(agent, conversation_history=[{"role": "user", "content": "stale parent"}])
+
+    assert agent._creation_governor_conversation_session_id == "app-conversation-42"
+
+
 def test_records_trusted_current_user_and_previous_assistant_messages():
     agent = _FakeAgent()
     _build(
@@ -2480,6 +2544,7 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     agent._zet_agent_execution_policy = "silent_automation"
     agent.request_overrides = {"response_format": {"type": "json_schema"}}
     agent._supports_followup_turns = False
+    agent._creation_action_receipt_transport = "canonical_final_v1"
     agent.stream_delta_callback = lambda _delta: None
     captured = {}
 
@@ -2501,6 +2566,27 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     assert captured["structured_output"] is True
     assert captured["supports_followup_turns"] is False
     assert captured["streaming_output"] is True
+    assert (
+        captured["creation_action_receipt_transport"] == "canonical_final_v1"
+    )
+
+
+def test_creation_governor_pre_hook_uses_stable_gateway_conversation_scope(monkeypatch):
+    agent = _FakeAgent()
+    agent._gateway_session_key = "stable-app-conversation"
+    captured = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "pre_llm_call":
+            captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+
+    _build(agent)
+
+    assert captured["conversation_session_id"] == "stable-app-conversation"
+    assert captured["session_id"] == "sess-1"
 
 
 def test_persist_user_message_becomes_original():
