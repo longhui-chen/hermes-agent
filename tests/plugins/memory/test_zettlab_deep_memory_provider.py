@@ -52,6 +52,159 @@ def test_model_tool_schemas_exclude_memo_write():
     assert names == {"memo_recall", "memo_confirm", "memo_forget"}
 
 
+def test_smart_mode_supplements_search_memory_without_turn_prefetch(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "smart"},
+    )
+    calls = []
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append((endpoint, arguments, timeout, trusted))
+        return {"items": [{"memory_id": "fact-1", "statement": "Frank 认识 Bob"}]}
+
+    provider._request = fake_request
+    provider.on_turn_start(1, "Frank 有哪些朋友")
+    assert provider._prefetch_thread is None
+    assert provider.prefetch("Frank 有哪些朋友", session_id="session-1") == ""
+
+    result = provider.search("Frank 有哪些朋友", 7)
+
+    assert provider.search_memory_mode() == "supplement"
+    assert {schema["name"] for schema in provider.get_tool_schemas()} == {
+        "memo_confirm",
+        "memo_forget",
+    }
+    assert result["status"] == "ok"
+    assert result["items"][0]["memory_id"] == "fact-1"
+    assert len(calls) == 1
+    assert calls[0][0] == "recall"
+    assert calls[0][1] == {"query": "Frank 有哪些朋友", "limit": 7}
+    assert calls[0][2] == 7.5
+    assert calls[0][3]["tool_call_id"].startswith("search-memory:")
+    assert calls[0][3]["source_text"] == "Frank 有哪些朋友"
+    provider.shutdown()
+
+
+def test_smart_mode_search_memory_tool_runs_real_provider_recall_flow(monkeypatch, tmp_path):
+    from agent.memory_manager import MemoryManager
+    from tools.search_memory_tool import search_memory_tool
+
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "smart"},
+    )
+    calls = []
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append((endpoint, arguments, trusted))
+        return {
+            "items": [{
+                "id": "fact-real-flow",
+                "statement": "Frank 认识 Bob",
+                "recall_score": 87,
+            }]
+        }
+
+    provider._request = fake_request
+    provider.on_turn_start(1, "Frank 有哪些朋友")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+
+    result = json.loads(search_memory_tool(
+        {"query": "Frank 朋友", "top_k": 3},
+        memory_manager=manager,
+    ))
+
+    assert calls[0][0] == "recall"
+    assert calls[0][1] == {"query": "Frank 朋友", "limit": 3}
+    assert calls[0][2]["source_text"] == "Frank 有哪些朋友"
+    assert result["provider"] == "zettlab_deep_memory"
+    assert result["provider_status"] == "ok"
+    deep_item = next(item for item in result["items"] if item["id"] == "fact-real-flow")
+    assert deep_item["excerpt"] == "Frank 认识 Bob"
+    assert deep_item["score"] == 87.0
+    provider.shutdown()
+
+
+def test_off_mode_disables_chat_recall_but_keeps_native_write_mirroring(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "off"},
+    )
+    calls = []
+    completed = threading.Event()
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append(endpoint)
+        completed.set()
+        return {"status": "stored"}
+
+    provider._request = fake_request
+    provider.on_turn_start(2, "记住 Frank 认识 Alice")
+
+    assert provider.get_tool_schemas() == []
+    assert provider.search_memory_mode() == "disabled"
+    assert provider.prefetch("Frank", session_id="session-1") == ""
+    assert provider._prefetch_thread is None
+    assert json.loads(provider.handle_tool_call("memo_recall", {"query": "Frank"})) == {
+        "error": "Deep Memory chat access is disabled"
+    }
+
+    provider.on_memory_write(
+        "add",
+        "memory",
+        "Frank 认识 Alice",
+        {"turn_id": "turn-2"},
+    )
+    assert completed.wait(1.0)
+    assert calls == ["write"]
+    provider.shutdown()
+
+
+def test_unknown_mode_falls_back_to_legacy_always(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        memory_config={"deep_memory_mode": "future-mode"},
+    )
+    provider._request = lambda *_args, **_kwargs: {"items": []}
+
+    provider.on_turn_start(1, "需要自动召回")
+
+    assert provider.search_memory_mode() == "disabled"
+    assert {schema["name"] for schema in provider.get_tool_schemas()} == {
+        "memo_recall",
+        "memo_confirm",
+        "memo_forget",
+    }
+    assert provider._prefetch_thread is not None
+    provider._prefetch_thread.join(timeout=1.0)
+    provider.shutdown()
+
+
 def test_native_memory_is_mirrored_to_deep_memory():
     prompt = ZettlabDeepMemoryProvider().system_prompt_block()
 

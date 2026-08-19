@@ -48,6 +48,10 @@ def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapte
         adapter._profile_handler(adapter._handle_profile_reload),
     )
     app.router.add_post(
+        "/p/{profile}/v1/memory/reload",
+        adapter._profile_handler(adapter._handle_memory_reload),
+    )
+    app.router.add_post(
         "/p/{profile}/v1/runtime/reset",
         adapter._profile_handler(adapter._handle_runtime_reset),
     )
@@ -2033,6 +2037,7 @@ async def test_prefixed_control_routes_registered(profile_homes):
         "/p/{profile}/v1/skills/reload",
         "/p/{profile}/v1/connectors/reload",
         "/p/{profile}/v1/profile/reload",
+        "/p/{profile}/v1/memory/reload",
         "/p/{profile}/v1/runtime/reset",
         "/p/{profile}/v1/profile/unload",
         "/p/{profile}/v1/model/switch",

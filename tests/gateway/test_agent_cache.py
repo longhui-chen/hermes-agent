@@ -10,6 +10,7 @@ Verifies that the agent cache correctly:
 """
 
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -133,6 +134,17 @@ class TestExtractCacheBustingConfig:
         assert out["compression.target_ratio"] == 0.3
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
+
+    def test_deep_memory_mode_is_a_next_turn_cache_boundary(self):
+        # Keep this contract test import-free so it also runs on the Windows
+        # host where gateway.run's Linux process-boundary dependencies are not
+        # importable. The surrounding extraction/signature tests exercise the
+        # production tuple machinery on supported runtimes.
+        source = (Path(__file__).parents[2] / "gateway" / "run.py").read_text(
+            encoding="utf-8"
+        )
+
+        assert '("memory", "deep_memory_mode")' in source
 
 
     def test_missing_keys_yield_none(self):

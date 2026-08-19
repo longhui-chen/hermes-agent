@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 _PREFETCH_WAIT_SECS = 7.75
 _PREFETCH_REQUEST_TIMEOUT = 60.0
+_SEARCH_REQUEST_TIMEOUT = 7.5
 _DEFAULT_TOOL_TIMEOUT = 65.0
 _MAX_PREFETCH_CONTEXT_CHARS = 12_000
 _MAX_MIRROR_OUTBOX_ITEMS = 512
@@ -47,6 +48,12 @@ _MIRROR_TRANSIENT_ERRORS = {
     "network",
     "invalid_response",
 }
+_DEEP_MEMORY_MODES = {"off", "smart", "always"}
+
+
+def _normalize_deep_memory_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in _DEEP_MEMORY_MODES else "always"
 
 
 class DeepMemoryMCPToolError(ValueError):
@@ -129,6 +136,9 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
         self._session_id = ""
         self._current_source_text = ""
         self._current_turn_id = ""
+        # Preserve the pre-existing automatic recall behaviour when an older
+        # config has no explicit mode.
+        self._deep_memory_mode = "always"
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: threading.Thread | None = None
         self._prefetch_query = ""
@@ -175,6 +185,13 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
         self._user_id = str(kwargs.get("deep_memory_principal") or "").strip()
         self._user_id_alt = str(kwargs.get("deep_memory_subject") or "").strip()
         self._session_id = str(session_id or "").strip()
+        memory_config = kwargs.get("memory_config")
+        configured_mode = (
+            memory_config.get("deep_memory_mode")
+            if isinstance(memory_config, dict)
+            else None
+        )
+        self._deep_memory_mode = _normalize_deep_memory_mode(configured_mode)
         self._shutdown.clear()
         self._mirror_wake.clear()
         hermes_home = str(kwargs.get("hermes_home") or "").strip()
@@ -222,6 +239,27 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
         ]
 
     def system_prompt_block(self) -> str:
+        if self._deep_memory_mode == "off":
+            return (
+                "Hermes native memory remains the chat memory authority. "
+                "Deep Memory chat recall is disabled, so use the native "
+                "memory and search_memory tools only. Successful native "
+                "memory changes continue to be mirrored durably in the "
+                "background for future use."
+            )
+        if self._deep_memory_mode == "smart":
+            return (
+                "Hermes native memory is primary and Zettlab Deep Memory is "
+                "a supplemental recall source. Use search_memory for explicit "
+                "recall; it automatically runs Deep Memory memo_recall and "
+                "combines the results with native MEMORY.md and USER.md. "
+                "Stable facts must still be written once through the native "
+                "memory tool; successful native changes are mirrored by the "
+                "provider's on_memory_write hook. memo_write and memo_recall "
+                "are not exposed as model tools in this mode. memo_confirm "
+                "and memo_forget remain available for conflict resolution and "
+                "explicit deletion."
+            )
         return (
             "Hermes native memory and Zettlab Deep Memory are both enabled. "
             "For stable identity, relationships, preferences, habits, norms, "
@@ -240,6 +278,10 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
         )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        if self._deep_memory_mode == "off":
+            return []
+        if self._deep_memory_mode == "smart":
+            return [MEMO_CONFIRM_SCHEMA, MEMO_FORGET_SCHEMA]
         return [
             MEMO_RECALL_SCHEMA,
             MEMO_CONFIRM_SCHEMA,
@@ -252,7 +294,42 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
         # evidence_quote is locatable; it is never logged or audited.
         self._current_source_text = str(message or "")[:32_000]
         self._current_turn_id = f"turn-{turn_number}"
-        self._start_prefetch(self._current_source_text, session_id=self._session_id)
+        if self._deep_memory_mode == "always":
+            self._start_prefetch(self._current_source_text, session_id=self._session_id)
+
+    def search_memory_mode(self) -> str:
+        """Supplement native search only in the explicit smart mode."""
+        return "supplement" if self._deep_memory_mode == "smart" else "disabled"
+
+    def search(self, query: str, top_k: int) -> Dict[str, Any]:
+        """Run the same authenticated memo_recall used by the model tool.
+
+        ``search_memory_tool`` provides the outer fail-open timeout and merges
+        the returned items with native curated memory. This request also has a
+        shorter transport timeout so a timed-out daemon thread does not linger.
+        """
+        if self._deep_memory_mode != "smart":
+            return {"items": [], "status": "disabled"}
+        query = str(query or "").strip()
+        if not query or not self._user_id or not self._session_id:
+            return {"items": [], "status": "unavailable"}
+        try:
+            limit = max(1, min(int(top_k), 20))
+        except (TypeError, ValueError):
+            limit = 5
+        trusted = self._trusted_context({})
+        trusted["tool_call_id"] = f"search-memory:{uuid.uuid4().hex}"
+        result = self._request(
+            "recall",
+            {"query": query, "limit": limit},
+            timeout=_SEARCH_REQUEST_TIMEOUT,
+            trusted=trusted,
+        )
+        items = result.get("items")
+        if not isinstance(items, list):
+            items = []
+        status = str(result.get("status") or ("ok" if items else "empty"))
+        return {"items": items, "status": status}
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         self._session_id = str(new_session_id or "").strip()
@@ -558,6 +635,8 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Consume recall started by on_turn_start before the model API call."""
+        if self._deep_memory_mode != "always":
+            return ""
         query = str(query or "").strip()
         session_id = str(session_id or self._session_id).strip()
         if not query or not session_id:
@@ -581,6 +660,10 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name not in {"memo_recall", "memo_confirm", "memo_forget"}:
             return tool_error(f"Unknown deep memory tool: {tool_name}")
+        if self._deep_memory_mode == "off":
+            return tool_error("Deep Memory chat access is disabled")
+        if self._deep_memory_mode == "smart" and tool_name == "memo_recall":
+            return tool_error("Use search_memory for supplemental Deep Memory recall")
         trusted = self._trusted_context(kwargs)
         if not trusted["user_id"] or not trusted["session_id"]:
             return tool_error("Deep Memory identity is unavailable")

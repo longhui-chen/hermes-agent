@@ -8,6 +8,7 @@ import {
   enumOptionsFor,
   getNested,
   isExternalMemoryProvider,
+  memoryFieldVisible,
   providerGroup,
   sectionFieldEntries,
   setNested,
@@ -48,6 +49,18 @@ describe('settings helpers', () => {
       for (const value of ['', 'builtin', 'built-in', 'Builtin', 'none', '  ', undefined, null, 7]) {
         expect(isExternalMemoryProvider(value)).toBe(false)
       }
+    })
+  })
+
+  describe('memoryFieldVisible', () => {
+    it('shows the Deep Memory mode only for the Zettlab provider', () => {
+      expect(
+        memoryFieldVisible('memory.deep_memory_mode', {
+          memory: { provider: 'zettlab_deep_memory' }
+        })
+      ).toBe(true)
+      expect(memoryFieldVisible('memory.deep_memory_mode', { memory: { provider: 'honcho' } })).toBe(false)
+      expect(memoryFieldVisible('memory.provider', { memory: { provider: 'honcho' } })).toBe(true)
     })
   })
 
@@ -330,6 +343,19 @@ describe('settings helpers', () => {
   })
 
   describe('sectionFieldEntries', () => {
+    it('includes the Deep Memory mode in the Memory section when provided by the backend schema', () => {
+      const schema = {
+        'memory.deep_memory_mode': { type: 'select' as const, options: ['off', 'smart', 'always'] }
+      }
+      const config: HermesConfigRecord = {
+        memory: { provider: 'zettlab_deep_memory', deep_memory_mode: 'smart' }
+      }
+
+      const memoryKeys = (sectionFieldEntries(schema, config).get('memory') ?? []).map(([key]) => key)
+
+      expect(memoryKeys).toContain('memory.deep_memory_mode')
+    })
+
     it('renders memory.provider from config even when the backend schema omits it', () => {
       const schema = { 'memory.memory_enabled': { type: 'boolean' as const } }
       const config: HermesConfigRecord = { memory: { memory_enabled: true, provider: '' } }

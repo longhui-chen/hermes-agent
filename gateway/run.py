@@ -4950,7 +4950,23 @@ class TurnRunner:
         if _cache_lock and _cache is not None:
             with _cache_lock:
                 cached = _cache.get(ctx.session_key)
-                if cached and cached[1] == _sig:
+                if cached and cached[1] != _sig:
+                    # Config/tool signature changes are a turn-boundary
+                    # replacement, not an in-place mutation. Pop the old
+                    # AIAgent now and release its provider/client resources
+                    # after the cache lock. This is required for live memory
+                    # mode changes: the old provider may own a mirror worker
+                    # and its tool schemas are immutable for that turn.
+                    logger.info(
+                        "Agent cache invalidated for session %s: "
+                        "runtime config signature changed (%s -> %s)",
+                        ctx.session_key, cached[1], _sig,
+                    )
+                    evicted = self._runner._agent_cache.pop(ctx.session_key, None)
+                    _ev_agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
+                    if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
+                        _xproc_evicted_agent = _ev_agent
+                elif cached and cached[1] == _sig:
                     # cached[2] is the message_count at cache time;
                     # stale when a second process appended rows.
                     # cached[3] (when present) is the session_id the
@@ -24075,6 +24091,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "min_tail_user_messages"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
+        ("memory", "deep_memory_mode"),
         ("checkpoints", "enabled"),
         ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"),

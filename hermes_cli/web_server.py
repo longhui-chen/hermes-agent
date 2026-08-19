@@ -884,6 +884,11 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Memory provider plugin",
         "options": _memory_provider_options(),
     },
+    "memory.deep_memory_mode": {
+        "type": "select",
+        "description": "Deep Memory recall policy for new chat sessions",
+        "options": ["off", "smart", "always"],
+    },
     "model": {
         "type": "string",
         "description": "Default model (e.g. anthropic/claude-sonnet-4.6)",

@@ -567,7 +567,17 @@ export const en: Translations = {
       attachmentSizeDesc:
         'How big a local file Desktop will load for previews and image attach, in MB. Default is 16. Remote non-image attach uses a separate 256 MB cap. Setting this very high loads the whole file into memory and can freeze or crash the app.',
       attachmentSizeUnit: 'MB',
-      attachmentSizeLabel: 'Max preview / image load size in megabytes'
+      attachmentSizeLabel: 'Max preview / image load size in megabytes',
+      deepMemoryModeTitle: 'Deep Memory recall',
+      deepMemoryModeOff: 'Off',
+      deepMemoryModeSmart: 'Smart',
+      deepMemoryModeAlways: 'Always',
+      deepMemoryModeOffDesc:
+        'Chats use Hermes native memory only. Deep recall and Deep tools are disabled; native writes still mirror in the background. Applies to new chat sessions.',
+      deepMemoryModeSmartDesc:
+        'When search_memory runs, Hermes also calls memo_recall and combines native and Deep results. Applies to new chat sessions.',
+      deepMemoryModeAlwaysDesc:
+        'Deep Memory is recalled automatically at turn start, matching the current behavior. Applies to new chat sessions.'
     },
     quickEntry: {
       enabledTitle: 'Quick Entry',

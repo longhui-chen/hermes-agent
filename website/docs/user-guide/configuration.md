@@ -665,7 +665,15 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # true = require approval before any memory write
+  provider: ""              # optional external memory provider
+  deep_memory_mode: always  # zettlab_deep_memory: off | smart | always
 ```
+
+For `zettlab_deep_memory`, `off` keeps chat native-only, `smart` supplements
+explicit `search_memory` calls with `memo_recall`, and `always` performs the
+turn-start Deep Memory prefetch used by existing profiles. The setting applies
+to new chat sessions. Successful native memory writes continue mirroring in all
+three modes.
 
 With `memory.write_approval: true`, memory writes need your approval before they land: interactive CLI turns prompt inline; messaging sessions and the background self-improvement review stage the write for `/memory pending` → `/memory approve <id>` / `/memory reject <id>` review. Toggle at runtime with `/memory approval on|off`. See [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
 

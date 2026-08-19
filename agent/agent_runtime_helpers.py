@@ -2905,8 +2905,14 @@ def collect_answer_attribution_citations(agent, answer_text) -> None:
         token_count = len(set(_TOKEN_RE.findall(query.lower())))
         if token_count < 8:
             return
-        raw = _smt({"query": query, "top_k": 4},
-                   memory_manager=getattr(agent, "_memory_manager", None))
+        # Attribution is a post-answer citation pass, not a model-requested
+        # recall. Keep it native-only so smart Deep Memory does not perform a
+        # network lookup after every otherwise unrelated answer.
+        raw = _smt(
+            {"query": query, "top_k": 4},
+            memory_manager=getattr(agent, "_memory_manager", None),
+            supplement_external=False,
+        )
         parsed = json.loads(raw)
         items = parsed.get("items") if isinstance(parsed, dict) else None
         if not isinstance(items, list):

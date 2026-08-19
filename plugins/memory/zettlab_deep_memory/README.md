@@ -2,15 +2,19 @@
 
 Hermes Memory Provider plugin for the on-device Zettlab Deep Memory MCP
 service. Hermes keeps its built-in `MEMORY.md` and `USER.md` memory enabled;
-this provider mirrors committed built-in writes and injects authorized recall
-context before model calls.
+this provider mirrors committed built-in writes and can inject or supplement
+authorized recall according to the configured chat mode.
 
 ## Lifecycle
 
-- `on_turn_start()` starts `memo_recall` in a background thread.
-- `prefetch()` consumes that result before the model API call. If the backend
+- In `always` mode, `on_turn_start()` starts `memo_recall` in a background
+  thread and `prefetch()` consumes it before the model API call. If the backend
   is still slow after the bounded hot-path wait, injection is skipped for the
   turn and `memo_recall` remains available as an active-search backstop.
+- In `smart` mode, an explicit native `search_memory` call also runs one
+  bounded `memo_recall` and combines native and Deep results. There is no
+  turn-start prefetch and direct `memo_recall` is not model-facing.
+- In `off` mode, chat recall and model-facing Deep tools are disabled.
 - `on_memory_write()` durably enqueues successful built-in `add`, `replace`,
   and `remove` mutations in a profile-scoped SQLite outbox. It does not call
   the auxiliary model on the native-memory write path.
@@ -44,7 +48,12 @@ memory:
   memory_enabled: true
   user_profile_enabled: true
   provider: zettlab_deep_memory
+  deep_memory_mode: always  # off | smart | always
 ```
+
+The default is `always` for compatibility with existing profiles. Mode changes
+apply to new chat sessions. All three modes keep the durable `on_memory_write`
+mirror active so disabling chat recall does not create a write gap.
 
 ```dotenv
 ZETTLAB_DEEP_MEMORY_URL=http://127.0.0.1:PORT/api/v1/internal/deep-memory

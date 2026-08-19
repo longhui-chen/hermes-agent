@@ -537,6 +537,7 @@ export const ar = defineLocale({
       'memory.memoryCharLimit': 'ميزانية الذاكرة',
       'memory.userCharLimit': 'ميزانية الملف الشخصي',
       'memory.provider': 'مزود الذاكرة',
+      'memory.deepMemoryMode': 'وضع Deep Memory',
       'context.engine': 'محرك السياق',
       'compression.enabled': 'الضغط التلقائي',
       'compression.threshold': 'عتبة الضغط',
@@ -574,6 +575,7 @@ export const ar = defineLocale({
       'checkpoints.enabled': 'ينشئ لقطات رجوع قبل تعديلات الملفات.',
       'memory.memoryEnabled': 'يحفظ ذكريات دائمة يمكن أن تساعد الجلسات القادمة.',
       'memory.userProfileEnabled': 'يحافظ على ملف مختصر لتفضيلات المستخدم.',
+      'memory.deepMemoryMode': 'يتحكم في كيفية مشاركة Deep Memory في جلسات الدردشة الجديدة.',
       'context.engine': 'استراتيجية إدارة المحادثات الطويلة قرب حد السياق.',
       'compression.enabled': 'يلخص السياق الأقدم عندما تكبر المحادثات.',
       'voice.autoTts': 'ينطق ردود المساعد تلقائياً.',
@@ -626,7 +628,17 @@ export const ar = defineLocale({
       failedLoad: 'فشل تحميل الإعدادات',
       autosaveFailed: 'فشل الحفظ التلقائي',
       imported: 'تم استيراد الإعدادات',
-      invalidJson: 'JSON غير صالح'
+      invalidJson: 'JSON غير صالح',
+      deepMemoryModeTitle: 'استدعاء Deep Memory',
+      deepMemoryModeOff: 'إيقاف',
+      deepMemoryModeSmart: 'ذكي',
+      deepMemoryModeAlways: 'تشغيل',
+      deepMemoryModeOffDesc:
+        'تستخدم الدردشة ذاكرة Hermes الأصلية فقط. يتوقف استدعاء Deep وأدواته، مع استمرار نسخ الكتابات الأصلية في الخلفية. يطبق على جلسات الدردشة الجديدة.',
+      deepMemoryModeSmartDesc:
+        'عند تشغيل search_memory، يستدعي Hermes أيضا memo_recall ويدمج النتائج الأصلية ونتائج Deep. يطبق على جلسات الدردشة الجديدة.',
+      deepMemoryModeAlwaysDesc:
+        'يستدعي Deep Memory تلقائيا في بداية كل دور، مثل السلوك الحالي. يطبق على جلسات الدردشة الجديدة.'
     },
     quickEntry: {
       enabledTitle: 'الإدخال السريع',

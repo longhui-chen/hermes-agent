@@ -1,9 +1,10 @@
 """Tests for ZetAgentAdapter prompt-class reload endpoints (ZET-1139).
 
-Covers ``POST /v1/profile/reload`` (new in ZET-1139) and the ZET-1139
-additions to ``POST /v1/skills/reload`` (in-process invalidate + DB clear).
+Covers ``POST /v1/profile/reload``, ``POST /v1/memory/reload`` and the
+ZET-1139 additions to ``POST /v1/skills/reload``.
 """
 import ast
+import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -297,6 +298,51 @@ async def test_profile_reload_rejects_missing_bearer(monkeypatch):
     adapter = _make_adapter(monkeypatch, gateway_runner=runner)
 
     resp = await adapter._handle_profile_reload(_FakeRequest(auth=None))
+
+    assert resp.status == 401
+    runner._session_db.clear_all_system_prompts.assert_not_called()
+    runner.invalidate_all_cached_agents.assert_not_called()
+
+
+# =========================================================================
+# /v1/memory/reload
+# =========================================================================
+
+
+def test_memory_reload_arms_next_turn_without_mutating_cached_agent(monkeypatch):
+    runner = _make_runner(invalidate_returns=4, db_clears=9)
+    adapter = _make_adapter(monkeypatch, gateway_runner=runner)
+
+    resp = asyncio.run(adapter._handle_memory_reload(_FakeRequest()))
+
+    assert resp.status == 200
+    assert resp.payload == {
+        "reloaded": True,
+        "effective": "next_turn",
+        "db_rows_cleared": 9,
+    }
+    runner._session_db.clear_all_system_prompts.assert_called_once_with()
+    # In-flight turns keep their immutable mode snapshot. The normal next
+    # message config read + cache signature handles replacement.
+    runner.invalidate_all_cached_agents.assert_not_called()
+
+
+def test_memory_reload_db_failure_requests_restart_fallback(monkeypatch):
+    runner = _make_runner(db_raises=True)
+    adapter = _make_adapter(monkeypatch, gateway_runner=runner)
+
+    resp = asyncio.run(adapter._handle_memory_reload(_FakeRequest()))
+
+    assert resp.status == 500
+    assert resp.payload["error"]["code"] == "memory_reload_unavailable"
+    runner.invalidate_all_cached_agents.assert_not_called()
+
+
+def test_memory_reload_rejects_missing_bearer(monkeypatch):
+    runner = _make_runner()
+    adapter = _make_adapter(monkeypatch, gateway_runner=runner)
+
+    resp = asyncio.run(adapter._handle_memory_reload(_FakeRequest(auth=None)))
 
     assert resp.status == 401
     runner._session_db.clear_all_system_prompts.assert_not_called()

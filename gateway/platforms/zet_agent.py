@@ -7787,6 +7787,62 @@ class ZetAgentAdapter(APIServerAdapter):
             "db_rows_cleared": db_rows_cleared,
         })
 
+    async def _handle_memory_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/memory/reload — apply memory policy on the next turn.
+
+        The gateway reads profile ``config.yaml`` for every inbound message.
+        ``memory.deep_memory_mode`` is part of the AIAgent cache signature, so
+        the next turn replaces an agent built with a different mode and gets a
+        matching provider, system-prompt block and tool schema set.
+
+        Do not invalidate the live AIAgent here: this endpoint may arrive while
+        a turn is using it, and a mode switch must never change semantics in
+        the middle of that turn. Clearing persisted system prompts is the only
+        synchronous step needed; the ordinary next-turn config read performs
+        the in-process replacement. A failure is critical and returns 500 so
+        local-server can fall back to restarting this profile runtime.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        gw = getattr(self, "gateway_runner", None)
+        if gw is None:
+            return _reload_unavailable_response(
+                "memory-reload gateway lookup",
+                "memory_reload_unavailable",
+                exc_info=False,
+            )
+        if _request_value(request, "hermes_profile_home"):
+            session_db = await self._ensure_session_db_async()
+        else:
+            session_db = getattr(gw, "_session_db", None)
+        if session_db is None:
+            return _reload_unavailable_response(
+                "memory-reload SessionDB lookup",
+                "memory_reload_unavailable",
+                exc_info=False,
+            )
+        try:
+            db_rows_cleared = session_db.clear_all_system_prompts()
+            if inspect.isawaitable(db_rows_cleared):
+                db_rows_cleared = await db_rows_cleared
+        except Exception:
+            return _reload_unavailable_response(
+                "memory-reload DB clear", "memory_reload_unavailable"
+            )
+
+        logger.info(
+            "[zet_agent] memory-reload: next-turn config snapshot armed; "
+            "%d DB row(s) cleared",
+            db_rows_cleared,
+        )
+        return web.json_response({
+            "reloaded": True,
+            "effective": "next_turn",
+            "db_rows_cleared": db_rows_cleared,
+        })
+
     async def _handle_runtime_reset(self, request: "web.Request") -> "web.Response":
         """POST /v1/runtime/reset — reset one profile's in-memory runtime view.
 
@@ -8287,6 +8343,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._handle_profile_reload,
             )
             self._app.router.add_post(
+                "/v1/memory/reload",
+                self._handle_memory_reload,
+            )
+            self._app.router.add_post(
                 "/v1/runtime/reset",
                 self._handle_runtime_reset,
             )
@@ -8331,6 +8391,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/p/{profile}/v1/profile/reload",
                 self._profile_handler(self._handle_profile_reload),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/memory/reload",
+                self._profile_handler(self._handle_memory_reload),
             )
             self._app.router.add_post(
                 "/p/{profile}/v1/runtime/reset",

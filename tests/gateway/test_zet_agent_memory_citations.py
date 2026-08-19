@@ -164,7 +164,7 @@ def test_collect_prefetch_citations_silent_on_bad_input():
 
 
 def _fake_smt(items):
-    def _tool(args, memory_manager=None):
+    def _tool(args, memory_manager=None, **_kwargs):
         import json as _json
         return _json.dumps({"items": items}, ensure_ascii=False)
     return _tool

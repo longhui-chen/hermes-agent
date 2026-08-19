@@ -1749,6 +1749,10 @@ def init_agent(
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
+                        # Generic, non-secret provider context. Providers may
+                        # opt into config-driven lifecycle behaviour without
+                        # core branching on a particular plugin.
+                        "memory_config": dict(mem_config),
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning

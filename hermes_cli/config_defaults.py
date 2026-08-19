@@ -1659,6 +1659,13 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Chat recall policy for Zettlab Deep Memory. Native MEMORY.md/USER.md
+        # remain enabled independently, and committed native writes continue
+        # to mirror to the active provider in every mode.
+        #   off    — no Deep Memory recall or model-facing Deep tools
+        #   smart  — supplement explicit search_memory calls with memo_recall
+        #   always — prefetch Deep Memory at turn start (legacy behaviour)
+        "deep_memory_mode": "always",
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
