@@ -16,7 +16,9 @@ DEFAULT_SOCKET_PATH = Path(
     "/run/zettlab-local-server/agentcomputer-credential.sock"
 )
 _SOCKET_ENV = "ZETTLAB_AGENTCOMPUTER_CREDENTIAL_SOCKET"
-_MAX_REQUEST_BYTES = 256 * 1024
+# Agent Creator admits a 1 MiB JSON object. The broker envelope nests that
+# object, so its bounded transport limit needs headroom for JSON framing.
+_MAX_REQUEST_BYTES = 2 * 1024 * 1024
 _MAX_TOKEN_RESPONSE_BYTES = 8 * 1024
 _MAX_LARK_RESPONSE_BYTES = 512 * 1024
 _MAX_AGENT_ID_BYTES = 256
@@ -49,12 +51,31 @@ def request_agentcomputer_token(
 def request_app_auto_refresh_token(
     agent_id: str,
     *,
+    operation_kind: str,
+    operation: object,
+    owner_principal: str,
+    owner_agent_id: str,
+    turn_id: str,
+    session_id: str,
     socket_path: str | os.PathLike[str] | None = None,
 ) -> str:
-    """Request the scope certifying an approved create-app-agent payload."""
+    """Forward an operation; local-server derives its binding and issues the scope."""
+    fields = (operation_kind, owner_principal, owner_agent_id, turn_id, session_id)
+    if any(not isinstance(value, str) or not value.strip() for value in fields):
+        raise RuntimeError("App Host operation binding is incomplete")
+    if not isinstance(operation, dict):
+        raise RuntimeError("App Host operation is invalid")
 
     return _request_scoped_token(
-        agent_id, "app-auto-refresh", socket_path=socket_path
+        agent_id,
+        "app-auto-refresh",
+        operation_kind=operation_kind,
+        operation=operation,
+        owner_principal=owner_principal,
+        owner_agent_id=owner_agent_id,
+        turn_id=turn_id,
+        session_id=session_id,
+        socket_path=socket_path,
     )
 
 
@@ -63,11 +84,12 @@ def _request_scoped_token(
     purpose: str,
     *,
     socket_path: str | os.PathLike[str] | None = None,
+    **binding: object,
 ) -> str:
 
     normalized_agent_id = _normalize_agent_id(agent_id)
     payload = json.dumps(
-        {"agent_id": normalized_agent_id, "purpose": purpose},
+        {"agent_id": normalized_agent_id, "purpose": purpose, **binding},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")

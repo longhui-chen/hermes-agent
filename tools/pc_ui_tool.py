@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import base64
 import binascii
+import hashlib
 import json
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -40,7 +41,12 @@ _ACTIONS = {
     "clipboard_read",
     "clipboard_write",
     "kill_app",
+    "complete_task",
 }
+_READ_ACTIONS = {
+    "list_apps", "list_windows", "snapshot", "desktop_snapshot", "verify", "zoom", "clipboard_read", "complete_task",
+}
+_TASK_CONTROL_FIELDS = {"snapshot_revision", "user_input_epoch", "postcondition"}
 
 PC_UI_SCHEMA = {
     "name": "pc_ui",
@@ -52,7 +58,12 @@ PC_UI_SCHEMA = {
         "Start every interaction with snapshot once a window exists. Reuse only the pid, window_id and element "
         "indices returned by that fresh snapshot; never invent selectors, paths, shell commands, "
         "scripts or CDP requests. Secure controls are hidden and sensitive actions may require "
-        "another confirmation on the computer."
+        "another confirmation on the computer. When snapshot returns snapshot_revision and "
+        "user_input_epoch, copy both into every following mutation and provide a bounded, "
+        "observable postcondition. A mutation is successful only after the Host re-observes "
+        "the exact window and proves that postcondition. If a result includes task metadata, call complete_task once "
+        "after the requested desktop task is fully finished; it closes only the current runtime task lease and never "
+        "performs a desktop mutation."
     ),
     "parameters": {
         "type": "object",
@@ -114,6 +125,18 @@ PC_UI_SCHEMA = {
             "stable_samples": {"type": "integer", "minimum": 1, "maximum": 5},
             "width": {"type": "number", "minimum": 1},
             "height": {"type": "number", "minimum": 1},
+            "snapshot_revision": {
+                "type": "integer", "minimum": 1,
+                "description": "Exact revision returned by the latest snapshot for this task.",
+            },
+            "user_input_epoch": {
+                "type": "integer", "minimum": 0,
+                "description": "Input epoch returned by the latest snapshot. A user takeover invalidates it.",
+            },
+            "postcondition": {
+                "type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 8,
+                "description": "Deterministic predicates the Host must verify after a mutation.",
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -194,6 +217,7 @@ def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
         "clipboard_read": ("include_text",),
         "clipboard_write": ("text",),
         "kill_app": ("pid",),
+        "complete_task": (),
     }[action]
     required = {
         "list_apps": set(),
@@ -217,10 +241,11 @@ def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
         "clipboard_read": set(),
         "clipboard_write": {"text"},
         "kill_app": {"pid"},
+        "complete_task": set(),
     }[action]
     if any(name not in args for name in required):
         return None
-    if any(name not in allowed and name != "action" for name in args):
+    if any(name not in allowed and name != "action" and name not in _TASK_CONTROL_FIELDS for name in args):
         return None
     if action == "snapshot":
         has_pid = "pid" in args
@@ -268,13 +293,73 @@ def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
     return {name: args[name] for name in allowed if name in args}
 
 
-def pc_ui_tool(args: dict[str, Any], **_: Any) -> Any:
+def _wire_task_id(task_id: str) -> str:
+    return "task-" + hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:40]
+
+
+def _target_fingerprint(action: str, params: dict[str, Any]) -> str:
+    # Never hash user text or clipboard values into a durable identifier. The
+    # exact window/control/coordinates are sufficient to bind receipt replay.
+    safe = {
+        key: params[key]
+        for key in (
+            "app", "pid", "window_id", "element", "scope", "x", "y",
+            "from_x", "from_y", "to_x", "to_y", "path", "key",
+        )
+        if key in params
+    }
+    encoded = json.dumps(
+        {"action": action, "target": safe},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def _task_control(
+    args: dict[str, Any],
+    action: str,
+    params: dict[str, Any],
+    task_id: str,
+    tool_call_id: str,
+) -> dict[str, Any] | None:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return None
+    envelope: dict[str, Any] = {"task_id": _wire_task_id(task_id)}
+    if action not in _READ_ACTIONS:
+        tool_call_id = str(tool_call_id or "").strip()
+        if not tool_call_id:
+            raise ValueError("missing tool call identity for desktop mutation")
+        material = f"{task_id}\x00{tool_call_id}\x00{action}\x00{_target_fingerprint(action, params)}"
+        envelope["operation_id"] = "op-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:48]
+    for name in ("snapshot_revision", "user_input_epoch"):
+        value = args.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            envelope[name] = value
+    postcondition = args.get("postcondition")
+    if isinstance(postcondition, list):
+        envelope["postcondition"] = postcondition
+    return envelope
+
+
+def pc_ui_tool(
+    args: dict[str, Any],
+    task_id: str = "",
+    tool_call_id: str = "",
+    **_: Any,
+) -> Any:
     action = args.get("action")
     if action not in _ACTIONS:
         return json.dumps({"success": False, "code": "invalid_action"})
     params = _params(args, action)
     if params is None:
         return json.dumps({"success": False, "code": "invalid_parameters"})
+    try:
+        task_control = _task_control(args, action, params, task_id, tool_call_id)
+    except ValueError:
+        return json.dumps({"success": False, "code": "pc_task_identity_missing"})
     wire_action = {
         "list_apps": "list-apps",
         "list_windows": "list-windows",
@@ -287,6 +372,7 @@ def pc_ui_tool(args: dict[str, Any], **_: Any) -> Any:
         "clipboard_read": "clipboard-read",
         "clipboard_write": "clipboard-write",
         "kill_app": "kill-app",
+        "complete_task": "task-complete",
     }.get(action, action)
     try:
         with requests.Session() as client:
@@ -304,6 +390,7 @@ def pc_ui_tool(args: dict[str, Any], **_: Any) -> Any:
                     "session_id": _session_id(),
                     "action": f"ui.{wire_action}",
                     "params": params,
+                    **({"task_control": task_control} if task_control else {}),
                 },
                 timeout=_TIMEOUT_SECONDS,
             )

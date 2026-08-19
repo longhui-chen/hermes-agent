@@ -506,26 +506,26 @@ def _session_key():
 
 
 def _execution_headers():
-    """Forward server-issued execution context; model arguments never shape it."""
+    """Forward AppHost-owned request correlation; model arguments never shape it."""
     try:
         from gateway.session_context import (
-            business_execution_token,
             current_turn_identity,
             get_session_env,
+            zettlab_auth_principal,
         )
-        token = str(business_execution_token() or "").strip()
         identity = current_turn_identity()
         turn_id = identity[0] if identity else ""
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+        owner_principal = str(zettlab_auth_principal() or "").strip()
     except Exception:
         return {}
     headers = {}
-    if token:
-        headers["X-Zettlab-Business-Execution-Token"] = token
     if turn_id:
         headers["X-Hermes-Turn-Id"] = str(turn_id)
     if session_id:
         headers["X-Hermes-Session-Id"] = session_id
+    if owner_principal:
+        headers["X-Zettlab-Auth-Principal-Id"] = owner_principal
     # Bound scheduler sessions are server-generated as
     # cron_task_<job-id>_<UTC timestamp>.
     # The task id is therefore derived from trusted execution context, never
@@ -541,9 +541,11 @@ def _auto_refresh_scope_token(action, body, execution_headers):
 
     ``user_confirmed_auto`` is durable user intent in the immutable operation;
     the execution headers bind this particular publication to the active user
-    turn.  The model never receives the resulting bearer: it is sent once to
-    App Host, which claims it against the operation fingerprint before it can
-    provision the maintainer and cron job.
+    turn. Hermes forwards the same request object to local-server's broker and
+    then to App Host; local-server computes and verifies the operation binding.
+    Hermes never derives a digest or decides whether a capability matches.
+    The model never receives the resulting bearer: it is sent once to App
+    Host, which claims it before it can provision the maintainer and cron job.
     """
     if action != "publish" or not isinstance(body, dict):
         return None
@@ -552,9 +554,9 @@ def _auto_refresh_scope_token(action, body, execution_headers):
         return None
 
     required_execution_headers = {
-        "X-Zettlab-Business-Execution-Token",
         "X-Hermes-Turn-Id",
         "X-Hermes-Session-Id",
+        "X-Zettlab-Auth-Principal-Id",
     }
     if not required_execution_headers.issubset(execution_headers):
         raise _AutoRefreshScopeUnavailable(
@@ -566,7 +568,15 @@ def _auto_refresh_scope_token(action, body, execution_headers):
             "当前 Agent 身份不可用，无法授权自动维护；未发送发布请求"
         )
     try:
-        token = request_app_auto_refresh_token(agent_id)
+        token = request_app_auto_refresh_token(
+            agent_id,
+            operation_kind="apphost_publish_v1",
+            operation=body,
+            owner_principal=execution_headers.get("X-Zettlab-Auth-Principal-Id", ""),
+            owner_agent_id=agent_id,
+            turn_id=execution_headers["X-Hermes-Turn-Id"],
+            session_id=execution_headers["X-Hermes-Session-Id"],
+        )
     except Exception:
         raise _AutoRefreshScopeUnavailable(
             "自动维护授权暂不可用；未发送发布请求"

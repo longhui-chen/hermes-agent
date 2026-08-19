@@ -90,7 +90,10 @@ from agent.retry_utils import (
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.zet_agent_response_mode import (
+    activate_transport_selected_trusted_skill,
+    hardware_enrollment_preflight_response,
     reset_trusted_skill_execution,
+    transport_attested_skill_instruction,
     trusted_skill_allowed_tool_names,
     trusted_skill_scope_active,
 )
@@ -412,7 +415,23 @@ def _apply_zet_agent_plan_tool_visibility(agent: Any, api_kwargs: Dict[str, Any]
     if not trusted_skill_scope_active(agent):
         return False
 
-    scoped_tools = trusted_skill_allowed_tool_names(agent) | {"present_plan"}
+    trusted_tools = trusted_skill_allowed_tool_names(agent)
+    if getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation":
+        # Middleware/Relay may replace the provider payload after the first
+        # visibility pass.  Silent requests must be sealed by the intersection
+        # of the attested skill scope and the request-local policy snapshot;
+        # never re-add clarify/todo/present_plan from the broader skill scope.
+        policy_tools = set(
+            getattr(
+                agent,
+                "_zet_agent_execution_policy_valid_tool_names",
+                (),
+            )
+            or ()
+        )
+        scoped_tools = trusted_tools & policy_tools
+    else:
+        scoped_tools = trusted_tools | {"present_plan"}
 
     def _tool_name(tool: Any) -> str:
         if not isinstance(tool, dict):
@@ -489,6 +508,76 @@ def _valid_tool_names_for_response(agent: Any) -> set[str]:
     return valid
 
 
+def _seal_video_edit_provider_request(
+    agent: Any,
+    api_kwargs: Dict[str, Any],
+) -> bool:
+    """Re-apply the trusted video request contract at the provider boundary.
+
+    Request middleware and Relay are allowed to return a replacement payload.
+    The final transport callback therefore must not rely on the earlier
+    conversation-loop snapshot for tool visibility or thinking policy.  This
+    helper is deliberately narrow: non-Zettlab, non-video, and non-chat
+    requests are left untouched.
+    """
+    if not isinstance(api_kwargs, dict):
+        return False
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    if getattr(agent, "api_mode", "") != "chat_completions":
+        return False
+    task = getattr(agent, "_zet_agent_skill_direct_task", None)
+    if not bool(getattr(task, "video_edit_applicable", False)):
+        return False
+
+    bootstrap_required = _video_edit_skill_load_required(agent)
+    scope_active = trusted_skill_scope_active(agent)
+    changed = False
+
+    if bootstrap_required:
+        changed = _apply_forced_video_edit_skill_view(agent, api_kwargs) or changed
+    elif scope_active:
+        changed = _apply_zet_agent_plan_tool_visibility(agent, api_kwargs) or changed
+        if getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation":
+            # Once the signed skill is active, no caller/plugin-selected tool
+            # choice is part of the ActionV1 snapshot.  Drop replacements from
+            # LLM middleware so the provider sees only the policy∩scope tools.
+            if api_kwargs.pop("tool_choice", None) is not None:
+                changed = True
+            tool_config = api_kwargs.get("toolConfig")
+            if isinstance(tool_config, dict) and "toolChoice" in tool_config:
+                tool_config.pop("toolChoice", None)
+                changed = True
+
+    transport_instruction = transport_attested_skill_instruction(agent)
+    if transport_instruction:
+        changed = (
+            _append_api_system_instruction_once(
+                api_kwargs,
+                transport_instruction,
+            )
+            or changed
+        )
+
+    # The provider rejects a follow-up containing an assistant tool call when
+    # thinking mode is enabled but no reasoning_content is echoed back.  The
+    # same route/model predicate used by the bootstrap applies to every
+    # trusted video request, not only the first skill_view call.
+    if (bootstrap_required or scope_active) and _should_disable_thinking_for_forced_tool_choice(agent):
+        before = (
+            api_kwargs.get("extra_body"),
+            api_kwargs.get("reasoning_effort"),
+        )
+        _disable_thinking_for_forced_tool_choice(api_kwargs)
+        agent._zet_agent_force_present_plan_disable_thinking = True
+        changed = changed or before != (
+            api_kwargs.get("extra_body"),
+            api_kwargs.get("reasoning_effort"),
+        )
+
+    return changed
+
+
 def _error_text(error: Exception) -> str:
     parts = []
     for value in (
@@ -502,6 +591,22 @@ def _error_text(error: Exception) -> str:
             except Exception:
                 pass
     return " ".join(parts).lower()
+
+
+def _is_reasoning_echo_required_error(error: Exception) -> bool:
+    """Return True only for an upstream-declared reasoning replay requirement."""
+    if getattr(error, "status_code", None) not in {400, 422}:
+        return False
+    text = _error_text(error)
+    if "reasoning_content" not in text:
+        return False
+    return (
+        "must be passed back" in text
+        or (
+            "thinking mode" in text
+            and ("is required" in text or "required field" in text)
+        )
+    )
 
 
 def _is_deepseek_thinking_default_model(agent: Any) -> bool:
@@ -689,11 +794,17 @@ def _enforce_single_plan_interaction_tool_call(
             None,
         )
         if selected is None:
+            returned_names = sorted({
+                name
+                for name in (_tool_call_name(call) for call in tool_calls)
+                if name
+            })[:4]
             assistant_message.tool_calls = []
             _filter_provider_replay_tool_calls(assistant_message, None)
             logger.warning(
                 "zet_agent video edit: provider violated forced skill_view; "
-                "dropping all tool calls before execution"
+                "dropping all tool calls before execution (returned=%s)",
+                returned_names or ["<unnamed>"],
             )
             return bool(tool_calls)
         if len(tool_calls) == 1:
@@ -914,6 +1025,30 @@ def _append_api_system_instruction(
     api_kwargs["messages"] = patched
 
 
+def _append_api_system_instruction_once(
+    api_kwargs: Dict[str, Any], instruction: str
+) -> bool:
+    """Append an API-only instruction once across repeated provider sealing."""
+    messages = api_kwargs.get("messages")
+    if not instruction or not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and instruction in content:
+            return False
+        if isinstance(content, list) and any(
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and instruction in str(part.get("text") or "")
+            for part in content
+        ):
+            return False
+    _append_api_system_instruction(api_kwargs, instruction)
+    return True
+
+
 def _user_image_fallback_state(content: Any) -> tuple[bool, bool]:
     """Return whether user content has images and independent authored text."""
     if isinstance(content, str):
@@ -1066,34 +1201,70 @@ def _apply_forced_video_edit_skill_view(
 
     selected_tool = None
     tools = api_kwargs.get("tools")
-    if not isinstance(tools, list):
-        tools = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        function = tool.get("function")
-        if not isinstance(function, dict) or function.get("name") != "skill_view":
-            continue
-        selected_tool = copy.deepcopy(tool)
-        selected_function = selected_tool["function"]
-        parameters = selected_function.get("parameters")
-        if not isinstance(parameters, dict):
-            parameters = {}
-        original_properties = parameters.get("properties")
-        if not isinstance(original_properties, dict):
-            original_properties = {}
-        original_name = original_properties.get("name")
-        name_schema = (
-            dict(original_name) if isinstance(original_name, dict) else {}
+    live_valid_tool_names = set(
+        getattr(agent, "valid_tool_names", set()) or set()
+    )
+    policy_valid_tool_names = set(
+        getattr(
+            agent,
+            "_zet_agent_execution_policy_valid_tool_names",
+            set(),
         )
-        name_schema.update({"type": "string", "enum": [_VIDEO_EDIT_SKILL_NAME]})
-        selected_function["parameters"] = {
-            "type": "object",
-            "properties": {"name": name_schema},
-            "required": ["name"],
-            "additionalProperties": False,
-        }
-        break
+        or set()
+    )
+    skill_view_authorized = "skill_view" in (
+        live_valid_tool_names | policy_valid_tool_names
+    )
+    tool_sources = (
+        [tools]
+        if skill_view_authorized and isinstance(tools, list)
+        else []
+    )
+
+    # A trusted silent turn deliberately narrows ``agent.tools`` after
+    # ``skill_view`` succeeds.  If a malformed/out-of-policy follow-up
+    # revokes that scope, the next protocol retry still needs to expose the
+    # original attested bootstrap tool.  Use the request-local policy snapshot
+    # captured before narrowing; it contains only the tools authorized for this
+    # turn and never grants an execution tool by itself.
+    for source_name in ("_zet_agent_execution_policy_tools", "tools"):
+        source = getattr(agent, source_name, None)
+        if (
+            skill_view_authorized
+            and isinstance(source, (list, tuple))
+            and source not in tool_sources
+        ):
+            tool_sources.append(source)
+
+    for source in tool_sources:
+        for tool in source:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict) or function.get("name") != "skill_view":
+                continue
+            selected_tool = copy.deepcopy(tool)
+            selected_function = selected_tool["function"]
+            parameters = selected_function.get("parameters")
+            if not isinstance(parameters, dict):
+                parameters = {}
+            original_properties = parameters.get("properties")
+            if not isinstance(original_properties, dict):
+                original_properties = {}
+            original_name = original_properties.get("name")
+            name_schema = (
+                dict(original_name) if isinstance(original_name, dict) else {}
+            )
+            name_schema.update({"type": "string", "enum": [_VIDEO_EDIT_SKILL_NAME]})
+            selected_function["parameters"] = {
+                "type": "object",
+                "properties": {"name": name_schema},
+                "required": ["name"],
+                "additionalProperties": False,
+            }
+            break
+        if selected_tool is not None:
+            break
 
     # Filtering is unconditional: a misconfigured request must not expose a
     # side-effect tool while the trusted execution scope is absent.
@@ -1110,7 +1281,26 @@ def _apply_forced_video_edit_skill_view(
         )
         return False
 
-    api_kwargs["tool_choice"] = "required"
+    # The silent policy snapshot is also the authoritative validation scope.
+    # Re-exposing only the schema is insufficient: response validation would
+    # otherwise reject the exact forced call as an unknown tool before the
+    # attestation handler can mint a fresh execution scope.
+    if "skill_view" not in live_valid_tool_names:
+        agent.valid_tool_names = live_valid_tool_names | {"skill_view"}
+        logger.info(
+            "zet_agent video edit: restored trusted skill_view validation "
+            "from the execution-policy snapshot"
+        )
+
+    # This bootstrap has exactly one safe, signed tool target. A generic
+    # ``required`` choice still lets non-conforming OpenAI-compatible models
+    # hallucinate another tool name, forcing a retry before any skill bytes are
+    # read. Bind the provider request to the exact function as well as the
+    # already narrowed schema; response validation remains fail-closed below.
+    api_kwargs["tool_choice"] = {
+        "type": "function",
+        "function": {"name": "skill_view"},
+    }
     disabled_thinking = _should_disable_thinking_for_forced_tool_choice(agent)
     if disabled_thinking:
         agent._zet_agent_force_present_plan_disable_thinking = True
@@ -1468,9 +1658,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    skip_memory_context = getattr(agent, "_skip_memory_context", False) is True
     stored_prompt = None
     stored_state = "missing"
-    if conversation_history and agent._session_db:
+    if conversation_history and agent._session_db and not skip_memory_context:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:
@@ -1547,7 +1738,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
     is_brand_new_session = not conversation_history
-    if is_brand_new_session:
+    if is_brand_new_session and not skip_memory_context:
         # Plugin hook: on_session_start — fired once when a brand-new
         # session is created (not on continuation, not after a
         # hot-reload-driven rebuild).  Plugins can use this to
@@ -1580,7 +1771,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # to log at DEBUG, which silently broke prefix-cache reuse on the
     # gateway path (fresh AIAgent per turn → reads from this row every
     # subsequent turn).
-    if agent._session_db:
+    if agent._session_db and not skip_memory_context:
         try:
             updated = agent._session_db.update_system_prompt(
                 agent.session_id, agent._cached_system_prompt
@@ -2276,6 +2467,12 @@ def _apply_context_engine_selection(
     value yields the unmodified ``api_messages``. The result is request-only —
     persisted conversation history is never mutated here.
     """
+    # Strict/silent executions must not expose frozen workflow context to an
+    # external context-engine plugin.  The agent initializer records this
+    # policy before any turn starts; keep the guard here as a second, local
+    # enforcement point for resumed turns and custom callers.
+    if bool(getattr(agent, "_strict_memory_isolation", False)):
+        return api_messages
     engine = getattr(agent, "context_compressor", None)
     if engine is None or not hasattr(engine, "select_context"):
         return api_messages
@@ -2358,6 +2555,8 @@ def _notify_context_engine_turn_complete(
     ``messages`` is passed as a shallow copy so the engine cannot mutate the
     persisted transcript.
     """
+    if bool(getattr(agent, "_strict_memory_isolation", False)):
+        return
     engine = getattr(agent, "context_compressor", None)
     hook = getattr(engine, "on_turn_complete", None)
     if engine is None or not callable(hook):
@@ -2560,6 +2759,8 @@ def run_conversation(
         explicit_skill_slug=trusted_skill_slug,
         tool_execution_allowed=not tools_disabled_for_request,
     )
+    agent._zet_agent_transport_attested_skill = None
+    activate_transport_selected_trusted_skill(agent)
     # Zettlab App plan 模式：本轮每次模型调用只允许 clarify / present_plan。
     agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(
         agent, original_user_message
@@ -2642,6 +2843,33 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+
+    # Subnet discovery is a trusted-client workflow. Return its actionable
+    # card before Codex/provider/tool execution; the scan starts only after the
+    # user confirms in the first-party client.
+    _hardware_preflight_response = hardware_enrollment_preflight_response(
+        agent,
+        original_user_message,
+    )
+    if _hardware_preflight_response:
+        messages.append({"role": "assistant", "content": _hardware_preflight_response})
+        from agent.turn_finalizer import finalize_turn as _finalize_preflight_turn
+
+        return _finalize_preflight_turn(
+            agent,
+            final_response=_hardware_preflight_response,
+            api_call_count=0,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(hardware_enrollment_preflight)",
+        )
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -3481,6 +3709,10 @@ def run_conversation(
                 _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
                 _apply_forced_present_plan_tool_choice(agent, api_kwargs)
                 _apply_forced_video_edit_skill_view(agent, api_kwargs)
+                _append_api_system_instruction_once(
+                    api_kwargs,
+                    transport_attested_skill_instruction(agent),
+                )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -6587,6 +6819,25 @@ def run_conversation(
                     and not classified.should_fallback
                 )
                 if is_client_error:
+                    # Opaque model aliases may switch upstream families without
+                    # changing the public provider/model name. Learn the
+                    # capability only from the upstream's explicit validation
+                    # response, repair the replay payload, and retry once. A
+                    # different route gets a different capability key; strict
+                    # providers that reject the field never enter this branch.
+                    if (
+                        getattr(agent, "api_mode", "") == "chat_completions"
+                        and not _retry.reasoning_echo_retry_attempted
+                        and _is_reasoning_echo_required_error(api_error)
+                    ):
+                        _retry.reasoning_echo_retry_attempted = True
+                        agent._learn_reasoning_echo_for_current_route()
+                        if agent._reapply_reasoning_echo_for_provider(api_messages):
+                            agent._buffer_vprint(
+                                "🧠 Upstream requires reasoning_content replay; "
+                                "repaired assistant tool-call history and retrying once."
+                            )
+                            continue
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /

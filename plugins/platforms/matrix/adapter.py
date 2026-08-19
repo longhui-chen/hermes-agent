@@ -81,6 +81,7 @@ try:
         PresenceState,
         RoomCreatePreset,
         RoomID,
+        SpecVersions,
         SyncToken,
         TrustState,
         UserID,
@@ -120,6 +121,11 @@ except ImportError:
 
     RoomCreatePreset = _RoomCreatePresetStub  # type: ignore[misc,assignment]
 
+    class _SpecVersionsStub:  # type: ignore[no-redef]
+        V111 = "v1.11"
+
+    SpecVersions = _SpecVersionsStub  # type: ignore[misc,assignment]
+
     class _TrustStateStub:  # type: ignore[no-redef]
         UNVERIFIED = 0
         VERIFIED = 1
@@ -133,9 +139,14 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    _read_httpx_body_with_limit,
+    inbound_media_download_permit,
     log_media_intake_failure,
+    read_aiohttp_body_with_limit,
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
+    safe_exc,
+    safe_url_for_log,
     _ssrf_redirect_guard,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
@@ -153,7 +164,20 @@ _MATRIX_MEDIA_KIND = {
     MessageType.DOCUMENT: "file",
 }
 
+DEFAULT_MATRIX_MAX_MEDIA_BYTES = 100 * 1024 * 1024
+
 _MATRIX_VOICE_WAVEFORM_BINS = 30
+
+
+def _matrix_allow_all_users() -> bool:
+    return any(
+        os.getenv(name, "").lower() in {"true", "1", "yes"}
+        for name in ("MATRIX_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS")
+    )
+
+
+class _MatrixInboundMediaRejected(ValueError):
+    """实际媒体流超过本 adapter 上限，禁止再降级成远程 URL。"""
 
 
 def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
@@ -685,7 +709,7 @@ def _create_matrix_session(proxy_url: str | None):
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
-                proxy_url,
+                safe_url_for_log(proxy_url),
             )
             return aiohttp.ClientSession(trust_env=True)
 
@@ -1203,11 +1227,22 @@ class MatrixAdapter(BasePlatformAdapter):
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
         if self._proxy_url:
-            logger.info("Matrix: proxy configured — %s", self._proxy_url)
+            logger.info(
+                "Matrix: proxy configured — %s", safe_url_for_log(self._proxy_url)
+            )
         try:
-            self._max_media_bytes = int(os.getenv("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
+            configured_media_limit = int(
+                os.getenv("MATRIX_MAX_MEDIA_BYTES", str(DEFAULT_MATRIX_MAX_MEDIA_BYTES))
+            )
         except ValueError:
-            self._max_media_bytes = 100 * 1024 * 1024
+            configured_media_limit = DEFAULT_MATRIX_MAX_MEDIA_BYTES
+        # 共享流 reader 把非正数解释为“不限”，不能让一个环境变量关闭
+        # Matrix 入站媒体的累计字节门。
+        self._max_media_bytes = (
+            configured_media_limit
+            if configured_media_limit > 0
+            else DEFAULT_MATRIX_MAX_MEDIA_BYTES
+        )
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # Matrix clients split long messages around 4000 chars.
@@ -2265,7 +2300,7 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.warning(
                 "Matrix: failed to download image %s: %s",
                 _redact_url_for_log(image_url),
-                exc,
+                safe_exc(exc),
             )
             fallback = (
                 "I couldn't download and upload the image to Matrix. "
@@ -2285,113 +2320,34 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def _download_external_media_with_cap(self, url: str) -> tuple[bytes, str, str]:
         """Download external media while enforcing redirect safety and size caps."""
-        from tools.url_safety import is_safe_url
+        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
         if not is_safe_url(url):
             raise ValueError("blocked unsafe media URL")
-
-        def _check_content_length(headers: Any) -> None:
-            raw = None
-            try:
-                raw = headers.get("Content-Length") or headers.get("content-length")
-            except Exception:
-                raw = None
-            if raw is None:
-                return
-            try:
-                size = int(raw)
-            except (TypeError, ValueError):
-                return
-            if size > self._max_media_bytes:
-                raise ValueError(
-                    f"media exceeds Matrix limit ({size} > {self._max_media_bytes} bytes)"
-                )
-
-        def _check_image_content_type(content_type: str) -> str:
-            content_type = str(content_type or "").split(";", 1)[0].strip().lower()
-            if not content_type.startswith("image/"):
-                raise ValueError("external media is not an image")
-            return content_type
-
-        def _append_chunk(parts: list[bytes], total: int, chunk: bytes) -> int:
-            total += len(chunk)
-            if total > self._max_media_bytes:
-                raise ValueError(
-                    f"media exceeds Matrix limit (> {self._max_media_bytes} bytes)"
-                )
-            parts.append(chunk)
-            return total
-
         fname = url.rsplit("/", 1)[-1].split("?")[0] or "image.png"
-
-        def _safe_redirect_target(current_url: str, location: str) -> str:
-            """Resolve a redirect Location and re-validate it against SSRF policy.
-
-            A public-looking URL can 302-redirect the gateway toward loopback,
-            private-network, or cloud-metadata endpoints. Validating only the
-            final URL is insufficient because the connection to the unsafe hop
-            has already been made. Re-check every hop before following it.
-            """
-            next_url = urljoin(current_url, location)
-            if not is_safe_url(next_url):
-                raise ValueError("blocked unsafe redirect URL")
-            return next_url
-
-        try:
-            import aiohttp as _aiohttp
-
-            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(self._proxy_url)
-            async with _aiohttp.ClientSession(**_sess_kw) as http:
-                fetch_url = url
-                for _ in range(20):
-                    async with http.get(
-                        fetch_url,
-                        timeout=_aiohttp.ClientTimeout(total=30),
-                        allow_redirects=False,
-                        **_req_kw,
-                    ) as resp:
-                        if resp.status in {301, 302, 303, 307, 308}:
-                            location = resp.headers.get("Location")
-                            if not location:
-                                raise ValueError("redirect missing Location")
-                            fetch_url = _safe_redirect_target(fetch_url, location)
-                            continue
-                        resp.raise_for_status()
-                        _check_content_length(resp.headers)
-                        parts: list[bytes] = []
-                        total = 0
-                        async for chunk in resp.content.iter_chunked(65536):
-                            total = _append_chunk(parts, total, bytes(chunk))
-                        ct = _check_image_content_type(
-                            getattr(resp, "content_type", None)
-                            or resp.headers.get("content-type", "application/octet-stream")
-                        )
-                        return b"".join(parts), ct, fname
-                raise ValueError("too many redirects")
-        except ImportError:
-            from tools.url_safety import create_ssrf_safe_async_client
-
-            _httpx_kw: dict = {}
-            if self._proxy_url:
-                _httpx_kw["proxy"] = self._proxy_url
-            _httpx_kw["event_hooks"] = {"response": [_ssrf_redirect_guard]}
-            async with create_ssrf_safe_async_client(**_httpx_kw) as http:
-                async with http.stream(
-                    "GET",
-                    url,
-                    follow_redirects=True,
-                    timeout=30,
-                ) as resp:
+        client_kwargs: dict = {
+            "timeout": 30,
+            "follow_redirects": True,
+            "event_hooks": {"response": [_ssrf_redirect_guard]},
+        }
+        if self._proxy_url:
+            client_kwargs["proxy"] = self._proxy_url
+        async with create_ssrf_safe_async_client(**client_kwargs) as http:
+            async with inbound_media_download_permit():
+                async with http.stream("GET", url) as resp:
                     resp.raise_for_status()
-                    _check_content_length(resp.headers)
-                    parts: list[bytes] = []
-                    total = 0
-                    async for chunk in resp.aiter_bytes():
-                        total = _append_chunk(parts, total, bytes(chunk))
-                    ct = _check_image_content_type(
-                        resp.headers.get("content-type", "application/octet-stream")
+                    data = await _read_httpx_body_with_limit(
+                        resp,
+                        media_type="Matrix outbound image",
+                        max_bytes=self._max_media_bytes,
+                        permit_acquired=True,
                     )
-                    return b"".join(parts), ct, fname
+                content_type = str(
+                    resp.headers.get("content-type", "application/octet-stream")
+                ).split(";", 1)[0].strip().lower()
+                if not content_type.startswith("image/"):
+                    raise ValueError("external media is not an image")
+                return data, content_type, fname
 
     async def send_image_file(
         self,
@@ -2412,13 +2368,14 @@ class MatrixAdapter(BasePlatformAdapter):
         images: list[tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> bool:
         """Send multiple Matrix images as one ordered logical batch."""
         if not images:
-            return
+            return False
         from urllib.parse import unquote as _unquote
 
         total = len(images)
+        sent_any = False
         for idx, (image_url, alt_text) in enumerate(images, start=1):
             if human_delay > 0 and idx > 1:
                 await asyncio.sleep(human_delay)
@@ -2441,6 +2398,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
             if not result.success:
                 logger.warning("Matrix: failed to send image %d/%d: %s", idx, total, result.error)
+            else:
+                sent_any = True
+        return sent_any
 
     async def send_document(
         self,
@@ -3452,14 +3412,16 @@ class MatrixAdapter(BasePlatformAdapter):
             event_size_int = int(event_size) if event_size is not None else 0
         except (TypeError, ValueError):
             event_size_int = 0
-        if event_size_int and event_size_int > self._max_media_bytes:
+        declared_oversize = bool(
+            event_size_int and event_size_int > self._max_media_bytes
+        )
+        if declared_oversize:
             logger.warning(
                 "[Matrix] Rejecting oversized inbound media %s (%d > %d bytes)",
                 event_id,
                 event_size_int,
                 self._max_media_bytes,
             )
-            return
 
         # For encrypted media, the URL may be in file.url.
         file_content = source_content.get("file", {})
@@ -3498,14 +3460,46 @@ class MatrixAdapter(BasePlatformAdapter):
         elif event_mimetype:
             media_type = event_mimetype
 
+        # Mention/room gate and共享授权必须先于任何媒体网络/磁盘开销。
+        ctx = await self._resolve_message_context(
+            room_id,
+            sender,
+            event_id,
+            body,
+            source_content,
+            relates_to,
+        )
+        if ctx is None:
+            return
+        body, is_dm, chat_type, thread_id, display_name, source = ctx
+        if self._is_sender_authorized(sender, chat_type, room_id) is False:
+            await self.handle_message(MessageEvent(
+                text=body,
+                message_type=msg_type,
+                source=source,
+                raw_message=source_content,
+                message_id=event_id,
+            ))
+            return
+
         # Cache media locally when downstream tools need a real file path.
         cached_path = None
+        media_unavailable_note = ""
+        # MXC v1.11 下载需要 Bearer，旧服务端则是另一条 v3 URL；下游模型
+        # 两者都无法协商/附带认证。因此失败时只给可行动占位，不发裸 HTTP URL。
+        allow_http_fallback = False
         should_cache_locally = msg_type in {
             MessageType.PHOTO, MessageType.AUDIO, MessageType.VIDEO, MessageType.DOCUMENT,
         } or is_voice_message or is_encrypted_media
-        if should_cache_locally and url:
+        if declared_oversize:
+            media_unavailable_note = (
+                f"[{_MATRIX_MEDIA_KIND.get(msg_type, 'file')} attachment "
+                "unavailable: it exceeds the configured size limit; "
+                "ask the user to send a smaller file]"
+            )
+        elif should_cache_locally and url:
             try:
-                file_bytes = await self._client.download_media(ContentURI(url))
+                file_bytes = await self._download_mxc_media_with_cap(str(url))
                 if file_bytes is not None:
                     if is_encrypted_media:
                         from mautrix.crypto.attachments import decrypt_attachment
@@ -3545,6 +3539,11 @@ class MatrixAdapter(BasePlatformAdapter):
                                 event_id,
                             )
                             file_bytes = None
+                            media_unavailable_note = (
+                                f"[{_MATRIX_MEDIA_KIND.get(msg_type, 'file')} "
+                                "attachment unavailable: encrypted media metadata "
+                                "is incomplete; ask the user to send it again]"
+                            )
 
                     if file_bytes is not None:
                         from gateway.platforms.base import (
@@ -3584,6 +3583,38 @@ class MatrixAdapter(BasePlatformAdapter):
                                 file_bytes, filename
                             )
             except Exception as e:
+                if isinstance(e, _MatrixInboundMediaRejected):
+                    allow_http_fallback = False
+                    media_unavailable_note = (
+                        f"[{_MATRIX_MEDIA_KIND.get(msg_type, 'file')} attachment "
+                        "unavailable: it exceeds the configured size limit; "
+                        "ask the user to send a smaller file]"
+                    )
+                elif is_encrypted_media:
+                    media_unavailable_note = (
+                        f"[{_MATRIX_MEDIA_KIND.get(msg_type, 'file')} attachment "
+                        "unavailable: it could not be decrypted; ask the user "
+                        "to send it again]"
+                    )
+                else:
+                    try:
+                        legacy_public_media = not (
+                            await self._client.versions()
+                        ).supports(SpecVersions.V111)
+                    except Exception:
+                        legacy_public_media = False
+                    if legacy_public_media:
+                        http_url = str(self._client.api.get_download_url(
+                            ContentURI(str(url)), authenticated=False,
+                        ))
+                        allow_http_fallback = True
+                        media_unavailable_note = ""
+                    else:
+                        media_unavailable_note = (
+                            f"[{_MATRIX_MEDIA_KIND.get(msg_type, 'file')} attachment "
+                            "unavailable: it could not be downloaded; ask the user "
+                            "to send it again]"
+                        )
                 # ⚠️ 分格声明:Matrix 的下载 URL(`_mxc_to_http`)是
                 # `{homeserver}/_matrix/client/v1/media/download/...`,**不带**
                 # 签名参数或 access_token(认证走 Authorization 头)⇒ 这里
@@ -3598,22 +3629,11 @@ class MatrixAdapter(BasePlatformAdapter):
                     url=http_url, exc=e, event_id=event_id,
                 )
 
-        ctx = await self._resolve_message_context(
-            room_id,
-            sender,
-            event_id,
-            body,
-            source_content,
-            relates_to,
-        )
-        if ctx is None:
-            return
-        body, is_dm, chat_type, thread_id, display_name, source = ctx
-
         if msgtype == "m.image" and _looks_like_matrix_image_filename(body):
             body = ""
+        if media_unavailable_note:
+            body = f"{body}\n\n{media_unavailable_note}".strip()
 
-        allow_http_fallback = bool(http_url) and not is_encrypted_media
         media_urls = (
             [cached_path]
             if cached_path
@@ -3633,6 +3653,88 @@ class MatrixAdapter(BasePlatformAdapter):
 
         await self.handle_message(msg_event)
 
+    async def _download_mxc_media_with_cap(self, mxc_url: str) -> bytearray:
+        """复用 mautrix 的端点/认证协商流式下载，并在缓冲前执行大小门。"""
+        if not self._client or not getattr(self._client, "api", None):
+            raise RuntimeError("Matrix client API is unavailable")
+        api = self._client.api
+        # 跟 mautrix 0.21.0 download_media() 保持同一协议决策：v1.11+
+        # 用带 Bearer 的 client/v1 authenticated-media；旧 homeserver
+        # 继续用无需认证的 media/v3。密码登录得到的新 token 在 api.token，
+        # 不能回读启动配置里的 self._access_token。
+        authenticated = (await self._client.versions()).supports(
+            SpecVersions.V111
+        )
+        download_url = api.get_download_url(
+            ContentURI(mxc_url), authenticated=authenticated
+        )
+        # 让 homeserver 代理媒体正文；⛔ 不把带认证的下载交给任意 3xx 目标。
+        # SDK 的 endpoint/token/version 协商保持不变，只收紧重定向语义。
+        query_params = {"allow_redirect": "false"}
+        headers = {}
+        if authenticated:
+            headers["Authorization"] = f"Bearer {api.token}"
+            if api.as_user_id:
+                query_params["user_id"] = api.as_user_id
+        request_id = api.log_download_request(download_url, query_params)
+        started_at = time.monotonic()
+        async with inbound_media_download_permit():
+            async with api.session.get(
+                download_url,
+                params=query_params,
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
+                try:
+                    if 300 <= response.status < 400:
+                        if authenticated:
+                            raise RuntimeError("Authenticated Matrix media redirect refused")
+                        location = response.headers.get("Location") or response.headers.get("location")
+                        if not location:
+                            raise RuntimeError("Matrix media redirect missing Location")
+                        redirect_url = urljoin(str(download_url), str(location))
+                        from tools.url_safety import (
+                            create_ssrf_safe_async_client,
+                            is_safe_url,
+                        )
+                        if not is_safe_url(redirect_url):
+                            raise RuntimeError("Unsafe Matrix media redirect refused")
+                        async with create_ssrf_safe_async_client(
+                            timeout=30,
+                            follow_redirects=True,
+                            event_hooks={"response": [_ssrf_redirect_guard]},
+                        ) as redirect_client:
+                            async with redirect_client.stream("GET", redirect_url) as redirected:
+                                redirected.raise_for_status()
+                                try:
+                                    return await _read_httpx_body_with_limit(
+                                        redirected,
+                                        media_type="Matrix inbound media",
+                                        max_bytes=self._max_media_bytes,
+                                        permit_acquired=True,
+                                    )
+                                except ValueError as exc:
+                                    raise _MatrixInboundMediaRejected(str(exc)) from exc
+                    status_result = response.raise_for_status()
+                    if inspect.isawaitable(status_result):
+                        await status_result
+                    try:
+                        return await read_aiohttp_body_with_limit(
+                            response,
+                            media_type="Matrix inbound media",
+                            max_bytes=self._max_media_bytes,
+                            permit_acquired=True,
+                        )
+                    except ValueError as exc:
+                        raise _MatrixInboundMediaRejected(str(exc)) from exc
+                finally:
+                    api.log_download_request_done(
+                        download_url,
+                        request_id,
+                        time.monotonic() - started_at,
+                        response.status,
+                    )
+
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""
 
@@ -3645,11 +3747,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # federated Matrix user could invite the bot into arbitrary rooms,
         # exposing its presence and metadata. Mirrors the allow-list gate
         # used on the message/reaction paths.
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
-            "true",
-            "1",
-            "yes",
-        }
+        allow_all = _matrix_allow_all_users()
         if not allow_all and not (
             self._allowed_user_ids and inviter in self._allowed_user_ids
         ):
@@ -4016,11 +4114,7 @@ class MatrixAdapter(BasePlatformAdapter):
         prompt: Any,
         prompt_label: str,
     ) -> bool:
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
-            "true",
-            "1",
-            "yes",
-        }
+        allow_all = _matrix_allow_all_users()
         if not allow_all and not (
             self._allowed_user_ids and sender in self._allowed_user_ids
         ):

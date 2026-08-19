@@ -36,7 +36,7 @@ def _trusted_context(monkeypatch):
         "ZETTLAB_LOCAL_SERVER_URL": "http://127.0.0.1:19090",
         "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
     }.get(name, default))
-    monkeypatch.setattr(module, "business_execution_token", lambda: "execution-token")
+    monkeypatch.setattr(module, "hardware_execution_token", lambda: "execution-token")
     monkeypatch.setattr(module, "get_session_env", lambda name, default="": {
         "HERMES_SESSION_ID": "zettlab:owner:agent:chat",
         "HERMES_TURN_ID": "turn-1",
@@ -60,7 +60,9 @@ def test_ssh_control_forwards_unrestricted_command_through_trusted_loopback(monk
     assert captured["trust_env"] is False
     assert captured["json"]["command"] == "cd / && find . -type f | sort > /tmp/all-files"
     assert captured["headers"]["X-Zettlab-Agent-Action-Token"] == "action-token"
-    assert captured["headers"]["X-Zettlab-Business-Execution-Token"] == "execution-token"
+    assert captured["headers"]["X-Zettlab-Hardware-Execution-Token"] == "execution-token"
+    retired_header = "X-Zettlab-Business-" + "Execution-Token"
+    assert retired_header not in captured["headers"]
     assert captured["timeout"] == 125
 
 
@@ -89,7 +91,7 @@ def test_ssh_control_encodes_file_write_and_never_accepts_remote_credentials(mon
 
 def test_ssh_control_stays_discoverable_but_dispatch_denies_without_execution_token(monkeypatch):
     _trusted_context(monkeypatch)
-    monkeypatch.setattr(module, "business_execution_token", lambda: "")
+    monkeypatch.setattr(module, "hardware_execution_token", lambda: "")
 
     assert module._check_ssh_control() is True
     assert json.loads(module.ssh_control_tool({"action": "list_connections"}))["code"] == "ssh_authorization_unavailable"

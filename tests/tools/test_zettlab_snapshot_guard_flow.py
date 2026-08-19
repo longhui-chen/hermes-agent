@@ -65,6 +65,24 @@ def _install(monkeypatch, *replies):
     return rec
 
 
+def _scope_denied_error():
+    body = json.dumps(
+        {
+            "error": {
+                "code": "SNAPSHOT_AGENT_PATH_OUT_OF_SCOPE",
+                "message": "path out of scope",
+            }
+        }
+    ).encode("utf-8")
+    return urllib.error.HTTPError(
+        "http://127.0.0.1:19090/api/v1/internal/snapshot/agent-protection/ensure",
+        403,
+        "Forbidden",
+        None,
+        io.BytesIO(body),
+    )
+
+
 def test_dispatch_writes_through_when_snapshot_unavailable_flow(monkeypatch, tmp_path):
     """本特性完全不可用时，行为与 2026-07-29 引入它之前完全一致（PRD 附录 B #18，
     验收 §19 #1b）。
@@ -218,3 +236,52 @@ def test_snapshot_gate_sees_final_middleware_rewritten_args_flow(monkeypatch, tm
     assert rec.requests[0]["body"]["paths"] == [str(real)], "ensure 必须看到改写后的最终路径"
     assert real.read_text(encoding="utf-8") == "overwritten", "写入落在改写后的目标上"
     assert decoy.read_text(encoding="utf-8") == "d", "诱饵路径不该被动"
+
+
+def test_dispatch_runs_trusted_proactive_helper_without_snapshotting_gateway_cwd_flow(
+    monkeypatch,
+):
+    from tools import terminal_tool
+
+    rec = _install(monkeypatch, _scope_denied_error())
+    command = (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/'
+        'scripts/proactive_video.py" --agent-id main resolve '
+        '--manifest-id pvm_' + "A" * 32
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_parse_video_edit_runtime_command",
+        lambda _command: types.SimpleNamespace(
+            argv=[
+                "python3",
+                "/trusted/proactive_video.py",
+                "--agent-id",
+                "main",
+                "resolve",
+                "--manifest-id",
+                "pvm_" + "A" * 32,
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "terminal_tool",
+        lambda **_kwargs: json.dumps(
+            {
+                "output": "resolved",
+                "exit_code": 0,
+                "video_edit_runtime_direct": True,
+            }
+        ),
+    )
+
+    result = model_tools.handle_function_call(
+        "terminal",
+        {"command": command},
+        task_id="main",
+        turn_id="pvm-" + "a" * 24,
+    )
+
+    assert json.loads(result)["video_edit_runtime_direct"] is True
+    assert rec.requests == []

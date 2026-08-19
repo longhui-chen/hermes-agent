@@ -124,6 +124,15 @@ def test_safe_exc_redacts_and_bounds_data_uri_payloads():
     assert out.startswith("RuntimeError:") and len(out) <= 2100
 
 
+def test_safe_exc_redacts_multiline_data_uri_payloads():
+    payload = "QUJDREVGR0g=\nSElKS0xNTk8="
+    out = safe_exc(RuntimeError(f"activity='data:image/png;base64,{payload}' failed"))
+
+    assert "QUJD" not in out and "SElK" not in out
+    assert "<data-uri>" in out and "failed" in out
+    assert "\n" not in out
+
+
 # ───────── ③ 闭集门：作用域内⛔不许再有裸异常进日志 ─────────
 
 

@@ -1,0 +1,6 @@
+# Reviewed resolver policy for reproducible ZPK builds. Keep this as an
+# absolute RFC3339 cutoff because the supported uv 0.7.x parser does not accept
+# relative durations or the newer per-package config table. The lockfile pins
+# the exceptional packages directly. Advance the cutoff with the next lock
+# refresh rather than making the package build depend on host/user time.
+exclude-newer = "2026-08-04T00:00:00Z"
