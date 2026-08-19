@@ -2266,22 +2266,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
-        if (
-            agent._tool_guardrail_halt_decision is not None
-            and i < len(assistant_message.tool_calls)
-        ):
-            _append_cancelled_tool_results(
-                messages,
-                assistant_message.tool_calls[i:],
-                reason="guardrail halt",
-            )
-            _flush_session_db_after_tool_progress(
-                agent,
-                messages,
-                stage="guardrail halt cancelled tool results",
-            )
-            break
-
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -2345,27 +2329,9 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for segment_index, (kind, calls) in enumerate(segments):
+    for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):
             return
-        if agent._tool_guardrail_halt_decision is not None:
-            remaining_calls = [
-                call
-                for _, later_calls in segments[segment_index:]
-                for call in later_calls
-            ]
-            if remaining_calls:
-                _append_cancelled_tool_results(
-                    messages,
-                    remaining_calls,
-                    reason="guardrail halt",
-                )
-                _flush_session_db_after_tool_progress(
-                    agent,
-                    messages,
-                    stage="guardrail halt cancelled tool segments",
-                )
-            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(

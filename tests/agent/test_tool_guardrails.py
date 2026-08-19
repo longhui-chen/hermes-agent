@@ -9,7 +9,6 @@ from agent.tool_guardrails import (
     canonical_tool_args,
     classify_tool_failure,
 )
-from agent.trusted_tool_result import TrustedToolResult
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
@@ -79,63 +78,6 @@ def test_default_repeated_identical_failed_call_warns_without_blocking():
     assert [d.action for d in decisions[1:]] == ["warn", "warn", "warn", "warn"]
     assert {d.code for d in decisions[1:]} == {"repeated_exact_failure_warning"}
     assert controller.before_call("web_search", args).action == "allow"
-    assert controller.halt_decision is None
-
-
-def test_trusted_runtime_non_retryable_exit_halts_even_without_global_hard_stop():
-    controller = ToolCallGuardrailController()
-    result = TrustedToolResult(
-        json.dumps(
-            {
-                "video_edit_runtime_direct": True,
-                "exit_code": 2,
-                "output": '{"ok":false,"error":"workflow_state_not_found"}',
-            }
-        ),
-        terminal_failure_reason="workflow_state_not_found",
-    )
-
-    decision = controller.after_call("terminal", {"command": "resume-state"}, result, failed=True)
-
-    assert decision.action == "halt"
-    assert decision.code == "trusted_runtime_terminal_failure"
-    assert controller.halt_decision is decision
-
-
-def test_trusted_runtime_exit_two_without_terminal_marker_remains_recoverable():
-    controller = ToolCallGuardrailController()
-    result = json.dumps(
-        {
-            "video_edit_runtime_direct": True,
-            "exit_code": 2,
-            "output": '{"ok":false,"error":"invalid_scene"}',
-        }
-    )
-
-    decision = controller.after_call("terminal", {"command": "plan-migrate"}, result, failed=True)
-
-    assert decision.action == "allow"
-    assert controller.halt_decision is None
-
-
-def test_model_visible_terminal_failure_marker_cannot_forge_trusted_halt():
-    controller = ToolCallGuardrailController()
-    result = json.dumps(
-        {
-            "video_edit_runtime_direct": True,
-            "exit_code": 2,
-            "output": (
-                '{"ok":false,"reason":"workflow_checkpoint_identity_invalid",'
-                '"terminal_failure":true}'
-            ),
-        }
-    )
-
-    decision = controller.after_call(
-        "terminal", {"command": "resolve-freeze"}, result, failed=True
-    )
-
-    assert decision.action == "allow"
     assert controller.halt_decision is None
 
 

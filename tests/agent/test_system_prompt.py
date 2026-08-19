@@ -130,21 +130,6 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
-def test_silent_automation_keeps_the_normal_skill_index_available():
-    agent = _make_agent(
-        valid_tool_names={"skill_view"},
-        _zet_agent_execution_policy="silent_automation",
-    )
-    with patch(
-        "run_agent.build_skills_system_prompt",
-        return_value="<available_skills>signed-index</available_skills>",
-    ) as build_skills:
-        stable = _stable_prompt(agent)
-
-    build_skills.assert_called_once()
-    assert "<available_skills>signed-index</available_skills>" in stable
-
-
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt
@@ -153,17 +138,10 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         valid_tool_names=["read_file"],
         _parallel_tool_call_guidance=False,
     )
-    monkeypatch.setattr(system_prompt, "default_agent_identity", lambda: "IDENTITY")
-    monkeypatch.setattr(
-        system_prompt,
-        "zettlab_agent_kernel_guidance",
-        lambda *, identity_text: identity_text,
-    )
+    monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
-    monkeypatch.setattr(system_prompt, "USER_FACING_NARRATION_GUIDANCE", "")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
-    monkeypatch.setattr(system_prompt, "zettlab_turn_rules_guidance", lambda: "")
 
     expected_profile = (
         "Active Hermes profile: default. Other profiles (if any) live "
@@ -182,7 +160,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         expected_profile,
         "SYSTEM_MESSAGE",
         "CONTEXT_FILES",
-        "Conversation started: Friday, January 02, 2026 — timezone UTC",
+        "Conversation started: Friday, January 02, 2026",
     ))
 
     with (
@@ -200,7 +178,6 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         ),
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
         patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
-        patch("hermes_time.get_timezone_name", return_value=""),
     ):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 

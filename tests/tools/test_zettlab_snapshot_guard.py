@@ -318,39 +318,6 @@ def test_trusted_video_plan_migrate_does_not_snapshot_gateway_cwd(
     assert rec.requests == []
 
 
-def test_trusted_proactive_resolve_does_not_snapshot_gateway_cwd(
-    monkeypatch, tmp_path
-):
-    from tools import terminal_tool
-
-    rec = _install(monkeypatch)
-    monkeypatch.setattr(
-        terminal_tool,
-        "_parse_video_edit_runtime_command",
-        lambda _command: types.SimpleNamespace(
-            argv=[
-                sys.executable,
-                "/trusted/proactive_video.py",
-                "--agent-id",
-                "main",
-                "resolve",
-                "--manifest-id",
-                "pvm_" + "A" * 32,
-            ]
-        ),
-    )
-
-    command = (
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/'
-        'scripts/proactive_video.py" --agent-id main resolve '
-        '--manifest-id pvm_' + "A" * 32
-    )
-    assert guard.maybe_require_snapshot(
-        "terminal", {"command": command}, turn_id="pvm-" + "a" * 24
-    ) is None
-    assert rec.requests == []
-
-
 def test_trusted_camera_action_does_not_snapshot_gateway_cwd(
     monkeypatch, tmp_path
 ):
@@ -394,62 +361,6 @@ def test_untrusted_camera_command_keeps_generic_cwd_protection(
     command = (
         'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/'
         'camera_connector.py" list && rm -f note.txt'
-    )
-    assert guard.maybe_require_snapshot(
-        "terminal", {"command": command}, turn_id="turn_1"
-    ) is None
-    assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
-
-
-def test_trusted_printer3d_action_does_not_snapshot_gateway_cwd(
-    monkeypatch, tmp_path
-):
-    from tools import terminal_tool
-
-    rec = _install(monkeypatch)
-    monkeypatch.setattr(
-        terminal_tool,
-        "_parse_printer3d_runtime_command",
-        lambda _command: types.SimpleNamespace(
-            argv=[
-                sys.executable,
-                "/trusted/printer3d_control.py",
-                "pause",
-                "--printer-id",
-                "printer-1",
-                "--idempotency-key",
-                "idem-1",
-            ]
-        ),
-    )
-
-    command = (
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/printer3d-control/scripts/'
-        'printer3d_control.py" pause --printer-id printer-1 '
-        '--idempotency-key idem-1'
-    )
-    assert guard.maybe_require_snapshot(
-        "terminal", {"command": command}, turn_id="turn_1"
-    ) is None
-    assert rec.requests == []
-
-
-def test_untrusted_printer3d_command_keeps_generic_cwd_protection(
-    monkeypatch, tmp_path
-):
-    from tools import terminal_tool
-
-    rec = _install(monkeypatch, {"ready": True, "operations": []})
-    monkeypatch.setattr(
-        terminal_tool,
-        "_parse_printer3d_runtime_command",
-        lambda _command: None,
-    )
-
-    command = (
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/printer3d-control/scripts/'
-        'printer3d_control.py" pause --printer-id printer-1 '
-        '--idempotency-key idem-1; rm -f note.txt'
     )
     assert guard.maybe_require_snapshot(
         "terminal", {"command": command}, turn_id="turn_1"

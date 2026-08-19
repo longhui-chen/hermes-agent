@@ -123,6 +123,17 @@ async def test_invalid_content_length_header_does_not_break_download():
     assert await read_aiohttp_body_with_limit(r, media_type="test") == b"ok"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_length", [11, None])
+async def test_callers_can_apply_a_smaller_platform_cap(content_length):
+    """LINE 图片 10 MiB 等平台上限必须能收紧全局默认值。"""
+    r = _FakeResponse([b"x" * 11], content_length=content_length)
+    with pytest.raises(ValueError, match="11 bytes > 10 bytes"):
+        await read_aiohttp_body_with_limit(
+            r, media_type="platform image", max_bytes=10,
+        )
+
+
 def test_weixin_has_no_bare_read_on_media_paths():
     """闭集：微信的两条媒体路径⛔ 不许再出现裸 ``response.read()``。
 

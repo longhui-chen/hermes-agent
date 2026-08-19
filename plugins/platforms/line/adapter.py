@@ -122,6 +122,8 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_image_from_url,
     cache_video_from_bytes,
+    get_inbound_media_max_bytes,
+    read_aiohttp_body_with_limit,
     safe_exc,
 )
 from gateway.config import Platform
@@ -613,7 +615,9 @@ class _LineClient:
         except Exception as exc:  # best-effort; never raise
             logger.debug("LINE loading indicator failed: %s", exc)
 
-    async def fetch_content(self, message_id: str) -> bytes:
+    async def fetch_content(
+        self, message_id: str, *, max_bytes: Optional[int] = None,
+    ) -> bytes:
         """Download an inbound media message's binary content."""
         import aiohttp
         url = LINE_CONTENT_URL_FMT.format(message_id=message_id)
@@ -622,7 +626,9 @@ class _LineClient:
             async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
                 if resp.status >= 400:
                     raise RuntimeError(f"LINE content {resp.status}")
-                return await resp.read()
+                return await read_aiohttp_body_with_limit(
+                    resp, media_type="LINE inbound media", max_bytes=max_bytes,
+                )
 
     async def get_bot_user_id(self) -> Optional[str]:
         """Fetch this channel's own userId so we can filter self-messages."""
@@ -1212,8 +1218,21 @@ class LineAdapter(BasePlatformAdapter):
     ) -> Tuple[Optional[str], str]:
         if not self._client or not message_id:
             return None, ""
+        configured_limit = get_inbound_media_max_bytes()
+        platform_limit = {
+            "image": LINE_IMAGE_MAX_BYTES,
+            "audio": LINE_AV_MAX_BYTES,
+            "video": LINE_AV_MAX_BYTES,
+        }.get(msg_type)
+        positive_limits = [
+            limit for limit in (configured_limit, platform_limit)
+            if limit is not None and limit > 0
+        ]
+        max_bytes = min(positive_limits) if positive_limits else 0
         try:
-            data = await self._client.fetch_content(message_id)
+            data = await self._client.fetch_content(
+                message_id, max_bytes=max_bytes,
+            )
         except Exception as exc:
             logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
             return None, ""

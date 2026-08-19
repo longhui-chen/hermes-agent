@@ -49,27 +49,12 @@ def request_agentcomputer_token(
 def request_app_auto_refresh_token(
     agent_id: str,
     *,
-    operation_digest: str,
-    owner_agent_id: str,
-    turn_id: str,
-    session_id: str,
     socket_path: str | os.PathLike[str] | None = None,
 ) -> str:
-    """Request a scope bound to one server-attested operation and turn."""
-    fields = (operation_digest, owner_agent_id, turn_id, session_id)
-    if any(not isinstance(value, str) or not value.strip() for value in fields):
-        raise RuntimeError("App Host operation binding is incomplete")
-    if not re.fullmatch(r"[0-9a-f]{64}", operation_digest):
-        raise RuntimeError("App Host operation digest is invalid")
+    """Request the scope certifying an approved create-app-agent payload."""
 
     return _request_scoped_token(
-        agent_id,
-        "app-auto-refresh",
-        operation_digest=operation_digest,
-        owner_agent_id=owner_agent_id,
-        turn_id=turn_id,
-        session_id=session_id,
-        socket_path=socket_path,
+        agent_id, "app-auto-refresh", socket_path=socket_path
     )
 
 
@@ -78,12 +63,11 @@ def _request_scoped_token(
     purpose: str,
     *,
     socket_path: str | os.PathLike[str] | None = None,
-    **binding: str,
 ) -> str:
 
     normalized_agent_id = _normalize_agent_id(agent_id)
     payload = json.dumps(
-        {"agent_id": normalized_agent_id, "purpose": purpose, **binding},
+        {"agent_id": normalized_agent_id, "purpose": purpose},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")

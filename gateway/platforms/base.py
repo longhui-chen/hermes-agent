@@ -935,7 +935,12 @@ def validate_inbound_media_size(
         )
 
 
-async def read_aiohttp_body_with_limit(response, *, media_type: str) -> bytearray:
+async def read_aiohttp_body_with_limit(
+    response,
+    *,
+    media_type: str,
+    max_bytes: Optional[int] = None,
+) -> bytearray:
     """aiohttp 版的「有上限地读响应体」。
 
     ⭐ 判据结构逐字照抄下面的 httpx 版 ``_read_httpx_body_with_limit``:
@@ -950,7 +955,7 @@ async def read_aiohttp_body_with_limit(response, *, media_type: str) -> bytearra
     之后才轮到落盘处的大小校验 —— 在 1C2G 设备上单个超大附件就能把进程
     撑爆,大小门根本来不及生效。⭐「先读完再校验」= 没有校验。
     """
-    max_bytes = get_inbound_media_max_bytes()
+    max_bytes = get_inbound_media_max_bytes() if max_bytes is None else max_bytes
     content_length = response.headers.get("content-length")
     if content_length:
         try:

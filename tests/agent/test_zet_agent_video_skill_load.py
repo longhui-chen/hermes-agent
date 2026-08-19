@@ -9,10 +9,8 @@ from agent.conversation_loop import (
     _apply_forced_video_edit_skill_view,
     _apply_zet_agent_plan_tool_visibility,
     _enforce_single_plan_interaction_tool_call,
-    _seal_video_edit_provider_request,
     _valid_tool_names_for_response,
 )
-from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 from gateway.session_context import clear_turn_vars, set_turn_vars
 from run_agent import AIAgent
 
@@ -165,10 +163,7 @@ def test_video_edit_first_request_forces_exact_skill_view_without_mutating_regis
 
     assert _apply_forced_video_edit_skill_view(_agent(), api_kwargs)
 
-    assert api_kwargs["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "skill_view"},
-    }
+    assert api_kwargs["tool_choice"] == "required"
     assert api_kwargs["parallel_tool_calls"] is False
     assert [tool["function"]["name"] for tool in api_kwargs["tools"]] == [
         "skill_view"
@@ -192,66 +187,6 @@ def test_video_edit_first_request_forces_exact_skill_view_without_mutating_regis
     assert skill_tool["function"]["parameters"] == original_skill_parameters
 
 
-def test_video_edit_skill_force_recovers_skill_view_from_policy_snapshot(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        "agent.conversation_loop.trusted_skill_scope_active",
-        lambda _agent: False,
-    )
-    policy_skill_tool = _tool("skill_view")
-    agent = _agent(
-        # The active scope narrowed the live set to execution tools before it
-        # failed; the policy snapshot is the same-turn attested source.
-        tools=[_tool("terminal")],
-        valid_tool_names={"terminal"},
-        _zet_agent_execution_policy_tools=[policy_skill_tool, _tool("terminal")],
-        _zet_agent_execution_policy_valid_tool_names={"skill_view", "terminal"},
-    )
-    api_kwargs = {"tools": [_tool("terminal")]}
-
-    assert _apply_forced_video_edit_skill_view(agent, api_kwargs)
-    assert [tool["function"]["name"] for tool in api_kwargs["tools"]] == [
-        "skill_view"
-    ]
-    assert api_kwargs["tools"][0]["function"]["parameters"]["properties"][
-        "name"
-    ]["enum"] == [_VIDEO_EDIT_SKILL]
-    assert "tool_choice" in api_kwargs
-    assert _valid_tool_names_for_response(agent) == {"skill_view", "terminal"}
-    exact = _tool_call("skill_view", '{"name":"video-edit-workflow-mini"}')
-    assistant_message = SimpleNamespace(tool_calls=[exact], provider_data={})
-    assert not _enforce_single_plan_interaction_tool_call(
-        agent,
-        assistant_message,
-    )
-    assert assistant_message.tool_calls == [exact]
-    assert policy_skill_tool["function"]["parameters"]["properties"]["name"] == {
-        "type": "string",
-        "description": "Skill name",
-    }
-
-
-def test_video_edit_skill_force_does_not_restore_unauthorized_policy_tool(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        "agent.conversation_loop.trusted_skill_scope_active",
-        lambda _agent: False,
-    )
-    agent = _agent(
-        tools=[_tool("terminal")],
-        valid_tool_names={"terminal"},
-        _zet_agent_execution_policy_tools=[_tool("skill_view"), _tool("terminal")],
-        _zet_agent_execution_policy_valid_tool_names={"terminal"},
-    )
-    api_kwargs = {"tools": [_tool("terminal")]}
-
-    assert not _apply_forced_video_edit_skill_view(agent, api_kwargs)
-    assert api_kwargs["tools"] == []
-    assert agent.valid_tool_names == {"terminal"}
-
-
 def test_video_edit_skill_force_stops_after_trusted_scope_activates(monkeypatch):
     monkeypatch.setattr(
         "agent.conversation_loop.trusted_skill_scope_active",
@@ -265,103 +200,6 @@ def test_video_edit_skill_force_stops_after_trusted_scope_activates(monkeypatch)
         "terminal",
     ]
     assert "tool_choice" not in api_kwargs
-
-
-def test_provider_boundary_reseals_bootstrap_after_middleware_replacement(
-    monkeypatch,
-):
-    """A replacement payload cannot bypass the exact skill_view bootstrap."""
-    monkeypatch.setattr(
-        "agent.conversation_loop.trusted_skill_scope_active",
-        lambda _agent: False,
-    )
-    skill_tool = _tool("skill_view")
-    agent = _agent(
-        valid_tool_names={"skill_view", "terminal"},
-        _zet_agent_execution_policy_tools=[skill_tool, _tool("terminal")],
-        _zet_agent_execution_policy_valid_tool_names={"skill_view", "terminal"},
-    )
-    # This is the shape an execution middleware replacement could return after
-    # the normal conversation-loop policy pass.
-    replacement = {
-        "messages": [{"role": "user", "content": "剪辑"}],
-        "tools": [_tool("terminal")],
-        "tool_choice": "required",
-        "reasoning_effort": "high",
-    }
-    client = MagicMock()
-    client.chat.completions.create.return_value = _text_response("ok")
-
-    _dispatch_nonstreaming_api_request(
-        agent,
-        replacement,
-        make_client=lambda *_args, **_kwargs: client,
-    )
-
-    sent = client.chat.completions.create.call_args.kwargs
-    assert [tool["function"]["name"] for tool in sent["tools"]] == [
-        "skill_view"
-    ]
-    assert sent["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "skill_view"},
-    }
-    assert sent["parallel_tool_calls"] is False
-    assert sent["extra_body"] == {"thinking": {"type": "disabled"}}
-    assert "reasoning_effort" not in sent
-
-
-def test_provider_boundary_reseals_active_scope_follow_up(monkeypatch):
-    """Follow-up provider calls retain the trusted allowlist and no-thinking policy."""
-    monkeypatch.setattr(
-        "agent.conversation_loop.trusted_skill_scope_active",
-        lambda _agent: True,
-    )
-    monkeypatch.setattr(
-        "agent.conversation_loop.trusted_skill_allowed_tool_names",
-        lambda _agent: frozenset({"terminal"}),
-    )
-    agent = _agent(valid_tool_names={"skill_view", "terminal", "todo"})
-    replacement = {
-        "tools": [_tool("terminal"), _tool("todo")],
-        "tool_choice": {
-            "type": "function",
-            "function": {"name": "terminal"},
-        },
-        "reasoning_effort": "high",
-    }
-
-    assert _seal_video_edit_provider_request(agent, replacement)
-    assert [tool["function"]["name"] for tool in replacement["tools"]] == [
-        "terminal"
-    ]
-    assert replacement["parallel_tool_calls"] is False
-    assert replacement["extra_body"] == {"thinking": {"type": "disabled"}}
-    assert "reasoning_effort" not in replacement
-
-
-def test_policy_exhausted_scope_is_not_an_active_capability():
-    tokens = set_turn_vars(turn_id="policy-exhausted-video")
-    try:
-        identity = response_mode._current_skill_direct_turn_identity()
-        assert identity is not None
-        task = response_mode._SkillDirectTaskContext(
-            task_sha256="task-policy-exhausted",
-            turn_identity=identity,
-            video_edit_applicable=True,
-        )
-        agent = _agent(_zet_agent_skill_direct_task=task)
-        agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
-            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
-            task_sha256=task.task_sha256,
-            turn_identity=identity,
-            allowed_tools=frozenset(),
-            policy_exhausted=True,
-        )
-
-        assert response_mode.trusted_skill_scope_active(agent) is False
-    finally:
-        clear_turn_vars(tokens)
 
 
 def test_video_edit_skill_force_does_not_change_non_video_or_plan_requests(monkeypatch):
@@ -484,138 +322,11 @@ def test_video_edit_plain_text_is_bounded_to_two_protocol_retries():
         result = agent.run_conversation("剪辑\n[file: /data/input.mp4]")
 
     assert api_call.call_count == 3
-    assert all(
-        call.args[0]["tool_choice"]
-        == {
-            "type": "function",
-            "function": {"name": "skill_view"},
-        }
-        for call in api_call.call_args_list
-    )
     assert result["failed"] is True
     assert result["completed"] is False
     assert "video-edit skill protocol error" in result["error"].lower()
     assert all(
         not message.get("_video_edit_skill_protocol_synthetic")
-        for message in result["messages"]
-    )
-
-
-def test_silent_transport_attestation_accepts_terminal_when_provider_ignores_tool_choice(
-    monkeypatch,
-):
-    """The provider is no longer responsible for returning exact skill_view."""
-    agent = _runtime_agent(("skill_view", "terminal"))
-    policy_tools = [_tool("skill_view"), _tool("terminal")]
-    agent._zet_agent_execution_policy = "silent_automation"
-    agent._zet_agent_execution_policy_tools = policy_tools
-    agent._zet_agent_execution_policy_valid_tool_names = {
-        "skill_view",
-        "terminal",
-    }
-    agent.tools = [policy_tools[0]]
-    agent.valid_tool_names = {"skill_view"}
-    agent._zet_agent_trusted_user_message = (
-        '{"proactive_manifest_id":"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-        '"trigger_id":"pvm-aaaaaaaaaaaaaaaaaaaaaaaa"}'
-    )
-    agent._zet_agent_trusted_skill_slug = _VIDEO_EDIT_SKILL
-
-    def attest_transport_scope(runtime_agent):
-        task = runtime_agent._zet_agent_skill_direct_task
-        runtime_agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
-            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
-            task_sha256=task.task_sha256,
-            turn_identity=task.turn_identity,
-            allowed_tools=response_mode._VIDEO_EDIT_DIRECT_TOOLS,
-            execution_receipt=response_mode._TrustedExecutionReceipt(
-                agent_id="main",
-                action_token="",
-                hardware_execution_token="",
-                business_execution_action="a" * 64,
-                business_execution_action_version="1",
-                turn_id="provider-ignored-tool-choice",
-                session_id="api-lineage",
-                gateway_session_key="proactive-provider-ignore",
-                execution_policy="silent_automation",
-            ),
-        )
-        response_mode._activate_execution_policy_tools(
-            runtime_agent,
-            response_mode._VIDEO_EDIT_DIRECT_TOOLS,
-        )
-        return True
-
-    monkeypatch.setattr(
-        "agent.conversation_loop.activate_transport_selected_trusted_skill",
-        attest_transport_scope,
-    )
-    monkeypatch.setattr(
-        "agent.conversation_loop.transport_attested_skill_instruction",
-        lambda _agent: "# signed proactive video skill",
-    )
-    terminal = _tool_response(
-        "terminal",
-        json.dumps(
-            {
-                "command": (
-                    'python3 "$ZETTLAB_PRESETS_DIR/skills/'
-                    'video-edit-workflow-mini/scripts/proactive_video.py" '
-                    '--agent-id "main" resolve --manifest-id '
-                    '"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
-                )
-            }
-        ),
-    )
-    completed = _text_response("done")
-
-    def execute_terminal(assistant_message, messages, *_args):
-        call = assistant_message.tool_calls[0]
-        assert call.function.name == "terminal"
-        messages.append(
-            {
-                "role": "tool",
-                "name": "terminal",
-                "tool_call_id": call.id,
-                "content": '{"output":"{}","exit_code":0}',
-            }
-        )
-
-    turn_tokens = set_turn_vars(turn_id="provider-ignored-tool-choice")
-    try:
-        with (
-            patch.object(
-                agent,
-                "_interruptible_api_call",
-                side_effect=[terminal, completed],
-            ) as api_call,
-            patch.object(
-                agent,
-                "_execute_tool_calls",
-                side_effect=execute_terminal,
-            ) as execute,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("ignored provider bootstrap")
-    finally:
-        clear_turn_vars(turn_tokens)
-
-    assert api_call.call_count == 2
-    first_request = api_call.call_args_list[0].args[0]
-    assert [
-        tool["function"]["name"] for tool in first_request["tools"]
-    ] == ["terminal"]
-    assert "tool_choice" not in first_request
-    assert "signed proactive video skill" in first_request["messages"][0][
-        "content"
-    ]
-    execute.assert_called_once()
-    assert result["completed"] is True
-    assert result["final_response"] == "done"
-    assert all(
-        "signed proactive video skill" not in str(message.get("content") or "")
         for message in result["messages"]
     )
 
@@ -655,41 +366,6 @@ def test_trusted_video_memory_schema_is_scoped_even_when_platform_omits_it(
     ] == ["terminal"]
 
 
-def test_silent_provider_replacement_is_sealed_to_policy_scope(monkeypatch):
-    agent = _agent(
-        valid_tool_names={"skill_view", "terminal", "todo", "clarify"},
-        _zet_agent_execution_policy="silent_automation",
-        _zet_agent_execution_policy_valid_tool_names={"skill_view", "terminal"},
-    )
-    monkeypatch.setattr(
-        "agent.conversation_loop.trusted_skill_scope_active",
-        lambda _agent: True,
-    )
-    monkeypatch.setattr(
-        "agent.conversation_loop.trusted_skill_allowed_tool_names",
-        lambda _agent: frozenset({"terminal", "todo", "clarify"}),
-    )
-
-    api_kwargs = {
-        "tools": [_tool("terminal"), _tool("todo"), _tool("clarify")],
-        "tool_choice": {"type": "function", "function": {"name": "todo"}},
-        "toolConfig": {
-            "tools": [_tool("terminal"), _tool("present_plan")],
-            "toolChoice": {"tool": {"name": "present_plan"}},
-        },
-    }
-
-    assert _seal_video_edit_provider_request(agent, api_kwargs)
-    assert [tool["function"]["name"] for tool in api_kwargs["tools"]] == [
-        "terminal"
-    ]
-    assert [
-        tool["function"]["name"] for tool in api_kwargs["toolConfig"]["tools"]
-    ] == ["terminal"]
-    assert "tool_choice" not in api_kwargs
-    assert "toolChoice" not in api_kwargs["toolConfig"]
-
-
 def test_plan_success_memory_authorization_matches_memory_tool_shape():
     content = (
         "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
@@ -723,309 +399,6 @@ def test_plan_success_memory_authorization_matches_memory_tool_shape():
     ) == frozenset({
         response_mode._canonical_memory_payload_sha256(memory_args)
     })
-
-
-def test_plan_success_replace_authorization_matches_copied_helper_shape():
-    old_content = (
-        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
-        '{"s":{"daily":{"p":{"st":"daily_vlog"}}},"v":1}\n'
-        "-->"
-    )
-    new_content = (
-        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
-        '{"s":{"daily":{"p":{"st":"freestyle"}}},"v":1}\n'
-        "-->"
-    )
-    helper_operation = {
-        "action": "replace",
-        "content": new_content,
-        "old_text": old_content,
-        "target": "memory",
-    }
-    terminal_result = {
-        "output": json.dumps(
-            {"ok": True, "operations": [helper_operation]},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-    }
-    copied_helper_args = {"operations": [helper_operation]}
-    standard_memory_args = {
-        "target": "memory",
-        "operations": [{
-            "action": "replace",
-            "content": new_content,
-            "old_text": old_content,
-        }],
-    }
-
-    copied_digest = response_mode._canonical_memory_payload_sha256(
-        copied_helper_args
-    )
-    assert copied_digest == response_mode._canonical_memory_payload_sha256(
-        standard_memory_args
-    )
-    assert response_mode._memory_payload_hashes_from_terminal_result(
-        terminal_result
-    ) == frozenset({copied_digest})
-
-
-def test_plan_success_single_memory_operation_matches_helper_batch_shape():
-    content = (
-        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
-        '{"s":{"daily":{"p":{"st":"freestyle"}}},"v":1}\n'
-        "-->"
-    )
-    operation = {
-        "action": "replace",
-        "content": content,
-        "old_text": content,
-        "target": "memory",
-    }
-    terminal_result = {
-        "output": json.dumps(
-            {"ok": True, "operations": [operation]},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-    }
-    batch_args = {"operations": [operation]}
-    single_args = {
-        key: value for key, value in operation.items() if key != "operations"
-    }
-
-    digest = response_mode._canonical_memory_payload_sha256(batch_args)
-    assert response_mode._canonical_memory_payload_sha256(single_args) == digest
-    assert response_mode._memory_payload_hashes_from_terminal_result(
-        terminal_result
-    ) == frozenset({digest})
-    assert response_mode._memory_authorization_for_scope(
-        single_args,
-        response_mode._SkillDirectScope(
-            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
-            task_sha256="task",
-            turn_identity=("turn", object()),
-            allowed_tools=frozenset({"memory"}),
-            memory_payload_sha256=frozenset({digest}),
-        ),
-    ) == (digest, "")
-
-
-def test_targetless_single_memory_operation_infers_only_helper_target():
-    operation = {
-        "action": "replace",
-        "content": "new preference",
-        "old_text": "old preference",
-        "target": "memory",
-    }
-    terminal_result = {
-        "output": json.dumps(
-            {"ok": True, "operations": [operation]},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-    }
-    targetless_args = {
-        key: value for key, value in operation.items() if key != "target"
-    }
-    digest = response_mode._canonical_memory_payload_sha256(
-        {"operations": [operation]}
-    )
-    scope = response_mode._SkillDirectScope(
-        relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
-        task_sha256="task",
-        turn_identity=("turn", object()),
-        allowed_tools=frozenset({"memory"}),
-        memory_payload_sha256=frozenset({digest}),
-        memory_payload_shape_authorizations=(
-            response_mode._memory_payload_shape_authorizations_from_terminal_result(
-                terminal_result
-            )
-        ),
-    )
-
-    assert response_mode._memory_authorization_for_scope(
-        targetless_args, scope
-    ) == (digest, "memory")
-    assert response_mode._memory_authorization_for_scope(
-        {**targetless_args, "target": "user"}, scope
-    ) == ("", "")
-
-
-def test_targetless_memory_copy_is_bound_to_helper_target_and_exact_body():
-    operation = {
-        "action": "replace",
-        "content": "new preference",
-        "old_text": "old preference",
-        "target": "memory",
-    }
-    terminal_result = {
-        "output": json.dumps(
-            {"ok": True, "operations": [operation]},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-    }
-    helper_args = {"operations": [operation]}
-    targetless_args = {
-        "operations": [
-            {key: value for key, value in operation.items() if key != "target"}
-        ]
-    }
-    full_digest = response_mode._canonical_memory_payload_sha256(helper_args)
-    shape_authorizations = (
-        response_mode._memory_payload_shape_authorizations_from_terminal_result(
-            terminal_result
-        )
-    )
-    scope = response_mode._SkillDirectScope(
-        relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
-        task_sha256="task",
-        turn_identity=("turn", object()),
-        allowed_tools=frozenset({"memory"}),
-        memory_payload_sha256=frozenset({full_digest}),
-        memory_payload_shape_authorizations=shape_authorizations,
-    )
-
-    assert response_mode._memory_authorization_for_scope(
-        targetless_args, scope
-    ) == (full_digest, "memory")
-    assert response_mode._memory_authorization_for_scope(
-        {
-            "operations": [
-                {"action": "replace", "content": "tampered", "old_text": "old preference"}
-            ]
-        },
-        scope,
-    ) == ("", "")
-    assert response_mode._memory_authorization_for_scope(
-        {**targetless_args, "target": "user"},
-        scope,
-    ) == ("", "")
-
-
-def test_trusted_video_plan_success_replace_commits_copied_single_operation_flow(
-    monkeypatch,
-    tmp_path,
-):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    config = {
-        "memory": {
-            "memory_enabled": True,
-            "user_profile_enabled": True,
-            "memory_char_limit": 2200,
-            "user_char_limit": 1375,
-        }
-    }
-    with patch("hermes_cli.config.load_config", return_value=config):
-        agent = _runtime_agent(
-            ("skill_view", "clarify", "todo", "terminal"),
-            enabled_toolsets=["hermes-zet-agent", "cronjob"],
-            skip_memory=False,
-        )
-
-    old_content = (
-        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
-        '{"s":{"daily":{"p":{"st":"daily_vlog"}}},"v":1}\n'
-        "-->"
-    )
-    new_content = (
-        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
-        '{"s":{"daily":{"p":{"st":"freestyle"}}},"v":1}\n'
-        "-->"
-    )
-    assert agent._memory_store.add("memory", old_content)["success"] is True
-    helper_operation = {
-        "action": "replace",
-        "content": new_content,
-        "old_text": old_content,
-        "target": "memory",
-    }
-    terminal_result = json.dumps(
-        {
-            "output": json.dumps(
-                {"ok": True, "operations": [helper_operation]},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            "exit_code": 0,
-            "error": None,
-            "video_edit_runtime_direct": True,
-        },
-        ensure_ascii=False,
-    )
-    terminal_args = {
-        "command": (
-            "python3 \"$ZETTLAB_PRESETS_DIR/skills/"
-            "video-edit-workflow-mini/scripts/preference_resolver.py\" "
-            "plan-success --workflow-state /tmp/workflow_state.json"
-        ),
-        "timeout": 120,
-    }
-    receipt = response_mode._TrustedExecutionReceipt(
-        agent_id="agent-1",
-        action_token="action-secret",
-        hardware_execution_token="",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
-        turn_id="trusted-memory-helper-copy",
-        session_id="session-1",
-    )
-
-    turn_tokens = set_turn_vars(turn_id="trusted-memory-helper-copy")
-    try:
-        task = response_mode._skill_direct_task_context(agent, "剪辑")
-        agent._zet_agent_skill_direct_task = task
-        agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
-            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
-            task_sha256=task.task_sha256,
-            turn_identity=task.turn_identity,
-            allowed_tools=frozenset({"terminal"}),
-            execution_receipt=receipt,
-        )
-        agent._zet_agent_skill_direct_operation = None
-        monkeypatch.setattr(
-            response_mode,
-            "_video_edit_command_policy",
-            lambda _args: (True, True),
-        )
-
-        assert response_mode.trusted_skill_operation_block_message(
-            agent,
-            function_name="terminal",
-            function_args=terminal_args,
-        ) is None
-        response_mode.dispatch_trusted_skill_operation(
-            agent,
-            function_name="terminal",
-            function_args=terminal_args,
-            dispatch=lambda: terminal_result,
-        )
-        assert "memory" in response_mode.trusted_skill_allowed_tool_names(agent)
-
-        # Some providers copy the helper operation into the official single-op
-        # memory shape but silently omit target. The trusted scope must recover
-        # that target only from the exact helper result, rather than treating
-        # an unscoped memory write as safe.
-        targetless_operation = {
-            key: value for key, value in helper_operation.items() if key != "target"
-        }
-        assistant_message = _tool_response(
-            "memory",
-            json.dumps(targetless_operation, ensure_ascii=False),
-        ).choices[0].message
-        messages = []
-        agent._execute_tool_calls_sequential(
-            assistant_message,
-            messages,
-            "trusted-memory-helper-copy-task",
-        )
-    finally:
-        clear_turn_vars(turn_tokens)
-
-    assert agent._memory_store.memory_entries == [new_content]
-    tool_result = next(message for message in messages if message["role"] == "tool")
-    assert json.loads(tool_result["content"])["success"] is True
 
 
 def test_trusted_video_response_exception_is_limited_to_memory(monkeypatch):
@@ -1195,19 +568,16 @@ def test_trusted_video_receipt_and_rearm_ignore_plugin_result_rewrite(
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
         action_token="action-secret",
-        hardware_execution_token="",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
+        business_execution_token="business-secret",
         turn_id="trusted-terminal-plugin-boundary",
         session_id="session-1",
     )
     expected_receipt = {
         "ZET_AGENT_ID": "agent-1",
-        "ZETTLAB_BUSINESS_EXECUTION_ACTION": "a" * 64,
-        "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION": "1",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "action-secret",
+        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-secret",
         "HERMES_TURN_ID": "trusted-terminal-plugin-boundary",
-        "HERMES_SESSION_KEY": "",
-        "HERMES_SESSION_ID": "session-1",
+        "HERMES_SESSION_KEY": "session-1",
     }
     events = []
 
@@ -1315,9 +685,7 @@ def test_trusted_video_terminal_authorization_normalizes_registry_args(
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
         action_token="action-secret",
-        hardware_execution_token="",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
+        business_execution_token="business-secret",
         turn_id="trusted-terminal-coercion",
         session_id="session-1",
     )
@@ -1366,52 +734,6 @@ def test_trusted_video_terminal_authorization_normalizes_registry_args(
     assert json.loads(result)["exit_code"] == 0
 
 
-def test_trusted_video_receipt_preserves_stable_and_lineage_sessions():
-    receipt = response_mode._TrustedExecutionReceipt(
-        agent_id="agent-1",
-        action_token="action-secret",
-        hardware_execution_token="",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
-        turn_id="pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
-        session_id="api-lineage-tip",
-        gateway_session_key="proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
-        execution_policy="silent_automation",
-    )
-    token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
-    try:
-        captured = response_mode.trusted_video_edit_runtime_receipt()
-    finally:
-        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(token)
-
-    assert captured["HERMES_SESSION_KEY"] == "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
-    assert captured["HERMES_SESSION_ID"] == "api-lineage-tip"
-    assert (
-        captured["HERMES_GATEWAY_SESSION_KEY"]
-        == "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
-    )
-    assert captured["HERMES_EXECUTION_POLICY"] == "silent_automation"
-
-
-def test_trusted_video_receipt_rejects_legacy_hardware_token():
-    receipt = response_mode._TrustedExecutionReceipt(
-        agent_id="agent-1",
-        action_token="",
-        hardware_execution_token="b" * 64,
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
-        turn_id="video-legacy-isolation",
-        session_id="api-lineage-tip",
-        gateway_session_key="video-stable-session",
-        execution_policy="silent_automation",
-    )
-    token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
-    try:
-        assert response_mode.trusted_video_edit_runtime_receipt() == {}
-    finally:
-        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(token)
-
-
 @pytest.mark.parametrize(
     ("rewrite_result", "expected_scope"),
     [(False, True), (True, False)],
@@ -1425,12 +747,10 @@ def test_trusted_skill_scope_uses_final_displayed_skill_view_result(
     monkeypatch.setattr(
         response_mode,
         "_capture_trusted_execution_receipt",
-        lambda _turn_identity, _relative_path: response_mode._TrustedExecutionReceipt(
+        lambda _turn_identity: response_mode._TrustedExecutionReceipt(
             agent_id="agent-1",
             action_token="action-secret",
-            hardware_execution_token="",
-            business_execution_action="a" * 64,
-            business_execution_action_version="1",
+            business_execution_token="business-secret",
             turn_id="final-skill-view-result",
             session_id="session-1",
         ),
@@ -1517,9 +837,7 @@ def test_trusted_video_blocks_terminal_args_changed_after_preflight(monkeypatch)
     receipt = response_mode._TrustedExecutionReceipt(
         agent_id="agent-1",
         action_token="action-secret",
-        hardware_execution_token="",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
+        business_execution_token="business-secret",
         turn_id="trusted-terminal-args",
         session_id="session-1",
     )

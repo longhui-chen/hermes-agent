@@ -366,7 +366,6 @@ def build_turn_context(
     if recovered_history is not None:
         conversation_history = recovered_history
 
-
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
     # Creating it here — before _cached_system_prompt is populated — inserts a
@@ -1099,19 +1098,6 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
-    # governor 的会话作用域必须跟这一轮**最终生效**的 session 一致，所以绑定放在
-    # 这里——本轮所有会旋转 session 的动作（turn-start 的旋转恢复、idle 压缩、
-    # preflight 压缩）都已经跑完，紧接着就是 pre_llm_call。
-    #
-    # 绑早了会怎样：压缩把 agent.session_id 旋转成 canonical child，而响应头回给
-    # 客户端的是 child；推荐卡却存进了父 scope，客户端照响应头提交动作时 governor
-    # 在 child scope 里找不到刚展示的 proposal，只能拒绝——那张卡从此点不动。
-    #
-    # 显式的 gateway key 不受影响：它本来就是调用方指定的稳定作用域，压缩不动它。
-    agent._creation_governor_conversation_session_id = (
-        getattr(agent, "_gateway_session_key", None) or agent.session_id
-    )
-
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
@@ -1122,9 +1108,6 @@ def build_turn_context(
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
-            conversation_session_id=(
-                agent._creation_governor_conversation_session_id
-            ),
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,
@@ -1141,18 +1124,12 @@ def build_turn_context(
                 or ""
             ),
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
-            execution_policy=(
-                getattr(agent, "_zet_agent_execution_policy", None) or ""
-            ),
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
             structured_output=_structured_output,
             supports_followup_turns=bool(
                 getattr(agent, "_supports_followup_turns", True)
             ),
             streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
-            creation_action_receipt_transport=getattr(
-                agent, "_creation_action_receipt_transport", ""
-            ),
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

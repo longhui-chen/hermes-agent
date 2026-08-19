@@ -134,6 +134,7 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
     log_media_intake_failure,
+    read_aiohttp_body_with_limit,
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
     _ssrf_redirect_guard,
@@ -154,6 +155,10 @@ _MATRIX_MEDIA_KIND = {
 }
 
 _MATRIX_VOICE_WAVEFORM_BINS = 30
+
+
+class _MatrixInboundMediaRejected(ValueError):
+    """实际媒体流超过本 adapter 上限，禁止再降级成远程 URL。"""
 
 
 def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
@@ -3500,12 +3505,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Cache media locally when downstream tools need a real file path.
         cached_path = None
+        allow_http_fallback = bool(http_url) and not is_encrypted_media
         should_cache_locally = msg_type in {
             MessageType.PHOTO, MessageType.AUDIO, MessageType.VIDEO, MessageType.DOCUMENT,
         } or is_voice_message or is_encrypted_media
         if should_cache_locally and url:
             try:
-                file_bytes = await self._client.download_media(ContentURI(url))
+                file_bytes = await self._download_mxc_media_with_cap(str(url))
                 if file_bytes is not None:
                     if is_encrypted_media:
                         from mautrix.crypto.attachments import decrypt_attachment
@@ -3584,6 +3590,13 @@ class MatrixAdapter(BasePlatformAdapter):
                                 file_bytes, filename
                             )
             except Exception as e:
+                if isinstance(e, _MatrixInboundMediaRejected):
+                    allow_http_fallback = False
+                    body = (
+                        f"[{_MATRIX_MEDIA_KIND.get(msg_type, 'file')} attachment "
+                        "unavailable: it exceeds the configured size limit; "
+                        "ask the user to send a smaller file]"
+                    )
                 # ⚠️ 分格声明:Matrix 的下载 URL(`_mxc_to_http`)是
                 # `{homeserver}/_matrix/client/v1/media/download/...`,**不带**
                 # 签名参数或 access_token(认证走 Authorization 头)⇒ 这里
@@ -3613,7 +3626,6 @@ class MatrixAdapter(BasePlatformAdapter):
         if msgtype == "m.image" and _looks_like_matrix_image_filename(body):
             body = ""
 
-        allow_http_fallback = bool(http_url) and not is_encrypted_media
         media_urls = (
             [cached_path]
             if cached_path
@@ -3632,6 +3644,33 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(msg_event)
+
+    async def _download_mxc_media_with_cap(self, mxc_url: str) -> bytearray:
+        """用 mautrix 已认证 session 流式下载，并在缓冲完成前执行大小门。"""
+        if not self._client or not getattr(self._client, "api", None):
+            raise RuntimeError("Matrix client API is unavailable")
+        download_url = self._mxc_to_http(mxc_url)
+        headers = (
+            {"Authorization": f"Bearer {self._access_token}"}
+            if self._access_token
+            else {}
+        )
+        async with self._client.api.session.get(
+            download_url,
+            params={"allow_redirect": "true"},
+            headers=headers,
+        ) as response:
+            status_result = response.raise_for_status()
+            if inspect.isawaitable(status_result):
+                await status_result
+            try:
+                return await read_aiohttp_body_with_limit(
+                    response,
+                    media_type="Matrix inbound media",
+                    max_bytes=self._max_media_bytes,
+                )
+            except ValueError as exc:
+                raise _MatrixInboundMediaRejected(str(exc)) from exc
 
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""

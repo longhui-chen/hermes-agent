@@ -99,25 +99,6 @@ def test_output_transforms_chain_in_registration_order():
     assert results[-1] == "[redacted] | governor"
 
 
-def test_transform_hook_can_require_canonical_delivery_without_changing_text():
-    manager = PluginManager()
-    canonical_requests: list[bool] = []
-
-    def authoritative_identity_transform(**kwargs):
-        kwargs["require_canonical_response"]()
-        return kwargs["response_text"]
-
-    manager._hooks["transform_llm_output"] = [authoritative_identity_transform]
-    results = manager.invoke_hook(
-        "transform_llm_output",
-        response_text="same bytes",
-        require_canonical_response=lambda: canonical_requests.append(True),
-    )
-
-    assert results == ["same bytes"]
-    assert canonical_requests == [True]
-
-
 
 
 def test_hook_exception_does_not_replace_response(tmp_path, monkeypatch):

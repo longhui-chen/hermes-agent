@@ -177,7 +177,7 @@ def test_request_forwards_only_task_local_execution_headers(monkeypatch):
     seen = {}
     session_tokens = set_session_vars(session_id="cron_task_abcdef123456_20260817_120000")
     turn_tokens = set_turn_vars(
-        turn_id="turn-1", hardware_execution_token="a" * 64
+        turn_id="turn-1", business_execution_token="a" * 64
     )
     try:
         with mux_profile_scope(monkeypatch, _scope()), patch(
@@ -188,18 +188,17 @@ def test_request_forwards_only_task_local_execution_headers(monkeypatch):
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     req = seen["req"]
-    assert req.get_header("X-zettlab-business-execution-token") is None
-    assert req.get_header("X-zettlab-hardware-execution-token") is None
+    assert req.get_header("X-zettlab-business-execution-token") == "a" * 64
     assert req.get_header("X-hermes-turn-id") == "turn-1"
     assert req.get_header("X-hermes-session-id") == "cron_task_abcdef123456_20260817_120000"
     assert req.get_header("X-zettlab-app-maintenance-task-id") == "abcdef123456"
 
 
-def test_hardware_execution_token_is_never_forwarded_by_apphost(monkeypatch):
+def test_business_execution_token_is_not_lost_when_turn_correlation_is_absent(monkeypatch):
     from gateway.session_context import clear_turn_vars, set_turn_vars
 
     seen = {}
-    turn_tokens = set_turn_vars(hardware_execution_token="b" * 64)
+    turn_tokens = set_turn_vars(business_execution_token="b" * 64)
     try:
         with mux_profile_scope(monkeypatch, _scope()), patch(
             "tools.apphost_tool._urlopen", _capture_urlopen(seen)
@@ -207,8 +206,7 @@ def test_hardware_execution_token_is_never_forwarded_by_apphost(monkeypatch):
             assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
     finally:
         clear_turn_vars(turn_tokens)
-    assert seen["req"].get_header("X-zettlab-business-execution-token") is None
-    assert seen["req"].get_header("X-zettlab-hardware-execution-token") is None
+    assert seen["req"].get_header("X-zettlab-business-execution-token") == "b" * 64
     assert seen["req"].get_header("X-hermes-turn-id") is None
 
 
@@ -518,7 +516,9 @@ def test_publish_operation_is_passed_through_unchanged(monkeypatch):
     seen = {}
     operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "user_confirmed_auto", "maintenance": {"schedule": "0 9 * * *"}}
     session_tokens = set_session_vars(session_id="session-1")
-    turn_tokens = set_turn_vars(turn_id="turn-1")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="e" * 64
+    )
     try:
         with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
             "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
@@ -534,11 +534,7 @@ def test_publish_operation_is_passed_through_unchanged(monkeypatch):
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     assert out["ok"] is True
-    mint.assert_called_once()
-    assert mint.call_args.kwargs["owner_agent_id"] == "main"
-    assert mint.call_args.kwargs["turn_id"] == "turn-1"
-    assert mint.call_args.kwargs["session_id"] == "session-1"
-    assert len(mint.call_args.kwargs["operation_digest"]) == 64
+    mint.assert_called_once_with("main")
     assert json.loads(seen["req"].data)["operation"] == operation
     assert seen["req"].get_header("X-zettlab-agent-action-token") == "a" * 64
 
@@ -611,7 +607,9 @@ def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent
     operation = {"operation_id": "op-reload", "data_refresh": "user_confirmed_auto"}
     response = {"operation": {"operation_id": "op-reload", "terminal": "succeeded"}}
     session_tokens = set_session_vars(session_id="session-1")
-    turn_tokens = set_turn_vars(turn_id="turn-1")
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", business_execution_token="e" * 64
+    )
     try:
         with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
             "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64

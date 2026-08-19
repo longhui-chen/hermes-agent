@@ -209,10 +209,83 @@ class TestInboundMedia:
             asyncio.run(adapter._handle_message_event(self._event("image")))
 
         cache.assert_called_once_with(b"line-bytes", ext=".jpg")
+        adapter._client.fetch_content.assert_awaited_once_with(
+            "image-1", max_bytes=_line.LINE_IMAGE_MAX_BYTES,
+        )
         event = self._captured_event(adapter)
         assert event.message_type is _line.MessageType.PHOTO
         assert event.media_urls == ["/cache/image.jpg"]
         assert event.media_types == ["image/jpeg"]
+
+    @pytest.mark.parametrize(
+        "msg_type,expected_type,expected_mime,cache_name",
+        [
+            ("audio", _line.MessageType.VOICE, "audio/", "cache_audio_from_bytes"),
+            ("video", _line.MessageType.VIDEO, "video/mp4", "cache_video_from_bytes"),
+            ("file", _line.MessageType.DOCUMENT, "application/octet-stream", "cache_document_from_bytes"),
+        ],
+    )
+    def test_other_inbound_media_shapes_share_bounded_fetch_and_one_event(
+        self, adapter, msg_type, expected_type, expected_mime, cache_name,
+    ):
+        with patch.object(_line, cache_name, return_value=f"/cache/{msg_type}.bin"):
+            asyncio.run(adapter._handle_message_event(self._event(msg_type)))
+
+        configured = _line.get_inbound_media_max_bytes()
+        platform_limit = (
+            _line.LINE_AV_MAX_BYTES if msg_type in {"audio", "video"} else configured
+        )
+        assert configured > 0, "夹具必须启用真实全局媒体上限"
+        adapter._client.fetch_content.assert_awaited_once_with(
+            f"{msg_type}-1", max_bytes=min(configured, platform_limit),
+        )
+        event = self._captured_event(adapter)
+        assert event.message_type is expected_type
+        assert event.text == f"[{msg_type}]"
+        assert event.media_urls == [f"/cache/{msg_type}.bin"]
+        if expected_mime.endswith("/"):
+            assert len(event.media_types) == 1
+            assert event.media_types[0].startswith(expected_mime)
+        else:
+            assert event.media_types == [expected_mime]
+
+    @pytest.mark.asyncio
+    async def test_line_client_rejects_actual_stream_over_platform_cap(self, monkeypatch):
+        import aiohttp
+
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"x" * 11
+
+        class Response:
+            status = 200
+            headers = {}
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def read(self):
+                return b"x" * 11
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: Session())
+        client = _line._LineClient("token")
+
+        with pytest.raises(ValueError, match="11 bytes > 10 bytes"):
+            await client.fetch_content("image-1", max_bytes=10)
 
 
 # ---------------------------------------------------------------------------
@@ -506,4 +579,3 @@ class TestMediaPublicUrlGuard:
         result = asyncio.run(ad.send_image_file("Uchat", str(img)))
         assert not result.success
         assert "LINE_PUBLIC_URL" in (result.error or "")
-

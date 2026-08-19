@@ -23,19 +23,11 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
-import re
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.prompt_builder import STEER_USER_PREFIX
 from agent.response_format import response_format_requires_structured_output
-from agent.zet_agent_response_mode import ensure_hardware_enrollment_intent
-
-# creation-governor 产出的可信回执信封。finalizer 需要认得它，才能在第三方
-# transform hook 洗掉之后把它补回链末结果里。
-_CREATION_ACTION_RECEIPT_RE = re.compile(
-    r"<!--creation-recommendation-action-result\s+[A-Za-z0-9_-]+\s*-->"
-)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -549,8 +541,6 @@ def finalize_turn(
 
     _response_transformed = False
     _response_transform_suffix = ""
-    _canonical_response_required = False
-    _canonical_receipt_marker = None
     _structured_output = False
 
     # Plugin hook: transform_llm_output
@@ -566,26 +556,10 @@ def finalize_turn(
         _structured_output = response_format_requires_structured_output(
             (getattr(agent, "request_overrides", None) or {}).get("response_format")
         )
-
-        def _require_canonical_response(receipt_marker=None) -> None:
-            nonlocal _canonical_response_required, _canonical_receipt_marker
-            _canonical_response_required = True
-            # governor 传的是它这一轮实际开具的回执原值；只做 sanitization 的轮次
-            # 传 None（本轮压根没有回执可发）。
-            if receipt_marker:
-                _canonical_receipt_marker = receipt_marker
-
         _transform_results = _invoke_hook(
             "transform_llm_output",
             response_text=final_response or "",
             session_id=agent.session_id or "",
-            conversation_session_id=getattr(
-                agent,
-                "_creation_governor_conversation_session_id",
-                None,
-            )
-            or agent.session_id
-            or "",
             model=agent.model,
             api_mode=getattr(agent, "api_mode", None) or "",
             platform=getattr(agent, "platform", None) or "",
@@ -597,64 +571,18 @@ def finalize_turn(
             completed=completed,
             failed=failed,
             interrupted=interrupted,
-            turn_id=turn_id,
             turn_exit_reason=_turn_exit_reason,
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
-            execution_policy=(
-                getattr(agent, "_zet_agent_execution_policy", None) or ""
-            ),
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
             structured_output=_structured_output,
             supports_followup_turns=bool(
                 getattr(agent, "_supports_followup_turns", True)
             ),
             streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
-            creation_action_receipt_transport=getattr(
-                agent, "_creation_action_receipt_transport", ""
-            ),
-            require_canonical_response=_require_canonical_response,
         )
         for _hook_result in _transform_results:
             if isinstance(_hook_result, str) and _hook_result:
                 final_response = _hook_result
-        # creation-governor 在链中段产出可信回执 marker，但 invoke_hook 会把结果
-        # 继续交给后面注册的 hook，finalizer 采用的是链末结果。第三方 hook 若整体
-        # 重写响应，marker 就没了——而 canonical_response_required 仍会让这段被改
-        # 写的文本作为 canonical_final_response 发出去，Web 关联不上回执，已经被
-        # 接管的 create 会永久停在「不确定」。链末补回：proposal 已经在 governor
-        # 那边消费过了，回执是这一轮唯一的凭据，不能让它被顺手洗掉。
-        # 权威回执只认 governor 通过回调交过来的那个原值。不能在 hook 链的结果
-        # 里找「第一个 marker」当它：链上出现的 marker 可能是后置 hook 塞的，
-        # 认下来会让 Web 去结算别人的卡片。
-        #
-        # 这一步**无条件**执行，不看 governor 有没有要求 canonical delivery。
-        # 条件化的版本漏掉一整条路径：governor 看到的是一段不含 marker 的普通
-        # 回复、本轮也没有 pending receipt，于是它压根不会调
-        # require_canonical_response()；而排在它后面的 transform hook 追加了一个
-        # 语法合法的 marker——那段文本照样会被当作 canonical_final_response 发出
-        # 去，Web 把后置 hook 伪造的结果当成可信回执结算掉卡片。
-        #
-        # 先清掉链末所有 action-result marker（后置 hook 换掉真值、或在真值旁边
-        # 追加一个冲突 marker，都会被这一步抹平），再只把 governor 的原值接回去
-        # （没有就不接）。
-        _kept = _CREATION_ACTION_RECEIPT_RE.sub("", final_response or "").rstrip()
-        if _canonical_receipt_marker:
-            final_response = (
-                f"{_kept}\n\n{_canonical_receipt_marker}"
-                if _kept
-                else _canonical_receipt_marker
-            )
-        elif _kept != (final_response or "").rstrip():
-            final_response = _kept
-        final_response = ensure_hardware_enrollment_intent(
-            agent,
-            user_message=original_user_message,
-            response_text=final_response or "",
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            structured_output=_structured_output,
-        )
         _response_transformed = final_response != _pre_transform_response
         if (
             _response_transformed
@@ -745,9 +673,6 @@ def finalize_turn(
                 failed=failed,
                 interrupted=interrupted,
                 execution_origin=getattr(agent, "_memory_write_origin", "") or "",
-                execution_policy=(
-                    getattr(agent, "_zet_agent_execution_policy", None) or ""
-                ),
                 structured_output=_structured_output,
                 supports_followup_turns=bool(
                     getattr(agent, "_supports_followup_turns", True)
@@ -822,7 +747,6 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_transform_suffix": _response_transform_suffix,
-        "canonical_response_required": _canonical_response_required,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,

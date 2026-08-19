@@ -477,13 +477,6 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
-    # Execution middleware and Relay may replace the request after the
-    # conversation loop has applied its policy.  Seal the narrow trusted video
-    # contract immediately before any provider client sees the payload.
-    from agent.conversation_loop import _seal_video_edit_provider_request
-
-    _seal_video_edit_provider_request(agent, api_kwargs)
-
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -3084,13 +3077,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Native Gemini rejects OpenAI's usage-streaming extension.
             if not is_native_gemini_base_url(agent.base_url):
                 stream_kwargs["stream_options"] = {"include_usage": True}
-            # This is the last mutable boundary after Relay/execution
-            # middleware.  Re-seal before constructing the provider client so
-            # a replacement payload cannot bypass trusted tool visibility or
-            # the follow-up thinking policy.
-            from agent.conversation_loop import _seal_video_edit_provider_request
-
-            _seal_video_edit_provider_request(agent, stream_kwargs)
             request_client = _set_request_client(
                 agent._create_request_openai_client(
                     reason="chat_completion_stream_request",

@@ -162,7 +162,6 @@ def _exit_code(value: typing.Any) -> int:
 def _execute(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
     source_bundle = payload.get("source_bundle") or {}
     env = payload.get("env") or {}
-    context = payload.get("context") or {}
     secrets = payload.get("secrets") or {}
     argv = payload.get("argv") or []
     script = str(payload.get("script") or "")
@@ -171,7 +170,6 @@ def _execute(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
         not isinstance(source_bundle, dict)
         or "__main__" not in source_bundle
         or not isinstance(env, dict)
-        or not isinstance(context, dict)
         or not isinstance(secrets, dict)
         or not isinstance(argv, list)
         or not script
@@ -186,20 +184,14 @@ def _execute(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
     original_main_module = sys.modules.get("__main__")
     finder = _PinnedSourceFinder(source_bundle)
     context_module = types.ModuleType(_RUNTIME_CONTEXT_MODULE)
-    context_values = {
-        str(key): str(value)
-        for key, value in context.items()
-        if value is not None
-    }
     secret_values = {
         str(key): str(value)
         for key, value in secrets.items()
         if value is not None
     }
-    context_values.update(secret_values)
 
     def runtime_value(name: str, default: str = "") -> str:
-        return context_values.get(str(name), default)
+        return secret_values.get(str(name), default)
 
     context_module.get = runtime_value  # type: ignore[attr-defined]
     module_names = [name for name in source_bundle if name != "__main__"]
@@ -249,7 +241,6 @@ def _execute(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
             pass
         os.environ.clear()
         os.environ.update(original_env)
-        context_values.clear()
         secret_values.clear()
 
     return {
@@ -270,9 +261,6 @@ def _max_rss_bytes() -> int:
 
 
 def _scrub_request(payload: dict[str, typing.Any]) -> None:
-    context = payload.get("context")
-    if isinstance(context, dict):
-        context.clear()
     secrets = payload.get("secrets")
     if isinstance(secrets, dict):
         secrets.clear()

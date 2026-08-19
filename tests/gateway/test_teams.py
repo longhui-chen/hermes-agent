@@ -587,6 +587,45 @@ class TestTeamsAttachmentClassification:
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.DOCUMENT
         assert len(event.media_urls) == 2
+        assert event.text == "see attached", "同一 Activity 的文字不能因附件处理而丢失"
+
+    @pytest.mark.asyncio
+    async def test_attachment_download_rejects_stream_over_global_cap(self, monkeypatch):
+        adapter = self._make_adapter()
+
+        class Response:
+            headers = {"content-length": "11"}
+            content = b"x" * 11
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
+                yield self.content
+
+        class Stream:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock(return_value=Response())
+        client.stream = MagicMock(return_value=Stream())
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: client,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_inbound_media_max_bytes", lambda: 10,
+        )
+
+        with pytest.raises(ValueError, match="11 bytes > 10 bytes"):
+            await adapter._fetch_attachment_bytes("https://files.example/a.bin")
 
 
 # ── _standalone_send (out-of-process cron delivery) ──────────────────────

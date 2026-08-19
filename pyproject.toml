@@ -382,7 +382,8 @@ override-dependencies = [
   "microsoft-teams-cards==2.0.13.4",
   "microsoft-teams-common==2.0.13.4",
 ]
-exclude-newer = "2026-08-04T00:00:00Z"
+exclude-newer = "14 days"
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's

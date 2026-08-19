@@ -512,7 +512,6 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
-    strict_memory_isolation: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -576,16 +575,6 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
-
-    strict_memory_isolation = bool(strict_memory_isolation)
-    if strict_memory_isolation:
-        if enabled_toolsets is not None:
-            enabled_toolsets = [
-                name for name in enabled_toolsets if name != "memory"
-            ]
-        disabled_toolsets = list(disabled_toolsets or [])
-        if "memory" not in disabled_toolsets:
-            disabled_toolsets.append("memory")
     _install_safe_stdio()
 
     agent.model = model
@@ -849,7 +838,6 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
-    agent._strict_memory_isolation = strict_memory_isolation
     agent._skip_tool_loading = bool(skip_tool_loading)
     
     # Model response configuration
@@ -1457,13 +1445,6 @@ def init_agent(
             disabled_toolsets=disabled_toolsets,
             quiet_mode=agent.quiet_mode,
         )
-    if strict_memory_isolation:
-        agent.tools = [
-            tool
-            for tool in agent.tools
-            if not isinstance(tool, dict)
-            or str((tool.get("function") or {}).get("name") or "") != "memory"
-        ]
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1699,11 +1680,6 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # A memory-skipping runtime must also reject a persisted system-prompt
-    # snapshot from an earlier memory-enabled turn. conversation_loop reads
-    # this private construction-time fact before restore/persist.
-    agent._skip_memory_context = bool(skip_memory or strict_memory_isolation)
-
     # A flush/background agent may pass skip_memory=True to avoid spinning up an
     # external memory *provider*, but if the caller also explicitly enables the
     # "memory" toolset it still needs the built-in file-backed store — otherwise
@@ -1711,7 +1687,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not strict_memory_isolation and (not skip_memory or _memory_toolset_requested):
+    if not skip_memory or _memory_toolset_requested:
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1732,7 +1708,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory and not strict_memory_isolation:
+    if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
@@ -2428,12 +2404,6 @@ def init_agent(
     # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
     # 3. Check general plugin system (user-installed plugins)
     # 4. Fall back to built-in ContextCompressor
-    # Silent/strict runs are frozen, request-local executions.  Never load a
-    # user/plugin context engine for them: its selection and turn-finalizer
-    # hooks can observe or mutate the frozen transcript outside the trusted
-    # runtime boundary.  The built-in compressor remains available for the
-    # ordinary context budget path, but no external engine is admitted.
-    _context_engine_isolated = bool(strict_memory_isolation)
     _selected_engine = None
     _copy_failed = False
     _engine_name = "compressor"  # default
@@ -2443,7 +2413,7 @@ def init_agent(
     except Exception:
         pass
 
-    if _engine_name != "compressor" and not _context_engine_isolated:
+    if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
@@ -2636,8 +2606,6 @@ def init_agent(
     # same local-model latency penalty.
     agent._context_engine_tool_names: set = set()
     if (
-        not _context_engine_isolated
-        and
         hasattr(agent, "context_compressor")
         and agent.context_compressor
         and agent.tools is not None
@@ -2674,11 +2642,7 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if (
-        not _context_engine_isolated
-        and hasattr(agent, "context_compressor")
-        and agent.context_compressor
-    ):
+    if hasattr(agent, "context_compressor") and agent.context_compressor:
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,

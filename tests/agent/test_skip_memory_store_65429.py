@@ -24,29 +24,21 @@ class _FakeOpenAI:
         pass
 
 
-def _make_agent(
-    monkeypatch,
-    enabled_toolsets=None,
-    skip_memory=True,
-    strict_memory_isolation=False,
-):
+def _make_agent(monkeypatch, enabled_toolsets=None, skip_memory=True):
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
-    kwargs = {
-        "api_key": "test-key",
-        "base_url": "http://test",
-        "provider": "openrouter",
-        "api_mode": "chat_completions",
-        "max_iterations": 1,
-        "quiet_mode": True,
-        "skip_context_files": True,
-        "skip_memory": skip_memory,
-        "enabled_toolsets": enabled_toolsets,
-    }
-    if strict_memory_isolation:
-        kwargs["strict_memory_isolation"] = True
-    return AIAgent(**kwargs)
+    return AIAgent(
+        api_key="test-key",
+        base_url="http://test",
+        provider="openrouter",
+        api_mode="chat_completions",
+        max_iterations=1,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=skip_memory,
+        enabled_toolsets=enabled_toolsets,
+    )
 
 
 def test_skip_memory_with_memory_toolset_creates_store(monkeypatch, tmp_path):
@@ -104,21 +96,3 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     memory_md = tmp_path / "hm" / "memories" / "MEMORY.md"
     assert memory_md.exists()
     assert "User prefers concise answers." in memory_md.read_text()
-
-
-def test_strict_memory_isolation_overrides_explicit_memory_toolset(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
-    agent = _make_agent(
-        monkeypatch,
-        enabled_toolsets=["memory"],
-        skip_memory=True,
-        strict_memory_isolation=True,
-    )
-
-    assert agent._memory_store is None
-    assert agent._memory_manager is None
-    assert agent._memory_enabled is False
-    assert agent._user_profile_enabled is False
-    assert "memory" not in agent.valid_tool_names

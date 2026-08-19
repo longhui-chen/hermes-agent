@@ -2097,8 +2097,7 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     if not getattr(cfg, "multiplex_profiles", False):
         return cfg
     try:
-        from hermes_cli.profiles import get_profile_dir
-        home = get_profile_dir(_multiplex_active_profile_name() or "default")
+        home = get_hermes_home()
     except Exception:
         return cfg
     try:
@@ -2791,6 +2790,11 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
+def _normalize_media_type(value: Any) -> str:
+    """把调用方提供的 MIME 规范成所有媒体消费者共用的 token。"""
+    return str(value or "").split(";", 1)[0].strip().lower()
+
+
 def _event_media_type_at(event, index: int) -> str:
     """Return the per-attachment MIME for the attachment at *index*.
 
@@ -2798,7 +2802,12 @@ def _event_media_type_at(event, index: int) -> str:
     that slot (some adapters only set a message-level type).
     """
     media_types = getattr(event, "media_types", None) or []
-    return media_types[index] if index < len(media_types) else ""
+    if index >= len(media_types):
+        return ""
+    # MIME tokens are case-insensitive and may carry parameters. Normalize
+    # once at the shared consumer so Matrix/Teams/LINE and every future
+    # adapter reach the same image/audio/video gates.
+    return _normalize_media_type(media_types[index])
 
 
 def _event_media_is_image(event, index: int) -> bool:
@@ -3461,17 +3470,7 @@ def _load_gateway_runtime_config() -> dict:
         return {}
     from hermes_cli.config import _expand_env_vars
 
-    # Process-level reads happen before an inbound turn installs a profile
-    # secret scope. In multiplex mode, resolve the config inside the active
-    # profile scope so harmless refs (for example ZETTLAB_PRESETS_DIR) do not
-    # make GatewayRunner crash while preserving fail-closed secret handling.
-    try:
-        from hermes_cli.profiles import get_profile_dir
-        active = _multiplex_active_profile_name() or "default"
-        with _profile_runtime_scope(get_profile_dir(active)):
-            expanded = _expand_env_vars(cfg)
-    except Exception:
-        expanded = _expand_env_vars(cfg)
+    expanded = _expand_env_vars(cfg)
     return expanded if isinstance(expanded, dict) else {}
 
 
@@ -17137,7 +17136,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             image_paths = []
             audio_paths = []
             for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                mtype = _event_media_type_at(event, i)
                 # Classify images per-attachment: trust this attachment's own
                 # MIME, and only honour the message-level PHOTO type when the
                 # per-attachment MIME is unknown. Otherwise a document (or any
@@ -17151,7 +17150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     audio_file_paths.append(path)
                 elif not _pending_stt_prepared and _event_media_is_stt_input(event, i):
                     audio_paths.append(path)
-                if mtype.startswith("video/") or (not mtype and event.message_type == MessageType.VIDEO):
+                if _event_media_is_video(event, i):
                     video_paths.append(path)
 
             if image_paths:
@@ -17335,7 +17334,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or _event_media_is_video(event, i)
                 ):
                     continue
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                mtype = _event_media_type_at(event, i)
                 if mtype in {"", "application/octet-stream"}:
                     _ext = os.path.splitext(path)[1].lower()
                     if _ext in _TEXT_EXTENSIONS:
@@ -20714,7 +20713,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from run_agent import AIAgent
 
         media_urls = media_urls or []
-        media_types = media_types or []
+        # ``/background`` 绕过 MessageEvent 的普通消费链，必须在这个共同
+        # 入口复用同一 MIME 规则；否则 gate 能识别的合法 MIME 变体会在
+        # 真正视觉预处理处再次丢失。
+        media_types = [_normalize_media_type(value) for value in (media_types or [])]
 
         adapter = self._adapter_for_source(source)
         if not adapter:

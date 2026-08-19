@@ -315,39 +315,6 @@ async def test_goal_schedule_runs_without_pending_steer(monkeypatch):
     assert len(goals.calls) == 1
 
 
-@pytest.mark.asyncio
-async def test_silent_automation_skips_goal_and_title_hooks(monkeypatch):
-    adapter = _adapter(monkeypatch)
-    goals = _RecordingGoals()
-    titles = []
-    monkeypatch.setattr(adapter, "_goals", lambda: goals)
-    monkeypatch.setattr(
-        zet_agent,
-        "gateway_sensitive_process_boundary_ready",
-        lambda: True,
-    )
-
-    async def record_title(**kwargs):
-        titles.append(kwargs)
-
-    monkeypatch.setattr(adapter, "_emit_native_session_title", record_title)
-    _patch_base_run_agent(
-        monkeypatch,
-        ({"final_response": "ok", "session_id": "s1"},),
-    )
-
-    await adapter._run_agent(
-        user_message="run frozen manifest",
-        session_id="s1",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
-        execution_policy="silent_automation",
-    )
-
-    assert goals.calls == []
-    assert titles == []
-
-
 # ---------------------------------------------------------------------------
 # /v1/capabilities steer declaration
 # ---------------------------------------------------------------------------

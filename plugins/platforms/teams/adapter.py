@@ -91,6 +91,7 @@ from gateway.platforms.base import (
     cache_media_bytes,
     log_media_intake_failure,
     safe_exc,
+    _read_httpx_body_with_limit,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -925,12 +926,15 @@ class TeamsAdapter(BasePlatformAdapter):
             follow_redirects=True,
             event_hooks={"response": [_ssrf_redirect_guard]},
         ) as client:
-            response = await client.get(
+            async with client.stream(
+                "GET",
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
-            )
-            response.raise_for_status()
-            return response.content
+            ) as response:
+                response.raise_for_status()
+                return await _read_httpx_body_with_limit(
+                    response, media_type="Teams inbound attachment",
+                )
 
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
         """Process an incoming Teams message and dispatch to the gateway."""

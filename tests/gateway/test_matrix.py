@@ -1981,6 +1981,36 @@ class TestMatrixImageOnlyMediaNormalization:
         ]
         assert captured_event.message_type == MessageType.PHOTO
 
+    @pytest.mark.asyncio
+    async def test_image_caption_and_media_stay_in_one_gateway_event(self):
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter.handle_message = capture
+
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$image-caption",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "请看这张图",
+                "url": "mxc://example/caption.png",
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={},
+            msgtype="m.image",
+        )
+
+        assert captured_event is not None
+        assert captured_event.text == "请看这张图"
+        assert len(captured_event.media_urls) == 1
+        assert captured_event.media_types == ["image/png"]
+
 
     @pytest.mark.asyncio
     async def test_inbound_oversized_media_is_rejected(self):
@@ -2010,6 +2040,64 @@ class TestMatrixImageOnlyMediaNormalization:
 
         assert captured_event is None
         self.adapter._client.download_media.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inbound_actual_bytes_over_cap_are_not_forwarded(self):
+        """Matrix 事件可省略/谎报 size；实际流必须在缓冲完成前受限。"""
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"\xff\xd8\xff" + b"x" * 8
+
+        class Response:
+            headers = {}
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+        class Session:
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        self.adapter._max_media_bytes = 10
+        self.adapter._client.download_media = AsyncMock(
+            return_value=b"\xff\xd8\xff" + b"x" * 8
+        )
+        self.adapter._client.api = types.SimpleNamespace(session=Session())
+        self.adapter.handle_message = capture
+
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$image-actual-big",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "oversize.png",
+                "url": "mxc://example/oversize.png",
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={},
+            msgtype="m.image",
+        )
+
+        assert captured_event is not None
+        assert not captured_event.media_urls, (
+            "实际超限的 Matrix 媒体不能落盘或作为远程 URL 继续送进模型"
+        )
+        assert "size limit" in captured_event.text and "smaller" in captured_event.text
 
 
     @pytest.mark.asyncio

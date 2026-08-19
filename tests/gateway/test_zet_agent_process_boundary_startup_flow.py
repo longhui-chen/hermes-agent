@@ -224,7 +224,7 @@ async def test_zet_boundary_failure_is_not_a_fatal_adapter_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_boundary_failure_does_not_read_or_parse_action_flow(monkeypatch):
+async def test_boundary_failure_does_not_read_or_parse_token_flow(monkeypatch):
     import gateway.platforms.zet_agent as zet_agent
 
     monkeypatch.setattr(
@@ -240,8 +240,7 @@ async def test_boundary_failure_does_not_read_or_parse_action_flow(monkeypatch):
         (),
         {
             "headers": {
-                "X-Zettlab-Business-Execution-Action": "a" * 64,
-                "X-Zettlab-Business-Execution-Action-Version": "1",
+                "X-Zettlab-Business-Execution-Token": "a" * 64,
             },
             "read": AsyncMock(
                 side_effect=AssertionError("request must not be read")
