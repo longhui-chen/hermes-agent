@@ -2097,7 +2097,8 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     if not getattr(cfg, "multiplex_profiles", False):
         return cfg
     try:
-        home = get_hermes_home()
+        from hermes_cli.profiles import get_profile_dir
+        home = get_profile_dir(_multiplex_active_profile_name() or "default")
     except Exception:
         return cfg
     try:
@@ -3460,7 +3461,17 @@ def _load_gateway_runtime_config() -> dict:
         return {}
     from hermes_cli.config import _expand_env_vars
 
-    expanded = _expand_env_vars(cfg)
+    # Process-level reads happen before an inbound turn installs a profile
+    # secret scope. In multiplex mode, resolve the config inside the active
+    # profile scope so harmless refs (for example ZETTLAB_PRESETS_DIR) do not
+    # make GatewayRunner crash while preserving fail-closed secret handling.
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        active = _multiplex_active_profile_name() or "default"
+        with _profile_runtime_scope(get_profile_dir(active)):
+            expanded = _expand_env_vars(cfg)
+    except Exception:
+        expanded = _expand_env_vars(cfg)
     return expanded if isinstance(expanded, dict) else {}
 
 

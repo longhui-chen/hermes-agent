@@ -574,6 +574,9 @@ def finalize_turn(
             interrupted=interrupted,
             turn_exit_reason=_turn_exit_reason,
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+            execution_policy=(
+                getattr(agent, "_zet_agent_execution_policy", None) or ""
+            ),
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
             structured_output=_structured_output,
             supports_followup_turns=bool(
@@ -683,6 +686,9 @@ def finalize_turn(
                 failed=failed,
                 interrupted=interrupted,
                 execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+                execution_policy=(
+                    getattr(agent, "_zet_agent_execution_policy", None) or ""
+                ),
                 structured_output=_structured_output,
                 supports_followup_turns=bool(
                     getattr(agent, "_supports_followup_turns", True)

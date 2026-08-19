@@ -426,7 +426,8 @@ description: Trusted video-edit execution flow test
     )
     turn_tokens = set_turn_vars(
         turn_id="external-api-turn",
-        business_execution_token="business-token",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     try:
         agent = _FakeAgent()
@@ -434,7 +435,12 @@ description: Trusted video-edit execution flow test
         agent._zet_agent_response_mode = "plan"
         ctx = _build(
             agent,
-            user_message="请把 [file: /data/input.mp4] 剪辑成 vlog 成片",
+            user_message=(
+                "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0028.MOV (42.5 MB)]\n"
+                "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0027.MOV (67.0 MB)]\n"
+                "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0029.MOV (85.5 MB)]\n\n"
+                "Edit these three Hangzhou Songcheng videos into a vertical vlog."
+            ),
             task_id="api-task",
         )
         assert agent._current_turn_id != "external-api-turn"
@@ -464,7 +470,10 @@ description: Trusted video-edit execution flow test
             function_args=terminal_args,
         ) is None
 
-        business_token = session_context_module._BUSINESS_EXECUTION_TOKEN.set("")
+        action_token = session_context_module._BUSINESS_EXECUTION_ACTION.set("")
+        action_version_token = (
+            session_context_module._BUSINESS_EXECUTION_ACTION_VERSION.set("")
+        )
         session_key_token = session_context_module._SESSION_KEY.set("")
         empty_secret_token = secret_scope_module.set_secret_scope({})
         try:
@@ -473,11 +482,10 @@ description: Trusted video-edit execution flow test
             def _dispatch():
                 runtime_env = build_video_edit_runtime_env({})
                 assert runtime_env["ZET_AGENT_ID"] == "main"
-                assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
-                assert (
-                    runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
-                    == "business-token"
-                )
+                assert "ZETTLAB_AGENT_ACTION_TOKEN" not in runtime_env
+                assert runtime_env["ZETTLAB_BUSINESS_EXECUTION_ACTION"] == "a" * 64
+                assert runtime_env["ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION"] == "1"
+                assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in runtime_env
                 assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
                 assert (
                     runtime_env["HERMES_SESSION_KEY"]
@@ -501,12 +509,150 @@ description: Trusted video-edit execution flow test
         finally:
             secret_scope_module.reset_secret_scope(empty_secret_token)
             session_context_module._SESSION_KEY.reset(session_key_token)
-            session_context_module._BUSINESS_EXECUTION_TOKEN.reset(business_token)
+            session_context_module._BUSINESS_EXECUTION_ACTION_VERSION.reset(
+                action_version_token
+            )
+            session_context_module._BUSINESS_EXECUTION_ACTION.reset(action_token)
     finally:
         response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
         secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_trusted_skill_reload_bypasses_dedup_for_one_fresh_attestation(
+    tmp_path,
+    monkeypatch,
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted video-edit reload skill\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+
+    task_id = "trusted-skill-reload-task"
+    skills_tool_module.reset_skill_view_dedup(task_id)
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:reload-session",
+        session_id="zettlab:user:main:reload-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="trusted-skill-reload-turn",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+    )
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(
+            agent,
+            "请把 [file: /data/input.mp4] 剪辑成成片",
+        )
+        args = {"name": "video-edit-workflow-mini"}
+
+        def _view():
+            return skills_tool_module._skill_view_with_bump(
+                args,
+                task_id=task_id,
+            )
+
+        first_result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args=args,
+            dispatch=_view,
+        )
+        first_payload = json.loads(first_result)
+        first_attestation = first_payload[response_mode._ATTESTATION_FIELD]
+        assert first_payload.get("dedup") is None
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=first_result,
+        )
+
+        # Simulate an out-of-policy operation revoking the bounded scope. The
+        # same turn must read the signed bytes again; the earlier one-shot
+        # attestation cannot be reused from the repeat-view stub.
+        agent._zet_agent_skill_direct_scope = None
+        agent._zet_agent_skill_direct_operation = None
+        reload_result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args=args,
+            dispatch=_view,
+        )
+        reload_payload = json.loads(reload_result)
+        assert reload_payload.get("dedup") is None
+        assert reload_payload[response_mode._ATTESTATION_FIELD] != first_attestation
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=reload_result,
+        )
+
+        # Once the trusted scope is active, an ordinary repeat remains deduped.
+        repeat_result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args=args,
+            dispatch=_view,
+        )
+        repeat_payload = json.loads(repeat_result)
+        assert repeat_payload["dedup"] is True
+        assert response_mode._ATTESTATION_FIELD not in repeat_payload
+        assert not response_mode.trusted_skill_view_fresh_read_required()
+    finally:
+        skills_tool_module.reset_skill_view_dedup(task_id)
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_trusted_skill_fresh_read_context_clears_after_dispatch_error(
+    monkeypatch,
+):
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    monkeypatch.setattr(
+        response_mode,
+        "_trusted_skill_view_refresh_required",
+        lambda _agent, _args: True,
+    )
+
+    def _fail():
+        assert response_mode.trusted_skill_view_fresh_read_required()
+        raise RuntimeError("skill read failed")
+
+    with pytest.raises(RuntimeError, match="skill read failed"):
+        response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args={"name": "trusted-skill"},
+            dispatch=_fail,
+        )
+
+    assert not response_mode.trusted_skill_view_fresh_read_required()
 
 
 def test_video_edit_followup_turn_reuses_same_session_capability_flow(
@@ -543,7 +689,8 @@ def test_video_edit_followup_turn_reuses_same_session_capability_flow(
     )
     turn_tokens = set_turn_vars(
         turn_id="video-turn-1",
-        business_execution_token="business-token-1",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
     try:
@@ -563,7 +710,8 @@ def test_video_edit_followup_turn_reuses_same_session_capability_flow(
         clear_turn_vars(turn_tokens)
         turn_tokens = set_turn_vars(
             turn_id="video-turn-2",
-            business_execution_token="business-token-2",
+            business_execution_action="b" * 64,
+            business_execution_action_version="1",
         )
         response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
         resumed_agent = _FakeAgent()
@@ -757,7 +905,8 @@ def test_confirmed_plan_ack_inherits_only_bound_video_edit_turn_unit():
             turn_id="video-confirm-turn",
             plan_ack_status="confirmed",
             plan_ack_turn_id="video-plan-turn",
-            business_execution_token="business-token",
+            business_execution_action="a" * 64,
+            business_execution_action_version="1",
         )
         try:
             confirmed_agent = _FakeAgent()
@@ -775,7 +924,8 @@ def test_confirmed_plan_ack_inherits_only_bound_video_edit_turn_unit():
             turn_id="other-confirm-turn",
             plan_ack_status="confirmed",
             plan_ack_turn_id="unrelated-plan-turn",
-            business_execution_token="business-token",
+            business_execution_action="a" * 64,
+            business_execution_action_version="1",
         )
         try:
             mismatched_agent = _FakeAgent()
@@ -853,6 +1003,22 @@ def test_short_natural_video_edit_commands_without_inline_asset_are_explicit_uni
         assert not agent._zet_agent_skill_direct_task.video_edit_applicable, unrelated
 
 
+def test_plural_english_video_attachments_activate_video_edit_scope_unit():
+    agent = _FakeAgent()
+    message = (
+        "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0028.MOV (42.5 MB)]\n"
+        "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0027.MOV (67.0 MB)]\n"
+        "[视频: /volume1/subvol/agents/data/main/uploads/IMG_0029.MOV (85.5 MB)]\n\n"
+        "Edit these three Hangzhou Songcheng videos into a vertical vlog."
+    )
+
+    reset_trusted_skill_execution(agent, message)
+
+    task = agent._zet_agent_skill_direct_task
+    assert task.video_edit_applicable
+    assert task.video_edit_explicit
+
+
 def test_explicit_video_edit_transport_selection_mints_task_scope_unit():
     raw_slash_agent = _FakeAgent()
     reset_trusted_skill_execution(
@@ -926,7 +1092,8 @@ def test_raw_slash_text_cannot_mint_trusted_video_scope_flow(
     )
     turn_tokens = set_turn_vars(
         turn_id="raw-slash-turn",
-        business_execution_token="business-token",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     try:
         agent = _FakeAgent()
@@ -982,7 +1149,8 @@ def test_model_switch_note_video_edit_resume_scope_flow(tmp_path, monkeypatch):
     )
     turn_tokens = set_turn_vars(
         turn_id="model-switch-video-turn",
-        business_execution_token="business-token",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
     )
     response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
     try:
@@ -1547,7 +1715,8 @@ def test_camera_vision_scope_is_bound_to_exact_current_attachment(monkeypatch):
             execution_receipt=response_mode._TrustedExecutionReceipt(
                 agent_id="main",
                 action_token="action-token",
-                business_execution_token="business-token",
+                hardware_execution_token="b" * 64,
+                business_execution_action="",
                 turn_id="camera-vision-turn",
                 session_id="camera-session",
             ),
@@ -1743,7 +1912,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
     secret_token = secret_scope_module.set_secret_scope(
         {
             "ZET_AGENT_ID": "main",
-            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token:camera/v2",
         }
     )
     session_tokens = set_session_vars(
@@ -1752,7 +1921,7 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
     )
     turn_tokens = set_turn_vars(
         turn_id="camera-turn",
-        business_execution_token="business-token",
+        hardware_execution_token="b" * 64,
     )
     try:
         with pytest.raises(PermissionError):
@@ -1802,8 +1971,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
             frozen = build_camera_runtime_env()
             assert frozen == {
                 "ZET_AGENT_ID": "main",
-                "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-token",
+                "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token:camera/v2",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN": "b" * 64,
                 "HERMES_TURN_ID": "camera-turn",
                 "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
                 "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",
@@ -1942,10 +2111,11 @@ def test_camsnap_repeat_view_mints_fresh_scope_for_next_turn(
     monkeypatch.setattr(
         response_mode,
         "_capture_trusted_execution_receipt",
-        lambda turn_identity: response_mode._TrustedExecutionReceipt(
+        lambda turn_identity, _relative_path: response_mode._TrustedExecutionReceipt(
             agent_id="main",
             action_token="action-token",
-            business_execution_token="business-token",
+            hardware_execution_token="b" * 64,
+            business_execution_action="",
             turn_id=turn_identity[0],
             session_id="stable-camera-session",
         ),
@@ -1965,9 +2135,15 @@ def test_camsnap_repeat_view_mints_fresh_scope_for_next_turn(
                     "查看摄像头最新快照",
                     explicit_skill_slug="camsnap",
                 )
-                result = skills_tool_module._skill_view_with_bump(
-                    {"name": "camsnap"},
-                    task_id=task_id,
+                args = {"name": "camsnap"}
+                result = response_mode.dispatch_trusted_skill_operation(
+                    agent,
+                    function_name="skill_view",
+                    function_args=args,
+                    dispatch=lambda: skills_tool_module._skill_view_with_bump(
+                        args,
+                        task_id=task_id,
+                    ),
                 )
                 payload = json.loads(result)
                 assert payload.get("dedup") is None
@@ -2033,6 +2209,216 @@ def test_camsnap_skill_cannot_activate_for_unrelated_task_flow(
         clear_turn_vars(turn_tokens)
 
 
+@pytest.mark.parametrize(
+    "token",
+    ["", "has space", "line\nfeed", "\x7fdelete", "x" * 4097],
+)
+def test_camera_action_token_rejects_empty_control_or_oversized_values(token):
+    assert not response_mode._is_opaque_action_token(token)
+
+
+def test_camera_action_token_accepts_opaque_utf8_value():
+    assert response_mode._is_opaque_action_token("profile-token:相机/v2")
+
+
+def test_silent_attestation_rejects_skill_path_mismatch(
+    monkeypatch,
+):
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    agent._zet_agent_execution_policy = "silent_automation"
+    turn_tokens = set_turn_vars(turn_id="silent-slug-mismatch")
+    try:
+        task = response_mode._skill_direct_task_context(
+            agent,
+            "执行已授权的视频任务",
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+        agent._zet_agent_skill_direct_task = task
+        attestation = "silent-slug-mismatch-attestation"
+        serialized = json.dumps(
+            {
+                "name": "camsnap",
+                "content": "trusted camera skill",
+                response_mode._ATTESTATION_FIELD: attestation,
+            },
+            ensure_ascii=False,
+        )
+        monkeypatch.setattr(
+            response_mode,
+            "_consume_skill_attestation",
+            lambda token, result: (
+                types.SimpleNamespace(
+                    relative_path=response_mode._CAMERA_SKILL_PATH,
+                    turn_identity=task.turn_identity,
+                )
+                if token == attestation and result == serialized
+                else None
+            ),
+        )
+        capture = MagicMock()
+        monkeypatch.setattr(response_mode, "_capture_trusted_execution_receipt", capture)
+
+        assert not response_mode.apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=serialized,
+        )
+        capture.assert_not_called()
+        assert response_mode.trusted_skill_allowed_tool_names(agent) == frozenset()
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
+def test_silent_transport_attestation_rebuilds_scope_after_process_restart_flow(
+    tmp_path,
+    monkeypatch,
+):
+    """A fresh Hermes process must not wait for a provider skill_view call."""
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import (
+        clear_session_vars,
+        pop_execution_session_key,
+        push_execution_session_key,
+        set_session_vars,
+    )
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted proactive video skill after restart\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+
+    # A process restart loses every pending one-shot skill_view attestation.
+    response_mode._PENDING_ATTESTATIONS.clear()
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    secret_token = secret_scope_module.set_secret_scope(
+        {"ZET_AGENT_ID": "main"}
+    )
+    session_tokens = set_session_vars(
+        session_key="proactive-pvm-restart",
+        session_id="api-lineage-after-restart",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="pvm-restart-turn",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        execution_policy="silent_automation",
+    )
+    execution_session_token = push_execution_session_key(
+        "proactive-pvm-restart"
+    )
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        agent._zet_agent_execution_policy = "silent_automation"
+        agent._zet_agent_execution_policy_tools = [
+            {"type": "function", "function": {"name": "skill_view"}},
+            {"type": "function", "function": {"name": "terminal"}},
+        ]
+        agent._zet_agent_execution_policy_valid_tool_names = {
+            "skill_view",
+            "terminal",
+        }
+        agent.tools = list(agent._zet_agent_execution_policy_tools[:1])
+        agent.valid_tool_names = {"skill_view"}
+        reset_trusted_skill_execution(
+            agent,
+            '{"proactive_manifest_id":"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"trigger_id":"pvm-aaaaaaaaaaaaaaaaaaaaaaaa"}',
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+
+        assert response_mode.activate_transport_selected_trusted_skill(agent)
+        assert response_mode.trusted_skill_scope_active(agent)
+        assert [
+            tool["function"]["name"] for tool in agent.tools
+        ] == ["terminal"]
+        assert agent.valid_tool_names == {"terminal"}
+        assert (
+            "trusted proactive video skill after restart"
+            in response_mode.transport_attested_skill_instruction(agent)
+        )
+        # The deterministic runtime path does not mint a replayable/provider-
+        # returned attestation token.
+        assert response_mode._PENDING_ATTESTATIONS == {}
+    finally:
+        pop_execution_session_key(execution_session_token)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+        response_mode._PENDING_ATTESTATIONS.clear()
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+
+
+def test_silent_transport_attestation_keeps_terminal_hidden_after_snapshot_drift(
+    tmp_path,
+    monkeypatch,
+):
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# original signed proactive video skill\n"
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    agent._zet_agent_execution_policy = "silent_automation"
+    agent._zet_agent_execution_policy_tools = [
+        {"type": "function", "function": {"name": "skill_view"}},
+        {"type": "function", "function": {"name": "terminal"}},
+    ]
+    agent._zet_agent_execution_policy_valid_tool_names = {
+        "skill_view",
+        "terminal",
+    }
+    agent.tools = list(agent._zet_agent_execution_policy_tools[:1])
+    agent.valid_tool_names = {"skill_view"}
+    turn_tokens = set_turn_vars(
+        turn_id="pvm-snapshot-drift",
+        business_execution_action="a" * 64,
+        business_execution_action_version="1",
+        execution_policy="silent_automation",
+    )
+    try:
+        reset_trusted_skill_execution(
+            agent,
+            '{"proactive_manifest_id":"pvm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"trigger_id":"pvm-aaaaaaaaaaaaaaaaaaaaaaaa"}',
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+        skill_path.write_text("# changed after startup\n", encoding="utf-8")
+
+        assert not response_mode.activate_transport_selected_trusted_skill(agent)
+        assert not response_mode.trusted_skill_scope_active(agent)
+        assert [
+            tool["function"]["name"] for tool in agent.tools
+        ] == ["skill_view"]
+        assert agent.valid_tool_names == {"skill_view"}
+        assert response_mode.transport_attested_skill_instruction(agent) == ""
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
 def test_clarify_requires_nonempty_user_response_to_rearm_trusted_scope_flow():
     turn_tokens = set_turn_vars(turn_id="clarify-turn")
     try:
@@ -2091,6 +2477,7 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     agent._user_id = "transport-user"
     agent._user_id_alt = "canonical-user"
     agent._memory_write_origin = "background_review"
+    agent._zet_agent_execution_policy = "silent_automation"
     agent.request_overrides = {"response_format": {"type": "json_schema"}}
     agent._supports_followup_turns = False
     agent.stream_delta_callback = lambda _delta: None
@@ -2109,6 +2496,7 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     assert captured["api_mode"] == "chat_completions"
     assert captured["sender_id"] == "canonical-user"
     assert captured["execution_origin"] == "background_review"
+    assert captured["execution_policy"] == "silent_automation"
     assert captured["is_kanban_worker"] is True
     assert captured["structured_output"] is True
     assert captured["supports_followup_turns"] is False

@@ -22,7 +22,7 @@ from tools.environments.local import build_camera_runtime_env
 
 
 ACTION_TOKEN = "a" * 64
-BUSINESS_TOKEN = "b" * 64
+HARDWARE_TOKEN = "b" * 64
 
 
 @pytest.fixture(autouse=True)
@@ -62,9 +62,9 @@ def _write_camera_runtime(tmp_path: Path) -> Path:
             "session_id": os.environ.get("HERMES_SESSION_ID", ""),
             "session_key": os.environ.get("HERMES_SESSION_KEY", ""),
             "action": secret("ZETTLAB_AGENT_ACTION_TOKEN"),
-            "business": secret("ZETTLAB_BUSINESS_EXECUTION_TOKEN"),
+            "hardware": secret("ZETTLAB_HARDWARE_EXECUTION_TOKEN"),
             "action_plain": os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
-            "business_plain": os.environ.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
+            "hardware_plain": os.environ.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", ""),
         }, sort_keys=True))
         """
         ).lstrip(),
@@ -103,11 +103,16 @@ def _bind_receipt():
     )
     turn_tokens = set_turn_vars(
         turn_id="turn-1",
-        business_execution_token=BUSINESS_TOKEN,
+        hardware_execution_token=HARDWARE_TOKEN,
+        business_execution_action="c" * 64,
+        business_execution_action_version="1",
     )
     turn_identity = response_mode._current_skill_direct_turn_identity()
     assert turn_identity is not None
-    receipt = response_mode._capture_trusted_execution_receipt(turn_identity)
+    receipt = response_mode._capture_trusted_execution_receipt(
+        turn_identity,
+        response_mode._CAMERA_SKILL_PATH,
+    )
     assert receipt is not None
     receipt_token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
     return secret_token, session_tokens, turn_tokens, receipt_token
@@ -193,7 +198,7 @@ def test_camera_runtime_env_is_request_and_profile_scoped():
         assert build_camera_runtime_env() == {
             "ZET_AGENT_ID": "agent-1",
             "ZETTLAB_AGENT_ACTION_TOKEN": ACTION_TOKEN,
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": BUSINESS_TOKEN,
+            "ZETTLAB_HARDWARE_EXECUTION_TOKEN": HARDWARE_TOKEN,
             "HERMES_TURN_ID": "turn-1",
             "HERMES_SESSION_ID": "api-lineage-session-1",
             "HERMES_SESSION_KEY": "api-lineage-session-1",
@@ -220,7 +225,7 @@ def test_camera_runtime_direct_runner_flow_uses_secret_fds(monkeypatch, tmp_path
     assert result["camera_runtime_direct"] is True
     assert result["exit_code"] == 0
     assert ACTION_TOKEN not in result["output"]
-    assert BUSINESS_TOKEN not in result["output"]
+    assert HARDWARE_TOKEN not in result["output"]
     payload = json.loads(result["output"])
     assert payload["argv"] == ["snap", "--camera-id", "cam_front"]
     assert payload["agent"] == "agent-1"
@@ -228,9 +233,9 @@ def test_camera_runtime_direct_runner_flow_uses_secret_fds(monkeypatch, tmp_path
     assert payload["session_id"] == "api-lineage-session-1"
     assert payload["session_key"] == "api-lineage-session-1"
     assert payload["action"] == "[REDACTED]"
-    assert payload["business"] == "[REDACTED]"
+    assert payload["hardware"] == "[REDACTED]"
     assert payload["action_plain"] == ""
-    assert payload["business_plain"] == ""
+    assert payload["hardware_plain"] == ""
     assert (
         hashlib.sha256(script.read_bytes()).hexdigest()
         == (
@@ -260,13 +265,13 @@ def test_terminal_flow_routes_camera_to_trusted_direct_runner(monkeypatch, tmp_p
     assert result["camera_runtime_direct"] is True
     assert result["exit_code"] == 0
     assert ACTION_TOKEN not in result["output"]
-    assert BUSINESS_TOKEN not in result["output"]
+    assert HARDWARE_TOKEN not in result["output"]
     payload = json.loads(result["output"])
     assert payload["argv"] == ["list"]
     assert payload["action"] == "[REDACTED]"
-    assert payload["business"] == "[REDACTED]"
+    assert payload["hardware"] == "[REDACTED]"
     assert payload["action_plain"] == ""
-    assert payload["business_plain"] == ""
+    assert payload["hardware_plain"] == ""
 
 
 def test_camera_runtime_flow_fails_closed_without_capability(monkeypatch, tmp_path):

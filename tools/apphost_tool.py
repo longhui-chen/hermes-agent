@@ -16,6 +16,7 @@ remain available for devices and skills that still stage through App Host.
 """
 
 import json
+import hashlib
 import os
 import re
 import urllib.error
@@ -506,22 +507,18 @@ def _session_key():
 
 
 def _execution_headers():
-    """Forward server-issued execution context; model arguments never shape it."""
+    """Forward AppHost-owned request correlation; model arguments never shape it."""
     try:
         from gateway.session_context import (
-            business_execution_token,
             current_turn_identity,
             get_session_env,
         )
-        token = str(business_execution_token() or "").strip()
         identity = current_turn_identity()
         turn_id = identity[0] if identity else ""
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
     except Exception:
         return {}
     headers = {}
-    if token:
-        headers["X-Zettlab-Business-Execution-Token"] = token
     if turn_id:
         headers["X-Hermes-Turn-Id"] = str(turn_id)
     if session_id:
@@ -552,7 +549,6 @@ def _auto_refresh_scope_token(action, body, execution_headers):
         return None
 
     required_execution_headers = {
-        "X-Zettlab-Business-Execution-Token",
         "X-Hermes-Turn-Id",
         "X-Hermes-Session-Id",
     }
@@ -566,7 +562,17 @@ def _auto_refresh_scope_token(action, body, execution_headers):
             "当前 Agent 身份不可用，无法授权自动维护；未发送发布请求"
         )
     try:
-        token = request_app_auto_refresh_token(agent_id)
+        canonical = json.dumps(
+            operation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        operation_digest = hashlib.sha256(canonical).hexdigest()
+        token = request_app_auto_refresh_token(
+            agent_id,
+            operation_digest=operation_digest,
+            owner_agent_id=agent_id,
+            turn_id=execution_headers["X-Hermes-Turn-Id"],
+            session_id=execution_headers["X-Hermes-Session-Id"],
+        )
     except Exception:
         raise _AutoRefreshScopeUnavailable(
             "自动维护授权暂不可用；未发送发布请求"

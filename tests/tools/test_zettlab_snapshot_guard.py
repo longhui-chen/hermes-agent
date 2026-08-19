@@ -318,6 +318,39 @@ def test_trusted_video_plan_migrate_does_not_snapshot_gateway_cwd(
     assert rec.requests == []
 
 
+def test_trusted_proactive_resolve_does_not_snapshot_gateway_cwd(
+    monkeypatch, tmp_path
+):
+    from tools import terminal_tool
+
+    rec = _install(monkeypatch)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_parse_video_edit_runtime_command",
+        lambda _command: types.SimpleNamespace(
+            argv=[
+                sys.executable,
+                "/trusted/proactive_video.py",
+                "--agent-id",
+                "main",
+                "resolve",
+                "--manifest-id",
+                "pvm_" + "A" * 32,
+            ]
+        ),
+    )
+
+    command = (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/'
+        'scripts/proactive_video.py" --agent-id main resolve '
+        '--manifest-id pvm_' + "A" * 32
+    )
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": command}, turn_id="pvm-" + "a" * 24
+    ) is None
+    assert rec.requests == []
+
+
 def test_trusted_camera_action_does_not_snapshot_gateway_cwd(
     monkeypatch, tmp_path
 ):

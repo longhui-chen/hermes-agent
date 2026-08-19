@@ -1,8 +1,9 @@
-"""Tests for _normalize_chat_content in the API server adapter."""
+"""Tests for API request normalization and trusted execution boundaries."""
 
-from gateway.platforms import api_server
+import pytest
+
 from gateway.platforms.api_server import (
-    _extract_business_execution_token,
+    _extract_requested_execution_policy,
     _extract_plan_ack,
     _extract_plan_auto_execute,
     _extract_response_mode,
@@ -10,18 +11,16 @@ from gateway.platforms.api_server import (
     _normalize_chat_content,
     _resolve_plan_auto_execute,
 )
-
-
-class TestExtractBusinessExecutionToken:
-    def test_valid_opaque_token_is_preserved(self):
-        assert _extract_business_execution_token("a" * 64) == "a" * 64
-
-    def test_malformed_or_header_injected_token_is_dropped(self):
-        assert _extract_business_execution_token("short") == ""
-        assert _extract_business_execution_token("a" * 64 + "\r\nX-Evil: 1") == ""
-        assert _extract_business_execution_token("A" * 64) == ""
-
-
+class TestExtractExecutionPolicy:
+    def test_requested_policy_is_only_an_explicit_transport_signal(self):
+        assert _extract_requested_execution_policy({}) == ""
+        assert _extract_requested_execution_policy({"metadata": "silent"}) == ""
+        assert _extract_requested_execution_policy(
+            {"metadata": {"execution_policy": 1}}
+        ) == ""
+        assert _extract_requested_execution_policy(
+            {"metadata": {"executionPolicy": " Silent_Automation "}}
+        ) == "silent_automation"
 class TestExtractResponseMode:
     def test_plan_mode_is_preserved(self):
         assert _extract_response_mode(

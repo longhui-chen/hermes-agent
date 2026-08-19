@@ -1145,6 +1145,7 @@ _TRUSTED_VIDEO_EDIT_SCRIPT_NAMES = frozenset({
     "workflow_state.py",
     "cloud_render_business.py",
     "normalize.py",
+    "proactive_video.py",
 })
 _TRUSTED_VIDEO_EDIT_WRITE_OPTIONS = frozenset({
     "--output",
