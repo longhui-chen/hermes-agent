@@ -2466,6 +2466,12 @@ def _apply_context_engine_selection(
     value yields the unmodified ``api_messages``. The result is request-only —
     persisted conversation history is never mutated here.
     """
+    # Strict/silent executions must not expose frozen workflow context to an
+    # external context-engine plugin.  The agent initializer records this
+    # policy before any turn starts; keep the guard here as a second, local
+    # enforcement point for resumed turns and custom callers.
+    if bool(getattr(agent, "_strict_memory_isolation", False)):
+        return api_messages
     engine = getattr(agent, "context_compressor", None)
     if engine is None or not hasattr(engine, "select_context"):
         return api_messages
@@ -2548,6 +2554,8 @@ def _notify_context_engine_turn_complete(
     ``messages`` is passed as a shallow copy so the engine cannot mutate the
     persisted transcript.
     """
+    if bool(getattr(agent, "_strict_memory_isolation", False)):
+        return
     engine = getattr(agent, "context_compressor", None)
     hook = getattr(engine, "on_turn_complete", None)
     if engine is None or not callable(hook):

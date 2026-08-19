@@ -534,7 +534,11 @@ def test_publish_operation_is_passed_through_unchanged(monkeypatch):
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     assert out["ok"] is True
-    mint.assert_called_once_with("main")
+    mint.assert_called_once()
+    assert mint.call_args.kwargs["owner_agent_id"] == "main"
+    assert mint.call_args.kwargs["turn_id"] == "turn-1"
+    assert mint.call_args.kwargs["session_id"] == "session-1"
+    assert len(mint.call_args.kwargs["operation_digest"]) == 64
     assert json.loads(seen["req"].data)["operation"] == operation
     assert seen["req"].get_header("X-zettlab-agent-action-token") == "a" * 64
 

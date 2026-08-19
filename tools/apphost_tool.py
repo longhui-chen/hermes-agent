@@ -16,6 +16,7 @@ remain available for devices and skills that still stage through App Host.
 """
 
 import json
+import hashlib
 import os
 import re
 import urllib.error
@@ -561,7 +562,17 @@ def _auto_refresh_scope_token(action, body, execution_headers):
             "当前 Agent 身份不可用，无法授权自动维护；未发送发布请求"
         )
     try:
-        token = request_app_auto_refresh_token(agent_id)
+        canonical = json.dumps(
+            operation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        operation_digest = hashlib.sha256(canonical).hexdigest()
+        token = request_app_auto_refresh_token(
+            agent_id,
+            operation_digest=operation_digest,
+            owner_agent_id=agent_id,
+            turn_id=execution_headers["X-Hermes-Turn-Id"],
+            session_id=execution_headers["X-Hermes-Session-Id"],
+        )
     except Exception:
         raise _AutoRefreshScopeUnavailable(
             "自动维护授权暂不可用；未发送发布请求"

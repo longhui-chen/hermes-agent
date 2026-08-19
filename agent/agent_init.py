@@ -2428,6 +2428,12 @@ def init_agent(
     # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
     # 3. Check general plugin system (user-installed plugins)
     # 4. Fall back to built-in ContextCompressor
+    # Silent/strict runs are frozen, request-local executions.  Never load a
+    # user/plugin context engine for them: its selection and turn-finalizer
+    # hooks can observe or mutate the frozen transcript outside the trusted
+    # runtime boundary.  The built-in compressor remains available for the
+    # ordinary context budget path, but no external engine is admitted.
+    _context_engine_isolated = bool(strict_memory_isolation)
     _selected_engine = None
     _copy_failed = False
     _engine_name = "compressor"  # default
@@ -2437,7 +2443,7 @@ def init_agent(
     except Exception:
         pass
 
-    if _engine_name != "compressor":
+    if _engine_name != "compressor" and not _context_engine_isolated:
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
@@ -2630,6 +2636,8 @@ def init_agent(
     # same local-model latency penalty.
     agent._context_engine_tool_names: set = set()
     if (
+        not _context_engine_isolated
+        and
         hasattr(agent, "context_compressor")
         and agent.context_compressor
         and agent.tools is not None
@@ -2666,7 +2674,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not _context_engine_isolated
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,
