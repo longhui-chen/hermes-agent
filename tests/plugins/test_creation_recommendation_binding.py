@@ -1744,3 +1744,53 @@ def test_release_and_receipt_claim_happen_in_a_single_lock_acquisition(monkeypat
     assert acquisitions["count"] == 1, (
         "释放闸门和领取回执分成了两次拿锁，中间留出了并发窗口"
     )
+
+
+# 消费 proposal 和发布 accepted 回执之间不能有窗口。有窗口的话，并发重放会在这两步
+# 之间读到「proposal 已被消费」、写下 rejected，而它的响应可能在 accepted 落库之前
+# 就把 rejected 带回客户端——一次已经接管的创建被显示成失败，用户重试就是重复创建。
+#
+# 注入点选在 _grant_creation_for_turn：它正好在临界区之后、外层写回执之前，也就是
+# 那个窗口本身。修好之后 accepted 在临界区里就发布了，重放读到的必然是 accepted。
+def test_replay_never_reads_rejected_before_the_accepted_receipt_is_published(
+    two_requests, monkeypatch
+):
+    first, second = two_requests
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "publish-window", creation_type="skill")
+    real_grant = plugin._grant_creation_for_turn
+    replay_output = {}
+
+    def _grant_then_let_the_replay_run(turn_id: str, creation_type: str) -> None:
+        real_grant(turn_id, creation_type)
+        if replay_output:
+            return
+        second.run(
+            plugin._on_pre_llm_call,
+            session_id="publish-window",
+            sender_id="owner-a",
+            turn_id="shared-turn",
+            user_message=_action(payload),
+            conversation_history=[],
+            creation_action_receipt_transport=RECEIPT_TRANSPORT,
+        )
+        replay_output["text"] = second.run(
+            plugin._transform_llm_output,
+            session_id="publish-window",
+            sender_id="owner-a",
+            turn_id="shared-turn",
+            response_text="这张卡我看过了。",
+            completed=True,
+            failed=False,
+            creation_action_receipt_transport=RECEIPT_TRANSPORT,
+        )
+
+    monkeypatch.setattr(
+        plugin, "_grant_creation_for_turn", _grant_then_let_the_replay_run
+    )
+    _accept_action(first, plugin, "publish-window", payload, "shared-turn")
+
+    assert replay_output.get("text"), "注入点没被触发，这条用例没验到窗口"
+    assert _decode_action_result(replay_output["text"])["status"] == "accepted", (
+        "重放在 accepted 落库之前读到了 rejected"
+    )

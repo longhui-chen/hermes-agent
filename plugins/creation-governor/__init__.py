@@ -1849,7 +1849,12 @@ def _parse_recommendation_response(user_message: str) -> dict[str, Any] | None:
 
 
 def _handle_previous_proposal_action(
-    session_id: str, user_message: str, now: float
+    session_id: str,
+    user_message: str,
+    now: float,
+    *,
+    turn_id: str = "",
+    receipt_transport: str = "",
 ) -> _ActionHandlingOutcome:
     structured = _parse_recommendation_response(user_message)
     if structured is None and "[creation_recommendation_response]" in user_message:
@@ -1875,6 +1880,19 @@ def _handle_previous_proposal_action(
                 _discard_staged_proposal_locked(
                     session_id, state, release_claim=False
                 )
+                # 消费 proposal 和发布 accepted 回执必须在**同一个**临界区。分开
+                # 的话中间有个窗口：并发重放读到「proposal 已被消费」、写下
+                # rejected，而它的响应可能在 accepted 落库之前就把 rejected 带回
+                # 客户端——一次已经接管的创建被显示成失败，用户重试就是重复创建。
+                # 赢下这次状态跃迁的请求必然一路走到 accepted（下面 create 分支没
+                # 有别的出口），所以在这里发布是安全的；外层随后那次存储是同值
+                # 重放，被单调规则吃掉。
+                if turn_id and receipt_transport:
+                    _store_pending_action_result_locked(
+                        state,
+                        turn_id,
+                        _ActionReceipt(structured["proposal_id"], action, "accepted"),
+                    )
             elif current and action == "dismiss":
                 state["last_proposal"] = None
                 state["proposal_stage"] = None
@@ -2177,7 +2195,13 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         # 从这里起这一轮进入配额管控：出现过推荐动作，创建工具就不能再无条件
         # 放行。接管成功会往下发一张票，被拒则一张都没有。
         _enter_creation_quota_for_turn(outer_turn_id)
-        outcome = _handle_previous_proposal_action(session_id, user_message, now)
+        outcome = _handle_previous_proposal_action(
+            session_id,
+            user_message,
+            now,
+            turn_id=outer_turn_id,
+            receipt_transport=receipt_transport,
+        )
         if (
             outcome.receipt is not None
             and outcome.receipt.status == "accepted"
