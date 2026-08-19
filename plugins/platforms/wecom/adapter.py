@@ -62,6 +62,8 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     safe_exc,
+    safe_traceback,
+    safe_url_for_log,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -391,9 +393,9 @@ class WeComAdapter(BasePlatformAdapter):
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             return True
         except Exception as exc:
-            message = f"WeCom startup failed: {exc}"
+            message = f"WeCom startup failed: {safe_exc(exc)}"
             self._set_fatal_error("wecom_connect_error", message, retryable=True)
-            logger.error("[%s] Failed to connect: %s", self.name, safe_exc(exc), exc_info=True)
+            logger.error("[%s] Failed to connect:\n%s", self.name, safe_traceback(exc))
             await self._cleanup_ws()
             if self._http_client:
                 await self._http_client.aclose()
@@ -1791,11 +1793,22 @@ class WeComAdapter(BasePlatformAdapter):
 
         try:
             prepared = await self._prepare_outbound_media(media_source, file_name=file_name)
-        except FileNotFoundError as exc:
-            return SendResult(success=False, error=str(exc))
+        except FileNotFoundError:
+            return SendResult(
+                success=False,
+                error="WeCom media file was not found. Regenerate or re-upload it, then try again.",
+            )
         except Exception as exc:
-            logger.error("[%s] Failed to prepare outbound media %s: %s", self.name, media_source, safe_exc(exc))
-            return SendResult(success=False, error=str(exc))
+            logger.error(
+                "[%s] Failed to prepare outbound media %s: %s",
+                self.name,
+                safe_url_for_log(media_source),
+                safe_exc(exc),
+            )
+            return SendResult(
+                success=False,
+                error="WeCom could not prepare the media. Check the source and try again.",
+            )
 
         if prepared["rejected"]:
             await self._send_followup_markdown(
@@ -1830,8 +1843,16 @@ class WeComAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending media to WeCom")
         except Exception as exc:
-            logger.error("[%s] Failed to send media %s: %s", self.name, media_source, safe_exc(exc))
-            return SendResult(success=False, error=str(exc))
+            logger.error(
+                "[%s] Failed to send media %s: %s",
+                self.name,
+                safe_url_for_log(media_source),
+                safe_exc(exc),
+            )
+            return SendResult(
+                success=False,
+                error="WeCom media delivery failed. Check the bot connection and try again.",
+            )
 
         caption_result = None
         downgrade_result = None
@@ -1926,7 +1947,12 @@ class WeComAdapter(BasePlatformAdapter):
         if result.success or not self._looks_like_url(image_url):
             return result
 
-        logger.warning("[%s] Falling back to text send for image URL %s: %s", self.name, image_url, result.error)
+        logger.warning(
+            "[%s] Falling back to text send for image URL %s: %s",
+            self.name,
+            safe_url_for_log(image_url),
+            result.error,
+        )
         fallback_text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id=chat_id, content=fallback_text, reply_to=reply_to)
 

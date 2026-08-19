@@ -104,6 +104,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     is_network_accessible,
+    safe_exc,
     validate_media_delivery_path,
 )
 from gateway.readiness import collect_runtime_readiness
@@ -711,6 +712,179 @@ _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 _CURRENT_TURN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 _CURRENT_TURN_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_API_MEDIA_PROBE_MAX_DATA_HEADER = 128
+_API_MEDIA_PROBE_MAX_IMAGE_SAMPLES = 8
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 入站媒体观测点 —— **真正的入口**在这里,⛔ 不在 platform adapter
+# ═══════════════════════════════════════════════════════════════════════
+#
+# 🔴 实测推翻的前提(2026-08-17 21:32–21:36,cloud-gt002):
+#    我把探针挂在 ``BasePlatformAdapter.handle_message``,理由是
+#    ``RelayAdapter`` 继承了它。代码在、进程是新槽、门全绿、逆改全红 ——
+#    **真实流量里一次都没执行**。
+#    ⭐ 板端根本不走 Python platform adapter,走的是**这条 HTTP 端点**
+#      (同窗口 access log 有 ``POST /p/main/v1/chat/completions 200``)。
+#    ⇒ **「继承了」推不出「会被执行」**。判据必须是「它实际被谁调用」,
+#      ⛔ 不是「结构上它在调用链里」。
+#
+# ⭐ 本探针**每个请求都出声**(哪怕没有任何媒体、哪怕 JSON 都没解开)。
+#    为什么:上一版对纯文本**保持沉默**,于是「没有那行」有两种成因 ——
+#    「没有媒体」和「根本没被执行」—— 混在一起就什么都判不了。
+#    ⇒ 判据从「有没有那行」换成「``seq`` 有没有前进」:
+#      seq 停着不动 = 没被执行;seq 前进而 media=0 = 执行了、请求里真没媒体。
+#    ⭐ 这是**唯一**能把「量具没跑」和「被测对象是空的」分开的形状。
+_API_MEDIA_PROBE = "[API-MEDIA-INGRESS]"
+_API_MEDIA_PROBE_SEQ = itertools.count(1)
+
+
+def _probe_describe_image_ref(url_value: Any) -> str:
+    """把一条图片引用压成**不含内容**的形状描述。
+
+    ⛔ 一个字符的 URL / base64 都不出;只出:固定 scheme、已知 data MIME 或
+       ``other``、payload **字节数**(数字不是内容)。
+    ⭐ 这正是 LS 侧 ``model input data url missing`` 的镜像判据:
+       它说「我没送出去」,这里能证明「我确实一个都没收到 / 收到了但形状不对」。
+    """
+    if not isinstance(url_value, str) or not url_value:
+        return "empty"
+    if url_value[:5].lower() == "data:":
+        comma = url_value.find(",", 5, 5 + _API_MEDIA_PROBE_MAX_DATA_HEADER)
+        if comma < 0:
+            return "data:malformed"
+        header = url_value[5:comma]
+        pieces = header.split(";")
+        mime = pieces[0].lower()
+        label = mime if mime in _CURRENT_TURN_IMAGE_MIMES else "other"
+        b64 = any(piece.lower() == "base64" for piece in pieces[1:])
+        return f"data:{label};{'b64' if b64 else 'raw'};{len(url_value) - comma - 1}b"
+    if url_value[:8].lower() == "https://":
+        return "https"
+    if url_value[:7].lower() == "http://":
+        return "http"
+    return "other"
+
+
+def _probe_profile_id(profile: Any) -> str:
+    """Keep the route profile correlatable without writing client path text."""
+    if not isinstance(profile, str) or not profile:
+        return "-"
+    return hashlib.sha256(profile.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _log_api_media_ingress(
+    request: Any, body: Any, *, outcome: str = "", profile: str = "",
+) -> None:
+    """记录**每一次** chat/completions 请求里到底带了什么媒体。
+
+    ⛔ 不出:URL 值、base64 内容、鉴权头、消息正文。
+    ✅ 出:条数、part 类型分布、图片引用的**形状**、固定的不支持类型类别。
+
+    ⚠️ ``file`` / ``input_file`` / ``input_audio`` 这三类在本端点是**直接 400**
+       的(见 ``_normalize_multimodal_content``:file 抛
+       ``unsupported_content_type``,audio 落到最后那条 unknown 分支)。
+       ⇒ 它们出现在 ``unsupported=[…]`` 里就等于**当场定位**了
+       「文件/音频发不进来」的归属:⛔ 不是链路丢了,是这个端点不收。
+
+    ⛔ 本函数永不向调用方抛异常(把请求处理弄挂不可接受),也⛔ 不静默:
+       自己坏了打 ``[API-MEDIA-INGRESS-ERR]``。
+    """
+    seq = next(_API_MEDIA_PROBE_SEQ)
+    try:
+        counts = {"text": 0, "image": 0, "file": 0, "other": 0}
+        unsupported: List[str] = []
+        img_shapes: List[str] = []
+        img_more = 0
+        n_msgs = 0
+        parts_more = 0
+        # 🔴 探针盲区补丁(2026-08-17 实证):**文件根本不是 part**。
+        #    LS 的 `internal/backend/hermes/chat.go` 逐字写着:
+        #      "{type:image_url,...}; non-image media (files) are appended to the
+        #       user text as a line \"[file: <url>]\" since hermes' Chat
+        #       Completions endpoint does not (today) expose a file content part"
+        #    ⇒ 只按 part 类型枚举,文件消息在探针眼里和纯文本**长得一模一样**,
+        #      正好落在最要紧的那一格上。⇒ 数 `[file: ` 出现次数。
+        #    ⛔ 只出**计数**,⛔ 一个字符的路径都不出(路径会泄漏 HERMES_HOME 布局)。
+        file_notes = 0
+        content_shapes: List[str] = []
+
+        def _count_file_notes(text: Any) -> None:
+            nonlocal file_notes
+            if isinstance(text, str):
+                file_notes += text.count("[file: ")
+
+        messages = (body or {}).get("messages") if isinstance(body, dict) else None
+        if isinstance(messages, list):
+            n_msgs = len(messages)
+            current = next(
+                (msg for msg in reversed(messages)
+                 if isinstance(msg, dict) and msg.get("role") == "user"),
+                None,
+            )
+            if current is not None:
+                content = current.get("content")
+                if not isinstance(content, list):
+                    # ⭐ 非图片消息 LS 送的是**纯字符串** content(不是 parts 数组)——
+                    #    这一支以前整个不统计,文件行就是在这里被漏掉的。
+                    content_shapes.append("str" if isinstance(content, str) else "?")
+                    _count_file_notes(content)
+                else:
+                    content_shapes.append("list")
+                    parts = content[:MAX_CONTENT_LIST_SIZE]
+                    parts_more = len(content) - len(parts)
+                    for part in parts:
+                        if isinstance(part, str):
+                            counts["text"] += 1
+                            continue
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = str(part.get("type") or "").strip().lower()
+                        if ptype in _TEXT_PART_TYPES:
+                            counts["text"] += 1
+                            _count_file_notes(part.get("text"))
+                        elif ptype in _IMAGE_PART_TYPES:
+                            counts["image"] += 1
+                            ref = part.get("image_url")
+                            if isinstance(ref, dict):
+                                ref = ref.get("url")
+                            if len(img_shapes) < _API_MEDIA_PROBE_MAX_IMAGE_SAMPLES:
+                                img_shapes.append(_probe_describe_image_ref(ref))
+                            else:
+                                img_more += 1
+                        elif ptype in _FILE_PART_TYPES:
+                            counts["file"] += 1
+                            unsupported.append(ptype)
+                        else:
+                            counts["other"] += 1
+                            unsupported.append("input_audio" if ptype == "input_audio" else "other")
+
+        if outcome:
+            verdict = outcome
+        elif unsupported:
+            verdict = "has_unsupported"
+        elif counts["image"] and file_notes:
+            verdict = "image_and_filenote"
+        elif counts["image"]:
+            verdict = "image_only"
+        elif file_notes:
+            # ⭐ 文件走的是文本行,⛔ 不是 part —— 这一格以前会被误判成 no_media。
+            verdict = "filenote_only"
+        else:
+            verdict = "no_media"
+
+        logger.info(
+            "%s seq=%d id=%x-%04x profile=%s msgs=%d shapes=[%s] parts_more=%d text=%d image=%d "
+            "filepart=%d other=%d filenote=%d img=[%s] img_more=%d unsupported=[%s] verdict=%s",
+            _API_MEDIA_PROBE, seq, os.getpid(), seq & 0xFFFF,
+            _probe_profile_id(profile), n_msgs, ",".join(content_shapes), parts_more,
+            counts["text"], counts["image"], counts["file"], counts["other"],
+            file_notes,
+            ",".join(img_shapes), img_more, ",".join(sorted(set(unsupported))), verdict,
+        )
+    except Exception as exc:
+        # ⛔ 不裸 `%s` 异常 —— 请求体里可能带 data URL / 令牌,异常消息会回显。
+        logger.warning("[API-MEDIA-INGRESS-ERR] seq=%d %s", seq, safe_exc(exc))
 
 
 def _normalize_multimodal_content(content: Any) -> Any:
@@ -5499,10 +5673,21 @@ class APIServerAdapter(BasePlatformAdapter):
             return limited
 
         # Parse request body
+        _probe_profile = ""
+        try:
+            _probe_profile = str(request.match_info.get("profile", "") or "")
+        except Exception:
+            _probe_profile = ""
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
+            # ⭐ 解不开也要出声 —— 否则「没有那行」又会有两种成因。
+            _log_api_media_ingress(request, None, outcome="bad_json", profile=_probe_profile)
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        # ⭐ 入站媒体观测点:**每个请求都记一行**,seq 单调递增。
+        #    这是本端点真正的入口 —— 板端走的就是它,⛔ 不是 platform adapter。
+        _log_api_media_ingress(request, body, profile=_probe_profile)
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):

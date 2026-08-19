@@ -68,6 +68,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     log_media_intake_failure,
     safe_exc,
+    safe_traceback,
     media_failure_reply_text,
     read_aiohttp_body_with_limit,
 )
@@ -1454,7 +1455,12 @@ class WeixinAdapter(BasePlatformAdapter):
         try:
             await self._process_message(message)
         except Exception as exc:
-            logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), safe_exc(exc), exc_info=True)
+            logger.error(
+                "[%s] unhandled inbound error from=%s:\n%s",
+                self.name,
+                _safe_id(message.get("from_user_id")),
+                safe_traceback(exc),
+            )
 
     async def _process_message(self, message: Dict[str, Any]) -> None:
         assert self._poll_session is not None
@@ -2290,7 +2296,19 @@ class WeixinAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if image_url.startswith(("http://", "https://")):
-            file_path = await self._download_remote_media(image_url)
+            try:
+                file_path = await self._download_remote_media(image_url)
+            except Exception as exc:
+                # 下载异常可能原样携带签名 URL；到用户边界只返回固定、可行动的分类。
+                logger.error("[%s] remote image download failed: %s", self.name, safe_exc(exc))
+                status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+                if status in {401, 403, 404, 410}:
+                    error = "Weixin could not access the image link. Please resend the image."
+                    retryable = False
+                else:
+                    error = "Weixin could not download the image. Check the network and resend the image."
+                    retryable = True
+                return SendResult(success=False, error=error, retryable=retryable)
             cleanup = True
         else:
             file_path = image_url.replace("file://", "")

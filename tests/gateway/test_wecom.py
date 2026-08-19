@@ -277,6 +277,73 @@ class TestMediaUpload:
 
 class TestSend:
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("signed", [
+        "https://cdn.example/media.png?token=TOP_SECRET",
+        "https://[bad?token=TOP_SECRET",
+    ])
+    async def test_prepare_media_failure_does_not_leak_signed_source(self, caplog, signed):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._prepare_outbound_media = AsyncMock(
+            side_effect=RuntimeError(f"403 while reading {signed}")
+        )
+
+        with caplog.at_level("ERROR"):
+            result = await adapter._send_media_source("chat-1", signed)
+
+        adapter._prepare_outbound_media.assert_awaited_once_with(signed, file_name=None)
+        assert "TOP_SECRET" not in caplog.text and signed not in caplog.text
+        assert "TOP_SECRET" not in (result.error or "")
+        assert result.error == "WeCom could not prepare the media. Check the source and try again."
+        assert result.retryable is False, "清洗日志不能顺带改变原有自动重试语义"
+
+    @pytest.mark.asyncio
+    async def test_send_media_failure_does_not_leak_signed_source(self, caplog):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        signed = "https://cdn.example/media.png?token=TOP_SECRET"
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._prepare_outbound_media = AsyncMock(return_value={
+            "data": b"image",
+            "final_type": "image",
+            "file_name": "image.png",
+            "rejected": False,
+            "downgraded": False,
+            "downgrade_note": None,
+        })
+        adapter._upload_media_bytes = AsyncMock(
+            side_effect=RuntimeError(f"403 while sending {signed}")
+        )
+
+        with caplog.at_level("ERROR"):
+            result = await adapter._send_media_source("chat-1", signed)
+
+        adapter._upload_media_bytes.assert_awaited_once()
+        assert "TOP_SECRET" not in caplog.text and signed not in caplog.text
+        assert "TOP_SECRET" not in (result.error or "")
+        assert result.error == "WeCom media delivery failed. Check the bot connection and try again."
+        assert result.retryable is False, "清洗日志不能顺带改变原有自动重试语义"
+
+    @pytest.mark.asyncio
+    async def test_image_fallback_log_redacts_signed_url(self, caplog):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        signed = "https://cdn.example/media.png?token=TOP_SECRET"
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_media_source = AsyncMock(
+            return_value=SendResult(success=False, error="safe media failure")
+        )
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        with caplog.at_level("WARNING"):
+            await adapter.send_image("chat-1", signed)
+
+        adapter._send_media_source.assert_awaited_once()
+        assert "TOP_SECRET" not in caplog.text and signed not in caplog.text
+        adapter.send.assert_awaited_once()
+
 
     @pytest.mark.asyncio
     async def test_send_voice_sends_caption_and_downgrade_note(self):
@@ -482,4 +549,3 @@ class TestTextBatchFlushRace:
         assert adapter._pending_text_batches.get(key) is event, (
             "superseded task must not pop the event"
         )
-

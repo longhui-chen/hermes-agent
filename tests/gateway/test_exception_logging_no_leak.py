@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import pathlib
 
 import pytest
@@ -109,6 +110,20 @@ def test_safe_exc_leaves_harmless_messages_readable():
     assert "read timed out after 30s" in out and "TimeoutError" in out
 
 
+def test_safe_exc_redacts_and_bounds_data_uri_payloads():
+    marker = b"TEAMS-USER-FILE-CONTENT-"
+    payload = base64.b64encode(marker * 1000).decode()
+    exc = RuntimeError(f"send failed activity='data:image/png;base64,{payload}' after upload")
+    raw = str(exc)
+    assert payload[:80] in raw and len(raw) > 20_000, "量具没把真实长 data URI 放进异常"
+
+    out = safe_exc(exc)
+
+    assert payload[:80] not in out and "data:image/png;base64" not in out
+    assert "<data-uri>" in out and "after upload" in out
+    assert out.startswith("RuntimeError:") and len(out) <= 2100
+
+
 # ───────── ③ 闭集门：作用域内⛔不许再有裸异常进日志 ─────────
 
 
@@ -192,3 +207,30 @@ def test_exc_info_true_is_a_known_open_edge():
         "新增了 exc_info=True 的日志点 —— traceback 里会有完整异常消息。\n"
         "确认这个 except 捕到的异常不含 URL/凭据/路径后，再把上限加一：\n  "
         + "\n  ".join(sites))
+
+
+def test_safe_exc_callers_do_not_reenable_raw_tracebacks() -> None:
+    """``safe_exc`` 与 ``exc_info=True`` 同用会让 logging 再次格式化原异常。"""
+    safe_calls = 0
+    bypasses: list[str] = []
+    for root in ("gateway", "plugins"):
+        for path in sorted((_REPO / root).rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+                has_safe_render = any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"safe_exc", "safe_traceback"}
+                    for arg in call.args
+                    for node in ast.walk(arg)
+                )
+                if not has_safe_render:
+                    continue
+                safe_calls += 1
+                if any(
+                    kw.arg == "exc_info" and getattr(kw.value, "value", None) is True
+                    for kw in call.keywords
+                ):
+                    bypasses.append(f"{path.relative_to(_REPO)}:{call.lineno}")
+    assert safe_calls >= 50, f"只扫到 {safe_calls} 个 safe_exc 调用,量具可能坏了"
+    assert not bypasses, "这些调用清洗正文后又用原始 traceback 绕过:\n  " + "\n  ".join(bypasses)

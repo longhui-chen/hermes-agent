@@ -133,6 +133,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    log_media_intake_failure,
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
     _ssrf_redirect_guard,
@@ -140,6 +141,17 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import ThreadParticipationTracker
 
 logger = logging.getLogger(__name__)
+
+#: MessageType ⇒ 记账用的 kind 词表。⛔ 不许把 MessageType 枚举名直接当 kind
+#: 写进日志 —— 那是内部标识,而 kind 是跨 provider 对齐的词(见 weixin
+#: `_ITEM_KIND` 与 wecom 同名表)。
+_MATRIX_MEDIA_KIND = {
+    MessageType.PHOTO: "image",
+    MessageType.VIDEO: "video",
+    MessageType.AUDIO: "audio",
+    MessageType.VOICE: "voice",
+    MessageType.DOCUMENT: "file",
+}
 
 _MATRIX_VOICE_WAVEFORM_BINS = 30
 
@@ -3572,7 +3584,19 @@ class MatrixAdapter(BasePlatformAdapter):
                                 file_bytes, filename
                             )
             except Exception as e:
-                logger.warning("[Matrix] Failed to cache media: %s", e)
+                # ⚠️ 分格声明:Matrix 的下载 URL(`_mxc_to_http`)是
+                # `{homeserver}/_matrix/client/v1/media/download/...`,**不带**
+                # 签名参数或 access_token(认证走 Authorization 头)⇒ 这里
+                # **不是**像 Slack/Teams/Discord 那样的凭据泄漏面。
+                # 改走共享记账的理由是另外两条:①原写法把 mautrix 的
+                # `MatrixRequestError` 整个 `%s` 进日志,响应体可能带回服务端
+                # 细节 ②「哪一类媒体、因为什么没取到」原来完全看不出来 ——
+                # 一条 "Failed to cache media" 把 4 类失败压成同一句。
+                log_media_intake_failure(
+                    logger, "matrix", _MATRIX_MEDIA_KIND.get(msg_type, "file"),
+                    "decrypt_or_cache_failed" if is_encrypted_media else "download_failed",
+                    url=http_url, exc=e, event_id=event_id,
+                )
 
         ctx = await self._resolve_message_context(
             room_id,
