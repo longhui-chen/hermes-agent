@@ -140,6 +140,7 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
     _read_httpx_body_with_limit,
+    inbound_media_download_permit,
     log_media_intake_failure,
     read_aiohttp_body_with_limit,
     resolve_proxy_url,
@@ -2332,13 +2333,15 @@ class MatrixAdapter(BasePlatformAdapter):
         if self._proxy_url:
             client_kwargs["proxy"] = self._proxy_url
         async with create_ssrf_safe_async_client(**client_kwargs) as http:
-            async with http.stream("GET", url) as resp:
-                resp.raise_for_status()
-                data = await _read_httpx_body_with_limit(
-                    resp,
-                    media_type="Matrix outbound image",
-                    max_bytes=self._max_media_bytes,
-                )
+            async with inbound_media_download_permit():
+                async with http.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    data = await _read_httpx_body_with_limit(
+                        resp,
+                        media_type="Matrix outbound image",
+                        max_bytes=self._max_media_bytes,
+                        permit_acquired=True,
+                    )
                 content_type = str(
                     resp.headers.get("content-type", "application/octet-stream")
                 ).split(";", 1)[0].strip().lower()
@@ -3675,59 +3678,62 @@ class MatrixAdapter(BasePlatformAdapter):
                 query_params["user_id"] = api.as_user_id
         request_id = api.log_download_request(download_url, query_params)
         started_at = time.monotonic()
-        async with api.session.get(
-            download_url,
-            params=query_params,
-            headers=headers,
-            allow_redirects=False,
-        ) as response:
-            try:
-                if 300 <= response.status < 400:
-                    if authenticated:
-                        raise RuntimeError("Authenticated Matrix media redirect refused")
-                    location = response.headers.get("Location") or response.headers.get("location")
-                    if not location:
-                        raise RuntimeError("Matrix media redirect missing Location")
-                    redirect_url = urljoin(str(download_url), str(location))
-                    from tools.url_safety import (
-                        create_ssrf_safe_async_client,
-                        is_safe_url,
-                    )
-                    if not is_safe_url(redirect_url):
-                        raise RuntimeError("Unsafe Matrix media redirect refused")
-                    async with create_ssrf_safe_async_client(
-                        timeout=30,
-                        follow_redirects=True,
-                        event_hooks={"response": [_ssrf_redirect_guard]},
-                    ) as redirect_client:
-                        async with redirect_client.stream("GET", redirect_url) as redirected:
-                            redirected.raise_for_status()
-                            try:
-                                return await _read_httpx_body_with_limit(
-                                    redirected,
-                                    media_type="Matrix inbound media",
-                                    max_bytes=self._max_media_bytes,
-                                )
-                            except ValueError as exc:
-                                raise _MatrixInboundMediaRejected(str(exc)) from exc
-                status_result = response.raise_for_status()
-                if inspect.isawaitable(status_result):
-                    await status_result
+        async with inbound_media_download_permit():
+            async with api.session.get(
+                download_url,
+                params=query_params,
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
                 try:
-                    return await read_aiohttp_body_with_limit(
-                        response,
-                        media_type="Matrix inbound media",
-                        max_bytes=self._max_media_bytes,
+                    if 300 <= response.status < 400:
+                        if authenticated:
+                            raise RuntimeError("Authenticated Matrix media redirect refused")
+                        location = response.headers.get("Location") or response.headers.get("location")
+                        if not location:
+                            raise RuntimeError("Matrix media redirect missing Location")
+                        redirect_url = urljoin(str(download_url), str(location))
+                        from tools.url_safety import (
+                            create_ssrf_safe_async_client,
+                            is_safe_url,
+                        )
+                        if not is_safe_url(redirect_url):
+                            raise RuntimeError("Unsafe Matrix media redirect refused")
+                        async with create_ssrf_safe_async_client(
+                            timeout=30,
+                            follow_redirects=True,
+                            event_hooks={"response": [_ssrf_redirect_guard]},
+                        ) as redirect_client:
+                            async with redirect_client.stream("GET", redirect_url) as redirected:
+                                redirected.raise_for_status()
+                                try:
+                                    return await _read_httpx_body_with_limit(
+                                        redirected,
+                                        media_type="Matrix inbound media",
+                                        max_bytes=self._max_media_bytes,
+                                        permit_acquired=True,
+                                    )
+                                except ValueError as exc:
+                                    raise _MatrixInboundMediaRejected(str(exc)) from exc
+                    status_result = response.raise_for_status()
+                    if inspect.isawaitable(status_result):
+                        await status_result
+                    try:
+                        return await read_aiohttp_body_with_limit(
+                            response,
+                            media_type="Matrix inbound media",
+                            max_bytes=self._max_media_bytes,
+                            permit_acquired=True,
+                        )
+                    except ValueError as exc:
+                        raise _MatrixInboundMediaRejected(str(exc)) from exc
+                finally:
+                    api.log_download_request_done(
+                        download_url,
+                        request_id,
+                        time.monotonic() - started_at,
+                        response.status,
                     )
-                except ValueError as exc:
-                    raise _MatrixInboundMediaRejected(str(exc)) from exc
-            finally:
-                api.log_download_request_done(
-                    download_url,
-                    request_id,
-                    time.monotonic() - started_at,
-                    response.status,
-                )
 
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""

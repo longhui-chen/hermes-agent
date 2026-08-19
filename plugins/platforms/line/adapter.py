@@ -124,6 +124,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_video_from_bytes,
     get_inbound_media_max_bytes,
+    inbound_media_download_permit,
     read_aiohttp_body_with_limit,
     safe_exc,
 )
@@ -146,6 +147,11 @@ LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
 LINE_REQUEST_CACHE_MAX_TOTAL_CHARS = 8_000_000
+LINE_MORE_REPLY_TEXT = "More of this answer is ready."
+LINE_MORE_BUTTON_LABEL = "Show more"
+LINE_RESPONSE_TOO_LARGE_TEXT = (
+    "The response was too large to deliver. Ask for a shorter answer or a file."
+)
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -397,6 +403,23 @@ def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[s
     return chunks
 
 
+def _bounded_line_text(text: str) -> str:
+    if len(text) > LINE_REQUEST_CACHE_MAX_TOTAL_CHARS:
+        keep = LINE_REQUEST_CACHE_MAX_TOTAL_CHARS - len(LINE_RESPONSE_TOO_LARGE_TEXT) - 2
+        return f"{text[:keep]}\n\n{LINE_RESPONSE_TOO_LARGE_TEXT}"
+    return text
+
+
+def _line_text_page(text: str) -> Tuple[List[str], str]:
+    """Return one five-message LINE page and a cacheable remainder."""
+    chunks = split_for_line(_bounded_line_text(text))
+    if len(chunks) <= LINE_MAX_MESSAGES_PER_CALL:
+        return chunks, ""
+    return chunks[:LINE_MAX_MESSAGES_PER_CALL - 1], "\n".join(
+        chunks[LINE_MAX_MESSAGES_PER_CALL - 1:]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Webhook signature verification
 # ---------------------------------------------------------------------------
@@ -474,6 +497,15 @@ class RequestCache:
             return None
         rid = str(uuid.uuid4())
         self._entries[rid] = _CacheEntry(state=State.PENDING, chat_id=chat_id)
+        return rid
+
+    def register_ready(self, chat_id: str, payload: Any) -> Optional[str]:
+        rid = self.register_pending(chat_id)
+        if rid is None:
+            return None
+        if not self.set_ready(rid, payload):
+            self.delete(rid)
+            return None
         return rid
 
     def get(self, request_id: str) -> Optional[_CacheEntry]:
@@ -704,12 +736,14 @@ class _LineClient:
         url = LINE_CONTENT_URL_FMT.format(message_id=message_id)
         timeout = aiohttp.ClientTimeout(total=30.0)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"LINE content {resp.status}")
-                return await read_aiohttp_body_with_limit(
-                    resp, media_type="LINE inbound media", max_bytes=max_bytes,
-                )
+            async with inbound_media_download_permit():
+                async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"LINE content {resp.status}")
+                    return await read_aiohttp_body_with_limit(
+                        resp, media_type="LINE inbound media", max_bytes=max_bytes,
+                        permit_acquired=True,
+                    )
 
     async def get_bot_user_id(self) -> Optional[str]:
         """Fetch this channel's own userId so we can filter self-messages."""
@@ -1301,9 +1335,11 @@ class LineAdapter(BasePlatformAdapter):
             payload = self._cache.claim_ready(request_id)
             if payload is None:
                 return
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
-            messages = [_text_message(c) for c in chunks]
-            first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
+            chunks = split_for_line(_bounded_line_text(
+                strip_markdown_preserving_urls(str(payload))
+            ))
+            first_batch = [_text_message(c) for c in chunks[:LINE_MAX_MESSAGES_PER_CALL]]
+            remaining = "\n".join(chunks[LINE_MAX_MESSAGES_PER_CALL:])
             try:
                 await self._client.reply(reply_token, first_batch)
             except Exception as exc:
@@ -1321,18 +1357,22 @@ class LineAdapter(BasePlatformAdapter):
                     logger.error("LINE: postback push fallback failed: %s", exc2)
                 return
 
-            offset = LINE_MAX_MESSAGES_PER_CALL
-            while offset < len(messages):
-                batch = messages[offset:offset + LINE_MAX_MESSAGES_PER_CALL]
+            if remaining:
+                page, remainder = _line_text_page(remaining)
+                follow_up = [_text_message(c) for c in page]
+                if remainder:
+                    follow_up.append(build_postback_button_message(
+                        LINE_MORE_REPLY_TEXT, LINE_MORE_BUTTON_LABEL, request_id,
+                    ))
                 try:
-                    await self._client.push(chat_id, batch)
+                    await self._client.push(chat_id, follow_up)
                 except Exception as exc:
-                    self._cache.release_ready(
-                        request_id, "\n".join(chunks[offset:]),
-                    )
+                    self._cache.release_ready(request_id, remaining)
                     logger.error("LINE: postback follow-up push failed: %s", exc)
                     return
-                offset += LINE_MAX_MESSAGES_PER_CALL
+                if remainder:
+                    self._cache.release_ready(request_id, remainder)
+                    return
             self._cache.mark_delivered(request_id)
             self._pending_buttons.pop(chat_id, None)
         elif entry.state is State.ERROR:
@@ -1456,40 +1496,46 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
-        chunks = split_for_line(strip_markdown_preserving_urls(content))
+        chunks, remainder = _line_text_page(
+            strip_markdown_preserving_urls(content)
+        )
         if not chunks:
             return SendResult(success=True, message_id=None)
         messages = [_text_message(c) for c in chunks]
-        first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
-        rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
+        continuation_id = None
+        if remainder:
+            continuation_id = self._cache.register_ready(chat_id, remainder)
+            if continuation_id:
+                messages.append(build_postback_button_message(
+                    LINE_MORE_REPLY_TEXT,
+                    LINE_MORE_BUTTON_LABEL,
+                    continuation_id,
+                ))
+            else:
+                messages.append(_text_message(LINE_RESPONSE_TOO_LARGE_TEXT))
 
         token, used_reply = (
             ("", False) if force_push else self._consume_reply_token(chat_id)
         )
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, first_batch)
+                await self._client.reply(token, messages)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
                 try:
-                    await self._client.push(chat_id, first_batch)
+                    await self._client.push(chat_id, messages)
                 except Exception as push_exc:
+                    if continuation_id:
+                        self._cache.delete(continuation_id)
                     logger.error("LINE: push send failed: %s", push_exc)
                     return SendResult(success=False, error=str(push_exc))
         else:
             try:
-                await self._client.push(chat_id, first_batch)
+                await self._client.push(chat_id, messages)
             except Exception as exc:
-                logger.error("LINE: push send failed: %s", exc)
-                return SendResult(success=False, error=str(exc))
-
-        while rest:
-            batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
-            rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
-            try:
-                await self._client.push(chat_id, batch)
-            except Exception as exc:
+                if continuation_id:
+                    self._cache.delete(continuation_id)
                 logger.error("LINE: push send failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
         return SendResult(success=True, message_id=token if used_reply else None)
@@ -2133,40 +2179,32 @@ class LineAdapter(BasePlatformAdapter):
         chat_id: str,
         messages: List[Dict[str, Any]],
     ) -> SendResult:
-        """Send already-built message objects, batched at 5/call."""
+        """Send at most one LINE-sized batch of already-built messages."""
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
         if not messages:
             return SendResult(success=True, message_id=None)
+        if len(messages) > LINE_MAX_MESSAGES_PER_CALL:
+            return SendResult(
+                success=False,
+                error="LINE delivery exceeds the five-message call limit",
+            )
 
-        first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
-        rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
-
-        # First batch: try reply token, fall back to push.
+        # One bounded call: try reply token, then fall back to one push.
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply:
             try:
-                await self._client.reply(token, first_batch)
+                await self._client.reply(token, messages)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, first_batch)
+                    await self._client.push(chat_id, messages)
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
         else:
             try:
-                await self._client.push(chat_id, first_batch)
+                await self._client.push(chat_id, messages)
             except Exception as exc:
-                return SendResult(success=False, error=str(exc))
-
-        # Subsequent batches: always push (reply token is single-use).
-        while rest:
-            batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
-            rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
-            try:
-                await self._client.push(chat_id, batch)
-            except Exception as exc:
-                logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
 
         await self._settle_pending_visible_delivery(chat_id)
@@ -2300,12 +2338,17 @@ async def _standalone_send(
         return {"error": "LINE standalone send: missing token or chat_id"}
 
     plain = strip_markdown_preserving_urls(message or "")
-    chunks = split_for_line(plain) or [""]
-    messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+    chunks, remainder = _line_text_page(plain)
+    notices = []
+    if remainder:
+        notices.append(_text_message(LINE_RESPONSE_TOO_LARGE_TEXT))
     if media_files:
         # Tack on a hint so the recipient knows media was generated but not delivered.
-        messages.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))
-        messages = messages[:LINE_MAX_MESSAGES_PER_CALL]
+        notices.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))
+    available = max(0, LINE_MAX_MESSAGES_PER_CALL - len(notices))
+    messages = [_text_message(c) for c in chunks[:available]] + notices
+    if not messages:
+        messages = [_text_message("")]
 
     client = _LineClient(token)
     try:

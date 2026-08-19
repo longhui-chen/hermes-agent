@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -264,3 +265,40 @@ async def test_public_download_uses_ssrf_safe_client(monkeypatch, tmp_path):
     assert calls and calls[0][1] == "https://cdn.example/media.png"
     assert "Authorization" not in calls[0][2].get("headers", {})
     assert Path(localized).read_bytes() == b"png"
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_before_opening_response_when_permits_are_full(monkeypatch):
+    opened = []
+    permit_checked = []
+
+    @asynccontextmanager
+    async def no_capacity():
+        permit_checked.append(True)
+        raise ValueError("full")
+        yield
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def stream(self, *_args, **_kwargs):
+            opened.append(True)
+            raise AssertionError("HTTP response opened before media permit")
+
+    monkeypatch.setattr(
+        "tools.url_safety.create_ssrf_safe_async_client",
+        lambda **_kwargs: Client(),
+    )
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        "gateway.platforms.base.inbound_media_download_permit", no_capacity,
+    )
+
+    client = RelayMediaClient("https://conn.example", "gw1", "sec")
+    assert await client.download("https://cdn.example/file.png") is None
+    assert permit_checked == [True]
+    assert opened == []

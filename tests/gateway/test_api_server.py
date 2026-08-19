@@ -3466,6 +3466,82 @@ class TestResponsesEndpoint:
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
 
+    @pytest.mark.asyncio
+    async def test_batch_store_failure_is_reported_instead_of_claiming_completed(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_run_agent",
+                    new=AsyncMock(
+                        return_value=(
+                            {"final_response": "done", "messages": [], "api_calls": 1},
+                            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                        )
+                    ),
+                ),
+                patch.object(adapter._response_store, "put", return_value=False),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "large history", "store": True},
+                )
+                assert resp.status == 500
+                body = await resp.json()
+
+        assert body["error"]["type"] == "server_error"
+        assert "stored" in body["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_stream_store_failure_ends_with_failed_not_completed(self, adapter):
+        import queue as _q
+        import gateway.platforms.api_server as api_mod
+
+        written: list[bytes] = []
+
+        class _Response:
+            async def prepare(self, _request):
+                return None
+
+            async def write(self, payload):
+                written.append(payload)
+
+        async def _agent_result():
+            return (
+                {"final_response": "done", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        stream_q: _q.Queue = _q.Queue()
+        stream_q.put("done")
+        stream_q.put(None)
+        task = asyncio.create_task(_agent_result())
+        with (
+            patch.object(api_mod.web, "StreamResponse", return_value=_Response()),
+            patch.object(adapter._response_store, "put", return_value=False),
+        ):
+            await adapter._write_sse_responses(
+                request=MagicMock(headers={}),
+                response_id="resp_store_failure",
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=task,
+                agent_ref=[None],
+                conversation_history=[],
+                user_message="large history",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id=None,
+            )
+
+        wire = b"".join(written).decode()
+        assert "event: response.failed" in wire
+        assert "event: response.completed" not in wire
+        assert "could not be stored" in wire.lower()
+
 
     @pytest.mark.asyncio
     async def test_previous_response_id_stores_compressed_transcript_directly(self, adapter):

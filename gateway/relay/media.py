@@ -203,6 +203,7 @@ class RelayMediaClient:
         from gateway.platforms.base import (
             _read_httpx_body_with_limit,
             _ssrf_redirect_guard,
+            inbound_media_download_permit,
             safe_exc,
             safe_url_for_log,
         )
@@ -229,15 +230,17 @@ class RelayMediaClient:
                     event_hooks={"response": [_ssrf_redirect_guard]},
                 )
             async with client_cm as client:
-                async with client.stream("GET", url, headers=headers) as resp:
-                    if needs_auth and getattr(resp, "is_redirect", False):
-                        raise ValueError("authenticated relay media redirect refused")
-                    resp.raise_for_status()
-                    data = await _read_httpx_body_with_limit(
-                        resp,
-                        media_type="relay inbound media",
-                        max_bytes=MEDIA_MAX_BYTES,
-                    )
+                async with inbound_media_download_permit():
+                    async with client.stream("GET", url, headers=headers) as resp:
+                        if needs_auth and getattr(resp, "is_redirect", False):
+                            raise ValueError("authenticated relay media redirect refused")
+                        resp.raise_for_status()
+                        data = await _read_httpx_body_with_limit(
+                            resp,
+                            media_type="relay inbound media",
+                            max_bytes=MEDIA_MAX_BYTES,
+                            permit_acquired=True,
+                        )
                     if not data:
                         return None
                     name = suggested_name or ""

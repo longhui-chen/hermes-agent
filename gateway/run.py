@@ -14031,7 +14031,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # without flushing causes permanent data loss.
             try:
                 from gateway.shutdown_flush import flush_pending_to_file
-                flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+                flush_pending_to_file(
+                    dict(self._pending_messages),
+                    reason="shutdown",
+                    session_store=getattr(self, "session_store", None),
+                )
             except Exception:
                 pass
             # On the real runner these are live SessionState views whose

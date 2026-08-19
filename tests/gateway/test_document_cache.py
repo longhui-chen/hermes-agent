@@ -108,6 +108,33 @@ class TestCleanupDocumentCache:
 
 
 class TestSharedMediaCacheBudget:
+    def test_budget_is_shared_across_multiplexed_profile_cache_roots(
+        self, tmp_path, monkeypatch,
+    ):
+        root = tmp_path / "hermes"
+        old_file = root / "profiles" / "alpha" / "cache" / "documents" / "old.bin"
+        incoming = root / "profiles" / "beta" / "cache" / "documents" / "new.bin"
+        old_file.parent.mkdir(parents=True)
+        incoming.parent.mkdir(parents=True)
+        old_file.write_bytes(b"1111")
+        old = time.time() - 11 * 60
+        os.utime(old_file, (old, old))
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_CACHE_MAX_TOTAL_BYTES", 6,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_CACHE_MAX_FILES", 100,
+        )
+
+        from gateway.platforms.base import _write_bounded_media_cache_file
+        _write_bounded_media_cache_file(incoming, b"2222")
+
+        assert incoming.exists()
+        assert not old_file.exists(), (
+            "beta 写入必须计入 alpha 已占用字节，不能给每个 profile 单独一份预算"
+        )
+
     def test_oldest_file_is_evicted_before_total_bytes_exceed_cap(
         self, monkeypatch,
     ):

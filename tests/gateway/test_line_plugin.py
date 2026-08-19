@@ -354,6 +354,47 @@ class TestSendRouting:
             # We invoked client.push(chat_id, messages) — check first batch
             sent_messages = adapter._client.push.call_args.args[1]
         assert len(sent_messages) <= 5
+        assert adapter._client.push.await_count == 1, (
+            "一个 turn 只能产生一次文本交付调用，不能按答案长度无界 push"
+        )
+        assert sent_messages[-1]["type"] == "template", (
+            "未发送的后缀必须进入可领取分页，不能静默截断"
+        )
+        action = sent_messages[-1]["template"]["actions"][0]
+        request_id = json.loads(action["data"])["request_id"]
+        cached = adapter._cache.get(request_id)
+        assert cached is not None and cached.state is State.READY
+        assert "x" * 4500 in cached.payload
+
+    def test_postback_claim_delivers_one_page_and_keeps_remainder_ready(self, adapter):
+        payload = "\n\n".join(["y" * 4500 for _ in range(20)])
+        request_id = adapter._cache.register_ready("Uchat", payload)
+        event = {
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "Uchat"},
+            "postback": {"data": json.dumps({
+                "action": "show_response", "request_id": request_id,
+            })},
+        }
+
+        asyncio.run(adapter._handle_postback_event(event))
+
+        adapter._client.reply.assert_awaited_once()
+        adapter._client.push.assert_awaited_once()
+        messages = adapter._client.push.await_args.args[1]
+        assert len(messages) == 5 and messages[-1]["type"] == "template"
+        cached = adapter._cache.get(request_id)
+        assert cached is not None and cached.state is State.READY
+        assert 0 < len(cached.payload) < len(payload)
+
+    def test_prebuilt_media_messages_cannot_fan_out_across_calls(self, adapter):
+        result = asyncio.run(adapter._send_messages(
+            "Uchat", [{"type": "text", "text": str(i)} for i in range(6)]
+        ))
+
+        assert result.success is False
+        adapter._client.reply.assert_not_awaited()
+        adapter._client.push.assert_not_awaited()
 
     def test_format_message_strips_markdown(self, adapter):
         out = adapter.format_message("**bold** [link](https://x.com)")
@@ -418,6 +459,24 @@ class TestStandaloneSend:
         cfg = PlatformConfig(enabled=True, extra={})
         result = asyncio.run(_standalone_send(cfg, "Uchat", "hi"))
         assert "error" in result
+
+    def test_long_response_is_one_visible_bounded_push(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "token", "channel_secret": "secret",
+        })
+        client = MagicMock()
+        client.push = AsyncMock()
+        monkeypatch.setattr(_line, "_LineClient", lambda _token: client)
+        big = "\n\n".join(["z" * 4500 for _ in range(20)])
+
+        result = asyncio.run(_standalone_send(cfg, "Uchat", big))
+
+        assert result["success"] is True
+        client.push.assert_awaited_once()
+        messages = client.push.await_args.args[1]
+        assert len(messages) == 5
+        assert "too large" in messages[-1]["text"].lower()
 
 
 class TestPostbackButtonShape:

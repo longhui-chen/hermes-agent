@@ -91,6 +91,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_media_bytes,
     get_inbound_media_max_bytes,
+    inbound_media_download_permit,
     log_media_intake_failure,
     safe_exc,
     validate_inbound_media_size,
@@ -938,15 +939,17 @@ class TeamsAdapter(BasePlatformAdapter):
             follow_redirects=True,
             event_hooks={"response": [_ssrf_redirect_guard]},
         ) as client:
-            async with client.stream(
-                "GET",
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
-            ) as response:
-                response.raise_for_status()
-                return await _read_httpx_body_with_limit(
-                    response, media_type="Teams inbound attachment",
-                )
+            async with inbound_media_download_permit():
+                async with client.stream(
+                    "GET",
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
+                ) as response:
+                    response.raise_for_status()
+                    return await _read_httpx_body_with_limit(
+                        response, media_type="Teams inbound attachment",
+                        permit_acquired=True,
+                    )
 
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
         """Process an incoming Teams message and dispatch to the gateway."""

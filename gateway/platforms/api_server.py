@@ -167,6 +167,9 @@ MAX_STORED_RESPONSES = 100
 # 100 条 LRU 之外再加总字节硬顶；否则 previous_response_id 链会在每条记录
 # 重复整段历史，带 data URI 时按三角形速度占满磁盘。
 MAX_RESPONSE_STORE_BYTES = 512 * 1024 * 1024
+RESPONSE_STORE_FAILURE_MESSAGE = (
+    "Response could not be stored. Retry with store=false or start a new conversation."
+)
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
@@ -7204,9 +7207,9 @@ class APIServerAdapter(BasePlatformAdapter):
             *,
             conversation_history_snapshot: Optional[List[Dict[str, Any]]] = None,
             session_id_snapshot: Optional[str] = None,
-        ) -> None:
+        ) -> bool:
             if not store:
-                return
+                return True
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
@@ -7218,6 +7221,7 @@ class APIServerAdapter(BasePlatformAdapter):
             })
             if conversation and stored:
                 self._response_store.set_conversation(conversation, response_id)
+            return stored
 
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
@@ -7594,11 +7598,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "role": "assistant",
                         "content": final_response_text or _redact_api_error_text(agent_error),
                     })
-                _persist_response_snapshot(
+                stored = _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
                 )
-                terminal_snapshot_persisted = True
+                terminal_snapshot_persisted = stored
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -7622,16 +7626,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 # here we only propagate a compression-rotated session_id so
                 # previous_response_id chaining resumes the child session.
                 _result_sid = result.get("session_id") if isinstance(result, dict) else None
-                _persist_response_snapshot(
+                stored = _persist_response_snapshot(
                     completed_env,
                     conversation_history_snapshot=full_history,
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
-                terminal_snapshot_persisted = True
-                await _write_event("response.completed", {
-                    "type": "response.completed",
-                    "response": completed_env,
-                })
+                terminal_snapshot_persisted = stored
+                if store and not stored:
+                    failed_env = _envelope("failed")
+                    failed_env["output"] = final_items
+                    failed_env["error"] = {
+                        "message": RESPONSE_STORE_FAILURE_MESSAGE,
+                        "type": "server_error",
+                    }
+                    failed_env["usage"] = completed_env["usage"]
+                    await _write_event("response.failed", {
+                        "type": "response.failed",
+                        "response": failed_env,
+                    })
+                else:
+                    await _write_event("response.completed", {
+                        "type": "response.completed",
+                        "response": completed_env,
+                    })
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
@@ -8029,6 +8046,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # conversation name automatically chains to this response
             if conversation and stored:
                 self._response_store.set_conversation(conversation, response_id)
+            if not stored:
+                return web.json_response(
+                    _openai_error(
+                        RESPONSE_STORE_FAILURE_MESSAGE,
+                        err_type="server_error",
+                    ),
+                    status=500,
+                    headers={"X-Hermes-Session-Id": _effective_session_id},
+                )
 
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:

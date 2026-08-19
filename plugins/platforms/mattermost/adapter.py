@@ -28,6 +28,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    inbound_media_download_permit,
     read_aiohttp_body_with_limit,
 )
 
@@ -553,20 +554,22 @@ class MattermostAdapter(BasePlatformAdapter):
 
         for attempt in range(3):
             try:
-                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status >= 500 or resp.status == 429:
-                        if attempt < 2:
-                            logger.debug("Mattermost download retry %d/2 for %s (status %d)",
-                                         attempt + 1, url[:80], resp.status)
-                            await asyncio.sleep(1.5 * (attempt + 1))
-                            continue
-                    if resp.status >= 400:
-                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
-                    file_data = await read_aiohttp_body_with_limit(
-                        resp, media_type="Mattermost outbound media",
-                    )
-                    ct = resp.content_type or "application/octet-stream"
-                    break
+                async with inbound_media_download_permit():
+                    async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status >= 500 or resp.status == 429:
+                            if attempt < 2:
+                                logger.debug("Mattermost download retry %d/2 for %s (status %d)",
+                                             attempt + 1, url[:80], resp.status)
+                                await asyncio.sleep(1.5 * (attempt + 1))
+                                continue
+                        if resp.status >= 400:
+                            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
+                        file_data = await read_aiohttp_body_with_limit(
+                            resp, media_type="Mattermost outbound media",
+                            permit_acquired=True,
+                        )
+                        ct = resp.content_type or "application/octet-stream"
+                        break
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
@@ -688,19 +691,21 @@ class MattermostAdapter(BasePlatformAdapter):
                             logger.warning("Mattermost: blocked unsafe image URL in batch")
                             continue
                         try:
-                            async with self._session.get(
-                                image_url, timeout=aiohttp.ClientTimeout(total=30)
-                            ) as resp:
-                                if resp.status >= 400:
-                                    logger.warning(
-                                        "Mattermost: failed to download image (HTTP %d): %s",
-                                        resp.status, image_url[:80],
+                            async with inbound_media_download_permit():
+                                async with self._session.get(
+                                    image_url, timeout=aiohttp.ClientTimeout(total=30)
+                                ) as resp:
+                                    if resp.status >= 400:
+                                        logger.warning(
+                                            "Mattermost: failed to download image (HTTP %d): %s",
+                                            resp.status, image_url[:80],
+                                        )
+                                        continue
+                                    file_data = await read_aiohttp_body_with_limit(
+                                        resp, media_type="Mattermost outbound image",
+                                        permit_acquired=True,
                                     )
-                                    continue
-                                file_data = await read_aiohttp_body_with_limit(
-                                    resp, media_type="Mattermost outbound image",
-                                )
-                                ct = resp.content_type or "image/png"
+                                    ct = resp.content_type or "image/png"
                         except Exception as dl_err:
                             logger.warning("Mattermost: download failed for %s: %s", image_url[:80], dl_err)
                             continue
@@ -943,14 +948,18 @@ class MattermostAdapter(BasePlatformAdapter):
 
                 import aiohttp
                 dl_url = f"{self._base_url}/api/v4/files/{fid}"
-                async with self._session.get(
-                    dl_url,
-                    headers={"Authorization": f"Bearer {self._token}"},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status < 400:
+                async with inbound_media_download_permit():
+                    async with self._session.get(
+                        dl_url,
+                        headers={"Authorization": f"Bearer {self._token}"},
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        if resp.status >= 400:
+                            logger.warning("Mattermost: failed to download file %s: HTTP %s", fid, resp.status)
+                            continue
                         file_data = await read_aiohttp_body_with_limit(
                             resp, media_type="Mattermost inbound attachment",
+                            permit_acquired=True,
                         )
                         from gateway.platforms.base import cache_image_from_bytes, cache_document_from_bytes
                         if mime.startswith("image/"):
@@ -966,8 +975,6 @@ class MattermostAdapter(BasePlatformAdapter):
                             local_path = cache_document_from_bytes(file_data, fname)
                             media_urls.append(local_path)
                             media_types.append(mime)
-                    else:
-                        logger.warning("Mattermost: failed to download file %s: HTTP %s", fid, resp.status)
             except Exception as exc:
                 logger.warning("Mattermost: error downloading file %s: %s", fid, exc)
 

@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -925,6 +926,19 @@ def _inbound_media_read_semaphore() -> asyncio.Semaphore:
         return semaphore
 
 
+@asynccontextmanager
+async def inbound_media_download_permit():
+    """Reserve one media download slot before opening an HTTP response."""
+    semaphore = _inbound_media_read_semaphore()
+    if semaphore.locked():
+        raise ValueError("Inbound media download concurrency limit reached")
+    await semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
 def get_inbound_media_max_bytes() -> int:
     """Return the max inbound image/audio/video bytes allowed in memory.
 
@@ -975,12 +989,7 @@ def _write_bounded_media_cache_file(filepath: "Path", data: bytes) -> None:
             f"{MEDIA_CACHE_MAX_TOTAL_BYTES} bytes)"
         )
     with _MEDIA_CACHE_WRITE_LOCK:
-        dirs = (
-            get_image_cache_dir(),
-            get_audio_cache_dir(),
-            get_video_cache_dir(),
-            get_document_cache_dir(),
-        )
+        dirs = _process_media_cache_dirs(filepath)
         now = time.time()
         files: list[tuple[float, int, Path]] = []
         for cache_dir in dirs:
@@ -1026,11 +1035,46 @@ def _write_bounded_media_cache_file(filepath: "Path", data: bytes) -> None:
         filepath.write_bytes(data)
 
 
+def _process_media_cache_dirs(filepath: "Path") -> tuple["Path", ...]:
+    """Return every media cache directory sharing this process's disk budget."""
+    root = get_default_hermes_root()
+    try:
+        filepath.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        # Tests and embedders may inject an isolated cache outside HERMES_HOME;
+        # never let that test-only budget sweep the real process cache.
+        return (filepath.parent,)
+    homes = [root]
+    profiles_dir = root / "profiles"
+    try:
+        homes.extend(
+            child for child in profiles_dir.iterdir()
+            if not child.is_symlink() and child.is_dir()
+        )
+    except OSError:
+        pass
+
+    dirs = {filepath.parent}
+    layouts = (
+        ("cache/images", "image_cache"),
+        ("cache/audio", "audio_cache"),
+        ("cache/videos", "video_cache"),
+        ("cache/documents", "document_cache"),
+    )
+    for home in homes:
+        for new_subpath, old_name in layouts:
+            for candidate in (home / new_subpath, home / old_name):
+                if not candidate.is_symlink() and candidate.is_dir():
+                    dirs.add(candidate)
+    return tuple(sorted(dirs, key=str))
+
+
 async def read_aiohttp_body_with_limit(
     response,
     *,
     media_type: str,
     max_bytes: Optional[int] = None,
+    permit_acquired: bool = False,
 ) -> bytearray:
     """aiohttp 版的「有上限地读响应体」。
 
@@ -1064,10 +1108,10 @@ async def read_aiohttp_body_with_limit(
     # ``chunks`` 已持有完整响应体(N 字节),``b"".join(chunks)`` **再分配一份
     # 同样大小** ⇒ 默认 128 MiB 上限下瞬时驻留约 **256 MiB**,在 ~2GB 共享设备上
     # 足以把进程连同别人的会话一起压垮。⭐ 有上限 ≠ 有界:上限管的是**一份**。
-    # ⇒ 累积进**单个** ``bytearray`` 并**直接返回**,⛔ 不做 ``bytes(buf)``
-    # (那正是要删掉的那份复制)。调用点全集两处
-    # (``weixin.py:627`` 入站 / ``:2403`` 出站),都交给 ``handle.write(...)``。
-    async with _inbound_media_read_semaphore():
+    # ⇒ 累积进**单个** ``bytearray`` 并**直接返回**,⛔ 不做 ``bytes(buf)``。
+    # 生产调用点在打开 HTTP response 前统一获取 download permit；这里保留
+    # 默认申请仅兼容直接调用者，生产路径用 ``permit_acquired=True`` 避免二次申请。
+    async def _read_body() -> bytearray:
         buf = bytearray()
         total = 0
         async for chunk in response.content.iter_chunked(65536):
@@ -1077,6 +1121,10 @@ async def read_aiohttp_body_with_limit(
             )
             buf.extend(chunk)
         return buf
+    if permit_acquired:
+        return await _read_body()
+    async with _inbound_media_read_semaphore():
+        return await _read_body()
 
 
 async def _read_httpx_body_with_limit(
@@ -1084,6 +1132,7 @@ async def _read_httpx_body_with_limit(
     *,
     media_type: str,
     max_bytes: Optional[int] = None,
+    permit_acquired: bool = False,
 ) -> bytearray:
     """Read an httpx streaming response body without exceeding the media cap.
 
@@ -1107,9 +1156,9 @@ async def _read_httpx_body_with_limit(
             )
 
     # ⭐ 兄弟调用点:与上面 aiohttp 版**同一缺陷**。⛔ 不留一处旧写法。
-    # 调用点全集两处(:1080 image / :1222 audio),都交给 ``cache_*_from_bytes``
-    # → ``len()`` / 魔数比较 / 落盘,``bytearray`` 全部支持。
-    async with _inbound_media_read_semaphore():
+    # 生产调用点在打开 HTTP response 前统一获取 download permit；这里保留
+    # 默认申请仅兼容直接调用者，生产路径用 ``permit_acquired=True`` 避免二次申请。
+    async def _read_body() -> bytearray:
         buf = bytearray()
         total = 0
         async for chunk in response.aiter_bytes():
@@ -1117,6 +1166,10 @@ async def _read_httpx_body_with_limit(
             validate_inbound_media_size(total, media_type=media_type, max_bytes=max_bytes)
             buf.extend(chunk)
         return buf
+    if permit_acquired:
+        return await _read_body()
+    async with _inbound_media_read_semaphore():
+        return await _read_body()
 
 
 def get_image_cache_dir() -> Path:
@@ -1214,18 +1267,20 @@ async def cache_image_from_url(
     ) as client:
         for attempt in range(retries + 1):
             try:
-                async with client.stream(
-                    "GET",
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                        "Accept": "image/*,*/*;q=0.8",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    content = await _read_httpx_body_with_limit(
-                        response, media_type="image", max_bytes=max_bytes,
-                    )
+                async with inbound_media_download_permit():
+                    async with client.stream(
+                        "GET",
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                            "Accept": "image/*,*/*;q=0.8",
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        content = await _read_httpx_body_with_limit(
+                            response, media_type="image", max_bytes=max_bytes,
+                            permit_acquired=True,
+                        )
                 return cache_image_from_bytes(content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
@@ -1356,18 +1411,19 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
     ) as client:
         for attempt in range(retries + 1):
             try:
-                async with client.stream(
-                    "GET",
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                        "Accept": "audio/*,*/*;q=0.8",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    content = await _read_httpx_body_with_limit(
-                        response, media_type="audio",
-                    )
+                async with inbound_media_download_permit():
+                    async with client.stream(
+                        "GET",
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                            "Accept": "audio/*,*/*;q=0.8",
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        content = await _read_httpx_body_with_limit(
+                            response, media_type="audio", permit_acquired=True,
+                        )
                 return cache_audio_from_bytes(content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
@@ -7477,7 +7533,11 @@ class BasePlatformAdapter(ABC):
         # Flush pending messages to disk before clearing (#72680).
         try:
             from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+            flush_pending_to_file(
+                self._pending_messages,
+                reason="adapter_shutdown",
+                session_store=getattr(self, "_session_store", None),
+            )
         except Exception:
             pass
         self._pending_messages.clear()
