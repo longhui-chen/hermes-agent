@@ -2445,7 +2445,17 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
 
     with _state_lock:
         state = _state_locked(session_id, time.monotonic())
-        welcome = state.pop("onboarding_welcome", None)
+        # 只有产生这张 welcome 卡的那一轮能取走它。onboarding_welcome 挂在会话
+        # 级 state 上，而同一 conversation 可能有并发的 API 请求——谁先进
+        # transform 谁就 pop 掉，于是卡片被附到另一个请求的正文上、按那个请求
+        # 的 transport 标 action_receipts（能力可能不同），而真正的 welcome
+        # 响应再也拿不到卡。按 source_turn_id 认领，认不上就原样留着。
+        _pending_welcome = state.get("onboarding_welcome")
+        welcome = None
+        if isinstance(_pending_welcome, dict):
+            _owner_turn = _text(_pending_welcome.get("source_turn_id"), 160)
+            if not _owner_turn or _owner_turn == turn_id:
+                welcome = state.pop("onboarding_welcome", None)
     if isinstance(welcome, dict):
         # HEAD 已按同一组信号算好 turn_failed，这里不重复判定。
         if turn_failed:

@@ -247,6 +247,9 @@ def test_final_onboarding_welcome_emits_existing_cards_without_auxiliary_model(m
     )
     transformed = plugin._transform_llm_output(
         session_id="welcome-session",
+        # 生产上 transform_llm_output 收得到 turn_id（turn_finalizer.py 传的），
+        # welcome 卡按 source_turn_id 认领，这里必须跟上面那次 pre_llm_call 对上。
+        turn_id="turn-welcome",
         response_text="Frank，很高兴认识你。",
         completed=True,
     )
@@ -328,6 +331,69 @@ def test_onboarding_welcome_task_card_is_marked_with_action_receipts(
     assert task.get("action_receipts", False) is expected
     state = plugin._session_states[next(iter(plugin._session_states))]
     assert state["last_proposal"]["action_receipts"] is expected
+
+
+# onboarding_welcome 挂在会话级 state 上，而同一 conversation 可能有并发的 API
+# 请求。谁先进 transform 谁就 pop 掉的话，卡片会被附到另一个请求的正文上、按那个
+# 请求的 transport 标 action_receipts（能力可能不同），真正的 welcome 响应再也
+# 拿不到卡。
+def test_onboarding_welcome_is_only_claimed_by_the_turn_that_produced_it(monkeypatch):
+    plugin = _load_plugin()
+    context = _Context(_FakeLlm([]))
+    context.emit_attachment = lambda _attachment: True
+    plugin.register(context)
+    monkeypatch.setattr(
+        plugin,
+        "_connection_inventory",
+        lambda _session_id, _now: {
+            "fetched": True,
+            "channels_connected": [],
+            "channels_available": [],
+            "channels_recommendable": [],
+            "connectors_connected": [],
+            "connectors_recommendable": [],
+        },
+    )
+    marker = _onboarding_welcome_marker(
+        {
+            "version": 1,
+            "type": "zettlab_onboarding_welcome",
+            "channel": {"requested": False},
+            "task": {
+                "title": "持续跟进产品进展",
+                "reason": "让变化中的进展保持更新。",
+                "proposalText": "要现在设置吗？",
+            },
+        }
+    )
+    plugin._on_pre_llm_call(
+        profile_name="onboarding",
+        session_id="welcome-concurrent",
+        turn_id="welcome-turn",
+        user_message=f"Please welcome the user.\n{marker}",
+        conversation_history=[],
+    )
+
+    # 另一个并发请求先进 transform：它不该把卡领走。
+    other = plugin._transform_llm_output(
+        session_id="welcome-concurrent",
+        turn_id="other-turn",
+        response_text="这是另一条请求的回复。",
+        completed=True,
+    )
+    assert other is None or "creation-recommendation:start" not in other, (
+        "并发请求把 welcome 卡领走了"
+    )
+
+    # 真正的 welcome 请求随后仍能拿到卡。
+    transformed = plugin._transform_llm_output(
+        session_id="welcome-concurrent",
+        turn_id="welcome-turn",
+        response_text="Frank，很高兴认识你。",
+        completed=True,
+    )
+    assert transformed is not None
+    assert _decode_envelope(transformed)["creation_type"] == "task"
 
 
 def test_onboarding_welcome_channel_is_omitted_when_inventory_has_no_supported_target(monkeypatch):
@@ -457,6 +523,7 @@ def test_onboarding_welcome_emits_real_agent_template_cards(monkeypatch):
     )
     transformed = plugin._transform_llm_output(
         session_id="agent-template-welcome",
+        turn_id="turn-template",
         response_text="欢迎回来。",
         completed=True,
     )
