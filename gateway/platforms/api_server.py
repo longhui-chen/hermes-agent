@@ -600,6 +600,11 @@ def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
     return ""
 
 
+# 与 _handle_chat_completions 收进 conversation_messages 的那组 role 保持同源。
+# 两处不一致就会出现「门禁看的那条」和「Agent 收到的那条」不是同一条。
+_AGENT_INPUT_MESSAGE_ROLES = frozenset({"user", "assistant"})
+
+
 def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
     """正文里是否出现了创建建议动作信封——不看内容是否合法。
 
@@ -621,11 +626,18 @@ def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
     # governor 解析的就是它。若这里只看最后一条 user 消息，一个「末条是 assistant
     # 且正文带 wrapper」的普通请求就会漏判——transport 不被清除，governor 照样
     # 解析那个 wrapper、消费 proposal 并产出可信回执，版本化端点的门禁被绕过。
+    # 判据必须跟 _handle_chat_completions 真正喂给 Agent 的那条消息是同一条：
+    # 它只把 role 为 user / assistant 的收进 conversation_messages，其余（tool、
+    # 以及任何将来新增的 role）整条忽略。这里若按「最后一条非 system」来选，
+    # 在正文带 wrapper 的 user 消息后面追加一条 tool 消息就能骗过门禁——门禁看
+    # 到的是那条 tool、判定没有 wrapper 而保留 transport，而 Agent 实际收到的
+    # 仍是前面那条 user，governor 照样消费 proposal 并产出可信回执。
     last_message = next(
         (
             message
             for message in reversed(messages)
-            if isinstance(message, dict) and message.get("role") != "system"
+            if isinstance(message, dict)
+            and message.get("role") in _AGENT_INPUT_MESSAGE_ROLES
         ),
         None,
     )
@@ -5948,7 +5960,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
-            elif role in {"user", "assistant"}:
+            elif role in _AGENT_INPUT_MESSAGE_ROLES:
                 try:
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
