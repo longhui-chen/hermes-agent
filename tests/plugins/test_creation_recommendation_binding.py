@@ -340,7 +340,7 @@ def test_rejected_action_blocks_creation_tools_for_that_turn():
 def test_accepted_action_leaves_creation_tools_open():
     """正向对照：动作被接管的那一轮，创建工具必须照常可用。"""
     plugin = _load_plugin()
-    payload = _show_card(plugin, "deny-gate-control")
+    payload = _show_card(plugin, "deny-gate-control", creation_type="skill")
 
     accepted = plugin._on_pre_llm_call(
         session_id="deny-gate-control",
@@ -480,7 +480,8 @@ def test_bounded_user_message_keeps_the_trailing_envelope():
 # 的话会把先到那个请求真实的创建也挡掉——客户端收到 accepted，资源却没建出来。
 def test_accepted_action_survives_a_concurrent_replay_deny():
     plugin = _load_plugin()
-    payload = _show_card(plugin, "concurrent-replay")
+    # 用 skill 卡片：票按品类发放，skill 卡换来的票对应 skill_manage。
+    payload = _show_card(plugin, "concurrent-replay", creation_type="skill")
 
     accepted = plugin._on_pre_llm_call(
         session_id="concurrent-replay",
@@ -522,6 +523,67 @@ def test_accepted_action_survives_a_concurrent_replay_deny():
     )
     assert blocked is not None and blocked["action"] == "block", (
         "同一轮的第二次创建被放行了——一次 accepted 只应该买一张票"
+    )
+
+
+# 票只给 create。dismiss / mute_session / unmute_session 同样拿到 accepted 回执，
+# 但用户表达的恰恰是「别建」或「只改偏好」——给它们发票等于模型无视内部提示去调
+# create 时闸门主动让路。
+# unmute_session 不在这里测：会话没静音过时它本来就被判无效，构造它要先走一遍
+# mute 再重新出卡，而它走的是与 mute 同一条发票分支（`receipt.action == "create"`
+# 之外的一切都不发票）。
+@pytest.mark.parametrize("action", ["dismiss", "mute_session"])
+def test_non_create_actions_do_not_buy_a_creation_ticket(action: str):
+    plugin = _load_plugin()
+    session = f"no-ticket-{action}"
+    payload = _show_card(plugin, session, creation_type="skill")
+
+    accepted = plugin._on_pre_llm_call(
+        session_id=session,
+        sender_id="owner-a",
+        turn_id=f"{action}-turn",
+        user_message=_action(payload, action=action),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+    assert accepted is not None
+    assert "invalid or expired" not in accepted["context"]
+
+    blocked = plugin._on_pre_tool_call(
+        tool_name="skill_manage",
+        args={"action": "create"},
+        turn_id=f"{action}-turn",
+    )
+    assert blocked is not None and blocked["action"] == "block", (
+        f"{action} 被接管后仍放行了一次创建"
+    )
+
+
+# 票绑定品类：接受一张 Skill 卡换来的票不该放行一次 cronjob(create)。
+def test_creation_ticket_is_bound_to_its_creation_type():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "typed-ticket", creation_type="skill")
+    plugin._on_pre_llm_call(
+        session_id="typed-ticket",
+        sender_id="owner-a",
+        turn_id="typed-turn",
+        user_message=_action(payload),
+        conversation_history=[],
+        creation_action_receipt_transport=RECEIPT_TRANSPORT,
+    )
+
+    crossed = plugin._on_pre_tool_call(
+        tool_name="cronjob", args={"action": "create"}, turn_id="typed-turn"
+    )
+    assert crossed is not None and crossed["action"] == "block", (
+        "Skill 卡换来的票放行了一次定时任务创建"
+    )
+    # 对照：本品类的创建照常放行。
+    assert (
+        plugin._on_pre_tool_call(
+            tool_name="skill_manage", args={"action": "create"}, turn_id="typed-turn"
+        )
+        is None
     )
 
 

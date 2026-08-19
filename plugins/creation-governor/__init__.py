@@ -201,6 +201,9 @@ class _ActionReceipt(NamedTuple):
 class _ActionHandlingOutcome(NamedTuple):
     context: str
     receipt: _ActionReceipt | None
+    # 这次动作针对的创建品类。只有 create 被接管时才有意义——创建配额按品类
+    # 发放，接受一张 Skill 卡换来的票不该放行一次 cronjob(create)。
+    creation_type: str = ""
 
 _ONBOARDING_WELCOME_RE = re.compile(
     r"<!--zettlab-onboarding-welcome\s+([A-Za-z0-9_-]+)-->",
@@ -684,6 +687,12 @@ DENIED_CREATION_TOOL_ACTIONS = {
     "skill_manage": {"create"},
     "cronjob": {"create"},
 }
+# 哪个工具落地哪个品类。票是按品类发的：接受一张 Skill 卡不该顺带放行一次
+# cronjob(create)。
+CREATION_TOOL_TYPES = {
+    "skill_manage": "skill",
+    "cronjob": "task",
+}
 MAX_DENIED_CREATION_TURNS = 256
 
 # 闸门是**配额**，不是布尔开关：这个 turn 上允许落地的创建次数，等于被真正
@@ -700,7 +709,7 @@ MAX_DENIED_CREATION_TURNS = 256
 #
 # 键存在 = 这个 turn 上出现过推荐动作、进入配额管控；键不存在 = 普通轮次，
 # 用户直接说「帮我建个 skill」不受影响。
-_creation_turn_quota: "OrderedDict[str, int]" = OrderedDict()
+_creation_turn_quota: "OrderedDict[str, dict[str, int]]" = OrderedDict()
 
 
 def _trim_creation_turn_quota_locked() -> None:
@@ -714,18 +723,27 @@ def _enter_creation_quota_for_turn(turn_id: str) -> None:
     if not key:
         return
     with _state_lock:
-        _creation_turn_quota.setdefault(key, 0)
+        _creation_turn_quota.setdefault(key, {})
         _creation_turn_quota.move_to_end(key)
         _trim_creation_turn_quota_locked()
 
 
-def _grant_creation_for_turn(turn_id: str) -> None:
-    """一次动作被真正接管，发一张创建票。"""
+def _grant_creation_for_turn(turn_id: str, creation_type: str) -> None:
+    """一次 create 动作被真正接管，为**它那个品类**发一张票。
+
+    只给 create 发票：dismiss / mute_session / unmute_session 也会拿到 accepted
+    回执，但用户表达的恰恰是「别建」或「只改偏好」——给它们发票等于模型无视
+    内部提示去调 create 时闸门主动让路。
+
+    票绑定品类：接受一张 Skill 卡换来的票不该放行一次 cronjob(create)。
+    """
     key = _pending_turn_key(turn_id)
-    if not key:
+    normalized = _normalize_creation_type(creation_type)
+    if not key or not normalized:
         return
     with _state_lock:
-        _creation_turn_quota[key] = _creation_turn_quota.get(key, 0) + 1
+        quota = _creation_turn_quota.setdefault(key, {})
+        quota[normalized] = quota.get(normalized, 0) + 1
         _creation_turn_quota.move_to_end(key)
         _trim_creation_turn_quota_locked()
 
@@ -738,8 +756,8 @@ def _release_creation_deny(turn_id: str) -> None:
         _creation_turn_quota.pop(key, None)
 
 
-def _consume_creation_quota(turn_id: str) -> bool:
-    """这次创建能不能放行。有票就消耗一张放行，没票就挡。
+def _consume_creation_quota(turn_id: str, creation_type: str) -> bool:
+    """这次创建能不能放行。该品类有票就消耗一张放行，没票就挡。
 
     不受管控的普通轮次（键不存在）永远放行——这道闸门只针对推荐动作那条路径。
     """
@@ -747,12 +765,13 @@ def _consume_creation_quota(turn_id: str) -> bool:
     if not key:
         return True
     with _state_lock:
-        remaining = _creation_turn_quota.get(key)
-        if remaining is None:
+        quota = _creation_turn_quota.get(key)
+        if quota is None:
             return True
+        remaining = quota.get(creation_type, 0)
         if remaining <= 0:
             return False
-        _creation_turn_quota[key] = remaining - 1
+        quota[creation_type] = remaining - 1
         return True
 
 
@@ -779,7 +798,7 @@ def _on_pre_tool_call(
             return None
     # 配额在这里消耗：判定「是不是一次创建」之后、放行之前。放在更早会让
     # list / patch 这类调用白白吃掉一张票。
-    if _consume_creation_quota(turn_id):
+    if _consume_creation_quota(turn_id, CREATION_TOOL_TYPES.get(tool_name, "")):
         return None
     return {
         "action": "block",
@@ -799,6 +818,19 @@ def _store_pending_action_result_locked(
         return
     turn_id = _pending_turn_key(turn_id)
     pending = state["pending_action_results"]
+    existing = pending.get(turn_id)
+    # 同一个 turn_id 上的结果是**单调**的：接管过就接管过了，后到的重放请求
+    # 拿到的 rejected 不能把它盖掉。双击 / 传输重发会让两个请求复用同一个
+    # turn_id，先到的消费掉 proposal 拿到 accepted、后到的必然判无效——覆盖
+    # 之后先结束的那个请求会取走 rejected，客户端把一次已经接管的创建显示成
+    # 失败，用户重来一次就是重复创建。
+    if (
+        isinstance(existing, _ActionReceipt)
+        and existing.status == "accepted"
+        and receipt.status != "accepted"
+    ):
+        pending.move_to_end(turn_id)
+        return
     pending[turn_id] = receipt
     pending.move_to_end(turn_id)
     while len(pending) > MAX_PENDING_ACTION_RESULTS:
@@ -1828,6 +1860,7 @@ def _handle_previous_proposal_action(
                 "confirmation boundaries. Do not run another opportunity review this turn.]"
             ),
             _ActionReceipt(structured["proposal_id"], action, "accepted"),
+            structured["creation_type"],
         )
 
     with _state_lock:
@@ -2006,8 +2039,12 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         # 放行。接管成功会往下发一张票，被拒则一张都没有。
         _enter_creation_quota_for_turn(outer_turn_id)
         outcome = _handle_previous_proposal_action(session_id, user_message, now)
-        if outcome.receipt is not None and outcome.receipt.status == "accepted":
-            _grant_creation_for_turn(outer_turn_id)
+        if (
+            outcome.receipt is not None
+            and outcome.receipt.status == "accepted"
+            and outcome.receipt.action == "create"
+        ):
+            _grant_creation_for_turn(outer_turn_id, outcome.creation_type)
         if outcome.receipt is not None and receipt_transport:
             with _state_lock:
                 state = _state_locked(session_id, now)
