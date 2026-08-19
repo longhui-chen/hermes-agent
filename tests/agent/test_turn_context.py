@@ -1828,8 +1828,9 @@ def test_camera_vision_scope_is_bound_to_exact_current_attachment(monkeypatch):
     [
         ("帮我连接下摄像头", ("camera",)),
         ("添加一台 3D 打印机和一个电脑节点", ("printer3d", "pc_node")),
-        ("发现附近可以连接的硬件设备", ("camera", "printer3d", "pc_node")),
+        ("发现附近可以连接的硬件设备", ("camera", "printer3d", "pc_node", "tv")),
         ("Connect a camera and a 3D printer", ("camera", "printer3d")),
+        ("配对一个语音终端", ("voice_terminal",)),
         ("解释一下“帮我连接摄像头”这句话", ()),
         ("摄像头连接失败了", ()),
         ("查看摄像头", ()),
@@ -1843,6 +1844,43 @@ def test_camera_vision_scope_is_bound_to_exact_current_attachment(monkeypatch):
 )
 def test_hardware_enrollment_fallback_is_bounded(message, expected_types):
     assert response_mode._hardware_enrollment_requested_types(message) == expected_types
+
+
+def test_private_subnet_hardware_enrollment_is_normalized_and_narrowed():
+    assert response_mode._private_hardware_discovery_scope(
+        "发现 192.168.8.27/24 网段里的硬件设备",
+    ) == "192.168.8.0/24"
+    assert response_mode._hardware_enrollment_requested_types(
+        "发现 192.168.8.27/24 网段里的硬件设备",
+        subnet_scoped=True,
+    ) == ("camera", "tv")
+    assert response_mode._private_hardware_discovery_scope(
+        "发现 203.0.113.0/24 网段里的设备",
+    ) == ""
+    assert response_mode._private_hardware_discovery_scope(
+        "发现 192.168.0.0/16 网段里的设备",
+    ) == ""
+
+
+def test_current_subnet_hardware_enrollment_emits_current_scope():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    response = response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="帮我扫描下当前网段有哪些硬件设备可以连接",
+        response_text="将在卡片内发现 ONVIF 摄像头和 DLNA 电视。",
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    )
+
+    assert response.count("```zettlab-connector-enrollment-intent") == 1
+    assert '"resource_kind": "camera"' in response
+    assert '"resource_kind": "tv"' in response
+    assert '"network_scope": {\n    "mode": "current"' in response
+    assert "printer3d" not in response
+    assert "pc_node" not in response
 
 
 def test_hardware_enrollment_fallback_emits_canonical_secret_free_intent():
@@ -1864,10 +1902,88 @@ def test_hardware_enrollment_fallback_emits_canonical_secret_free_intent():
         structured_output=False,
     )
 
-    assert response.count("```zettlab-hardware-enrollment-intent") == 1
-    assert '"requested_types": [\n    "camera"\n  ]' in response
+    assert "```zettlab-hardware-enrollment-intent" not in response
+    assert response.count("```zettlab-connector-enrollment-intent") == 1
+    assert '"resource_kind": "camera"' in response
     assert "192.0.2.1" not in response
     assert '"host"' not in response
+
+
+def test_hardware_enrollment_fallback_replaces_duplicate_v2_and_v1_with_scoped_v2():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    response = response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="发现 192.168.8.27/24 网段里的硬件设备",
+        response_text=(
+            "将生成本地发现预览。\n\n"
+            "```zettlab-connector-enrollment-intent\n"
+            '{"schema_version":"2","kind":"connector_enrollment","items":'
+            '[{"resource_kind":"camera"},{"resource_kind":"tv"}],'
+            '"setup_requested":true}\n```\n\n'
+            "```zettlab-hardware-enrollment-intent\n"
+            '{"schema_version":"1","kind":"hardware","requested_types":'
+            '["camera","printer3d","pc_node"],"discovery_requested":true}\n```'
+        ),
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    )
+
+    assert response.count("```zettlab-connector-enrollment-intent") == 1
+    assert "```zettlab-hardware-enrollment-intent" not in response
+    assert '"resource_kind": "camera"' in response
+    assert '"resource_kind": "tv"' in response
+    assert '"network_scope": {\n    "cidr": "192.168.8.0/24"' in response
+    assert "printer3d" not in response
+    assert "pc_node" not in response
+
+
+def test_invalid_or_unsupported_subnet_discovery_never_falls_back_to_broad_scan():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    for message in (
+        "发现 203.0.113.0/24 网段里的硬件设备",
+        "发现 192.168.0.0/16 网段里的硬件设备",
+        "发现 192.168.8.0/24 网段里的 3D 打印机",
+    ):
+        response = response_mode.ensure_hardware_enrollment_intent(
+            agent,
+            user_message=message,
+            response_text="当前请求无法生成受限发现卡。",
+            completed=True,
+            failed=False,
+            interrupted=False,
+            structured_output=False,
+        )
+        assert "zettlab-connector-enrollment-intent" not in response
+        assert "zettlab-hardware-enrollment-intent" not in response
+
+
+def test_mixed_protocol_v2_is_preserved_without_legacy_hardware_fallback():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    original = (
+        "请确认摄像头和 SSH 连接。\n\n"
+        "```zettlab-connector-enrollment-intent\n"
+        '{"schema_version":"2","kind":"connector_enrollment","items":'
+        '[{"resource_kind":"camera"},{"resource_kind":"protocol_endpoint",'
+        '"adapter_id":"ssh"}],"setup_requested":true}\n```'
+    )
+    response = response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="添加一个摄像头和 SSH 连接",
+        response_text=original,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    )
+
+    assert response == original
+    assert response.count("```zettlab-connector-enrollment-intent") == 1
+    assert "zettlab-hardware-enrollment-intent" not in response
 
 
 def test_hardware_status_turn_strips_model_authored_enrollment_card():

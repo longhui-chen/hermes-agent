@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -22,6 +23,8 @@ from typing import Any, Callable, Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from agent.response_format import response_format_requires_structured_output
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +106,13 @@ _PRINTER3D_INTENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _HARDWARE_ENROLLMENT_FENCE = "zettlab-hardware-enrollment-intent"
+_CONNECTOR_ENROLLMENT_FENCE = "zettlab-connector-enrollment-intent"
 _HARDWARE_ENROLLMENT_BLOCK_RE = re.compile(
     r"\s*```zettlab-hardware-enrollment-intent\s*\r?\n[\s\S]*?\r?\n```",
+    re.IGNORECASE,
+)
+_CONNECTOR_ENROLLMENT_BLOCK_RE = re.compile(
+    r"\s*```zettlab-connector-enrollment-intent\s*\r?\n(?P<payload>[\s\S]*?)\r?\n```",
     re.IGNORECASE,
 )
 _LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE = re.compile(
@@ -159,6 +167,48 @@ _HARDWARE_ENROLLMENT_TYPE_RES = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "tv",
+        re.compile(
+            r"(?:电视|電視|投屏设备|投屏裝置|投屏|tv|television|display|renderer|テレビ|TV|텔레비전)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "voice_terminal",
+        re.compile(
+            r"(?:语音终端|語音終端|麦克风终端|麥克風終端|语音遥控器|語音遙控器|voice\s*terminal|microphone\s*terminal|voice\s*remote)",
+            re.IGNORECASE,
+        ),
+    ),
+)
+_DISCOVERABLE_SUBNET_HARDWARE_TYPES = frozenset({"camera", "tv"})
+_RFC1918_NETWORKS = tuple(
+    ipaddress.ip_network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+_IPV4_SCOPE_RE = re.compile(
+    r"(?<![\d.])(?P<address>(?:\d{1,3}\.){3}\d{1,3})(?:/(?P<prefix>\d{1,2}))?(?![\d.])"
+)
+_CURRENT_PRIVATE_NETWORK_RE = re.compile(
+    r"(?:当前|本机|现在所在的?)(?:局域网|网段|子网)|(?:current|local)\s+(?:private\s+)?(?:network|subnet|lan)\b",
+    re.IGNORECASE,
+)
+_LOCAL_PRIVATE_NETWORK_RE = re.compile(
+    r"(?:局域网|區域網路|本地网络|本地網路)|\b(?:local\s+network|lan)\b",
+    re.IGNORECASE,
+)
+_SUBNET_DISCOVERY_ACTION_RE = re.compile(
+    r"(?:扫描|掃描|扫一下|掃一下|查找|搜索|搜尋|搜寻|发现|發現)"
+    r"|\b(?:scan|discover|find|search)\b",
+    re.IGNORECASE,
+)
+_SUBNET_UNSUPPORTED_TYPE_RE = re.compile(
+    r"(?:打印机|印表機|プリンター|프린터)|\bprinters?\b",
+    re.IGNORECASE,
+)
+_SUBNET_NON_HARDWARE_SCAN_RE = re.compile(
+    r"(?:端口|埠|主机|主機|网关|網關)|\b(?:ports?|hosts?|gateway|nmap)\b",
+    re.IGNORECASE,
 )
 _VIDEO_EDIT_POLICY_VIOLATION_RETRIES = 2
 _VIDEO_EDIT_RESUME_TTL_SECONDS = 3 * 60 * 60
@@ -3363,7 +3413,114 @@ def request_response_mode(agent: Any) -> str:
     return "plan" if mode == "plan" else ""
 
 
-def _hardware_enrollment_requested_types(user_message: Any) -> tuple[str, ...]:
+def _private_hardware_discovery_scope(user_message: Any) -> str:
+    """Return one normalized RFC1918 /24-/30 scope from the user message."""
+    task_text, _ = _task_text_and_video_asset(user_message)
+    matches = list(_IPV4_SCOPE_RE.finditer(task_text))
+    if len(matches) != 1:
+        return ""
+    match = matches[0]
+    prefix = match.group("prefix") or "24"
+    try:
+        network = ipaddress.ip_network(
+            f"{match.group('address')}/{prefix}",
+            strict=False,
+        )
+    except ValueError:
+        return ""
+    if (
+        network.version != 4
+        or network.prefixlen < 24
+        or network.prefixlen > 30
+        or not any(network.subnet_of(private) for private in _RFC1918_NETWORKS)
+    ):
+        return ""
+    return str(network)
+
+
+def _subnet_hardware_discovery_request(
+    user_message: Any,
+) -> tuple[tuple[str, ...], str, bool] | None:
+    """Recognize one explicit, bounded private-network discovery request."""
+    task_text, _ = _task_text_and_video_asset(user_message)
+    normalized = " ".join(_strip_gateway_model_switch_note(task_text).split())
+    if (
+        not normalized
+        or len(normalized) > 320
+        or not _SUBNET_DISCOVERY_ACTION_RE.search(normalized)
+        or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
+    ):
+        return None
+
+    network_scope = _private_hardware_discovery_scope(user_message)
+    if _IPV4_SCOPE_RE.search(normalized) and not network_scope:
+        return None
+    current_network = not network_scope and bool(
+        _CURRENT_PRIVATE_NETWORK_RE.search(normalized)
+        or _LOCAL_PRIVATE_NETWORK_RE.search(normalized)
+    )
+    if not network_scope and not current_network:
+        return None
+    if (
+        _SUBNET_UNSUPPORTED_TYPE_RE.search(normalized)
+        or _SUBNET_NON_HARDWARE_SCAN_RE.search(normalized)
+    ):
+        return None
+
+    positioned_types: list[tuple[int, str]] = []
+    for hardware_type, pattern in _HARDWARE_ENROLLMENT_TYPE_RES:
+        match = pattern.search(normalized)
+        if match is not None:
+            positioned_types.append((match.start(), hardware_type))
+    positioned_types.sort(key=lambda item: item[0])
+    requested_types = tuple(hardware_type for _, hardware_type in positioned_types)
+    if not requested_types:
+        requested_types = ("camera", "tv")
+    if any(
+        hardware_type not in _DISCOVERABLE_SUBNET_HARDWARE_TYPES
+        for hardware_type in requested_types
+    ):
+        return None
+    return requested_types, network_scope, current_network
+
+
+def _blocked_subnet_hardware_discovery_request(user_message: Any) -> bool:
+    """Return whether a scan-shaped request must stop before Agent tools."""
+    task_text, _ = _task_text_and_video_asset(user_message)
+    normalized = " ".join(_strip_gateway_model_switch_note(task_text).split())
+    if (
+        not normalized
+        or len(normalized) > 320
+        or not _SUBNET_DISCOVERY_ACTION_RE.search(normalized)
+        or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
+        or not (
+            _IPV4_SCOPE_RE.search(normalized)
+            or _CURRENT_PRIVATE_NETWORK_RE.search(normalized)
+            or _LOCAL_PRIVATE_NETWORK_RE.search(normalized)
+        )
+    ):
+        return False
+    if (
+        (
+            _IPV4_SCOPE_RE.search(normalized)
+            and not _private_hardware_discovery_scope(user_message)
+        )
+        or _SUBNET_UNSUPPORTED_TYPE_RE.search(normalized)
+        or _SUBNET_NON_HARDWARE_SCAN_RE.search(normalized)
+    ):
+        return True
+    return any(
+        pattern.search(normalized)
+        and hardware_type not in _DISCOVERABLE_SUBNET_HARDWARE_TYPES
+        for hardware_type, pattern in _HARDWARE_ENROLLMENT_TYPE_RES
+    )
+
+
+def _hardware_enrollment_requested_types(
+    user_message: Any,
+    *,
+    subnet_scoped: bool = False,
+) -> tuple[str, ...]:
     """Recognize only short, direct hardware enrollment requests.
 
     Skill selection remains the primary semantic path. This bounded classifier
@@ -3394,8 +3551,63 @@ def _hardware_enrollment_requested_types(user_message: Any) -> tuple[str, ...]:
         positioned_types.sort(key=lambda item: item[0])
         return tuple(hardware_type for _, hardware_type in positioned_types)
     if _HARDWARE_ENROLLMENT_GENERIC_RE.search(normalized):
-        return ("camera", "printer3d", "pc_node")
+        if subnet_scoped:
+            return ("camera", "tv")
+        return ("camera", "printer3d", "pc_node", "tv")
     return ()
+
+
+def _strip_model_hardware_enrollment_blocks(text: str) -> str:
+    """Remove hardware-only setup blocks while preserving protocol intents."""
+    stripped = _HARDWARE_ENROLLMENT_BLOCK_RE.sub("", text)
+    stripped = _LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE.sub("", stripped)
+
+    def remove_hardware_v2(match: re.Match[str]) -> str:
+        try:
+            payload = json.loads(match.group("payload"))
+        except (TypeError, ValueError):
+            return match.group(0)
+        if not isinstance(payload, dict) or payload.get("kind") != "connector_enrollment":
+            return match.group(0)
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            return match.group(0)
+        known_hardware = {"camera", "printer3d", "pc_node", "tv", "voice_terminal"}
+        if not all(
+            isinstance(item, dict) and item.get("resource_kind") in known_hardware
+            for item in items
+        ):
+            return match.group(0)
+        return ""
+
+    return _CONNECTOR_ENROLLMENT_BLOCK_RE.sub(remove_hardware_v2, stripped)
+
+
+def _append_hardware_enrollment_intent(
+    visible_text: str,
+    requested_types: tuple[str, ...],
+    *,
+    network_scope: str = "",
+    current_network: bool = False,
+) -> str:
+    intent: dict[str, Any] = {
+        "schema_version": "2",
+        "kind": "connector_enrollment",
+        "items": [
+            {"resource_kind": hardware_type}
+            for hardware_type in requested_types
+        ],
+        "setup_requested": True,
+    }
+    if network_scope:
+        intent["network_scope"] = {"cidr": network_scope}
+    elif current_network:
+        intent["network_scope"] = {"mode": "current"}
+    payload = json.dumps(intent, ensure_ascii=False, indent=2)
+    return (
+        f"{visible_text}\n\n```{_CONNECTOR_ENROLLMENT_FENCE}\n"
+        f"{payload}\n```"
+    )
 
 
 def ensure_hardware_enrollment_intent(
@@ -3408,7 +3620,7 @@ def ensure_hardware_enrollment_intent(
     interrupted: bool,
     structured_output: bool,
 ) -> str:
-    """Append a canonical, secret-free hardware enrollment intent when needed.
+    """Append one canonical, secret-free connector enrollment intent when needed.
 
     The transform never discovers hardware or accepts addresses/credentials. It
     only gives first-party App/Web clients enough information to render the
@@ -3426,31 +3638,99 @@ def ensure_hardware_enrollment_intent(
         or not text.strip()
     ):
         return text
-    visible_text = _HARDWARE_ENROLLMENT_BLOCK_RE.sub("", text)
-    visible_text = _LEGACY_HARDWARE_CAMERA_INTENT_BLOCK_RE.sub("", visible_text)
+    visible_text = _strip_model_hardware_enrollment_blocks(text)
     removed_model_intent = visible_text != text
     if removed_model_intent:
         visible_text = visible_text.strip()
-    requested_types = _hardware_enrollment_requested_types(user_message)
+    if _blocked_subnet_hardware_discovery_request(user_message):
+        return visible_text if removed_model_intent else text
+    task_text, _ = _task_text_and_video_asset(user_message)
+    subnet_request = _subnet_hardware_discovery_request(user_message)
+    if subnet_request is not None:
+        requested_types, network_scope, current_network = subnet_request
+    else:
+        network_scope = _private_hardware_discovery_scope(user_message)
+        current_network = not network_scope and bool(
+            _CURRENT_PRIVATE_NETWORK_RE.search(task_text)
+        )
+        requested_types = _hardware_enrollment_requested_types(
+            user_message,
+            subnet_scoped=bool(network_scope) or current_network,
+        )
+    if _IPV4_SCOPE_RE.search(task_text) and not network_scope:
+        # An invalid, public, oversized or ambiguous range must not degrade to
+        # broad unscoped discovery.
+        return visible_text if removed_model_intent else text
+    if requested_types and _CONNECTOR_ENROLLMENT_BLOCK_RE.search(visible_text):
+        # A mixed hardware + protocol V2 intent is outside this hardware-only
+        # canonicalizer. Preserve that single V2 block and suppress the legacy
+        # fallback instead of dropping protocol items or producing two cards.
+        return visible_text if removed_model_intent else text
     if not requested_types:
         # A model-authored setup block is not authoritative. Remove stale or
         # over-eager hardware cards from status/usage turns even when no new
         # canonical enrollment intent needs to be appended.
         return visible_text if removed_model_intent else text
 
-    payload = json.dumps(
-        {
-            "schema_version": "1",
-            "kind": "hardware",
-            "requested_types": list(requested_types),
-            "discovery_requested": True,
-        },
-        ensure_ascii=False,
-        indent=2,
+    if (network_scope or current_network) and any(
+        hardware_type not in _DISCOVERABLE_SUBNET_HARDWARE_TYPES
+        for hardware_type in requested_types
+    ):
+        # Do not silently convert a printer/PC/pairing request into a camera/TV
+        # scan. The model can explain that those types use trusted manual or
+        # account/pairing discovery instead.
+        return visible_text if removed_model_intent else text
+
+    return _append_hardware_enrollment_intent(
+        visible_text,
+        requested_types,
+        network_scope=network_scope,
+        current_network=current_network,
     )
-    return (
-        f"{visible_text}\n\n```{_HARDWARE_ENROLLMENT_FENCE}\n"
-        f"{payload}\n```"
+
+
+def hardware_enrollment_preflight_response(
+    agent: Any,
+    user_message: Any,
+) -> str:
+    """Return an immediate client card before the provider/tool loop."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return ""
+    subnet_request = _subnet_hardware_discovery_request(user_message)
+    if subnet_request is None:
+        if _blocked_subnet_hardware_discovery_request(user_message):
+            task_text, _ = _task_text_and_video_asset(user_message)
+            if re.search(r"[\u3400-\u9fff]", task_text):
+                return (
+                    "该请求不会执行 shell、nmap 或端口扫描。请使用私有 /24–/30 "
+                    "网段；当前网段发现仅支持 ONVIF 摄像头和 DLNA 电视。"
+                )
+            return (
+                "This request will not run shell, nmap, or a port scan. Use a "
+                "private /24–/30 subnet; discovery currently supports ONVIF "
+                "cameras and DLNA TVs."
+            )
+        return ""
+    if response_format_requires_structured_output(
+        (getattr(agent, "request_overrides", None) or {}).get("response_format")
+    ):
+        return ""
+    requested_types, network_scope, current_network = subnet_request
+    task_text, _ = _task_text_and_video_asset(user_message)
+    is_chinese = bool(re.search(r"[\u3400-\u9fff]", task_text))
+    intro = (
+        "点击卡片中的“发现附近设备”开始扫描；结果会显示在卡片内，且不会自动连接。"
+        if is_chinese
+        else (
+            "Select “Discover nearby devices” to scan. Results stay in the "
+            "card and are not connected automatically."
+        )
+    )
+    return _append_hardware_enrollment_intent(
+        intro,
+        requested_types,
+        network_scope=network_scope,
+        current_network=current_network,
     )
 
 
