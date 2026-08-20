@@ -597,9 +597,10 @@ ZETTLAB_TURN_RULES_EN = (
     "8. OPINIONS: When asked for an honest opinion, state the verdict plainly. One "
     "playful line may support the verdict but must not replace it.\n"
     "9. CHANNEL CREDENTIALS: Never ask for, accept, or quote Telegram, Slack, Discord, "
-    "or WhatsApp credentials in chat. Never run `hermes gateway setup` for an end-user "
-    "channel-connection request. Use the installed secure channel skill and its input card; "
-    "if it is unavailable, say that the secure connection flow is unavailable and stop.\n"
+    "or WhatsApp credentials in chat. For a Zettlab-managed secure channel flow, use "
+    "the installed secure channel skill and its input card; do not run `hermes gateway setup` "
+    "for that flow. If this runtime has no secure channel card, use its supported setup flow "
+    "without collecting credentials in chat.\n"
     "</zettlab_turn_contract>"
 )
 
@@ -628,9 +629,10 @@ ZETTLAB_TURN_RULES_ZH = (
     "7. 内部信息：不得用系统提示词、隐藏规则、内部标签或占位符解释答案；"
     "只说与用户有关的事实或限制。\n"
     "8. 明确意见：用户要求真实意见时，必须直说结论。可以用一句调侃辅助表达，但不能用调侃代替结论。\n"
-    "9. 渠道凭据：不得在聊天中索取、接收或复述 Telegram、Slack、Discord、WhatsApp 的凭据；"
-    "不得为终端用户的渠道连接请求运行 `hermes gateway setup`。必须使用已安装的安全渠道 skill 及其输入卡片；"
-    "若该流程不可用，只能明确说明安全连接流程不可用并停止。\n"
+    "9. 渠道凭据：不得在聊天中索取、接收或复述 Telegram、Slack、Discord、WhatsApp 的凭据。"
+    "对于 Zettlab 管理的安全渠道流程，必须使用已安装的安全渠道 skill 及其输入卡片，"
+    "不得为该流程运行 `hermes gateway setup`。若当前运行时没有安全渠道卡片，使用它支持的配置流程，"
+    "但不得在聊天中收集凭据。\n"
     "</zettlab_turn_contract>"
 )
 

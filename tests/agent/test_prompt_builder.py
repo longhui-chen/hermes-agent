@@ -190,8 +190,8 @@ class TestGuidanceConstants:
     @pytest.mark.parametrize(
         ("lang", "required"),
         [
-            ("en", "Never run `hermes gateway setup` for an end-user"),
-            ("zh", "不得为终端用户的渠道连接请求运行 `hermes gateway setup`"),
+            ("en", "do not run `hermes gateway setup` for that flow"),
+            ("zh", "不得为该流程运行 `hermes gateway setup`"),
         ],
     )
     def test_turn_contract_blocks_chat_channel_credentials(self, lang, required):
