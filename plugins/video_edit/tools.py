@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,14 @@ from typing import Any
 from tools.registry import tool_error, tool_result
 
 from plugins.video_edit import client, normalizer, preferences, state
-from plugins.video_edit.paths import VideoPathError, agent_id_from_kwargs, result_path, task_id_from_kwargs, validate_input_file
+from plugins.video_edit.paths import (
+    VideoPathError,
+    agent_id_from_kwargs,
+    result_path,
+    safe_id,
+    task_id_from_kwargs,
+    validate_input_file,
+)
 
 
 def _ok(value: dict[str, Any]) -> str:
@@ -31,6 +39,49 @@ def _workflow_or_error(raw: Any, agent_id: str) -> dict[str, Any]:
 
 def _scene(args: dict[str, Any]) -> str:
     return str(args.get("scene") or "general").strip()[:64] or "general"
+
+
+def _proactive_session_id(entry: dict[str, Any]) -> str:
+    """Return the server-owned output bucket for a proactive workflow."""
+    if not entry.get("proactive"):
+        return ""
+    trigger_id = safe_id(entry.get("proactive_trigger_id"), fallback="")
+    if not trigger_id or not trigger_id.startswith("pvm-"):
+        raise state.WorkflowError("proactive workflow trigger is missing")
+    return "proactive-" + trigger_id
+
+
+def _checkpoint_target(
+    raw_path: str,
+    agent_id: str,
+    *,
+    session_id: str = "",
+) -> Path:
+    """Validate/rehome an existing checkpoint into its required session bucket."""
+    name = Path(raw_path).name
+    target = result_path(agent_id, name, allow_existing=True, session_id=session_id)
+    if not raw_path:
+        return target
+    candidate = Path(raw_path)
+    if not candidate.exists():
+        # A pending path may legitimately not have been created yet. The
+        # sanitized basename above is the only part we carry forward.
+        return target
+    try:
+        source = validate_input_file(str(candidate), agent_id)
+    except VideoPathError as exc:
+        raise state.WorkflowError("video result checkpoint is invalid") from exc
+    if source == target:
+        return target
+    if target.exists():
+        source_evidence = client.file_evidence(source)
+        target_evidence = client.file_evidence(target)
+        if source_evidence["sha256"] != target_evidence["sha256"]:
+            raise state.WorkflowError("video result checkpoint conflicts with session artifact")
+        source.unlink()
+        return target
+    os.replace(source, target)
+    return target
 
 
 def handle_preferences_resolve(args: dict, **kwargs: Any) -> str:
@@ -303,10 +354,13 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
             # it against the current agent's output bucket before reusing a
             # completed artifact; this keeps profile state and produced files
             # aligned after a restart or manual state-file replacement.
-            existing_target = result_path(agent_id, Path(existing).name, allow_existing=True)
-            if str(existing_target) != existing:
-                raise state.WorkflowError("video result checkpoint is invalid")
+            output_session = _proactive_session_id(entry)
+            existing_target = _checkpoint_target(
+                existing, agent_id, session_id=output_session
+            )
             evidence = client.file_evidence(existing_target)
+            if str(existing_target) != existing:
+                state.update(workflow_id, agent_id, {"output_path": evidence["path"]})
             return _ok({
                 "ok": True,
                 "workflow_id": workflow_id,
@@ -317,12 +371,17 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
                 "next": "video_edit_preferences_record_success",
             })
         pending = str(entry.get("pending_output_path") or "").strip()
+        output_session = _proactive_session_id(entry)
         if pending:
-            target = result_path(agent_id, Path(pending).name, allow_existing=True)
-            if str(target) != pending:
-                raise state.WorkflowError("video result checkpoint is invalid")
+            target = _checkpoint_target(
+                pending, agent_id, session_id=output_session
+            )
         else:
-            target = result_path(agent_id, str(args.get("filename") or f"{workflow_id}.mp4"))
+            target = result_path(
+                agent_id,
+                str(args.get("filename") or f"{workflow_id}.mp4"),
+                session_id=output_session,
+            )
             state.update(workflow_id, agent_id, {"pending_output_path": str(target), "status": "downloading"})
         recovered = target.is_file()
         evidence = client.file_evidence(target) if recovered else client.download(result_url, target)
@@ -348,6 +407,9 @@ def handle_proactive_resolve(args: dict, **kwargs: Any) -> str:
         payload = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
         if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
             raise client.VideoClientError("proactive manifest contains no files")
+        trigger_id = safe_id(payload.get("trigger_id"), fallback="")
+        if not trigger_id or not trigger_id.startswith("pvm-"):
+            raise client.VideoClientError("proactive manifest has no server trigger")
         workflow = state.workflow_id(task_id, agent_id)
         scene = str(payload.get("scene") or "general")
         resolved = preferences.resolve(agent_id, scene, {}, silent=True)
@@ -360,6 +422,7 @@ def handle_proactive_resolve(args: dict, **kwargs: Any) -> str:
             "manifest_id": manifest_id, "source_paths": paths,
             "preferences": resolved["preferences"], "preference_sources": resolved["sources"],
             "status": "proactive_resolved", "proactive": True,
+            "proactive_trigger_id": trigger_id,
         })
         return _ok({"ok": True, "workflow_id": workflow, "manifest_id": manifest_id, "file_count": len(paths), "silent": True, "next": "video_edit_upload_assets"})
     except Exception as exc:

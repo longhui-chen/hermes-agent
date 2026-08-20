@@ -506,7 +506,17 @@ def test_proactive_report_is_exactly_once(isolated_video_home, monkeypatch, tmp_
     source = isolated_video_home[1] / "agent-a" / "weekly.mov"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"video")
-    monkeypatch.setattr(client, "proactive_resolve", lambda manifest_id, **kwargs: {"data": {"scene": "weekly", "files": [{"path": str(source)}]}})
+    monkeypatch.setattr(
+        client,
+        "proactive_resolve",
+        lambda manifest_id, **kwargs: {
+            "data": {
+                "trigger_id": "pvm-report-exactly-once",
+                "scene": "weekly",
+                "files": [{"path": str(source)}],
+            }
+        },
+    )
     first = json.loads(tools.handle_proactive_resolve({"manifest_id": "manifest-1", "task_id": "weekly-1"}, agent_id="agent-a"))
     assert first["silent"] is True
     workflow = first["workflow_id"]
@@ -523,3 +533,51 @@ def test_proactive_report_is_exactly_once(isolated_video_home, monkeypatch, tmp_
     assert json.loads(tools.handle_proactive_report({"workflow_id": workflow}, agent_id="agent-a"))["reported"] is True
     assert json.loads(tools.handle_proactive_report({"workflow_id": workflow}, agent_id="agent-a"))["reused"] is True
     assert len(calls) == 1
+
+
+def test_proactive_download_uses_server_trigger_output_bucket(
+    isolated_video_home, monkeypatch
+):
+    """Weekly artifacts must land in the same bucket local-server validates."""
+    source = isolated_video_home[1] / "agent-a" / "weekly.mov"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"video")
+    monkeypatch.setattr(
+        client,
+        "proactive_resolve",
+        lambda manifest_id, **kwargs: {
+            "trigger_mode": "proactive_silent",
+            "trigger_id": "pvm-trigger-bucket-test",
+            "scene": "weekly",
+            "files": [{"path": str(source)}],
+        },
+    )
+    first = json.loads(
+        tools.handle_proactive_resolve(
+            {"manifest_id": "manifest-1", "task_id": "weekly-bucket"},
+            agent_id="agent-a",
+        )
+    )
+    workflow = first["workflow_id"]
+    tools.state.update(
+        workflow,
+        "agent-a",
+        {"result_url": "https://cdn.example.test/result.mp4", "status": "completed"},
+    )
+
+    def fake_download(_url, target):
+        target.write_bytes(b"rendered")
+        return {"path": str(target), "size": 8, "sha256": "digest"}
+
+    monkeypatch.setattr(client, "download", fake_download)
+    delivered = json.loads(
+        tools.handle_download_result(
+            {"workflow_id": workflow, "filename": "weekly.mp4"},
+            agent_id="agent-a",
+        )
+    )
+
+    assert delivered["ok"] is True
+    assert delivered["output"].endswith(
+        "/output/agent-a/proactive-pvm-trigger-bucket-test/weekly.mp4"
+    )

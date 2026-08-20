@@ -143,13 +143,27 @@ def output_root(agent_id: str) -> Path:
     return bucket
 
 
-def result_path(agent_id: str, filename: str, *, allow_existing: bool = False) -> Path:
+def result_path(
+    agent_id: str,
+    filename: str,
+    *,
+    allow_existing: bool = False,
+    session_id: str = "",
+) -> Path:
     name = Path(str(filename or "video-edit.mp4").strip()).name
     if not name or name in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
         raise VideoPathError("invalid result filename")
     if not name.lower().endswith(".mp4"):
         name += ".mp4"
     root = output_root(agent_id)
+    if session_id:
+        bucket = safe_id(session_id, fallback="")
+        if not bucket:
+            raise VideoPathError("result session is invalid")
+        root = root / bucket
+        root.mkdir(mode=0o750, parents=False, exist_ok=True)
+        if root.is_symlink():
+            raise VideoPathError("result session directory is a symlink")
     candidate = root / name
     if candidate.is_symlink():
         raise VideoPathError("result path is unavailable")
