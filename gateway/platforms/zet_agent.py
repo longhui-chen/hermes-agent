@@ -315,6 +315,43 @@ def _apply_execution_policy(
         for name in set(getattr(agent, "valid_tool_names", ()) or ())
         if _allowed_name(name)
     }
+    has_video_tools = any(
+        _is_video_edit_tool_name(_agent_tool_name(tool))
+        for tool in allowed_tools
+    )
+    if video_edit_turn and not has_video_tools:
+        # ``model_tools`` may have replaced non-core plugin schemas with the
+        # tool-search bridge before this policy is applied.  Filtering that
+        # assembled list would leave a silent video turn with zero executable
+        # tools, because ``tool_search``/``tool_call`` are intentionally not
+        # video business tools.  Re-read the same enabled toolsets with the
+        # progressive-disclosure assembly disabled, then apply the exact
+        # video prefix filter below.  This is tool discovery, not an auth hop.
+        try:
+            from model_tools import get_tool_definitions
+
+            direct_tools = get_tool_definitions(
+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            direct_video_tools = [
+                tool for tool in direct_tools
+                if _is_video_edit_tool_name(_agent_tool_name(tool))
+            ]
+            if direct_video_tools:
+                allowed_tools = direct_video_tools
+                allowed_names = {
+                    _agent_tool_name(tool) for tool in direct_video_tools
+                }
+        except Exception:
+            # Keep the original filtered snapshot as a bounded degradation;
+            # the model will receive a structured unavailable-tool response.
+            logger.warning(
+                "[zet_agent] direct video plugin tool refresh failed",
+                exc_info=True,
+            )
     # Keep the bounded snapshot private on the agent so a later MCP refresh
     # cannot widen the toolset behind the policy.
     agent._zet_agent_execution_policy = execution_policy

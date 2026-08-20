@@ -764,6 +764,23 @@ def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
     return _strip_skill_display_token(user_message, skill_slug)
 
 
+def _is_video_edit_skill_slug(skill_slug: str) -> bool:
+    """Identify the ordinary video orchestration Skill for silent turns.
+
+    Silent automation normally skips Skill expansion because it has no
+    interactive user-facing command flow. Weekly video still needs the
+    Skill's business sequencing instructions; this prompt-only expansion does
+    not restore ``skill_view`` or any capability/attestation protocol.
+    """
+    normalized = str(skill_slug or "").strip().lower().strip("/")
+    return normalized in {
+        "video-edit-workflow-mini",
+        "video-edit-workflow",
+        "video-edit",
+        "video_edit",
+    } or normalized.startswith(("video-edit-", "video_edit_"))
+
+
 _HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
 
 
@@ -6317,11 +6334,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 history = []
 
         # Explicit skill selection is triggered ONLY by metadata.skill_slug —
-        # never by sniffing the message text. Ordinary turns may pre-expand the
-        # selected Skill through the zet_agent hook. Silent video turns keep
-        # the task/slug as routing metadata but skip pre-expansion: the ordinary
-        # video_edit plugin tools are exposed directly, with no skill_view or
-        # capability/attestation hop.
+        # never by sniffing the message text. Ordinary turns and silent video
+        # turns expand the selected Skill as prompt-level business guidance.
+        # Silent video still skips every interactive skill_view/
+        # capability/attestation hop; plugin tools remain the only side-effect
+        # boundary.
         # The expansion runs LATE on purpose; the placement is load-bearing:
         #   - AFTER session_id is final, so skill templates resolve
         #     ${HERMES_SESSION_ID} against the real session (session_id is
@@ -6343,7 +6360,11 @@ class APIServerAdapter(BasePlatformAdapter):
             and (not requested_silent_automation or execution_policy == "silent_automation")
         )
         skill_expansion_enabled = bool(
-            skill_selection_enabled and execution_policy != "silent_automation"
+            skill_selection_enabled
+            and (
+                execution_policy != "silent_automation"
+                or _is_video_edit_skill_slug(skill_slug)
+            )
         )
         trusted_user_message = (
             trusted_task_message

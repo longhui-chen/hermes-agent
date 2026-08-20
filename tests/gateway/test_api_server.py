@@ -2242,6 +2242,68 @@ class TestChatCompletionsEndpoint:
                 )
 
     @pytest.mark.asyncio
+    async def test_silent_video_skill_expands_orchestration_without_auth_hop(
+        self,
+        adapter,
+    ):
+        """Silent weekly turns still receive the Skill's orchestration text.
+
+        The silent policy must remove interactive/authentication hops, but it
+        cannot remove the business workflow instructions.  Without expansion
+        the model only sees a JSON trigger and plugin schemas and can answer
+        with plain text without ever calling ``video_edit_proactive_resolve``.
+        """
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as mock_run, patch.object(
+                adapter,
+                "_expand_inbound_skill_invocation",
+                new_callable=AsyncMock,
+            ) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                mock_expand.return_value = (
+                    "<<VIDEO-ORCHESTRATION:video-edit-workflow-mini>>"
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Idempotency-Key": "silent-video-expansion-1"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                '{"proactive_manifest_id":"manifest-1",'
+                                '"trigger_id":"trigger-1"}'
+                            ),
+                        }],
+                        "stream": False,
+                        "metadata": {
+                            "skill_slug": "video-edit-workflow-mini",
+                            "execution_policy": "silent_automation",
+                        },
+                    },
+                )
+
+                assert resp.status == 200
+                mock_expand.assert_awaited_once()
+                assert mock_expand.await_args.args[1] == (
+                    "video-edit-workflow-mini"
+                )
+                assert mock_run.await_args.kwargs["user_message"] == (
+                    "<<VIDEO-ORCHESTRATION:video-edit-workflow-mini>>"
+                )
+                assert mock_run.await_args.kwargs["trusted_skill_slug"] == (
+                    "video-edit-workflow-mini"
+                )
+
+    @pytest.mark.asyncio
     async def test_slash_text_without_skill_slug_is_never_expanded(self, adapter):
         # The explicit metadata.skill_slug field is the ONLY trigger: message
         # text is never sniffed, so a literal "/<skill> ..." (e.g. the user
