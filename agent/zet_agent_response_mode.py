@@ -187,6 +187,10 @@ _RFC1918_NETWORKS = tuple(
 _IPV4_SCOPE_RE = re.compile(
     r"(?<![\d.])(?P<address>(?:\d{1,3}\.){3}\d{1,3})(?:/(?P<prefix>\d{1,2}))?(?![\d.])"
 )
+_IPV4_WILDCARD_SCOPE_RE = re.compile(
+    r"(?<![\d.])(?P<base>(?:\d{1,3}\.){3})(?:x|\*)(?:/(?P<prefix>\d{1,2}))?(?![A-Za-z0-9_.])",
+    re.IGNORECASE,
+)
 _CURRENT_PRIVATE_NETWORK_RE = re.compile(
     r"(?:当前|本机|现在所在的?)(?:局域网|网段|子网)|(?:current|local)\s+(?:private\s+)?(?:network|subnet|lan)\b",
     re.IGNORECASE,
@@ -2416,14 +2420,21 @@ def request_response_mode(agent: Any) -> str:
 def _private_hardware_discovery_scope(user_message: Any) -> str:
     """Return one normalized RFC1918 /24-/30 scope from the user message."""
     task_text = _task_text(user_message)
-    matches = list(_IPV4_SCOPE_RE.finditer(task_text))
+    matches = [
+        (match, False) for match in _IPV4_SCOPE_RE.finditer(task_text)
+    ] + [
+        (match, True) for match in _IPV4_WILDCARD_SCOPE_RE.finditer(task_text)
+    ]
     if len(matches) != 1:
         return ""
-    match = matches[0]
+    match, wildcard = matches[0]
     prefix = match.group("prefix") or "24"
+    if wildcard and prefix != "24":
+        return ""
+    address = f"{match.group('base')}0" if wildcard else match.group("address")
     try:
         network = ipaddress.ip_network(
-            f"{match.group('address')}/{prefix}",
+            f"{address}/{prefix}",
             strict=False,
         )
     except ValueError:
@@ -2436,6 +2447,13 @@ def _private_hardware_discovery_scope(user_message: Any) -> str:
     ):
         return ""
     return str(network)
+
+
+def _has_explicit_hardware_discovery_scope(task_text: str) -> bool:
+    return bool(
+        _IPV4_SCOPE_RE.search(task_text)
+        or _IPV4_WILDCARD_SCOPE_RE.search(task_text)
+    )
 
 
 def _subnet_hardware_discovery_request(
@@ -2453,7 +2471,7 @@ def _subnet_hardware_discovery_request(
         return None
 
     network_scope = _private_hardware_discovery_scope(user_message)
-    if _IPV4_SCOPE_RE.search(normalized) and not network_scope:
+    if _has_explicit_hardware_discovery_scope(normalized) and not network_scope:
         return None
     current_network = not network_scope and bool(
         _CURRENT_PRIVATE_NETWORK_RE.search(normalized)
@@ -2494,7 +2512,7 @@ def _blocked_subnet_hardware_discovery_request(user_message: Any) -> bool:
         or not _SUBNET_DISCOVERY_ACTION_RE.search(normalized)
         or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
         or not (
-            _IPV4_SCOPE_RE.search(normalized)
+            _has_explicit_hardware_discovery_scope(normalized)
             or _CURRENT_PRIVATE_NETWORK_RE.search(normalized)
             or _LOCAL_PRIVATE_NETWORK_RE.search(normalized)
         )
@@ -2502,7 +2520,7 @@ def _blocked_subnet_hardware_discovery_request(user_message: Any) -> bool:
         return False
     if (
         (
-            _IPV4_SCOPE_RE.search(normalized)
+            _has_explicit_hardware_discovery_scope(normalized)
             and not _private_hardware_discovery_scope(user_message)
         )
         or _SUBNET_UNSUPPORTED_TYPE_RE.search(normalized)
@@ -2657,7 +2675,7 @@ def ensure_hardware_enrollment_intent(
             user_message,
             subnet_scoped=bool(network_scope) or current_network,
         )
-    if _IPV4_SCOPE_RE.search(task_text) and not network_scope:
+    if _has_explicit_hardware_discovery_scope(task_text) and not network_scope:
         # An invalid, public, oversized or ambiguous range must not degrade to
         # broad unscoped discovery.
         return visible_text if removed_model_intent else text

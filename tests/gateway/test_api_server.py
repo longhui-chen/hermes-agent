@@ -2955,6 +2955,65 @@ class TestChatCompletionsEndpoint:
             for chunk in chunks
             if chunk["choices"][0]["finish_reason"] == "stop"
         )
+        streamed_text = "".join(
+            chunk["choices"][0].get("delta", {}).get("content", "")
+            for chunk in chunks
+        )
+        assert streamed_text == response_text
+        assert "hermes" not in terminal
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_final_response_when_agent_returns_without_deltas(self, adapter):
+        response_text = (
+            "Select the discovery card.\n\n"
+            "```zettlab-connector-enrollment-intent\n"
+            '{"schema_version":"2","kind":"connector_enrollment"}\n'
+            "```"
+        )
+        mock_result = {
+            "final_response": response_text,
+            "response_transformed": False,
+            "canonical_response_required": False,
+            "completed": True,
+            "failed": False,
+            "messages": [],
+            "api_calls": 0,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+                run_agent.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "scan this subnet"}],
+                        "stream": True,
+                    },
+                )
+            assert response.status == 200
+            body = await response.text()
+
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        content_chunks = [
+            chunk["choices"][0].get("delta", {}).get("content")
+            for chunk in chunks
+            if chunk["choices"][0].get("delta", {}).get("content") is not None
+        ]
+        terminal = next(
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0]["finish_reason"] == "stop"
+        )
+        assert content_chunks == [response_text]
         assert "hermes" not in terminal
 
     @pytest.mark.asyncio

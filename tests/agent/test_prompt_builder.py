@@ -188,6 +188,16 @@ class TestGuidanceConstants:
             assert text in guidance
 
     @pytest.mark.parametrize(
+        ("lang", "required"),
+        [
+            ("en", "do not run `hermes gateway setup` for that flow"),
+            ("zh", "不得为该流程运行 `hermes gateway setup`"),
+        ],
+    )
+    def test_turn_contract_blocks_chat_channel_credentials(self, lang, required):
+        assert required in zettlab_turn_rules_guidance(lang)
+
+    @pytest.mark.parametrize(
         ("lang", "own_files", "implicit_input", "controlled_index", "fallback"),
         [
             (

@@ -373,17 +373,19 @@ def test_common_base_owns_agent_creation_routing(monkeypatch, lang, required):
         (
             "en",
             (
-                "agent-creator` skill's CLI over raw shell",
+                "agent-creator` skill's CLI first",
                 "skill_view(name='agent-creator')",
-                "bypass path validation",
+                "use bash or other command-line tools",
+                "Do not stop solely because the CLI",
             ),
         ),
         (
             "zh",
             (
-                "agent-creator` skill 的 CLI 而不是原生 shell",
+                "优先使用 `agent-creator` skill 的 CLI",
                 "skill_view(name='agent-creator')",
-                "绕开路径校验",
+                "使用 bash 或当前会话可用的其它命令行工具",
+                "不能只因为 CLI",
             ),
         ),
     ],
@@ -403,9 +405,9 @@ def test_workspace_and_device_ops_route_to_trusted_cli(monkeypatch, lang, requir
 def test_workspace_ops_rule_absent_without_skill_view(monkeypatch, lang):
     """Narrow toolsets (`terminal`, `file`, `debugging`) ship no skill_view.
 
-    Telling those sessions to load agent-creator — while forbidding the shell
-    they do have — would strand ordinary file and diagnostic work, so the rule
-    must not be injected at all when the loader tool is missing.
+    Telling those sessions to load an unavailable skill cannot help them. They
+    keep using the terminal/file tools they actually have, so the routing rule
+    must not be injected when the loader tool is missing.
     """
     monkeypatch.setenv("HERMES_AGENT_LANG", lang)
 
@@ -413,6 +415,24 @@ def test_workspace_ops_rule_absent_without_skill_view(monkeypatch, lang):
 
     assert "skill_view(name='agent-creator')" not in stable
     assert "agent-creator` skill" not in stable
+
+
+@pytest.mark.parametrize("lang", ["en", "zh"])
+def test_workspace_device_cli_to_shell_fallback_guidance_flow(monkeypatch, lang):
+    """The real system-prompt assembly keeps CLI preferred without turning a
+    CLI limitation into a terminal user failure."""
+    monkeypatch.setenv("HERMES_AGENT_LANG", lang)
+
+    stable = _stable_prompt(valid_tool_names=["skill_view", "terminal"])
+
+    if lang == "zh":
+        assert "优先使用 `agent-creator` skill 的 CLI" in stable
+        assert "使用 bash 或当前会话可用的其它命令行工具" in stable
+        assert "继续完成用户目标" in stable
+    else:
+        assert "agent-creator` skill's CLI first" in stable
+        assert "use bash or other command-line tools" in stable
+        assert "continue toward the user's goal" in stable
 
 
 def test_runtime_default_is_the_neutral_base():

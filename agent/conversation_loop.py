@@ -2499,7 +2499,7 @@ def run_conversation(
     # user confirms in the first-party client.
     _hardware_preflight_response = hardware_enrollment_preflight_response(
         agent,
-        original_user_message,
+        trusted_skill_task,
     )
     if _hardware_preflight_response:
         messages.append({"role": "assistant", "content": _hardware_preflight_response})

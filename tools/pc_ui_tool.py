@@ -42,11 +42,42 @@ _ACTIONS = {
     "clipboard_write",
     "kill_app",
     "complete_task",
+    # Compatibility aliases shared with the generic Codex Computer Use
+    # surface. They are normalized before reaching the PC host.
+    "capture",
+    "double_click",
+    "right_click",
+    "middle_click",
+    "type",
+    "key",
+}
+_ACTION_ALIASES = {
+    "capture": "snapshot",
+    "double_click": "click",
+    "right_click": "click",
+    "middle_click": "click",
+    "type": "type_text",
+    "key": "keystroke",
 }
 _READ_ACTIONS = {
     "list_apps", "list_windows", "snapshot", "desktop_snapshot", "verify", "zoom", "clipboard_read", "complete_task",
 }
-_TASK_CONTROL_FIELDS = {"snapshot_revision", "user_input_epoch", "postcondition"}
+_TASK_CONTROL_FIELDS = {"snapshot_revision", "user_input_epoch", "postcondition", "capture_after"}
+_APP_CONTEXT_ACTIONS = {
+    "focus",
+    "invoke",
+    "click",
+    "drag",
+    "type_text",
+    "set_value",
+    "scroll",
+    "keystroke",
+    "invoke_menu",
+    "verify",
+    "zoom",
+    "set_window_frame",
+    "kill_app",
+}
 
 PC_UI_SCHEMA = {
     "name": "pc_ui",
@@ -98,10 +129,19 @@ PC_UI_SCHEMA = {
             "include_screenshot": {"type": "boolean"},
             "include_hidden": {"type": "boolean"},
             "include_text": {"type": "boolean"},
+            "capture_after": {
+                "type": "boolean",
+                "description": "Mutation actions return a fresh observation by default; set false only when not needed.",
+            },
             "query": {"type": "string", "maxLength": 256},
             "scope": {"type": "string", "enum": ["window", "desktop"]},
             "x": {"type": "number", "minimum": 0},
             "y": {"type": "number", "minimum": 0},
+            "coordinate": {
+                "type": "array", "items": {"type": "number"},
+                "minItems": 2, "maxItems": 2,
+                "description": "Codex Computer Use compatible [x, y] fallback for click/type/scroll/key actions.",
+            },
             "x1": {"type": "number", "minimum": 0},
             "y1": {"type": "number", "minimum": 0},
             "x2": {"type": "number", "minimum": 0},
@@ -110,6 +150,14 @@ PC_UI_SCHEMA = {
             "from_y": {"type": "number", "minimum": 0},
             "to_x": {"type": "number", "minimum": 0},
             "to_y": {"type": "number", "minimum": 0},
+            "from_coordinate": {
+                "type": "array", "items": {"type": "number"},
+                "minItems": 2, "maxItems": 2,
+            },
+            "to_coordinate": {
+                "type": "array", "items": {"type": "number"},
+                "minItems": 2, "maxItems": 2,
+            },
             "from_zoom": {"type": "boolean"},
             "button": {"type": "string", "enum": ["left", "right", "middle"]},
             "count": {"type": "integer", "enum": [1, 2]},
@@ -243,6 +291,27 @@ def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
         "kill_app": {"pid"},
         "complete_task": set(),
     }[action]
+    # The flat tool schema exposes app/include_text to every action. Models can
+    # therefore legally repeat the observed app name on a window mutation or
+    # request text while taking a semantic snapshot. These fields do not belong
+    # on the Host wire contract, so validate and discard them here instead of
+    # rejecting an otherwise fenced operation as invalid_parameters.
+    context_only: set[str] = set()
+    if action in _APP_CONTEXT_ACTIONS and "app" in args:
+        app = args["app"]
+        if (
+            not isinstance(app, str)
+            or not app.strip()
+            or len(app) > 256
+            or "\x00" in app
+        ):
+            return None
+        context_only.add("app")
+    if action in {"snapshot", "desktop_snapshot"} and "include_text" in args:
+        if not isinstance(args["include_text"], bool):
+            return None
+        context_only.add("include_text")
+    args = {name: value for name, value in args.items() if name not in context_only}
     if any(name not in args for name in required):
         return None
     if any(name not in allowed and name != "action" and name not in _TASK_CONTROL_FIELDS for name in args):
@@ -344,18 +413,108 @@ def _task_control(
     return envelope
 
 
+def _fresh_observation(
+    args: dict[str, Any],
+    params: dict[str, Any],
+    task_id: str,
+) -> dict[str, Any] | None:
+    """Re-observe the exact target after a successful mutation.
+
+    This mirrors Codex Computer Use's capture-after contract while keeping the
+    connected-PC endpoint as the only authority. Failures are represented as
+    an absent observation; they never turn an already-delivered mutation into
+    an automatic retry.
+    """
+    if params.get("scope") == "desktop":
+        action = "ui.desktop-snapshot"
+        observation_params: dict[str, Any] = {}
+    else:
+        app = args.get("app")
+        if not isinstance(app, str) or not app.strip():
+            return None
+        action = "ui.snapshot"
+        observation_params = {"app": app}
+        if isinstance(params.get("pid"), int) and isinstance(params.get("window_id"), int):
+            observation_params.update(pid=params["pid"], window_id=params["window_id"])
+    try:
+        task_control = _task_control(args, "snapshot", observation_params, task_id, "")
+    except ValueError:
+        return None
+    try:
+        with requests.Session() as client:
+            client.trust_env = False
+            response = client.post(
+                _endpoint(),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Zettlab-Agent-Action-Token": str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
+                    "X-Zettlab-Browser-Session-Token": _session_token(),
+                },
+                json={
+                    "session_id": _session_id(),
+                    "action": action,
+                    "params": observation_params,
+                    **({"task_control": task_control} if task_control else {}),
+                },
+                timeout=_TIMEOUT_SECONDS,
+            )
+            if not getattr(response, "ok", True) or len(response.content) > _MAX_RESPONSE_BYTES:
+                return None
+            payload = response.json()
+            return payload.get("result") if isinstance(payload, dict) else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _invalid_parameters_hint(args: dict[str, Any], action: str) -> str:
+    if action == "click":
+        if "button" in args and args.get("button") not in {"left", "right", "middle"}:
+            return "button is a mouse button; use element from the latest snapshot or coordinate=[x,y] for the control"
+        return "refresh snapshot and provide exactly one target: element or coordinate=[x,y]"
+    if action in {"type_text", "keystroke"}:
+        return "refresh snapshot and provide element or coordinate=[x,y] together with text/key"
+    return "refresh the exact app/window snapshot and reuse only its returned identifiers"
+
+
 def pc_ui_tool(
     args: dict[str, Any],
     task_id: str = "",
     tool_call_id: str = "",
     **_: Any,
 ) -> Any:
-    action = args.get("action")
+    raw_action = args.get("action")
+    action = _ACTION_ALIASES.get(raw_action, raw_action)
+    if action not in _ACTIONS or raw_action in _ACTION_ALIASES:
+        if action not in {"snapshot", "click", "type_text", "keystroke"}:
+            return json.dumps({"success": False, "code": "invalid_action"})
+    normalized = dict(args)
+    normalized["action"] = action
+    if raw_action == "double_click":
+        normalized["count"] = 2
+    elif raw_action == "right_click":
+        normalized["button"] = "right"
+    elif raw_action == "middle_click":
+        normalized["button"] = "middle"
+    for source, x_name, y_name in (
+        ("coordinate", "x", "y"),
+        ("from_coordinate", "from_x", "from_y"),
+        ("to_coordinate", "to_x", "to_y"),
+    ):
+        point = normalized.pop(source, None)
+        if point is not None:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                return json.dumps({"success": False, "code": "invalid_parameters"})
+            normalized[x_name], normalized[y_name] = point
+    args = normalized
     if action not in _ACTIONS:
         return json.dumps({"success": False, "code": "invalid_action"})
     params = _params(args, action)
     if params is None:
-        return json.dumps({"success": False, "code": "invalid_parameters"})
+        return json.dumps({
+            "success": False,
+            "code": "invalid_parameters",
+            "hint": _invalid_parameters_hint(args, action),
+        }, ensure_ascii=False)
     try:
         task_control = _task_control(args, action, params, task_id, tool_call_id)
     except ValueError:
@@ -405,6 +564,19 @@ def pc_ui_tool(
         payload = response.json()
     except ValueError:
         return json.dumps({"success": False, "code": "invalid_pc_response"})
+    if (
+        isinstance(payload, dict)
+        and payload.get("success") is True
+        and args.get("capture_after", True)
+        and action not in _READ_ACTIONS
+    ):
+        observed = _fresh_observation(args, params, task_id)
+        if observed is not None:
+            result_payload = payload.get("result")
+            if isinstance(result_payload, dict):
+                result_payload["observation"] = observed
+            else:
+                payload["result"] = {"action_result": result_payload, "observation": observed}
     result = payload.get("result") if isinstance(payload, dict) else None
     if isinstance(result, dict):
         screenshot_b64 = result.pop("screenshot_b64", None)

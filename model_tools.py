@@ -1288,6 +1288,7 @@ def handle_function_call(
     dispatch_wrapper: Optional[
         Callable[[str, Dict[str, Any], Callable[[], Any]], Any]
     ] = None,
+    search_memory_manager: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1312,6 +1313,9 @@ def handle_function_call(
         dispatch_wrapper: Internal boundary around the raw registry handler.
                        It runs inside tool-execution middleware and before
                        post/transform hooks, with the final dispatched args.
+        search_memory_manager: Internal per-agent memory manager threaded only
+                       to the search_memory registry handler. This keeps
+                       provider-backed supplemental recall session-scoped.
 
     Returns:
         Function result as a JSON string.
@@ -1403,6 +1407,7 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 dispatch_wrapper=dispatch_wrapper,
+                search_memory_manager=search_memory_manager,
             )
 
     _tool_original_args = dict(function_args)
@@ -1554,14 +1559,20 @@ def handle_function_call(
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     def _registry_dispatch() -> Any:
+                        dispatch_kwargs = {
+                            "task_id": task_id,
+                            "session_id": session_id,
+                            "user_task": user_task,
+                            "previous_assistant_message": previous_assistant_message,
+                            "turn_id": turn_id,
+                            "tool_call_id": tool_call_id,
+                        }
+                        if function_name == "search_memory":
+                            dispatch_kwargs["memory_manager"] = search_memory_manager
                         return registry.dispatch(
-                            function_name, next_args,
-                            task_id=task_id,
-                            session_id=session_id,
-                            user_task=user_task,
-                            previous_assistant_message=previous_assistant_message,
-                            turn_id=turn_id,
-                            tool_call_id=tool_call_id,
+                            function_name,
+                            next_args,
+                            **dispatch_kwargs,
                         )
 
                     if dispatch_wrapper is not None:
