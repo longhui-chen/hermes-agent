@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
 
-from plugins.video_edit.paths import VideoPathError
+from plugins.video_edit.paths import VideoPathError, agent_id_from_kwargs, safe_id
 
 DEFAULT_BASE = "http://127.0.0.1:19090/api/v1/ai-proxy/business"
 DEFAULT_INTERNAL_BASE = "http://127.0.0.1:19090/api/v1/internal/proactive-video"
@@ -50,33 +50,35 @@ def _internal_base() -> str:
     return raw
 
 
-def _platform_token() -> str:
-    try:
-        from agent.secret_scope import get_secret
+def _replay_partition(agent_id: str = "") -> str:
+    """Return a non-secret profile namespace for deterministic retries.
 
-        token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
-    except Exception as exc:
-        raise VideoClientError("video edit platform identity is unavailable") from exc
-    if not token:
-        raise VideoClientError("video edit platform identity is unavailable")
-    return token
+    This value is hashed into request IDs only. It is deliberately not sent as
+    a credential or used by local-server for admission; it merely prevents two
+    profiles with identical payloads from sharing an in-memory replay record.
+    """
+    return safe_id(agent_id.strip() or agent_id_from_kwargs())
 
 
-def _request_key(operation: str, payload: Any) -> str:
+def _request_key(operation: str, payload: Any, *, agent_id: str = "") -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(f"video-edit\x00{operation}\x00".encode() + encoded).hexdigest()
+    partition = _replay_partition(agent_id)
+    return hashlib.sha256(f"video-edit\x00{partition}\x00{operation}\x00".encode() + encoded).hexdigest()
 
 
-def _headers(operation: str, payload: Any, *, content_type: str = "application/json") -> dict[str, str]:
-    key = _request_key(operation, payload)
+def _headers(
+    operation: str,
+    payload: Any,
+    *,
+    content_type: str = "application/json",
+    agent_id: str = "",
+) -> dict[str, str]:
+    key = _request_key(operation, payload, agent_id=agent_id)
     return {
         "Accept": "application/json",
         "Content-Type": content_type,
         "X-Request-Id": key,
         "Idempotency-Key": key,
-        # This is the pre-existing Hermes platform identity. It is not a
-        # video capability and is never exposed as a model argument.
-        "X-Zettlab-Agent-Action-Token": _platform_token(),
         "User-Agent": "hermes-video-edit-plugin/1",
     }
 
@@ -93,10 +95,17 @@ def _decode_response(response: Any) -> Any:
         raise VideoClientError("video service response is invalid", status=getattr(response, "status", 0)) from exc
 
 
-def post_json(path: str, payload: Any, *, timeout: float = 1800.0, internal: bool = False) -> Any:
+def post_json(
+    path: str,
+    payload: Any,
+    *,
+    timeout: float = 1800.0,
+    internal: bool = False,
+    agent_id: str = "",
+) -> Any:
     base = _internal_base() if internal else _base_url()
     url = f"{base}/{path.lstrip('/')}"
-    headers = _headers(path, payload)
+    headers = _headers(path, payload, agent_id=agent_id)
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -110,9 +119,9 @@ def post_json(path: str, payload: Any, *, timeout: float = 1800.0, internal: boo
             body = _decode_response(exc)
         except Exception:
             body = None
-        # A 401 is a stable caller-identity failure, not a transient turn
-        # capability. Retrying the same request only repeats a side effect and
-        # recreates the authorization loop this plugin is meant to remove.
+        # A 401 is a provider/device admission failure, not a transient video
+        # caller capability. Retrying the same request only repeats a side effect
+        # and hides the real upstream failure.
         raise VideoClientError("video service rejected request", status=exc.code, body=body) from exc
     except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
         raise VideoClientError("video service request failed") from exc
@@ -135,7 +144,7 @@ def _multipart_parts(files: list[Path], boundary: str) -> tuple[list[bytes], lis
     return preambles, epilogues, total
 
 
-def upload(files: list[Path], *, timeout: float = 1800.0) -> Any:
+def upload(files: list[Path], *, timeout: float = 1800.0, agent_id: str = "") -> Any:
     if not files or len(files) > MAX_UPLOAD_FILES:
         raise VideoClientError("invalid upload file count")
     total_size = sum(path.stat().st_size for path in files)
@@ -146,7 +155,12 @@ def upload(files: list[Path], *, timeout: float = 1800.0) -> Any:
     closing = f"--{boundary}--\r\n".encode()
     body_size += len(closing)
     base = urllib.parse.urlparse(_base_url())
-    headers = _headers("assets/upload", [str(path) for path in files], content_type=f"multipart/form-data; boundary={boundary}")
+    headers = _headers(
+        "assets/upload",
+        [str(path) for path in files],
+        content_type=f"multipart/form-data; boundary={boundary}",
+        agent_id=agent_id,
+    )
     headers["Content-Length"] = str(body_size)
     connection = http.client.HTTPConnection(base.hostname, base.port or 80, timeout=timeout)
     try:
@@ -208,7 +222,13 @@ def extract_project(body: Any) -> dict[str, Any]:
     raise VideoClientError("video project response is invalid")
 
 
-def create_project(object_keys: list[str], preferences: dict[str, Any], *, user_prompt: str = "") -> dict[str, Any]:
+def create_project(
+    object_keys: list[str],
+    preferences: dict[str, Any],
+    *,
+    user_prompt: str = "",
+    agent_id: str = "",
+) -> dict[str, Any]:
     payload = {
         "object_keys": object_keys,
         "mode": "rendered",
@@ -219,11 +239,11 @@ def create_project(object_keys: list[str], preferences: dict[str, Any], *, user_
     prompt = str(user_prompt or preferences.get("user_prompt") or "").strip()
     if prompt:
         payload["user_prompt"] = prompt[:512]
-    return extract_project(post_json("projects", payload, timeout=1800.0))
+    return extract_project(post_json("projects", payload, timeout=1800.0, agent_id=agent_id))
 
 
-def poll_project(project_id: str, *, timeout: float = 120.0) -> dict[str, Any]:
-    body = post_json("projects/batch", [project_id], timeout=timeout)
+def poll_project(project_id: str, *, timeout: float = 120.0, agent_id: str = "") -> dict[str, Any]:
+    body = post_json("projects/batch", [project_id], timeout=timeout, agent_id=agent_id)
     if isinstance(body, dict):
         data = body.get("data")
         projects = data.get("projects") if isinstance(data, dict) else None
@@ -307,13 +327,25 @@ def file_evidence(target: Path) -> dict[str, Any]:
     return {"path": str(target), "size": total, "sha256": digest.hexdigest()}
 
 
-def proactive_resolve(manifest_id: str) -> dict[str, Any]:
-    body = post_json("manifest/resolve", {"manifest_id": manifest_id}, timeout=30.0, internal=True)
+def proactive_resolve(manifest_id: str, *, agent_id: str = "") -> dict[str, Any]:
+    body = post_json(
+        "manifest/resolve",
+        {"manifest_id": manifest_id},
+        timeout=30.0,
+        internal=True,
+        agent_id=agent_id,
+    )
     if not isinstance(body, dict):
         raise VideoClientError("proactive manifest response is invalid")
     return body
 
 
-def proactive_report(manifest_id: str, output_path: str) -> dict[str, Any]:
-    body = post_json("result", {"manifest_id": manifest_id, "output_path": output_path}, timeout=30.0, internal=True)
+def proactive_report(manifest_id: str, output_path: str, *, agent_id: str = "") -> dict[str, Any]:
+    body = post_json(
+        "result",
+        {"manifest_id": manifest_id, "output_path": output_path},
+        timeout=30.0,
+        internal=True,
+        agent_id=agent_id,
+    )
     return body if isinstance(body, dict) else {"ok": True}

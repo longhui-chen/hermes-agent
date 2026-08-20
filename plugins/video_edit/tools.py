@@ -159,7 +159,7 @@ def handle_upload_assets(args: dict, **kwargs: Any) -> str:
                 })
         uploaded = list(existing)
         for batch in _upload_batches(upload_files[len(existing):]):
-            body = client.upload(batch)
+            body = client.upload(batch, agent_id=agent_id)
             uploaded.extend(client.extract_upload_keys(body))
             state.update(workflow_id, agent_id, {"object_keys": uploaded, "uploaded_count": len(uploaded), "status": "assets_uploaded"})
             # Normalized intermediates are disposable as soon as their upload
@@ -186,7 +186,7 @@ def handle_create_project(args: dict, **kwargs: Any) -> str:
         existing = str(entry.get("project_id") or "").strip()
         if existing:
             return _ok({"ok": True, "workflow_id": workflow_id, "project_id": existing, "reused": True, "next": "video_edit_wait_project"})
-        project = client.create_project(object_keys, dict(entry.get("preferences") or {}), user_prompt=str(args.get("user_prompt") or ""))
+        project = client.create_project(object_keys, dict(entry.get("preferences") or {}), user_prompt=str(args.get("user_prompt") or ""), agent_id=agent_id)
         project_id = str(project.get("project_id") or "").strip()
         if not project_id:
             raise client.VideoClientError("video project id is missing")
@@ -207,7 +207,7 @@ def handle_wait_project(args: dict, **kwargs: Any) -> str:
         deadline = time.monotonic() + max(15, min(480, int(args.get("max_wait_seconds") or 120)))
         project = dict(entry.get("project") or {})
         while True:
-            project = client.poll_project(project_id, timeout=min(120, max(15, deadline - time.monotonic())))
+            project = client.poll_project(project_id, timeout=min(120, max(15, deadline - time.monotonic())), agent_id=agent_id)
             status = str(project.get("status") or "").strip().lower()
             state.update(workflow_id, agent_id, {"project": project, "status": status or "polling"})
             if status == "completed":
@@ -283,13 +283,13 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
 
 def handle_proactive_resolve(args: dict, **kwargs: Any) -> str:
     try:
+        agent_id = agent_id_from_kwargs(kwargs)
         manifest_id = str(args.get("manifest_id") or "").strip()
         task_id = str(args.get("task_id") or task_id_from_kwargs(kwargs)).strip()[:256]
-        body = client.proactive_resolve(manifest_id)
+        body = client.proactive_resolve(manifest_id, agent_id=agent_id)
         payload = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
         if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
             raise client.VideoClientError("proactive manifest contains no files")
-        agent_id = agent_id_from_kwargs(kwargs)
         workflow = state.workflow_id(task_id, agent_id)
         scene = str(payload.get("scene") or "general")
         resolved = preferences.resolve(agent_id, scene, {}, silent=True)
@@ -321,7 +321,7 @@ def handle_proactive_report(args: dict, **kwargs: Any) -> str:
         output = str(entry.get("output_path") or "").strip()
         if not manifest_id or not output:
             raise state.WorkflowError("proactive result is not ready")
-        result = client.proactive_report(manifest_id, output)
+        result = client.proactive_report(manifest_id, output, agent_id=agent_id)
         state.update(workflow_id, agent_id, {"reported": True, "status": "reported"})
         return _ok({"ok": True, "workflow_id": workflow_id, "reported": True, "result": result})
     except Exception as exc:

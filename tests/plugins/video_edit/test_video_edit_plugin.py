@@ -192,10 +192,13 @@ def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated
     source = isolated_video_home[1] / "agent-a" / "input.mov"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"video")
-    monkeypatch.setattr(client, "_platform_token", lambda: "platform-identity")
-    headers = client._headers("projects", {"x": 1})
-    assert headers["X-Zettlab-Agent-Action-Token"] == "platform-identity"
+    monkeypatch.delenv("ZETTLAB_AGENT_ACTION_TOKEN", raising=False)
+    headers = client._headers("projects", {"x": 1}, agent_id="agent-a")
+    assert "Authorization" not in headers
+    assert "X-Zettlab-Agent-Action-Token" not in headers
     assert not any("Business-Execution" in key or "Action-Version" in key for key in headers)
+    other_profile = client._headers("projects", {"x": 1}, agent_id="agent-b")
+    assert headers["Idempotency-Key"] != other_profile["Idempotency-Key"]
 
     workflow = json.loads(
         tools.handle_preferences_resolve(
@@ -203,15 +206,15 @@ def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated
             agent_id="agent-a",
         )
     )["workflow_id"]
-    monkeypatch.setattr(client, "upload", lambda files: {"data": {"uploads": [{"object_key": "obj-1"}]}})
+    monkeypatch.setattr(client, "upload", lambda files, **kwargs: {"data": {"uploads": [{"object_key": "obj-1"}]}})
     uploaded = json.loads(
         tools.handle_upload_assets({"workflow_id": workflow, "files": [str(source)]}, agent_id="agent-a")
     )
     assert uploaded["uploaded"] == 1
-    monkeypatch.setattr(client, "create_project", lambda keys, prefs, user_prompt="": {"project_id": "project-1", "status": "queued"})
+    monkeypatch.setattr(client, "create_project", lambda keys, prefs, user_prompt="", **kwargs: {"project_id": "project-1", "status": "queued"})
     created = json.loads(tools.handle_create_project({"workflow_id": workflow, "user_prompt": "make a vlog"}, agent_id="agent-a"))
     assert created["project_id"] == "project-1"
-    monkeypatch.setattr(client, "poll_project", lambda project_id, timeout=120: {"project_id": project_id, "status": "completed", "result_url": "https://cdn.example.test/result.mp4"})
+    monkeypatch.setattr(client, "poll_project", lambda project_id, timeout=120, **kwargs: {"project_id": project_id, "status": "completed", "result_url": "https://cdn.example.test/result.mp4"})
     waited = json.loads(tools.handle_wait_project({"workflow_id": workflow, "max_wait_seconds": 15}, agent_id="agent-a"))
     assert waited["continue_required"] is False
     assert "result_url" not in waited
@@ -316,7 +319,7 @@ def test_upload_normalized_intermediates_are_cleaned_after_each_batch(isolated_v
     normalized.write_bytes(b"normalized")
     monkeypatch.setattr(normalizer, "normalize_files", lambda files, workflow_id: [normalized])
     monkeypatch.setattr(normalizer, "cleanup", lambda paths, workflow_id: [path.unlink(missing_ok=True) for path in paths])
-    monkeypatch.setattr(client, "upload", lambda files: {"data": {"uploads": [{"object_key": "obj-1"}]}})
+    monkeypatch.setattr(client, "upload", lambda files, **kwargs: {"data": {"uploads": [{"object_key": "obj-1"}]}})
     uploaded = json.loads(tools.handle_upload_assets({"workflow_id": workflow, "files": [str(source)]}, agent_id="agent-a"))
     assert uploaded["strategy"] == "normalized"
     assert uploaded["uploaded"] == 1
@@ -342,7 +345,7 @@ def test_normalizer_failure_falls_back_to_direct_without_new_workflow(isolated_v
     monkeypatch.setattr(
         client,
         "upload",
-        lambda files: seen.extend(files) or {"data": {"uploads": [{"object_key": "obj-1"}] }},
+        lambda files, **kwargs: seen.extend(files) or {"data": {"uploads": [{"object_key": "obj-1"}] }},
     )
 
     uploaded = json.loads(
@@ -359,11 +362,11 @@ def test_proactive_report_is_exactly_once(isolated_video_home, monkeypatch, tmp_
     source = isolated_video_home[1] / "agent-a" / "weekly.mov"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"video")
-    monkeypatch.setattr(client, "proactive_resolve", lambda manifest_id: {"data": {"scene": "weekly", "files": [{"path": str(source)}]}})
+    monkeypatch.setattr(client, "proactive_resolve", lambda manifest_id, **kwargs: {"data": {"scene": "weekly", "files": [{"path": str(source)}]}})
     first = json.loads(tools.handle_proactive_resolve({"manifest_id": "manifest-1", "task_id": "weekly-1"}, agent_id="agent-a"))
     assert first["silent"] is True
     workflow = first["workflow_id"]
-    monkeypatch.setattr(client, "upload", lambda files: {"data": {"uploads": [{"object_key": "weekly-object"}]}})
+    monkeypatch.setattr(client, "upload", lambda files, **kwargs: {"data": {"uploads": [{"object_key": "weekly-object"}]}})
     uploaded = json.loads(
         tools.handle_upload_assets({"workflow_id": workflow}, agent_id="agent-a")
     )
@@ -372,7 +375,7 @@ def test_proactive_report_is_exactly_once(isolated_video_home, monkeypatch, tmp_
     output.write_bytes(b"rendered")
     tools.state.update(workflow, "agent-a", {"output_path": str(output), "proactive": True})
     calls = []
-    monkeypatch.setattr(client, "proactive_report", lambda manifest_id, path: calls.append((manifest_id, path)) or {"ok": True})
+    monkeypatch.setattr(client, "proactive_report", lambda manifest_id, path, **kwargs: calls.append((manifest_id, path)) or {"ok": True})
     assert json.loads(tools.handle_proactive_report({"workflow_id": workflow}, agent_id="agent-a"))["reported"] is True
     assert json.loads(tools.handle_proactive_report({"workflow_id": workflow}, agent_id="agent-a"))["reused"] is True
     assert len(calls) == 1
