@@ -18,6 +18,7 @@ from plugins.video_edit.paths import (
     result_path,
     safe_id,
     task_id_from_kwargs,
+    validate_output_file,
     validate_input_file,
 )
 
@@ -68,7 +69,7 @@ def _checkpoint_target(
         # sanitized basename above is the only part we carry forward.
         return target
     try:
-        source = validate_input_file(str(candidate), agent_id)
+        source = validate_output_file(str(candidate), agent_id, session_id=session_id)
     except VideoPathError as exc:
         raise state.WorkflowError("video result checkpoint is invalid") from exc
     if source == target:

@@ -10,8 +10,13 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -39,6 +44,85 @@ _NORMALIZER_ENV_ALLOWLIST = frozenset({
 
 class NormalizeError(RuntimeError):
     """Raised when the bounded hardware normalization step cannot complete."""
+
+
+def _run_bounded_subprocess(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    timeout: float,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    """Run a helper while draining stdout/stderr into fixed-size buffers."""
+    popen_options: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "env": env,
+    }
+    if os.name == "posix":
+        popen_options["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    process = subprocess.Popen(command, **popen_options)
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": MAX_STDOUT_BYTES, "stderr": MAX_STDERR_BYTES}
+    overflowed = threading.Event()
+
+    def drain(name: str, stream: Any) -> None:
+        buffer = buffers[name]
+        limit = limits[name]
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            remaining = limit - len(buffer)
+            if remaining > 0:
+                buffer.extend(chunk[:remaining])
+            if len(chunk) > max(remaining, 0):
+                overflowed.set()
+
+    threads = [
+        threading.Thread(
+            target=drain,
+            args=(name, stream),
+            name=f"video-normalizer-{name}",
+            daemon=True,
+        )
+        for name, stream in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        )
+        if stream is not None
+    ]
+    for thread in threads:
+        thread.start()
+
+    timed_out = False
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if overflowed.is_set() or time.monotonic() >= deadline:
+            timed_out = time.monotonic() >= deadline
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    process.kill()
+            else:
+                process.kill()
+            break
+        time.sleep(0.01)
+    returncode = process.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+    completed = subprocess.CompletedProcess(
+        command,
+        returncode,
+        stdout=bytes(buffers["stdout"]).decode("utf-8", "replace"),
+        stderr=bytes(buffers["stderr"]).decode("utf-8", "replace"),
+    )
+    return completed, overflowed.is_set() or timed_out
 
 
 def _presets_root() -> Path:
@@ -89,6 +173,50 @@ def _temporary_root(workflow_id: str) -> Path:
     return root
 
 
+def _pin_input(source: Path, workflow_id: str, index: int) -> Path:
+    """Create a same-filesystem inode snapshot for the helper process."""
+    try:
+        descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise NormalizeError("video normalization input is unavailable") from exc
+    snapshot: Path | None = None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+            raise NormalizeError("video normalization input is invalid")
+        fd, name = tempfile.mkstemp(
+            dir=str(source.parent),
+            prefix=f".hermes-video-input-{safe_id(workflow_id)}-{index}-",
+        )
+        os.close(fd)
+        os.unlink(name)
+        snapshot = Path(name)
+        os.link(source, snapshot, follow_symlinks=False)
+        snapshot_info = os.stat(snapshot, follow_symlinks=False)
+        if (
+            snapshot_info.st_dev != info.st_dev
+            or snapshot_info.st_ino != info.st_ino
+            or snapshot_info.st_size != info.st_size
+        ):
+            raise NormalizeError("video normalization input changed")
+        return snapshot
+    except NormalizeError:
+        if snapshot is not None:
+            snapshot.unlink(missing_ok=True)
+        raise
+    except (OSError, ValueError) as exc:
+        if snapshot is not None:
+            snapshot.unlink(missing_ok=True)
+        raise NormalizeError("video normalization input cannot be pinned") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _bounded(value: str, limit: int) -> str:
     encoded = str(value or "").encode("utf-8", "replace")
     if len(encoded) <= limit:
@@ -113,33 +241,37 @@ def _normalizer_env() -> dict[str, str]:
 def normalize_file(source: Path, workflow_id: str, index: int) -> Path:
     if not source.is_file() or source.is_symlink():
         raise NormalizeError("video input is unavailable")
-    workspace = _temporary_root(workflow_id)
-    target = workspace / f"vewm_{index}.mp4"
-    if target.exists() or target.is_symlink():
-        target.unlink(missing_ok=True)
-    command = [
-        sys.executable,
-        str(normalizer_script()),
-        "--input",
-        str(source),
-        "--output",
-        str(target),
-    ]
+    pinned_source = _pin_input(source, workflow_id, index)
     try:
-        completed = subprocess.run(
+        workspace = _temporary_root(workflow_id)
+        target = workspace / f"vewm_{index}.mp4"
+        if target.exists() or target.is_symlink():
+            target.unlink(missing_ok=True)
+        command = [
+            sys.executable,
+            str(normalizer_script()),
+            "--input",
+            str(pinned_source),
+            "--output",
+            str(target),
+        ]
+    except Exception:
+        pinned_source.unlink(missing_ok=True)
+        raise
+    try:
+        completed, bounded_failure = _run_bounded_subprocess(
             command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=NORMALIZER_TIMEOUT_SECONDS,
-            check=False,
-            stdin=subprocess.DEVNULL,
             env=_normalizer_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         target.unlink(missing_ok=True)
         raise NormalizeError("video normalization failed") from exc
+    finally:
+        pinned_source.unlink(missing_ok=True)
+    if bounded_failure:
+        target.unlink(missing_ok=True)
+        raise NormalizeError("video normalizer output exceeded its bounded capture")
     if completed.returncode != 0 or not target.is_file() or target.is_symlink() or target.stat().st_size <= 0:
         target.unlink(missing_ok=True)
         detail = _bounded(completed.stderr, MAX_STDERR_BYTES)

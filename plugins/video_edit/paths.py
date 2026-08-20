@@ -117,6 +117,31 @@ def validate_input_file(raw: str, agent_id: str) -> Path:
     return resolved
 
 
+def validate_output_file(raw: str, agent_id: str, *, session_id: str = "") -> Path:
+    """Validate a persisted result strictly inside the agent output bucket."""
+    if not isinstance(raw, str) or len(raw.encode()) > _MAX_PATH_BYTES:
+        raise VideoPathError("output checkpoint path is invalid")
+    candidate = Path(raw.strip())
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise VideoPathError("output checkpoint path is invalid")
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file() or resolved.stat().st_size <= 0:
+            raise VideoPathError("output checkpoint is unavailable")
+    except (OSError, ValueError) as exc:
+        raise VideoPathError("output checkpoint is unavailable") from exc
+    root = output_root(agent_id).resolve()
+    boundary = root
+    if session_id:
+        bucket = safe_id(session_id, fallback="")
+        if not bucket:
+            raise VideoPathError("output checkpoint session is invalid")
+        boundary = (root / bucket).resolve()
+    if not _under(resolved, boundary):
+        raise VideoPathError("output checkpoint is outside the agent output bucket")
+    return resolved
+
+
 def output_root(agent_id: str) -> Path:
     try:
         from tools.runtime_workdir import agent_output_dir

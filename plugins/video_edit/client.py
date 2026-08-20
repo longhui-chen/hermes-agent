@@ -132,8 +132,9 @@ def post_json(
         replay_scope=replay_scope,
     )
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode(), headers=headers, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             status = int(getattr(response, "status", response.getcode()))
             body = _decode_response(response)
             if status >= 400:
@@ -372,18 +373,59 @@ def poll_project(project_id: str, *, timeout: float = 120.0, agent_id: str = "")
     raise VideoClientError("video project poll response is invalid")
 
 
-def _download_allowed(raw: str) -> bool:
+def _resolve_download_target(raw: str) -> tuple[urllib.parse.ParseResult, tuple[str, ...]] | None:
     parsed = urllib.parse.urlparse(str(raw or ""))
     if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.hostname:
-        return False
+        return None
     host = parsed.hostname.lower()
     if host in {"localhost"} or host.endswith((".local", ".lan", ".internal")):
-        return False
+        return None
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return True
-    return not (address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved)
+        try:
+            infos = socket.getaddrinfo(
+                host,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except OSError:
+            return None
+        addresses: list[str] = []
+        for info in infos:
+            sockaddr = info[4] if len(info) > 4 else ()
+            raw_address = sockaddr[0] if sockaddr else ""
+            try:
+                address = ipaddress.ip_address(raw_address)
+            except ValueError:
+                return None
+            if address.compressed not in addresses:
+                addresses.append(address.compressed)
+        if not addresses:
+            return None
+    else:
+        addresses = [address.compressed]
+    parsed_addresses = [ipaddress.ip_address(item) for item in addresses]
+    if any(
+        item.is_private
+        or item.is_loopback
+        or item.is_link_local
+        or item.is_multicast
+        or item.is_reserved
+        or item.is_unspecified
+        for item in parsed_addresses
+    ):
+        return None
+    return parsed, tuple(addresses)
+
+
+def _download_allowed(raw: str) -> bool:
+    """Validate a result URL without performing a second DNS lookup."""
+    return _resolve_download_target(raw) is not None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -391,15 +433,69 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect is not allowed", headers, fp)
 
 
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that only dials the addresses admitted before connect."""
+
+    def __init__(self, host: str, *, pinned_addresses: tuple[str, ...], **kwargs: Any):
+        self._pinned_addresses = pinned_addresses
+        super().__init__(host, **kwargs)
+        # HTTPConnection stores the module-level resolver on the instance;
+        # replace that callback after the base constructor has run.
+        self._create_connection = self._pinned_create_connection
+
+    def _pinned_create_connection(
+        self,
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        last_error: OSError | None = None
+        for pinned in self._pinned_addresses:
+            try:
+                return socket.create_connection(
+                    (pinned, address[1]),
+                    timeout,
+                    source_address,
+                )
+            except OSError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError("video result host has no pinned address")
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, pinned_addresses: tuple[str, ...]):
+        super().__init__()
+        self._pinned_addresses = pinned_addresses
+
+    def https_open(self, request: urllib.request.Request):  # type: ignore[override]
+        return self.do_open(
+            lambda host, **kwargs: _PinnedHTTPSConnection(
+                host,
+                pinned_addresses=self._pinned_addresses,
+                **kwargs,
+            ),
+            request,
+            context=self._context,
+        )
+
+
 def download(result_url: str, target: Path, *, timeout: float = 1800.0) -> dict[str, Any]:
-    if not _download_allowed(result_url):
+    resolved_target = _resolve_download_target(result_url)
+    if resolved_target is None:
         raise VideoClientError("video result URL is not allowed")
+    _, pinned_addresses = resolved_target
     request = urllib.request.Request(result_url, headers={"User-Agent": "hermes-video-edit-plugin/1"})
     fd, part_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".part", dir=str(target.parent)
     )
     part = Path(part_name)
-    opener = urllib.request.build_opener(_NoRedirect())
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _PinnedHTTPSHandler(pinned_addresses),
+        _NoRedirect(),
+    )
     total = 0
     digest = hashlib.sha256()
     try:

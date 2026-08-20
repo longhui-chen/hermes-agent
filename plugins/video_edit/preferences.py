@@ -88,6 +88,13 @@ def _bounded_data(value: Any) -> dict[str, Any]:
 
 def _read(path: Path) -> dict[str, Any]:
     try:
+        if path.stat().st_size > MAX_PREFERENCE_BYTES:
+            raise PreferenceError("video preference memory file is too large")
+    except FileNotFoundError:
+        return _empty()
+    except OSError as exc:
+        raise PreferenceError("video preference memory is unreadable") from exc
+    try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return _empty()

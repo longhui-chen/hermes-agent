@@ -17,6 +17,7 @@ from plugins.video_edit.paths import safe_id, state_path
 MAX_WORKFLOWS = 64
 WORKFLOW_TTL_SECONDS = 90 * 24 * 60 * 60
 MAX_FILES = 8
+MAX_WORKFLOW_BYTES = 2 * 1024 * 1024
 
 
 class WorkflowError(ValueError):
@@ -33,6 +34,13 @@ def _empty() -> dict[str, Any]:
 
 
 def _read(path: Path) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > MAX_WORKFLOW_BYTES:
+            raise WorkflowError("video workflow state file is too large")
+    except FileNotFoundError:
+        return _empty()
+    except OSError as exc:
+        raise WorkflowError("video workflow state is unreadable") from exc
     try:
         raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,20 +99,86 @@ def test_normalizer_is_a_separate_bounded_plugin_adapter(isolated_video_home, mo
     calls = []
 
     def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
+        input_path = Path(command[command.index("--input") + 1])
+        calls.append((command, kwargs, input_path.stat().st_ino))
         target = Path(command[command.index("--output") + 1])
         target.write_bytes(b"normalized")
-        return type("Completed", (), {"returncode": 0, "stdout": '{"output": "' + str(target) + '"}\n', "stderr": ""})()
+        completed = type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": '{"output": "' + str(target) + '"}\n', "stderr": ""},
+        )()
+        return completed, False
 
-    monkeypatch.setattr(normalizer.subprocess, "run", fake_run)
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
     result = normalizer.normalize_file(source, "workflow-1", 0)
     assert result.read_bytes() == b"normalized"
     assert calls and calls[0][0][:2] == [normalizer.sys.executable, str(script)]
-    assert calls[0][1]["check"] is False
+    input_path = Path(calls[0][0][calls[0][0].index("--input") + 1])
+    assert input_path != source
+    assert calls[0][2] == source.stat().st_ino
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in calls[0][1]["env"]
     assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in calls[0][1]["env"]
     normalizer.cleanup([result], "workflow-1")
     assert not result.exists()
+    assert not input_path.exists()
+
+
+def test_normalizer_subprocess_output_is_bounded(tmp_path):
+    code = (
+        "import sys; sys.stderr.write('x' * %d); "
+        "sys.stdout.write('{\\\"output\\\": \\\"ok\\\"}\\n')"
+    ) % (normalizer.MAX_STDERR_BYTES + 4096)
+
+    completed, overflowed = normalizer._run_bounded_subprocess(
+        [normalizer.sys.executable, "-c", code],
+        env={},
+        timeout=5,
+    )
+
+    assert overflowed is True
+    assert len(completed.stderr.encode()) <= normalizer.MAX_STDERR_BYTES
+
+
+def test_normalizer_uses_a_process_group_for_bounded_kill(monkeypatch):
+    calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"x" * (normalizer.MAX_STDERR_BYTES + 1))
+            self.killed = False
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def wait(self):
+            self.killed = True
+            return -9
+
+        def kill(self):
+            self.killed = True
+
+    process = FakeProcess()
+
+    def fake_popen(*_args, **kwargs):
+        calls.append(kwargs)
+        return process
+
+    monkeypatch.setattr(normalizer.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(normalizer.os, "killpg", lambda pid, signal: calls.append((pid, signal)))
+
+    completed, overflowed = normalizer._run_bounded_subprocess(
+        ["normalizer"], env={}, timeout=5
+    )
+
+    assert overflowed is True
+    assert completed.returncode == -9
+    if normalizer.os.name == "posix":
+        assert calls[-1][0] == process.pid
+        assert calls[0]["start_new_session"] is True
 
 
 def test_normalizer_resolves_the_rerooted_presets_bundle(monkeypatch, tmp_path):
@@ -255,6 +322,24 @@ def test_oversized_existing_scene_is_dropped_during_read(isolated_video_home, mo
     resolved = preferences.resolve("agent-a", "valid", {}, silent=True)
     assert resolved["preferences"]["style"] == "travel"
     assert preferences.resolve("agent-a", "too-large", {}, silent=True)["memory_hit"] is False
+
+
+def test_oversized_preference_file_is_rejected_before_read(isolated_video_home):
+    path = isolated_video_home[0] / "video_edit" / "agent-a" / "preferences.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"{" + b" " * preferences.MAX_PREFERENCE_BYTES)
+
+    with pytest.raises(preferences.PreferenceError, match="too large"):
+        preferences.resolve("agent-a", "general", {}, silent=True)
+
+
+def test_oversized_workflow_file_is_rejected_before_read(isolated_video_home):
+    path = isolated_video_home[0] / "video_edit" / "agent-a" / "workflows.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"{" + b" " * tools.state.MAX_WORKFLOW_BYTES)
+
+    with pytest.raises(tools.state.WorkflowError, match="too large"):
+        tools.state.get("vew_missing", "agent-a")
 
 
 def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated_video_home, monkeypatch, tmp_path):
@@ -480,6 +565,17 @@ def test_persisted_output_path_is_revalidated_inside_agent_bucket(isolated_video
     assert "checkpoint is invalid" in delivered["error"]
 
 
+def test_raw_media_is_not_accepted_as_output_checkpoint(isolated_video_home, monkeypatch, tmp_path):
+    raw_root = tmp_path / "raw-media"
+    raw_root.mkdir()
+    raw_file = raw_root / "source.mp4"
+    raw_file.write_bytes(b"raw media")
+    monkeypatch.setattr(paths, "_RAW_ROOTS", (str(raw_root),))
+
+    with pytest.raises(paths.VideoPathError, match="output"):
+        paths.validate_output_file(str(raw_file), "agent-a")
+
+
 def test_output_root_rejects_a_symlink(tmp_path, monkeypatch):
     real = tmp_path / "real-output"
     real.mkdir()
@@ -695,6 +791,72 @@ def test_poll_project_selects_the_requested_project(monkeypatch):
     assert client.poll_project("wanted")["project_id"] == "wanted"
 
 
+def test_post_json_uses_direct_loopback_opener(monkeypatch):
+    seen = []
+
+    class Response:
+        status = 200
+
+        def getcode(self):
+            return 200
+
+        def read(self, _size):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            return Response()
+
+    def build_opener(*handlers):
+        seen.extend(handlers)
+        return Opener()
+
+    monkeypatch.setattr(client.urllib.request, "build_opener", build_opener)
+
+    client.post_json("projects", {}, agent_id="agent-a")
+
+    assert any(
+        isinstance(handler, client.urllib.request.ProxyHandler)
+        and handler.proxies == {}
+        for handler in seen
+    )
+
+
+def test_download_rejects_numeric_host_resolving_to_loopback(monkeypatch):
+    monkeypatch.setattr(
+        client.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (client.socket.AF_INET, client.socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443))
+        ],
+    )
+
+    assert not client._download_allowed("https://2130706433/result.mp4")
+
+
+def test_download_connection_uses_resolved_ip_without_dns_retry(monkeypatch):
+    dialed = []
+    monkeypatch.setattr(
+        client.socket,
+        "create_connection",
+        lambda address, *_args: dialed.append(address) or object(),
+    )
+    connection = client._PinnedHTTPSConnection(
+        "cdn.example.test",
+        pinned_addresses=("93.184.216.34",),
+    )
+
+    connection._create_connection(("cdn.example.test", 443), 5, None)
+
+    assert dialed == [("93.184.216.34", 443)]
+
+
 def test_create_project_rejects_partial_upload_checkpoint(isolated_video_home, monkeypatch):
     workflow = "vew_partial-upload-checkpoint"
     tools.state.update(
@@ -900,6 +1062,13 @@ def test_download_uses_random_no_follow_part_file(monkeypatch, tmp_path):
             return Response()
 
     monkeypatch.setattr(client.urllib.request, "build_opener", lambda *_args: Opener())
+    monkeypatch.setattr(
+        client.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (client.socket.AF_INET, client.socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))
+        ],
+    )
 
     evidence = client.download("https://cdn.example.test/result.mp4", target)
 
