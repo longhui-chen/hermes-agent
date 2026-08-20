@@ -53,7 +53,7 @@ _DEEP_MEMORY_MODES = {"off", "smart", "always"}
 
 def _normalize_deep_memory_mode(value: Any) -> str:
     mode = str(value or "").strip().lower()
-    return mode if mode in _DEEP_MEMORY_MODES else "always"
+    return mode if mode in _DEEP_MEMORY_MODES else "smart"
 
 
 class DeepMemoryMCPToolError(ValueError):
@@ -136,9 +136,9 @@ class ZettlabDeepMemoryProvider(MemoryProvider):
         self._session_id = ""
         self._current_source_text = ""
         self._current_turn_id = ""
-        # Preserve the pre-existing automatic recall behaviour when an older
-        # config has no explicit mode.
-        self._deep_memory_mode = "always"
+        # Missing or invalid profile settings use the product default. Explicit
+        # off/always selections remain authoritative.
+        self._deep_memory_mode = "smart"
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: threading.Thread | None = None
         self._prefetch_query = ""

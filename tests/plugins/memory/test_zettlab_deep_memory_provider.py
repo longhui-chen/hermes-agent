@@ -4,6 +4,8 @@ import sqlite3
 import threading
 import time
 
+import pytest
+
 from plugins.memory.zettlab_deep_memory import (
     DeepMemoryMCPToolError,
     ZettlabDeepMemoryProvider,
@@ -49,7 +51,7 @@ def test_model_tool_schemas_exclude_memo_write():
     names = {
         schema["name"] for schema in ZettlabDeepMemoryProvider().get_tool_schemas()
     }
-    assert names == {"memo_recall", "memo_confirm", "memo_forget"}
+    assert names == {"memo_confirm", "memo_forget"}
 
 
 def test_smart_mode_supplements_search_memory_without_turn_prefetch(monkeypatch, tmp_path):
@@ -180,7 +182,8 @@ def test_off_mode_disables_chat_recall_but_keeps_native_write_mirroring(monkeypa
     provider.shutdown()
 
 
-def test_unknown_mode_falls_back_to_legacy_always(monkeypatch, tmp_path):
+@pytest.mark.parametrize("configured_mode", [None, "future-mode"])
+def test_missing_or_unknown_mode_falls_back_to_smart(monkeypatch, tmp_path, configured_mode):
     monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
@@ -188,29 +191,31 @@ def test_unknown_mode_falls_back_to_legacy_always(monkeypatch, tmp_path):
         provider,
         tmp_path,
         deep_memory_principal="user-1",
-        memory_config={"deep_memory_mode": "future-mode"},
+        memory_config=(
+            {}
+            if configured_mode is None
+            else {"deep_memory_mode": configured_mode}
+        ),
     )
     provider._request = lambda *_args, **_kwargs: {"items": []}
 
-    provider.on_turn_start(1, "需要自动召回")
+    provider.on_turn_start(1, "只在搜索时召回")
 
-    assert provider.search_memory_mode() == "disabled"
+    assert provider.search_memory_mode() == "supplement"
     assert {schema["name"] for schema in provider.get_tool_schemas()} == {
-        "memo_recall",
         "memo_confirm",
         "memo_forget",
     }
-    assert provider._prefetch_thread is not None
-    provider._prefetch_thread.join(timeout=1.0)
+    assert provider._prefetch_thread is None
     provider.shutdown()
 
 
 def test_native_memory_is_mirrored_to_deep_memory():
     prompt = ZettlabDeepMemoryProvider().system_prompt_block()
 
-    assert "call the native memory tool once" in prompt
+    assert "written once through the native memory tool" in prompt
     assert "on_memory_write hook" in prompt
-    assert "memo_write is not exposed as a model tool" in prompt
+    assert "memo_write and memo_recall are not exposed as model tools" in prompt
 
 
 def test_provider_does_not_repurpose_generic_account_identity(monkeypatch, tmp_path):
@@ -330,7 +335,11 @@ def test_prefetch_recall_uses_mcp_and_builds_provider_context(monkeypatch, tmp_p
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
     _initialize(
-        provider, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="user-1",
+        memory_config={"deep_memory_mode": "always"},
     )
     captured = []
     started = threading.Event()
@@ -365,7 +374,12 @@ def test_on_turn_start_prefetch_is_non_blocking(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
-    _initialize(provider, tmp_path, deep_memory_principal="user-1")
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        memory_config={"deep_memory_mode": "always"},
+    )
     started = threading.Event()
     release = threading.Event()
 
@@ -521,6 +535,7 @@ def test_mcp_tool_error_is_not_treated_as_a_success(monkeypatch, caplog, tmp_pat
         tmp_path,
         deep_memory_principal="iam:issuer:user-1",
         deep_memory_subject="user-1",
+        memory_config={"deep_memory_mode": "always"},
     )
 
     class Response:

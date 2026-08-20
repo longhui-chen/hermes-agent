@@ -48,7 +48,7 @@ memory:
   memory_enabled: true
   user_profile_enabled: true
   provider: zettlab_deep_memory
-  deep_memory_mode: always  # off | smart | always
+  deep_memory_mode: smart  # off | smart | always
 ```
 
 The default is `always` for compatibility with existing profiles. Mode changes

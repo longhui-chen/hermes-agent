@@ -666,7 +666,7 @@ memory:
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # true = require approval before any memory write
   provider: ""              # optional external memory provider
-  deep_memory_mode: always  # zettlab_deep_memory: off | smart | always
+  deep_memory_mode: smart  # zettlab_deep_memory: off | smart | always
 ```
 
 For `zettlab_deep_memory`, `off` keeps chat native-only, `smart` supplements

@@ -1664,8 +1664,8 @@ DEFAULT_CONFIG = {
         # to mirror to the active provider in every mode.
         #   off    — no Deep Memory recall or model-facing Deep tools
         #   smart  — supplement explicit search_memory calls with memo_recall
-        #   always — prefetch Deep Memory at turn start (legacy behaviour)
-        "deep_memory_mode": "always",
+        #   always — prefetch Deep Memory at turn start
+        "deep_memory_mode": "smart",
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
