@@ -1,8 +1,10 @@
 import json
 import logging
+import signal
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -139,6 +141,98 @@ def test_smart_mode_search_memory_tool_runs_real_provider_recall_flow(monkeypatc
     assert deep_item["excerpt"] == "Frank 认识 Bob"
     assert deep_item["score"] == 87.0
     provider.shutdown()
+
+
+def test_smart_mode_registry_dispatch_runs_provider_recall_flow(monkeypatch, tmp_path):
+    from agent.memory_manager import MemoryManager
+    from model_tools import handle_function_call
+
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "smart"},
+    )
+    calls = []
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append((endpoint, arguments, trusted))
+        return {
+            "items": [{
+                "id": "fact-registry-flow",
+                "statement": "Frank 认识 Bob",
+                "recall_score": 91,
+            }]
+        }
+
+    provider._request = fake_request
+    provider.on_turn_start(1, "Frank 有哪些朋友")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+
+    result = json.loads(handle_function_call(
+        "search_memory",
+        {"query": "Frank 朋友", "top_k": 3},
+        search_memory_manager=manager,
+    ))
+
+    assert calls[0][0] == "recall"
+    assert calls[0][1] == {"query": "Frank 朋友", "limit": 3}
+    assert calls[0][2]["source_text"] == "Frank 有哪些朋友"
+    assert result["provider"] == "zettlab_deep_memory"
+    assert result["provider_status"] == "ok"
+    deep_item = next(
+        item for item in result["items"] if item["id"] == "fact-registry-flow"
+    )
+    assert deep_item["excerpt"] == "Frank 认识 Bob"
+    assert deep_item["score"] == 91.0
+    provider.shutdown()
+
+
+def test_production_tool_executor_threads_live_manager_to_search_memory(monkeypatch):
+    monkeypatch.setattr(signal, "SIGKILL", signal.SIGTERM, raising=False)
+    from agent import tool_executor
+
+    manager = object()
+    captured = {}
+
+    def fake_handle_function_call(name, args, task_id, **kwargs):
+        captured.update(kwargs)
+        return json.dumps({"items": []})
+
+    monkeypatch.setattr(
+        tool_executor,
+        "_ra",
+        lambda: SimpleNamespace(handle_function_call=fake_handle_function_call),
+    )
+    agent = SimpleNamespace(
+        platform="",
+        session_id="session-1",
+        _current_turn_id="turn-1",
+        _current_api_request_id="request-1",
+        _current_user_message="Frank 有哪些朋友",
+        _previous_assistant_message="",
+        valid_tool_names={"search_memory"},
+        enabled_toolsets=["memory"],
+        disabled_toolsets=[],
+        _memory_manager=manager,
+    )
+
+    result = tool_executor._handle_registry_function_call(
+        agent,
+        function_name="search_memory",
+        function_args={"query": "Frank 朋友"},
+        effective_task_id="task-1",
+        tool_call_id="call-1",
+        middleware_trace=[],
+    )
+
+    assert json.loads(result) == {"items": []}
+    assert captured["search_memory_manager"] is manager
 
 
 def test_off_mode_disables_chat_recall_but_keeps_native_write_mirroring(monkeypatch, tmp_path):

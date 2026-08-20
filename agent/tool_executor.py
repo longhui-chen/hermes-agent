@@ -778,6 +778,11 @@ def _handle_registry_function_call(
         "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
         "tool_request_middleware_trace": list(middleware_trace),
     }
+    if function_name == "search_memory":
+        # search_memory is registry-dispatched on the production gateway path.
+        # Thread the live, session-scoped manager through that boundary so a
+        # smart-mode provider can supplement native curated memory.
+        call_kwargs["search_memory_manager"] = agent._memory_manager
     if trusted_boundary_enabled:
         call_kwargs["dispatch_wrapper"] = _dispatch_wrapper
 
