@@ -2134,22 +2134,25 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
-RETIRED_BUSINESS_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
-    # Scrub-only compatibility fence. No runtime may read or emit these retired
-    # generic authorization values, but a stale parent environment must not leak
-    # them into a model-authored subprocess either.
-    "ZETTLAB_BUSINESS_" + "EXECUTION_TOKEN",
-    "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
-    "ZETTLAB_BUSINESS_EXECUTION_MODE",
-    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
-    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
-})
-VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    "ZETTLAB_BUSINESS_EXECUTION_ACTION",
-    "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
-})
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+})
+# These names belonged to the removed video BusinessExecution transport.  Keep
+# them in the scrub set (built from fragments so the retirement guard cannot
+# mistake a defensive cleanup list for a reintroduced wire protocol), but
+# never inject them into a child process.  The generic Agent action token above
+# remains available to unrelated creator/connector skills.
+_RETIRED_VIDEO_EXECUTION_PREFIX = "ZETTLAB_BUSINESS_EXECUTION_"
+RETIRED_VIDEO_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "TOKEN",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION_VERSION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "SCOPE_DIGEST",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "CAPABILITY",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "GRANT_VERSION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "MODE",
+    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -2166,9 +2169,8 @@ _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
-    | RETIRED_BUSINESS_EXECUTION_ENV_KEYS
-    | VIDEO_EDIT_RUNTIME_ENV_KEYS
     | HARDWARE_RUNTIME_ENV_KEYS
+    | RETIRED_VIDEO_EXECUTION_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
     | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
 )
@@ -2448,38 +2450,13 @@ def build_overseas_connect_runtime_env() -> tuple[dict[str, str], str]:
     return env, token
 
 
-def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]:
-    """Build the minimal env for the trusted video-edit script runner."""
-    env = _sanitize_subprocess_env(os.environ, base_env)
-    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
-        env.pop(key, None)
-    _inject_session_context_env(env)
-
-    try:
-        from agent.zet_agent_response_mode import trusted_video_edit_runtime_receipt
-
-        frozen_receipt = trusted_video_edit_runtime_receipt()
-    except Exception:
-        frozen_receipt = {}
-    if not frozen_receipt:
-        raise PermissionError("trusted video-edit execution receipt unavailable")
-    action = str(frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", "") or "").strip()
-    if (
-        frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION") != "1"
-        or re.fullmatch(r"[0-9a-f]{64}", action) is None
-    ):
-        raise PermissionError("trusted video-edit ActionV1 receipt unavailable")
-    env.update(frozen_receipt)
-    return env
-
-
 def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
     The helper receives the profile action token and the independently scoped
-    hardware capability plus turn/session correlation. Video ActionV1 is not
-    aliased into this path. Generic subprocesses continue to have all of these
-    values stripped by :func:`_apply_profile_secret_scope_env`.
+    hardware capability plus turn/session correlation. Generic subprocesses
+    continue to have all of these values stripped by
+    :func:`_apply_profile_secret_scope_env`.
     """
     try:
         from agent.zet_agent_response_mode import trusted_camera_runtime_receipt

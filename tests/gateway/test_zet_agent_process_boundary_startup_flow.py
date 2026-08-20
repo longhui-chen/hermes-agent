@@ -122,7 +122,6 @@ def test_sensitive_boundary_failure_is_not_retried_late(monkeypatch):
         else:
             sys.modules["gateway.sensitive_process_boundary"] = original_boundary
 
-
 @pytest.mark.asyncio
 async def test_generic_gateway_start_does_not_initialize_boundary_flow(
     monkeypatch,
@@ -221,40 +220,3 @@ async def test_zet_boundary_failure_is_not_a_fatal_adapter_error(monkeypatch):
 
     assert await adapter.connect() is False
     assert adapter.has_fatal_error is False
-
-
-@pytest.mark.asyncio
-async def test_boundary_failure_does_not_read_or_parse_action_flow(monkeypatch):
-    import gateway.platforms.zet_agent as zet_agent
-
-    monkeypatch.setattr(
-        zet_agent,
-        "initialize_gateway_sensitive_process_boundary",
-        lambda: True,
-    )
-    adapter = zet_agent.ZetAgentAdapter(
-        PlatformConfig(enabled=True, extra={"key": "test-key"})
-    )
-    request = type(
-        "Request",
-        (),
-        {
-            "headers": {
-                "X-Zettlab-Business-Execution-Action": "a" * 64,
-                "X-Zettlab-Business-Execution-Action-Version": "1",
-            },
-            "read": AsyncMock(
-                side_effect=AssertionError("request must not be read")
-            ),
-        },
-    )()
-    monkeypatch.setattr(
-        zet_agent,
-        "gateway_sensitive_process_boundary_ready",
-        lambda: False,
-    )
-
-    response = await adapter._diagnostic_chat_completions(request)
-
-    assert response.status == 503
-    request.read.assert_not_awaited()

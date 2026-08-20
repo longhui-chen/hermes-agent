@@ -250,11 +250,39 @@ _ONBOARDING_CLOSE_TIMEOUT_SECONDS = 30.0
 
 
 _SILENT_AUTOMATION_ALLOWED_TOOLS = frozenset({
-    # Explicit skill selection forces the attested first skill_view call.
+    # Generic silent turns retain the existing narrow bootstrap. Hardware
+    # helpers still require their independent attested scope before dispatch.
     "skill_view",
-    # terminal has a second, receipt-bound video runtime allowlist.
     "terminal",
 })
+
+_VIDEO_EDIT_SKILL_SLUGS = frozenset({
+    "video-edit-workflow-mini",
+    "video-edit-workflow",
+    "video-edit",
+    "video_edit",
+})
+
+
+def _is_video_edit_skill_slug(slug: str) -> bool:
+    normalized = str(slug or "").strip().lower().strip("/")
+    return normalized in _VIDEO_EDIT_SKILL_SLUGS
+
+
+def _video_edit_tool_names() -> frozenset[str]:
+    """Return the plugin's canonical tool names for silent policy filtering."""
+    try:
+        from plugins.video_edit.tools import HANDLERS
+
+        return frozenset(str(name).strip() for name in HANDLERS)
+    except Exception:
+        # A missing plugin must fail closed rather than turn a name prefix into
+        # an implicit capability for an unrelated installed plugin.
+        return frozenset()
+
+
+def _is_video_edit_tool_name(name: str) -> bool:
+    return str(name or "").strip() in _video_edit_tool_names()
 
 
 def _agent_tool_name(tool: Any) -> str:
@@ -266,30 +294,91 @@ def _agent_tool_name(tool: Any) -> str:
     return str(tool.get("name") or "")
 
 
-def _apply_execution_policy(agent: Any, execution_policy: str) -> None:
-    """Bootstrap a trusted silent turn with no side-effect tool exposed."""
+def _apply_execution_policy(
+    agent: Any,
+    execution_policy: str,
+    trusted_skill_slug: str = "",
+) -> None:
+    """Apply silent tool visibility without creating a video auth channel.
+
+    Video editing is an ordinary plugin toolset.  A silent video turn gets the
+    same bounded plugin tools directly; it does not first expose ``skill_view``
+    or wait for a trusted-skill attestation.  Other silent turns retain the
+    existing generic bootstrap and hardware fail-closed scope.
+    """
     if execution_policy != "silent_automation":
         return
+    video_edit_turn = _is_video_edit_skill_slug(trusted_skill_slug)
+
+    def _allowed_name(name: str) -> bool:
+        if video_edit_turn:
+            return _is_video_edit_tool_name(name)
+        return name in _SILENT_AUTOMATION_ALLOWED_TOOLS
+
     allowed_tools = [
         tool
         for tool in list(getattr(agent, "tools", ()) or ())
-        if _agent_tool_name(tool) in _SILENT_AUTOMATION_ALLOWED_TOOLS
+        if _allowed_name(_agent_tool_name(tool))
     ]
     allowed_names = {
         name
         for name in set(getattr(agent, "valid_tool_names", ()) or ())
-        if name in _SILENT_AUTOMATION_ALLOWED_TOOLS
+        if _allowed_name(name)
     }
-    # The model may not see terminal until an exact startup-snapshotted skill
-    # has been attested for this turn. Keeping the bounded snapshot private on
-    # the agent lets attestation restore only the policy/skill intersection.
+    has_video_tools = any(
+        _is_video_edit_tool_name(_agent_tool_name(tool))
+        for tool in allowed_tools
+    )
+    if video_edit_turn and not has_video_tools:
+        # ``model_tools`` may have replaced non-core plugin schemas with the
+        # tool-search bridge before this policy is applied.  Filtering that
+        # assembled list would leave a silent video turn with zero executable
+        # tools, because ``tool_search``/``tool_call`` are intentionally not
+        # video business tools.  Re-read the same enabled toolsets with the
+        # progressive-disclosure assembly disabled, then apply the canonical
+        # plugin HANDLERS allowlist below. This is tool discovery, not an auth hop.
+        try:
+            from model_tools import get_tool_definitions
+
+            direct_tools = get_tool_definitions(
+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            direct_video_tools = [
+                tool for tool in direct_tools
+                if _is_video_edit_tool_name(_agent_tool_name(tool))
+            ]
+            if direct_video_tools:
+                allowed_tools = direct_video_tools
+                allowed_names = {
+                    _agent_tool_name(tool) for tool in direct_video_tools
+                }
+        except Exception:
+            # Keep the original filtered snapshot as a bounded degradation;
+            # the model will receive a structured unavailable-tool response.
+            logger.warning(
+                "[zet_agent] direct video plugin tool refresh failed",
+                exc_info=True,
+            )
+    # Keep the bounded snapshot private on the agent so a later MCP refresh
+    # cannot widen the toolset behind the policy.
     agent._zet_agent_execution_policy = execution_policy
     agent._zet_agent_execution_policy_tools = allowed_tools
     agent._zet_agent_execution_policy_valid_tool_names = allowed_names
-    agent.tools = [
-        tool for tool in allowed_tools if _agent_tool_name(tool) == "skill_view"
-    ]
-    agent.valid_tool_names = {"skill_view"} & allowed_names
+    if video_edit_turn:
+        # The plugin owns its own bounded request/replay adapter.  Keeping the
+        # tools visible avoids a synthetic skill_view/attestation hop and lets
+        # the model continue a long or resumed edit directly from durable state.
+        agent.tools = list(allowed_tools)
+        agent.valid_tool_names = set(allowed_names)
+    else:
+        agent.tools = [
+            tool for tool in allowed_tools if _agent_tool_name(tool) == "skill_view"
+        ]
+        agent.valid_tool_names = {"skill_view"} & allowed_names
+    agent._zet_agent_video_edit_turn = video_edit_turn
     # A between-turn MCP refresh rebuilds the complete configured toolset and
     # would silently reintroduce non-allowlisted tools before model dispatch.
     # This agent exists for one internal turn, so preserve the exact snapshot.
@@ -3262,6 +3351,9 @@ class ZetAgentAdapter(APIServerAdapter):
         execution_policy = str(
             agent_request_overrides.pop("_zet_execution_policy", "") or ""
         ).strip().lower()
+        trusted_skill_slug = str(
+            agent_request_overrides.pop("_zet_trusted_skill_slug", "") or ""
+        ).strip()
         silent_execution = execution_policy == "silent_automation"
         disable_tools = (
             not silent_execution
@@ -3663,8 +3755,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 reused_onboarding_agent,
             )
         if execution_policy == "silent_automation":
-            # A trusted silent turn may share a lineage identifier for request
-            # authorization, but it is not part of the user's canonical chat.
+            # A silent turn may share a lineage identifier for continuity, but
+            # it is not part of the user's canonical chat.
             # Disable every SessionDB/JSON persistence path before the turn can
             # append its internal prompt, tool results, or final response.
             agent._persist_disabled = True
@@ -3675,7 +3767,11 @@ class ZetAgentAdapter(APIServerAdapter):
             agent.valid_tool_names = set()
             agent._skip_mcp_refresh = True
         else:
-            _apply_execution_policy(agent, execution_policy)
+            _apply_execution_policy(
+                agent,
+                execution_policy,
+                trusted_skill_slug,
+            )
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider")
             or getattr(agent, "provider", "")
@@ -3871,8 +3967,6 @@ class ZetAgentAdapter(APIServerAdapter):
         connector_route_capability: Optional[str] = None,
         creation_action_receipt_transport: str = "",
         hardware_execution_token: Optional[str] = None,
-        business_execution_action: Optional[str] = None,
-        business_execution_action_version: Optional[str] = None,
         execution_policy: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
@@ -3896,6 +3990,10 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         from gateway.session_context import zettlab_auth_principal
         request_overrides = dict(request_overrides or {})
+        # Private bootstrap metadata consumed and removed by this adapter's
+        # _create_agent. It selects the ordinary video plugin toolset for a
+        # silent task and never reaches AIAgent or a provider request.
+        request_overrides["_zet_trusted_skill_slug"] = trusted_skill_slug
         # Capture before base _run_agent hops to its executor. The principal
         # remains private request metadata, never a model argument.
         principal = zettlab_auth_principal()
@@ -3916,9 +4014,7 @@ class ZetAgentAdapter(APIServerAdapter):
             request_overrides = dict(request_overrides or {})
             request_overrides["_zet_onboarding_received_mono"] = time.monotonic()
 
-        if (
-            business_execution_action or hardware_execution_token
-        ) and not gateway_sensitive_process_boundary_ready():
+        if hardware_execution_token and not gateway_sensitive_process_boundary_ready():
             raise PermissionError(
                 "gateway process memory boundary is unavailable"
             )
@@ -3936,21 +4032,12 @@ class ZetAgentAdapter(APIServerAdapter):
         scoped_hardware_execution_token = str(
             hardware_execution_token or ""
         ).strip()
-        scoped_business_execution_action = str(
-            business_execution_action or ""
-        ).strip()
-        scoped_business_execution_action_version = str(
-            business_execution_action_version or ""
-        ).strip()
         if ack_status == "cancelled" or (ack_status and not ack_turn_id):
             # A cancelled or malformed plan acknowledgement cannot carry the
             # turn-bound side-effect capability into the resumed turn.
             scoped_hardware_execution_token = ""
-            scoped_business_execution_action = ""
-            scoped_business_execution_action_version = ""
-        # ``plan_ack`` is a UI receipt, not part of ActionV1. It may
-        # revoke the side-effect capability on cancellation, but it must not
-        # turn a verified silent turn back into an ordinary memory/tool turn.
+        # A plan acknowledgement is a UI receipt; it must not alter the
+        # ordinary plugin/tool path or create a second execution channel.
         scoped_execution_policy = str(execution_policy or "").strip().lower()
         if scoped_execution_policy == "silent_automation":
             # Silent execution is a receipt-bound workflow, never a caller
@@ -4065,10 +4152,6 @@ class ZetAgentAdapter(APIServerAdapter):
             plan_ack_turn_id=ack_turn_id,
             plan_ack_revision_requested=ack_revision_requested,
             hardware_execution_token=scoped_hardware_execution_token,
-            business_execution_action=scoped_business_execution_action,
-            business_execution_action_version=(
-                scoped_business_execution_action_version
-            ),
             execution_policy=scoped_execution_policy,
         )
         execution_session_token = push_execution_session_key(
@@ -4095,8 +4178,8 @@ class ZetAgentAdapter(APIServerAdapter):
             else title_user_message
         )
         if scoped_execution_policy == "silent_automation":
-            # Silent ActionV1 payloads must not leak their frozen task text into
-            # the billing/ledger X-Task-Title header or a user-visible card.
+            # Silent automation must not leak its frozen task text into the
+            # billing/ledger X-Task-Title header or a user-visible card.
             title_source = ""
         turn_title_token = push_zettlab_turn_title(
             ""
@@ -4140,10 +4223,6 @@ class ZetAgentAdapter(APIServerAdapter):
                 connector_route_capability=connector_route_capability,
                 creation_action_receipt_transport=creation_action_receipt_transport,
                 hardware_execution_token=scoped_hardware_execution_token,
-                business_execution_action=scoped_business_execution_action,
-                business_execution_action_version=(
-                    scoped_business_execution_action_version
-                ),
                 execution_policy=scoped_execution_policy,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
@@ -7188,18 +7267,6 @@ class ZetAgentAdapter(APIServerAdapter):
         downstream ``await request.json()`` inside the base handler reuses
         them — we only pay one read.
         """
-        raw_business_action = request.headers.get(
-            "X-Zettlab-Business-Execution-Action", ""
-        )
-        if raw_business_action and not gateway_sensitive_process_boundary_ready():
-            return web.json_response(
-                _openai_error(
-                    "ZetAgent process memory boundary is unavailable",
-                    code="process_boundary_unavailable",
-                ),
-                status=503,
-            )
-
         try:
             raw = await request.read()
         except Exception as e:

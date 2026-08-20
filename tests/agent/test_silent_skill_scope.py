@@ -1,78 +1,72 @@
-"""Silent automation may read only its transport-selected signed skill."""
+"""Silent video turns use ordinary plugin tools, not a skill authorization hop."""
 
-import json
 from types import SimpleNamespace
 
-from agent import zet_agent_response_mode as response_mode
-from gateway.session_context import clear_turn_vars, set_turn_vars
+from gateway.platforms.zet_agent import _apply_execution_policy
 
 
-def test_silent_skill_view_blocks_unrelated_skill_before_dispatch():
+def _tool(name: str) -> dict:
+    return {"type": "function", "function": {"name": name}}
+
+
+def test_silent_video_tools_are_available_without_skill_view_attestation():
+    names = {
+        "video_edit_preferences_resolve",
+        "video_edit_upload_assets",
+        "video_edit_create_project",
+        "video_edit_wait_project",
+        "video_edit_download_result",
+    }
     agent = SimpleNamespace(
-        platform="zet_agent",
-        _zet_agent_execution_policy="silent_automation",
+        tools=[*_map_tools(names), _tool("skill_view"), _tool("terminal")],
+        valid_tool_names=set(names) | {"skill_view", "terminal"},
     )
-    turn_tokens = set_turn_vars(turn_id="silent-skill-scope")
-    try:
-        response_mode.reset_trusted_skill_execution(
-            agent,
-            "执行已授权的视频任务",
-            explicit_skill_slug="video-edit-workflow-mini",
-        )
-        wrong_args = {"name": "camsnap"}
 
-        block = response_mode.trusted_skill_operation_block_message(
-            agent,
-            function_name="skill_view",
-            function_args=wrong_args,
-        )
-        assert block is not None
+    _apply_execution_policy(
+        agent,
+        "silent_automation",
+        trusted_skill_slug="video-edit-workflow-mini",
+    )
 
-        dispatched = []
-        result = response_mode.dispatch_trusted_skill_operation(
-            agent,
-            function_name="skill_view",
-            function_args=wrong_args,
-            dispatch=lambda: dispatched.append(True),
-        )
-
-        assert dispatched == []
-        assert json.loads(result)["trusted_skill_scope_blocked"] is True
-    finally:
-        clear_turn_vars(turn_tokens)
+    assert agent.valid_tool_names == names
+    assert {item["function"]["name"] for item in agent.tools} == names
+    assert agent._zet_agent_video_edit_turn is True
 
 
-def test_silent_skill_view_allows_exact_transport_selected_skill():
+def test_silent_video_rehydrates_plugin_tools_deferred_by_tool_search(monkeypatch):
+    """A silent video turn must not lose plugin tools to tool-search assembly."""
+    names = {
+        "video_edit_proactive_resolve",
+        "video_edit_upload_assets",
+        "video_edit_create_project",
+        "video_edit_wait_project",
+        "video_edit_download_result",
+        "video_edit_proactive_report",
+    }
     agent = SimpleNamespace(
-        platform="zet_agent",
-        _zet_agent_execution_policy="silent_automation",
+        # Tool-search may have collapsed the non-core plugin schemas to these
+        # bridge tools before the silent policy narrows the turn.
+        tools=[_tool("tool_search"), _tool("tool_describe"), _tool("tool_call")],
+        valid_tool_names={"tool_search", "tool_describe", "tool_call"},
+        enabled_toolsets=["hermes-zet-agent", "cronjob", "video_edit"],
+        disabled_toolsets=[],
+        quiet_mode=True,
     )
-    turn_tokens = set_turn_vars(turn_id="silent-skill-scope")
-    try:
-        response_mode.reset_trusted_skill_execution(
-            agent,
-            "执行已授权的视频任务",
-            explicit_skill_slug="video-edit-workflow-mini",
-        )
-        exact_args = {"name": "video-edit-workflow-mini"}
-        dispatched = []
 
-        assert (
-            response_mode.trusted_skill_operation_block_message(
-                agent,
-                function_name="skill_view",
-                function_args=exact_args,
-            )
-            is None
-        )
-        result = response_mode.dispatch_trusted_skill_operation(
-            agent,
-            function_name="skill_view",
-            function_args=exact_args,
-            dispatch=lambda: dispatched.append(True) or '{"success":true}',
-        )
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **kwargs: _map_tools(names),
+    )
 
-        assert dispatched == [True]
-        assert json.loads(result)["success"] is True
-    finally:
-        clear_turn_vars(turn_tokens)
+    _apply_execution_policy(
+        agent,
+        "silent_automation",
+        trusted_skill_slug="video-edit-workflow-mini",
+    )
+
+    assert agent.valid_tool_names == names
+    assert {item["function"]["name"] for item in agent.tools} == names
+
+
+def _map_tools(names: set[str]) -> list[dict]:
+    return [_tool(name) for name in sorted(names)]
