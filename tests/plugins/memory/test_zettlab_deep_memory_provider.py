@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.memory_manager import MemoryManager
 from plugins.memory.zettlab_deep_memory import (
     DeepMemoryMCPToolError,
     ZettlabDeepMemoryProvider,
@@ -310,6 +311,49 @@ def test_native_memory_is_mirrored_to_deep_memory():
     assert "written once through the native memory tool" in prompt
     assert "on_memory_write hook" in prompt
     assert "memo_write and memo_recall are not exposed as model tools" in prompt
+
+
+def test_three_modes_have_distinct_recall_contracts(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+
+    expected_tools = {
+        "off": set(),
+        "smart": {"memo_confirm", "memo_forget"},
+        "always": {"memo_recall", "memo_confirm", "memo_forget"},
+    }
+    for mode in ("off", "smart", "always"):
+        provider = ZettlabDeepMemoryProvider()
+        manager = MemoryManager()
+        manager.add_provider(provider)
+        manager.initialize_all(
+            "session-1",
+            hermes_home=str(tmp_path / mode),
+            deep_memory_principal="user-1",
+            memory_config={"deep_memory_mode": mode},
+        )
+        prompt = provider.system_prompt_block()
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        assert names == expected_tools[mode]
+        assert manager.get_all_tool_names() == expected_tools[mode]
+        if mode == "off":
+            assert "Deep Memory chat recall is disabled" in prompt
+            assert provider.search_memory_mode() == "disabled"
+        elif mode == "smart":
+            assert "No Deep Memory recall runs at turn start" in prompt
+            assert "Do not call memo_recall directly" in prompt
+            assert provider.search_memory_mode() == "supplement"
+        else:
+            assert "already been attempted automatically" in prompt
+            assert "Do not call memo_recall merely to repeat the same query" in prompt
+            assert "multi-hop retrieval" in prompt
+            assert "does not trigger another Deep Memory recall" in prompt
+            assert provider.search_memory_mode() == "disabled"
+            provider._request = lambda *_args, **_kwargs: {"items": []}
+            assert json.loads(manager.handle_tool_call(
+                "memo_recall", {"query": "Frank 的更多关系"}
+            )) == {"items": []}
+        manager.shutdown_all()
 
 
 def test_provider_does_not_repurpose_generic_account_identity(monkeypatch, tmp_path):
