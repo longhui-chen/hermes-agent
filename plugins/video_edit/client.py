@@ -9,6 +9,7 @@ import json
 import mimetypes
 import os
 import socket
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -167,7 +168,13 @@ def _multipart_parts(files: list[Path], boundary: str) -> tuple[list[bytes], lis
     return preambles, epilogues, total
 
 
-def upload(files: list[Path], *, timeout: float = 1800.0, agent_id: str = "") -> Any:
+def upload(
+    files: list[Path],
+    *,
+    timeout: float = 1800.0,
+    agent_id: str = "",
+    replay_scope: str = "",
+) -> Any:
     if not files or len(files) > MAX_UPLOAD_FILES:
         raise VideoClientError("invalid upload file count")
     total_size = sum(path.stat().st_size for path in files)
@@ -183,6 +190,7 @@ def upload(files: list[Path], *, timeout: float = 1800.0, agent_id: str = "") ->
         [str(path) for path in files],
         content_type=f"multipart/form-data; boundary={boundary}",
         agent_id=agent_id,
+        replay_scope=replay_scope,
     )
     headers["Content-Length"] = str(body_size)
     connection = http.client.HTTPConnection(base.hostname, base.port or 80, timeout=timeout)
@@ -278,13 +286,16 @@ def create_project(
 
 def poll_project(project_id: str, *, timeout: float = 120.0, agent_id: str = "") -> dict[str, Any]:
     body = post_json("projects/batch", [project_id], timeout=timeout, agent_id=agent_id)
+    projects: list[Any] = []
     if isinstance(body, dict):
         data = body.get("data")
-        projects = data.get("projects") if isinstance(data, dict) else None
-        if isinstance(projects, list) and projects and isinstance(projects[0], dict):
-            return dict(projects[0])
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return dict(data[0])
+        if isinstance(data, dict) and isinstance(data.get("projects"), list):
+            projects = data["projects"]
+        elif isinstance(data, list):
+            projects = data
+    for project in projects:
+        if isinstance(project, dict) and str(project.get("project_id") or "").strip() == project_id:
+            return dict(project)
     raise VideoClientError("video project poll response is invalid")
 
 
@@ -311,12 +322,16 @@ def download(result_url: str, target: Path, *, timeout: float = 1800.0) -> dict[
     if not _download_allowed(result_url):
         raise VideoClientError("video result URL is not allowed")
     request = urllib.request.Request(result_url, headers={"User-Agent": "hermes-video-edit-plugin/1"})
-    part = target.with_name(target.name + ".part")
+    fd, part_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".part", dir=str(target.parent)
+    )
+    part = Path(part_name)
     opener = urllib.request.build_opener(_NoRedirect())
     total = 0
     digest = hashlib.sha256()
     try:
-        with opener.open(request, timeout=timeout) as response, part.open("wb") as stream:
+        with opener.open(request, timeout=timeout) as response, os.fdopen(fd, "wb") as stream:
+            fd = -1
             while True:
                 chunk = response.read(CHUNK_BYTES)
                 if not chunk:
@@ -330,6 +345,8 @@ def download(result_url: str, target: Path, *, timeout: float = 1800.0) -> dict[
             os.fsync(stream.fileno())
         os.replace(part, target)
     except Exception:
+        if fd >= 0:
+            os.close(fd)
         try:
             part.unlink()
         except OSError:

@@ -53,6 +53,11 @@ SESSION_VARS = list(_VAR_MAP.keys())
 
 
 def test_retired_video_execution_environment_is_scrubbed_without_touching_generic_action_token():
+    assert {
+        "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
+        "ZETTLAB_BUSINESS_EXECUTION_MODE",
+        "ZETTLAB_EXECUTION_REQUEST_DIGEST",
+    }.issubset(RETIRED_VIDEO_EXECUTION_ENV_KEYS)
     env = {key: "stale" for key in RETIRED_VIDEO_EXECUTION_ENV_KEYS}
     env["ZETTLAB_AGENT_ACTION_TOKEN"] = "unrelated-skill-token"
     env["PATH"] = "/usr/bin"

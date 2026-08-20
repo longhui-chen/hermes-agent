@@ -259,7 +259,11 @@ def handle_upload_assets(args: dict, **kwargs: Any) -> str:
                 })
         uploaded = list(existing)
         for batch in _upload_batches(upload_files[len(existing):]):
-            body = client.upload(batch, agent_id=agent_id)
+            body = client.upload(
+                batch,
+                agent_id=agent_id,
+                replay_scope=source_fingerprint,
+            )
             batch_keys = client.extract_upload_keys(body)
             if len(batch_keys) != len(batch):
                 raise client.VideoClientError("video upload response does not match the requested batch")
@@ -368,7 +372,11 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
                 "size": evidence["size"],
                 "sha256": evidence["sha256"],
                 "reused": True,
-                "next": "video_edit_preferences_record_success",
+                "next": (
+                    "video_edit_proactive_report"
+                    if entry.get("proactive")
+                    else "video_edit_preferences_record_success"
+                ),
             })
         pending = str(entry.get("pending_output_path") or "").strip()
         output_session = _proactive_session_id(entry)
@@ -392,7 +400,12 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
         return _ok({
             "ok": True, "workflow_id": workflow_id, "output": evidence["path"],
             "size": evidence["size"], "sha256": evidence["sha256"],
-            "recovered": recovered, "next": "video_edit_preferences_record_success",
+            "recovered": recovered,
+            "next": (
+                "video_edit_proactive_report"
+                if entry.get("proactive")
+                else "video_edit_preferences_record_success"
+            ),
         })
     except Exception as exc:
         return _fail(f"video result download failed: {exc}")
@@ -413,10 +426,16 @@ def handle_proactive_resolve(args: dict, **kwargs: Any) -> str:
         workflow = state.workflow_id(task_id, agent_id)
         scene = str(payload.get("scene") or "general")
         resolved = preferences.resolve(agent_id, scene, {}, silent=True)
-        files = payload["files"][:state.MAX_FILES]
-        paths = [str(item.get("path") or "") for item in files if isinstance(item, dict) and str(item.get("path") or "").strip()]
-        if not paths:
-            raise client.VideoClientError("proactive manifest contains no usable files")
+        files = payload["files"]
+        if not 2 <= len(files) <= state.MAX_FILES:
+            raise client.VideoClientError("proactive manifest file count is invalid")
+        if any(
+            not isinstance(item, dict)
+            or not str(item.get("path") or "").strip()
+            for item in files
+        ):
+            raise client.VideoClientError("proactive manifest contains invalid files")
+        paths = [str(item["path"]).strip() for item in files]
         state.update(workflow, agent_id, {
             "task_id": task_id, "scene": scene,
             "manifest_id": manifest_id, "source_paths": paths,

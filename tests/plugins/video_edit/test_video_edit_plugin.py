@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -348,6 +349,46 @@ def test_workflow_rejects_source_selection_changes_instead_of_reusing_old_projec
     assert tools.state.get(workflow, "agent-a")["object_keys"] == ["old-object"]
 
 
+def test_same_source_path_replacement_gets_a_new_upload_replay_scope(
+    isolated_video_home, monkeypatch
+):
+    source = isolated_video_home[1] / "agent-a" / "same-path.mov"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"version-one")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {"task_id": "source-replacement"}, agent_id="agent-a"
+        )
+    )["workflow_id"]
+    scopes = []
+
+    def fake_upload(files, **kwargs):
+        scopes.append(kwargs["replay_scope"])
+        return {
+            "data": {
+                "uploads": [
+                    {"object_key": f"object-{len(scopes)}"} for _ in files
+                ]
+            }
+        }
+
+    monkeypatch.setattr(client, "upload", fake_upload)
+    assert json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]}, agent_id="agent-a"
+        )
+    )["uploaded"] == 1
+
+    source.write_bytes(b"version-two")
+    assert json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]}, agent_id="agent-a"
+        )
+    )["uploaded"] == 1
+    assert len(scopes) == 2
+    assert scopes[0] != scopes[1]
+
+
 def test_upload_batch_must_return_one_object_for_each_source(isolated_video_home, monkeypatch):
     source = isolated_video_home[1] / "agent-a" / "missing-result.mov"
     source.parent.mkdir(parents=True)
@@ -509,8 +550,10 @@ def test_normalizer_failure_falls_back_to_direct_without_new_workflow(isolated_v
 
 def test_proactive_report_is_exactly_once(isolated_video_home, monkeypatch, tmp_path):
     source = isolated_video_home[1] / "agent-a" / "weekly.mov"
+    second_source = isolated_video_home[1] / "agent-a" / "weekly-2.mov"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"video")
+    second_source.write_bytes(b"video-2")
     monkeypatch.setattr(
         client,
         "proactive_resolve",
@@ -518,18 +561,29 @@ def test_proactive_report_is_exactly_once(isolated_video_home, monkeypatch, tmp_
             "data": {
                 "trigger_id": "pvm-report-exactly-once",
                 "scene": "weekly",
-                "files": [{"path": str(source)}],
+                "files": [{"path": str(source)}, {"path": str(second_source)}],
             }
         },
     )
     first = json.loads(tools.handle_proactive_resolve({"manifest_id": "manifest-1", "task_id": "weekly-1"}, agent_id="agent-a"))
     assert first["silent"] is True
     workflow = first["workflow_id"]
-    monkeypatch.setattr(client, "upload", lambda files, **kwargs: {"data": {"uploads": [{"object_key": "weekly-object"}]}})
+    monkeypatch.setattr(
+        client,
+        "upload",
+        lambda files, **kwargs: {
+            "data": {
+                "uploads": [
+                    {"object_key": f"weekly-object-{index}"}
+                    for index, _ in enumerate(files)
+                ]
+            }
+        },
+    )
     uploaded = json.loads(
         tools.handle_upload_assets({"workflow_id": workflow}, agent_id="agent-a")
     )
-    assert uploaded["uploaded"] == 1
+    assert uploaded["uploaded"] == 2
     output = tmp_path / "weekly.mp4"
     output.write_bytes(b"rendered")
     tools.state.update(workflow, "agent-a", {"output_path": str(output), "proactive": True})
@@ -545,8 +599,10 @@ def test_proactive_download_uses_server_trigger_output_bucket(
 ):
     """Weekly artifacts must land in the same bucket local-server validates."""
     source = isolated_video_home[1] / "agent-a" / "weekly.mov"
+    second_source = isolated_video_home[1] / "agent-a" / "weekly-2.mov"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"video")
+    second_source.write_bytes(b"video-2")
     monkeypatch.setattr(
         client,
         "proactive_resolve",
@@ -554,7 +610,7 @@ def test_proactive_download_uses_server_trigger_output_bucket(
             "trigger_mode": "proactive_silent",
             "trigger_id": "pvm-trigger-bucket-test",
             "scene": "weekly",
-            "files": [{"path": str(source)}],
+            "files": [{"path": str(source)}, {"path": str(second_source)}],
         },
     )
     first = json.loads(
@@ -583,6 +639,143 @@ def test_proactive_download_uses_server_trigger_output_bucket(
     )
 
     assert delivered["ok"] is True
+    assert delivered["next"] == "video_edit_proactive_report"
     assert delivered["output"].endswith(
         "/output/proactive-pvm-trigger-bucket-test/weekly.mp4"
     )
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        [{"path": "/volume1/subvol/data/only-one.mov"}],
+        [{"path": f"/volume1/subvol/data/{index}.mov"} for index in range(tools.state.MAX_FILES + 1)],
+        [{"path": "/volume1/subvol/data/one.mov"}, {"path": ""}],
+    ],
+)
+def test_proactive_manifest_rejects_truncated_or_missing_entries(
+    isolated_video_home, monkeypatch, files
+):
+    monkeypatch.setattr(
+        client,
+        "proactive_resolve",
+        lambda manifest_id, **kwargs: {
+            "trigger_id": "pvm-invalid-manifest",
+            "scene": "weekly",
+            "files": files,
+        },
+    )
+
+    result = json.loads(
+        tools.handle_proactive_resolve(
+            {"manifest_id": "manifest-invalid", "task_id": "weekly-invalid"},
+            agent_id="agent-a",
+        )
+    )
+
+    assert "error" in result
+    assert "manifest" in result["error"]
+
+
+def test_poll_project_selects_the_requested_project(monkeypatch):
+    monkeypatch.setattr(
+        client,
+        "post_json",
+        lambda *_args, **_kwargs: {
+            "data": {
+                "projects": [
+                    {"project_id": "other", "status": "completed"},
+                    {"project_id": "wanted", "status": "processing"},
+                ]
+            }
+        },
+    )
+
+    assert client.poll_project("wanted")["project_id"] == "wanted"
+
+
+def test_upload_idempotency_tracks_source_scope_not_regenerated_temp_file(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "vewm_0.mp4"
+    source.write_bytes(b"first-normalized-version")
+    captured_keys = []
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"object-1"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            self.headers = {}
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, key, value):
+            self.headers[key] = value
+
+        def endheaders(self):
+            captured_keys.append(self.headers["Idempotency-Key"])
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    client.upload([source], agent_id="agent-a", replay_scope="source-v1")
+    stat_result = source.stat()
+    os.utime(
+        source,
+        ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000),
+    )
+    client.upload([source], agent_id="agent-a", replay_scope="source-v1")
+    client.upload([source], agent_id="agent-a", replay_scope="source-v2")
+
+    assert captured_keys[0] == captured_keys[1]
+    assert captured_keys[1] != captured_keys[2]
+
+
+def test_download_uses_random_no_follow_part_file(monkeypatch, tmp_path):
+    target = tmp_path / "result.mp4"
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"keep")
+    (tmp_path / "result.mp4.part").symlink_to(victim)
+
+    class Response:
+        status = 200
+
+        def __init__(self):
+            self.sent = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            if self.sent:
+                return b""
+            self.sent = True
+            return b"rendered"
+
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(client.urllib.request, "build_opener", lambda *_args: Opener())
+
+    evidence = client.download("https://cdn.example.test/result.mp4", target)
+
+    assert target.read_bytes() == b"rendered"
+    assert victim.read_bytes() == b"keep"
+    assert evidence["size"] == len(b"rendered")
