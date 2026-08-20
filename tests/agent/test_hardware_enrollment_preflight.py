@@ -38,6 +38,23 @@ class HardwareEnrollmentPreflightTest(TestCase):
         )
         self.assertIn('"cidr": "192.168.35.0/24"', response)
 
+    def test_private_wildcard_subnet_emits_scoped_discovery_card(self) -> None:
+        for user_message in (
+            "扫描下 192.168.10.x 这个网段有哪些硬件设备可以连接",
+            "扫描 192.168.10.* 的设备",
+        ):
+            with self.subTest(user_message=user_message):
+                response = response_mode.hardware_enrollment_preflight_response(
+                    self.agent,
+                    user_message,
+                )
+                self.assertIn("发现附近设备", response)
+                self.assertIn('"cidr": "192.168.10.0/24"', response)
+                self.assertIn('"resource_kind": "camera"', response)
+                self.assertIn('"resource_kind": "tv"', response)
+                self.assertNotIn("printer3d", response)
+                self.assertNotIn("pc_node", response)
+
     def test_explicit_discoverable_type_is_preserved(self) -> None:
         camera = response_mode.hardware_enrollment_preflight_response(
             self.agent,
@@ -56,6 +73,8 @@ class HardwareEnrollmentPreflightTest(TestCase):
         for user_message in (
             "扫描 203.0.113.0/24",
             "扫描 192.168.0.0/16",
+            "扫描 192.168.10.x/8",
+            "扫描 203.0.113.x",
             "扫描 192.168.1.0/24 和 192.168.2.0/24",
             "扫描当前网段的打印机",
             "扫描当前网段的电脑",
@@ -82,6 +101,9 @@ class HardwareEnrollmentPreflightTest(TestCase):
                 )
 
     def test_subnet_discovery_returns_before_provider_or_tools(self) -> None:
+        trusted_user_message = (
+            "扫描下 192.168.10.x 这个网段有哪些硬件设备可以连接"
+        )
         agent = SimpleNamespace(
             platform="zet_agent",
             request_overrides={},
@@ -90,9 +112,11 @@ class HardwareEnrollmentPreflightTest(TestCase):
             _tools_disabled_for_request=False,
         )
         context = SimpleNamespace(
-            user_message="扫描当前网段",
-            original_user_message="扫描当前网段",
-            messages=[{"role": "user", "content": "扫描当前网段"}],
+            user_message="<transport-context>opaque API envelope</transport-context>",
+            original_user_message=(
+                "<transport-context>opaque API envelope</transport-context>"
+            ),
+            messages=[{"role": "user", "content": trusted_user_message}],
             conversation_history=[],
             active_system_prompt="",
             effective_task_id="hardware-preflight-test",
@@ -118,7 +142,7 @@ class HardwareEnrollmentPreflightTest(TestCase):
             patch.object(
                 conversation_loop,
                 "_consume_trusted_skill_task_message",
-                return_value="扫描当前网段",
+                return_value=trusted_user_message,
             ),
             patch.object(conversation_loop, "_consume_trusted_skill_slug", return_value=""),
             patch.object(conversation_loop, "reset_trusted_skill_execution"),
@@ -131,9 +155,13 @@ class HardwareEnrollmentPreflightTest(TestCase):
             patch.object(conversation_loop, "_video_edit_skill_load_error", return_value=""),
             patch("agent.turn_finalizer.finalize_turn", side_effect=fake_finalize),
         ):
-            result = conversation_loop.run_conversation(agent, "扫描当前网段")
+            result = conversation_loop.run_conversation(agent, trusted_user_message)
 
         self.assertEqual(result["api_calls"], 0)
+        self.assertIn(
+            '"cidr": "192.168.10.0/24"',
+            result["final_response"],
+        )
         self.assertEqual(finalized["api_call_count"], 0)
         self.assertEqual(
             finalized["_turn_exit_reason"],

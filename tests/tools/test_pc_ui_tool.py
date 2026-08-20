@@ -311,6 +311,48 @@ def test_pc_ui_complete_bounded_action_surface_and_target_rules():
     assert module._params({"file_path": "/tmp/secret"}, "clipboard_write") is None
 
 
+def test_pc_ui_normalizes_schema_visible_context_without_weakening_fences():
+    assert module._params(
+        {
+            "action": "snapshot",
+            "app": "Calculator",
+            "include_text": True,
+        },
+        "snapshot",
+    ) == {"app": "Calculator"}
+    assert module._params(
+        {
+            "action": "set_value",
+            "app": "Calculator",
+            "pid": 42,
+            "window_id": 7,
+            "element": 3,
+            "value": "17",
+            "snapshot_revision": 4,
+            "user_input_epoch": 0,
+            "postcondition": [{"element": {"value_equals": "17"}}],
+        },
+        "set_value",
+    ) == {"pid": 42, "window_id": 7, "element": 3, "value": "17"}
+    assert module._params(
+        {"action": "desktop_snapshot", "include_text": False},
+        "desktop_snapshot",
+    ) == {}
+
+    assert module._params(
+        {"action": "invoke", "app": "", "pid": 42, "window_id": 7, "element": 3},
+        "invoke",
+    ) is None
+    assert module._params(
+        {"action": "snapshot", "app": "Calculator", "include_text": "yes"},
+        "snapshot",
+    ) is None
+    assert module._params(
+        {"action": "click", "app": "Calculator", "pid": 42, "window_id": 7},
+        "click",
+    ) is None
+
+
 def test_pc_ui_returns_screenshot_as_bounded_multimodal_content(monkeypatch):
     _configure(monkeypatch)
     image = base64.b64encode(b"window-image").decode("ascii")

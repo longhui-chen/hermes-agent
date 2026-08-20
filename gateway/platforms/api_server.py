@@ -6997,8 +6997,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # creation-recommendation envelope), emit that suffix before the
             # terminal chunk so API consumers persist and render the actual
             # final response rather than the pre-transform draft.
+            final_response = result_dict.get("final_response") or ""
+            has_streamed_response = any(streamed_text_parts)
             if result_dict.get("response_transformed"):
-                final_response = result_dict.get("final_response") or ""
                 transform_suffix = result_dict.get("response_transform_suffix")
                 streamed_response = "".join(streamed_text_parts)
                 if isinstance(transform_suffix, str) and transform_suffix:
@@ -7018,6 +7019,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         "final output is not an append-only transform",
                         completion_id,
                     )
+            elif not has_streamed_response and final_response:
+                # Some trusted preflight and other early-return paths produce a
+                # complete final response without entering the provider loop,
+                # so stream_delta_callback never receives a token. Preserve the
+                # OpenAI streaming contract by emitting that response exactly
+                # once before the terminal chunk.
+                await _emit(final_response)
 
             # Finish chunk
             finish_chunk = {

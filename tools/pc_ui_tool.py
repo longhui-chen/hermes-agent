@@ -47,6 +47,21 @@ _READ_ACTIONS = {
     "list_apps", "list_windows", "snapshot", "desktop_snapshot", "verify", "zoom", "clipboard_read", "complete_task",
 }
 _TASK_CONTROL_FIELDS = {"snapshot_revision", "user_input_epoch", "postcondition"}
+_APP_CONTEXT_ACTIONS = {
+    "focus",
+    "invoke",
+    "click",
+    "drag",
+    "type_text",
+    "set_value",
+    "scroll",
+    "keystroke",
+    "invoke_menu",
+    "verify",
+    "zoom",
+    "set_window_frame",
+    "kill_app",
+}
 
 PC_UI_SCHEMA = {
     "name": "pc_ui",
@@ -243,6 +258,27 @@ def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
         "kill_app": {"pid"},
         "complete_task": set(),
     }[action]
+    # The flat tool schema exposes app/include_text to every action. Models can
+    # therefore legally repeat the observed app name on a window mutation or
+    # request text while taking a semantic snapshot. These fields do not belong
+    # on the Host wire contract, so validate and discard them here instead of
+    # rejecting an otherwise fenced operation as invalid_parameters.
+    context_only: set[str] = set()
+    if action in _APP_CONTEXT_ACTIONS and "app" in args:
+        app = args["app"]
+        if (
+            not isinstance(app, str)
+            or not app.strip()
+            or len(app) > 256
+            or "\x00" in app
+        ):
+            return None
+        context_only.add("app")
+    if action in {"snapshot", "desktop_snapshot"} and "include_text" in args:
+        if not isinstance(args["include_text"], bool):
+            return None
+        context_only.add("include_text")
+    args = {name: value for name, value in args.items() if name not in context_only}
     if any(name not in args for name in required):
         return None
     if any(name not in allowed and name != "action" and name not in _TASK_CONTROL_FIELDS for name in args):
