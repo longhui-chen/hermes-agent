@@ -9,6 +9,7 @@ import json
 import mimetypes
 import os
 import socket
+import stat
 import tempfile
 import urllib.error
 import urllib.parse
@@ -151,11 +152,15 @@ def post_json(
         raise VideoClientError("video service request failed") from exc
 
 
-def _multipart_parts(files: list[Path], boundary: str) -> tuple[list[bytes], list[bytes], int]:
+def _multipart_parts(
+    files: list[Path],
+    sizes: list[int],
+    boundary: str,
+) -> tuple[list[bytes], list[bytes], int]:
     preambles: list[bytes] = []
     epilogues: list[bytes] = []
     total = 0
-    for path in files:
+    for path, size in zip(files, sizes):
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         safe_name = path.name.replace('"', "_").replace("\r", "_").replace("\n", "_")
         preamble = (
@@ -164,8 +169,33 @@ def _multipart_parts(files: list[Path], boundary: str) -> tuple[list[bytes], lis
         ).encode()
         preambles.append(preamble)
         epilogues.append(b"\r\n")
-        total += len(preamble) + path.stat().st_size + 2
+        total += len(preamble) + size + 2
     return preambles, epilogues, total
+
+
+def _open_upload_sources(files: list[Path]) -> list[tuple[Path, int, os.stat_result]]:
+    opened: list[tuple[Path, int, os.stat_result]] = []
+    try:
+        for path in files:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+                    raise VideoClientError("video upload source is invalid")
+            except Exception:
+                os.close(descriptor)
+                raise
+            opened.append((path, descriptor, info))
+        return opened
+    except Exception:
+        for _, descriptor, _ in opened:
+            os.close(descriptor)
+        raise
 
 
 def upload(
@@ -177,36 +207,76 @@ def upload(
 ) -> Any:
     if not files or len(files) > MAX_UPLOAD_FILES:
         raise VideoClientError("invalid upload file count")
-    total_size = sum(path.stat().st_size for path in files)
-    if total_size > MAX_UPLOAD_BYTES:
-        raise VideoClientError("upload exceeds size limit")
-    boundary = "----hermes-video-edit-" + hashlib.sha256("\x00".join(str(p) for p in files).encode()).hexdigest()[:24]
-    preambles, epilogues, body_size = _multipart_parts(files, boundary)
-    closing = f"--{boundary}--\r\n".encode()
-    body_size += len(closing)
-    base = urllib.parse.urlparse(_base_url())
-    headers = _headers(
-        "assets/upload",
-        [str(path) for path in files],
-        content_type=f"multipart/form-data; boundary={boundary}",
-        agent_id=agent_id,
-        replay_scope=replay_scope,
-    )
-    headers["Content-Length"] = str(body_size)
-    connection = http.client.HTTPConnection(base.hostname, base.port or 80, timeout=timeout)
     try:
+        opened = _open_upload_sources(files)
+    except OSError as exc:
+        raise VideoClientError("video upload source is unavailable") from exc
+    connection: http.client.HTTPConnection | None = None
+    try:
+        sizes = [info.st_size for _, _, info in opened]
+        total_size = sum(sizes)
+        if total_size > MAX_UPLOAD_BYTES:
+            raise VideoClientError("upload exceeds size limit")
+        boundary = "----hermes-video-edit-" + hashlib.sha256(
+            "\x00".join(str(p) for p in files).encode()
+        ).hexdigest()[:24]
+        preambles, epilogues, body_size = _multipart_parts(
+            files,
+            sizes,
+            boundary,
+        )
+        closing = f"--{boundary}--\r\n".encode()
+        body_size += len(closing)
+        base = urllib.parse.urlparse(_base_url())
+        headers = _headers(
+            "assets/upload",
+            [str(path) for path in files],
+            content_type=f"multipart/form-data; boundary={boundary}",
+            agent_id=agent_id,
+            replay_scope=replay_scope,
+        )
+        headers["Content-Length"] = str(body_size)
+        connection = http.client.HTTPConnection(
+            base.hostname,
+            base.port or 80,
+            timeout=timeout,
+        )
         connection.putrequest("POST", base.path.rstrip("/") + "/assets/upload")
         for key, value in headers.items():
             connection.putheader(key, value)
         connection.endheaders()
-        for path, preamble, epilogue in zip(files, preambles, epilogues):
+        for (path, descriptor, opened_info), preamble, epilogue in zip(
+            opened,
+            preambles,
+            epilogues,
+        ):
+            try:
+                current_info = os.stat(path, follow_symlinks=False)
+            except OSError as exc:
+                raise VideoClientError("video upload source changed") from exc
+            if (
+                not stat.S_ISREG(current_info.st_mode)
+                or current_info.st_dev != opened_info.st_dev
+                or current_info.st_ino != opened_info.st_ino
+                or current_info.st_size != opened_info.st_size
+            ):
+                raise VideoClientError("video upload source changed")
             connection.send(preamble)
-            with path.open("rb") as stream:
-                while True:
-                    chunk = stream.read(CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    connection.send(chunk)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            remaining = opened_info.st_size
+            while remaining > 0:
+                chunk = os.read(descriptor, min(CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise VideoClientError("video upload source changed")
+                connection.send(chunk)
+                remaining -= len(chunk)
+            finished_info = os.fstat(descriptor)
+            if (
+                finished_info.st_size != opened_info.st_size
+                or finished_info.st_mtime_ns != opened_info.st_mtime_ns
+                or finished_info.st_ctime_ns != opened_info.st_ctime_ns
+            ):
+                raise VideoClientError("video upload source changed")
             connection.send(epilogue)
         connection.send(closing)
         response = connection.getresponse()
@@ -223,7 +293,10 @@ def upload(
     except (OSError, socket.timeout) as exc:
         raise VideoClientError("video upload failed") from exc
     finally:
-        connection.close()
+        for _, descriptor, _ in opened:
+            os.close(descriptor)
+        if connection is not None:
+            connection.close()
 
 
 def extract_upload_keys(body: Any) -> list[str]:

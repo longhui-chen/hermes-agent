@@ -2304,6 +2304,39 @@ class TestChatCompletionsEndpoint:
                 )
 
     @pytest.mark.asyncio
+    async def test_silent_video_skill_slug_requires_exact_builtin_name(self, adapter):
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_run_agent", new_callable=AsyncMock
+            ) as mock_run, patch.object(
+                adapter,
+                "_expand_inbound_skill_invocation",
+                new_callable=AsyncMock,
+            ) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Idempotency-Key": "silent-video-prefix-1"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "run"}],
+                        "stream": False,
+                        "metadata": {
+                            "skill_slug": "video-edit-evil",
+                            "execution_policy": "silent_automation",
+                        },
+                    },
+                )
+
+                assert resp.status == 200
+                mock_expand.assert_not_awaited()
+                assert mock_run.await_args.kwargs["user_message"] == "run"
+
+    @pytest.mark.asyncio
     async def test_slash_text_without_skill_slug_is_never_expanded(self, adapter):
         # The explicit metadata.skill_slug field is the ONLY trigger: message
         # text is never sniffed, so a literal "/<skill> ..." (e.g. the user

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -694,6 +695,39 @@ def test_poll_project_selects_the_requested_project(monkeypatch):
     assert client.poll_project("wanted")["project_id"] == "wanted"
 
 
+def test_create_project_rejects_partial_upload_checkpoint(isolated_video_home, monkeypatch):
+    workflow = "vew_partial-upload-checkpoint"
+    tools.state.update(
+        workflow,
+        "agent-a",
+        {
+            "source_paths": [
+                "/volume1/subvol/data/one.mov",
+                "/volume1/subvol/data/two.mov",
+            ],
+            "object_keys": ["assets/one"],
+        },
+    )
+    called = False
+
+    def fake_create_project(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {"project_id": "unexpected"}
+
+    monkeypatch.setattr(client, "create_project", fake_create_project)
+
+    result = json.loads(
+        tools.handle_create_project(
+            {"workflow_id": workflow},
+            agent_id="agent-a",
+        )
+    )
+
+    assert "upload" in result["error"]
+    assert called is False
+
+
 def test_upload_idempotency_tracks_source_scope_not_regenerated_temp_file(
     monkeypatch, tmp_path
 ):
@@ -742,6 +776,99 @@ def test_upload_idempotency_tracks_source_scope_not_regenerated_temp_file(
 
     assert captured_keys[0] == captured_keys[1]
     assert captured_keys[1] != captured_keys[2]
+
+
+def test_upload_rejects_path_replacement_after_validation(monkeypatch, tmp_path):
+    source = tmp_path / "source.mov"
+    victim = tmp_path / "victim.txt"
+    source.write_bytes(b"safe")
+    victim.write_bytes(b"secret")
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"object-1"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            source.unlink()
+            source.symlink_to(victim)
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    with pytest.raises(client.VideoClientError):
+        client.upload([source], agent_id="agent-a", replay_scope="source-v1")
+
+
+def test_upload_closes_sources_when_preconnect_validation_fails(monkeypatch, tmp_path):
+    source = tmp_path / "source.mov"
+    source.write_bytes(b"safe")
+    descriptor = 42
+    info = SimpleNamespace(
+        st_size=4,
+        st_mode=0,
+        st_dev=1,
+        st_ino=2,
+        st_mtime_ns=3,
+        st_ctime_ns=4,
+    )
+    closed = []
+    monkeypatch.setattr(
+        client,
+        "_open_upload_sources",
+        lambda _files: [(source, descriptor, info)],
+    )
+    monkeypatch.setattr(
+        client,
+        "_base_url",
+        lambda: (_ for _ in ()).throw(
+            client.VideoClientError("invalid base")
+        ),
+    )
+    monkeypatch.setattr(client.os, "close", closed.append)
+
+    with pytest.raises(client.VideoClientError):
+        client.upload([source], agent_id="agent-a", replay_scope="source-v1")
+
+    assert closed == [descriptor]
+
+
+def test_upload_closes_current_descriptor_when_fstat_fails(monkeypatch, tmp_path):
+    source = tmp_path / "source.mov"
+    source.write_bytes(b"safe")
+    descriptor = 43
+    closed = []
+    monkeypatch.setattr(client.os, "open", lambda *_args, **_kwargs: descriptor)
+    monkeypatch.setattr(
+        client.os,
+        "fstat",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("fstat failed")),
+    )
+    monkeypatch.setattr(client.os, "close", closed.append)
+
+    with pytest.raises(OSError):
+        client._open_upload_sources([source])
+
+    assert closed == [descriptor]
 
 
 def test_download_uses_random_no_follow_part_file(monkeypatch, tmp_path):

@@ -175,7 +175,10 @@ def test_silent_video_turn_exposes_ordinary_plugin_tools_without_skill_view():
         "video_edit_download_result",
     }
     agent = type("Agent", (), {})()
-    agent.tools = [tool(name) for name in (*video_names, "skill_view", "terminal")]
+    agent.tools = [
+        tool(name)
+        for name in (*video_names, "video_edit_evil_plugin_tool", "skill_view", "terminal")
+    ]
     agent.valid_tool_names = {
         item["function"]["name"] for item in agent.tools
     }
@@ -193,6 +196,31 @@ def test_silent_video_turn_exposes_ordinary_plugin_tools_without_skill_view():
     assert agent._zet_agent_video_edit_turn is True
     assert "skill_view" not in agent.valid_tool_names
     assert "terminal" not in agent.valid_tool_names
+    assert "video_edit_evil_plugin_tool" not in agent.valid_tool_names
+
+
+def test_silent_video_policy_rejects_prefixed_skill_slug():
+    def tool(name):
+        return {"type": "function", "function": {"name": name}}
+
+    agent = type("Agent", (), {})()
+    agent.tools = [
+        tool("video_edit_upload_assets"),
+        tool("skill_view"),
+        tool("terminal"),
+    ]
+    agent.valid_tool_names = {
+        item["function"]["name"] for item in agent.tools
+    }
+
+    _apply_execution_policy(
+        agent,
+        "silent_automation",
+        trusted_skill_slug="video-edit-evil",
+    )
+
+    assert agent._zet_agent_video_edit_turn is False
+    assert agent.valid_tool_names == {"skill_view"}
 
 
 def test_unknown_execution_policy_leaves_tool_snapshot_unchanged():

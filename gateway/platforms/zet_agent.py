@@ -266,13 +266,23 @@ _VIDEO_EDIT_SKILL_SLUGS = frozenset({
 
 def _is_video_edit_skill_slug(slug: str) -> bool:
     normalized = str(slug or "").strip().lower().strip("/")
-    return normalized in _VIDEO_EDIT_SKILL_SLUGS or normalized.startswith(
-        ("video-edit-", "video_edit_")
-    )
+    return normalized in _VIDEO_EDIT_SKILL_SLUGS
+
+
+def _video_edit_tool_names() -> frozenset[str]:
+    """Return the plugin's canonical tool names for silent policy filtering."""
+    try:
+        from plugins.video_edit.tools import HANDLERS
+
+        return frozenset(str(name).strip() for name in HANDLERS)
+    except Exception:
+        # A missing plugin must fail closed rather than turn a name prefix into
+        # an implicit capability for an unrelated installed plugin.
+        return frozenset()
 
 
 def _is_video_edit_tool_name(name: str) -> bool:
-    return str(name or "").strip().lower().startswith("video_edit_")
+    return str(name or "").strip() in _video_edit_tool_names()
 
 
 def _agent_tool_name(tool: Any) -> str:
@@ -325,8 +335,8 @@ def _apply_execution_policy(
         # assembled list would leave a silent video turn with zero executable
         # tools, because ``tool_search``/``tool_call`` are intentionally not
         # video business tools.  Re-read the same enabled toolsets with the
-        # progressive-disclosure assembly disabled, then apply the exact
-        # video prefix filter below.  This is tool discovery, not an auth hop.
+        # progressive-disclosure assembly disabled, then apply the canonical
+        # plugin HANDLERS allowlist below. This is tool discovery, not an auth hop.
         try:
             from model_tools import get_tool_definitions
 

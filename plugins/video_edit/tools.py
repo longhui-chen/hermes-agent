@@ -288,8 +288,13 @@ def handle_create_project(args: dict, **kwargs: Any) -> str:
         workflow_id = str(args.get("workflow_id") or "").strip()
         entry = _workflow_or_error(workflow_id, agent_id)
         object_keys = [str(key).strip() for key in entry.get("object_keys") or [] if str(key).strip()]
-        if not object_keys:
-            raise state.WorkflowError("video assets have not been uploaded")
+        source_paths = [
+            str(path).strip()
+            for path in entry.get("source_paths") or []
+            if str(path).strip()
+        ]
+        if not source_paths or len(object_keys) != len(source_paths):
+            raise state.WorkflowError("video asset upload is incomplete")
         existing = str(entry.get("project_id") or "").strip()
         if existing:
             return _ok({"ok": True, "workflow_id": workflow_id, "project_id": existing, "reused": True, "next": "video_edit_wait_project"})

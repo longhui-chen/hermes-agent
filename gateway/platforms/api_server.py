@@ -778,7 +778,7 @@ def _is_video_edit_skill_slug(skill_slug: str) -> bool:
         "video-edit-workflow",
         "video-edit",
         "video_edit",
-    } or normalized.startswith(("video-edit-", "video_edit_"))
+    }
 
 
 _HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
