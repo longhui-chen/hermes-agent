@@ -317,6 +317,63 @@ def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated
     assert "authorization" not in json.dumps(delivered).lower()
 
 
+def test_workflow_rejects_source_selection_changes_instead_of_reusing_old_project(isolated_video_home, monkeypatch):
+    first = isolated_video_home[1] / "agent-a" / "first.mov"
+    second = isolated_video_home[1] / "agent-a" / "second.mov"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {"task_id": "source-selection"}, agent_id="agent-a"
+        )
+    )["workflow_id"]
+    monkeypatch.setattr(
+        client,
+        "upload",
+        lambda files, **kwargs: {"data": {"uploads": [{"object_key": "old-object"}]}},
+    )
+    assert json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(first)]}, agent_id="agent-a"
+        )
+    )["uploaded"] == 1
+
+    rejected = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(second)]}, agent_id="agent-a"
+        )
+    )
+    assert "source selection changed" in rejected["error"]
+    assert tools.state.get(workflow, "agent-a")["object_keys"] == ["old-object"]
+
+
+def test_upload_batch_must_return_one_object_for_each_source(isolated_video_home, monkeypatch):
+    source = isolated_video_home[1] / "agent-a" / "missing-result.mov"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"video")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {"task_id": "upload-cardinality"}, agent_id="agent-a"
+        )
+    )["workflow_id"]
+    monkeypatch.setattr(
+        client,
+        "upload",
+        lambda files, **kwargs: {"data": {"uploads": []}},
+    )
+
+    result = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]}, agent_id="agent-a"
+        )
+    )
+
+    assert "does not match the requested batch" in result["error"]
+    entry = tools.state.get(workflow, "agent-a")
+    assert entry.get("object_keys", []) == []
+
+
 def test_download_recovers_file_committed_before_state_checkpoint(isolated_video_home, monkeypatch):
     workflow = json.loads(
         tools.handle_preferences_resolve(

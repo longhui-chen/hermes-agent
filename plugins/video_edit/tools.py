@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from pathlib import Path
 from typing import Any
@@ -80,12 +81,39 @@ def handle_preferences_record_success(args: dict, **kwargs: Any) -> str:
 
 def _files_for_upload(entry: dict[str, Any], args: dict[str, Any]) -> list[Path]:
     raw_files = args.get("files")
-    if not isinstance(raw_files, list) or not raw_files:
-        raw_files = entry.get("source_paths")
+    persisted_files = entry.get("source_paths")
+    if isinstance(persisted_files, list) and persisted_files:
+        # A workflow is a durable continuation boundary. Once the first
+        # selection is recorded, later turns must use that exact selection;
+        # an explicit re-edit gets a new task/workflow instead of silently
+        # replacing the source set behind an existing cloud project.
+        if isinstance(raw_files, list) and raw_files:
+            requested = [str(value).strip() for value in raw_files]
+            if requested != [str(value).strip() for value in persisted_files]:
+                raise VideoPathError("workflow source selection changed; start a new edit")
+        raw_files = persisted_files
     if not isinstance(raw_files, list) or not raw_files or len(raw_files) > state.MAX_FILES:
         raise VideoPathError("video file count must be between 1 and 8")
     agent_id = str(entry.get("agent_id") or "")
     return [validate_input_file(str(value), agent_id) for value in raw_files]
+
+
+def _source_fingerprint(files: list[Path]) -> str:
+    """Identify the selected source set without reading multi-GB media twice."""
+    digest = hashlib.sha256()
+    for path in files:
+        stat_result = path.stat()
+        digest.update(str(path).encode("utf-8", "replace"))
+        digest.update(b"\x00")
+        digest.update(str(stat_result.st_dev).encode())
+        digest.update(b"\x00")
+        digest.update(str(stat_result.st_ino).encode())
+        digest.update(b"\x00")
+        digest.update(str(stat_result.st_size).encode())
+        digest.update(b"\x00")
+        digest.update(str(stat_result.st_mtime_ns).encode())
+        digest.update(b"\x00")
+    return digest.hexdigest()
 
 
 def _upload_batches(files: list[Path]) -> list[list[Path]]:
@@ -128,12 +156,33 @@ def handle_upload_assets(args: dict, **kwargs: Any) -> str:
         workflow_id = str(args.get("workflow_id") or "").strip()
         entry = _workflow_or_error(workflow_id, agent_id)
         files = _files_for_upload(entry, args)
+        source_fingerprint = _source_fingerprint(files)
+        previous_fingerprint = str(entry.get("source_fingerprint") or "").strip()
+        existing = list(entry.get("object_keys") or [])
+        if existing and previous_fingerprint != source_fingerprint:
+            # A source replacement under the same task must not inherit the
+            # previous upload/project/result checkpoints. The model can still
+            # continue naturally, but it must choose a fresh task_id for an
+            # intentional re-edit according to the Skill contract.
+            state.update(workflow_id, agent_id, {
+                "object_keys": [],
+                "uploaded_count": 0,
+                "project_id": "",
+                "project": {},
+                "result_url": "",
+                "output_path": "",
+                "pending_output_path": "",
+                "reported": False,
+                "status": "uploading",
+            })
+            entry = _workflow_or_error(workflow_id, agent_id)
         normalize = _should_normalize(entry, files, args)
         # Keep the private source checkpoint for retries, but never return it
         # to the model on proactive runs.
         state.update(workflow_id, agent_id, {
             "source_paths": [str(path) for path in files],
             "source_names": [path.name for path in files],
+            "source_fingerprint": source_fingerprint,
             "normalize": normalize,
             "status": "uploading",
         })
@@ -160,7 +209,10 @@ def handle_upload_assets(args: dict, **kwargs: Any) -> str:
         uploaded = list(existing)
         for batch in _upload_batches(upload_files[len(existing):]):
             body = client.upload(batch, agent_id=agent_id)
-            uploaded.extend(client.extract_upload_keys(body))
+            batch_keys = client.extract_upload_keys(body)
+            if len(batch_keys) != len(batch):
+                raise client.VideoClientError("video upload response does not match the requested batch")
+            uploaded.extend(batch_keys)
             state.update(workflow_id, agent_id, {"object_keys": uploaded, "uploaded_count": len(uploaded), "status": "assets_uploaded"})
             # Normalized intermediates are disposable as soon as their upload
             # batch has been accepted; the durable workflow keeps only keys.
