@@ -394,8 +394,6 @@ async def test_silent_automation_does_not_bind_billing_task_title(monkeypatch):
         trusted_user_message="private weekly task title",
         session_id="zettlab:u1:main:silent",
         turn_id="silent-turn-1",
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
         execution_policy="silent_automation",
     )
 

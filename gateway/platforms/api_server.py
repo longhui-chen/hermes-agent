@@ -764,24 +764,7 @@ def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
     return _strip_skill_display_token(user_message, skill_slug)
 
 
-_ACTION_VERSION = "1"
-_ACTION_HEADER = "X-Zettlab-Business-Execution-Action"
-_ACTION_VERSION_HEADER = "X-Zettlab-Business-Execution-Action-Version"
-_ACTION_RE = re.compile(r"[0-9a-f]{64}")
 _HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
-
-
-def _extract_business_execution_action(request: Any) -> Optional[Dict[str, str]]:
-    """Parse the opaque ActionV1 relay envelope without semantic auth."""
-    if request is None:
-        return None
-    raw = str(request.headers.get(_ACTION_HEADER, "") or "").strip()
-    version = str(request.headers.get(_ACTION_VERSION_HEADER, "") or "").strip()
-    if not raw and not version:
-        return None
-    if version != _ACTION_VERSION or _ACTION_RE.fullmatch(raw) is None:
-        return {}
-    return {"action_version": version, "action": raw}
 
 
 def _extract_hardware_execution_token(request: Any) -> str:
@@ -791,7 +774,7 @@ def _extract_hardware_execution_token(request: Any) -> str:
     token = str(
         request.headers.get(_HARDWARE_EXECUTION_TOKEN_HEADER, "") or ""
     ).strip()
-    return token if _ACTION_RE.fullmatch(token) is not None else ""
+    return token if re.fullmatch(r"[0-9a-f]{64}", token) is not None else ""
 
 
 def _extract_requested_execution_policy(body: Dict[str, Any]) -> str:
@@ -1943,8 +1926,8 @@ class ResponseStore:
 # CORS middleware
 # ---------------------------------------------------------------------------
 
-# ActionV1, HardwareExecutionToken, and X-Zettlab-Agent-Action-Token headers are
-# intentionally absent. They are loopback capability transport, not a
+# HardwareExecutionToken and X-Zettlab-Agent-Action-Token headers are
+# intentionally absent. They are loopback hardware transport, not a
 # browser/App contract; omission makes browser preflight fail closed even for
 # an allowed origin.
 
@@ -2453,23 +2436,15 @@ def _make_request_fingerprint(
     body: Dict[str, Any],
     keys: List[str],
     *,
-    business_execution_action: str = "",
     hardware_execution_token: str = "",
     admission_scope: str = "",
     identity_scope: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
     body_fingerprint = hashlib.sha256(repr(subset).encode("utf-8")).hexdigest()
-    action = str(business_execution_action or "").strip()
     hardware_token = str(hardware_execution_token or "").strip()
     capability_digests: List[bytes] = []
-    if _ACTION_RE.fullmatch(action) is not None:
-        capability_digests.append(
-            hashlib.sha256(
-                b"zettlab-business-execution-action-v1\0" + action.encode("ascii")
-            ).hexdigest().encode("ascii")
-        )
-    if _ACTION_RE.fullmatch(hardware_token) is not None:
+    if re.fullmatch(r"[0-9a-f]{64}", hardware_token) is not None:
         capability_digests.append(
             hashlib.sha256(
                 b"zettlab-hardware-execution-token-v1\0"
@@ -2509,17 +2484,22 @@ def _make_request_fingerprint(
 
 
 def _make_silent_automation_fingerprint(
-    authorization: Dict[str, Any],
+    body: Dict[str, Any], *, identity_scope: str = ""
 ) -> str:
-    """Bind retries to stable authorization identity, not mutable request bytes."""
-    action = str(authorization.get("action", "") or "").strip()
-    if (
-        authorization.get("action_version") != _ACTION_VERSION
-        or _ACTION_RE.fullmatch(action) is None
-    ):
-        return ""
+    """Bind silent retries to the durable task and request identity.
+
+    Silent automation is an execution mode, not a second capability protocol.
+    Idempotency still needs a stable fingerprint so a retry can resume the same
+    task without relying on a per-turn business token.
+    """
+    subset = {
+        key: body.get(key)
+        for key in ("messages", "metadata", "tools", "model", "stream")
+    }
+    encoded = json.dumps(subset, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    scope = hashlib.sha256(str(identity_scope or "").encode()).hexdigest()
     return hashlib.sha256(
-        b"zettlab-silent-automation-action-v1\0" + action.encode("ascii")
+        b"zettlab-silent-automation-v2\0" + encoded + b"\0" + scope.encode()
     ).hexdigest()
 
 
@@ -6170,26 +6150,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "canonical_final_creation_action_admitted", False
         ):
             creation_action_receipt_transport = ""
-        business_execution_action = _extract_business_execution_action(request)
         hardware_execution_token = _extract_hardware_execution_token(request)
         requested_execution_policy = _extract_requested_execution_policy(body)
         requested_silent_automation = (
             requested_execution_policy == "silent_automation"
         )
         execution_policy = ""
-        execution_authorization: Dict[str, Any] = {}
-        if business_execution_action == {}:
-            return web.json_response(
-                _openai_error(
-                    "invalid business execution action",
-                    param=_ACTION_HEADER,
-                    code="invalid_business_execution_action",
-                ),
-                status=403,
-            )
-        if business_execution_action is not None:
-            execution_authorization = dict(business_execution_action)
-
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -6323,18 +6289,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         if requested_silent_automation:
-            if business_execution_action is None:
-                # A silent request is an internal capability boundary. Never
-                # downgrade an invalid receipt to an ordinary turn: that would
-                # expose the caller's history/memory and interactive tools.
-                return web.json_response(
-                    _openai_error(
-                        "silent_automation authorization failed",
-                        param="metadata.execution_policy",
-                        code="invalid_silent_automation_authorization",
-                    ),
-                    status=403,
-                )
+            # Silent execution is a task mode, not a second business-capability
+            # protocol. Idempotency and the normal loopback caller identity
+            # keep retries attached to the same workflow.
             execution_policy = "silent_automation"
 
         if execution_policy == "silent_automation":
@@ -6344,12 +6301,6 @@ class APIServerAdapter(BasePlatformAdapter):
             response_mode = ""
             plan_ack = {}
             plan_auto_execute = False
-
-        trusted_business_execution_action = (
-            str(business_execution_action.get("action", "") or "")
-            if business_execution_action is not None
-            else ""
-        )
 
         if execution_policy == "silent_automation":
             # A silent authorization is a self-contained task receipt, not permission
@@ -6591,10 +6542,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 connector_route_capability=connector_route_capability,
                 creation_action_receipt_transport=creation_action_receipt_transport,
                 hardware_execution_token=hardware_execution_token,
-                business_execution_action=trusted_business_execution_action,
-                business_execution_action_version=(
-                    _ACTION_VERSION if trusted_business_execution_action else ""
-                ),
                 execution_policy=execution_policy,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
@@ -6658,10 +6605,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     connector_route_capability=connector_route_capability,
                     creation_action_receipt_transport=creation_action_receipt_transport,
                     hardware_execution_token=hardware_execution_token,
-                    business_execution_action=trusted_business_execution_action,
-                    business_execution_action_version=(
-                        _ACTION_VERSION if trusted_business_execution_action else ""
-                    ),
                     execution_policy=execution_policy,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
@@ -6673,7 +6616,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if idempotency_key:
             fp = (
-                _make_silent_automation_fingerprint(execution_authorization)
+                _make_silent_automation_fingerprint(
+                    body,
+                    identity_scope="\0".join(
+                        (
+                            str(request.get("hermes_profile_home") or ""),
+                            str(gateway_session_key or ""),
+                            str(session_id or ""),
+                        )
+                    ),
+                )
                 if execution_policy == "silent_automation"
                 else _make_request_fingerprint(
                     body,
@@ -6688,7 +6640,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         "stream",
                         "metadata",
                     ],
-                    business_execution_action=trusted_business_execution_action,
                     hardware_execution_token=hardware_execution_token,
                     admission_scope=(
                         "canonical_final_v1"
@@ -9178,8 +9129,6 @@ class APIServerAdapter(BasePlatformAdapter):
         connector_route_capability: Optional[str] = None,
         creation_action_receipt_transport: str = "",
         hardware_execution_token: Optional[str] = None,
-        business_execution_action: Optional[str] = None,
-        business_execution_action_version: Optional[str] = None,
         execution_policy: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,

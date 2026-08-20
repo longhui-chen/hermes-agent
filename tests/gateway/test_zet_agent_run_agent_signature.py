@@ -311,14 +311,10 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
             self.session_total_tokens = 0
 
         def run_conversation(self, **_kwargs):
-            from gateway.session_context import (
-                business_execution_action,
-                execution_policy,
-            )
+            from gateway.session_context import execution_policy
 
             observed.update(
                 {
-                    "business_action": business_execution_action(),
                     "execution_policy": execution_policy(),
                     "persist_disabled": self._persist_disabled,
                     "session_db": self._session_db,
@@ -369,8 +365,6 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
         session_id="api-lineage-tip",
         gateway_session_key="zettlab:owner:agent:stable",
         turn_id="pvm-" + "a" * 24,
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
         execution_policy="silent_automation",
         plan_ack={
             "turn_id": "plan-turn-1",
@@ -383,7 +377,6 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
     assert constructed[0]["skip_memory"] is True
     assert constructed[0]["strict_memory_isolation"] is True
     assert observed == {
-        "business_action": "",
         "execution_policy": "silent_automation",
         "persist_disabled": True,
         "session_db": None,
@@ -728,18 +721,12 @@ async def test_zet_agent_scopes_and_revokes_hardware_capability(monkeypatch):
 
     async def fake_run_agent(self, **kwargs):
         del self
-        from gateway.session_context import (
-            business_execution_action,
-            business_execution_action_version,
-            hardware_execution_token,
-        )
+        from gateway.session_context import hardware_execution_token
 
         observed.append(
             {
                 "kwargs": kwargs,
                 "hardware_token": hardware_execution_token(),
-                "business_action": business_execution_action(),
-                "action_version": business_execution_action_version(),
             }
         )
         return (
@@ -767,15 +754,9 @@ async def test_zet_agent_scopes_and_revokes_hardware_capability(monkeypatch):
         turn_id="camera-cancel-turn",
         plan_ack={"status": "cancelled", "turn_id": "camera-plan-turn"},
         hardware_execution_token=hardware_token,
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
     )
 
     assert observed[0]["hardware_token"] == hardware_token
-    assert observed[0]["business_action"] == ""
     assert observed[0]["kwargs"]["hardware_execution_token"] == hardware_token
     assert observed[1]["hardware_token"] == ""
-    assert observed[1]["business_action"] == ""
-    assert observed[1]["action_version"] == ""
     assert observed[1]["kwargs"]["hardware_execution_token"] == ""
-    assert observed[1]["kwargs"]["business_execution_action"] == ""

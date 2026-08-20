@@ -217,32 +217,20 @@ _PLAN_ACK_REVISION_REQUESTED: ContextVar = ContextVar(
     "HERMES_PLAN_ACK_REVISION_REQUESTED",
     default=_UNSET,
 )
-_BUSINESS_EXECUTION_ACTION: ContextVar = ContextVar(
-    "ZETTLAB_BUSINESS_EXECUTION_ACTION",
-    default=_UNSET,
-)
-_BUSINESS_EXECUTION_ACTION_VERSION: ContextVar = ContextVar(
-    "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
-    default=_UNSET,
-)
 # Dedicated capability retained only for hardware skills such as camsnap.
-# It stays outside _VAR_MAP so generic subprocesses cannot inherit it, and it
-# must never be used as a fallback for the ActionV1 video path.
+# It stays outside _VAR_MAP so generic subprocesses cannot inherit it.
 _HARDWARE_EXECUTION_TOKEN: ContextVar = ContextVar(
     "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
     default=_UNSET,
 )
-# Stable caller session bound alongside an ActionV1 receipt. It stays
-# outside _VAR_MAP so generic subprocesses cannot inherit authorization
-# identity, and remains available when an interaction resumes without the
-# API-server's transient session ContextVars.
+# Stable caller session identity for long-running turns. It stays outside
+# _VAR_MAP so generic subprocesses cannot inherit host routing metadata.
 _EXECUTION_SESSION_KEY: ContextVar = ContextVar(
     "ZETTLAB_EXECUTION_SESSION_KEY",
     default=_UNSET,
 )
-# The verified per-turn execution policy is kept separate from the legacy
-# session environment map.  It is non-secret routing metadata for the trusted
-# video receipt, but generic model-authored subprocesses must not inherit it.
+# The per-turn execution policy is kept separate from the legacy session
+# environment map. Generic model-authored subprocesses must not inherit it.
 _EXECUTION_POLICY: ContextVar = ContextVar(
     "HERMES_EXECUTION_POLICY",
     default=_UNSET,
@@ -315,12 +303,12 @@ def zettlab_turn_id() -> str:
 
 
 def push_execution_session_key(value: str):
-    """Bind the stable session identity for one business-execution turn."""
+    """Bind the stable session identity for one long-running turn."""
     return _EXECUTION_SESSION_KEY.set(str(value or "").strip())
 
 
 def pop_execution_session_key(token) -> None:
-    """Restore the business-execution session identity preceding this turn."""
+    """Restore the long-running session identity preceding this turn."""
     _EXECUTION_SESSION_KEY.reset(token)
 
 
@@ -429,8 +417,6 @@ def set_turn_vars(
     plan_ack_turn_id: str = "",
     plan_ack_revision_requested: str = "",
     hardware_execution_token: str = "",
-    business_execution_action: str = "",
-    business_execution_action_version: str = "",
     execution_policy: str = "",
 ) -> list:
     """Bind one request's turn identity and plan receipt task-locally."""
@@ -443,10 +429,6 @@ def set_turn_vars(
         _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
         _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
         _HARDWARE_EXECUTION_TOKEN.set(hardware_execution_token),
-        _BUSINESS_EXECUTION_ACTION.set(business_execution_action),
-        _BUSINESS_EXECUTION_ACTION_VERSION.set(
-            str(business_execution_action_version or "").strip()
-        ),
         _EXECUTION_POLICY.set(execution_policy),
     ]
 
@@ -461,8 +443,6 @@ def clear_turn_vars(tokens: list) -> None:
             _PLAN_ACK_TURN_ID,
             _PLAN_ACK_REVISION_REQUESTED,
             _HARDWARE_EXECUTION_TOKEN,
-            _BUSINESS_EXECUTION_ACTION,
-            _BUSINESS_EXECUTION_ACTION_VERSION,
             _EXECUTION_POLICY,
         ),
         tokens,
@@ -488,23 +468,6 @@ def current_turn_identity() -> tuple[str, object] | None:
     return normalized_turn_id, binding
 
 
-def business_execution_action() -> str:
-    """Return the task-local opaque ActionV1 for the video executor only."""
-    value = _BUSINESS_EXECUTION_ACTION.get()
-    if value is _UNSET or value is None:
-        return ""
-    normalized = str(value).strip()
-    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
-
-
-def business_execution_action_version() -> str:
-    """Return the frozen ActionV1 transport version for this turn."""
-    value = _BUSINESS_EXECUTION_ACTION_VERSION.get()
-    if value is _UNSET or value is None:
-        return ""
-    return str(value).strip()
-
-
 def hardware_execution_token() -> str:
     """Return the task-local opaque capability for trusted hardware helpers."""
     value = _HARDWARE_EXECUTION_TOKEN.get()
@@ -519,7 +482,7 @@ def execution_policy() -> str:
 
     This stays outside ``_VAR_MAP`` so ordinary model-authored subprocesses do
     not receive policy metadata through the generic session environment bridge.
-    The dedicated trusted video receipt snapshots it explicitly instead.
+    Hardware/plugin dispatch may use it to select the correct lifecycle.
     """
     value = _EXECUTION_POLICY.get()
     if value is _UNSET or value is None:
@@ -754,8 +717,6 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
     _HARDWARE_EXECUTION_TOKEN.set(_UNSET)
-    _BUSINESS_EXECUTION_ACTION.set(_UNSET)
-    _BUSINESS_EXECUTION_ACTION_VERSION.set(_UNSET)
     _EXECUTION_SESSION_KEY.set(_UNSET)
     _EXECUTION_POLICY.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
