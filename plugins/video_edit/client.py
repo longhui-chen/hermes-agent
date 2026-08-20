@@ -60,8 +60,19 @@ def _replay_partition(agent_id: str = "") -> str:
     return safe_id(agent_id.strip() or agent_id_from_kwargs())
 
 
-def _request_key(operation: str, payload: Any, *, agent_id: str = "") -> str:
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+def _request_key(
+    operation: str,
+    payload: Any,
+    *,
+    agent_id: str = "",
+    replay_scope: str = "",
+) -> str:
+    encoded = json.dumps(
+        {"payload": payload, "replay_scope": str(replay_scope or "").strip()},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
     partition = _replay_partition(agent_id)
     return hashlib.sha256(f"video-edit\x00{partition}\x00{operation}\x00".encode() + encoded).hexdigest()
 
@@ -72,8 +83,14 @@ def _headers(
     *,
     content_type: str = "application/json",
     agent_id: str = "",
+    replay_scope: str = "",
 ) -> dict[str, str]:
-    key = _request_key(operation, payload, agent_id=agent_id)
+    key = _request_key(
+        operation,
+        payload,
+        agent_id=agent_id,
+        replay_scope=replay_scope,
+    )
     return {
         "Accept": "application/json",
         "Content-Type": content_type,
@@ -102,10 +119,16 @@ def post_json(
     timeout: float = 1800.0,
     internal: bool = False,
     agent_id: str = "",
+    replay_scope: str = "",
 ) -> Any:
     base = _internal_base() if internal else _base_url()
     url = f"{base}/{path.lstrip('/')}"
-    headers = _headers(path, payload, agent_id=agent_id)
+    headers = _headers(
+        path,
+        payload,
+        agent_id=agent_id,
+        replay_scope=replay_scope,
+    )
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -228,6 +251,7 @@ def create_project(
     *,
     user_prompt: str = "",
     agent_id: str = "",
+    workflow_id: str = "",
 ) -> dict[str, Any]:
     payload = {
         "object_keys": object_keys,
@@ -239,7 +263,17 @@ def create_project(
     prompt = str(user_prompt or preferences.get("user_prompt") or "").strip()
     if prompt:
         payload["user_prompt"] = prompt[:512]
-    return extract_project(post_json("projects", payload, timeout=1800.0, agent_id=agent_id))
+    return extract_project(
+        post_json(
+            "projects",
+            payload,
+            timeout=1800.0,
+            agent_id=agent_id,
+            # Retry/resume of one workflow must replay, while a later explicit
+            # re-edit of identical material must create a new cloud project.
+            replay_scope=str(workflow_id or "").strip(),
+        )
+    )
 
 
 def poll_project(project_id: str, *, timeout: float = 120.0, agent_id: str = "") -> dict[str, Any]:

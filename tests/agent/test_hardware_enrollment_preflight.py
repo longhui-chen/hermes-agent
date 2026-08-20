@@ -128,7 +128,6 @@ class HardwareEnrollmentPreflightTest(TestCase):
                 return_value=False,
             ),
             patch.object(conversation_loop, "_plan_mode_interaction_error", return_value=""),
-            patch.object(conversation_loop, "_video_edit_skill_load_error", return_value=""),
             patch("agent.turn_finalizer.finalize_turn", side_effect=fake_finalize),
         ):
             result = conversation_loop.run_conversation(agent, "扫描当前网段")

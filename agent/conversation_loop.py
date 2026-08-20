@@ -609,6 +609,19 @@ def _consume_trusted_skill_slug(agent: Any) -> str:
     return trusted_skill_slug if isinstance(trusted_skill_slug, str) else ""
 
 
+def _hardware_scope_skill_slug(skill_slug: str) -> str:
+    """Keep ordinary video plugins out of the hardware attestation channel."""
+    normalized = str(skill_slug or "").strip().lower().strip("/")
+    if normalized in {
+        "video-edit-workflow-mini",
+        "video-edit-workflow",
+        "video-edit",
+        "video_edit",
+    } or normalized.startswith(("video-edit-", "video_edit_")):
+        return ""
+    return skill_slug
+
+
 def _plan_mode_interaction_error(agent: Any) -> Optional[str]:
     """Return a recoverable error when Plan mode cannot satisfy its protocol."""
     if not getattr(agent, "_zet_agent_plan_mode_active", False):
@@ -2398,7 +2411,9 @@ def run_conversation(
         agent,
         original_user_message,
     )
-    trusted_skill_slug = _consume_trusted_skill_slug(agent)
+    trusted_skill_slug = _hardware_scope_skill_slug(
+        _consume_trusted_skill_slug(agent)
+    )
     tools_disabled_for_request = bool(
         getattr(agent, "_tools_disabled_for_request", False)
     )

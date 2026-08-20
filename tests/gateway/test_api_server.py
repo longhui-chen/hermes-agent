@@ -2193,7 +2193,7 @@ class TestChatCompletionsEndpoint:
                 )
 
     @pytest.mark.asyncio
-    async def test_video_edit_skill_selection_preserves_trusted_scope_signal(
+    async def test_video_edit_skill_selection_preserves_routing_signal(
         self,
         adapter,
     ):

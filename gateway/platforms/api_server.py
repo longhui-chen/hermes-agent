@@ -6295,16 +6295,15 @@ class APIServerAdapter(BasePlatformAdapter):
             execution_policy = "silent_automation"
 
         if execution_policy == "silent_automation":
-            # Silent receipts authorize one server-owned workflow. UI/API
-            # controls are not part of that receipt and must not widen the
-            # workflow after authorization.
+            # Silent automation owns one server-selected task configuration.
+            # Interactive Plan controls are not part of that task.
             response_mode = ""
             plan_ack = {}
             plan_auto_execute = False
 
         if execution_policy == "silent_automation":
-            # A silent authorization is a self-contained task receipt, not permission
-            # to expose either caller-supplied or persisted chat context.
+            # Silent automation is a self-contained internal task, not part of
+            # the user's canonical chat history.
             history = []
             system_prompt = None
             current_turn_reference_image = ""
@@ -6319,9 +6318,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Explicit skill selection is triggered ONLY by metadata.skill_slug —
         # never by sniffing the message text. Ordinary turns may pre-expand the
-        # selected Skill through the zet_agent hook. Verified silent turns keep
-        # the trusted task/slug but skip pre-expansion entirely: their first
-        # model action must load the startup-snapshotted bytes through skill_view.
+        # selected Skill through the zet_agent hook. Silent video turns keep
+        # the task/slug as routing metadata but skip pre-expansion: the ordinary
+        # video_edit plugin tools are exposed directly, with no skill_view or
+        # capability/attestation hop.
         # The expansion runs LATE on purpose; the placement is load-bearing:
         #   - AFTER session_id is final, so skill templates resolve
         #     ${HERMES_SESSION_ID} against the real session (session_id is
@@ -6367,9 +6367,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        # Silent receipts authorize the server-side workflow and its configured
-        # route. Request-level model/provider/options must not become an
-        # unbound exfiltration or cost-control switch.
+        # Silent tasks run on the server-selected runtime. Request-level
+        # model/provider/options must not become an unbound exfiltration or
+        # cost-control switch.
         model_name = (
             self._model_name
             if execution_policy == "silent_automation"

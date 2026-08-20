@@ -25,6 +25,7 @@ from agent.context_compressor import ContextCompressor
 from agent.conversation_loop import (
     _consume_trusted_skill_slug,
     _consume_trusted_skill_task_message,
+    _hardware_scope_skill_slug,
 )
 from agent.turn_context import TurnContext, build_turn_context
 from agent.zet_agent_response_mode import (
@@ -38,6 +39,12 @@ from hermes_state import SessionDB
 
 _TEST_INTEGRITY_KEY_ID = "presets-test-202607"
 _TEST_INTEGRITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"\x09" * 32)
+
+
+def test_video_skill_slug_never_enters_hardware_trusted_scope():
+    assert _hardware_scope_skill_slug("video-edit-workflow-mini") == ""
+    assert _hardware_scope_skill_slug("/video_edit") == ""
+    assert _hardware_scope_skill_slug("camsnap") == "camsnap"
 
 
 class _FakeTodoStore:

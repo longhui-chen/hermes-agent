@@ -21,6 +21,20 @@ NORMALIZER_TIMEOUT_SECONDS = 1800
 MAX_STDOUT_BYTES = 64 * 1024
 MAX_STDERR_BYTES = 128 * 1024
 DEFAULT_PRESETS_ROOT = "/zettos/main/apps/com.zettlab.presets/current"
+_NORMALIZER_ENV_ALLOWLIST = frozenset({
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "LD_LIBRARY_PATH",
+    "ZETTLAB_UPLOAD_FFMPEG",
+    "ZETTLAB_UPLOAD_FFPROBE",
+})
 
 
 class NormalizeError(RuntimeError):
@@ -82,6 +96,20 @@ def _bounded(value: str, limit: int) -> str:
     return encoded[-limit:].decode("utf-8", "replace")
 
 
+def _normalizer_env() -> dict[str, str]:
+    """Build the media helper's data-only environment.
+
+    The normalizer needs paths/locale only.  Constructing an allowlist rather
+    than copying the Hermes process environment prevents every current or
+    retired bearer channel from reaching the packaged Python/ffmpeg process.
+    """
+    return {
+        key: value
+        for key in _NORMALIZER_ENV_ALLOWLIST
+        if (value := os.environ.get(key)) is not None
+    }
+
+
 def normalize_file(source: Path, workflow_id: str, index: int) -> Path:
     if not source.is_file() or source.is_symlink():
         raise NormalizeError("video input is unavailable")
@@ -107,6 +135,7 @@ def normalize_file(source: Path, workflow_id: str, index: int) -> Path:
             timeout=NORMALIZER_TIMEOUT_SECONDS,
             check=False,
             stdin=subprocess.DEVNULL,
+            env=_normalizer_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         target.unlink(missing_ok=True)

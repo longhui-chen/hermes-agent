@@ -2135,6 +2135,20 @@ AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
 })
+# These names belonged to the removed video BusinessExecution transport.  Keep
+# them in the scrub set (built from fragments so the retirement guard cannot
+# mistake a defensive cleanup list for a reintroduced wire protocol), but
+# never inject them into a child process.  The generic Agent action token above
+# remains available to unrelated creator/connector skills.
+_RETIRED_VIDEO_EXECUTION_PREFIX = "ZETTLAB_BUSINESS_EXECUTION_"
+RETIRED_VIDEO_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "TOKEN",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION_VERSION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "SCOPE_DIGEST",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "CAPABILITY",
+    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+})
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
 })
@@ -2151,6 +2165,7 @@ PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
     | HARDWARE_RUNTIME_ENV_KEYS
+    | RETIRED_VIDEO_EXECUTION_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
     | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
 )

@@ -41,6 +41,7 @@ from tools.environments import local as local_env_module
 from tools.environments.local import (
     LocalEnvironment,
     PROFILE_SCOPED_SUBPROCESS_ENV_KEYS,
+    RETIRED_VIDEO_EXECUTION_ENV_KEYS,
     _make_run_env,
     _sanitize_subprocess_env,
     build_connector_runtime_env,
@@ -49,6 +50,19 @@ from tools.environments.local import (
 
 # The full set of session vars the bridge owns.
 SESSION_VARS = list(_VAR_MAP.keys())
+
+
+def test_retired_video_execution_environment_is_scrubbed_without_touching_generic_action_token():
+    env = {key: "stale" for key in RETIRED_VIDEO_EXECUTION_ENV_KEYS}
+    env["ZETTLAB_AGENT_ACTION_TOKEN"] = "unrelated-skill-token"
+    env["PATH"] = "/usr/bin"
+
+    result = local_env_module._sanitize_subprocess_env(env)
+
+    for key in RETIRED_VIDEO_EXECUTION_ENV_KEYS:
+        assert key not in result
+    assert result.get("ZETTLAB_AGENT_ACTION_TOKEN") != "unrelated-skill-token"
+    assert result["PATH"] == "/usr/bin"
 
 
 @pytest.fixture(autouse=True)

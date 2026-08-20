@@ -163,6 +163,38 @@ def test_silent_automation_uses_minimal_positive_tool_allowlist():
     } == {"terminal"}
 
 
+def test_silent_video_turn_exposes_ordinary_plugin_tools_without_skill_view():
+    def tool(name):
+        return {"type": "function", "function": {"name": name}}
+
+    video_names = {
+        "video_edit_preferences_resolve",
+        "video_edit_upload_assets",
+        "video_edit_create_project",
+        "video_edit_wait_project",
+        "video_edit_download_result",
+    }
+    agent = type("Agent", (), {})()
+    agent.tools = [tool(name) for name in (*video_names, "skill_view", "terminal")]
+    agent.valid_tool_names = {
+        item["function"]["name"] for item in agent.tools
+    }
+
+    _apply_execution_policy(
+        agent,
+        "silent_automation",
+        trusted_skill_slug="video-edit-workflow-mini",
+    )
+
+    assert agent.valid_tool_names == video_names
+    assert {
+        item["function"]["name"] for item in agent.tools
+    } == video_names
+    assert agent._zet_agent_video_edit_turn is True
+    assert "skill_view" not in agent.valid_tool_names
+    assert "terminal" not in agent.valid_tool_names
+
+
 def test_unknown_execution_policy_leaves_tool_snapshot_unchanged():
     tools = [{"type": "function", "function": {"name": "clarify"}}]
     agent = type("Agent", (), {})()

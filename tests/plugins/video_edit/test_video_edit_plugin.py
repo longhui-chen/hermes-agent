@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from plugins.video_edit import client, normalizer, paths, tools
+from plugins.video_edit import client, normalizer, paths, preferences, tools
 import plugins.video_edit as video_plugin
 
 
@@ -91,6 +91,8 @@ def test_normalizer_is_a_separate_bounded_plugin_adapter(isolated_video_home, mo
     script = tmp_path / "normalize.py"
     script.write_text("# test helper", encoding="utf-8")
     monkeypatch.setenv("ZETTLAB_VIDEO_NORMALIZER", str(script))
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "must-not-reach-helper")
+    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "retired")
     calls = []
 
     def fake_run(command, **kwargs):
@@ -104,6 +106,8 @@ def test_normalizer_is_a_separate_bounded_plugin_adapter(isolated_video_home, mo
     assert result.read_bytes() == b"normalized"
     assert calls and calls[0][0][:2] == [normalizer.sys.executable, str(script)]
     assert calls[0][1]["check"] is False
+    assert "ZETTLAB_AGENT_ACTION_TOKEN" not in calls[0][1]["env"]
+    assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in calls[0][1]["env"]
     normalizer.cleanup([result], "workflow-1")
     assert not result.exists()
 
@@ -188,6 +192,69 @@ def test_preferences_and_workflows_are_isolated_between_agents(isolated_video_ho
     assert "workflow not found" in cross_agent["error"]
 
 
+def test_preference_memory_is_bounded_and_keeps_recent_scene_updates(isolated_video_home):
+    for index in range(preferences.MAX_SCENES + 9):
+        result = preferences.update(
+            "agent-a",
+            "scene",
+            f"scene-{index}",
+            "hard",
+            "set",
+            {"style": f"style-{index}"},
+        )
+        assert result["ok"] is True
+
+    path = isolated_video_home[0] / "video_edit" / "agent-a" / "preferences.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert len(payload["scenes"]) <= preferences.MAX_SCENES
+    assert len(path.read_bytes()) <= preferences.MAX_PREFERENCE_BYTES
+    assert "scene-0" not in payload["scenes"]
+    assert payload["scenes"][f"scene-{preferences.MAX_SCENES + 8}"]["hard"]["style"] == (
+        f"style-{preferences.MAX_SCENES + 8}"
+    )
+
+    preferences.update(
+        "agent-a", "scene", "scene-9", "hard", "set", {"style": "touched"}
+    )
+    preferences.update(
+        "agent-a",
+        "scene",
+        f"scene-{preferences.MAX_SCENES + 9}",
+        "hard",
+        "set",
+        {"style": "newest"},
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "scene-9" in payload["scenes"]
+    assert "scene-10" not in payload["scenes"]
+
+
+def test_oversized_existing_scene_is_dropped_during_read(isolated_video_home, monkeypatch):
+    monkeypatch.setattr(preferences, "MAX_SCENE_BYTES", 64)
+    path = isolated_video_home[0] / "video_edit" / "agent-a" / "preferences.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "global": {"hard": {}, "soft": {}},
+                "scenes": {
+                    "too-large": {
+                        "hard": {"user_prompt": "x" * 512},
+                        "soft": {"user_prompt": "y" * 512},
+                    },
+                    "valid": {"hard": {"style": "travel"}, "soft": {}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = preferences.resolve("agent-a", "valid", {}, silent=True)
+    assert resolved["preferences"]["style"] == "travel"
+    assert preferences.resolve("agent-a", "too-large", {}, silent=True)["memory_hit"] is False
+
+
 def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated_video_home, monkeypatch, tmp_path):
     source = isolated_video_home[1] / "agent-a" / "input.mov"
     source.parent.mkdir(parents=True)
@@ -199,6 +266,17 @@ def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated
     assert not any("Business-Execution" in key or "Action-Version" in key for key in headers)
     other_profile = client._headers("projects", {"x": 1}, agent_id="agent-b")
     assert headers["Idempotency-Key"] != other_profile["Idempotency-Key"]
+    first_edit = client._headers(
+        "projects", {"x": 1}, agent_id="agent-a", replay_scope="workflow-1"
+    )
+    resumed_edit = client._headers(
+        "projects", {"x": 1}, agent_id="agent-a", replay_scope="workflow-1"
+    )
+    later_reedit = client._headers(
+        "projects", {"x": 1}, agent_id="agent-a", replay_scope="workflow-2"
+    )
+    assert first_edit["Idempotency-Key"] == resumed_edit["Idempotency-Key"]
+    assert first_edit["Idempotency-Key"] != later_reedit["Idempotency-Key"]
 
     workflow = json.loads(
         tools.handle_preferences_resolve(
@@ -211,9 +289,18 @@ def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated
         tools.handle_upload_assets({"workflow_id": workflow, "files": [str(source)]}, agent_id="agent-a")
     )
     assert uploaded["uploaded"] == 1
-    monkeypatch.setattr(client, "create_project", lambda keys, prefs, user_prompt="", **kwargs: {"project_id": "project-1", "status": "queued"})
+    project_scopes = []
+    monkeypatch.setattr(
+        client,
+        "create_project",
+        lambda keys, prefs, user_prompt="", **kwargs: (
+            project_scopes.append(kwargs.get("workflow_id"))
+            or {"project_id": "project-1", "status": "queued"}
+        ),
+    )
     created = json.loads(tools.handle_create_project({"workflow_id": workflow, "user_prompt": "make a vlog"}, agent_id="agent-a"))
     assert created["project_id"] == "project-1"
+    assert project_scopes == [workflow]
     monkeypatch.setattr(client, "poll_project", lambda project_id, timeout=120, **kwargs: {"project_id": project_id, "status": "completed", "result_url": "https://cdn.example.test/result.mp4"})
     waited = json.loads(tools.handle_wait_project({"workflow_id": workflow, "max_wait_seconds": 15}, agent_id="agent-a"))
     assert waited["continue_required"] is False

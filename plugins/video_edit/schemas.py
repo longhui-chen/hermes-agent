@@ -35,9 +35,12 @@ _PREFERENCES = {
 TOOL_DEFINITIONS = [
     _tool(
         "video_edit_preferences_resolve",
-        "Resolve explicit, remembered, and default creative choices for one video-edit task. This never asks the user for authorization.",
+        "Resolve explicit, remembered, and default creative choices for one video-edit task and continue with sensible defaults.",
         {
-            "task_id": {"type": "string", "description": "Stable task key for retry/resume."},
+            "task_id": {
+                "type": "string",
+                "description": "Stable key for one edit: reuse it for retry/resume, choose a new value for an explicit re-edit.",
+            },
             "scene": {"type": "string", "maxLength": 64},
             "preferences": _PREFERENCES,
             "silent": {"type": "boolean", "description": "True for memory-hit or proactive runs; unresolved choices use defaults."},
@@ -68,7 +71,7 @@ TOOL_DEFINITIONS = [
     ),
     _tool(
         "video_edit_upload_assets",
-        "Upload bounded video assets for a workflow. Interactive edits pass files; proactive edits omit files and reuse the plugin-owned manifest checkpoint. Paths are validated locally and never become an authorization token.",
+        "Upload bounded video assets for a workflow. Interactive edits pass files; proactive edits omit files and reuse the plugin-owned manifest checkpoint. Paths are validated locally.",
         {
             "workflow_id": {"type": "string"},
             "files": {"type": "array", "items": {"type": "string"}, "maxItems": 8},

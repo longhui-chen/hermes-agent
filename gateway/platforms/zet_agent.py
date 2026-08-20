@@ -250,12 +250,29 @@ _ONBOARDING_CLOSE_TIMEOUT_SECONDS = 30.0
 
 
 _SILENT_AUTOMATION_ALLOWED_TOOLS = frozenset({
-    # Explicit skill selection forces the attested first skill_view call.
+    # Generic silent turns retain the existing narrow bootstrap. Hardware
+    # helpers still require their independent attested scope before dispatch.
     "skill_view",
-    # terminal may still be used by the generic hardware trust path; video
-    # editing is provided by ordinary plugin tools and never enters it.
     "terminal",
 })
+
+_VIDEO_EDIT_SKILL_SLUGS = frozenset({
+    "video-edit-workflow-mini",
+    "video-edit-workflow",
+    "video-edit",
+    "video_edit",
+})
+
+
+def _is_video_edit_skill_slug(slug: str) -> bool:
+    normalized = str(slug or "").strip().lower().strip("/")
+    return normalized in _VIDEO_EDIT_SKILL_SLUGS or normalized.startswith(
+        ("video-edit-", "video_edit_")
+    )
+
+
+def _is_video_edit_tool_name(name: str) -> bool:
+    return str(name or "").strip().lower().startswith("video_edit_")
 
 
 def _agent_tool_name(tool: Any) -> str:
@@ -267,30 +284,54 @@ def _agent_tool_name(tool: Any) -> str:
     return str(tool.get("name") or "")
 
 
-def _apply_execution_policy(agent: Any, execution_policy: str) -> None:
-    """Bootstrap a trusted silent turn with no side-effect tool exposed."""
+def _apply_execution_policy(
+    agent: Any,
+    execution_policy: str,
+    trusted_skill_slug: str = "",
+) -> None:
+    """Apply silent tool visibility without creating a video auth channel.
+
+    Video editing is an ordinary plugin toolset.  A silent video turn gets the
+    same bounded plugin tools directly; it does not first expose ``skill_view``
+    or wait for a trusted-skill attestation.  Other silent turns retain the
+    existing generic bootstrap and hardware fail-closed scope.
+    """
     if execution_policy != "silent_automation":
         return
+    video_edit_turn = _is_video_edit_skill_slug(trusted_skill_slug)
+
+    def _allowed_name(name: str) -> bool:
+        if video_edit_turn:
+            return _is_video_edit_tool_name(name)
+        return name in _SILENT_AUTOMATION_ALLOWED_TOOLS
+
     allowed_tools = [
         tool
         for tool in list(getattr(agent, "tools", ()) or ())
-        if _agent_tool_name(tool) in _SILENT_AUTOMATION_ALLOWED_TOOLS
+        if _allowed_name(_agent_tool_name(tool))
     ]
     allowed_names = {
         name
         for name in set(getattr(agent, "valid_tool_names", ()) or ())
-        if name in _SILENT_AUTOMATION_ALLOWED_TOOLS
+        if _allowed_name(name)
     }
-    # The model may not see terminal until an exact startup-snapshotted skill
-    # has been attested for this turn. Keeping the bounded snapshot private on
-    # the agent lets attestation restore only the policy/skill intersection.
+    # Keep the bounded snapshot private on the agent so a later MCP refresh
+    # cannot widen the toolset behind the policy.
     agent._zet_agent_execution_policy = execution_policy
     agent._zet_agent_execution_policy_tools = allowed_tools
     agent._zet_agent_execution_policy_valid_tool_names = allowed_names
-    agent.tools = [
-        tool for tool in allowed_tools if _agent_tool_name(tool) == "skill_view"
-    ]
-    agent.valid_tool_names = {"skill_view"} & allowed_names
+    if video_edit_turn:
+        # The plugin owns its own bounded request/replay adapter.  Keeping the
+        # tools visible avoids a synthetic skill_view/attestation hop and lets
+        # the model continue a long or resumed edit directly from durable state.
+        agent.tools = list(allowed_tools)
+        agent.valid_tool_names = set(allowed_names)
+    else:
+        agent.tools = [
+            tool for tool in allowed_tools if _agent_tool_name(tool) == "skill_view"
+        ]
+        agent.valid_tool_names = {"skill_view"} & allowed_names
+    agent._zet_agent_video_edit_turn = video_edit_turn
     # A between-turn MCP refresh rebuilds the complete configured toolset and
     # would silently reintroduce non-allowlisted tools before model dispatch.
     # This agent exists for one internal turn, so preserve the exact snapshot.
@@ -3263,6 +3304,9 @@ class ZetAgentAdapter(APIServerAdapter):
         execution_policy = str(
             agent_request_overrides.pop("_zet_execution_policy", "") or ""
         ).strip().lower()
+        trusted_skill_slug = str(
+            agent_request_overrides.pop("_zet_trusted_skill_slug", "") or ""
+        ).strip()
         silent_execution = execution_policy == "silent_automation"
         disable_tools = (
             not silent_execution
@@ -3664,8 +3708,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 reused_onboarding_agent,
             )
         if execution_policy == "silent_automation":
-            # A trusted silent turn may share a lineage identifier for request
-            # authorization, but it is not part of the user's canonical chat.
+            # A silent turn may share a lineage identifier for continuity, but
+            # it is not part of the user's canonical chat.
             # Disable every SessionDB/JSON persistence path before the turn can
             # append its internal prompt, tool results, or final response.
             agent._persist_disabled = True
@@ -3676,7 +3720,11 @@ class ZetAgentAdapter(APIServerAdapter):
             agent.valid_tool_names = set()
             agent._skip_mcp_refresh = True
         else:
-            _apply_execution_policy(agent, execution_policy)
+            _apply_execution_policy(
+                agent,
+                execution_policy,
+                trusted_skill_slug,
+            )
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider")
             or getattr(agent, "provider", "")
@@ -3895,6 +3943,10 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         from gateway.session_context import zettlab_auth_principal
         request_overrides = dict(request_overrides or {})
+        # Private bootstrap metadata consumed and removed by this adapter's
+        # _create_agent. It selects the ordinary video plugin toolset for a
+        # silent task and never reaches AIAgent or a provider request.
+        request_overrides["_zet_trusted_skill_slug"] = trusted_skill_slug
         # Capture before base _run_agent hops to its executor. The principal
         # remains private request metadata, never a model argument.
         principal = zettlab_auth_principal()

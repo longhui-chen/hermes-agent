@@ -27,6 +27,15 @@ VALID_DIRECTIVES = frozenset({
     "no_captions", "preserve_dialogue",
 })
 
+# Preference memory is intentionally a small bounded continuity aid, not an
+# unbounded transcript or authorization ledger.  Scene order is used as a
+# deterministic LRU approximation: updates move a scene to the end, and old
+# entries are dropped when the cap is reached.
+MAX_SCENES = 64
+MAX_SCENE_NAME_BYTES = 64
+MAX_SCENE_BYTES = 8 * 1024
+MAX_PREFERENCE_BYTES = 256 * 1024
+
 
 class PreferenceError(ValueError):
     pass
@@ -36,6 +45,47 @@ def _empty() -> dict[str, Any]:
     return {"version": 1, "global": {"hard": {}, "soft": {}}, "scenes": {}}
 
 
+def _bounded_data(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise PreferenceError("video preference memory is invalid")
+
+    global_value = value.get("global")
+    if not isinstance(global_value, dict):
+        global_value = {}
+    global_data = {
+        "hard": _clean_preferences(global_value.get("hard", {})),
+        "soft": _clean_preferences(global_value.get("soft", {})),
+    }
+
+    scenes_value = value.get("scenes")
+    if not isinstance(scenes_value, dict):
+        scenes_value = {}
+    scenes: dict[str, dict[str, dict[str, Any]]] = {}
+    for raw_name, raw_scene in scenes_value.items():
+        if not isinstance(raw_scene, dict):
+            continue
+        name = str(raw_name).strip()[:MAX_SCENE_NAME_BYTES]
+        if not name:
+            continue
+        scene = {
+            "hard": _clean_preferences(raw_scene.get("hard", {})),
+            "soft": _clean_preferences(raw_scene.get("soft", {})),
+        }
+        encoded_scene = json.dumps(
+            scene, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded_scene) > MAX_SCENE_BYTES:
+            continue
+        scenes[name] = scene
+
+    if len(scenes) > MAX_SCENES:
+        # JSON preserves insertion order.  The update path touches a scene by
+        # moving it to the end, so retaining the tail is a deterministic LRU
+        # eviction without storing an unbounded timestamp per scene.
+        scenes = dict(list(scenes.items())[-MAX_SCENES:])
+    return {"version": 1, "global": global_data, "scenes": scenes}
+
+
 def _read(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -43,11 +93,7 @@ def _read(path: Path) -> dict[str, Any]:
         return _empty()
     except (OSError, ValueError) as exc:
         raise PreferenceError("video preference memory is unreadable") from exc
-    if not isinstance(value, dict) or value.get("version") != 1:
-        raise PreferenceError("video preference memory is invalid")
-    value.setdefault("global", {"hard": {}, "soft": {}})
-    value.setdefault("scenes", {})
-    return value
+    return _bounded_data(value)
 
 
 def _clean_preferences(raw: Any) -> dict[str, Any]:
@@ -81,7 +127,13 @@ def _clean_preferences(raw: Any) -> dict[str, Any]:
 
 
 def _write(path: Path, data: dict[str, Any]) -> None:
-    payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    bounded = _bounded_data(data)
+    payload = json.dumps(
+        bounded, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(payload) > MAX_PREFERENCE_BYTES:
+        raise PreferenceError("video preference memory exceeds its bounded size")
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
         os.fchmod(fd, 0o600)
@@ -100,7 +152,11 @@ def _target(data: dict[str, Any], scope: str, scene: str) -> dict[str, Any]:
         return data["global"]
     if scope != "scene" or not scene:
         raise PreferenceError("scene scope requires a scene")
-    return data["scenes"].setdefault(scene, {"hard": {}, "soft": {}})
+    target = data["scenes"].setdefault(scene, {"hard": {}, "soft": {}})
+    # Touch the scene so the bounded tail behaves as an LRU on the next write.
+    data["scenes"].pop(scene, None)
+    data["scenes"][scene] = target
+    return target
 
 
 def resolve(agent_id: str, scene: str, explicit: Any, *, silent: bool = False) -> dict[str, Any]:

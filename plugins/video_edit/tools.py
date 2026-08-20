@@ -186,7 +186,13 @@ def handle_create_project(args: dict, **kwargs: Any) -> str:
         existing = str(entry.get("project_id") or "").strip()
         if existing:
             return _ok({"ok": True, "workflow_id": workflow_id, "project_id": existing, "reused": True, "next": "video_edit_wait_project"})
-        project = client.create_project(object_keys, dict(entry.get("preferences") or {}), user_prompt=str(args.get("user_prompt") or ""), agent_id=agent_id)
+        project = client.create_project(
+            object_keys,
+            dict(entry.get("preferences") or {}),
+            user_prompt=str(args.get("user_prompt") or ""),
+            agent_id=agent_id,
+            workflow_id=workflow_id,
+        )
         project_id = str(project.get("project_id") or "").strip()
         if not project_id:
             raise client.VideoClientError("video project id is missing")
