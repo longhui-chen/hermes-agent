@@ -413,7 +413,11 @@ def _task_control(
     return envelope
 
 
-def _fresh_observation(args: dict[str, Any], params: dict[str, Any]) -> dict[str, Any] | None:
+def _fresh_observation(
+    args: dict[str, Any],
+    params: dict[str, Any],
+    task_id: str,
+) -> dict[str, Any] | None:
     """Re-observe the exact target after a successful mutation.
 
     This mirrors Codex Computer Use's capture-after contract while keeping the
@@ -433,6 +437,10 @@ def _fresh_observation(args: dict[str, Any], params: dict[str, Any]) -> dict[str
         if isinstance(params.get("pid"), int) and isinstance(params.get("window_id"), int):
             observation_params.update(pid=params["pid"], window_id=params["window_id"])
     try:
+        task_control = _task_control(args, "snapshot", observation_params, task_id, "")
+    except ValueError:
+        return None
+    try:
         with requests.Session() as client:
             client.trust_env = False
             response = client.post(
@@ -442,15 +450,30 @@ def _fresh_observation(args: dict[str, Any], params: dict[str, Any]) -> dict[str
                     "X-Zettlab-Agent-Action-Token": str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
                     "X-Zettlab-Browser-Session-Token": _session_token(),
                 },
-                json={"session_id": _session_id(), "action": action, "params": observation_params},
+                json={
+                    "session_id": _session_id(),
+                    "action": action,
+                    "params": observation_params,
+                    **({"task_control": task_control} if task_control else {}),
+                },
                 timeout=_TIMEOUT_SECONDS,
             )
-            if not response.ok or len(response.content) > _MAX_RESPONSE_BYTES:
+            if not getattr(response, "ok", True) or len(response.content) > _MAX_RESPONSE_BYTES:
                 return None
             payload = response.json()
             return payload.get("result") if isinstance(payload, dict) else None
     except (requests.RequestException, ValueError):
         return None
+
+
+def _invalid_parameters_hint(args: dict[str, Any], action: str) -> str:
+    if action == "click":
+        if "button" in args and args.get("button") not in {"left", "right", "middle"}:
+            return "button is a mouse button; use element from the latest snapshot or coordinate=[x,y] for the control"
+        return "refresh snapshot and provide exactly one target: element or coordinate=[x,y]"
+    if action in {"type_text", "keystroke"}:
+        return "refresh snapshot and provide element or coordinate=[x,y] together with text/key"
+    return "refresh the exact app/window snapshot and reuse only its returned identifiers"
 
 
 def pc_ui_tool(
@@ -487,7 +510,11 @@ def pc_ui_tool(
         return json.dumps({"success": False, "code": "invalid_action"})
     params = _params(args, action)
     if params is None:
-        return json.dumps({"success": False, "code": "invalid_parameters"})
+        return json.dumps({
+            "success": False,
+            "code": "invalid_parameters",
+            "hint": _invalid_parameters_hint(args, action),
+        }, ensure_ascii=False)
     try:
         task_control = _task_control(args, action, params, task_id, tool_call_id)
     except ValueError:
@@ -543,7 +570,7 @@ def pc_ui_tool(
         and args.get("capture_after", True)
         and action not in _READ_ACTIONS
     ):
-        observed = _fresh_observation(args, params)
+        observed = _fresh_observation(args, params, task_id)
         if observed is not None:
             result_payload = payload.get("result")
             if isinstance(result_payload, dict):

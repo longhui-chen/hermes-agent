@@ -143,6 +143,7 @@ def test_pc_ui_injects_runtime_task_identity_without_exposing_scope_to_model(mon
             "snapshot_revision": 7,
             "user_input_epoch": 3,
             "postcondition": [{"window": {"exists": True}}],
+            "capture_after": False,
         },
         task_id="turn-1",
         tool_call_id="call-1",
@@ -309,6 +310,54 @@ def test_pc_ui_complete_bounded_action_surface_and_target_rules():
     ) is None
     assert module._params({"x": 1, "y": 2}, "move_cursor") is None
     assert module._params({"file_path": "/tmp/secret"}, "clipboard_write") is None
+
+
+def test_pc_ui_accepts_codex_computer_use_aliases_and_coordinate_targets():
+    assert module._params(
+        {"pid": 42, "window_id": 7, "x": 10, "y": 20}, "click"
+    ) == {"pid": 42, "window_id": 7, "x": 10, "y": 20}
+    assert module._ACTION_ALIASES == {
+        "capture": "snapshot",
+        "double_click": "click",
+        "right_click": "click",
+        "middle_click": "click",
+        "type": "type_text",
+        "key": "keystroke",
+    }
+    invalid = json.loads(module.pc_ui_tool({
+        "action": "click", "pid": 42, "window_id": 7, "button": "equals",
+    }))
+    assert invalid["code"] == "invalid_parameters"
+    assert "element" in invalid["hint"]
+
+
+def test_pc_ui_mutation_observes_same_window_after_success(monkeypatch):
+    _configure(monkeypatch)
+    calls = []
+
+    class _ObserveClient(_Client):
+        def post(self, url, **kwargs):
+            calls.append(kwargs["json"])
+            if kwargs["json"]["action"] == "ui.snapshot":
+                return _Response()
+            return _Response()
+
+    monkeypatch.setattr(module.requests, "Session", _ObserveClient)
+    result = module.pc_ui_tool({
+        "action": "right_click",
+        "app": "Calculator",
+        "pid": 42,
+        "window_id": 7,
+        "coordinate": [10, 20],
+    }, task_id="turn-1", tool_call_id="call-1")
+    assert json.loads(result)["success"] is True
+    assert calls[0]["action"] == "ui.click"
+    assert calls[0]["params"]["button"] == "right"
+    assert calls[0]["params"]["x"] == 10
+    assert calls[1]["action"] == "ui.snapshot"
+    assert calls[1]["params"] == {"app": "Calculator", "pid": 42, "window_id": 7}
+    assert calls[1]["task_control"]["task_id"] == module._wire_task_id("turn-1")
+    assert "operation_id" not in calls[1]["task_control"]
 
 
 def test_pc_ui_normalizes_schema_visible_context_without_weakening_fences():
