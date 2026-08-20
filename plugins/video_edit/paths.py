@@ -137,10 +137,13 @@ def output_root(agent_id: str) -> Path:
     root.mkdir(mode=0o750, parents=True, exist_ok=True)
     if root.is_symlink():
         raise VideoPathError("agent output directory is a symlink")
-    # agent-specific buckets keep concurrent profiles from sharing artifacts.
-    bucket = root / safe_id(agent_id)
-    bucket.mkdir(mode=0o750, parents=True, exist_ok=True)
-    return bucket
+    # local-server injects ZET_AGENT_OUTPUT_DIR as
+    # <agents-data>/<agent_id>/output for the active multiplex profile. Adding
+    # agent_id again would create output/<agent_id>/... and make the first
+    # child look like a session bucket to produced-file validation.
+    if not safe_id(agent_id, fallback=""):
+        raise VideoPathError("agent id is invalid")
+    return root
 
 
 def result_path(

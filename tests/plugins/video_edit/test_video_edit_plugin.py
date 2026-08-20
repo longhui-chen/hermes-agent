@@ -449,6 +449,11 @@ def test_output_root_rejects_a_symlink(tmp_path, monkeypatch):
         paths.output_root("agent-a")
 
 
+def test_output_root_does_not_duplicate_profile_bucket(isolated_video_home):
+    """ZET_AGENT_OUTPUT_DIR is already scoped to the active agent profile."""
+    assert paths.output_root("agent-a") == isolated_video_home[1].resolve()
+
+
 def test_upload_normalized_intermediates_are_cleaned_after_each_batch(isolated_video_home, monkeypatch, tmp_path):
     source = isolated_video_home[1] / "agent-a" / "input.mov"
     source.parent.mkdir(parents=True)
@@ -579,5 +584,5 @@ def test_proactive_download_uses_server_trigger_output_bucket(
 
     assert delivered["ok"] is True
     assert delivered["output"].endswith(
-        "/output/agent-a/proactive-pvm-trigger-bucket-test/weekly.mp4"
+        "/output/proactive-pvm-trigger-bucket-test/weekly.mp4"
     )
