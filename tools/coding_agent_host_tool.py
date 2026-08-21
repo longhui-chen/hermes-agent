@@ -1,4 +1,4 @@
-"""Read-only Provider discovery for the authorized Coding Agent Host."""
+"""Session-scoped Coding Agent control for the authorized Coding Agent Host."""
 
 from __future__ import annotations
 
