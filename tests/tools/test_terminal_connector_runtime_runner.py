@@ -33,6 +33,20 @@ def _write_connector_runtime(tmp_path, skill_id="linear"):
     return script
 
 
+def _write_action_runtime(tmp_path, skill_id="software-quality-connector-actions"):
+    script = tmp_path / "presets" / "skills" / skill_id / "scripts" / "action_runtime.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(textwrap.dedent(
+        """
+        import os
+
+        print("action token ok: " + str(os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "runner-token"))
+        print("action_route=" + os.environ.get("HERMES_SESSION_KEY", ""))
+        """
+    ).lstrip())
+    return script
+
+
 def _write_connector_runtime_with_import(tmp_path):
     script = tmp_path / "presets" / "skills" / "linear" / "scripts" / "connector_runtime.py"
     script.parent.mkdir(parents=True)
@@ -104,6 +118,37 @@ def test_connector_runtime_direct_runner_flow_receives_profile_scoped_env(monkey
     assert result["exit_code"] == 0
     assert "connector token ok: True" in result["output"]
     assert "connector_agent=agent-1" in result["output"]
+
+
+def test_action_runtime_direct_runner_flow_receives_turn_capability(monkeypatch, tmp_path):
+    """Action V2's distinct entrypoint remains inside the trusted runner."""
+    _write_action_runtime(tmp_path)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "agent-1")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "turn-capability")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_ensure_sensitive_runtime_boundary",
+        lambda: True,
+    )
+
+    result = json.loads(terminal_tool_module.terminal_tool(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/software-quality-connector-actions/scripts/action_runtime.py" '
+        'call connector.search --first-party-only --args-json "{}"',
+        task_id="action-runtime-direct-test",
+    ))
+
+    assert result["connector_runtime_direct"] is True
+    assert result["exit_code"] == 0
+    assert "action token ok: True" in result["output"]
+    assert "action_route=turn-capability" in result["output"]
 
 
 def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatch, tmp_path):
@@ -625,6 +670,9 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     non_presets = terminal_tool_module._parse_connector_runtime_command(
         f"python3 {script.parent.parent / 'connector_runtime.py'}"
     )
+    not_allowed = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/not_allowed.py" list-tools'
+    )
 
     assert direct is not None
     assert unquoted_braced is not None
@@ -635,6 +683,7 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     assert newline_compound is None
     assert quoted_punctuation is not None
     assert non_presets is None
+    assert not_allowed is None
 
 
 def test_shell_guard_blocks_wrapped_unquoted_braced_presets_path(monkeypatch, tmp_path):
