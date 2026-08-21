@@ -42,6 +42,7 @@ def _write_action_runtime(tmp_path, skill_id="software-quality-connector-actions
 
         print("action token ok: " + str(os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "runner-token"))
         print("action_route=" + os.environ.get("HERMES_SESSION_KEY", ""))
+        print("action_runtime=" + os.environ.get("ZETTLAB_CONNECTOR_ACTION_RUNTIME", ""))
         """
     ).lstrip())
     return script
@@ -122,12 +123,14 @@ def test_connector_runtime_direct_runner_flow_receives_profile_scoped_env(monkey
 
 def test_action_runtime_direct_runner_flow_receives_turn_capability(monkeypatch, tmp_path):
     """Action V2's distinct entrypoint remains inside the trusted runner."""
+    from gateway.session_context import set_zettlab_connector_route_capability
+
     _write_action_runtime(tmp_path)
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
     monkeypatch.setenv("ZET_AGENT_ID", "agent-1")
-    monkeypatch.setenv("HERMES_SESSION_KEY", "turn-capability")
+    set_zettlab_connector_route_capability("turn-capability")
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
@@ -139,16 +142,44 @@ def test_action_runtime_direct_runner_flow_receives_turn_capability(monkeypatch,
         lambda: True,
     )
 
-    result = json.loads(terminal_tool_module.terminal_tool(
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/software-quality-connector-actions/scripts/action_runtime.py" '
-        'call connector.search --first-party-only --args-json "{}"',
-        task_id="action-runtime-direct-test",
-    ))
+    try:
+        result = json.loads(terminal_tool_module.terminal_tool(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/software-quality-connector-actions/scripts/action_runtime.py" '
+            'call connector.search --first-party-only --args-json "{}"',
+            task_id="action-runtime-direct-test",
+        ))
+    finally:
+        set_zettlab_connector_route_capability("")
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
     assert "action token ok: True" in result["output"]
     assert "action_route=turn-capability" in result["output"]
+    assert (
+        "action_runtime=skills/software-quality-connector-actions/scripts/action_runtime.py"
+        in result["output"]
+    )
+
+
+def test_connector_action_runtime_identity_is_not_inherited_by_generic_or_env_builder(
+    monkeypatch,
+) -> None:
+    """Only terminal_tool may mint the identity after direct-runner verification."""
+    from tools.environments.local import (
+        CONNECTOR_ACTION_RUNTIME_ENV_KEY,
+        _sanitize_subprocess_env,
+        build_connector_runtime_env,
+    )
+
+    untrusted = "skills/attacker/scripts/action_runtime.py"
+    monkeypatch.setenv(CONNECTOR_ACTION_RUNTIME_ENV_KEY, untrusted)
+
+    assert CONNECTOR_ACTION_RUNTIME_ENV_KEY not in _sanitize_subprocess_env(
+        dict(os.environ)
+    )
+    assert CONNECTOR_ACTION_RUNTIME_ENV_KEY not in build_connector_runtime_env(
+        {CONNECTOR_ACTION_RUNTIME_ENV_KEY: untrusted}
+    )
 
 
 def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatch, tmp_path):
@@ -164,6 +195,11 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_ensure_sensitive_runtime_boundary",
+        lambda: True,
     )
     captured = {}
 
@@ -189,6 +225,9 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
     assert "ZETTLAB_CONNECTORS_URL" not in captured["base_env"]
     assert captured["injected_env"]["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "runner-token"
     assert captured["injected_env"]["ZETTLAB_CONNECTORS_URL"] == "http://127.0.0.1/rpc"
+    assert captured["injected_env"]["ZETTLAB_CONNECTOR_ACTION_RUNTIME"] == (
+        "skills/linear/scripts/connector_runtime.py"
+    )
     assert captured["argv"][0].endswith("connector_runtime.py")
     assert captured["script_bytes"] == script.read_bytes()
 
