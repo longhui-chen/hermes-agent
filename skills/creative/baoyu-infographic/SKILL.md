@@ -1,6 +1,6 @@
 ---
 name: baoyu-infographic
-description: "Infographics: 21 layouts x 21 styles (信息图, 可视化)."
+description: "用多种布局和风格生成信息图与数据可视化。"
 version: 1.56.1
 author: 宝玉 (JimLiu)
 license: MIT
