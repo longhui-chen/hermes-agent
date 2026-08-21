@@ -1081,6 +1081,10 @@ import sys
 
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
+_CONNECTOR_RUNTIME_SCRIPTS = frozenset({
+    _CONNECTOR_RUNTIME_SCRIPT,
+    "action_runtime.py",
+})
 _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES = 1024 * 1024
 _CONNECTOR_RUNTIME_TRUST_MAX_PATHS = 8192
 _CONNECTOR_RUNTIME_TRUST_MAX_BYTES = 64 * 1024 * 1024
@@ -1542,7 +1546,7 @@ def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
     if len(parts) < 4:
         _log_connector_runtime_rejection("invalid_layout", str(relative))
         return None
-    if parts[-1] != _CONNECTOR_RUNTIME_SCRIPT:
+    if parts[-1] not in _CONNECTOR_RUNTIME_SCRIPTS:
         _log_connector_runtime_rejection("invalid_script_name", str(relative))
         return None
     if parts[-2] != "scripts" or parts[-4] != "skills":
@@ -1779,7 +1783,7 @@ def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntime
         if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
             return None
 
-    if Path(tokens[1]).name != _CONNECTOR_RUNTIME_SCRIPT:
+    if Path(tokens[1]).name not in _CONNECTOR_RUNTIME_SCRIPTS:
         return None
 
     script = _resolve_connector_runtime_script(tokens[1])
@@ -1940,7 +1944,7 @@ def _connector_runtime_python_script_index(
     segment: list[str],
     python_index: int,
     *,
-    script_name: str = _CONNECTOR_RUNTIME_SCRIPT,
+    script_name: str | None = None,
 ) -> Optional[int]:
     """Find a script after Python flags without interpreting ``-c``/``-m``."""
     position = python_index + 1
@@ -1959,10 +1963,13 @@ def _connector_runtime_python_script_index(
             if position >= len(segment):
                 return None
             position += 1
-    if (
-        position >= len(segment)
-        or Path(segment[position]).name != script_name
-    ):
+    if position >= len(segment):
+        return None
+    candidate_name = Path(segment[position]).name
+    allowed_names = (
+        _CONNECTOR_RUNTIME_SCRIPTS if script_name is None else {script_name}
+    )
+    if candidate_name not in allowed_names:
         return None
     return position
 
