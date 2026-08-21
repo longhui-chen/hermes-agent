@@ -350,7 +350,7 @@ TOOLSETS = {
 
     "zettlab_pc": {
         "description": "Use locally approved files and semantic Computer Use on the connected desktop",
-        "tools": ["pc_node_status", "pc_file", "pc_ui"],
+        "tools": ["pc_node_status", "pc_file", "pc_ui", "coding_agent_host"],
         "includes": []
     },
 
@@ -578,7 +578,7 @@ TOOLSETS = {
         # tools are scoped to the active generated-app profile and must not be
         # advertised by messaging or Cron platforms.
         "tools": _HERMES_CORE_TOOLS + [
-            "call_agent", "app_host", "app_data", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "ssh_control"
+            "call_agent", "app_host", "app_data", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "coding_agent_host", "ssh_control"
         ],
         "includes": []
     },
