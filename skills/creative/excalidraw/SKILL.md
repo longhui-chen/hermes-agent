@@ -1,6 +1,6 @@
 ---
 name: excalidraw
-description: "Hand-drawn Excalidraw JSON diagrams (arch, flow, seq)."
+description: "生成手绘风 Excalidraw 架构图、流程图和时序图。"
 version: 1.0.1
 author: Hermes Agent
 license: MIT
@@ -195,4 +195,3 @@ See `references/colors.md` for full color tables. Quick reference:
 - Do NOT use emoji in text -- they don't render in Excalidraw's font
 - For dark mode diagrams, see `references/dark-mode.md`
 - For larger examples, see `references/examples.md`
-

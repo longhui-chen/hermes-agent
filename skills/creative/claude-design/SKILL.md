@@ -1,6 +1,6 @@
 ---
 name: claude-design
-description: Design one-off HTML artifacts (landing, deck, prototype).
+description: "设计一次性 HTML 页面、演示稿和交互原型。"
 version: 1.1.0
 author: BadTechBandit
 license: MIT

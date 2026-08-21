@@ -1,6 +1,6 @@
 ---
 name: zettlab-memo-setup
-description: "Use, configure, theme, extend, and orchestrate Zettlab Memo."
+description: "安装、配置、扩展和管理 Zettlab Memo。"
 version: 3.1.0
 author: Zettlab
 license: MIT
