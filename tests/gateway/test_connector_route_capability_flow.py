@@ -38,6 +38,9 @@ def _write_connector_runtime(tmp_path):
 
             print(json.dumps({
                 "runner_session_key": os.environ.get("HERMES_SESSION_KEY", ""),
+                "connector_action_runtime": os.environ.get(
+                    "ZETTLAB_CONNECTOR_ACTION_RUNTIME", ""
+                ),
             }))
             """
         ).lstrip(),
@@ -72,6 +75,11 @@ async def test_http_capabilities_remain_isolated_through_direct_runner(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_ensure_sensitive_runtime_boundary",
+        lambda: True,
     )
 
     adapter = APIServerAdapter(
@@ -124,8 +132,15 @@ async def test_http_capabilities_remain_isolated_through_direct_runner(
                 _post("transcript-B", capability_b, "route-session-B"),
             )
 
-    assert result_a == {"runner_session_key": capability_a}
-    assert result_b == {"runner_session_key": capability_b}
+    expected_runtime = "skills/linear/scripts/connector_runtime.py"
+    assert result_a == {
+        "runner_session_key": capability_a,
+        "connector_action_runtime": expected_runtime,
+    }
+    assert result_b == {
+        "runner_session_key": capability_b,
+        "connector_action_runtime": expected_runtime,
+    }
     combined = json.dumps([result_a, result_b])
     assert "transcript-A" not in combined
     assert "transcript-B" not in combined

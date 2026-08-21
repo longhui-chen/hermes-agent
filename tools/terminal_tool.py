@@ -1158,6 +1158,7 @@ _CONNECTOR_RUNTIME_SHELL_OPTIONS_WITH_ARG = {
 _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH = 8
 _CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _CONNECTOR_RUNTIME_TIMEOUT_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?")
+_CONNECTOR_RUNTIME_SKILL_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
 _LARK_CLI_COMMAND = "lark-cli"
 _LARK_CLI_MAX_TIMEOUT_SECONDS = 600
 @dataclass(frozen=True)
@@ -1542,14 +1543,18 @@ def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
         )
         return None
 
-    parts = path.parts
-    if len(parts) < 4:
+    parts = relative.parts
+    if len(parts) != 4:
         _log_connector_runtime_rejection("invalid_layout", str(relative))
         return None
     if parts[-1] not in _CONNECTOR_RUNTIME_SCRIPTS:
         _log_connector_runtime_rejection("invalid_script_name", str(relative))
         return None
-    if parts[-2] != "scripts" or parts[-4] != "skills":
+    if (
+        parts[0] != "skills"
+        or _CONNECTOR_RUNTIME_SKILL_ID_RE.fullmatch(parts[1]) is None
+        or parts[2] != "scripts"
+    ):
         _log_connector_runtime_rejection("invalid_layout", str(relative))
         return None
     if not path.is_file():
@@ -1568,6 +1573,27 @@ def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
         _log_connector_runtime_rejection(reason or "trust_check_failed", str(relative))
         return None
     return path
+
+
+def _connector_action_runtime_identity(
+    script: Path,
+    anchor: _ConnectorRuntimeRootAnchor,
+) -> Optional[str]:
+    """Return the canonical identity for one already-trusted direct runner."""
+    try:
+        relative = script.relative_to(anchor.resolved_root)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if (
+        len(parts) != 4
+        or parts[0] != "skills"
+        or _CONNECTOR_RUNTIME_SKILL_ID_RE.fullmatch(parts[1]) is None
+        or parts[2] != "scripts"
+        or parts[3] not in _CONNECTOR_RUNTIME_SCRIPTS
+    ):
+        return None
+    return relative.as_posix()
 
 
 def _managed_lark_cli_broker_enabled() -> bool:
@@ -2208,9 +2234,17 @@ def _run_connector_runtime_command_if_allowed(
 
     secret_values: list[str] = []
     try:
-        from tools.environments.local import build_connector_runtime_env
+        from tools.environments.local import (
+            CONNECTOR_ACTION_RUNTIME_ENV_KEY,
+            build_connector_runtime_env,
+        )
 
         connector_env = build_connector_runtime_env()
+        runtime_identity = _connector_action_runtime_identity(script, anchor)
+        if runtime_identity is None:
+            _log_connector_runtime_rejection("runtime_identity_unavailable")
+            return None
+        connector_env[CONNECTOR_ACTION_RUNTIME_ENV_KEY] = runtime_identity
 
         # ⭐ 受信 runner **不继承进程环境**,照抄同文件 _run_camera_runtime_command_if_allowed
         # 的做法(base_env={})。⛔ 别改回 _sanitize_subprocess_env(os.environ):那是**黑名单**

@@ -2131,6 +2131,8 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_ID",
 })
 
+CONNECTOR_ACTION_RUNTIME_ENV_KEY = "ZETTLAB_CONNECTOR_ACTION_RUNTIME"
+
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
@@ -2168,6 +2170,7 @@ _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
+    | {CONNECTOR_ACTION_RUNTIME_ENV_KEY}
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
     | HARDWARE_RUNTIME_ENV_KEYS
     | RETIRED_VIDEO_EXECUTION_ENV_KEYS
@@ -2255,6 +2258,9 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     # 填/删,底座里的其它东西一个都用不到。仓内另外三个 build_*_runtime_env
     # (agent_creator / overseas_connect / camera)本来就是白名单构造 —— 照抄它们。
     env = dict(base_env or {})
+    # The pinned script identity is minted by terminal_tool only after exact
+    # direct-runner path verification. Never accept an inherited/profile value.
+    env.pop(CONNECTOR_ACTION_RUNTIME_ENV_KEY, None)
 
     scope = None
     multiplex_active = False
