@@ -171,7 +171,7 @@ class TestSetupLogging:
                 pass
 
         hermes_logging.setup_logging(hermes_home=hermes_home)
-        plugin.register(_Context())
+        plugin._register_capabilities(_Context())
         plugin._on_pre_llm_call(
             session_id="formatter-probe",
             user_message="private-user-content-must-not-be-logged",
@@ -815,5 +815,4 @@ class TestAsyncQueueLogging:
             "agent.log" in getattr(h, "baseFilename", "")
             for h in hermes_logging.rotating_file_handlers()
         )
-
 

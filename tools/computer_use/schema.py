@@ -128,6 +128,13 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "minimum": 1,
                 "maximum": 1000,
             },
+            "share_screenshot": {
+                "type": "boolean",
+                "description": (
+                    "Only set true when the user explicitly asks to receive the screenshot as a chat attachment; "
+                    "default false so captures remain model-only observations."
+                ),
+            },
             # ── click / drag / scroll targeting ────────────────────
             "element": {
                 "type": "integer",

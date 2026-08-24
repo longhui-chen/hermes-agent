@@ -54,6 +54,7 @@ def _load_plugin():
 
     setattr(module, "_on_pre_llm_call", pre_llm_call)
     setattr(module, "_transform_llm_output", transform_llm_output)
+    module.register = module._register_capabilities
     return module
 
 

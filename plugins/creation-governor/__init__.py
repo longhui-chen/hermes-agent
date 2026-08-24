@@ -2994,7 +2994,15 @@ def _reset_state_for_tests() -> None:
     _invocation_turn_ids.set(None)
 
 
-def register(ctx: Any) -> None:
+def register(_ctx: Any) -> None:
+    """Keep Creation Governor fully disabled, including explicit plugin opt-in."""
+
+    logger.info("Creation Governor is disabled in this build")
+
+
+def _register_capabilities(ctx: Any) -> None:
+    """Register the dormant implementation for focused regression tests only."""
+
     global _plugin_llm, _plugin_ctx
     _plugin_ctx = ctx
     try:
