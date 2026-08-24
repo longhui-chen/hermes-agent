@@ -62,7 +62,7 @@ _ACTION_ALIASES = {
 _READ_ACTIONS = {
     "list_apps", "list_windows", "snapshot", "desktop_snapshot", "verify", "zoom", "clipboard_read", "complete_task",
 }
-_TASK_CONTROL_FIELDS = {"snapshot_revision", "user_input_epoch", "postcondition", "capture_after"}
+_TASK_CONTROL_FIELDS = {"snapshot_revision", "user_input_epoch", "postcondition", "capture_after", "share_screenshot"}
 _APP_CONTEXT_ACTIONS = {
     "focus",
     "invoke",
@@ -94,7 +94,8 @@ PC_UI_SCHEMA = {
         "observable postcondition. A mutation is successful only after the Host re-observes "
         "the exact window and proves that postcondition. If a result includes task metadata, call complete_task once "
         "after the requested desktop task is fully finished; it closes only the current runtime task lease and never "
-        "performs a desktop mutation."
+        "performs a desktop mutation. Set share_screenshot=true only when the user explicitly asks to receive the "
+        "screenshot in the current chat; otherwise screenshots remain model-only observations."
     ),
     "parameters": {
         "type": "object",
@@ -132,6 +133,10 @@ PC_UI_SCHEMA = {
             "capture_after": {
                 "type": "boolean",
                 "description": "Mutation actions return a fresh observation by default; set false only when not needed.",
+            },
+            "share_screenshot": {
+                "type": "boolean",
+                "description": "Only set true when the user explicitly asks to receive the screenshot as a chat attachment; default false.",
             },
             "query": {"type": "string", "maxLength": 256},
             "scope": {"type": "string", "enum": ["window", "desktop"]},
@@ -240,6 +245,16 @@ def _check_pc_ui() -> bool:
 
 
 _check_pc_ui._profile_scope_sensitive = True  # type: ignore[attr-defined]
+
+
+def _cache_shared_screenshot(data: bytes, mime_type: str) -> str | None:
+    """Cache an explicitly shared screenshot in the bounded media cache."""
+    try:
+        from gateway.platforms.base import cache_media_bytes
+        cached = cache_media_bytes(data, filename="computer-use-screenshot.png", mime_type=mime_type, default_kind="image")
+        return cached.path if cached else None
+    except Exception:
+        return None
 
 
 def _params(args: dict[str, Any], action: str) -> dict[str, Any] | None:
@@ -589,6 +604,10 @@ def pc_ui_tool(
             if len(image_bytes) > _MAX_SCREENSHOT_BYTES:
                 return json.dumps({"success": False, "code": "pc_screenshot_too_large"})
             summary = json.dumps(payload, ensure_ascii=False)
+            if bool(args.get("share_screenshot")):
+                attachment_path = _cache_shared_screenshot(image_bytes, screenshot_mime)
+                if attachment_path:
+                    summary += f"\nMEDIA:{attachment_path}"
             return {
                 "_multimodal": True,
                 "content": [

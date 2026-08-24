@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import binascii
 import json
 import logging
 import os
@@ -589,6 +590,7 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
 
 def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
     capture_after = bool(args.get("capture_after"))
+    share_screenshot = bool(args.get("share_screenshot"))
 
     if action == "capture":
         mode = str(args.get("mode", "som"))
@@ -601,7 +603,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
                 "window_id": args.get("window_id"),
             })
         cap = backend.capture(**capture_kwargs)
-        return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
+        return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")), share_screenshot=share_screenshot)
 
     if action == "wait":
         seconds = float(args.get("seconds", 1.0))
@@ -621,7 +623,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         if not app:
             return json.dumps({"error": "focus_app requires `app`"})
         res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, share_screenshot)
 
     # cua-driver's typed browser surface is namespaced inside the existing
     # computer_use tool so it cannot collide with native browser/MCP tools.
@@ -735,7 +737,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, share_screenshot)
 
     if action == "drag":
         has_elements = args.get("from_element") is not None and args.get("to_element") is not None
@@ -753,7 +755,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, share_screenshot)
 
     if action == "scroll":
         coord = args.get("coordinate") or (None, None)
@@ -766,24 +768,24 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, share_screenshot)
 
     if action == "type":
         res = backend.type_text(args.get("text", ""),
                                 delivery_mode=delivery_mode, bring_to_front=bring_to_front)
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, share_screenshot)
 
     if action == "key":
         res = backend.key(args.get("keys", ""),
                           delivery_mode=delivery_mode, bring_to_front=bring_to_front)
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, share_screenshot)
 
     if action == "set_value":
         value = args.get("value")
         if value is None:
             return json.dumps({"error": "set_value requires `value`"})
         res = backend.set_value(value=str(value), element=args.get("element"))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, share_screenshot)
 
     return json.dumps({"error": f"unknown action {action!r}"})
 
@@ -932,7 +934,21 @@ def _coerce_max_elements(value: Any) -> int:
     return n
 
 
-def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
+def _cache_shared_screenshot(data: bytes, mime_type: str) -> str | None:
+    """Cache an explicitly shared screenshot in the bounded media cache."""
+    try:
+        from gateway.platforms.base import cache_media_bytes
+        cached = cache_media_bytes(data, filename="computer-use-screenshot.png", mime_type=mime_type, default_kind="image")
+        return cached.path if cached else None
+    except Exception:
+        return None
+
+
+def _capture_response(
+    cap: CaptureResult,
+    max_elements: int = _DEFAULT_MAX_ELEMENTS,
+    share_screenshot: bool = False,
+) -> Any:
     total_elements = len(cap.elements)
     visible_elements = cap.elements[:max_elements]
     truncated_elements = max(0, total_elements - len(visible_elements))
@@ -974,6 +990,21 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
     summary = "\n".join(summary_lines)
 
     if cap.png_b64 and cap.mode != "ax" and not image_too_small:
+        shared_path = None
+        # Cache before auxiliary-vision routing so an explicitly requested
+        # attachment is still delivered when the main model is text-only.
+        if share_screenshot:
+            try:
+                raw = base64.b64decode(cap.png_b64, validate=True)
+            except (ValueError, TypeError, binascii.Error):
+                raw = b""
+            if raw and len(raw) <= 4 << 20:
+                _share_mime = cap.image_mime_type or (
+                    "image/jpeg" if cap.png_b64[:8].startswith("/9j/") else "image/png"
+                )
+                shared_path = _cache_shared_screenshot(raw, _share_mime)
+        if shared_path:
+            summary += f"\nMEDIA:{shared_path}"
         # Decide whether to hand the screenshot to the auxiliary.vision
         # pipeline (text-only result) or keep the multimodal envelope (main
         # model handles vision natively). Issue #24015: previously the
@@ -1252,6 +1283,7 @@ def _route_capture_through_aux_vision(
 
 def _maybe_follow_capture(
     backend: ComputerUseBackend, res: ActionResult, do_capture: bool,
+    share_screenshot: bool = False,
 ) -> Any:
     if not do_capture:
         return _text_response(res)
@@ -1276,7 +1308,7 @@ def _maybe_follow_capture(
         logger.warning("follow-up capture failed: %s", e)
         return _text_response(res)
     # Combine action summary with the capture.
-    resp = _capture_response(cap)
+    resp = _capture_response(cap, share_screenshot=share_screenshot)
     if isinstance(resp, dict) and resp.get("_multimodal"):
         # Keep the complete evidence/verdict contract visible when an image is
         # attached; otherwise capture_after would accidentally discard the
