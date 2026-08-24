@@ -73,7 +73,7 @@ def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch)
     assert manager._aux_tasks["creation_governor_checkpoint"]["plugin"] == "creation-governor"
 
 
-def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
+def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope(caplog):
     spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
     assert spec is not None
     plugin = importlib.util.module_from_spec(spec)
@@ -91,12 +91,20 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
     ]
     assert [tool["name"] for tool in context.tools] == ["detect_creation_opportunity"]
 
-    pre_context = context.hooks[0][0][1](
-        session_id="flow-session",
-        user_message="Look into this business problem.",
-        conversation_history=[],
-    )
+    with caplog.at_level("INFO", logger=plugin.__name__):
+        pre_context = context.hooks[0][0][1](
+            session_id="flow-session",
+            user_message="Look into this business problem.",
+            conversation_history=[],
+        )
     assert "background creation-opportunity review" in pre_context["context"]
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("creation_governor_pre_llm_summary ")
+    ]
+    assert len(summaries) == 1
+    assert "outcome=context_injected" in summaries[0]
 
     output = context.hooks[1][0][1](
         session_id="flow-session",
