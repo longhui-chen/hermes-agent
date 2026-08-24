@@ -1407,6 +1407,10 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "image_generate",
     "bfl_flux3_get_result",
     "video_generate",
+    # Screenshots are delivered only when the tool call explicitly opts in
+    # with share_screenshot=true and emits a bounded MEDIA: cache path.
+    "pc_ui",
+    "computer_use",
 }
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
@@ -1480,6 +1484,19 @@ _TOOL_MEDIA_RE = re.compile(
 )
 
 
+def _tool_content_text(content: Any) -> str:
+    """Normalize multipart tool content for MEDIA marker extraction."""
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    if isinstance(content, dict):
+        return str(content.get("text_summary") or content.get("text") or "")
+    return str(content or "")
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
@@ -1530,7 +1547,7 @@ def _collect_auto_append_media_tags(
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
         if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
-        content = str(msg.get("content") or "")
+        content = _tool_content_text(msg.get("content"))
         tool_name = tool_name_by_call_id.get(call_id)
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
@@ -1600,13 +1617,13 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     for msg in agent_history:
         role = msg.get("role")
         if role == "assistant":
-            content = str(msg.get("content", "") or "")
+            content = _tool_content_text(msg.get("content"))
             if "MEDIA:" in content:
                 _add_text_media_paths(content)
             continue
         if role not in {"tool", "function"}:
             continue
-        content = str(msg.get("content", "") or "")
+        content = _tool_content_text(msg.get("content"))
         if "MEDIA:" in content:
             _add_text_media_paths(content)
             continue
