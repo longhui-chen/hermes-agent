@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from agent.secret_scope import get_secret
+from tools.apphost_tool import _execution_headers
 from tools.loopback_transport import (
     HARDENED_OPENER as _NO_PROXY_OPENER,
     is_trusted_loopback_http as _is_trusted_loopback_http,
@@ -450,14 +451,16 @@ def _request_json(
 
     attempts = 2 if retry_read else 1
     for attempt in range(attempts):
+        headers = {
+            _ACTION_TOKEN_HEADER: token,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        headers.update(_execution_headers())
         request = urllib.request.Request(
             base + path,
             data=encoded,
-            headers={
-                _ACTION_TOKEN_HEADER: token,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             method=method,
         )
         try:

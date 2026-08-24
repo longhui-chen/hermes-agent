@@ -8,7 +8,15 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gateway.session_context import _VAR_MAP
+from gateway.session_context import (
+    _VAR_MAP,
+    clear_session_vars,
+    clear_turn_vars,
+    pop_zettlab_auth_principal,
+    push_zettlab_auth_principal,
+    set_session_vars,
+    set_turn_vars,
+)
 from tests.tools._profile_scope import mux_profile_scope
 from tools.app_data_tool import app_data_tool
 from tools.registry import discover_builtin_tools, registry
@@ -395,31 +403,47 @@ def test_delegated_child_cannot_forge_direct_app_dispatch(monkeypatch):
 
 
 def test_declared_operations_flow_through_real_loopback_transport(monkeypatch):
-    with _app_data_server() as (base_url, calls), mux_profile_scope(
-        monkeypatch,
-        _scope(base_url),
-        poison_environ=True,
-    ), patch(
-        "tools.app_data_tool._approval_result",
-        return_value={"approved": True},
-    ):
-        capability = json.loads(app_data_tool({
-            "action": "capabilities",
-            "slug": _SLUG,
-        }))
-        read_result = json.loads(app_data_tool({
-            "action": "invoke",
-            "slug": _SLUG,
-            "operation": _READ_OPERATION,
-            "query": {"label": "product"},
-        }))
-        mutation_result = json.loads(app_data_tool({
-            "action": "invoke",
-            "slug": _SLUG,
-            "operation": _MUTATION_OPERATION,
-            "payload": {"record_id": "record-1", "state": "accepted"},
-            "idempotency_key": "record:record-1:1",
-        }))
+    session_tokens = set_session_vars(
+        platform="zet_agent",
+        session_id="api-lineage-tip",
+        session_key="zettlab:owner-1:flow-agent:stable-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="turn-focus-1",
+    )
+    principal_token = push_zettlab_auth_principal(
+        "iam:issuer:user:owner-1"
+    )
+    try:
+        with _app_data_server() as (base_url, calls), mux_profile_scope(
+            monkeypatch,
+            _scope(base_url),
+            poison_environ=True,
+        ), patch(
+            "tools.app_data_tool._approval_result",
+            return_value={"approved": True},
+        ):
+            capability = json.loads(app_data_tool({
+                "action": "capabilities",
+                "slug": _SLUG,
+            }))
+            read_result = json.loads(app_data_tool({
+                "action": "invoke",
+                "slug": _SLUG,
+                "operation": _READ_OPERATION,
+                "query": {"label": "product"},
+            }))
+            mutation_result = json.loads(app_data_tool({
+                "action": "invoke",
+                "slug": _SLUG,
+                "operation": _MUTATION_OPERATION,
+                "payload": {"record_id": "record-1", "state": "accepted"},
+                "idempotency_key": "record:record-1:1",
+            }))
+    finally:
+        pop_zettlab_auth_principal(principal_token)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
 
     assert capability["data"] == {
         "version": 1,
@@ -441,6 +465,15 @@ def test_declared_operations_flow_through_real_loopback_transport(monkeypatch):
     assert [method for method, *_rest in calls] == ["GET", "GET", "POST", "GET", "POST"]
     assert all(
         headers.get("X-Zettlab-Agent-Action-Token") == "flow-operation-token"
+        for _method, _path, headers, _body in calls
+    )
+    assert all(
+        headers.get("X-Zettlab-Auth-Principal-Id")
+        == "iam:issuer:user:owner-1"
+        and headers.get("X-Hermes-Turn-Id") == "turn-focus-1"
+        and headers.get("X-Hermes-Session-Id") == "api-lineage-tip"
+        and headers.get("X-Hermes-Session-Key")
+        == "zettlab:owner-1:flow-agent:stable-session"
         for _method, _path, headers, _body in calls
     )
     assert calls[2][1].endswith(f"/operations/{_READ_OPERATION}")
