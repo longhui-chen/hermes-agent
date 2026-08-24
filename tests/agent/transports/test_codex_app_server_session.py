@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import json
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -126,6 +127,19 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     )
 
 
+class _TimingLogger:
+    def __init__(self) -> None:
+        self.records: list[str] = []
+
+    def info(self, message: str, *args: object) -> None:
+        self.records.append(message % args)
+
+
+def _timing_payload(logger: _TimingLogger) -> dict:
+    assert len(logger.records) == 1
+    return json.loads(logger.records[0].split(" ", 1)[1])
+
+
 # ---- choice mapping ----
 
 class TestApprovalChoiceMapping:
@@ -147,6 +161,75 @@ class TestTurnInputCoercion:
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
         ])
         assert text == "caption\n\n[image attached]"
+
+
+class TestProviderTiming:
+    def test_turn_start_records_one_physical_dispatch(self):
+        from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
+
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        logger = _TimingLogger()
+        timing = PrestreamTiming(logger=logger)
+
+        token = PRESTREAM_TIMING_CONTEXT.set(timing)
+        try:
+            result = session.run_turn("private", turn_timeout=2.0)
+        finally:
+            PRESTREAM_TIMING_CONTEXT.reset(token)
+
+        assert result.error is None
+        timing.observe_queued_semantic("content")
+        timing.public_write_completed(timing.semantic_classified("content"))
+        payload = _timing_payload(logger)
+        assert payload["provider_dispatch_scope"] == "physical"
+        assert payload["provider_dispatch_count"] == 1
+
+    def test_startup_failure_does_not_record_provider_dispatch(self):
+        from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
+
+        session = make_session(FakeClient())
+        logger = _TimingLogger()
+        timing = PrestreamTiming(logger=logger)
+
+        token = PRESTREAM_TIMING_CONTEXT.set(timing)
+        try:
+            with patch.object(
+                session,
+                "ensure_started",
+                side_effect=TimeoutError("startup unavailable"),
+            ):
+                result = session.run_turn("private", turn_timeout=2.0)
+        finally:
+            PRESTREAM_TIMING_CONTEXT.reset(token)
+
+        assert result.error is not None
+        timing.terminal_write_completed()
+        assert "provider_dispatch_count" not in _timing_payload(logger)
+
+    def test_prestart_interrupt_does_not_record_provider_dispatch(self):
+        from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
+
+        session = make_session(FakeClient())
+        session.ensure_started()
+        session._interrupt_event.set()
+        logger = _TimingLogger()
+        timing = PrestreamTiming(logger=logger)
+
+        token = PRESTREAM_TIMING_CONTEXT.set(timing)
+        try:
+            result = session.run_turn("private", turn_timeout=2.0)
+        finally:
+            PRESTREAM_TIMING_CONTEXT.reset(token)
+
+        assert result.interrupted is True
+        timing.terminal_write_completed()
+        assert "provider_dispatch_count" not in _timing_payload(logger)
 
 
 # ---- lifecycle ----
@@ -895,4 +978,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

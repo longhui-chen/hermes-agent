@@ -65,7 +65,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from agent.prestream_timing import PrestreamTiming
+from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -77,9 +77,7 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
-_prestream_timing_context: ContextVar[Optional[PrestreamTiming]] = ContextVar(
-    "api_server_prestream_timing", default=None
-)
+_prestream_timing_context = PRESTREAM_TIMING_CONTEXT
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:

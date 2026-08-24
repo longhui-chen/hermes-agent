@@ -559,6 +559,77 @@ async def test_run_agent_explicit_timing_reaches_executor_and_zet_creation_conte
 
 
 @pytest.mark.asyncio
+async def test_parallel_executor_turns_keep_provider_timing_request_local(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from agent.prestream_timing import (
+        PRESTREAM_TIMING_CONTEXT,
+        observe_provider_dispatch,
+    )
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, token="test"))
+    barrier = threading.Barrier(2)
+    seen: list[PrestreamTiming | None] = []
+
+    def _agent() -> MagicMock:
+        fake = MagicMock()
+        fake.session_prompt_tokens = 0
+        fake.session_completion_tokens = 0
+        fake.session_total_tokens = 0
+
+        def _run_conversation(**_kwargs):
+            timing = PRESTREAM_TIMING_CONTEXT.get()
+            seen.append(timing)
+            observe_provider_dispatch()
+            assert timing is not None
+            timing.observe_queued_semantic("content")
+            barrier.wait(timeout=5)
+            return {"final_response": "ok"}
+
+        fake.run_conversation.side_effect = _run_conversation
+        return fake
+
+    timings = [
+        PrestreamTiming(session_id="session-a"),
+        PrestreamTiming(session_id="session-b"),
+    ]
+    agents = [_agent(), _agent()]
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
+    with patch.object(adapter, "_create_agent", side_effect=agents):
+        await asyncio.gather(
+            adapter._run_agent(
+                user_message="private-a",
+                conversation_history=[],
+                session_id="session-a",
+                prestream_timing=timings[0],
+            ),
+            adapter._run_agent(
+                user_message="private-b",
+                conversation_history=[],
+                session_id="session-b",
+                prestream_timing=timings[1],
+            ),
+        )
+
+    assert set(map(id, seen)) == set(map(id, timings))
+    assert PRESTREAM_TIMING_CONTEXT.get() is None
+    for timing in timings:
+        timing.public_write_completed(timing.semantic_classified("content"))
+
+    payloads = {
+        payload["session_id"]: payload
+        for payload in (
+            json.loads(record.message.split(" ", 1)[1])
+            for record in caplog.records
+            if record.message.startswith("hermes.prestream.turn ")
+        )
+    }
+    assert set(payloads) == {"session-a", "session-b"}
+    assert all(payload["provider_dispatch_count"] == 1 for payload in payloads.values())
+    assert all("provider_wait_ms" in payload for payload in payloads.values())
+
+
+@pytest.mark.asyncio
 async def test_run_agent_init_exception_records_error_without_success_duration(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -710,6 +781,55 @@ async def test_real_zet_reasoning_callback_preserves_queue_to_write_duration(
     assert payload["first_event_kind"] == "reasoning"
     assert payload["semantic_to_sse_write_ms"] == 37
     assert "private chain of thought" not in summary
+
+
+def test_zet_agent_uses_shared_request_context_without_agent_callback_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT
+    from gateway.platforms.api_server import _prestream_timing_context
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.provider = kwargs.get("provider")
+
+    monkeypatch.setattr("run_agent.AIAgent", _Agent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {"provider": "test", "model": "test/model", "api_key": "secret"},
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test/model")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._checkpoint_agent_kwargs", lambda _cfg: {})
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 10)
+    monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", lambda: {})
+    monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", lambda: None)
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test"}))
+    assert _prestream_timing_context is PRESTREAM_TIMING_CONTEXT
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+    timings = [PrestreamTiming(), PrestreamTiming()]
+    agents = []
+
+    for timing in timings:
+        token = _prestream_timing_context.set(timing)
+        try:
+            agents.append(
+                adapter._create_agent(
+                    session_id="session-1",
+                    stream_delta_callback=lambda _value: None,
+                )
+            )
+        finally:
+            _prestream_timing_context.reset(token)
+
+    for agent in agents:
+        assert not hasattr(agent, "_provider_dispatch_started_callback")
+        assert not hasattr(agent, "_provider_first_semantic_callback")
 
 
 @pytest.mark.asyncio
