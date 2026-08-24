@@ -6,6 +6,7 @@ never retains token/chunk payloads and never changes the stream it observes.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
@@ -17,7 +18,12 @@ from typing import Any, Callable, Optional
 EVENT_NAME = "hermes.prestream.turn"
 MAX_CORRELATION_ID_LENGTH = 128
 _SEMANTIC_KINDS = frozenset({"reasoning", "content", "tool_start", "attachment"})
+_PROVIDER_SEMANTIC_KINDS = frozenset({"reasoning", "content", "tool_start"})
+_PROVIDER_DISPATCH_SCOPES = frozenset({"physical", "composite"})
 _LOGGER = logging.getLogger(__name__)
+PRESTREAM_TIMING_CONTEXT: ContextVar[Optional["PrestreamTiming"]] = ContextVar(
+    "agent_prestream_timing", default=None
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +49,16 @@ def _duration_ms(start: Optional[float], end: Optional[float]) -> Optional[int]:
     return int(round((end - start) * 1000))
 
 
+def observe_provider_dispatch(*, scope: str = "physical") -> None:
+    """Record one provider attempt on the current request, if any."""
+    try:
+        timing = PRESTREAM_TIMING_CONTEXT.get()
+        if timing is not None:
+            timing.provider_dispatch_started(scope=scope)
+    except Exception:
+        return
+
+
 class PrestreamTiming:
     """Collect and emit exactly one bounded summary for a streaming turn."""
 
@@ -64,6 +80,10 @@ class PrestreamTiming:
         "_logger",
         "_observed_semantic_at",
         "_observed_semantic_kind",
+        "_provider_dispatch_count",
+        "_provider_dispatch_scope",
+        "_provider_first_dispatch_at",
+        "_provider_semantic_at",
         "_session_id",
         "_skill_finished_at",
         "_skill_outcome",
@@ -94,6 +114,10 @@ class PrestreamTiming:
         self._history_ready_at: Optional[float] = None
         self._observed_semantic_kind = ""
         self._observed_semantic_at: Optional[float] = None
+        self._provider_dispatch_count = 0
+        self._provider_dispatch_scope = ""
+        self._provider_first_dispatch_at: Optional[float] = None
+        self._provider_semantic_at: Optional[float] = None
         self._skill_started_at: Optional[float] = None
         self._skill_finished_at: Optional[float] = None
         self._skill_outcome = ""
@@ -189,6 +213,29 @@ class PrestreamTiming:
         except Exception:
             return
 
+    def provider_dispatch_started(self, *, scope: str = "physical") -> None:
+        """Record one provider-bound execution and retain only its first start."""
+        try:
+            normalized_scope = (
+                scope if scope in _PROVIDER_DISPATCH_SCOPES else "physical"
+            )
+            observed = self._now()
+            with self._lock:
+                if (
+                    self._emitted
+                    or self._provider_semantic_at is not None
+                ):
+                    return
+                self._provider_dispatch_count += 1
+                if not self._provider_dispatch_scope:
+                    self._provider_dispatch_scope = normalized_scope
+                elif self._provider_dispatch_scope != normalized_scope:
+                    self._provider_dispatch_scope = "mixed"
+                if self._provider_first_dispatch_at is None:
+                    self._provider_first_dispatch_at = observed
+        except Exception:
+            return
+
     def _set_timestamp(self, name: str) -> None:
         try:
             observed = self._now()
@@ -217,10 +264,16 @@ class PrestreamTiming:
                 return
             observed_at = self._now()
             with self._lock:
-                if self._emitted or self._observed_semantic_kind:
+                if self._emitted:
                     return
-                self._observed_semantic_kind = normalized
-                self._observed_semantic_at = observed_at
+                if (
+                    normalized in _PROVIDER_SEMANTIC_KINDS
+                    and self._provider_semantic_at is None
+                ):
+                    self._provider_semantic_at = observed_at
+                if not self._observed_semantic_kind:
+                    self._observed_semantic_kind = normalized
+                    self._observed_semantic_at = observed_at
         except Exception:
             return
 
@@ -315,6 +368,9 @@ class PrestreamTiming:
             payload["skill_expand_outcome"] = self._skill_outcome
         if self._agent_init_outcome:
             payload["agent_init_outcome"] = self._agent_init_outcome
+        if self._provider_dispatch_count:
+            payload["provider_dispatch_count"] = self._provider_dispatch_count
+            payload["provider_dispatch_scope"] = self._provider_dispatch_scope
 
         durations = {
             "ingress_to_history_ready_ms": _duration_ms(self._ingress_at, self._history_ready_at),
@@ -325,6 +381,12 @@ class PrestreamTiming:
             ),
             "executor_queue_ms": _duration_ms(self._executor_queued_at, self._executor_started_at),
             "agent_init_ms": _duration_ms(self._agent_init_started_at, self._agent_init_finished_at),
+            "ingress_to_provider_dispatch_ms": _duration_ms(
+                self._ingress_at, self._provider_first_dispatch_at
+            ),
+            "provider_wait_ms": _duration_ms(
+                self._provider_first_dispatch_at, self._provider_semantic_at
+            ),
             "ingress_to_first_public_ms": _duration_ms(self._ingress_at, first_public_at),
             "semantic_to_sse_write_ms": _duration_ms(semantic_observed_at, first_public_at),
         }
@@ -353,6 +415,11 @@ class PrestreamTiming:
                 if self._agent_init_outcome
                 else "agent_init"
             )
+        if self._provider_dispatch_count:
+            if durations["ingress_to_provider_dispatch_ms"] is None:
+                missing.append("provider_dispatch")
+            if durations["provider_wait_ms"] is None:
+                missing.append("provider_first_semantic")
         if first_event_kind == "none":
             missing.append("first_public_semantic")
         elif durations["ingress_to_first_public_ms"] is None:

@@ -138,6 +138,96 @@ def test_stage_delays_only_populate_their_own_duration_fields() -> None:
     assert payload["explicit_skill"] is True
 
 
+def test_provider_dispatch_wait_is_first_wins_and_counts_retries() -> None:
+    clock = _Clock()
+    logger = _CapturingLogger()
+    timing = PrestreamTiming(logger=logger, clock=clock)
+
+    clock.advance_ms(5)
+    timing.provider_dispatch_started()
+    clock.advance_ms(11)
+    timing.provider_dispatch_started()
+    clock.advance_ms(17)
+    timing.observe_queued_semantic("content")
+    timing.provider_dispatch_started()
+    semantic = timing.semantic_observed("content")
+    clock.advance_ms(7)
+    timing.public_write_completed(semantic)
+
+    payload = _payload(logger)
+    assert payload["provider_dispatch_count"] == 2
+    assert payload["ingress_to_provider_dispatch_ms"] == 5
+    assert payload["provider_wait_ms"] == 28
+    assert payload["semantic_to_sse_write_ms"] == 7
+
+
+def test_provider_dispatch_without_semantic_is_partial_and_never_zero_filled() -> None:
+    clock = _Clock()
+    logger = _CapturingLogger()
+    timing = PrestreamTiming(logger=logger, clock=clock)
+
+    clock.advance_ms(13)
+    timing.provider_dispatch_started()
+    timing.terminal_write_completed()
+
+    payload = _payload(logger)
+    assert payload["provider_dispatch_count"] == 1
+    assert payload["ingress_to_provider_dispatch_ms"] == 13
+    assert "provider_wait_ms" not in payload
+    assert "provider_first_semantic" in payload["missing_stages"]
+
+
+def test_attachment_does_not_fabricate_provider_wait() -> None:
+    clock = _Clock()
+    logger = _CapturingLogger()
+    timing = PrestreamTiming(logger=logger, clock=clock)
+
+    timing.provider_dispatch_started()
+    clock.advance_ms(19)
+    timing.observe_queued_semantic("attachment")
+    timing.public_write_completed(timing.semantic_classified("attachment"))
+
+    payload = _payload(logger)
+    assert payload["first_event_kind"] == "attachment"
+    assert "provider_wait_ms" not in payload
+    assert "provider_first_semantic" in payload["missing_stages"]
+
+
+def test_attachment_first_still_captures_later_provider_semantic_before_write() -> None:
+    clock = _Clock()
+    logger = _CapturingLogger()
+    timing = PrestreamTiming(logger=logger, clock=clock)
+
+    timing.provider_dispatch_started()
+    clock.advance_ms(5)
+    timing.observe_queued_semantic("attachment")
+    clock.advance_ms(7)
+    timing.observe_queued_semantic("content")
+    clock.advance_ms(3)
+    timing.public_write_completed(timing.semantic_classified("attachment"))
+
+    payload = _payload(logger)
+    assert payload["first_event_kind"] == "attachment"
+    assert payload["provider_wait_ms"] == 12
+    assert payload["semantic_to_sse_write_ms"] == 10
+
+
+def test_composite_provider_dispatch_is_explicitly_scoped() -> None:
+    clock = _Clock()
+    logger = _CapturingLogger()
+    timing = PrestreamTiming(logger=logger, clock=clock)
+
+    timing.provider_dispatch_started(scope="composite")
+    clock.advance_ms(31)
+    timing.observe_queued_semantic("content")
+    timing.public_write_completed(timing.semantic_classified("content"))
+
+    payload = _payload(logger)
+    assert payload["provider_dispatch_scope"] == "composite"
+    assert payload["provider_dispatch_count"] == 1
+    assert payload["provider_wait_ms"] == 31
+
+
 def test_history_and_agent_init_delay_changes_are_isolated() -> None:
     def render(*, history_ms: int, init_ms: int) -> dict[str, Any]:
         clock = _Clock()
