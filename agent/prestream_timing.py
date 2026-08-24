@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 
 EVENT_NAME = "hermes.prestream.turn"
 MAX_CORRELATION_ID_LENGTH = 128
-_SEMANTIC_KINDS = frozenset({"reasoning", "content", "tool_start"})
+_SEMANTIC_KINDS = frozenset({"reasoning", "content", "tool_start", "attachment"})
 _LOGGER = logging.getLogger(__name__)
 
 

@@ -138,6 +138,19 @@ _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
 
+
+def _observe_queued_attachment(
+    prestream_timing: Optional[PrestreamTiming] = None,
+) -> None:
+    """Mark an attachment enqueue without retaining or inspecting its payload."""
+    try:
+        timing = prestream_timing or _prestream_timing_context.get()
+        if timing is not None:
+            timing.observe_queued_semantic("attachment")
+    except Exception:
+        return
+
+
 _zettlab_request_account_id: ContextVar[str] = ContextVar(
     "zettlab_request_account_id", default=""
 )
@@ -1790,6 +1803,9 @@ class ZetAgentAdapter(APIServerAdapter):
             async with asyncio.timeout(self._SKILL_INVOKE_ACQUIRE_TIMEOUT):
                 await sema.acquire()
         except asyncio.TimeoutError:
+            prestream_timing = _prestream_timing_context.get()
+            if prestream_timing is not None:
+                prestream_timing.skill_expand_completed("error")
             logger.warning(
                 "[zet_agent] skill expansion saturated; passing message through",
             )
@@ -2883,6 +2899,7 @@ class ZetAgentAdapter(APIServerAdapter):
             anchor = str(turn_id or "").strip() or uuid.uuid5(
                 uuid.NAMESPACE_OID, f"mc:{session_id}"
             ).hex[:12]
+            _observe_queued_attachment()
             stream_q.put((
                 "__tool_progress__",
                 {
@@ -2931,6 +2948,7 @@ class ZetAgentAdapter(APIServerAdapter):
             anchor = str(turn_id or "").strip() or uuid.uuid5(
                 uuid.NAMESPACE_OID, f"ms:{session_id}"
             ).hex[:12]
+            _observe_queued_attachment()
             stream_q.put((
                 "__tool_progress__",
                 {
@@ -4099,6 +4117,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         # Round-trip JSON to detach the queued frame from plugin
                         # mutation after emit_attachment returns.
                         safe_attachment = json.loads(encoded)
+                        _observe_queued_attachment(prestream_timing)
                         stream_q.put((
                             "__tool_progress__",
                             {

@@ -6996,6 +6996,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             semantic_event = prestream_timing.semantic_classified(
                                 "reasoning"
                             )
+                        elif item[1].get("type") == "hermes.attachment":
+                            semantic_event = prestream_timing.semantic_classified(
+                                "attachment"
+                            )
                         elif (
                             item[1].get("status") == "running"
                             and item[1].get("toolCallId")

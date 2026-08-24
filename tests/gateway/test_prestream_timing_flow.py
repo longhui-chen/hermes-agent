@@ -165,6 +165,157 @@ async def test_observer_failure_does_not_change_sse_bytes() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("push_name", "attachment_kind"),
+    [
+        ("_push_memory_citations", "memory.citations"),
+        ("_push_memory_saved", "memory.saved"),
+    ],
+)
+async def test_memory_attachment_records_queue_to_successful_sse_write(
+    caplog: pytest.LogCaptureFixture,
+    push_name: str,
+    attachment_kind: str,
+) -> None:
+    from gateway.platforms.api_server import _prestream_timing_context
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    now = 10.0
+
+    def clock() -> float:
+        return now
+
+    timing = _CountingTerminalTiming(clock=clock)
+    stream_q: queue.Queue = queue.Queue()
+    token = _prestream_timing_context.set(timing)
+    try:
+        assert getattr(ZetAgentAdapter, push_name)(
+            stream_q,
+            "turn-1",
+            "session-1",
+            [{"id": "private-memory-id", "source": "private", "excerpt": "secret"}],
+        )
+    finally:
+        _prestream_timing_context.reset(token)
+    stream_q.put(None)
+
+    response = AsyncMock(spec=web.StreamResponse)
+    response.prepare = AsyncMock()
+
+    async def _write(payload: bytes) -> None:
+        nonlocal now
+        if b'"type":"hermes.attachment"' in payload:
+            now += 0.037
+
+    response.write = AsyncMock(side_effect=_write)
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, token="test"))
+    with patch(
+        "gateway.platforms.api_server.web.StreamResponse", return_value=response
+    ):
+        await adapter._write_sse_chat_completion(
+            _request(),
+            f"cmpl-{attachment_kind}",
+            "model-hidden",
+            1,
+            stream_q,
+            asyncio.create_task(_completed_agent()),
+            prestream_timing=timing,
+        )
+
+    summary = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("hermes.prestream.turn ")
+    )
+    payload = json.loads(summary.split(" ", 1)[1])
+    assert payload["first_event_kind"] == "attachment"
+    assert payload["semantic_to_sse_write_ms"] == 37
+    assert timing.terminal_calls == 1
+    assert "private-memory-id" not in summary
+    assert "secret" not in summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("push_name", "failure"),
+    [
+        ("_push_memory_citations", "write_error"),
+        ("_push_memory_citations", "cancelled"),
+        ("_push_memory_saved", "write_error"),
+        ("_push_memory_saved", "cancelled"),
+    ],
+)
+async def test_memory_attachment_failed_write_does_not_fake_public_completion(
+    caplog: pytest.LogCaptureFixture,
+    push_name: str,
+    failure: str,
+) -> None:
+    from gateway.platforms.api_server import _prestream_timing_context
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    timing = _CountingTerminalTiming()
+    stream_q: queue.Queue = queue.Queue()
+    token = _prestream_timing_context.set(timing)
+    try:
+        assert getattr(ZetAgentAdapter, push_name)(
+            stream_q,
+            "turn-1",
+            "session-1",
+            [{"id": "private-memory-id", "source": "private", "excerpt": "secret"}],
+        )
+    finally:
+        _prestream_timing_context.reset(token)
+    stream_q.put(None)
+
+    response = AsyncMock(spec=web.StreamResponse)
+    response.prepare = AsyncMock()
+
+    async def _write(payload: bytes) -> None:
+        if b'"type":"hermes.attachment"' not in payload:
+            return
+        if failure == "cancelled":
+            raise asyncio.CancelledError
+        raise OSError("client disconnected")
+
+    response.write = AsyncMock(side_effect=_write)
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, token="test"))
+
+    async def _render() -> None:
+        with patch(
+            "gateway.platforms.api_server.web.StreamResponse", return_value=response
+        ):
+            await adapter._write_sse_chat_completion(
+                _request(),
+                f"cmpl-memory-{failure}",
+                "model-hidden",
+                1,
+                stream_q,
+                asyncio.create_task(_completed_agent()),
+                prestream_timing=timing,
+            )
+
+    if failure == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await _render()
+    else:
+        await _render()
+
+    summary = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("hermes.prestream.turn ")
+    )
+    payload = json.loads(summary.split(" ", 1)[1])
+    assert payload["first_event_kind"] == "none"
+    assert "semantic_to_sse_write_ms" not in payload
+    assert timing.terminal_calls == 1
+    assert "private-memory-id" not in summary
+    assert "secret" not in summary
+
+
+@pytest.mark.asyncio
 async def test_direct_final_response_records_semantic_to_successful_sse_write(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -635,6 +786,43 @@ async def test_fail_open_skill_build_is_still_classified_as_error(
     caplog.set_level(logging.INFO, logger="agent.prestream_timing")
     timing.terminal_write_completed()
     summary = next(r.message for r in caplog.records if r.message.startswith("hermes.prestream.turn "))
+    payload = json.loads(summary.split(" ", 1)[1])
+    assert payload["skill_expand_outcome"] == "error"
+    assert "skill_expand_ms" not in payload
+
+
+@pytest.mark.asyncio
+async def test_saturated_skill_expansion_is_not_classified_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from gateway.platforms.api_server import _prestream_timing_context
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test"}))
+    adapter._skill_invoke_semaphore = asyncio.Semaphore(0)
+    monkeypatch.setattr(adapter, "_SKILL_INVOKE_ACQUIRE_TIMEOUT", 0.001)
+    timing = PrestreamTiming(explicit_skill=True)
+    timing.skill_expand_started()
+    token = _prestream_timing_context.set(timing)
+    try:
+        result = await adapter._expand_inbound_skill_invocation(
+            "task",
+            "deep-research",
+            on_settled=timing.skill_expand_settled,
+        )
+    finally:
+        _prestream_timing_context.reset(token)
+
+    assert result == "task"
+    timing.skill_expand_completed("success")
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
+    timing.terminal_write_completed()
+    summary = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("hermes.prestream.turn ")
+    )
     payload = json.loads(summary.split(" ", 1)[1])
     assert payload["skill_expand_outcome"] == "error"
     assert "skill_expand_ms" not in payload

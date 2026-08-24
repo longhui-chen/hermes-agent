@@ -33,7 +33,9 @@ def _payload(logger: _CapturingLogger) -> dict[str, Any]:
     return json.loads(raw)
 
 
-@pytest.mark.parametrize("kind", ["reasoning", "content", "tool_start"])
+@pytest.mark.parametrize(
+    "kind", ["reasoning", "content", "tool_start", "attachment"]
+)
 def test_first_semantic_write_emits_once_for_supported_kinds(kind: str) -> None:
     clock = _Clock()
     logger = _CapturingLogger()
