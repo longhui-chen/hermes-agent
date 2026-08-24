@@ -52,7 +52,20 @@ class _Context:
         self.auxiliary_tasks.append(kwargs)
 
 
-def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch):
+def _load_capabilities_plugin():
+    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    assert spec is not None
+    plugin = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(plugin)
+    plugin._reset_state_for_tests()
+    plugin.register = plugin._register_capabilities
+    return plugin
+
+
+def test_bundled_governor_stays_disabled_with_empty_plugins_enabled(
+    tmp_path, monkeypatch
+):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text("plugins:\n  enabled: []\n")
@@ -62,24 +75,36 @@ def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch)
     manager.discover_and_load()
 
     loaded = manager._plugins["creation-governor"]
+    assert loaded.enabled is False
+    assert loaded.error == (
+        "not enabled in config (run `hermes plugins enable creation-governor` "
+        "to activate)"
+    )
+    assert loaded.tools_registered == []
+    assert loaded.hooks_registered == []
+    assert "creation_governor_checkpoint" not in manager._aux_tasks
+
+
+def test_governor_registers_nothing_even_when_explicitly_enabled(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - creation-governor\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    loaded = manager._plugins["creation-governor"]
     assert loaded.enabled is True, loaded.error
-    assert loaded.tools_registered == ["detect_creation_opportunity"]
-    assert set(loaded.hooks_registered) == {
-        "pre_llm_call",
-        "transform_llm_output",
-        "attachment_action",
-        "pre_tool_call",
-    }
-    assert manager._aux_tasks["creation_governor_checkpoint"]["plugin"] == "creation-governor"
+    assert loaded.tools_registered == []
+    assert loaded.hooks_registered == []
+    assert "creation_governor_checkpoint" not in manager._aux_tasks
 
 
 def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
-    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
-    assert spec is not None
-    plugin = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(plugin)
-    plugin._reset_state_for_tests()
+    plugin = _load_capabilities_plugin()
     context = _Context()
     plugin.register(context)
 
@@ -108,12 +133,7 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
 
 
 def test_pending_single_file_handoff_does_not_deliver_recommendation_card():
-    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
-    assert spec is not None
-    plugin = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(plugin)
-    plugin._reset_state_for_tests()
+    plugin = _load_capabilities_plugin()
     context = _Context()
     plugin.register(context)
 
@@ -139,12 +159,7 @@ def test_pending_single_file_handoff_does_not_deliver_recommendation_card():
 
 
 def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatch):
-    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
-    assert spec is not None
-    plugin = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(plugin)
-    plugin._reset_state_for_tests()
+    plugin = _load_capabilities_plugin()
     monkeypatch.setattr(
         plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor-flow.db"
     )
@@ -216,12 +231,7 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
 
 
 def test_invalid_card_action_flow_is_denied_without_entering_creation():
-    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
-    assert spec is not None
-    plugin = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(plugin)
-    plugin._reset_state_for_tests()
+    plugin = _load_capabilities_plugin()
     context = _Context()
     plugin.register(context)
 

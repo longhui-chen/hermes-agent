@@ -30,6 +30,7 @@ def _load_plugin():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     module._reset_state_for_tests()
+    module.register = module._register_capabilities
     return module
 
 
