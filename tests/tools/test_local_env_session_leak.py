@@ -375,6 +375,111 @@ def test_foreground_terminal_observes_live_profile_output(monkeypatch, tmp_path)
     assert result["output"].strip() == str(output)
 
 
+def test_terminal_child_observes_only_current_profile_catalog_token(monkeypatch, tmp_path):
+    """A model terminal child gets the narrow current-profile catalog token only."""
+    from agent import secret_scope as ss
+
+    current_catalog_token = "a" * 64
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "foreign-action-token")
+    scope_token = ss.set_secret_scope(
+        {
+            "ZETTLAB_SKILLHUB_CATALOG_TOKEN": current_catalog_token,
+            "ZETTLAB_AGENT_ACTION_TOKEN": "current-action-token",
+        }
+    )
+    environment = None
+    try:
+        environment = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        wrapped = environment._wrap_command("true", str(tmp_path))
+        result = environment.execute(
+            'printf "%s|%s" "${ZETTLAB_SKILLHUB_CATALOG_TOKEN-absent}" '
+            '"${ZETTLAB_AGENT_ACTION_TOKEN-absent}"'
+        )
+    finally:
+        if environment is not None:
+            environment.cleanup()
+        ss.reset_secret_scope(scope_token)
+
+    assert result["returncode"] == 0
+    assert result["output"].strip() == f"{current_catalog_token}|absent"
+    assert current_catalog_token not in wrapped
+
+
+@pytest.mark.parametrize(
+    "profile_value",
+    [None, "a" * 63, "A" * 64, "a" * 65, "a" * 63 + "g"],
+)
+def test_terminal_child_rejects_missing_or_invalid_catalog_token(
+    monkeypatch,
+    profile_value,
+    tmp_path,
+):
+    """A global or another profile cannot supply catalog access to this shell."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    scope = (
+        {"ZETTLAB_SKILLHUB_CATALOG_TOKEN": profile_value}
+        if profile_value is not None
+        else {}
+    )
+    scope_token = ss.set_secret_scope(scope)
+    environment = None
+    try:
+        environment = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        result = environment.execute(
+            'printf "%s|%s" "${ZETTLAB_SKILLHUB_CATALOG_TOKEN-absent}" '
+            '"${ZETTLAB_AGENT_ACTION_TOKEN-absent}"'
+        )
+    finally:
+        if environment is not None:
+            environment.cleanup()
+        ss.reset_secret_scope(scope_token)
+
+    assert result["returncode"] == 0
+    assert result["output"].strip() == "absent|absent"
+
+
+def test_single_profile_terminal_does_not_enable_catalog_token(monkeypatch):
+    """The narrow token is only a multiplex-gateway happy-path capability."""
+    from agent import secret_scope as ss
+
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    scope_token = ss.set_secret_scope(
+        {"ZETTLAB_SKILLHUB_CATALOG_TOKEN": "a" * 64}
+    )
+    try:
+        env = _make_run_env({})
+    finally:
+        ss.reset_secret_scope(scope_token)
+
+    assert "ZETTLAB_SKILLHUB_CATALOG_TOKEN" not in env
+
+
+def test_catalog_token_stays_out_of_nonterminal_subprocess_envs(monkeypatch):
+    """Only the generic terminal builder opts into the catalog bearer."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    scope_token = ss.set_secret_scope(
+        {"ZETTLAB_SKILLHUB_CATALOG_TOKEN": "a" * 64}
+    )
+    try:
+        envs = (
+            _sanitize_subprocess_env({}),
+            hermes_subprocess_env(),
+        )
+    finally:
+        ss.reset_secret_scope(scope_token)
+
+    for env in envs:
+        assert "ZETTLAB_SKILLHUB_CATALOG_TOKEN" not in env
+
+
 @pytest.mark.parametrize("value", ["relative/output", "bad\x00output", ""])
 def test_terminal_env_rejects_invalid_profile_output(monkeypatch, value):
     """Malformed profile values never replace the scrubbed process-global value."""
