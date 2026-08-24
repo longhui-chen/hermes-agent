@@ -657,6 +657,121 @@ def test_missing_fast_route_retries_once_on_active_main_model():
     )
 
 
+def test_pre_llm_observability_records_one_bounded_summary_without_user_content(caplog):
+    plugin = _load_plugin()
+    secret_marker = "private-user-content-must-not-be-logged"
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    with caplog.at_level("INFO", logger=plugin.__name__):
+        plugin._on_pre_llm_call(
+            session_id="observability-session",
+            user_message=secret_marker,
+            conversation_history=[],
+        )
+
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("creation_governor_pre_llm_summary ")
+    ]
+    assert len(summaries) == 1
+    assert "stage=exit" in summaries[0]
+    assert "outcome=context_injected" in summaries[0]
+    assert "evaluation_mode=synchronous" in summaries[0]
+    assert "route=auxiliary" in summaries[0]
+    assert "fast_outcome=completed" in summaries[0]
+    assert "fast_ms=" in summaries[0]
+    assert "fallback_ms=" not in summaries[0]
+    assert secret_marker not in caplog.text
+
+
+def test_pre_llm_observability_records_fast_route_fallback_stages(caplog):
+    plugin = _load_plugin()
+    llm = _FailingFastRouteLlm(_candidate())
+    plugin.register(_Context(llm))
+
+    with caplog.at_level("INFO", logger=plugin.__name__):
+        plugin._on_pre_llm_call(
+            session_id="observability-fallback-session",
+            user_message="Analyze this account.",
+            conversation_history=[],
+        )
+
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("creation_governor_pre_llm_summary ")
+    ]
+    assert len(summaries) == 1
+    assert "route=main_model_fallback" in summaries[0]
+    assert "fast_outcome=unavailable" in summaries[0]
+    assert "fallback_outcome=completed" in summaries[0]
+    assert "fast_ms=" in summaries[0]
+    assert "fallback_ms=" in summaries[0]
+
+
+def test_fast_bypass_seam_skips_auxiliary_call_without_changing_default(caplog):
+    plugin = _load_plugin()
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    assert plugin._evaluation_execution_mode() == "synchronous"
+    plugin.EVALUATION_EXECUTION_MODE = "fast_bypass"
+
+    with caplog.at_level("INFO", logger=plugin.__name__):
+        context = plugin._on_pre_llm_call(
+            session_id="fast-bypass-experiment",
+            user_message="Analyze this account.",
+            conversation_history=[],
+        )
+
+    assert llm.calls == []
+    assert "internal zero-shot review" in context["context"]
+    assert "has already completed" not in context["context"]
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("creation_governor_pre_llm_summary ")
+    ]
+    assert len(summaries) == 1
+    assert "route=fast_bypass" in summaries[0]
+    assert "fast_ms=" not in summaries[0]
+    assert "fallback_ms=" not in summaries[0]
+
+    plugin._reset_state_for_tests()
+    assert plugin._evaluation_execution_mode() == "synchronous"
+
+
+def test_pre_llm_observability_emits_one_terminal_summary_on_exception(
+    caplog, monkeypatch
+):
+    plugin = _load_plugin()
+
+    def _fail(**_kwargs):
+        raise RuntimeError("private-exception-detail")
+
+    monkeypatch.setattr(plugin, "_on_pre_llm_call_impl", _fail)
+    with caplog.at_level("INFO", logger=plugin.__name__):
+        with pytest.raises(RuntimeError, match="private-exception-detail"):
+            plugin._on_pre_llm_call(
+                session_id="exception-session",
+                user_message="private-user-content",
+                conversation_history=[],
+            )
+
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("creation_governor_pre_llm_summary ")
+    ]
+    assert len(summaries) == 1
+    assert "outcome=failed" in summaries[0]
+    assert "route=not_evaluated" in summaries[0]
+    assert "private-exception-detail" not in summaries[0]
+    assert "private-user-content" not in summaries[0]
+
+
 def test_api_server_never_evaluates_or_transforms_recommendations():
     plugin = _load_plugin()
     llm = _FakeLlm([_candidate()])

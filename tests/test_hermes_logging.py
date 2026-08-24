@@ -1,5 +1,6 @@
 """Tests for hermes_logging — centralized logging setup."""
 import io
+import importlib.util
 import json
 import logging
 import os
@@ -120,6 +121,78 @@ class TestSetupLogging:
         assert agent_log.exists()
         content = agent_log.read_text()
         assert "test message for agent.log" in content
+
+    def test_creation_governor_summary_survives_zettos_formatter_once_per_hook(
+        self, hermes_home
+    ):
+        plugin_path = (
+            Path(__file__).resolve().parents[1]
+            / "plugins"
+            / "creation-governor"
+            / "__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "creation_governor_logging_probe", plugin_path
+        )
+        assert spec is not None and spec.loader is not None
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        plugin._reset_state_for_tests()
+
+        class _Llm:
+            def complete(self, _messages, **_kwargs):
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "text": json.dumps({
+                            "decision": "none",
+                            "suggested_name": "",
+                            "reason": "",
+                            "target": "",
+                            "evidence_turn_ids": [],
+                            "confidence": 0,
+                            "dedup_key": "",
+                            "proposal_text": "",
+                        })
+                    },
+                )()
+
+        class _Context:
+            llm = _Llm()
+
+            def register_auxiliary_task(self, **_kwargs):
+                pass
+
+            def register_hook(self, *_args, **_kwargs):
+                pass
+
+            def register_tool(self, **_kwargs):
+                pass
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        plugin._register_capabilities(_Context())
+        plugin._on_pre_llm_call(
+            session_id="formatter-probe",
+            user_message="private-user-content-must-not-be-logged",
+            conversation_history=[],
+        )
+        hermes_logging.flush_log_queue()
+
+        records = _json_log_records((hermes_home / "logs" / "agent.log").read_text())
+        summaries = [
+            record["Attributes"]["msg"]
+            for record in records
+            if record["Attributes"].get("logger") == "creation_governor_logging_probe"
+            and record["Attributes"].get("msg", "").startswith(
+                "creation_governor_pre_llm_summary "
+            )
+        ]
+        assert len(summaries) == 1
+        assert "stage=exit" in summaries[0]
+        assert "outcome=context_injected" in summaries[0]
+        assert "fast_ms=" in summaries[0]
+        assert "private-user-content-must-not-be-logged" not in summaries[0]
 
 
 
@@ -742,5 +815,4 @@ class TestAsyncQueueLogging:
             "agent.log" in getattr(h, "baseFilename", "")
             for h in hermes_logging.rotating_file_handlers()
         )
-
 

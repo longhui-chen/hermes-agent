@@ -96,6 +96,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.prestream_timing import PrestreamTiming
+
 try:
     from aiohttp import web  # noqa: F401  -- import for type only
 except ImportError:
@@ -114,6 +116,7 @@ from gateway.platforms.api_server import (
     _REQUEST_OPTION_MISSING,
     _ProviderAuthResolutionError,
     _api_request_profile,
+    _prestream_timing_context,
     _apply_runtime_agent_overrides,
     _chat_finish_reason_from_result,
     _clean_request_string,
@@ -134,6 +137,19 @@ from gateway.platforms import zet_agent_cron as _zet_agent_cron
 _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
+
+
+def _observe_queued_attachment(
+    prestream_timing: Optional[PrestreamTiming] = None,
+) -> None:
+    """Mark an attachment enqueue without retaining or inspecting its payload."""
+    try:
+        timing = prestream_timing or _prestream_timing_context.get()
+        if timing is not None:
+            timing.observe_queued_semantic("attachment")
+    except Exception:
+        return
+
 
 _zettlab_request_account_id: ContextVar[str] = ContextVar(
     "zettlab_request_account_id", default=""
@@ -1788,6 +1804,9 @@ class ZetAgentAdapter(APIServerAdapter):
             async with asyncio.timeout(self._SKILL_INVOKE_ACQUIRE_TIMEOUT):
                 await sema.acquire()
         except asyncio.TimeoutError:
+            prestream_timing = _prestream_timing_context.get()
+            if prestream_timing is not None:
+                prestream_timing.skill_expand_completed("error")
             logger.warning(
                 "[zet_agent] skill expansion saturated; passing message through",
             )
@@ -1935,6 +1954,12 @@ class ZetAgentAdapter(APIServerAdapter):
         bound to zet_agent (see caller). The fork's skill-scope resolvers
         read that ContextVar BEFORE the process HERMES_PLATFORM env, so the
         binding is authoritative here without touching global state."""
+        prestream_timing = _prestream_timing_context.get()
+
+        def _mark_expand_error() -> None:
+            if prestream_timing is not None:
+                prestream_timing.skill_expand_completed("error")
+
         try:
             from agent.skill_commands import (
                 build_skill_invocation_message,
@@ -1942,6 +1967,7 @@ class ZetAgentAdapter(APIServerAdapter):
             )
             commands = scan_skill_commands()
         except Exception:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill scan failed; passing message through",
                 exc_info=True,
@@ -1949,6 +1975,7 @@ class ZetAgentAdapter(APIServerAdapter):
             return user_message
         info = commands.get(token)
         if not info:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] requested skill %s not installed (App inventory "
                 "drift?); passing message through", skill_slug,
@@ -1988,12 +2015,14 @@ class ZetAgentAdapter(APIServerAdapter):
                 token, user_instruction=task_text, task_id=session_id or None,
             )
         except Exception:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill %s build failed; passing message through",
                 skill_slug, exc_info=True,
             )
             return user_message
         if not part:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill %s resolved by scan but failed to "
                 "load; passing message through", skill_slug,
@@ -2871,6 +2900,7 @@ class ZetAgentAdapter(APIServerAdapter):
             anchor = str(turn_id or "").strip() or uuid.uuid5(
                 uuid.NAMESPACE_OID, f"mc:{session_id}"
             ).hex[:12]
+            _observe_queued_attachment()
             stream_q.put((
                 "__tool_progress__",
                 {
@@ -2919,6 +2949,7 @@ class ZetAgentAdapter(APIServerAdapter):
             anchor = str(turn_id or "").strip() or uuid.uuid5(
                 uuid.NAMESPACE_OID, f"ms:{session_id}"
             ).hex[:12]
+            _observe_queued_attachment()
             stream_q.put((
                 "__tool_progress__",
                 {
@@ -3825,10 +3856,14 @@ class ZetAgentAdapter(APIServerAdapter):
 
         # 1. Reasoning: late-bind on the agent (AIAgent reads
         # ``self.reasoning_callback`` at runtime).
+        prestream_timing = _prestream_timing_context.get()
+
         def _reasoning_cb(text: str) -> None:
             if not text:
                 return
             try:
+                if prestream_timing is not None:
+                    prestream_timing.observe_queued_semantic("reasoning")
                 stream_q.put(("__tool_progress__", {"type": "reasoning.delta", "text": text}))
             except Exception:
                 logger.debug("[zet_agent] reasoning_cb push failed", exc_info=True)
@@ -3973,6 +4008,7 @@ class ZetAgentAdapter(APIServerAdapter):
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
+        prestream_timing: Optional[PrestreamTiming] = None,
     ):
         """Wrap base ``_run_agent`` to bind the App and interaction scopes.
 
@@ -4082,6 +4118,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         # Round-trip JSON to detach the queued frame from plugin
                         # mutation after emit_attachment returns.
                         safe_attachment = json.loads(encoded)
+                        _observe_queued_attachment(prestream_timing)
                         stream_q.put((
                             "__tool_progress__",
                             {
@@ -4229,6 +4266,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
                 trusted_skill_slug=trusted_skill_slug,
+                prestream_timing=prestream_timing,
             )
             # Early-return steer salvage: many conversation_loop retry/error
             # paths return without running finalize_turn, so the closing
@@ -4579,6 +4617,7 @@ class ZetAgentAdapter(APIServerAdapter):
         self, request, completion_id: str, model: str, created: int,
         stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        prestream_timing: Optional[PrestreamTiming] = None,
     ):
         """Register the active turn under session_id for the lifetime of
         the SSE response, then delegate to the base writer. The
@@ -4606,6 +4645,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 active_ref,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                prestream_timing=prestream_timing,
             )
         finally:
             self._clear_active_session_turn(session_id, active_ref, agent_task)

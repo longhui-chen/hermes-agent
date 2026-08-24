@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -46,7 +47,7 @@ def _attachment_payloads(body: str):
 
 
 @pytest.mark.asyncio
-async def test_plugin_attachment_emit_reaches_real_sse_boundary_flow():
+async def test_plugin_attachment_emit_reaches_real_sse_boundary_flow(caplog):
     adapter = _adapter()
     app = web.Application()
     app["api_server_adapter"] = adapter
@@ -68,6 +69,7 @@ async def test_plugin_attachment_emit_reaches_real_sse_boundary_flow():
             {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
         )
 
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
     async with TestClient(TestServer(app)) as client:
         with patch.object(APIServerAdapter, "_run_agent", new=_fake_base_run):
             response = await client.post(
@@ -86,6 +88,16 @@ async def test_plugin_attachment_emit_reaches_real_sse_boundary_flow():
         "type": "hermes.attachment",
         "attachment": _attachment(),
     }]
+    summaries = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("hermes.prestream.turn ")
+    ]
+    assert len(summaries) == 1
+    timing_payload = json.loads(summaries[0].split(" ", 1)[1])
+    assert timing_payload["first_event_kind"] == "attachment"
+    assert "semantic_to_sse_write_ms" in timing_payload
+    assert "att-1" not in summaries[0]
     context = PluginContext(
         PluginManifest(name="attachment-test", source="test"),
         PluginManager(),

@@ -42,6 +42,7 @@ AUXILIARY_TASK_NAME = "creation_governor_checkpoint"
 AUXILIARY_MODEL_ALIAS = "zettlab-creation-fast"
 EVALUATION_TIMEOUT_SECONDS = 25.0
 MAIN_MODEL_FALLBACK_TIMEOUT_SECONDS = 15.0
+EVALUATION_EXECUTION_MODE: Literal["synchronous", "fast_bypass"] = "synchronous"
 PROPOSAL_TTL_SECONDS = 30 * 60
 DISMISS_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_RECENT_PROPOSALS = 128
@@ -84,6 +85,77 @@ UNSUPPORTED_API_MODES = {"codex_app_server"}
 UNSUPPORTED_PLATFORMS = {"acp"}
 _NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
 _ACTION_RECEIPT_TRANSPORT = "canonical_final_v1"
+
+
+def _evaluation_execution_mode() -> Literal["synchronous", "fast_bypass"]:
+    """Return the bounded experiment seam without changing the production default.
+
+    The default remains the existing synchronous checkpoint. A future cohort
+    controller can select ``fast_bypass`` at this seam after the latency and
+    recommendation-quality experiment is approved; this slice intentionally
+    does not add another configuration source or asynchronous execution path.
+    """
+
+    if EVALUATION_EXECUTION_MODE == "fast_bypass":
+        return "fast_bypass"
+    return "synchronous"
+
+
+def _record_pre_llm_timing(
+    timing: dict[str, Any] | None,
+    *,
+    route: str | None = None,
+    fast_started_at: float | None = None,
+    fast_outcome: str | None = None,
+    fallback_started_at: float | None = None,
+    fallback_outcome: str | None = None,
+) -> None:
+    """Accumulate bounded phase data on this hook's local call stack only."""
+
+    if timing is None:
+        return
+    if route is not None:
+        timing["route"] = route
+    if fast_outcome is not None:
+        timing["fast_outcome"] = fast_outcome
+    if fast_started_at is not None:
+        timing["fast_ms"] = round(
+            max(0.0, time.perf_counter() - fast_started_at) * 1000,
+            3,
+        )
+    if fallback_outcome is not None:
+        timing["fallback_outcome"] = fallback_outcome
+    if fallback_started_at is not None:
+        timing["fallback_ms"] = round(
+            max(0.0, time.perf_counter() - fallback_started_at) * 1000,
+            3,
+        )
+
+
+def _log_pre_llm_summary(timing: dict[str, Any], *, outcome: str) -> None:
+    """Write one formatter-stable summary without identity or conversation data."""
+
+    fields: list[tuple[str, Any]] = [
+        ("stage", "exit"),
+        (
+            "total_ms",
+            round(
+                max(0.0, time.perf_counter() - float(timing["started_at"])) * 1000,
+                3,
+            ),
+        ),
+        ("outcome", outcome),
+        ("evaluation_mode", timing["evaluation_mode"]),
+        ("route", timing.get("route", "not_evaluated")),
+    ]
+    for key in ("fast_outcome", "fast_ms", "fallback_outcome", "fallback_ms"):
+        if key in timing:
+            fields.append((key, timing[key]))
+    logger.info(
+        "creation_governor_pre_llm_summary %s",
+        " ".join(f"{key}={value}" for key, value in fields),
+    )
+
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
@@ -1565,9 +1637,15 @@ def _run_forced_evaluation(
     user_message: str,
     conversation_history: Any,
     connection_context: str = "",
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     llm = _plugin_llm
     if llm is None:
+        _record_pre_llm_timing(
+            timing,
+            route="no_client",
+            fast_outcome="skipped_no_client",
+        )
         return None
     evidence = _conversation_evidence(conversation_history, user_message)
     if connection_context:
@@ -1595,6 +1673,8 @@ def _run_forced_evaluation(
         },
         {"role": "user", "content": evidence},
     ]
+    fast_route_started_at = time.perf_counter()
+    _record_pre_llm_timing(timing, route="auxiliary")
     try:
         result = llm.complete(
             messages,
@@ -1605,18 +1685,35 @@ def _run_forced_evaluation(
             purpose="creation_opportunity_checkpoint_json",
             auxiliary_task=AUXILIARY_TASK_NAME,
         )
+        _record_pre_llm_timing(
+            timing,
+            fast_started_at=fast_route_started_at,
+            fast_outcome="completed",
+        )
     except Exception as fast_error:
         if not _FAST_ROUTE_UNAVAILABLE_RE.search(str(fast_error)):
+            _record_pre_llm_timing(
+                timing,
+                fast_started_at=fast_route_started_at,
+                fast_outcome="failed",
+            )
             logger.warning(
                 "creation opportunity fast-model checkpoint failed",
                 exc_info=True,
             )
             return None
+        _record_pre_llm_timing(
+            timing,
+            route="main_model_fallback",
+            fast_started_at=fast_route_started_at,
+            fast_outcome="unavailable",
+        )
         logger.warning(
             "creation opportunity fast-model route unavailable; retrying once "
             "on the active main model: %s",
             fast_error,
         )
+        fallback_started_at = time.perf_counter()
         try:
             result = llm.complete(
                 messages,
@@ -1626,7 +1723,17 @@ def _run_forced_evaluation(
                 fail_fast=True,
                 purpose="creation_opportunity_checkpoint_main_fallback",
             )
+            _record_pre_llm_timing(
+                timing,
+                fallback_started_at=fallback_started_at,
+                fallback_outcome="completed",
+            )
         except Exception:
+            _record_pre_llm_timing(
+                timing,
+                fallback_started_at=fallback_started_at,
+                fallback_outcome="failed",
+            )
             logger.warning(
                 "creation opportunity main-model fallback failed",
                 exc_info=True,
@@ -2055,7 +2162,11 @@ def _handle_previous_proposal_action(
     return _ActionHandlingOutcome("", None)
 
 
-def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
+def _on_pre_llm_call_impl(
+    *,
+    _timing: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, str] | None:
     raw_user_message = str(kwargs.get("user_message") or "")
     # Marker is appended after the visible welcome instruction. Inspect a
     # bounded tail before the onboarding-profile fast bypass: current App sends
@@ -2245,11 +2356,17 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             _state_locked(session_id, now)["last_evaluation_turn"] = turn
         inventory = _connection_inventory(session_id, now)
         availability_context = _channel_availability_context(inventory)
-        candidate = _run_forced_evaluation(
-            user_message=user_message,
-            conversation_history=kwargs.get("conversation_history"),
-            connection_context=_connection_inventory_context(inventory),
-        )
+        evaluation_mode = _evaluation_execution_mode()
+        if evaluation_mode == "fast_bypass":
+            _record_pre_llm_timing(_timing, route="fast_bypass")
+            candidate = None
+        else:
+            candidate = _run_forced_evaluation(
+                user_message=user_message,
+                conversation_history=kwargs.get("conversation_history"),
+                connection_context=_connection_inventory_context(inventory),
+                timing=_timing,
+            )
         if candidate is not None:
             candidate_result = _consider_candidate(
                 session_id, candidate, now, _text(kwargs.get("turn_id"), 160)
@@ -2302,6 +2419,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             "creation opportunity checkpoint unavailable; falling back to main-model review"
         )
     else:
+        _record_pre_llm_timing(_timing, route="not_due")
         # 非评估轮不发起网络请求，只复用会话内缓存的库存（TTL 内），
         # 保证主模型每一轮都有区域口径而不增加时延。
         with _state_lock:
@@ -2318,6 +2436,28 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         availability_context,
         _main_model_review_context(evaluation_completed=False),
     )
+
+
+def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
+    """Observe the synchronous hook boundary while preserving its return contract."""
+
+    timing: dict[str, Any] = {
+        "started_at": time.perf_counter(),
+        "evaluation_mode": _evaluation_execution_mode(),
+    }
+    try:
+        result = _on_pre_llm_call_impl(_timing=timing, **kwargs)
+    except Exception:
+        _log_pre_llm_summary(timing, outcome="failed")
+        raise
+
+    handoff_outcome = (
+        "context_injected"
+        if isinstance(result, dict) and bool(result.get("context"))
+        else "pass_through"
+    )
+    _log_pre_llm_summary(timing, outcome=handoff_outcome)
+    return result
 
 
 def _encode_recommendation(candidate: dict[str, Any]) -> str:
@@ -2835,7 +2975,7 @@ def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
 
 
 def _reset_state_for_tests() -> None:
-    global _plugin_llm, _plugin_ctx
+    global EVALUATION_EXECUTION_MODE, _plugin_llm, _plugin_ctx
     with _state_lock:
         _recent_proposals.clear()
         _dismissed_proposals.clear()
@@ -2849,6 +2989,7 @@ def _reset_state_for_tests() -> None:
         _creation_turn_invocations.clear()
     _plugin_llm = None
     _plugin_ctx = None
+    EVALUATION_EXECUTION_MODE = "synchronous"
     _invocation_scope.set(None)
     _invocation_turn_ids.set(None)
 
