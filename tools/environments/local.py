@@ -2165,6 +2165,8 @@ PROFILE_PUBLIC_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_OUTPUT_DIR",
     "WECOM_CLI_CONFIG_DIR",
 })
+SKILLHUB_CATALOG_TOKEN_ENV_KEY = "ZETTLAB_SKILLHUB_CATALOG_TOKEN"
+_SKILLHUB_CATALOG_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
 _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
 _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 
@@ -2176,10 +2178,16 @@ PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     | RETIRED_VIDEO_EXECUTION_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
     | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
+    | {SKILLHUB_CATALOG_TOKEN_ENV_KEY}
 )
 
 
-def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
+def _apply_profile_secret_scope_env(
+    env: dict,
+    *,
+    inject: bool,
+    inject_skillhub_catalog_token: bool = False,
+) -> None:
     """Scrub profile values and optionally inject safe terminal runtime data.
 
     The multiplex gateway intentionally avoids merging every profile's .env into
@@ -2187,9 +2195,10 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
     are not a trusted runner, so they must never inherit connector or Agent
     action bearer material from globals, extra env, or a shell snapshot. Skills
     that need secret values receive them through a dedicated allowlisted path.
-    The one public terminal value is re-read from the active profile scope only;
-    a stale process-global or shell-snapshot value is never trusted in multiplex
-    mode.
+    Public terminal values are re-read from the active profile scope only; a
+    stale process-global or shell-snapshot value is never trusted in multiplex
+    mode. The catalog bearer remains opt-in for the generic terminal builder,
+    so helper/background subprocesses continue to receive no profile bearer.
     """
     for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
         env.pop(key, None)
@@ -2237,6 +2246,14 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
         ):
             continue
         env[key] = os.path.normpath(value)
+
+    if inject_skillhub_catalog_token and multiplex_active and scope is not None:
+        catalog_token = scope.get(SKILLHUB_CATALOG_TOKEN_ENV_KEY)
+        if (
+            isinstance(catalog_token, str)
+            and _SKILLHUB_CATALOG_TOKEN_RE.fullmatch(catalog_token)
+        ):
+            env[SKILLHUB_CATALOG_TOKEN_ENV_KEY] = catalog_token
 
 
 def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
@@ -3410,7 +3427,11 @@ def _make_run_env(env: dict) -> dict:
     # The generic terminal path is model-controlled shell. Connector bearer
     # must only flow through a dedicated allowlisted connector runner, not via
     # Popen env or the shared shell snapshot.
-    _apply_profile_secret_scope_env(run_env, inject=True)
+    _apply_profile_secret_scope_env(
+        run_env,
+        inject=True,
+        inject_skillhub_catalog_token=True,
+    )
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
@@ -3519,6 +3540,15 @@ class LocalEnvironment(BaseEnvironment):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         self.init_session()
+
+    def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
+        """Keep the catalog bearer out of shared snapshots.
+
+        BaseEnvironment restores these names from the current Popen environment
+        after sourcing a snapshot, so the bearer never needs to appear in the
+        shell command string or persist for another profile.
+        """
+        return (SKILLHUB_CATALOG_TOKEN_ENV_KEY,)
 
     def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
         return tuple(
