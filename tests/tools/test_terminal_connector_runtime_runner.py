@@ -232,6 +232,75 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
     assert captured["script_bytes"] == script.read_bytes()
 
 
+def test_shared_linear_connector_runtime_receives_action_runtime_identity(
+    monkeypatch, tmp_path
+):
+    """The shared Linear skill uses the generic Action V2 identity contract."""
+    from tools import trusted_direct_runner
+
+    script = _write_connector_runtime(tmp_path, skill_id="linear")
+    presets_root = tmp_path / "presets"
+    root_identity = terminal_tool_module._path_identity(presets_root)
+    script_identity = terminal_tool_module._path_identity(script)
+    digest = terminal_tool_module.hashlib.sha256(script.read_bytes()).hexdigest()
+    anchor = terminal_tool_module._ConnectorRuntimeRootAnchor(
+        configured_root=presets_root,
+        resolved_root=presets_root,
+        identity=root_identity,
+        tree_digest="tree",
+        file_digests={
+            "skills/linear/scripts/connector_runtime.py": digest,
+        },
+    )
+    parsed = terminal_tool_module._ConnectorRuntimeCommand(
+        argv=["python", str(script), "list-tools"],
+        root_identity=root_identity,
+        script_identity=script_identity,
+    )
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return trusted_direct_runner.TrustedPythonResult(output="ok", returncode=0)
+
+    monkeypatch.setattr(terminal_tool_module, "_CONNECTOR_RUNTIME_ROOT_ANCHOR", anchor)
+    monkeypatch.setattr(
+        terminal_tool_module, "_parse_connector_runtime_command", lambda command: parsed
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module, "_ensure_sensitive_runtime_boundary", lambda: True
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_read_connector_runtime_script_bytes",
+        lambda path, **kwargs: script.read_bytes(),
+    )
+    monkeypatch.setattr(
+        trusted_direct_runner, "run_trusted_python_script", fake_run
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_root))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+
+    result = json.loads(
+        terminal_tool_module._run_connector_runtime_command_if_allowed(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
+            cwd=str(tmp_path),
+            timeout=5,
+        )
+    )
+
+    assert result["connector_runtime_direct"] is True
+    assert result["exit_code"] == 0
+    assert captured["injected_env"]["ZETTLAB_CONNECTOR_ACTION_RUNTIME"] == (
+        "skills/linear/scripts/connector_runtime.py"
+    )
+
+
 def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkeypatch, tmp_path):
     """Worker env/path/cwd/stdout mutations cannot bleed into the gateway process."""
     _write_connector_runtime_with_global_mutation(tmp_path)
