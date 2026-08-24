@@ -96,6 +96,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.prestream_timing import PrestreamTiming
+
 try:
     from aiohttp import web  # noqa: F401  -- import for type only
 except ImportError:
@@ -3987,6 +3989,7 @@ class ZetAgentAdapter(APIServerAdapter):
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
+        prestream_timing: Optional[PrestreamTiming] = None,
     ):
         """Wrap base ``_run_agent`` to bind the App and interaction scopes.
 
@@ -4243,6 +4246,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
                 trusted_skill_slug=trusted_skill_slug,
+                prestream_timing=prestream_timing,
             )
             # Early-return steer salvage: many conversation_loop retry/error
             # paths return without running finalize_turn, so the closing
@@ -4593,6 +4597,7 @@ class ZetAgentAdapter(APIServerAdapter):
         self, request, completion_id: str, model: str, created: int,
         stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        prestream_timing: Optional[PrestreamTiming] = None,
     ):
         """Register the active turn under session_id for the lifetime of
         the SSE response, then delegate to the base writer. The
@@ -4620,6 +4625,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 active_ref,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                prestream_timing=prestream_timing,
             )
         finally:
             self._clear_active_session_turn(session_id, active_ref, agent_task)

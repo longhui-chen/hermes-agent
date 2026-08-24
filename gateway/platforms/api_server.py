@@ -6638,6 +6638,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         request_overrides=request_overrides or None,
                         trusted_user_message=trusted_user_message,
                         trusted_skill_slug=trusted_skill_slug,
+                        prestream_timing=prestream_timing,
                     ))
                 except BaseException:
                     if prestream_timing is not None:
@@ -6663,6 +6664,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     request, completion_id, model_name, created, _stream_q,
                     agent_task, agent_ref, session_id=session_id,
                     gateway_session_key=gateway_session_key,
+                    prestream_timing=prestream_timing,
                 )
             finally:
                 _prestream_timing_context.reset(writer_timing_token)
@@ -6914,6 +6916,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if prestream_timing is None:
             prestream_timing = _prestream_timing_context.get()
 
+        timing_terminal_completed = False
+
+        def _complete_timing_terminal_once() -> None:
+            nonlocal timing_terminal_completed
+            if timing_terminal_completed:
+                return
+            timing_terminal_completed = True
+            if prestream_timing is not None:
+                try:
+                    prestream_timing.terminal_write_completed()
+                except Exception:
+                    pass
+
         sse_headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -6933,8 +6948,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             await response.prepare(request)
         except BaseException:
-            if prestream_timing is not None:
-                prestream_timing.terminal_write_completed()
+            _complete_timing_terminal_once()
             raise
 
         try:
@@ -6998,6 +7012,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     if isinstance(item, str):
                         streamed_text_parts.append(item)
                         if semantic_event is None:
+                            if prestream_timing is not None:
+                                prestream_timing.observe_queued_semantic("content")
                             semantic_event = (
                                 prestream_timing.semantic_classified("content")
                                 if prestream_timing is not None
@@ -7148,11 +7164,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if hermes_terminal:
                 finish_chunk["hermes"] = hermes_terminal
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
-            if prestream_timing is not None:
-                try:
-                    prestream_timing.terminal_write_completed()
-                except Exception:
-                    pass
+            _complete_timing_terminal_once()
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
@@ -7190,11 +7202,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         finally:
-            if prestream_timing is not None:
-                try:
-                    prestream_timing.terminal_write_completed()
-                except Exception:
-                    pass
+            _complete_timing_terminal_once()
 
         return response
 
@@ -9288,6 +9296,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
+        prestream_timing: Optional[PrestreamTiming] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -9329,7 +9338,8 @@ class APIServerAdapter(BasePlatformAdapter):
             (request_overrides or {}).get("_zettlab_session_context_account_id")
             or session_user_id
         ).strip()
-        prestream_timing = _prestream_timing_context.get()
+        if prestream_timing is None:
+            prestream_timing = _prestream_timing_context.get()
 
         def _run():
             from gateway.session_context import (
@@ -9565,6 +9575,8 @@ class APIServerAdapter(BasePlatformAdapter):
         from contextvars import copy_context
 
         ctx = copy_context()
+        if prestream_timing is not None:
+            ctx.run(_prestream_timing_context.set, prestream_timing)
         self._inflight_agent_runs += 1
         try:
             return await _run_in_executor_with_completion_barrier(

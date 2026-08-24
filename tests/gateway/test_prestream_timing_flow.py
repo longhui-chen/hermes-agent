@@ -35,6 +35,18 @@ async def _completed_agent(final_response: str = "") -> tuple[dict, dict]:
     )
 
 
+class _CountingTerminalTiming(PrestreamTiming):
+    __slots__ = ("terminal_calls",)
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.terminal_calls = 0
+
+    def terminal_write_completed(self) -> None:
+        self.terminal_calls += 1
+        super().terminal_write_completed()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("queue_item", "expected_kind"),
@@ -153,6 +165,114 @@ async def test_observer_failure_does_not_change_sse_bytes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_final_response_records_semantic_to_successful_sse_write(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, token="test"))
+    stream_q: queue.Queue = queue.Queue()
+    stream_q.put(None)
+    now = 10.0
+
+    def clock() -> float:
+        return now
+
+    timing = _CountingTerminalTiming(clock=clock)
+    chunks: list[bytes] = []
+    response = AsyncMock(spec=web.StreamResponse)
+    response.prepare = AsyncMock()
+
+    async def _write(payload: bytes) -> None:
+        nonlocal now
+        chunks.append(payload)
+        if b'"content": "direct answer"' in payload:
+            now += 0.037
+
+    response.write = AsyncMock(side_effect=_write)
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
+
+    with patch(
+        "gateway.platforms.api_server.web.StreamResponse", return_value=response
+    ):
+        await adapter._write_sse_chat_completion(
+            _request(),
+            "cmpl-direct",
+            "model-hidden",
+            1,
+            stream_q,
+            asyncio.create_task(_completed_agent("direct answer")),
+            prestream_timing=timing,
+        )
+
+    summaries = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("hermes.prestream.turn ")
+    ]
+    assert len(summaries) == 1
+    payload = json.loads(summaries[0].split(" ", 1)[1])
+    assert payload["first_event_kind"] == "content"
+    assert payload["semantic_to_sse_write_ms"] == 37
+    assert timing.terminal_calls == 1
+    assert b"direct answer" in b"".join(chunks)
+    assert "direct answer" not in summaries[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["write_error", "cancelled"])
+async def test_direct_final_response_failed_write_completes_terminal_once(
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, token="test"))
+    stream_q: queue.Queue = queue.Queue()
+    stream_q.put(None)
+    timing = _CountingTerminalTiming()
+    response = AsyncMock(spec=web.StreamResponse)
+    response.prepare = AsyncMock()
+
+    async def _write(payload: bytes) -> None:
+        if b'"content": "direct answer"' not in payload:
+            return
+        if failure == "cancelled":
+            raise asyncio.CancelledError
+        raise OSError("client disconnected")
+
+    response.write = AsyncMock(side_effect=_write)
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
+
+    async def _render() -> None:
+        with patch(
+            "gateway.platforms.api_server.web.StreamResponse", return_value=response
+        ):
+            await adapter._write_sse_chat_completion(
+                _request(),
+                f"cmpl-direct-{failure}",
+                "model-hidden",
+                1,
+                stream_q,
+                asyncio.create_task(_completed_agent("direct answer")),
+                prestream_timing=timing,
+            )
+
+    if failure == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await _render()
+    else:
+        await _render()
+
+    summaries = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("hermes.prestream.turn ")
+    ]
+    assert len(summaries) == 1
+    payload = json.loads(summaries[0].split(" ", 1)[1])
+    assert payload["first_event_kind"] == "none"
+    assert "semantic_to_sse_write_ms" not in payload
+    assert timing.terminal_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_zet_style_writer_override_keeps_one_turn_one_summary(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -160,8 +280,10 @@ async def test_zet_style_writer_override_keeps_one_turn_one_summary(
 
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, token="test"))
     assert adapter.platform == Platform.ZET_AGENT
+    runner_timings: list[PrestreamTiming] = []
 
     async def _run_agent(**kwargs):
+        runner_timings.append(kwargs["prestream_timing"])
         kwargs["stream_delta_callback"]("answer")
         return (
             {"final_response": "answer", "completed": True},
@@ -191,6 +313,7 @@ async def test_zet_style_writer_override_keeps_one_turn_one_summary(
 
     summaries = [r.message for r in caplog.records if r.message.startswith("hermes.prestream.turn ")]
     assert len(summaries) == 1
+    assert len(runner_timings) == 1
     assert json.loads(summaries[0].split(" ", 1)[1])["first_event_kind"] == "content"
     assert "private-user-secret" not in summaries[0]
     assert "must-not-be-logged" not in summaries[0]
@@ -238,6 +361,50 @@ async def test_run_agent_records_executor_queue_and_agent_init_boundaries(
     assert payload["executor_queue_ms"] >= 0
     assert payload["agent_init_ms"] >= 15
     assert "private user text" not in summary
+
+
+@pytest.mark.asyncio
+async def test_run_agent_explicit_timing_reaches_executor_and_zet_creation_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from gateway.platforms.api_server import _prestream_timing_context
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, token="test"))
+    fake_agent = MagicMock()
+    fake_agent.run_conversation.return_value = {"final_response": "ok"}
+    fake_agent.session_prompt_tokens = 0
+    fake_agent.session_completion_tokens = 0
+    fake_agent.session_total_tokens = 0
+    timing = PrestreamTiming()
+    timing.history_ready(source="request", count=0)
+    timing.executor_queued()
+    seen_in_executor: list[PrestreamTiming | None] = []
+
+    def _create_agent(**_kwargs):
+        seen_in_executor.append(_prestream_timing_context.get())
+        return fake_agent
+
+    caplog.set_level(logging.INFO, logger="agent.prestream_timing")
+    assert _prestream_timing_context.get() is None
+    with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+        await adapter._run_agent(
+            user_message="private user text",
+            conversation_history=[],
+            session_id="session-1",
+            prestream_timing=timing,
+        )
+
+    assert seen_in_executor == [timing]
+    assert _prestream_timing_context.get() is None
+    timing.public_write_completed(timing.semantic_observed("content"))
+    summary = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("hermes.prestream.turn ")
+    )
+    payload = json.loads(summary.split(" ", 1)[1])
+    assert payload["executor_queue_ms"] >= 0
+    assert payload["agent_init_ms"] >= 0
 
 
 @pytest.mark.asyncio
