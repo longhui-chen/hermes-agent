@@ -114,6 +114,7 @@ from gateway.platforms.api_server import (
     _REQUEST_OPTION_MISSING,
     _ProviderAuthResolutionError,
     _api_request_profile,
+    _prestream_timing_context,
     _apply_runtime_agent_overrides,
     _chat_finish_reason_from_result,
     _clean_request_string,
@@ -1934,6 +1935,12 @@ class ZetAgentAdapter(APIServerAdapter):
         bound to zet_agent (see caller). The fork's skill-scope resolvers
         read that ContextVar BEFORE the process HERMES_PLATFORM env, so the
         binding is authoritative here without touching global state."""
+        prestream_timing = _prestream_timing_context.get()
+
+        def _mark_expand_error() -> None:
+            if prestream_timing is not None:
+                prestream_timing.skill_expand_completed("error")
+
         try:
             from agent.skill_commands import (
                 build_skill_invocation_message,
@@ -1941,6 +1948,7 @@ class ZetAgentAdapter(APIServerAdapter):
             )
             commands = scan_skill_commands()
         except Exception:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill scan failed; passing message through",
                 exc_info=True,
@@ -1948,6 +1956,7 @@ class ZetAgentAdapter(APIServerAdapter):
             return user_message
         info = commands.get(token)
         if not info:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] requested skill %s not installed (App inventory "
                 "drift?); passing message through", skill_slug,
@@ -1987,12 +1996,14 @@ class ZetAgentAdapter(APIServerAdapter):
                 token, user_instruction=task_text, task_id=session_id or None,
             )
         except Exception:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill %s build failed; passing message through",
                 skill_slug, exc_info=True,
             )
             return user_message
         if not part:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill %s resolved by scan but failed to "
                 "load; passing message through", skill_slug,
@@ -3824,10 +3835,14 @@ class ZetAgentAdapter(APIServerAdapter):
 
         # 1. Reasoning: late-bind on the agent (AIAgent reads
         # ``self.reasoning_callback`` at runtime).
+        prestream_timing = _prestream_timing_context.get()
+
         def _reasoning_cb(text: str) -> None:
             if not text:
                 return
             try:
+                if prestream_timing is not None:
+                    prestream_timing.observe_queued_semantic("reasoning")
                 stream_q.put(("__tool_progress__", {"type": "reasoning.delta", "text": text}))
             except Exception:
                 logger.debug("[zet_agent] reasoning_cb push failed", exc_info=True)

@@ -65,6 +65,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from agent.prestream_timing import PrestreamTiming
+
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
 # (no prefix / multiplexing off → handle as the default profile).
@@ -74,6 +76,9 @@ _PROFILE_REJECTED = object()
 # Set by the profile-prefix middleware; read by handlers / _run_agent.
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
+)
+_prestream_timing_context: ContextVar[Optional[PrestreamTiming]] = ContextVar(
+    "api_server_prestream_timing", default=None
 )
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
@@ -6125,6 +6130,7 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        prestream_ingress_at = time.monotonic()
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -6311,6 +6317,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # keep retries attached to the same workflow.
             execution_policy = "silent_automation"
 
+        history_source = "request"
+        history_outcome = "request"
         if execution_policy == "silent_automation":
             # Silent automation owns one server-selected task configuration.
             # Interactive Plan controls are not part of that task.
@@ -6329,9 +6337,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 db = await self._ensure_session_db_async()
                 if db is not None:
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                    history_source = "session_db"
+                    history_outcome = "session_db_success"
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
+                history_source = "session_db"
+                history_outcome = "session_db_error"
+        history_ready_at = time.monotonic()
 
         # Explicit skill selection is triggered ONLY by metadata.skill_slug —
         # never by sniffing the message text. Ordinary turns and silent video
@@ -6376,6 +6389,26 @@ class APIServerAdapter(BasePlatformAdapter):
             if skill_selection_enabled
             else ""
         )
+
+        prestream_timing: Optional[PrestreamTiming] = None
+        if stream and self.platform == Platform.ZET_AGENT:
+            prestream_timing = PrestreamTiming(
+                session_id=session_id,
+                turn_id=turn_id,
+                explicit_skill=skill_selection_enabled,
+                ingress_at=prestream_ingress_at,
+            )
+            if history_outcome == "session_db_error":
+                prestream_timing.history_failed(
+                    source="session_db",
+                    outcome="session_db_error",
+                )
+            else:
+                prestream_timing.history_ready(
+                    source=history_source,
+                    count=len(history),
+                    observed_at=history_ready_at,
+                )
 
         async def _expanded_user_message(on_settled=None):
             if not skill_expansion_enabled:
@@ -6466,6 +6499,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 # completion via agent_task.done() instead.
                 if delta is not None:
                     for safe_delta in media_delta_filter.feed(delta):
+                        if prestream_timing is not None:
+                            prestream_timing.observe_queued_semantic("content")
                         _stream_q.put(safe_delta)
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
@@ -6492,13 +6527,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                wire_item = ("__tool_progress__", {
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
-                }))
+                })
+                if prestream_timing is not None:
+                    prestream_timing.observe_queued_semantic("tool_start")
+                _stream_q.put(wire_item)
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -6535,40 +6573,78 @@ class APIServerAdapter(BasePlatformAdapter):
                 request.get("hermes_profile_home")
             )
             try:
-                user_message = await _expanded_user_message(
-                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                if prestream_timing is not None and skill_expansion_enabled:
+                    prestream_timing.skill_expand_started()
+                def _expansion_settled() -> None:
+                    if prestream_timing is not None and skill_expansion_enabled:
+                        prestream_timing.skill_expand_settled()
+                    self._end_profile_chat_run(expansion_run_key)
+
+                expansion_timing_token = _prestream_timing_context.set(
+                    prestream_timing
                 )
+                try:
+                    try:
+                        user_message = await _expanded_user_message(
+                            on_settled=_expansion_settled
+                        )
+                    except asyncio.CancelledError:
+                        if prestream_timing is not None and skill_expansion_enabled:
+                            prestream_timing.skill_expand_completed("cancelled")
+                        raise
+                    except BaseException:
+                        if prestream_timing is not None and skill_expansion_enabled:
+                            prestream_timing.skill_expand_completed("error")
+                        raise
+                    else:
+                        if prestream_timing is not None and skill_expansion_enabled:
+                            prestream_timing.skill_expand_completed("success")
+                finally:
+                    _prestream_timing_context.reset(expansion_timing_token)
             except BaseException:
                 # The stream path ends the run in the agent task's
                 # done-callback; a failure before that task exists must not
                 # leak the active-run count (unload would then hang/refuse).
                 self._end_profile_chat_run(profile_run_key)
+                if prestream_timing is not None:
+                    prestream_timing.terminal_write_completed()
                 raise
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                **agent_overrides,
-                route=route,
-                response_mode=response_mode,
-                plan_ack=plan_ack,
-                plan_auto_execute=plan_auto_execute,
-                turn_id=turn_id,
-                connector_route_capability=connector_route_capability,
-                creation_action_receipt_transport=creation_action_receipt_transport,
-                hardware_execution_token=hardware_execution_token,
-                execution_policy=execution_policy,
-                current_turn_reference_image=current_turn_reference_image,
-                request_overrides=request_overrides or None,
-                trusted_user_message=trusted_user_message,
-                trusted_skill_slug=trusted_skill_slug,
-            ))
+            if prestream_timing is not None:
+                prestream_timing.executor_queued()
+            timing_token = _prestream_timing_context.set(prestream_timing)
+            try:
+                try:
+                    agent_task = asyncio.ensure_future(self._run_agent(
+                        user_message=user_message,
+                        conversation_history=history,
+                        ephemeral_system_prompt=system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_on_delta,
+                        tool_start_callback=_on_tool_start,
+                        tool_complete_callback=_on_tool_complete,
+                        agent_ref=agent_ref,
+                        gateway_session_key=gateway_session_key,
+                        **agent_overrides,
+                        route=route,
+                        response_mode=response_mode,
+                        plan_ack=plan_ack,
+                        plan_auto_execute=plan_auto_execute,
+                        turn_id=turn_id,
+                        connector_route_capability=connector_route_capability,
+                        creation_action_receipt_transport=creation_action_receipt_transport,
+                        hardware_execution_token=hardware_execution_token,
+                        execution_policy=execution_policy,
+                        current_turn_reference_image=current_turn_reference_image,
+                        request_overrides=request_overrides or None,
+                        trusted_user_message=trusted_user_message,
+                        trusted_skill_slug=trusted_skill_slug,
+                    ))
+                except BaseException:
+                    if prestream_timing is not None:
+                        prestream_timing.terminal_write_completed()
+                    raise
+            finally:
+                _prestream_timing_context.reset(timing_token)
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             def _finish_chat_stream(_fut):
@@ -6581,11 +6657,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 lambda _fut, key=profile_run_key: self._end_profile_chat_run(key)
             )
 
-            return await self._write_sse_chat_completion(
-                request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
-                gateway_session_key=gateway_session_key,
-            )
+            writer_timing_token = _prestream_timing_context.set(prestream_timing)
+            try:
+                return await self._write_sse_chat_completion(
+                    request, completion_id, model_name, created, _stream_q,
+                    agent_task, agent_ref, session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+            finally:
+                _prestream_timing_context.reset(writer_timing_token)
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
@@ -6821,6 +6901,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        prestream_timing: Optional[PrestreamTiming] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -6829,6 +6910,9 @@ class APIServerAdapter(BasePlatformAdapter):
         LLM API calls, and the asyncio task wrapper is cancelled.
         """
         import queue as _q
+
+        if prestream_timing is None:
+            prestream_timing = _prestream_timing_context.get()
 
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -6846,7 +6930,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
+        try:
+            await response.prepare(request)
+        except BaseException:
+            if prestream_timing is not None:
+                prestream_timing.terminal_write_completed()
+            raise
 
         try:
             last_activity = time.monotonic()
@@ -6872,6 +6961,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                semantic_event = None
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     # Keep browserState's wire representation identical to its
                     # UTF-8 byte-budget calculation.  ASCII escaping can triple
@@ -6887,6 +6977,18 @@ class APIServerAdapter(BasePlatformAdapter):
                             "utf-8", errors="backslashreplace"
                         )
                     )
+                    if semantic_event is None and prestream_timing is not None:
+                        if item[1].get("type") == "reasoning.delta":
+                            semantic_event = prestream_timing.semantic_classified(
+                                "reasoning"
+                            )
+                        elif (
+                            item[1].get("status") == "running"
+                            and item[1].get("toolCallId")
+                        ):
+                            semantic_event = prestream_timing.semantic_classified(
+                                "tool_start"
+                            )
                 elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
                     event_data = json.dumps(item[1])
                     await response.write(
@@ -6895,12 +6997,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 else:
                     if isinstance(item, str):
                         streamed_text_parts.append(item)
+                        if semantic_event is None:
+                            semantic_event = (
+                                prestream_timing.semantic_classified("content")
+                                if prestream_timing is not None
+                                else None
+                            )
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
                         "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                if prestream_timing is not None:
+                    try:
+                        prestream_timing.public_write_completed(semantic_event)
+                    except Exception:
+                        pass
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -7035,6 +7148,11 @@ class APIServerAdapter(BasePlatformAdapter):
             if hermes_terminal:
                 finish_chunk["hermes"] = hermes_terminal
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            if prestream_timing is not None:
+                try:
+                    prestream_timing.terminal_write_completed()
+                except Exception:
+                    pass
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
@@ -7070,6 +7188,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(b"data: [DONE]\n\n")
             except Exception:
                 pass
+
+        finally:
+            if prestream_timing is not None:
+                try:
+                    prestream_timing.terminal_write_completed()
+                except Exception:
+                    pass
 
         return response
 
@@ -9204,6 +9329,7 @@ class APIServerAdapter(BasePlatformAdapter):
             (request_overrides or {}).get("_zettlab_session_context_account_id")
             or session_user_id
         ).strip()
+        prestream_timing = _prestream_timing_context.get()
 
         def _run():
             from gateway.session_context import (
@@ -9214,6 +9340,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 set_zettlab_turn_id,
             )
 
+            if prestream_timing is not None:
+                prestream_timing.executor_started()
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
@@ -9239,22 +9367,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     create_overrides = dict(request_overrides or {})
                     create_overrides["_zet_plan_auto_execute"] = resolved_plan_auto_execute
                     create_overrides["_zet_execution_policy"] = execution_policy or ""
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=stream_delta_callback,
-                        tool_progress_callback=tool_progress_callback,
-                        tool_start_callback=tool_start_callback,
-                        tool_complete_callback=tool_complete_callback,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=requested_model,
-                        requested_provider=requested_provider,
-                        model_options=model_options,
-                        route=route,
-                        session_model=session_model,
-                        confirmed_runtime_lock=confirmed_runtime_lock,
-                        request_overrides=create_overrides,
-                    )
+                    if prestream_timing is not None:
+                        prestream_timing.agent_init_started()
+                    try:
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=stream_delta_callback,
+                            tool_progress_callback=tool_progress_callback,
+                            tool_start_callback=tool_start_callback,
+                            tool_complete_callback=tool_complete_callback,
+                            gateway_session_key=gateway_session_key,
+                            requested_model=requested_model,
+                            requested_provider=requested_provider,
+                            model_options=model_options,
+                            route=route,
+                            session_model=session_model,
+                            confirmed_runtime_lock=confirmed_runtime_lock,
+                            request_overrides=create_overrides,
+                        )
+                    except BaseException:
+                        if prestream_timing is not None:
+                            prestream_timing.agent_init_finished("error")
+                        raise
+                    else:
+                        if prestream_timing is not None:
+                            prestream_timing.agent_init_finished("success")
                     agent._tools_disabled_for_request = (
                         create_overrides.get("tool_choice") == "none"
                     )
