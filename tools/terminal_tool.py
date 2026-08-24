@@ -1149,8 +1149,18 @@ _PRINTER3D_RUNTIME_CAPABILITIES = {
     "printer3d_connector.py": "zettlab.printer3d.actions.v1",
     "printer3d_control.py": "hardware.printer3d.control.v1",
 }
+_PLAUD_RUNTIME_SCRIPT = "plaud_connector.py"
+_PLAUD_RUNTIME_RELATIVE_PATH = Path(
+    "skills/plaud-recordings/scripts/plaud_connector.py"
+)
+_PLAUD_RUNTIME_MANIFEST_RELATIVE_PATH = Path(
+    "skills/plaud-recordings/manifest.yaml"
+)
+_PLAUD_RUNTIME_CAPABILITY = "zettlab.plaud.actions.v1"
+_PLAUD_FILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _CAMERA_RUNTIME_MAX_MANIFEST_BYTES = 64 * 1024
 _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS = 80
+_PLAUD_RUNTIME_MAX_TIMEOUT_SECONDS = 45
 _CAMERA_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
@@ -4923,6 +4933,13 @@ class _Printer3DRuntimeCommand:
     script_identity: tuple[int, int]
 
 
+@dataclass(frozen=True)
+class _PlaudRuntimeCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+
+
 def _video_edit_runtime_timeout(
     parsed: _VideoEditRuntimeCommand,
     requested_timeout: int,
@@ -5523,6 +5540,178 @@ def _printer3d_runtime_shell_guard_result(command: str) -> Optional[str]:
         ),
         "printer3d_runtime_direct": False,
         "printer3d_runtime_blocked": True,
+    }, ensure_ascii=False)
+
+
+def _resolve_plaud_runtime_script(raw_path: str) -> Optional[Path]:
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
+        return None
+    relative_text: Optional[str] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative_text = raw_path[len(prefix):]
+            break
+    if relative_text is None:
+        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).absolute()
+        for allowed_root in (anchor.configured_root, anchor.resolved_root):
+            try:
+                relative_text = str(expanded.relative_to(allowed_root))
+                break
+            except ValueError:
+                continue
+    if relative_text is None or Path(relative_text) != _PLAUD_RUNTIME_RELATIVE_PATH:
+        return None
+    candidate = anchor.resolved_root / _PLAUD_RUNTIME_RELATIVE_PATH
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(anchor.resolved_root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file() or not _connector_runtime_path_is_trusted(
+        candidate,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        return None
+    return resolved
+
+
+def _plaud_runtime_date_allowed(value: str) -> bool:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        return False
+    try:
+        time.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _plaud_runtime_arguments_allowed(arguments: list[str]) -> bool:
+    if not arguments:
+        return False
+    action = arguments[0]
+    if action in {"transcript", "note"}:
+        return bool(
+            len(arguments) == 3
+            and arguments[1] == "--file-id"
+            and _PLAUD_FILE_ID_RE.fullmatch(arguments[2]) is not None
+        )
+    if action == "list":
+        values = arguments[1:]
+        allowed = {"--page": (1, 1000), "--page-size": (10, 100)}
+    elif action == "search":
+        if len(arguments) < 2:
+            return False
+        keyword = arguments[1]
+        if (
+            not keyword.strip()
+            or len(keyword.encode("utf-8")) > 200
+            or any(ord(character) < 0x20 for character in keyword)
+        ):
+            return False
+        values = arguments[2:]
+        allowed = {"--max": (1, 100), "--from": None, "--to": None}
+    else:
+        return False
+    if len(values) % 2 != 0:
+        return False
+    seen: set[str] = set()
+    for index in range(0, len(values), 2):
+        flag, value = values[index:index + 2]
+        bounds = allowed.get(flag)
+        if flag not in allowed or flag in seen:
+            return False
+        seen.add(flag)
+        if bounds is None:
+            if not _plaud_runtime_date_allowed(value):
+                return False
+            continue
+        if not value.isdigit() or not bounds[0] <= int(value) <= bounds[1]:
+            return False
+    return True
+
+
+def _parse_plaud_runtime_command(command: str) -> Optional[_PlaudRuntimeCommand]:
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if (
+        len(tokens) < 3
+        or not _is_python_executable_token(tokens[0])
+        or Path(tokens[1]).name != _PLAUD_RUNTIME_SCRIPT
+        or any(token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION for token in tokens)
+        or not _plaud_runtime_arguments_allowed(tokens[2:])
+    ):
+        return None
+    script = _resolve_plaud_runtime_script(tokens[1])
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if script is None or anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _PlaudRuntimeCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _plaud_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool:
+    manifest = anchor.resolved_root / _PLAUD_RUNTIME_MANIFEST_RELATIVE_PATH
+    try:
+        digest = anchor.file_digests.get(_PLAUD_RUNTIME_MANIFEST_RELATIVE_PATH.as_posix())
+        if digest is None or not _connector_runtime_path_is_trusted(
+            manifest,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        ):
+            return False
+        raw = _read_connector_runtime_script_bytes(
+            manifest,
+            expected_identity=_path_identity(manifest),
+            expected_digest=digest,
+        )
+        if len(raw) > _CAMERA_RUNTIME_MAX_MANIFEST_BYTES:
+            return False
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        return bool(
+            isinstance(loaded, dict)
+            and loaded.get("id") == "plaud-recordings"
+            and loaded.get("required_scopes") == ["hardware.plaud:read"]
+            and _PLAUD_RUNTIME_CAPABILITY
+            in (loaded.get("runtime_capabilities") or [])
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def _plaud_runtime_shell_guard_result(command: str) -> Optional[str]:
+    if _PLAUD_RUNTIME_SCRIPT not in command:
+        return None
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": (
+            "PLAUD actions require one exact foreground signed helper command "
+            "with fixed read-only arguments and no shell operators, wrappers, "
+            "account identifier, credential, URL, path, audio, write, or control input."
+        ),
+        "plaud_runtime_direct": False,
+        "plaud_runtime_blocked": True,
     }, ensure_ascii=False)
 
 
@@ -6683,6 +6872,102 @@ def _run_printer3d_runtime_command_if_allowed(
             "exit_code": -1,
             "error": f"3D-printer runtime execution failed: {type(exc).__name__}",
             "printer3d_runtime_direct": True,
+        }, ensure_ascii=False)
+
+
+def _run_plaud_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_plaud_runtime_command(command)
+    if parsed is None:
+        return _plaud_runtime_shell_guard_result(command)
+    if not _ensure_sensitive_runtime_boundary():
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "PLAUD runtime process memory boundary is unavailable",
+            "plaud_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(parsed.argv[1])
+    expected_digest: Optional[str] = None
+    try:
+        expected_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
+        identities_match = (
+            anchor is not None
+            and expected_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+            and _plaud_runtime_manifest_allows(anchor)
+        )
+    except (OSError, AttributeError):
+        identities_match = False
+    if not identities_match:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "PLAUD runtime package identity or capability is unavailable",
+            "plaud_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=expected_digest,
+        )
+        from tools.environments.local import build_plaud_runtime_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        trusted_env = build_plaud_runtime_env()
+        trusted_secrets = {
+            key: trusted_env.pop(key)
+            for key in (
+                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+            )
+        }
+        secret_values = list(trusted_secrets.values())
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=Path(run_cwd),
+            base_env={},
+            injected_env=trusted_env,
+            injected_secrets=trusted_secrets,
+            timeout=max(1, min(timeout, _PLAUD_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            secret_values=secret_values,
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+        payload = json.loads(_connector_runtime_result_json(
+            command=command,
+            output=completed.output,
+            returncode=completed.returncode,
+            secret_values=secret_values,
+            timed_out=completed.timed_out,
+        ))
+        payload.pop("connector_runtime_direct", None)
+        payload["plaud_runtime_direct"] = True
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"PLAUD runtime execution failed: {type(exc).__name__}",
+            "plaud_runtime_direct": True,
         }, ensure_ascii=False)
 
 
@@ -8143,6 +8428,13 @@ def terminal_tool(
                 }, ensure_ascii=False)
 
         if not background and not pty:
+            plaud_runtime_result = _run_plaud_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if plaud_runtime_result is not None:
+                return plaud_runtime_result
             printer3d_runtime_result = _run_printer3d_runtime_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -8182,6 +8474,9 @@ def terminal_tool(
             lark_cli_result = _lark_cli_shell_guard_result(command)
             if lark_cli_result is not None:
                 return lark_cli_result
+            plaud_runtime_result = _plaud_runtime_shell_guard_result(command)
+            if plaud_runtime_result is not None:
+                return plaud_runtime_result
             camera_runtime_result = _camera_runtime_shell_guard_result(command)
             if camera_runtime_result is not None:
                 return camera_runtime_result
