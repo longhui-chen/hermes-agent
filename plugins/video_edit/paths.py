@@ -66,6 +66,10 @@ _ISO_VIDEO_BRANDS = {
     b"qt  ",
 }
 _ISO_BMFF_MAX_BOX_DEPTH = 8
+_ISO_BMFF_MAX_TOP_LEVEL_BOXES = 4096
+_ISO_BMFF_MAX_CHILD_BOXES = 4096
+_ISO_BMFF_MAX_MOOV_BYTES = VIDEO_PROBE_BYTES
+_ISO_BMFF_READ_CHUNK_BYTES = 64 * 1024
 
 
 class VideoPathError(ValueError):
@@ -211,6 +215,39 @@ def _iso_bmff_boxes(
         offset = box_end
 
 
+def _iso_bmff_complete_boxes(
+    sample: bytes,
+    start: int,
+    end: int,
+) -> list[tuple[bytes, int, int]] | None:
+    """Return all boxes only when the bounded parent is structurally complete."""
+    if start < 0 or end < start or end > len(sample):
+        return None
+    boxes: list[tuple[bytes, int, int]] = []
+    offset = start
+    while offset < end:
+        if len(boxes) >= _ISO_BMFF_MAX_CHILD_BOXES:
+            return None
+        if end - offset < 8:
+            return None
+        size = int.from_bytes(sample[offset : offset + 4], "big")
+        kind = sample[offset + 4 : offset + 8]
+        header_size = 8
+        if size == 1:
+            if end - offset < 16:
+                return None
+            size = int.from_bytes(sample[offset + 8 : offset + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = end - offset
+        if size < header_size or size > end - offset:
+            return None
+        box_end = offset + size
+        boxes.append((kind, offset + header_size, box_end))
+        offset = box_end
+    return boxes
+
+
 def _iso_bmff_mdia_has_video_handler(
     sample: bytes,
     start: int,
@@ -219,7 +256,10 @@ def _iso_bmff_mdia_has_video_handler(
 ) -> bool:
     if depth > _ISO_BMFF_MAX_BOX_DEPTH:
         return False
-    for kind, payload_start, box_end in _iso_bmff_boxes(sample, start, end):
+    boxes = _iso_bmff_complete_boxes(sample, start, end)
+    if boxes is None:
+        return False
+    for kind, payload_start, box_end in boxes:
         if kind != b"hdlr" or box_end - payload_start < 12:
             continue
         # FullBox(version + flags), pre_defined, then handler_type.
@@ -236,9 +276,28 @@ def _iso_bmff_trak_has_video_handler(
 ) -> bool:
     if depth > _ISO_BMFF_MAX_BOX_DEPTH:
         return False
-    for kind, payload_start, box_end in _iso_bmff_boxes(sample, start, end):
+    boxes = _iso_bmff_complete_boxes(sample, start, end)
+    if boxes is None:
+        return False
+    for kind, payload_start, box_end in boxes:
         if kind == b"mdia" and _iso_bmff_mdia_has_video_handler(
             sample, payload_start, box_end, depth + 1
+        ):
+            return True
+    return False
+
+
+def _iso_bmff_moov_has_video_track(
+    sample: bytes,
+    start: int,
+    end: int,
+) -> bool:
+    boxes = _iso_bmff_complete_boxes(sample, start, end)
+    if boxes is None:
+        return False
+    for trak_kind, trak_start, trak_end in boxes:
+        if trak_kind == b"trak" and _iso_bmff_trak_has_video_handler(
+            sample, trak_start, trak_end, 2
         ):
             return True
     return False
@@ -248,19 +307,110 @@ def _iso_bmff_has_video_track(sample: bytes) -> bool:
     """Require an actual ``hdlr=vide`` track, not just an ISO brand."""
     if not _iso_bmff_is_video(sample):
         return False
+    # ``sample`` is intentionally only a bounded prefix.  A valid fast-start
+    # moov may be followed by an incomplete mdat tail in that prefix; the
+    # descriptor-aware path performs whole-file top-level validation when the
+    # prefix cannot prove the track.
     for kind, payload_start, box_end in _iso_bmff_boxes(
         sample, 0, len(sample)
     ):
-        if kind != b"moov":
-            continue
-        for trak_kind, trak_start, trak_end in _iso_bmff_boxes(
+        if kind == b"moov" and _iso_bmff_moov_has_video_track(
             sample, payload_start, box_end
         ):
-            if trak_kind == b"trak" and _iso_bmff_trak_has_video_handler(
-                sample, trak_start, trak_end, 2
-            ):
-                return True
+            return True
     return False
+
+
+def _iso_bmff_read_top_level_header(
+    descriptor: int,
+    offset: int,
+    file_size: int,
+) -> tuple[bytes, int, int] | None:
+    """Read one bounded top-level header and return kind, end, header size."""
+    if offset < 0 or offset > file_size - 8:
+        return None
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    header = os.read(descriptor, 8)
+    if len(header) < 8:
+        return None
+    size = int.from_bytes(header[:4], "big")
+    kind = header[4:8]
+    header_size = 8
+    if size == 1:
+        largesize = os.read(descriptor, 8)
+        if len(largesize) < 8:
+            return None
+        size = int.from_bytes(largesize, "big")
+        header_size = 16
+    elif size == 0:
+        size = file_size - offset
+    if size < header_size or size > file_size - offset:
+        return None
+    return kind, offset + size, header_size
+
+
+def _iso_bmff_read_range(
+    descriptor: int,
+    offset: int,
+    size: int,
+) -> bytes | None:
+    """Read one bounded box without touching unrelated media payload."""
+    if size < 0 or size > _ISO_BMFF_MAX_MOOV_BYTES:
+        return None
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(
+            descriptor,
+            min(_ISO_BMFF_READ_CHUNK_BYTES, remaining),
+        )
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _iso_bmff_has_video_track_descriptor(
+    descriptor: int,
+    file_size: int,
+) -> bool:
+    """Find a bounded ``moov`` by seeking over trusted top-level sizes."""
+    offset = 0
+    saw_ftyp = False
+    saw_moov = False
+    has_video_track = False
+    for _ in range(_ISO_BMFF_MAX_TOP_LEVEL_BOXES):
+        header = _iso_bmff_read_top_level_header(
+            descriptor, offset, file_size
+        )
+        if header is None:
+            return False
+        kind, box_end, header_size = header
+        if kind == b"ftyp":
+            saw_ftyp = True
+        elif kind == b"moov":
+            if not saw_ftyp or saw_moov:
+                return False
+            saw_moov = True
+            box_size = box_end - offset
+            raw = _iso_bmff_read_range(descriptor, offset, box_size)
+            if raw is None:
+                return False
+            # The header parser has already checked the box size; only parse
+            # complete child boxes inside this bounded moov snapshot.
+            has_video_track = _iso_bmff_moov_has_video_track(
+                raw, header_size, len(raw)
+            )
+        if box_end <= offset:
+            return False
+        offset = box_end
+        if offset == file_size:
+            break
+    if offset != file_size:
+        return False
+    return saw_moov and has_video_track
 
 
 def _ebml_doctype(sample: bytes) -> str:
@@ -387,10 +537,20 @@ def inspect_video_descriptor(path: Path, descriptor: int) -> tuple[str, bool]:
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
         sample = os.read(descriptor, VIDEO_HEADER_BYTES)
+        size = os.fstat(descriptor).st_size
+        signature = _detect_video_container_signature(sample)
         if _detect_video_container(sample) in details[1]:
             return details[0], True
+        if signature == "iso-bmff":
+            if "iso-bmff" not in details[1]:
+                raise VideoPathError("input is not a supported video file")
+            if _iso_bmff_has_video_track_descriptor(descriptor, size):
+                return details[0], True
+            # A recognized ISO brand without a bounded, structurally valid
+            # video track is intentionally inconclusive; the upload caller
+            # will fail closed when the packaged probe is unavailable.
+            return details[0], False
 
-        size = os.fstat(descriptor).st_size
         probe_limit = min(size, VIDEO_PROBE_BYTES)
         chunks = [sample]
         remaining = probe_limit - len(sample)

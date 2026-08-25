@@ -48,7 +48,13 @@ def trusted_upload_media_probe(tmp_path, monkeypatch):
         for source in sources:
             info = source.stat()
             identities.append(
-                (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+                (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                )
             )
         return identities
 
@@ -900,7 +906,7 @@ def test_source_fingerprint_ignores_ctime_only_but_detects_inode_replacement():
     assert tools._source_fingerprint([source]) != original
 
 
-def test_upload_retry_survives_admission_ctime_change_after_transient_failure(
+def test_upload_retry_keeps_admission_identity_after_transient_failure(
     isolated_video_home,
     monkeypatch,
     tmp_path,
@@ -919,8 +925,9 @@ def test_upload_retry_survives_admission_ctime_change_after_transient_failure(
     admission_ctimes = []
 
     def inspect(command, *, env, timeout, pass_fds):
-        assert len(pass_fds) == 1
+        assert len(pass_fds) == 2
         assert command[1].endswith(f"/{pass_fds[0]}")
+        assert command[3].endswith(f"/{pass_fds[1]}")
         admission_ctimes.append(source.stat().st_ctime_ns)
         payload = {
             "ok": True,
@@ -964,8 +971,6 @@ def test_upload_retry_survives_admission_ctime_change_after_transient_failure(
 
     monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
     initial_ctime = source.stat().st_ctime_ns
-    time.sleep(0.01)
-
     transient = json.loads(
         tools.handle_upload_assets(
             {"workflow_id": workflow, "files": [str(source)]},
@@ -975,7 +980,6 @@ def test_upload_retry_survives_admission_ctime_change_after_transient_failure(
 
     assert transient["reason_code"] == "transient_failure"
     assert transient["retryable"] is True
-    assert source.stat().st_ctime_ns != initial_ctime
     checkpoint = tools.state.get(workflow, "agent-a")
     assert checkpoint["source_fingerprint"] == tools._source_fingerprint([source])
 
@@ -989,6 +993,8 @@ def test_upload_retry_survives_admission_ctime_change_after_transient_failure(
     assert retried["ok"] is True
     assert retried["uploaded"] == 1
     assert admission_ctimes and len(admission_ctimes) == 2
+    assert admission_ctimes[0] == initial_ctime
+    assert admission_ctimes[1] == initial_ctime
     assert connection_attempts == 2
     assert tools.state.get(workflow, "agent-a")["object_keys"] == ["asset-1"]
 
@@ -3443,6 +3449,104 @@ def test_upload_stream_declares_the_admitted_video_mime(monkeypatch, tmp_path):
     request_body = b"".join(sent)
     assert b"Content-Type: video/x-matroska" in request_body
     assert b"application/octet-stream" not in request_body
+
+
+def test_upload_refreshes_multipart_size_after_probe_growth(monkeypatch, tmp_path):
+    source = tmp_path / "grown-after-probe.mkv"
+    _write_video(source, b"before-growth")
+    appended = b"probe-added-bytes"
+    headers = {}
+    sent = []
+
+    def inspect(sources, _workflow_id):
+        assert list(sources) == [source]
+        with source.open("ab") as stream:
+            stream.write(appended)
+        info = source.stat()
+        # The client must use the descriptor snapshot after this callback, not
+        # the size captured before it ran.
+        return [
+            (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        ]
+
+    monkeypatch.setattr(normalizer, "inspect_files", inspect)
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"grown"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, key, value):
+            headers[key] = value
+
+        def endheaders(self):
+            return None
+
+        def send(self, chunk):
+            sent.append(chunk)
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    client.upload([source], agent_id="agent-a", replay_scope="probe-growth")
+
+    assert int(headers["Content-Length"]) == sum(len(chunk) for chunk in sent)
+    assert appended in b"".join(sent)
+
+
+def test_upload_rejects_probe_growth_over_limit_before_connect(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "grown-over-limit.mp4"
+    _write_video(source, b"bounded-header")
+    os.truncate(source, client.MAX_UPLOAD_BYTES - 1)
+    connections = []
+
+    def inspect(sources, _workflow_id):
+        assert list(sources) == [source]
+        os.truncate(source, client.MAX_UPLOAD_BYTES + 1)
+        info = source.stat()
+        return [
+            (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        ]
+
+    monkeypatch.setattr(normalizer, "inspect_files", inspect)
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            connections.append(True)
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    with pytest.raises(client.VideoClientError, match="size limit"):
+        client.upload([source], agent_id="agent-a", replay_scope="probe-over-limit")
+
+    assert connections == []
 
 
 def test_upload_rechecks_the_opened_descriptor_before_connect(monkeypatch, tmp_path):

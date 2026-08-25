@@ -20,6 +20,14 @@ def _iso_box(kind: bytes, payload: bytes) -> bytes:
     return (len(payload) + 8).to_bytes(4, "big") + kind + payload
 
 
+def _iso_largesize_box(kind: bytes, payload: bytes) -> bytes:
+    return b"\x00\x00\x00\x01" + kind + (len(payload) + 16).to_bytes(8, "big") + payload
+
+
+def _iso_zero_size_box(kind: bytes, payload: bytes) -> bytes:
+    return b"\x00\x00\x00\x00" + kind + payload
+
+
 def _iso_ftyp(brand: bytes = b"qt  ") -> bytes:
     payload = brand + b"\x00\x00\x00\x00" + brand
     return _iso_box(b"ftyp", payload)
@@ -44,6 +52,13 @@ def _iso_video_sample() -> bytes:
 
 def _iso_audio_sample() -> bytes:
     return _iso_track_sample(b"soun", brand=b"isom")
+
+
+def _iso_tail_sample(handler_type: bytes = b"vide", brand: bytes = b"qt  ") -> bytes:
+    ftyp = _iso_ftyp(brand)
+    moov = _iso_track_sample(handler_type, brand=brand)[len(ftyp) :]
+    mdat_payload = b"\x00" * (paths.VIDEO_PROBE_BYTES + 8192)
+    return ftyp + _iso_box(b"mdat", mdat_payload) + moov
 
 
 def _install_trusted_normalizer(
@@ -266,6 +281,7 @@ def test_packaged_probe_uses_fixed_argv_and_returns_inode_identity(
             timeout=timeout,
             pass_fds=pass_fds,
             script_inode=os.fstat(pass_fds[0]).st_ino,
+            source_inode=os.fstat(pass_fds[1]).st_ino,
         )
         payload = {
             "ok": True,
@@ -279,17 +295,146 @@ def test_packaged_probe_uses_fixed_argv_and_returns_inode_identity(
     identities = normalizer.inspect_files([source], "workflow-1")
 
     assert identities == [
-        (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            source.stat().st_ctime_ns,
+        )
     ]
     assert captured["command"][0] == sys.executable
     assert captured["command"][1] != str(script)
     assert captured["command"][1].endswith(f"/{captured['pass_fds'][0]}")
+    assert captured["command"][3].endswith(f"/{captured['pass_fds'][1]}")
     assert captured["script_inode"] == script.stat().st_ino
+    assert captured["source_inode"] == source.stat().st_ino
     assert captured["command"][2] == "--inspect-input"
     assert len(captured["command"]) == 4
+    assert len(captured["pass_fds"]) == 2
     assert captured["timeout"] == normalizer.MEDIA_INSPECTION_TIMEOUT_SECONDS
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in captured["env"]
     assert not list(tmp_path.glob(".hermes-video-input-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fd path requires procfs")
+def test_packaged_probe_fd_path_survives_helper_child_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "child-readable.mkv"
+    source.write_bytes(_MATROSKA_HEADER + b"child-readable-payload")
+    script = _install_trusted_normalizer(tmp_path, monkeypatch)
+    script.write_text(
+        "import argparse, json, subprocess, sys\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--inspect-input', action='append', default=[])\n"
+        "args = parser.parse_args()\n"
+        "child = subprocess.run([sys.executable, '-c', "
+        "\"from pathlib import Path; import sys; "
+        "print(len(Path(sys.argv[1]).read_bytes()))\", args.inspect_input[0]], "
+        "capture_output=True, text=True)\n"
+        "if child.returncode != 0:\n"
+        "    print(child.stderr, file=sys.stderr)\n"
+        "    raise SystemExit(2)\n"
+        "print(json.dumps({'ok': True, 'items': "
+        "[{'category': 'direct_only'}]}))\n",
+        encoding="utf-8",
+    )
+
+    identities = normalizer.inspect_files([source], "workflow-child-fd")
+
+    assert identities[0][:4] == (
+        source.stat().st_dev,
+        source.stat().st_ino,
+        source.stat().st_size,
+        source.stat().st_mtime_ns,
+    )
+
+
+def test_packaged_probe_identity_handles_duplicate_hard_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "same-inode-a.mkv"
+    alias = tmp_path / "same-inode-b.mkv"
+    source.write_bytes(_MATROSKA_HEADER + b"payload")
+    os.link(source, alias)
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def run(command, **_kwargs):
+        payload = {
+            "ok": True,
+            "items": [
+                {"category": "direct_only", "direct_ok": True},
+                {"category": "direct_only", "direct_ok": True},
+            ],
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), ""), False
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", run)
+    identities = normalizer.inspect_files([source, alias], "workflow-1")
+
+    assert len(identities) == 2
+    assert identities[0][:4] == identities[1][:4]
+    assert identities[0][4] == source.stat().st_ctime_ns
+    assert not list(tmp_path.glob(".hermes-video-input-*"))
+
+
+def test_packaged_probe_rejects_source_change_during_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "changed-during-probe.mkv"
+    source.write_bytes(_MATROSKA_HEADER + b"payload")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def run(command, **_kwargs):
+        source.write_bytes(source.read_bytes() + b"changed")
+        payload = {
+            "ok": True,
+            "items": [{"category": "direct_only", "direct_ok": True}],
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), ""), False
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", run)
+    with pytest.raises(normalizer.NormalizeError, match="input changed"):
+        normalizer.inspect_files([source], "workflow-1")
+
+    assert not list(tmp_path.glob(".hermes-video-input-*"))
+
+
+def test_packaged_probe_rejects_same_size_mutation_with_restored_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "same-size-mutation.mkv"
+    source.write_bytes(_MATROSKA_HEADER + b"original-payload")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    before = source.stat()
+
+    def run(command, **_kwargs):
+        with source.open("r+b") as stream:
+            stream.seek(-1, os.SEEK_END)
+            current = stream.read(1)
+            stream.seek(-1, os.SEEK_CUR)
+            stream.write(b"X" if current != b"X" else b"Y")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        payload = {
+            "ok": True,
+            "items": [{"category": "direct_only", "direct_ok": True}],
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), ""), False
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", run)
+    with pytest.raises(normalizer.NormalizeError, match="input changed"):
+        normalizer.inspect_files([source], "workflow-1")
+
+    assert source.stat().st_size == before.st_size
+    assert source.stat().st_mtime_ns == before.st_mtime_ns
+    assert source.stat().st_ctime_ns != before.st_ctime_ns
 
 
 def test_packaged_probe_maps_missing_video_stream_to_path_rejection(
@@ -475,6 +620,53 @@ def test_old_helper_capability_error_allows_proven_video_upload(
     assert client.extract_upload_keys(result) == ["asset-old"]
 
 
+def test_local_fallback_rejects_same_size_mutation_with_restored_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "local-fallback-mutation.mov"
+    source.write_bytes(_iso_video_sample())
+    before = source.stat()
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizerUnavailableError("capability is unavailable")
+        ),
+    )
+    real_inspect = client.inspect_video_descriptor
+
+    def inspect(path: Path, descriptor: int):
+        result = real_inspect(path, descriptor)
+        with source.open("r+b") as stream:
+            stream.seek(-1, os.SEEK_END)
+            current = stream.read(1)
+            stream.seek(-1, os.SEEK_CUR)
+            stream.write(b"X" if current != b"X" else b"Y")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return result
+
+    monkeypatch.setattr(client, "inspect_video_descriptor", inspect)
+    connections: list[bool] = []
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            connections.append(True)
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    with pytest.raises(client.VideoClientError, match="source changed"):
+        client.upload(
+            [source],
+            agent_id="agent-a",
+            replay_scope="local-fallback-mutation",
+        )
+
+    assert connections == []
+
+
 def test_unavailable_helper_is_reported_before_source_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -511,9 +703,16 @@ def test_read_only_source_snapshot_uses_local_raw_admission(
     _install_trusted_normalizer(tmp_path, monkeypatch)
     monkeypatch.setattr(
         normalizer,
-        "_pin_input",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            normalizer.NormalizeError("video normalization input cannot be pinned")
+        "_run_bounded_subprocess",
+        lambda command, **_kwargs: (
+            subprocess.CompletedProcess(
+                command,
+                2,
+                "",
+                "usage: normalize.py [-h]\n"
+                "normalize.py: error: unrecognized arguments: --inspect-input",
+            ),
+            False,
         ),
     )
 
@@ -674,6 +873,216 @@ def test_missing_packaged_probe_allows_locally_proven_video_upload(
     assert client.extract_upload_keys(result) == ["asset-local"]
 
 
+def test_missing_packaged_probe_allows_tail_moov_video_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "tail-moov.mov"
+    source.write_bytes(_iso_tail_sample())
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizerUnavailableError(
+                "video media inspection capability is unavailable"
+            )
+        ),
+    )
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-tail"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    result = client.upload(
+        [source],
+        agent_id="agent-a",
+        replay_scope="tail-moov",
+    )
+
+    assert client.extract_upload_keys(result) == ["asset-tail"]
+
+
+@pytest.mark.parametrize(
+    ("mdat_builder", "moov_builder"),
+    [
+        pytest.param(_iso_box, _iso_box, id="32-bit"),
+        pytest.param(_iso_largesize_box, _iso_box, id="mdat-largesize"),
+        pytest.param(_iso_box, _iso_largesize_box, id="moov-largesize"),
+        pytest.param(_iso_box, _iso_zero_size_box, id="moov-zero-size"),
+    ],
+)
+def test_tail_moov_descriptor_supports_top_level_size_encodings(
+    tmp_path: Path,
+    mdat_builder,
+    moov_builder,
+) -> None:
+    source = tmp_path / "tail-size-encoding.mov"
+    ftyp = _iso_ftyp()
+    moov = _iso_video_sample()[len(ftyp) :]
+    source.write_bytes(
+        ftyp
+        + mdat_builder(
+            b"mdat",
+            b"\x00" * (paths.VIDEO_PROBE_BYTES + 8192),
+        )
+        + moov_builder(b"moov", moov[8:])
+    )
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            True,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def test_tail_moov_scanner_seeks_over_mdat_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "tail-read-offsets.mov"
+    ftyp = _iso_ftyp()
+    moov = _iso_video_sample()[len(ftyp) :]
+    mdat = _iso_box(b"mdat", b"\x00" * (paths.VIDEO_PROBE_BYTES + 8192))
+    source.write_bytes(ftyp + mdat + moov)
+    mdat_start = len(ftyp)
+    payload_start = mdat_start + 8
+    moov_start = mdat_start + len(mdat)
+    real_read = paths.os.read
+    reads: list[tuple[int, int]] = []
+
+    def read(fd: int, size: int) -> bytes:
+        offset = paths.os.lseek(fd, 0, os.SEEK_CUR)
+        reads.append((offset, size))
+        return real_read(fd, size)
+
+    monkeypatch.setattr(paths.os, "read", read)
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            True,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert (mdat_start, 8) in reads
+    assert not any(
+        payload_start <= offset < moov_start
+        for offset, _size in reads[1:]
+    )
+
+
+@pytest.mark.parametrize("corruption", ["trailing-top-level", "nested-child"])
+def test_tail_moov_rejects_structurally_incomplete_boxes(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    ftyp = _iso_ftyp()
+    mdat = _iso_box(b"mdat", b"\x00" * (paths.VIDEO_PROBE_BYTES + 8192))
+    valid_trak = _iso_video_sample()[len(ftyp) + 8 :]
+    if corruption == "trailing-top-level":
+        moov = _iso_box(b"moov", valid_trak)
+        malformed = b"\x00\x00\x00\x20junk"
+    else:
+        moov = _iso_box(b"moov", valid_trak + b"\x00\x00\x00\x20junk")
+        malformed = b""
+    source = tmp_path / f"tail-malformed-{corruption}.mov"
+    source.write_bytes(ftyp + mdat + moov + malformed)
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            False,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def test_tail_moov_rejects_unscanned_top_level_box_overflow(
+    tmp_path: Path,
+) -> None:
+    ftyp = _iso_ftyp()
+    moov = _iso_video_sample()[len(ftyp) :]
+    mdat = _iso_box(b"mdat", b"\x00" * (paths.VIDEO_PROBE_BYTES + 8192))
+    free_boxes = b"".join(
+        _iso_box(b"free", b"")
+        for _ in range(paths._ISO_BMFF_MAX_TOP_LEVEL_BOXES)
+    )
+    source = tmp_path / "tail-box-limit.mov"
+    source.write_bytes(ftyp + mdat + moov + free_boxes)
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            False,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def test_missing_packaged_probe_rejects_tail_moov_audio_without_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "tail-audio.mov"
+    source.write_bytes(_iso_tail_sample(b"soun", brand=b"isom"))
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizerUnavailableError(
+                "video media inspection capability is unavailable"
+            )
+        ),
+    )
+    connections: list[bool] = []
+    monkeypatch.setattr(
+        client.http.client,
+        "HTTPConnection",
+        lambda *_args, **_kwargs: connections.append(True),
+    )
+
+    with pytest.raises(
+        normalizer.NormalizeError,
+        match="inspection is unavailable",
+    ):
+        client.upload(
+            [source],
+            agent_id="agent-a",
+            replay_scope="tail-audio",
+        )
+
+    assert connections == []
+
+
 def test_media_probe_failure_does_not_use_raw_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -757,7 +1166,15 @@ def test_successful_probe_is_bound_to_the_opened_inode_before_upload(
         inspected = list(sources)
         assert inspected == [source]
         info = source.stat()
-        return [(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)]
+        return [
+            (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        ]
 
     class Response:
         status = 200
@@ -797,3 +1214,33 @@ def test_successful_probe_is_bound_to_the_opened_inode_before_upload(
     )
 
     assert client.extract_upload_keys(result) == ["asset-1"]
+
+
+def test_upload_rejects_incomplete_probe_identity_before_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "incomplete-identity.mkv"
+    source.write_bytes(_MATROSKA_HEADER + b"video")
+
+    def inspect(sources, _workflow_id):
+        info = list(sources)[0].stat()
+        return [(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)]
+
+    monkeypatch.setattr(normalizer, "inspect_files", inspect)
+    connections: list[bool] = []
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            connections.append(True)
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    with pytest.raises(client.VideoClientError, match="inspection is invalid"):
+        client.upload(
+            [source],
+            agent_id="agent-a",
+            replay_scope="incomplete-identity",
+        )
+
+    assert connections == []

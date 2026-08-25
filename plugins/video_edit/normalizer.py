@@ -396,6 +396,65 @@ def _pin_input(source: Path, workflow_id: str, index: int) -> Path:
         os.close(descriptor)
 
 
+def _inspection_fd_path(descriptor: int) -> str:
+    """Return a path the helper and its ffprobe child can reopen.
+
+    The parent PID is intentional: ``normalize.py`` starts ffprobe without
+    inheriting the media descriptor, so a ``/proc/self/fd`` path would point
+    at an unrelated fd in that grandchild.  Keeping the parent descriptor open
+    for the entire probe gives both processes the same pinned inode handle.
+    """
+    proc_root = Path(f"/proc/{os.getpid()}/fd")
+    if not proc_root.is_dir():
+        raise NormalizeError("video normalizer is unavailable")
+    path = proc_root / str(descriptor)
+    try:
+        os.stat(path)
+    except OSError as exc:
+        raise NormalizeError("video normalizer is unavailable") from exc
+    return str(path)
+
+
+def _open_inspection_input(source: Path) -> tuple[int, os.stat_result]:
+    """Open an inspection input once and return its stable descriptor identity."""
+    try:
+        descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise NormalizeError("video media inspection input is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        path_info = os.stat(source, follow_symlinks=False)
+        identity = (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size <= 0
+            or identity
+            != (
+                path_info.st_dev,
+                path_info.st_ino,
+                path_info.st_size,
+                path_info.st_mtime_ns,
+                path_info.st_ctime_ns,
+            )
+        ):
+            raise NormalizeError("video media inspection input changed")
+        return descriptor, info
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _bounded(value: str, limit: int) -> str:
     encoded = str(value or "").encode("utf-8", "replace")
     if len(encoded) <= limit:
@@ -523,43 +582,72 @@ def normalize_files(sources: Iterable[Path], workflow_id: str) -> list[Path]:
 def inspect_files(
     sources: Iterable[Path],
     workflow_id: str,
-) -> list[tuple[int, int, int, int]]:
+) -> list[tuple[int, int, int, int, int]]:
     """Confirm video streams through the packaged probe without creating output."""
     source_list = list(sources)
     if not 1 <= len(source_list) <= MAX_INSPECT_FILES:
         raise NormalizeError("video media inspection input is invalid")
-    # Do this before _pin_input: snapshots are hard links created beside the
-    # source and therefore require write access to a possibly read-only media
-    # directory.  An unavailable optional helper must be reported without
-    # touching that directory so raw-direct callers can use their local check.
+    # Resolve helper availability before opening source descriptors so an
+    # unavailable optional helper can be reported cleanly to the raw-direct
+    # fallback without touching media files.
     _require_inspection_helper()
-    pinned: list[Path] = []
-    identities: list[tuple[int, int, int, int]] = []
+    descriptors: list[int] = []
+    identities: list[tuple[int, int, int, int, int]] = []
     try:
-        for index, source in enumerate(source_list):
-            snapshot = _pin_input(source, workflow_id, index)
-            pinned.append(snapshot)
-            info = os.stat(snapshot, follow_symlinks=False)
+        input_paths: list[str] = []
+        for source in source_list:
+            descriptor, info = _open_inspection_input(source)
+            descriptors.append(descriptor)
+            input_paths.append(_inspection_fd_path(descriptor))
             identities.append(
-                (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+                (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                )
             )
         with _opened_normalizer_script() as (script_path, pass_fds):
             command = [sys.executable, script_path]
-            for snapshot in pinned:
-                command.extend(["--inspect-input", str(snapshot)])
+            for input_path in input_paths:
+                command.extend(["--inspect-input", input_path])
+            child_fds = tuple(dict.fromkeys((*pass_fds, *descriptors)))
             completed, bounded_failure = _run_bounded_subprocess(
                 command,
                 timeout=MEDIA_INSPECTION_TIMEOUT_SECONDS,
                 env=_normalizer_env(),
-                pass_fds=pass_fds,
+                pass_fds=child_fds,
             )
+        # The helper reads through the parent-held descriptors.  Compare both
+        # the descriptor and the original path after it exits; no hard-link
+        # cleanup can create an unobservable ctime transition.
+        for source, descriptor, expected in zip(
+            source_list, descriptors, identities
+        ):
+            try:
+                current = os.fstat(descriptor)
+                path_info = os.stat(source, follow_symlinks=False)
+            except OSError as exc:
+                raise NormalizeError("video media inspection input changed") from exc
+            current_identity = (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+            path_identity = (
+                path_info.st_dev,
+                path_info.st_ino,
+                path_info.st_size,
+                path_info.st_mtime_ns,
+                path_info.st_ctime_ns,
+            )
+            if current_identity != expected or path_identity != expected:
+                raise NormalizeError("video media inspection input changed")
     except NormalizeError as exc:
-        # A source-directory snapshot is only an implementation detail of the
-        # optional packaged probe.  If the directory is read-only (or cannot
-        # create a same-filesystem hard link), callers may still use the
-        # bounded descriptor admission path for a raw-direct upload.  Invalid
-        # or changed media remains a normal failure and stays fail-closed.
-        if str(exc).strip() == "video normalization input cannot be pinned":
+        if str(exc).strip() == "video normalizer is unavailable":
             raise NormalizerUnavailableError(
                 "video media inspection capability is unavailable"
             ) from exc
@@ -567,8 +655,9 @@ def inspect_files(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise NormalizeError("video media inspection failed") from exc
     finally:
-        for snapshot in pinned:
-            snapshot.unlink(missing_ok=True)
+        for descriptor in descriptors:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
     if bounded_failure or completed.returncode != 0:
         if not bounded_failure and _inspection_capability_missing(completed):
