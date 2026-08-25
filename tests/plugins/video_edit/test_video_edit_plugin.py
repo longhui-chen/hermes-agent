@@ -73,6 +73,57 @@ def _iso_video_sample(brand: bytes, marker: bytes = b"") -> bytes:
     )
 
 
+def _ebml_size(value: int) -> bytes:
+    for width in range(1, 9):
+        if value <= (1 << (7 * width)) - 2:
+            return ((1 << (7 * width)) | value).to_bytes(width, "big")
+    raise ValueError("EBML fixture is too large")
+
+
+def _ebml_element(element_id: bytes, payload: bytes) -> bytes:
+    return element_id + _ebml_size(len(payload)) + payload
+
+
+def _ebml_sample(
+    doctype: bytes,
+    track_type: int,
+    marker: bytes = b"",
+) -> bytes:
+    header_payload = b"".join(
+        (
+            _ebml_element(b"\x42\x86", b"\x01"),
+            _ebml_element(b"\x42\xf7", b"\x01"),
+            _ebml_element(b"\x42\xf2", b"\x04"),
+            _ebml_element(b"\x42\xf3", b"\x08"),
+            _ebml_element(b"\x42\x82", doctype),
+            _ebml_element(b"\x42\x87", b"\x04"),
+            _ebml_element(b"\x42\x85", b"\x02"),
+        )
+    )
+    codec_id = b"V_VP9" if track_type == 1 else b"A_OPUS"
+    track_entry = _ebml_element(
+        b"\xae",
+        b"".join(
+            (
+                _ebml_element(b"\xd7", b"\x01"),
+                _ebml_element(b"\x73\xc5", b"\x01"),
+                _ebml_element(b"\x83", bytes([track_type])),
+                _ebml_element(b"\x86", codec_id),
+            )
+        ),
+    )
+    segment_payload = _ebml_element(b"\x16\x54\xae\x6b", track_entry)
+    if marker:
+        segment_payload += _ebml_element(b"\xec", marker)
+    return (
+        _ebml_element(b"\x1a\x45\xdf\xa3", header_payload)
+        + b"\x18\x53\x80\x67"
+        + b"\x01"
+        + b"\xff" * 7
+        + segment_payload
+    )
+
+
 def _video_sample(suffix: str, marker: bytes = b"") -> bytes:
     suffix = suffix.lower()
     if suffix in {".3g2", ".3gp", ".m4v", ".mov", ".mp4"}:
@@ -80,14 +131,7 @@ def _video_sample(suffix: str, marker: bytes = b"") -> bytes:
         return _iso_video_sample(brand, marker)
     if suffix in {".mkv", ".webm"}:
         doctype = b"matroska" if suffix == ".mkv" else b"webm"
-        return (
-            b"\x1a\x45\xdf\xa3"
-            + b"\x42\x82"
-            + bytes([0x80 | len(doctype)])
-            + doctype
-            + b"\x83\x81\x01"
-            + marker
-        )
+        return _ebml_sample(doctype, 1, marker)
     if suffix == ".avi":
         body = b"AVI LIST\x00\x00\x00\x00strhvids" + marker
         return b"RIFF" + len(body).to_bytes(4, "little") + body
@@ -1614,7 +1658,7 @@ def test_video_media_admission_has_a_fixed_container_and_mime_contract(
         ),
         (
             "audio.mkv",
-            b"\x1a\x45\xdf\xa3\x42\x82\x88matroska\x83\x81\x02",
+            _ebml_sample(b"matroska", 2),
         ),
         ("audio.flv", b"FLV\x01\x04\x00\x00\x00\x09"),
         ("audio.avi", b"RIFF\x10\x00\x00\x00AVI LISTstrhauds"),
