@@ -57,6 +57,8 @@ _PRINTER3D_SKILL_PATHS = frozenset({
     "skills/printer3d-control/SKILL.md",
 })
 _PRINTER3D_DIRECT_TOOLS = frozenset({"terminal"})
+_PLAUD_SKILL_PATH = "skills/plaud-recordings/SKILL.md"
+_PLAUD_DIRECT_TOOLS = frozenset({"terminal"})
 _CAMERA_INTENT_RE = re.compile(
     r"(?:摄像头|镜头|camera).{0,48}(?:查看|看下|看看|获取|列出|截图|快照|画面|短视频|录像|统计|分析|识别|人数|多少人|有没有人|view|list|snap|snapshot|image|frame|clip|doctor|analy[sz]e|count|people|person)"
     r"|(?:查看|看下|看看|获取|列出|截图|快照|画面|短视频|录像|统计|分析|识别|人数|多少人|有没有人|view|list|snap|snapshot|image|frame|clip|doctor|analy[sz]e|count|people|person).{0,48}(?:摄像头|镜头|camera)",
@@ -101,6 +103,11 @@ _CAMERA_CONTINUATION_INTENT_RE = re.compile(
 _PRINTER3D_INTENT_RE = re.compile(
     r"(?:3d\s*打印机|三维打印机|printer).{0,32}(?:查看|列出|状态|进度|暂停|继续|恢复|取消|list|status|progress|pause|resume|cancel)"
     r"|(?:查看|列出|状态|进度|暂停|继续|恢复|取消|list|status|progress|pause|resume|cancel).{0,32}(?:3d\s*打印机|三维打印机|printer)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PLAUD_INTENT_RE = re.compile(
+    r"(?:plaud|录音|录音笔|转写|逐字稿).{0,40}(?:查看|列出|搜索|查找|读取|笔记|摘要|list|search|read|transcript|note)"
+    r"|(?:查看|列出|搜索|查找|读取|笔记|摘要|list|search|read|transcript|note).{0,40}(?:plaud|录音|录音笔|转写|逐字稿)",
     re.IGNORECASE | re.DOTALL,
 )
 _HARDWARE_ENROLLMENT_FENCE = "zettlab-hardware-enrollment-intent"
@@ -284,6 +291,8 @@ class _SkillDirectTaskContext:
     camera_inventory_only: bool = False
     printer3d_applicable: bool = False
     printer3d_explicit: bool = False
+    plaud_applicable: bool = False
+    plaud_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -452,13 +461,14 @@ def _capture_trusted_execution_receipt(
     """Freeze the existing hardware transport identity before a helper call.
 
     Video editing is implemented by ordinary Hermes plugin tools and never
-    enters this receipt path.  Camera/printer helpers still need the platform
-    identity and hardware execution token because they address physical
-    devices, not the cloud video renderer.
+    enters this receipt path. Camera/printer/PLAUD helpers still need the
+    platform identity and hardware execution token because they address
+    hardware or its authorized cloud data, not the cloud video renderer.
     """
     if relative_path not in {
         _CAMERA_SKILL_PATH,
         *_PRINTER3D_SKILL_PATHS,
+        _PLAUD_SKILL_PATH,
     }:
         return None
     try:
@@ -579,6 +589,11 @@ def trusted_camera_runtime_receipt() -> Mapping[str, str]:
 
 def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for signed printer helpers."""
+    return trusted_camera_runtime_receipt()
+
+
+def trusted_plaud_runtime_receipt() -> Mapping[str, str]:
+    """Return the private one-operation receipt for the PLAUD helper."""
     return trusted_camera_runtime_receipt()
 
 
@@ -908,6 +923,9 @@ def _capture_trusted_presets_snapshot(
             expected_printer_sha256 = expected_hashes.get(printer_skill_path)
             if expected_printer_sha256:
                 expected_trusted_skill_hashes[printer_skill_path] = expected_printer_sha256
+        expected_plaud_sha256 = expected_hashes.get(_PLAUD_SKILL_PATH)
+        if expected_plaud_sha256:
+            expected_trusted_skill_hashes[_PLAUD_SKILL_PATH] = expected_plaud_sha256
 
         trusted_skills: list[_TrustedDirectSkillSnapshot] = []
         scanned = 0
@@ -1302,6 +1320,7 @@ def _skill_direct_task_context(
         "printer3d",
         "printer3d-control",
     }
+    plaud_transport_selection = normalized_skill_slug == "plaud-recordings"
     camera_resume_sessions = _camera_resume_sessions_locked(now=time.monotonic())
     camera_resume_key = _current_resume_key()
     camera_continuation = _camera_continuation_intent(normalized)
@@ -1316,7 +1335,11 @@ def _skill_direct_task_context(
 
     task_binding = (
         f"skill:{normalized_skill_slug}\n{normalized}"
-        if camera_transport_selection or printer3d_transport_selection
+        if (
+            camera_transport_selection
+            or printer3d_transport_selection
+            or plaud_transport_selection
+        )
         else normalized
     )
     hardware_inventory = bool(_HARDWARE_INVENTORY_INTENT_RE.search(normalized))
@@ -1347,6 +1370,11 @@ def _skill_direct_task_context(
             or hardware_inventory
         ),
         printer3d_explicit=printer3d_transport_selection,
+        plaud_applicable=(
+            plaud_transport_selection
+            or bool(_PLAUD_INTENT_RE.search(normalized))
+        ),
+        plaud_explicit=plaud_transport_selection,
     )
 
 
@@ -1417,6 +1445,8 @@ def _trusted_skill_view_refresh_required(
         task_paths.add(_CAMERA_SKILL_PATH)
     if task.printer3d_applicable:
         task_paths.update(_PRINTER3D_SKILL_PATHS)
+    if task.plaud_applicable:
+        task_paths.add(_PLAUD_SKILL_PATH)
     if requested_path not in task_paths:
         return False
 
@@ -1481,6 +1511,7 @@ def _activate_trusted_skill_scope(
     if relative_path not in {
         _CAMERA_SKILL_PATH,
         *_PRINTER3D_SKILL_PATHS,
+        _PLAUD_SKILL_PATH,
     }:
         return False
 
@@ -1495,6 +1526,10 @@ def _activate_trusted_skill_scope(
             or (
                 relative_path in _PRINTER3D_SKILL_PATHS
                 and task.printer3d_applicable
+            )
+            or (
+                relative_path == _PLAUD_SKILL_PATH
+                and task.plaud_applicable
             )
         )
     )
@@ -1541,6 +1576,8 @@ def _activate_trusted_skill_scope(
         _CAMERA_DIRECT_TOOLS
         if relative_path == _CAMERA_SKILL_PATH
         else _PRINTER3D_DIRECT_TOOLS
+        if relative_path in _PRINTER3D_SKILL_PATHS
+        else _PLAUD_DIRECT_TOOLS
     )
 
     with _SKILL_DIRECT_LOCK:
@@ -1792,6 +1829,45 @@ def _printer3d_command_policy(
     return False
 
 
+def _plaud_runtime_argv(function_args: Mapping[str, Any]) -> list[str] | None:
+    command = function_args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        from tools.terminal_tool import _parse_plaud_runtime_command
+
+        parsed = _parse_plaud_runtime_command(command)
+    except Exception:
+        return None
+    argv = getattr(parsed, "argv", None)
+    if (
+        not isinstance(argv, list)
+        or len(argv) < 3
+        or not all(isinstance(value, str) for value in argv)
+    ):
+        return None
+    return list(argv)
+
+
+def _plaud_command_policy(function_args: Mapping[str, Any]) -> bool:
+    if any(
+        bool(function_args.get(field))
+        for field in (
+            "background",
+            "force",
+            "notify_on_complete",
+            "pty",
+            "watch_patterns",
+            "workdir",
+        )
+    ):
+        return False
+    argv = _plaud_runtime_argv(function_args)
+    return bool(
+        argv is not None and os.path.basename(argv[1]) == "plaud_connector.py"
+    )
+
+
 def _silent_skill_view_scope_block_message(
     agent: Any,
     function_args: Mapping[str, Any],
@@ -1926,6 +2002,18 @@ def trusted_skill_operation_block_message(
                     "scope minted by an attested printer skill. Load the matching "
                     "trusted skill and retry the exact operation."
                 )
+            if (
+                function_name == "terminal"
+                and _plaud_runtime_argv(function_args) is not None
+            ):
+                logger.warning(
+                    "zet_agent: blocked PLAUD runtime command without a current trusted scope"
+                )
+                return (
+                    "Trusted PLAUD commands require a current request-bound scope "
+                    "minted by the attested `plaud-recordings` skill. Load that "
+                    "trusted skill and retry the exact operation."
+                )
             return None
 
         if scope.policy_exhausted:
@@ -1957,6 +2045,8 @@ def trusted_skill_operation_block_message(
                         normalized_args,
                         relative_path=scope.relative_path,
                     )
+                elif scope.relative_path == _PLAUD_SKILL_PATH:
+                    allowed = _plaud_command_policy(normalized_args)
                 else:
                     allowed = False
                 authorized_args_sha256 = _canonical_tool_args_sha256(
@@ -2062,6 +2152,7 @@ def _claim_trusted_terminal_dispatch(
             if (
                 _camera_runtime_argv(function_args) is not None
                 or _printer3d_runtime_argv(function_args) is not None
+                or _plaud_runtime_argv(function_args) is not None
             ):
                 return None, (
                     "Trusted runtime commands require a current "
@@ -2111,6 +2202,8 @@ def _claim_trusted_terminal_dispatch(
                 normalized_args,
                 relative_path=scope.relative_path,
             )
+        elif scope.relative_path == _PLAUD_SKILL_PATH:
+            allowed = _plaud_command_policy(normalized_args)
         else:
             allowed = False
         receipt = scope.execution_receipt
@@ -2362,6 +2455,9 @@ def _rearm_skill_direct_scope_after_success(
             elif scope.relative_path in _PRINTER3D_SKILL_PATHS:
                 runtime_direct_field = "printer3d_runtime_direct"
                 runtime_blocked_field = "printer3d_runtime_blocked"
+            elif scope.relative_path == _PLAUD_SKILL_PATH:
+                runtime_direct_field = "plaud_runtime_direct"
+                runtime_blocked_field = "plaud_runtime_blocked"
             else:
                 return False
             successful = bool(
