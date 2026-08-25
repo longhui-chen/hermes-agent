@@ -61,6 +61,11 @@ _LATEST_OUTPUT: Dict[str, str] = {}
 # wrote, so the App's per-run history can show delivery failures distinctly.
 _LATEST_OUTPUT_PATH: Dict[str, Any] = {}
 
+# job_id → scheduler's silence verdict, published by _record_silent_run just
+# before save_job_output. Drained with _LATEST_OUTPUT in the mark_job_run
+# wrapper — a verdict surviving into the next run would mute real output.
+_LATEST_SILENT: Dict[str, bool] = {}
+
 # Tool calls whose successful execution we treat as "produced a file this
 # turn". Keep in sync with zettlab-local-server/internal/chat/handler/
 # produced_files.go (App reuses the same shape for in-chat file cards).
@@ -876,6 +881,9 @@ def install() -> None:
         _LATEST_OUTPUT_PATH[job_id] = saved
         return saved
 
+    def _wrapped_record_silent(job_id: str, silent: bool):
+        _LATEST_SILENT[job_id] = bool(silent)
+
     def _wrapped_mark(
         job_id: str,
         success: bool,
@@ -960,13 +968,15 @@ def install() -> None:
         finally:
             _LATEST_OUTPUT.pop(job_id, None)
             _LATEST_OUTPUT_PATH.pop(job_id, None)
+            _LATEST_SILENT.pop(job_id, None)
 
     setattr(_wrapped_mark, _PATCH_SENTINEL, True)
     setattr(_wrapped_save, _PATCH_SENTINEL, True)
 
     _sched.save_job_output = _wrapped_save
     _sched.mark_job_run = _wrapped_mark
-    _dbg("install() patched mark_job_run + save_job_output OK")
+    _sched._record_silent_run = _wrapped_record_silent
+    _dbg("install() patched mark_job_run + save_job_output + _record_silent_run OK")
 
     # ── run_job retry wrapper — auto-retry clean transient failures.
     try:
@@ -1450,6 +1460,13 @@ def _is_silent_run(job_id: str) -> bool:
     落卡路径必须同样跳过，否则每个窗口外 tick 都会往聊天泄漏一张空卡；
     per-run .md 仍由 save_job_output 落盘，详情页历史不受影响。
     """
+    # Scheduler 的判定优先：它读 final_response，每个 skip 分支都置 SILENT_MARKER。
+    # 下面的文本嗅探只能看到分支碰巧写了什么，漏掉不写 "**Status:** silent" 的
+    # wake-gate 分支和整个 doc 为空的分支（TB-20260817-007）。
+    recorded = _LATEST_SILENT.get(job_id)
+    if recorded is not None:
+        return recorded
+
     doc = _LATEST_OUTPUT.get(job_id, "")
     if not doc.strip():
         return False
