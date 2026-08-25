@@ -1679,6 +1679,21 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
 
 
+def test_between_turns_refresh_requests_same_turn_snapshot_reuse():
+    """The request-scoped fast path is enabled only by the turn prologue."""
+    agent = _FakeAgent()
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
+         patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        _build(agent)
+
+    refresh.assert_called_once_with(
+        agent,
+        quiet_mode=True,
+        reuse_current_turn_snapshot=True,
+    )
+
+
 
 
 

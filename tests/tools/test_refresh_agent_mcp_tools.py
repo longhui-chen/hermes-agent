@@ -44,6 +44,187 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_turn_prologue_reuses_exact_just_built_snapshot_once(monkeypatch):
+    """Only the automatic prologue may consume an exact request-local hit."""
+    agent = _agent(["read_file"])
+    turn_binding = ("turn-1", object())
+    agent._tool_snapshot_generation = (7, 11)
+    agent._tool_snapshot_turn_identity = turn_binding
+
+    import model_tools
+    from tools.registry import registry
+
+    rebuilds = []
+    monkeypatch.setattr(registry, "cache_generation", lambda: (7, 11))
+    monkeypatch.setattr(
+        "gateway.session_context.current_turn_identity",
+        lambda: turn_binding,
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: rebuilds.append(True) or [_tool("read_file")],
+    )
+
+    assert mcp_tool.refresh_agent_mcp_tools(
+        agent, reuse_current_turn_snapshot=True
+    ) == set()
+    assert rebuilds == []
+    assert agent._tool_snapshot_turn_identity is None
+
+    # The marker is one-shot. A second prologue in the same copied ContextVar
+    # scope must fall back to the normal rebuild instead of extending reuse.
+    assert mcp_tool.refresh_agent_mcp_tools(
+        agent, reuse_current_turn_snapshot=True
+    ) == set()
+    assert rebuilds == [True]
+
+
+def test_turn_snapshot_reuse_fails_closed_across_request_or_generation(monkeypatch):
+    """A new turn or MCP registry change always runs the live gates again."""
+    import model_tools
+    from tools.registry import registry
+
+    built_binding = ("turn-1", object())
+    active_binding = ("turn-2", object())
+    rebuilds = []
+    monkeypatch.setattr(
+        "gateway.session_context.current_turn_identity",
+        lambda: active_binding,
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: rebuilds.append(True) or [_tool("read_file")],
+    )
+
+    agent = _agent(["read_file"])
+    agent._tool_snapshot_generation = (7, 11)
+    agent._tool_snapshot_turn_identity = built_binding
+    monkeypatch.setattr(registry, "cache_generation", lambda: (7, 11))
+    mcp_tool.refresh_agent_mcp_tools(agent, reuse_current_turn_snapshot=True)
+
+    agent._tool_snapshot_generation = (7, 11)
+    agent._tool_snapshot_turn_identity = active_binding
+    monkeypatch.setattr(registry, "cache_generation", lambda: (7, 12))
+    mcp_tool.refresh_agent_mcp_tools(agent, reuse_current_turn_snapshot=True)
+
+    assert rebuilds == [True, True]
+
+
+def test_new_request_rechecks_revoked_authorization_with_reused_turn_id(monkeypatch):
+    """A client-reused turn ID cannot preserve a revoked tool grant."""
+    import model_tools
+    from gateway.session_context import clear_turn_vars, set_turn_vars
+    from tools.registry import registry
+
+    agent = _agent(["read_file", "profile_write"])
+    grant = {"write": True}
+    monkeypatch.setattr(registry, "cache_generation", lambda: (9, 4))
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: (
+            [_tool("read_file"), _tool("profile_write")]
+            if grant["write"]
+            else [_tool("read_file")]
+        ),
+    )
+
+    first_tokens = set_turn_vars(turn_id="client-reused-id")
+    try:
+        from gateway.session_context import current_turn_identity
+
+        agent._tool_snapshot_generation = (9, 4)
+        agent._tool_snapshot_turn_identity = current_turn_identity()
+    finally:
+        clear_turn_vars(first_tokens)
+
+    grant["write"] = False
+    second_tokens = set_turn_vars(turn_id="client-reused-id")
+    try:
+        mcp_tool.refresh_agent_mcp_tools(
+            agent,
+            reuse_current_turn_snapshot=True,
+        )
+    finally:
+        clear_turn_vars(second_tokens)
+
+    assert agent.valid_tool_names == {"read_file"}
+    assert all(
+        tool["function"]["name"] != "profile_write" for tool in agent.tools
+    )
+
+
+def test_explicit_refresh_never_uses_turn_snapshot_marker(monkeypatch):
+    """Reload and late-binding callers keep their unconditional rebuild."""
+    agent = _agent(["read_file"])
+    turn_binding = ("turn-1", object())
+    agent._tool_snapshot_generation = (2, 3)
+    agent._tool_snapshot_turn_identity = turn_binding
+
+    import model_tools
+    from tools.registry import registry
+
+    rebuilds = []
+    monkeypatch.setattr(registry, "cache_generation", lambda: (2, 3))
+    monkeypatch.setattr(
+        "gateway.session_context.current_turn_identity",
+        lambda: turn_binding,
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: rebuilds.append(True) or [_tool("read_file")],
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert rebuilds == [True]
+    assert agent._tool_snapshot_turn_identity == turn_binding
+
+
+def test_concurrent_prologues_cannot_both_consume_turn_snapshot(monkeypatch):
+    agent = _agent(["read_file"])
+    turn_binding = ("turn-1", object())
+    agent._tool_snapshot_generation = (4, 6)
+    agent._tool_snapshot_turn_identity = turn_binding
+
+    import model_tools
+    from tools.registry import registry
+
+    rebuilds = []
+    rebuild_lock = threading.Lock()
+
+    def _rebuild(**_kwargs):
+        with rebuild_lock:
+            rebuilds.append(True)
+        return [_tool("read_file")]
+
+    monkeypatch.setattr(registry, "cache_generation", lambda: (4, 6))
+    monkeypatch.setattr(
+        "gateway.session_context.current_turn_identity",
+        lambda: turn_binding,
+    )
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _rebuild)
+
+    threads = [
+        threading.Thread(
+            target=mcp_tool.refresh_agent_mcp_tools,
+            args=(agent,),
+            kwargs={"reuse_current_turn_snapshot": True},
+        )
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert rebuilds == [True]
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 

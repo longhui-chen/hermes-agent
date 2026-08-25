@@ -930,7 +930,12 @@ def init_agent(
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
-    agent._tool_snapshot_generation = 0
+    agent._tool_snapshot_generation = (-1, -1)
+    # Exact task-local turn identity that built the initial snapshot. The
+    # between-turns prologue may consume it once to avoid rebuilding the same
+    # snapshot inside the same request. It is deliberately not a session ID:
+    # sessions span requests, while authorization and profile scopes do not.
+    agent._tool_snapshot_turn_identity = None
     # Rate limit tracking — updated from x-ratelimit-* response headers
     # after each API call.  Accessed by /usage slash command.
     agent._rate_limit_state: Optional["RateLimitState"] = None
@@ -1444,14 +1449,22 @@ def init_agent(
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
     if skip_tool_loading:
-        agent._tool_snapshot_generation = 0
+        agent._tool_snapshot_generation = (-1, -1)
         agent.tools = []
     else:
         try:
             from tools.registry import registry as _snapshot_registry
-            agent._tool_snapshot_generation = _snapshot_registry._generation
+            agent._tool_snapshot_generation = _snapshot_registry.cache_generation()
         except Exception:
-            agent._tool_snapshot_generation = 0
+            agent._tool_snapshot_generation = (-1, -1)
+        try:
+            from gateway.session_context import current_turn_identity
+
+            agent._tool_snapshot_turn_identity = current_turn_identity()
+        except Exception:
+            # Standalone/CLI callers have no trusted gateway turn binding and
+            # therefore keep the existing full-refresh behavior.
+            agent._tool_snapshot_turn_identity = None
         agent.tools = _ra().get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
