@@ -501,6 +501,52 @@ class TestJudgeDrivenWait:
         assert mgr.is_waiting() is False
         assert mgr.state.waiting_until == 0.0
 
+    def test_gather_background_processes_scopes_to_session_key(self, hermes_home):
+        from hermes_cli.goals import gather_background_processes
+
+        class _Reg:
+            def __init__(self):
+                self.calls = []
+
+            def list_sessions(self, task_id=None, session_key=None):
+                self.calls.append((task_id, session_key))
+                if session_key == "goal-sid":
+                    return [
+                        {"session_id": "proc-goal", "status": "running", "pid": 11},
+                        {"session_id": "proc-done", "status": "exited", "pid": 12},
+                    ]
+                if session_key == "cron-sid":
+                    return [{"session_id": "proc-cron", "status": "running", "pid": 99}]
+                return [
+                    {"session_id": "proc-goal", "status": "running", "pid": 11},
+                    {"session_id": "proc-cron", "status": "running", "pid": 99},
+                ]
+
+        reg = _Reg()
+        with patch("tools.process_registry.process_registry", reg):
+            scoped = gather_background_processes(session_key="goal-sid")
+            unscoped = gather_background_processes()
+        assert [row["session_id"] for row in scoped] == ["proc-goal"]
+        assert {row["session_id"] for row in unscoped} == {"proc-goal", "proc-cron"}
+        assert reg.calls[0] == (None, "goal-sid")
+
+    def test_gather_background_processes_merges_extra_session_keys(self, hermes_home):
+        from hermes_cli.goals import gather_background_processes
+
+        class _Reg:
+            def list_sessions(self, task_id=None, session_key=None):
+                if session_key == "new-sid":
+                    return [{"session_id": "proc-new", "status": "running", "pid": 1}]
+                if session_key == "old-sid":
+                    return [{"session_id": "proc-old", "status": "running", "pid": 2}]
+                return []
+
+        with patch("tools.process_registry.process_registry", _Reg()):
+            rows = gather_background_processes(
+                session_key="new-sid", extra_session_keys=["old-sid", "new-sid"],
+            )
+        assert {row["session_id"] for row in rows} == {"proc-new", "proc-old"}
+
     def test_continue_verdict_still_continues_with_background(self, hermes_home):
         """A running process present but judge says continue → normal loop."""
         from hermes_cli import goals
