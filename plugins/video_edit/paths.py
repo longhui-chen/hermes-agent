@@ -248,24 +248,69 @@ def _iso_bmff_complete_boxes(
     return boxes
 
 
+def _iso_bmff_mdia_video_status(
+    sample: bytes,
+    start: int,
+    end: int,
+    depth: int,
+) -> tuple[bool, bool]:
+    if depth > _ISO_BMFF_MAX_BOX_DEPTH:
+        return False, False
+    boxes = _iso_bmff_complete_boxes(sample, start, end)
+    if boxes is None:
+        return False, False
+    handler_count = 0
+    has_video = False
+    for kind, payload_start, box_end in boxes:
+        if kind != b"hdlr":
+            continue
+        handler_count += 1
+        if handler_count > 1:
+            return False, False
+        if box_end - payload_start < 12:
+            return False, False
+        # FullBox(version + flags), pre_defined, then handler_type.
+        if sample[payload_start + 8 : payload_start + 12] == b"vide":
+            has_video = True
+    return handler_count == 1, has_video
+
+
 def _iso_bmff_mdia_has_video_handler(
     sample: bytes,
     start: int,
     end: int,
     depth: int,
 ) -> bool:
+    valid, has_video = _iso_bmff_mdia_video_status(sample, start, end, depth)
+    return valid and has_video
+
+
+def _iso_bmff_trak_video_status(
+    sample: bytes,
+    start: int,
+    end: int,
+    depth: int,
+) -> tuple[bool, bool]:
     if depth > _ISO_BMFF_MAX_BOX_DEPTH:
-        return False
+        return False, False
     boxes = _iso_bmff_complete_boxes(sample, start, end)
     if boxes is None:
-        return False
+        return False, False
+    mdia_count = 0
+    has_video = False
     for kind, payload_start, box_end in boxes:
-        if kind != b"hdlr" or box_end - payload_start < 12:
+        if kind != b"mdia":
             continue
-        # FullBox(version + flags), pre_defined, then handler_type.
-        if sample[payload_start + 8 : payload_start + 12] == b"vide":
-            return True
-    return False
+        mdia_count += 1
+        if mdia_count > 1:
+            return False, False
+        valid, mdia_has_video = _iso_bmff_mdia_video_status(
+            sample, payload_start, box_end, depth + 1
+        )
+        if not valid:
+            return False, False
+        has_video = has_video or mdia_has_video
+    return mdia_count == 1, has_video
 
 
 def _iso_bmff_trak_has_video_handler(
@@ -274,17 +319,8 @@ def _iso_bmff_trak_has_video_handler(
     end: int,
     depth: int,
 ) -> bool:
-    if depth > _ISO_BMFF_MAX_BOX_DEPTH:
-        return False
-    boxes = _iso_bmff_complete_boxes(sample, start, end)
-    if boxes is None:
-        return False
-    for kind, payload_start, box_end in boxes:
-        if kind == b"mdia" and _iso_bmff_mdia_has_video_handler(
-            sample, payload_start, box_end, depth + 1
-        ):
-            return True
-    return False
+    valid, has_video = _iso_bmff_trak_video_status(sample, start, end, depth)
+    return valid and has_video
 
 
 def _iso_bmff_moov_has_video_track(
@@ -295,12 +331,17 @@ def _iso_bmff_moov_has_video_track(
     boxes = _iso_bmff_complete_boxes(sample, start, end)
     if boxes is None:
         return False
+    has_video = False
     for trak_kind, trak_start, trak_end in boxes:
-        if trak_kind == b"trak" and _iso_bmff_trak_has_video_handler(
+        if trak_kind != b"trak":
+            continue
+        valid, trak_has_video = _iso_bmff_trak_video_status(
             sample, trak_start, trak_end, 2
-        ):
-            return True
-    return False
+        )
+        if not valid:
+            return False
+        has_video = has_video or trak_has_video
+    return has_video
 
 
 def _iso_bmff_has_video_track(sample: bytes) -> bool:
@@ -389,6 +430,8 @@ def _iso_bmff_has_video_track_descriptor(
             return False
         kind, box_end, header_size = header
         if kind == b"ftyp":
+            if saw_ftyp:
+                return False
             saw_ftyp = True
         elif kind == b"moov":
             if not saw_ftyp or saw_moov:
@@ -539,8 +582,6 @@ def inspect_video_descriptor(path: Path, descriptor: int) -> tuple[str, bool]:
         sample = os.read(descriptor, VIDEO_HEADER_BYTES)
         size = os.fstat(descriptor).st_size
         signature = _detect_video_container_signature(sample)
-        if _detect_video_container(sample) in details[1]:
-            return details[0], True
         if signature == "iso-bmff":
             if "iso-bmff" not in details[1]:
                 raise VideoPathError("input is not a supported video file")
