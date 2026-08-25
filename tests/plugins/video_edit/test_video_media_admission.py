@@ -13,7 +13,86 @@ from plugins.video_edit import client, normalizer, paths
 
 _ASF_HEADER = bytes.fromhex("3026b2758e66cf11a6d900aa0062ce6c")
 _ASF_VIDEO_STREAM = bytes.fromhex("c0ef19bc4d5bcf11a8fd00805f5c442b")
-_MATROSKA_HEADER = b"\x1a\x45\xdf\xa3\x42\x82\x88matroska"
+_EBML_HEADER_ID = b"\x1a\x45\xdf\xa3"
+_EBML_SEGMENT_ID = b"\x18\x53\x80\x67"
+_EBML_TRACKS_ID = b"\x16\x54\xae\x6b"
+_EBML_TRACK_ENTRY_ID = b"\xae"
+_EBML_TRACK_TYPE_ID = b"\x83"
+_EBML_VOID_ID = b"\xec"
+
+
+def _ebml_size(value: int) -> bytes:
+    for width in range(1, 9):
+        if value <= (1 << (7 * width)) - 2:
+            return ((1 << (7 * width)) | value).to_bytes(width, "big")
+    raise ValueError("EBML fixture is too large")
+
+
+def _ebml_element(element_id: bytes, payload: bytes) -> bytes:
+    return element_id + _ebml_size(len(payload)) + payload
+
+
+def _ebml_header(doctype: bytes) -> bytes:
+    payload = b"".join(
+        (
+            _ebml_element(b"\x42\x86", b"\x01"),
+            _ebml_element(b"\x42\xf7", b"\x01"),
+            _ebml_element(b"\x42\xf2", b"\x04"),
+            _ebml_element(b"\x42\xf3", b"\x08"),
+            _ebml_element(b"\x42\x82", doctype),
+            _ebml_element(b"\x42\x87", b"\x04"),
+            _ebml_element(b"\x42\x85", b"\x02"),
+        )
+    )
+    return _ebml_element(_EBML_HEADER_ID, payload)
+
+
+def _ebml_track_entry(track_type: int, extra: bytes = b"") -> bytes:
+    codec_id = b"V_VP9" if track_type == 1 else b"A_OPUS"
+    payload = b"".join(
+        (
+            _ebml_element(b"\xd7", b"\x01"),
+            _ebml_element(b"\x73\xc5", b"\x01"),
+            _ebml_element(_EBML_TRACK_TYPE_ID, bytes([track_type])),
+            _ebml_element(b"\x86", codec_id),
+            extra,
+        )
+    )
+    return _ebml_element(_EBML_TRACK_ENTRY_ID, payload)
+
+
+def _ebml_sample(
+    doctype: bytes = b"matroska",
+    *,
+    track_type: int = 1,
+    before_tracks: bytes = b"",
+    after_tracks: bytes = b"",
+    unknown_segment: bool = True,
+) -> bytes:
+    tracks = _ebml_element(
+        _EBML_TRACKS_ID,
+        _ebml_track_entry(track_type),
+    )
+    segment_payload = before_tracks + tracks + after_tracks
+    segment_size = (
+        b"\x01" + b"\xff" * 7
+        if unknown_segment
+        else _ebml_size(len(segment_payload))
+    )
+    return (
+        _ebml_header(doctype)
+        + _EBML_SEGMENT_ID
+        + segment_size
+        + segment_payload
+    )
+
+
+_MATROSKA_HEADER = (
+    _ebml_header(b"matroska")
+    + _EBML_SEGMENT_ID
+    + b"\x01"
+    + b"\xff" * 7
+)
 
 
 def _iso_box(kind: bytes, payload: bytes) -> bytes:
@@ -83,7 +162,9 @@ def _install_trusted_normalizer(
 def _delayed_video_sample(suffix: str) -> bytes:
     padding = b"\x00" * (paths.VIDEO_HEADER_BYTES * 2)
     if suffix == ".mkv":
-        return _MATROSKA_HEADER + b"\xec\x60\x00" + padding + b"\x83\x81\x01"
+        return _ebml_sample(
+            before_tracks=_ebml_element(_EBML_VOID_ID, padding)
+        )
     if suffix == ".avi":
         body = b"AVI " + b"JUNK" + len(padding).to_bytes(4, "little") + padding
         body += b"LIST\x10\x00\x00\x00strhvids"
@@ -130,10 +211,14 @@ def test_descriptor_probe_is_bounded_when_large_container_is_inconclusive(
 ) -> None:
     source = tmp_path / "large-void.mkv"
     source.write_bytes(
-        _MATROSKA_HEADER
-        + b"\xec\x30\x00\x00"
-        + b"\x00" * (paths.VIDEO_PROBE_BYTES + paths.VIDEO_HEADER_BYTES)
-        + b"\x83\x81\x01"
+        _ebml_sample(
+            before_tracks=_ebml_element(
+                _EBML_VOID_ID,
+                b"\x00" * (
+                    paths.VIDEO_PROBE_BYTES + paths.VIDEO_HEADER_BYTES
+                ),
+            )
+        )
     )
     descriptor = os.open(source, os.O_RDONLY)
     read_sizes: list[int] = []
@@ -161,7 +246,7 @@ def test_complete_small_audio_container_is_delegated_to_packaged_probe(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "audio-only.mkv"
-    source.write_bytes(_MATROSKA_HEADER + b"\x83\x81\x02")
+    source.write_bytes(_ebml_sample(track_type=2))
     descriptor = os.open(source, os.O_RDONLY)
     try:
         assert paths.inspect_video_descriptor(source, descriptor) == (
@@ -170,6 +255,70 @@ def test_complete_small_audio_container_is_delegated_to_packaged_probe(
         )
     finally:
         os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        _MATROSKA_HEADER
+        + _ebml_element(_EBML_VOID_ID, b"metadata\x83\x81\x01"),
+        _MATROSKA_HEADER
+        + _ebml_element(
+            _EBML_TRACKS_ID,
+            _ebml_element(_EBML_TRACK_TYPE_ID, b"\x01"),
+        ),
+        _MATROSKA_HEADER
+        + _ebml_element(
+            _EBML_TRACKS_ID,
+            _ebml_track_entry(
+                1,
+                _ebml_element(_EBML_TRACK_TYPE_ID, b"\x01"),
+            ),
+        ),
+        _MATROSKA_HEADER
+        + _EBML_TRACKS_ID
+        + b"\xff"
+        + _ebml_track_entry(1),
+        _MATROSKA_HEADER + _EBML_TRACKS_ID + b"\x40",
+        _ebml_header(b"matroska")
+        + _EBML_SEGMENT_ID
+        + _ebml_size(1024)
+        + _ebml_element(_EBML_TRACKS_ID, _ebml_track_entry(1)),
+    ],
+    ids=[
+        "marker-in-void",
+        "track-type-outside-entry",
+        "duplicate-track-type",
+        "unknown-tracks-size",
+        "truncated-size-vint",
+        "segment-size-past-eof",
+    ],
+)
+def test_ebml_video_track_proof_fails_closed_on_invalid_hierarchy(
+    sample: bytes,
+) -> None:
+    with pytest.raises(paths.VideoPathError, match="supported video"):
+        paths.validate_video_sample(Path("invalid.mkv"), sample)
+
+
+def test_ebml_doctype_must_be_a_direct_header_child() -> None:
+    forged_header = _ebml_element(
+        _EBML_HEADER_ID,
+        _ebml_element(
+            _EBML_VOID_ID,
+            _ebml_element(b"\x42\x82", b"matroska"),
+        ),
+    )
+    sample = (
+        forged_header
+        + _EBML_SEGMENT_ID
+        + b"\x01"
+        + b"\xff" * 7
+        + _ebml_element(_EBML_TRACKS_ID, _ebml_track_entry(1))
+    )
+
+    with pytest.raises(paths.VideoPathError, match="supported video"):
+        paths.validate_video_sample(Path("forged.mkv"), sample)
 
 
 @pytest.mark.parametrize("suffix", [".mov", ".mp4"])
@@ -442,7 +591,7 @@ def test_packaged_probe_maps_missing_video_stream_to_path_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "audio-only.mkv"
-    source.write_bytes(_MATROSKA_HEADER + b"\x83\x81\x02")
+    source.write_bytes(_ebml_sample(track_type=2))
     _install_trusted_normalizer(tmp_path, monkeypatch)
     payload = {
         "ok": True,
@@ -758,7 +907,7 @@ def test_read_only_source_snapshot_uses_local_raw_admission(
 @pytest.mark.parametrize(
     ("filename", "prefix"),
     [
-        ("large-audio.mkv", _MATROSKA_HEADER + b"\x83\x81\x02"),
+        ("large-audio.mkv", _ebml_sample(track_type=2)),
         ("large-forged.asf", _ASF_HEADER),
     ],
 )
@@ -791,18 +940,37 @@ def test_large_inconclusive_container_requires_probe_before_network(
     assert connections == []
 
 
-def test_container_marker_cannot_bypass_packaged_probe(
+@pytest.mark.parametrize(
+    "capability_error",
+    [
+        normalizer.NormalizerUnavailableError(
+            "video media inspection capability is unavailable"
+        ),
+        normalizer.NormalizeError("video normalizer is unavailable"),
+    ],
+    ids=["missing-helper", "old-helper"],
+)
+def test_container_marker_cannot_bypass_missing_packaged_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capability_error: normalizer.NormalizeError,
 ) -> None:
     source = tmp_path / "forged-marker.mkv"
-    source.write_bytes(_MATROSKA_HEADER + b"metadata\x83\x81\x01")
+    source.write_bytes(
+        _ebml_sample(
+            track_type=2,
+            before_tracks=_ebml_element(
+                _EBML_VOID_ID,
+                b"metadata\x83\x81\x01",
+            ),
+        )
+    )
     connections: list[bool] = []
     monkeypatch.setattr(
         normalizer,
         "inspect_files",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            paths.VideoPathError("input is not a supported video file")
+            capability_error
         ),
     )
     monkeypatch.setattr(
@@ -811,10 +979,83 @@ def test_container_marker_cannot_bypass_packaged_probe(
         lambda *_args, **_kwargs: connections.append(True),
     )
 
-    with pytest.raises(paths.VideoPathError, match="supported video"):
+    with pytest.raises(
+        normalizer.NormalizeError,
+        match="inspection is unavailable",
+    ):
         client.upload([source], agent_id="agent-a", replay_scope="source-v1")
 
     assert connections == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "doctype", "unknown_segment"),
+    [
+        ("video.mkv", b"matroska", False),
+        ("video.webm", b"webm", True),
+    ],
+)
+def test_structured_ebml_video_is_locally_proven_without_packaged_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    doctype: bytes,
+    unknown_segment: bool,
+) -> None:
+    source = tmp_path / filename
+    source.write_bytes(
+        _ebml_sample(doctype, unknown_segment=unknown_segment)
+    )
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizerUnavailableError(
+                "video media inspection capability is unavailable"
+            )
+        ),
+    )
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-ebml"}]}}'
+
+    connections: list[bool] = []
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            connections.append(True)
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    result = client.upload(
+        [source],
+        agent_id="agent-a",
+        replay_scope="structured-ebml",
+    )
+
+    assert client.extract_upload_keys(result) == ["asset-ebml"]
+    assert connections == [True]
 
 
 def test_missing_packaged_probe_allows_locally_proven_video_upload(
@@ -1216,9 +1457,16 @@ def test_missing_packaged_probe_rejects_inconclusive_local_video(
 ) -> None:
     source = tmp_path / "probe-unavailable-large.mkv"
     source.write_bytes(
-        _MATROSKA_HEADER
-        + b"\xec\x30\x00\x00"
-        + b"\x00" * (paths.VIDEO_PROBE_BYTES + paths.VIDEO_HEADER_BYTES)
+        _ebml_header(b"matroska")
+        + _EBML_SEGMENT_ID
+        + b"\x01"
+        + b"\xff" * 7
+        + _ebml_element(
+            _EBML_VOID_ID,
+            b"\x00" * (
+                paths.VIDEO_PROBE_BYTES + paths.VIDEO_HEADER_BYTES
+            ),
+        )
     )
     connections: list[bool] = []
     monkeypatch.setattr(

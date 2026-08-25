@@ -70,6 +70,13 @@ _ISO_BMFF_MAX_TOP_LEVEL_BOXES = 4096
 _ISO_BMFF_MAX_CHILD_BOXES = 4096
 _ISO_BMFF_MAX_MOOV_BYTES = VIDEO_PROBE_BYTES
 _ISO_BMFF_READ_CHUNK_BYTES = 64 * 1024
+_EBML_HEADER_ID = b"\x1a\x45\xdf\xa3"
+_EBML_DOCTYPE_ID = b"\x42\x82"
+_EBML_SEGMENT_ID = b"\x18\x53\x80\x67"
+_EBML_TRACKS_ID = b"\x16\x54\xae\x6b"
+_EBML_TRACK_ENTRY_ID = b"\xae"
+_EBML_TRACK_TYPE_ID = b"\x83"
+_EBML_MAX_ELEMENTS = 4096
 
 
 class VideoPathError(ValueError):
@@ -456,26 +463,226 @@ def _iso_bmff_has_video_track_descriptor(
     return saw_moov and has_video_track
 
 
+def _ebml_vint_width(first: int, maximum: int) -> int:
+    if first <= 0:
+        return 0
+    return next(
+        (
+            width
+            for width in range(1, maximum + 1)
+            if first & (1 << (8 - width))
+        ),
+        0,
+    )
+
+
+def _ebml_read_id(
+    sample: bytes,
+    offset: int,
+    end: int,
+) -> tuple[bytes, int] | None:
+    available_end = min(end, len(sample))
+    if offset < 0 or offset >= available_end:
+        return None
+    width = _ebml_vint_width(sample[offset], 4)
+    if not width or offset + width > available_end:
+        return None
+    raw = sample[offset : offset + width]
+    data = int.from_bytes(raw, "big") & ((1 << (7 * width)) - 1)
+    if data in {0, (1 << (7 * width)) - 1}:
+        return None
+    return raw, offset + width
+
+
+def _ebml_read_size(
+    sample: bytes,
+    offset: int,
+    end: int,
+) -> tuple[int | None, int] | None:
+    available_end = min(end, len(sample))
+    if offset < 0 or offset >= available_end:
+        return None
+    width = _ebml_vint_width(sample[offset], 8)
+    if not width or offset + width > available_end:
+        return None
+    value = sample[offset] & ((1 << (8 - width)) - 1)
+    for byte in sample[offset + 1 : offset + width]:
+        value = (value << 8) | byte
+    unknown = (1 << (7 * width)) - 1
+    return (None if value == unknown else value), offset + width
+
+
+def _ebml_element_header(
+    sample: bytes,
+    offset: int,
+    parent_end: int,
+) -> tuple[bytes, int, int | None] | None:
+    element_id = _ebml_read_id(sample, offset, parent_end)
+    if element_id is None:
+        return None
+    raw_id, size_offset = element_id
+    size_value = _ebml_read_size(sample, size_offset, parent_end)
+    if size_value is None:
+        return None
+    size, payload_start = size_value
+    if payload_start > parent_end:
+        return None
+    if size is None:
+        return raw_id, payload_start, None
+    if size > parent_end - payload_start:
+        return None
+    return raw_id, payload_start, payload_start + size
+
+
+def _ebml_header(sample: bytes) -> tuple[str, int] | None:
+    root = _ebml_element_header(sample, 0, len(sample))
+    if root is None:
+        return None
+    element_id, payload_start, payload_end = root
+    if element_id != _EBML_HEADER_ID or payload_end is None:
+        return None
+    offset = payload_start
+    doctype = ""
+    for _ in range(_EBML_MAX_ELEMENTS):
+        if offset == payload_end:
+            break
+        child = _ebml_element_header(sample, offset, payload_end)
+        if child is None:
+            return None
+        child_id, child_start, child_end = child
+        if child_end is None or child_end > len(sample):
+            return None
+        if child_id == _EBML_DOCTYPE_ID:
+            if doctype or not 1 <= child_end - child_start <= 32:
+                return None
+            try:
+                doctype = sample[child_start:child_end].decode("ascii").lower()
+            except UnicodeDecodeError:
+                return None
+        offset = child_end
+    if offset != payload_end or not doctype:
+        return None
+    return doctype, payload_end
+
+
 def _ebml_doctype(sample: bytes) -> str:
-    marker = b"\x42\x82"
-    offset = sample.find(marker, 4)
-    if offset < 0 or offset + len(marker) >= len(sample):
-        return ""
-    size_offset = offset + len(marker)
-    first = sample[size_offset]
-    width = next((index for index in range(1, 9) if first & (1 << (8 - index))), 0)
-    if not width or size_offset + width > len(sample):
-        return ""
-    size = first & ((1 << (8 - width)) - 1)
-    for byte in sample[size_offset + 1 : size_offset + width]:
-        size = (size << 8) | byte
-    value_offset = size_offset + width
-    if size <= 0 or value_offset + size > len(sample):
-        return ""
-    try:
-        return sample[value_offset : value_offset + size].decode("ascii").lower()
-    except UnicodeDecodeError:
-        return ""
+    header = _ebml_header(sample)
+    return header[0] if header is not None else ""
+
+
+def _ebml_track_entry_video_status(
+    sample: bytes,
+    start: int,
+    end: int,
+) -> tuple[bool, bool]:
+    if start < 0 or end < start or end > len(sample):
+        return False, False
+    offset = start
+    track_type: int | None = None
+    for _ in range(_EBML_MAX_ELEMENTS):
+        if offset == end:
+            break
+        child = _ebml_element_header(sample, offset, end)
+        if child is None:
+            return False, False
+        child_id, payload_start, payload_end = child
+        if payload_end is None:
+            return False, False
+        if child_id == _EBML_TRACK_TYPE_ID:
+            if track_type is not None or not 1 <= payload_end - payload_start <= 8:
+                return False, False
+            track_type = int.from_bytes(sample[payload_start:payload_end], "big")
+        offset = payload_end
+    if offset != end or track_type is None:
+        return False, False
+    return True, track_type == 1
+
+
+def _ebml_tracks_video_status(
+    sample: bytes,
+    start: int,
+    end: int,
+) -> tuple[bool, bool]:
+    if start < 0 or end < start or end > len(sample):
+        return False, False
+    offset = start
+    track_entries = 0
+    has_video = False
+    for _ in range(_EBML_MAX_ELEMENTS):
+        if offset == end:
+            break
+        child = _ebml_element_header(sample, offset, end)
+        if child is None:
+            return False, False
+        child_id, payload_start, payload_end = child
+        if payload_end is None:
+            return False, False
+        if child_id == _EBML_TRACK_ENTRY_ID:
+            track_entries += 1
+            valid, entry_has_video = _ebml_track_entry_video_status(
+                sample, payload_start, payload_end
+            )
+            if not valid:
+                return False, False
+            has_video = has_video or entry_has_video
+        offset = payload_end
+    if offset != end or not track_entries:
+        return False, False
+    return True, has_video
+
+
+def _ebml_segment_has_video_track(
+    sample: bytes,
+    start: int,
+    end: int,
+) -> bool:
+    offset = start
+    for _ in range(_EBML_MAX_ELEMENTS):
+        if offset >= end or offset >= len(sample):
+            return False
+        child = _ebml_element_header(sample, offset, end)
+        if child is None:
+            return False
+        child_id, payload_start, payload_end = child
+        if child_id == _EBML_TRACKS_ID:
+            if payload_end is None or payload_end > len(sample):
+                return False
+            valid, has_video = _ebml_tracks_video_status(
+                sample, payload_start, payload_end
+            )
+            return valid and has_video
+        if payload_end is None:
+            return False
+        offset = payload_end
+    return False
+
+
+def _ebml_has_video_track(
+    sample: bytes,
+    file_size: int,
+) -> bool:
+    header = _ebml_header(sample)
+    if header is None or file_size < len(sample):
+        return False
+    doctype, offset = header
+    if doctype not in {"matroska", "webm"} or offset > file_size:
+        return False
+    for _ in range(_EBML_MAX_ELEMENTS):
+        if offset >= file_size or offset >= len(sample):
+            return False
+        element = _ebml_element_header(sample, offset, file_size)
+        if element is None:
+            return False
+        element_id, payload_start, payload_end = element
+        if element_id == _EBML_SEGMENT_ID:
+            segment_end = file_size if payload_end is None else payload_end
+            return _ebml_segment_has_video_track(
+                sample, payload_start, segment_end
+            )
+        if payload_end is None:
+            return False
+        offset = payload_end
+    return False
 
 
 def _mpeg_ts_has_sync(sample: bytes, packet_size: int, sync_offset: int) -> bool:
@@ -529,14 +736,19 @@ def _detect_video_container_signature(sample: bytes) -> str:
     return ""
 
 
-def _detect_video_container(sample: bytes) -> str:
+def _detect_video_container(
+    sample: bytes,
+    *,
+    file_size: int | None = None,
+) -> str:
     container = _detect_video_container_signature(sample)
     if container == "iso-bmff":
         return container if _iso_bmff_has_video_track(sample) else ""
     if container in {"flv", "mxf"}:
         return container
-    if container in {"matroska", "webm"} and b"\x83\x81\x01" in sample:
-        return container
+    if container in {"matroska", "webm"}:
+        physical_size = len(sample) if file_size is None else file_size
+        return container if _ebml_has_video_track(sample, physical_size) else ""
     if container == "avi" and b"vids" in sample:
         return container
     if container == "asf" and _ASF_VIDEO_STREAM in sample:
@@ -604,7 +816,7 @@ def inspect_video_descriptor(path: Path, descriptor: int) -> tuple[str, bool]:
         sample = b"".join(chunks)
     finally:
         os.lseek(descriptor, position, os.SEEK_SET)
-    if _detect_video_container(sample) in details[1]:
+    if _detect_video_container(sample, file_size=size) in details[1]:
         return details[0], True
     if (
         len(sample) == probe_limit
