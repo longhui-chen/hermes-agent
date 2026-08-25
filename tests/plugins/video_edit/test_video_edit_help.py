@@ -832,6 +832,32 @@ def test_false_missing_and_string_help_follow_optional_task_identity_contract():
     )
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"help": True, "action": "set"},
+        {"help": True, "scope": "scene"},
+        {"help": True, "scope": "scene", "action": "set"},
+    ],
+)
+def test_help_true_ignores_business_conditionals_but_keeps_schema_boundaries(
+    arguments,
+):
+    name = "video_edit_preferences_update"
+
+    assert schemas.validate_tool_arguments(name, arguments) == []
+    assert schemas.validate_tool_arguments(name, {"help": "true", "action": "set"})
+    assert schemas.validate_tool_arguments(
+        name,
+        {"help": True, "unknown_sensitive_key": "ignored?"},
+    ) == [
+        {
+            "path": "$.unknown_sensitive_key",
+            "rule": "additionalProperties",
+        }
+    ]
+
+
 def test_direct_visible_help_then_business_uses_same_handler_once(monkeypatch):
     import model_tools
 

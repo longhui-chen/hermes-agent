@@ -972,6 +972,19 @@ def validate_tool_arguments(name: str, args: Any) -> list[dict[str, Any]]:
     if not isinstance(args, dict):
         return [{"path": "$", "rule": "type", "expected": "object"}]
     parameters = TOOL_DEFINITIONS_BY_NAME[name]["parameters"]
+    # A literal help request is side-effect free and deliberately ignores all
+    # business inputs.  The public schemas still expose the business
+    # conditionals for normal calls, but applying them here would make a
+    # mixed request such as ``help=true, action=set`` incorrectly require
+    # ``preferences`` before Help can be rendered.  Keep property validation
+    # (including the control fields and unknown-field policy) while omitting
+    # the root-level business conditionals for this mode.
+    if args.get("help") is True:
+        parameters = {
+            key: value
+            for key, value in parameters.items()
+            if key not in {"allOf", "if", "then", "else"}
+        }
     issues: list[dict[str, Any]] = []
     _validate_value(args, parameters, "$", issues)
     return issues
