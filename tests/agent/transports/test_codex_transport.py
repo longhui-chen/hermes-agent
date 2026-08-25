@@ -36,6 +36,37 @@ class TestCodexTransportBasic:
         assert result[0]["type"] == "function"
         assert result[0]["name"] == "terminal"
 
+    def test_convert_tools_preserves_direct_pure_help_conditional(self, transport):
+        parameters = {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string"},
+                "help": {"type": "boolean", "default": False},
+            },
+            "required": [],
+            "if": {
+                "properties": {"help": {"const": True}},
+                "required": ["help"],
+            },
+            "then": {},
+            "else": {"required": ["document_id"]},
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "conditional_help",
+                    "parameters": parameters,
+                },
+            }
+        ]
+
+        converted = transport.convert_tools(tools)[0]
+
+        assert converted["strict"] is False
+        assert converted["parameters"]["if"] == parameters["if"]
+        assert converted["parameters"]["else"] == parameters["else"]
+
 
 class TestCodexBuildKwargs:
 

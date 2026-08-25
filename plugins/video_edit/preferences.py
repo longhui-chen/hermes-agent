@@ -26,6 +26,9 @@ VALID_DIRECTIVES = frozenset({
     "keep_original_audio", "add_background_music", "no_background_music", "add_captions",
     "no_captions", "preserve_dialogue",
 })
+MAX_EDITING_DIRECTIVES = 3
+MAX_STYLE_LENGTH = 512
+MAX_USER_PROMPT_LENGTH = 512
 
 # Preference memory is intentionally a small bounded continuity aid, not an
 # unbounded transcript or authorization ledger.  Scene order is used as a
@@ -113,7 +116,11 @@ def _clean_preferences(raw: Any) -> dict[str, Any]:
         if key == "editing_directives":
             if not isinstance(value, list):
                 continue
-            values = [str(item).strip() for item in value[:3] if str(item).strip() in VALID_DIRECTIVES]
+            values = [
+                str(item).strip()
+                for item in value[:MAX_EDITING_DIRECTIVES]
+                if str(item).strip() in VALID_DIRECTIVES
+            ]
             out[key] = values
         elif key == "duration":
             try:
@@ -128,8 +135,10 @@ def _clean_preferences(raw: Any) -> dict[str, Any]:
             out[key] = str(value)
         elif key == "upload_preference" and str(value) in {"raw_direct", "normalized"}:
             out[key] = str(value)
-        elif key in {"style", "user_prompt"} and isinstance(value, str) and value.strip():
-            out[key] = value.strip()[:512]
+        elif key == "style" and isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:MAX_STYLE_LENGTH]
+        elif key == "user_prompt" and isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:MAX_USER_PROMPT_LENGTH]
     return out
 
 

@@ -614,3 +614,215 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+class TestDeferredPureHelpProbe:
+    @staticmethod
+    def _register(
+        name,
+        help_schema=None,
+        topic_schema=None,
+        *,
+        pure_help=False,
+        legacy_wrapper=False,
+    ):
+        from tools.registry import registry
+
+        properties = {
+            "document_id": {"type": "string"},
+        }
+        if help_schema is not None:
+            properties["help"] = help_schema
+        if topic_schema is not None:
+            properties["help_topic"] = topic_schema
+        parameters = {
+            "type": "object",
+            "properties": properties,
+            "required": ["document_id"],
+        }
+        if pure_help:
+            conditional = {
+                "if": {
+                    "properties": {"help": {"const": True}},
+                    "required": ["help"],
+                },
+                "then": {},
+                "else": {"required": ["document_id"]},
+            }
+            parameters.update({"required": [], "additionalProperties": False})
+            if legacy_wrapper:
+                parameters["allOf"] = [conditional]
+            else:
+                parameters.update(conditional)
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+            schema={
+                "name": name,
+                "description": "Generic deferred help probe.",
+                "parameters": parameters,
+            },
+            toolset="plugin-help-probe",
+        )
+
+    def test_literal_true_bypasses_required_for_exact_conditional_contract(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        name = "plain_contract_help"
+        self._register(
+            name,
+            {"type": "boolean", "default": False},
+            {
+                "type": "string",
+                "default": "overview",
+                "enum": ["overview", "inputs", "outputs", "errors", "recovery", "examples"],
+            },
+            pure_help=True,
+        )
+        assert validate_deferred_call_args(name, {"help": True}) is None
+        assert validate_deferred_call_args(
+            name, {"help": True, "unrelated_business_field": "ignored"}
+        ) is None
+
+    def test_legacy_wrapped_contract_remains_valid_during_upgrade(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        name = "plain_contract_legacy_help"
+        self._register(
+            name,
+            {"type": "boolean", "default": False},
+            {"type": "string", "default": "overview", "enum": ["overview"]},
+            pure_help=True,
+            legacy_wrapper=True,
+        )
+        assert validate_deferred_call_args(name, {"help": True}) is None
+        error = validate_deferred_call_args(name, {})
+        assert error is not None
+        assert "document_id" in json.loads(error)["error"]
+
+    def test_help_shaped_fields_without_conditional_contract_do_not_bypass(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        name = "plain_contract_help_without_opt_in"
+        self._register(
+            name,
+            {"type": "boolean", "default": False},
+            {
+                "type": "string",
+                "default": "overview",
+                "enum": ["overview", "inputs"],
+            },
+        )
+
+        error = validate_deferred_call_args(name, {"help": True})
+        assert error is not None
+        assert "document_id" in json.loads(error)["error"]
+
+    @pytest.mark.parametrize(
+        "topics",
+        [
+            ["overview"],
+            ["summary", "details"],
+            ["overview", "inputs", "outputs", "errors", "recovery", "examples", "other"],
+        ],
+    )
+    def test_help_topic_vocabulary_is_derived_from_each_schema(self, topics):
+        from tools.tool_search import validate_deferred_call_args
+
+        name = f"plain_contract_help_{len(topics)}_{topics[0]}"
+        self._register(
+            name,
+            {"type": "boolean", "default": False},
+            {"type": "string", "default": topics[0], "enum": topics},
+            pure_help=True,
+        )
+        assert validate_deferred_call_args(name, {"help": True}) is None
+
+    @pytest.mark.parametrize("arguments", [{}, {"help": False}, {"help": "true"}, {"help": 1}])
+    def test_false_missing_and_non_boolean_help_do_not_bypass(self, arguments):
+        from tools.tool_search import validate_deferred_call_args
+
+        name = "plain_contract_help_strict"
+        self._register(
+            name,
+            {"type": "boolean", "default": False},
+            {
+                "type": "string",
+                "default": "overview",
+                "enum": ["overview", "inputs", "outputs", "errors", "recovery", "examples"],
+            },
+            pure_help=True,
+        )
+        error = validate_deferred_call_args(name, arguments)
+        assert error is not None
+        assert "document_id" in json.loads(error)["error"]
+
+    @pytest.mark.parametrize(
+        ("name", "help_schema", "topic_schema"),
+        [
+            (
+                "plain_help_missing_topic",
+                {"type": "boolean", "default": False},
+                None,
+            ),
+            (
+                "plain_help_missing_flag_default",
+                {"type": "boolean"},
+                {
+                    "type": "string",
+                    "default": "overview",
+                    "enum": ["overview", "inputs", "outputs", "errors", "recovery", "examples"],
+                },
+            ),
+            (
+                "plain_help_missing_topic_default",
+                {"type": "boolean", "default": False},
+                {
+                    "type": "string",
+                    "enum": ["overview", "inputs", "outputs", "errors", "recovery", "examples"],
+                },
+            ),
+            (
+                "plain_help_empty_enum_topic",
+                {"type": "boolean", "default": False},
+                {
+                    "type": "string",
+                    "default": "overview",
+                    "enum": [],
+                },
+            ),
+            (
+                "plain_help_default_outside_enum",
+                {"type": "boolean", "default": False},
+                {"type": "string", "default": "overview", "enum": ["inputs"]},
+            ),
+            (
+                "plain_help_non_string_topic",
+                {"type": "boolean", "default": False},
+                {"type": "string", "default": "overview", "enum": ["overview", 1]},
+            ),
+            (
+                "plain_help_wrong_topic",
+                {"type": "boolean", "default": False},
+                {"type": "boolean", "default": "overview", "enum": []},
+            ),
+            (
+                "plain_help_wrong_flag",
+                {"type": "string", "default": False},
+                {
+                    "type": "string",
+                    "default": "overview",
+                    "enum": ["overview", "inputs", "outputs", "errors", "recovery", "examples"],
+                },
+            ),
+        ],
+    )
+    def test_bypass_requires_both_declared_control_types(
+        self, name, help_schema, topic_schema
+    ):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register(name, help_schema, topic_schema, pure_help=True)
+        error = validate_deferred_call_args(name, {"help": True})
+        assert error is not None
+        assert "document_id" in json.loads(error)["error"]

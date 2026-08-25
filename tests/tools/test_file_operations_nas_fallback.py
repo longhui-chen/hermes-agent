@@ -7,6 +7,7 @@ fallback must not force the semantic mode.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -344,6 +345,7 @@ def test_nas_search_default_keeps_fast_modes(monkeypatch, file_ops):
 
     sent = json.loads(captured["req"].data.decode("utf-8"))
     assert sent["modes"] == ["name", "content"]
+    assert "return_references" not in sent
     assert captured["timeout"] == 10
 
 
@@ -424,6 +426,156 @@ def test_nas_search_carded_true_or_absent_keeps_cards_contract(monkeypatch, file
         assert "do not list" in result.note.lower()
 
 
+@pytest.mark.parametrize("carded", [True, False])
+def test_nas_search_requested_references_are_exact_bounded_and_single_request(
+        monkeypatch, file_ops, carded):
+    _zettlab_env(monkeypatch)
+    paths = [f"/nas/video-{i}.mp4" for i in range(25)]
+    items = [{
+        "filename": "name-only-without-path.mp4",
+        "snippet": "not a usable path reference",
+    }]
+    items.extend({
+        "path": path,
+        "snippet": f"private snippet {i}",
+        "token": f"not-a-reference-{i}",
+        "video_search": {"chunk_start": i},
+    } for i, path in enumerate(paths))
+    payload = {"data": {
+        "items": items,
+        "total_count": len(paths) + 1,
+        "carded": carded,
+    }}
+    opener = MagicMock(side_effect=_fake_urlopen(payload))
+
+    with patch("tools.file_operations.urlopen_hardened", opener):
+        result = file_ops.nas_search(
+            "walking by the shore",
+            limit=60,
+            video_semantic=True,
+            return_references=True,
+        )
+
+    assert result.files == paths[:file_ops._NAS_UNCARDED_LIST_CAP]
+    assert result.carded is carded
+    assert opener.call_count == 1
+    output = result.to_dict()
+    assert output["files"] == paths[:20]
+    assert output["truncated"] is True
+    assert "incomplete" in output["limit_reason"]
+    assert "snippet" not in output
+    assert "token" not in output
+    assert "video_search" not in output
+    serialized = json.dumps(output)
+    assert "name-only-without-path" not in serialized
+    assert "private snippet" not in serialized
+    assert "not-a-reference" not in serialized
+
+
+def test_nas_search_requested_references_keep_old_server_card_compatibility(
+        monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    payload = {"data": {
+        "items": [{"path": "/nas/legacy/video.mp4"}],
+        "total_count": 1,
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search("legacy", return_references=True)
+
+    assert result.files == ["/nas/legacy/video.mp4"]
+    assert result.truncated is False
+    assert result.limit_reason is None
+    assert result.carded is None
+    assert "carded" not in result.to_dict()
+    assert "rendered as preview cards" in result.note
+
+
+def test_nas_search_old_server_scoped_references_fail_closed(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    prefix = "/volume1/subvol/data/Videos/trip"
+    payload = {"data": {
+        "items": [
+            {"path": f"{prefix}/inside.mp4"},
+            {"path": "/volume1/subvol/data/Videos/private.mp4"},
+        ],
+        "total_count": 2,
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search(
+            "trip",
+            path_prefix=prefix,
+            return_references=True,
+        )
+
+    assert result.total_count == 2
+    assert result.files == []
+    assert result.carded is None
+    assert result.truncated is True
+    assert result.limit_reason and "could not verify" in result.limit_reason
+    assert "do not use" in result.limit_reason
+    assert "ignored path_prefix" in result.note
+
+
+@pytest.mark.parametrize("carded", [True, False])
+def test_nas_search_scoped_references_require_component_descendants(
+        monkeypatch, file_ops, carded):
+    _zettlab_env(monkeypatch)
+    requested_prefix = "/volume1/subvol/data/Videos/./trip/"
+    normalized_prefix = "/volume1/subvol/data/Videos/trip"
+    payload = {"data": {
+        "items": [
+            {"path": f"{normalized_prefix}/inside.mp4"},
+            {"path": f"{normalized_prefix}/nested/clip.mp4"},
+            {"path": f"{normalized_prefix}-private/sibling.mp4"},
+            {"path": f"{normalized_prefix}/../outside.mp4"},
+            {"path": f"{normalized_prefix}/nested/../canonical.mp4"},
+            {"path": normalized_prefix},
+            {"path": "relative/trip.mp4"},
+            {"path": f"{normalized_prefix}/space.mp4 "},
+        ],
+        "total_count": 8,
+        "carded": carded,
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search(
+            "trip",
+            path_prefix=requested_prefix,
+            return_references=True,
+        )
+
+    assert result.files == [
+        f"{normalized_prefix}/inside.mp4",
+        f"{normalized_prefix}/nested/clip.mp4",
+    ]
+    assert result.carded is carded
+    assert result.truncated is True
+    assert result.limit_reason and "incomplete" in result.limit_reason
+
+
+@pytest.mark.parametrize("carded", [True, False])
+def test_nas_search_supported_server_returns_complete_scoped_references(
+        monkeypatch, file_ops, carded):
+    _zettlab_env(monkeypatch)
+    prefix = "/volume1/subvol/data/Videos/trip"
+    paths = [f"{prefix}/one.mp4", f"{prefix}/nested/two.mp4"]
+    payload = {"data": {
+        "items": [{"path": path} for path in paths],
+        "total_count": len(paths),
+        "carded": carded,
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search(
+            "trip",
+            path_prefix=prefix,
+            return_references=True,
+        )
+
+    assert result.files == paths
+    assert result.carded is carded
+    assert result.truncated is False
+    assert result.limit_reason is None
+
+
 def test_nas_search_carded_key_visibility_in_tool_output(monkeypatch, file_ops):
     """to_dict 的 carded 键 = local-server 端 collector 的让位信号：
     server 报 true/false → 键存在（collector 跳过 legacy 衍生卡，防双卡）；
@@ -451,6 +603,23 @@ def test_implicit_fallback_uncarded_returns_count_only(monkeypatch, file_ops):
     assert result.files == []
     assert "list the matched files" not in result.note.lower()
     assert "do not claim" in result.note.lower()
+
+
+def test_implicit_fallback_never_returns_requested_references(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    payload = {"data": {
+        "items": [{"path": "/nas/private/video.mp4"}],
+        "total_count": 1,
+        "carded": False,
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops._zettlab_nas_fallback(
+            "q", 50, return_references=True
+        )
+
+    assert result is not None
+    assert result.files == []
+    assert "files" not in result.to_dict()
 
 
 def test_nas_search_prefix_ignored_by_old_server_notes_unscoped(monkeypatch, file_ops):
@@ -495,7 +664,8 @@ def test_search_tool_nas_target_dispatches_to_nas_search():
                                      task_id="t-nas-1"))
     fake_ops.nas_search.assert_called_once_with(pattern="鸟", limit=60,
                                                 semantic=True, video_semantic=False,
-                                                path_prefix="/v/d")
+                                                path_prefix="/v/d",
+                                                return_references=False)
     assert out["total_count"] == 3
     assert out["note"] == "cards rendered"
 
@@ -514,7 +684,7 @@ def test_search_tool_nas_video_semantic_dispatches_end_to_end():
 
     fake_ops.nas_search.assert_called_once_with(
         pattern="还原魔方", limit=60, semantic=False,
-        video_semantic=True, path_prefix="",
+        video_semantic=True, path_prefix="", return_references=False,
     )
     assert out["total_count"] == 1
 
@@ -535,6 +705,152 @@ def test_search_files_schema_and_handler_expose_video_semantic():
     assert mocked.call_args.kwargs["video_semantic"] is True
 
 
+def test_search_files_reference_mode_uses_shared_loop_guard_before_nas_side_effect():
+    from tools.file_tools import SEARCH_FILES_SCHEMA, _handle_search_files
+
+    reference_schema = SEARCH_FILES_SCHEMA["parameters"]["properties"][
+        "return_references"
+    ]
+    assert reference_schema["type"] == "boolean"
+    assert reference_schema["default"] is False
+
+    fake_ops = MagicMock()
+    fake_ops.nas_search.return_value = SearchResult(
+        total_count=1,
+        files=["/nas/video.mp4"],
+        carded=True,
+        note="cards rendered",
+    )
+    args = {
+        "pattern": "walking by the shore",
+        "target": "nas",
+        "limit": 60,
+        "video_semantic": True,
+        "return_references": True,
+    }
+    with patch("tools.file_tools._get_file_ops", return_value=fake_ops):
+        results = [json.loads(_handle_search_files(
+            args, task_id="t-handler-reference-loop",
+        )) for _ in range(4)]
+
+    assert [result["files"] for result in results[:3]] == [
+        ["/nas/video.mp4"],
+        ["/nas/video.mp4"],
+        ["/nas/video.mp4"],
+    ]
+    assert "BLOCKED" in results[3]["error"]
+    assert fake_ops.nas_search.call_count == 3
+    fake_ops.nas_search.assert_called_with(
+        pattern="walking by the shore",
+        limit=60,
+        semantic=False,
+        video_semantic=True,
+        path_prefix="",
+        return_references=True,
+    )
+
+
+def test_search_tool_reference_mode_is_part_of_exact_loop_key():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import search_tool
+
+    fake_ops = MagicMock()
+    fake_ops.nas_search.return_value = SearchResult(
+        total_count=1,
+        files=["/nas/video.mp4"],
+        carded=True,
+        note="cards rendered",
+    )
+    with _patch("tools.file_tools._get_file_ops", return_value=fake_ops):
+        for _ in range(3):
+            search_tool(
+                "walking by the shore",
+                target="nas",
+                video_semantic=True,
+                task_id="t-reference-mode-key",
+            )
+        out = json.loads(search_tool(
+            "walking by the shore",
+            target="nas",
+            video_semantic=True,
+            task_id="t-reference-mode-key",
+            return_references=True,
+        ))
+
+    assert out["files"] == ["/nas/video.mp4"]
+    assert fake_ops.nas_search.call_count == 4
+
+
+def test_search_files_default_reference_mode_preserves_legacy_handler_path():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import _handle_search_files
+
+    legacy = '{"total_count": 1, "note": "cards rendered"}'
+    with _patch("tools.file_tools.search_tool", return_value=legacy) as search, \
+         _patch("tools.file_tools._get_file_ops") as get_ops:
+        out = _handle_search_files({
+            "pattern": "report",
+            "target": "nas",
+            "return_references": False,
+        }, task_id="t-handler-default")
+
+    assert out == legacy
+    get_ops.assert_not_called()
+    assert search.call_args.kwargs["return_references"] is False
+
+
+@pytest.mark.parametrize("args", [
+    {"pattern": "report", "return_references": True},
+    {"pattern": "report", "target": "content", "return_references": True},
+    {"pattern": "*.mp4", "target": "files", "return_references": True},
+])
+def test_search_files_reference_mode_is_ignored_outside_explicit_nas(args):
+    from unittest.mock import patch as _patch
+    from tools.file_tools import _handle_search_files
+
+    with _patch("tools.file_tools.search_tool", return_value="{}") as search, \
+         _patch("tools.file_tools._get_file_ops") as get_ops:
+        assert _handle_search_files(args, task_id="t-non-nas-references") == "{}"
+
+    search.assert_called_once()
+    get_ops.assert_not_called()
+
+
+def test_search_tool_non_nas_ignores_reference_mode_in_exact_loop_key():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import search_tool
+
+    fake_ops = MagicMock()
+    fake_ops.search.return_value = SearchResult(total_count=0)
+    with _patch("tools.file_tools._get_file_ops", return_value=fake_ops):
+        for _ in range(3):
+            search_tool("report", task_id="t-non-nas-reference-key")
+        out = json.loads(search_tool(
+            "report",
+            task_id="t-non-nas-reference-key",
+            return_references=True,
+        ))
+
+    assert "BLOCKED" in out["error"]
+    assert fake_ops.search.call_count == 3
+
+
+def test_search_files_reference_mode_preserves_unavailable_error_shape():
+    from unittest.mock import patch as _patch
+    from tools.file_tools import _handle_search_files
+
+    with _patch("tools.file_tools._get_file_ops", return_value=object()):
+        out = json.loads(_handle_search_files({
+            "pattern": "q",
+            "target": "nas",
+            "return_references": True,
+        }, task_id="t-handler-unavailable"))
+
+    assert out == {
+        "error": "NAS search (target='nas') is not available in this environment."
+    }
+
+
 def test_search_tool_nas_target_unavailable_env_is_tool_error():
     from unittest.mock import patch as _patch
     from tools.file_tools import search_tool
@@ -543,3 +859,26 @@ def test_search_tool_nas_target_unavailable_env_is_tool_error():
     with _patch("tools.file_tools._get_file_ops", return_value=fake_ops):
         out = json.loads(search_tool("q", target="nas", task_id="t-nas-2"))
     assert "error" in out and "not available" in out["error"]
+
+
+def test_file_search_video_handoff_uses_native_references_without_command_path():
+    workspace = Path(__file__).resolve().parents[3]
+    skill_path = (
+        workspace / "zettlab-presets" / "skills" / "common" /
+        "file-search" / "SKILL.md"
+    )
+    if not skill_path.is_file():
+        pytest.skip("zettlab-presets sibling is unavailable outside the monorepo")
+
+    skill = skill_path.read_text(encoding="utf-8")
+    start = skill.index("## Compound Request Handoff")
+    end = skill.index("\n## ", start + 1)
+    guidance = skill[start:end].lower()
+
+    assert "search_files(" in guidance
+    assert 'target="nas"' in guidance
+    assert "return_references=true" in guidance
+    assert "never use a terminal" in guidance
+    assert "curl" in guidance
+    assert "shell/python script" in guidance
+    assert "/api/v1/file/index/agent-search" not in guidance
