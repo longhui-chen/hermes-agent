@@ -18,6 +18,7 @@ from plugins.video_edit.paths import (
     MAX_TASK_ID_LENGTH,
     VideoPathError,
     agent_id_from_kwargs,
+    output_root,
     result_path,
     safe_id,
     validate_output_file,
@@ -307,6 +308,89 @@ def _proactive_session_id(entry: dict[str, Any]) -> str:
     return "proactive-" + trigger_id
 
 
+def _interactive_output_session_id(
+    entry: dict[str, Any],
+    kwargs: dict[str, Any],
+) -> str:
+    """Return the stable App output bucket for an interactive workflow.
+
+    The gateway's ``session_id`` may rotate after context compression.  The
+    request-local execution session key is the stable App conversation key,
+    so its final component is the same bucket local-server scans for
+    ``produced_files``.  Once selected, persist and reuse the bucket from the
+    workflow checkpoint instead of moving an artifact when a later turn runs.
+    """
+
+    persisted = str(entry.get("output_session_id") or "").strip()
+    if persisted:
+        bucket = safe_id(persisted, fallback="")
+        if not bucket or bucket != persisted:
+            raise _WorkflowUnavailable("video result session checkpoint is invalid")
+        return bucket
+
+    stable_session = ""
+    try:
+        from gateway.session_context import execution_session_key
+
+        stable_session = execution_session_key()
+    except Exception:
+        pass
+    if not stable_session:
+        # Compatibility for direct registry callers that carry the original
+        # zettlab session but do not install the request ContextVar.  A rotated
+        # ``api-*`` lineage id is deliberately not accepted as an App bucket.
+        candidate = str(kwargs.get("session_id") or "").strip()
+        if candidate.startswith("zettlab:"):
+            stable_session = candidate
+    if not stable_session:
+        return ""
+    _, separator, suffix = stable_session.rpartition(":")
+    bucket = safe_id(suffix if separator else stable_session, fallback="")
+    if not bucket:
+        raise _WorkflowUnavailable("video result session is unavailable")
+    return bucket
+
+
+def _output_session_id(entry: dict[str, Any], kwargs: dict[str, Any]) -> str:
+    if entry.get("proactive"):
+        return _proactive_session_id(entry)
+    return _interactive_output_session_id(entry, kwargs)
+
+
+def _new_result_target(
+    agent_id: str,
+    workflow_id: str,
+    filename: str,
+    *,
+    session_id: str,
+) -> Path:
+    """Allocate a deterministic per-workflow target without model retries."""
+
+    primary = result_path(
+        agent_id,
+        filename,
+        allow_existing=True,
+        session_id=session_id,
+    )
+    if not primary.exists():
+        return primary
+    suffix = safe_id(workflow_id, fallback="")
+    if not suffix:
+        raise VideoPathError("result path is unavailable")
+    extension = ".mp4"
+    stem_limit = 128 - len(extension) - len(suffix) - 1
+    stem = primary.stem[:stem_limit].rstrip(".-_") or "video-edit"
+    alternate = result_path(
+        agent_id,
+        f"{stem}-{suffix}{extension}",
+        allow_existing=True,
+        session_id=session_id,
+    )
+    if alternate.exists():
+        raise VideoPathError("result path is unavailable")
+    return alternate
+
+
 def _checkpoint_target(
     raw_path: str,
     agent_id: str,
@@ -325,8 +409,16 @@ def _checkpoint_target(
         return target
     try:
         source = validate_output_file(str(candidate), agent_id, session_id=session_id)
-    except VideoPathError as exc:
-        raise state.WorkflowError("video result checkpoint is invalid") from exc
+    except VideoPathError as scoped_exc:
+        # One-time compatibility for pre-session-scope checkpoints: only a
+        # file directly under the profile output root may be rehomed.  Never
+        # accept an artifact from another session bucket.
+        try:
+            source = validate_output_file(str(candidate), agent_id)
+        except VideoPathError as exc:
+            raise state.WorkflowError("video result checkpoint is invalid") from exc
+        if not session_id or source.parent != output_root(agent_id).resolve():
+            raise state.WorkflowError("video result checkpoint is invalid") from scoped_exc
     if source == target:
         return target
     if target.exists():
@@ -951,7 +1043,7 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
                 "project_not_completed",
                 workflow_id=workflow_id,
             )
-        output_session = _proactive_session_id(entry)
+        output_session = _output_session_id(entry, kwargs)
         existing = str(entry.get("output_path") or "").strip()
         pending = str(entry.get("pending_output_path") or "").strip()
         checkpoint = existing or pending
@@ -962,8 +1054,9 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
                 session_id=output_session,
             )
         else:
-            target = result_path(
+            target = _new_result_target(
                 agent_id,
+                workflow_id,
                 str(args.get("filename") or f"{workflow_id}.mp4"),
                 session_id=output_session,
             )
@@ -973,12 +1066,13 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
             except client.VideoClientError:
                 pass
             else:
+                checkpoint_patch: dict[str, Any] = {}
                 if str(target) != existing:
-                    state.update(
-                        workflow_id,
-                        agent_id,
-                        {"output_path": evidence["path"]},
-                    )
+                    checkpoint_patch["output_path"] = evidence["path"]
+                if output_session and not entry.get("proactive"):
+                    checkpoint_patch["output_session_id"] = output_session
+                if checkpoint_patch:
+                    state.update(workflow_id, agent_id, checkpoint_patch)
                 return _ok({
                     "ok": True,
                     "workflow_id": workflow_id,
@@ -992,14 +1086,17 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
                         else "video_edit_preferences_record_success"
                     ),
                 })
+        pending_patch = {
+            "pending_output_path": str(target),
+            "output_path": "",
+            "status": "downloading",
+        }
+        if output_session and not entry.get("proactive"):
+            pending_patch["output_session_id"] = output_session
         state.update(
             workflow_id,
             agent_id,
-            {
-                "pending_output_path": str(target),
-                "output_path": "",
-                "status": "downloading",
-            },
+            pending_patch,
         )
         recovered = not existing and target.is_file()
         evidence: dict[str, Any] | None = None
