@@ -1299,6 +1299,61 @@ def test_download_recovers_file_committed_before_state_checkpoint(isolated_video
     assert delivered["size"] == len(b"already-downloaded")
 
 
+def test_interactive_download_uses_stable_app_session_bucket_despite_flat_collision(
+    isolated_video_home,
+    monkeypatch,
+):
+    from gateway.session_context import (
+        pop_execution_session_key,
+        push_execution_session_key,
+    )
+
+    workflow = "vew_interactive-session-output"
+    tools.state.update(
+        workflow,
+        "agent-a",
+        {
+            "task_id": "interactive-session-output",
+            "source_paths": ["/volume1/subvol/data/source.mov"],
+            "object_keys": ["assets/source"],
+            "project_id": "project-interactive-session-output",
+            "project": {"status": "completed"},
+            "result_url": "https://cdn.example.test/result.mp4",
+            "status": "completed",
+        },
+    )
+    flat_collision = paths.result_path("agent-a", "hangzhou-vlog.mp4")
+    flat_collision.write_bytes(b"older-session-render")
+    downloads = []
+
+    def fake_download(_url, target):
+        downloads.append(target)
+        target.write_bytes(b"current-session-render")
+        return client.file_evidence(target)
+
+    monkeypatch.setattr(client, "download", fake_download)
+    token = push_execution_session_key("zettlab:user-a:agent-a:app-session-a")
+    try:
+        delivered = json.loads(
+            tools.handle_download_result(
+                {"workflow_id": workflow, "filename": "hangzhou-vlog.mp4"},
+                agent_id="agent-a",
+                session_id="api-compaction-tip",
+            )
+        )
+    finally:
+        pop_execution_session_key(token)
+
+    expected = isolated_video_home[1] / "app-session-a" / "hangzhou-vlog.mp4"
+    assert delivered["ok"] is True
+    assert delivered["output"] == str(expected)
+    assert downloads == [expected]
+    assert expected.read_bytes() == b"current-session-render"
+    assert flat_collision.read_bytes() == b"older-session-render"
+    checkpoint = tools.state.get(workflow, "agent-a")
+    assert checkpoint["output_session_id"] == "app-session-a"
+
+
 def test_expired_result_url_repolls_existing_project_and_downloads_refreshed_url(
     isolated_video_home,
     monkeypatch,
