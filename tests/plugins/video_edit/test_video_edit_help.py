@@ -846,7 +846,13 @@ def test_help_true_ignores_business_conditionals_but_keeps_schema_boundaries(
     name = "video_edit_preferences_update"
 
     assert schemas.validate_tool_arguments(name, arguments) == []
-    assert schemas.validate_tool_arguments(name, {"help": "true", "action": "set"})
+    invalid_help = schemas.validate_tool_arguments(
+        name, {"help": "true", "action": "set"}
+    )
+    assert any(
+        issue["path"] == "$.help" and issue["rule"] == "type"
+        for issue in invalid_help
+    )
     assert schemas.validate_tool_arguments(
         name,
         {"help": True, "unknown_sensitive_key": "ignored?"},
