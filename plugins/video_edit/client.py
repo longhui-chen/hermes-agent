@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from plugins.video_edit import normalizer
 from plugins.video_edit.paths import (
@@ -318,6 +318,31 @@ def _inspect_opened_sources(
     return refreshed
 
 
+def _admit_normalized_outputs(
+    opened: list[tuple[Path, int, os.stat_result]],
+    outputs: Sequence[normalizer.NormalizedOutput],
+) -> list[tuple[Path, int, os.stat_result]]:
+    """Admit only the exact helper-produced inodes bound by the normalizer."""
+    if len(outputs) != len(opened):
+        raise normalizer.NormalizeError("normalized video admission is invalid")
+    admitted: list[tuple[Path, int, os.stat_result]] = []
+    for (path, descriptor, opened_info), output in zip(opened, outputs):
+        if type(output) is not normalizer.NormalizedOutput or output.path != path:
+            raise normalizer.NormalizeError("normalized video admission is invalid")
+        try:
+            if not _probe_identity_matches(opened_info, output.identity):
+                raise normalizer.NormalizeError("normalized video output changed")
+            current = _assert_upload_source_identity(path, descriptor, opened_info)
+            if not _probe_identity_matches(current, output.identity):
+                raise normalizer.NormalizeError("normalized video output changed")
+        except VideoClientError as exc:
+            raise normalizer.NormalizeError(
+                "normalized video output changed"
+            ) from exc
+        admitted.append((path, descriptor, current))
+    return admitted
+
+
 def _is_normalizer_unavailable(exc: normalizer.NormalizeError) -> bool:
     """Keep the raw-direct fallback limited to capability failures."""
     if isinstance(exc, normalizer.NormalizerUnavailableError):
@@ -357,16 +382,30 @@ def upload(
     timeout: float = 1800.0,
     agent_id: str = "",
     replay_scope: str = "",
+    normalized_outputs: Sequence[normalizer.NormalizedOutput] | None = None,
 ) -> Any:
     if not files or len(files) > MAX_UPLOAD_FILES:
         raise VideoClientError("invalid upload file count")
     try:
         opened = _open_upload_sources(files)
     except OSError as exc:
+        if normalized_outputs is not None:
+            raise normalizer.NormalizeError(
+                "normalized video output changed"
+            ) from exc
         raise VideoClientError("video upload source is unavailable") from exc
+    except (VideoClientError, VideoPathError) as exc:
+        if normalized_outputs is not None:
+            raise normalizer.NormalizeError(
+                "normalized video output changed"
+            ) from exc
+        raise
     connection: http.client.HTTPConnection | None = None
     try:
-        opened = _inspect_opened_sources(opened, replay_scope)
+        if normalized_outputs is None:
+            opened = _inspect_opened_sources(opened, replay_scope)
+        else:
+            opened = _admit_normalized_outputs(opened, normalized_outputs)
         # Revalidate every path and descriptor before deriving any request
         # framing.  A probe-time growth or metadata mutation therefore fails
         # without constructing HTTPConnection.

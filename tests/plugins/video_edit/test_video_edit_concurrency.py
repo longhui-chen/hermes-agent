@@ -344,7 +344,19 @@ def test_concurrent_normalized_upload_reuses_completed_checkpoint(
         assert release_normalizer.wait(timeout=2)
         output = tmp_path / "normalized.mp4"
         output.write_bytes(b"normalized")
-        return [output]
+        info = output.stat()
+        return [
+            normalizer.NormalizedOutput(
+                path=output,
+                identity=(
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                ),
+            )
+        ]
 
     def upload(files, **_kwargs):
         upload_calls.append([path.name for path in files])

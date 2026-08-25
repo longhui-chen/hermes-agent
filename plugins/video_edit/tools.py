@@ -626,7 +626,7 @@ def _refresh_result_url_checkpoint(
 def _handle_upload_assets_locked(
     args: dict[str, Any], agent_id: str, workflow_id: str
 ) -> str:
-    normalized: list[Path] = []
+    normalized: list[normalizer.NormalizedOutput] = []
     try:
         entry = _workflow_or_error(workflow_id, agent_id)
         raw_existing = entry.get("object_keys")
@@ -705,7 +705,8 @@ def _handle_upload_assets_locked(
         upload_files = files
         if normalize:
             try:
-                upload_files = normalized = normalizer.normalize_files(files, workflow_id)
+                normalized = normalizer.normalize_files(files, workflow_id)
+                upload_files = [output.path for output in normalized]
                 # Read the helper identity after the output has been produced.
                 # This keeps an unavailable optional helper from blocking the
                 # first attempt before the raw-direct fallback can run.
@@ -730,11 +731,18 @@ def _handle_upload_assets_locked(
                     "status": "uploading",
                 })
         uploaded = list(existing)
+        normalized_by_path = {output.path: output for output in normalized}
         for batch in _upload_batches(upload_files[len(existing):]):
+            batch_outputs = (
+                [normalized_by_path[path] for path in batch]
+                if normalize
+                else None
+            )
             body = client.upload(
                 batch,
                 agent_id=agent_id,
                 replay_scope=source_fingerprint,
+                normalized_outputs=batch_outputs,
             )
             batch_keys = client.extract_upload_keys(body)
             if len(batch_keys) != len(batch):
@@ -755,9 +763,11 @@ def _handle_upload_assets_locked(
             )
             # Normalized intermediates are disposable as soon as their upload
             # batch has been accepted; the durable workflow keeps only keys.
-            if normalize:
-                normalizer.cleanup(batch, workflow_id)
-                normalized = [path for path in normalized if path not in batch]
+            if batch_outputs is not None:
+                normalizer.cleanup(batch_outputs, workflow_id)
+                normalized = [
+                    output for output in normalized if output not in batch_outputs
+                ]
         return _ok({"ok": True, "workflow_id": workflow_id, "uploaded": len(uploaded), "strategy": "normalized" if normalize else "raw_direct", "next": "video_edit_create_project"})
     except Exception as exc:
         return _business_fail(
