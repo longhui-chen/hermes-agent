@@ -25,14 +25,14 @@ EXPECTED_BUSINESS_PROPERTIES = {
 }
 
 EXPECTED_REQUIRED = {
-    "video_edit_preferences_resolve": ["task_id"],
+    "video_edit_preferences_resolve": [],
     "video_edit_preferences_update": ["scope", "kind", "action"],
     "video_edit_preferences_record_success": ["preferences"],
     "video_edit_upload_assets": ["workflow_id"],
     "video_edit_create_project": ["workflow_id"],
     "video_edit_wait_project": ["workflow_id"],
     "video_edit_download_result": ["workflow_id"],
-    "video_edit_proactive_resolve": ["manifest_id", "task_id"],
+    "video_edit_proactive_resolve": ["manifest_id"],
     "video_edit_proactive_report": ["workflow_id"],
 }
 
@@ -45,6 +45,7 @@ HELP_SCHEMA_DIGEST_BY_VERSION = {
     "1.4": "6e0bb9af2ccfeb04a1890a3595a5690b152a849d46ed67b2815906f7a422cc9d",
     "1.5": "57a5b21662652e76059efdec848c1b55500c9463fbdc82a363489003aacaa541",
     "1.6": "e8fa7a6778e0f60d8690db7a6ae4ebf0a7dfb3f7f8b1b8c77271644cdcf62709",
+    "1.7": "baccd822ed985b1b0b69008be51083bc1009d86060fc12a76d792d19dcd1ff08",
 }
 
 OVERVIEW_FIELDS = {
@@ -90,7 +91,6 @@ def _install_side_effect_sentinels(monkeypatch: pytest.MonkeyPatch) -> list[str]
 
     targets = (
         (tools, "agent_id_from_kwargs"),
-        (tools, "task_id_from_kwargs"),
         (tools, "validate_input_file"),
         (tools, "validate_output_file"),
         (tools, "result_path"),
@@ -194,7 +194,17 @@ def _walk_schema_contract(
         defaults[path] = copy.deepcopy(value["default"])
     selected = {
         key: copy.deepcopy(value[key])
-        for key in ("enum", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems")
+        for key in (
+            "enum",
+            "minimum",
+            "maximum",
+            "minLength",
+            "maxLength",
+            "minItems",
+            "maxItems",
+            "minProperties",
+            "maxProperties",
+        )
         if key in value
     }
     if selected:
@@ -252,7 +262,10 @@ def test_nine_tools_keep_business_schema_and_add_only_unified_help_controls():
         }
         assert parameters["then"] == {}
         assert parameters["else"] == {"required": EXPECTED_REQUIRED[name]}
-        assert "allOf" not in parameters
+        if name == "video_edit_preferences_update":
+            assert len(parameters["allOf"]) == 2
+        else:
+            assert "allOf" not in parameters
         assert set(properties) == EXPECTED_BUSINESS_PROPERTIES[name] | {"help", "help_topic"}
         assert properties["help"] == {
             "type": "boolean",
@@ -417,8 +430,12 @@ def test_sanitized_model_schemas_keep_all_normal_required_inputs_visible():
         }
         assert parameters["then"] == {}
         assert parameters["else"] == {"required": required}
-        assert not validator.is_valid({})
-        assert not validator.is_valid({"help": False})
+        if required:
+            assert not validator.is_valid({})
+            assert not validator.is_valid({"help": False})
+        else:
+            assert validator.is_valid({})
+            assert validator.is_valid({"help": False})
         assert validator.is_valid({"help": True})
         normal_arguments = schemas.TOOL_HELP_METADATA[name]["minimal_valid_call"][
             "arguments"
@@ -566,7 +583,7 @@ def test_terminal_help_recovery_wording_is_business_neutral():
 @pytest.mark.parametrize(
     ("name", "arguments", "rule"),
     [
-        ("video_edit_preferences_resolve", {}, "required"),
+            ("video_edit_preferences_resolve", {"task_id": 1}, "type"),
         (
             "video_edit_preferences_update",
             {"scope": "invalid", "kind": "soft", "action": "set"},
@@ -709,6 +726,41 @@ def test_schema_validator_accepts_boundaries_and_rejects_every_constraint_family
             {"workflow_id": "WORKFLOW_ID", "normalize": "true"},
             "type",
         ),
+        (
+            "video_edit_preferences_update",
+            {"scope": "global", "kind": "soft", "action": "set"},
+            "required",
+        ),
+        (
+            "video_edit_preferences_update",
+            {
+                "scope": "scene",
+                "kind": "soft",
+                "action": "set",
+                "preferences": {"style": "travel"},
+            },
+            "required",
+        ),
+        (
+            "video_edit_preferences_update",
+            {
+                "scope": "global",
+                "kind": "soft",
+                "action": "set",
+                "preferences": {"duraton": 30},
+            },
+            "additionalProperties",
+        ),
+        (
+            "video_edit_preferences_update",
+            {
+                "scope": "global",
+                "kind": "soft",
+                "action": "set",
+                "preferences": {},
+            },
+            "minProperties",
+        ),
     )
     for name, arguments, expected_rule in rejected:
         issues = schemas.validate_tool_arguments(name, arguments)
@@ -716,9 +768,10 @@ def test_schema_validator_accepts_boundaries_and_rejects_every_constraint_family
 
 
 def test_preference_schema_reuses_runtime_cleaning_constraints():
-    preference_schema = schemas.TOOL_DEFINITIONS_BY_NAME[
+    preference_container = schemas.TOOL_DEFINITIONS_BY_NAME[
         "video_edit_preferences_resolve"
-    ]["parameters"]["properties"]["preferences"]["properties"]
+    ]["parameters"]["properties"]["preferences"]
+    preference_schema = preference_container["properties"]
 
     assert preference_schema["style"]["maxLength"] == preferences.MAX_STYLE_LENGTH
     assert preference_schema["user_prompt"]["maxLength"] == (
@@ -730,6 +783,7 @@ def test_preference_schema_reuses_runtime_cleaning_constraints():
     assert preference_schema["editing_directives"]["items"]["enum"] == sorted(
         preferences.VALID_DIRECTIVES
     )
+    assert preference_container["additionalProperties"] is False
 
 
 def test_help_examples_and_contract_do_not_contain_sensitive_or_escape_material():
@@ -765,13 +819,13 @@ def test_help_examples_and_contract_do_not_contain_sensitive_or_escape_material(
         assert not any(value in examples for value in forbidden)
 
 
-def test_false_missing_and_string_help_never_bypass_business_validation():
-    handler = tools.HANDLERS["video_edit_preferences_resolve"]
-    for arguments in ({}, {"help": False}, {"help": "true"}):
-        result = _parsed(handler, arguments)
-        assert result["code"] == "invalid_arguments"
-        assert any(issue["rule"] == "required" for issue in result["issues"])
-    string_result = _parsed(handler, {"help": "true"})
+def test_false_missing_and_string_help_follow_optional_task_identity_contract():
+    name = "video_edit_preferences_resolve"
+    assert schemas.validate_tool_arguments(name, {}) == []
+    assert schemas.validate_tool_arguments(name, {"help": False}) == []
+
+    string_result = _parsed(tools.HANDLERS[name], {"help": "true"})
+    assert string_result["code"] == "invalid_arguments"
     assert any(
         issue["path"] == "$.help" and issue["rule"] == "type"
         for issue in string_result["issues"]
@@ -796,14 +850,14 @@ def test_direct_visible_help_then_business_uses_same_handler_once(monkeypatch):
         )
         if definition["function"]["name"] == name
     )
-    assert "Normal-call required inputs: task_id" in visible["parameters"][
+    assert "Normal-call required inputs: none" in visible["parameters"][
         "description"
     ]
-    assert "Required for normal calls" in visible["parameters"]["properties"][
+    assert "Required for normal calls" not in visible["parameters"]["properties"][
         "task_id"
     ]["description"]
     assert "allOf" not in visible["parameters"]
-    assert visible["parameters"]["else"] == {"required": ["task_id"]}
+    assert visible["parameters"]["else"] == {"required": []}
 
     def observe_dispatch(
         dispatched_name: str,
@@ -870,7 +924,11 @@ def test_deferred_exact_describe_help_business_trajectory(monkeypatch):
         handler_calls.append(mode)
         return dispatch()
 
-    def invoke(call_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def invoke(
+        call_name: str,
+        arguments: dict[str, Any],
+        **call_kwargs: Any,
+    ) -> dict[str, Any]:
         trajectory.append(call_name)
         return json.loads(
             model_tools.handle_function_call(
@@ -878,29 +936,35 @@ def test_deferred_exact_describe_help_business_trajectory(monkeypatch):
                 arguments,
                 enabled_toolsets=["video_edit"],
                 dispatch_wrapper=observe_dispatch,
+                **call_kwargs,
             )
         )
 
     described = invoke("tool_describe", {"name": name})
     assert described["name"] == name
     assert described["parameters"]["properties"]["help"]["type"] == "boolean"
-    assert described["parameters"]["else"] == {"required": ["task_id"]}
-    assert "Normal-call required inputs: task_id" in described["parameters"][
+    assert described["parameters"]["else"] == {"required": []}
+    assert "Normal-call required inputs: none" in described["parameters"][
         "description"
     ]
-    assert "Required for normal calls" in described["parameters"]["properties"][
+    assert "Required for normal calls" not in described["parameters"]["properties"][
         "task_id"
     ]["description"]
 
     missing_result = invoke(
         "tool_call",
         {"name": name, "arguments": {}},
+        turn_id="TRACE_TASK_ID",
     )
-    assert "task_id" in missing_result["error"]
-    assert "NOT invoked" in missing_result["error"]
-    assert missing_result["parameters"]["else"] == {"required": ["task_id"]}
-    assert handler_calls == []
-    assert boundary_calls == []
+    assert missing_result["ok"] is True
+    assert missing_result["workflow_id"] == "trace-workflow-id"
+    assert handler_calls == ["business"]
+    assert boundary_calls == [
+        "agent_context",
+        "state.workflow_id",
+        "preferences.resolve",
+        "state.create_or_validate_identity",
+    ]
 
     help_result = invoke(
         "tool_call",
@@ -909,8 +973,8 @@ def test_deferred_exact_describe_help_business_trajectory(monkeypatch):
     assert help_result["tool"] == name
     assert help_result["ignored_business_fields"] == ["scene"]
     assert help_result["side_effects"] == "none"
-    assert handler_calls == ["help"]
-    assert boundary_calls == []
+    assert handler_calls == ["business", "help"]
+    assert len(boundary_calls) == 4
 
     business_result = invoke(
         "tool_call",
@@ -919,10 +983,10 @@ def test_deferred_exact_describe_help_business_trajectory(monkeypatch):
     assert business_result["ok"] is True
     assert trajectory == ["tool_describe", "tool_call", "tool_call", "tool_call"]
     assert "tool_search" not in trajectory
-    assert handler_calls == ["help", "business"]
+    assert handler_calls == ["business", "help", "business"]
     assert boundary_calls == [
         "agent_context",
         "state.workflow_id",
         "preferences.resolve",
         "state.create_or_validate_identity",
-    ]
+    ] * 2

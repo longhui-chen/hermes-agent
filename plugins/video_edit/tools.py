@@ -20,7 +20,6 @@ from plugins.video_edit.paths import (
     agent_id_from_kwargs,
     result_path,
     safe_id,
-    task_id_from_kwargs,
     validate_output_file,
     validate_input_file,
 )
@@ -71,6 +70,13 @@ def _business_fail(
         )
     if isinstance(exc, _WorkflowUnavailable):
         return _failure(tool_name, "workflow_unavailable", str(exc), **fields)
+    if isinstance(exc, preferences.PreferenceValidationError):
+        return _failure(
+            tool_name,
+            "invalid_arguments",
+            str(exc),
+            **fields,
+        )
     if isinstance(exc, (state.WorkflowError, preferences.PreferenceError)):
         return _failure(
             tool_name,
@@ -223,6 +229,60 @@ def _scene(args: dict[str, Any]) -> str:
     return str(args.get("scene") or "general").strip()[:64] or "general"
 
 
+def _bounded_task_id(raw: Any) -> str:
+    """Normalize one workflow key without allowing an unbounded identifier."""
+
+    value = str(raw or "").strip()
+    return value[:MAX_TASK_ID_LENGTH] if value else ""
+
+
+def _trusted_turn_id(kwargs: dict[str, Any]) -> str:
+    """Return the dispatcher-owned turn key, when one is bound.
+
+    ``args["task_id"]`` is model-authored.  The dispatcher metadata and the
+    request-local session context are platform-owned, so they must win before
+    any model value is considered.  The context fallback also covers direct
+    plugin calls made inside an active gateway turn where the caller does not
+    repeat the metadata kwargs.
+    """
+
+    value = _bounded_task_id(kwargs.get("turn_id"))
+    if value:
+        return value
+    try:
+        from gateway.session_context import current_turn_identity, zettlab_turn_id
+
+        identity = current_turn_identity()
+        value = _bounded_task_id(identity[0] if identity else "")
+        if value:
+            return value
+        value = _bounded_task_id(zettlab_turn_id())
+        if value:
+            return value
+    except Exception:
+        pass
+    # These values are supplied by the registry dispatcher for direct/legacy
+    # callers. They remain trusted metadata, but an active request ContextVar
+    # must take precedence so a stale compatibility key cannot cross turns.
+    for key in ("task_id", "session_id"):
+        value = _bounded_task_id(kwargs.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _task_id_for_request(args: dict[str, Any], kwargs: dict[str, Any]) -> str:
+    """Resolve a workflow key with trusted turn identity precedence."""
+
+    trusted_turn_id = _trusted_turn_id(kwargs)
+    if trusted_turn_id:
+        return trusted_turn_id
+    model_task_id = _bounded_task_id(args.get("task_id"))
+    if model_task_id:
+        return model_task_id
+    return ""
+
+
 def _interactive_request_identity(
     args: dict[str, Any], task_id: str
 ) -> dict[str, Any]:
@@ -312,9 +372,9 @@ def _recoverable_checkpoint_target(
 def handle_preferences_resolve(args: dict, **kwargs: Any) -> str:
     try:
         agent_id = agent_id_from_kwargs(kwargs)
-        task_id = str(args.get("task_id") or task_id_from_kwargs(kwargs)).strip()[
-            :MAX_TASK_ID_LENGTH
-        ]
+        task_id = _task_id_for_request(args, kwargs)
+        if not task_id:
+            raise VideoPathError("video edit task identity is required")
         workflow = state.workflow_id(task_id, agent_id)
         resolved = preferences.resolve(
             agent_id,
@@ -376,8 +436,12 @@ def handle_preferences_resolve(args: dict, **kwargs: Any) -> str:
 def handle_preferences_update(args: dict, **kwargs: Any) -> str:
     try:
         agent_id = agent_id_from_kwargs(kwargs)
+        # Keep a missing/blank scene empty for the lower validation boundary;
+        # the generic _scene() default of "general" is only correct for
+        # resolve/record calls, not for scope=scene updates.
+        update_scene = str(args.get("scene") or "").strip()[:64]
         result = preferences.update(
-            agent_id, str(args.get("scope") or ""), _scene(args), str(args.get("kind") or ""),
+            agent_id, str(args.get("scope") or ""), update_scene, str(args.get("kind") or ""),
             str(args.get("action") or ""), args.get("preferences"),
         )
         return _ok(result)
@@ -513,6 +577,14 @@ def _normalizer_generation_for_upload(
     # however, must remain pinned to the exact helper generation used for the
     # accepted uploads.
     if not source_checkpointed:
+        return ""
+    # A preparation-only checkpoint has a source fingerprint but no accepted
+    # object key yet.  It is safe to retry normalization because no provider
+    # side effect has been committed and no helper generation was pinned.  As
+    # soon as a generation or object key exists, preserve the strict drift
+    # check so a retry cannot mix media prepared by different helper releases.
+    has_uploaded_objects = bool(entry.get("object_keys"))
+    if not persisted and not has_uploaded_objects:
         return ""
     try:
         current = normalizer.generation()
@@ -1042,9 +1114,9 @@ def handle_proactive_resolve(args: dict, **kwargs: Any) -> str:
     try:
         agent_id = agent_id_from_kwargs(kwargs)
         manifest_id = str(args.get("manifest_id") or "").strip()
-        task_id = str(args.get("task_id") or task_id_from_kwargs(kwargs)).strip()[
-            :MAX_TASK_ID_LENGTH
-        ]
+        task_id = _task_id_for_request(args, kwargs)
+        if not task_id:
+            raise VideoPathError("video edit task identity is required")
         body = client.proactive_resolve(manifest_id, agent_id=agent_id)
         payload = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
         if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):

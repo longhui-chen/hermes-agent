@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from plugins.video_edit import client, normalizer, paths, preferences, schemas, tools
+from plugins.video_edit import client, normalizer, paths, preferences, schemas, state, tools
 import plugins.video_edit as video_plugin
 
 
@@ -528,6 +528,154 @@ def test_preferences_and_workflows_are_isolated_between_agents(isolated_video_ho
         )
     )
     assert "workflow not found" in cross_agent["error"]
+
+
+def test_trusted_turn_id_wins_over_model_task_id(isolated_video_home):
+    resolved = json.loads(
+        tools.handle_preferences_resolve(
+            {"task_id": "model-chosen", "scene": "travel"},
+            agent_id="agent-a",
+            turn_id="trusted-turn",
+        )
+    )
+
+    expected = state.workflow_id("trusted-turn", "agent-a")
+    assert resolved["ok"] is True
+    assert resolved["workflow_id"] == expected
+    assert state.get(expected, "agent-a")["task_id"] == "trusted-turn"
+
+
+def test_active_turn_context_wins_over_legacy_dispatch_task_id(
+    isolated_video_home,
+    monkeypatch,
+):
+    import gateway.session_context as session_context
+
+    monkeypatch.setattr(
+        session_context,
+        "current_turn_identity",
+        lambda: ("context-turn", object()),
+    )
+    monkeypatch.setattr(session_context, "zettlab_turn_id", lambda: "")
+
+    resolved = json.loads(
+        tools.handle_preferences_resolve(
+            {"task_id": "model-chosen", "scene": "travel"},
+            agent_id="agent-a",
+            task_id="legacy-dispatch-task",
+        )
+    )
+
+    expected = state.workflow_id("context-turn", "agent-a")
+    assert resolved["ok"] is True
+    assert resolved["workflow_id"] == expected
+    assert state.get(expected, "agent-a")["task_id"] == "context-turn"
+
+
+def test_resolve_without_task_id_requires_trusted_turn_context(isolated_video_home):
+    result = json.loads(
+        tools.handle_preferences_resolve(
+            {"scene": "travel"},
+            agent_id="agent-a",
+        )
+    )
+
+    assert result["code"] == "invalid_arguments"
+    assert result["reason_code"] == "invalid_arguments"
+
+
+def test_proactive_resolve_without_task_id_requires_trusted_turn_context(
+    isolated_video_home,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        client,
+        "proactive_resolve",
+        lambda *_args, **_kwargs: pytest.fail("manifest lookup must not run"),
+    )
+
+    result = json.loads(
+        tools.handle_proactive_resolve(
+            {"manifest_id": "manifest-1"},
+            agent_id="agent-a",
+        )
+    )
+
+    assert result["code"] == "invalid_arguments"
+    assert result["reason_code"] == "invalid_arguments"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"scope": "global", "kind": "soft", "action": "set"},
+        {
+            "scope": "scene",
+            "kind": "soft",
+            "action": "set",
+            "preferences": {"style": "travel"},
+        },
+        {
+            "scope": "global",
+            "kind": "soft",
+            "action": "set",
+            "preferences": {"duraton": 30},
+        },
+    ],
+)
+def test_preference_update_rejects_invalid_contract_before_state_write(
+    isolated_video_home,
+    arguments,
+):
+    result = json.loads(
+        tools.handle_preferences_update(arguments, agent_id="agent-a")
+    )
+    preference_path = isolated_video_home[0] / "video_edit" / "agent-a" / "preferences.json"
+
+    assert result["code"] == "invalid_arguments"
+    assert result["reason_code"] == "invalid_arguments"
+    assert not preference_path.exists()
+
+
+def test_preference_update_runtime_guard_rejects_unknown_fields_without_state_write(
+    isolated_video_home,
+):
+    preference_path = isolated_video_home[0] / "video_edit" / "agent-a" / "preferences.json"
+
+    with pytest.raises(preferences.PreferenceError, match="unknown or invalid"):
+        preferences.update(
+            "agent-a",
+            "global",
+            "",
+            "soft",
+            "set",
+            {"duraton": 30},
+        )
+
+    assert not preference_path.exists()
+
+
+def test_preference_update_handler_preserves_missing_scene_for_fail_closed_guard(
+    isolated_video_home,
+):
+    business_handler = tools.handle_preferences_update.__wrapped__
+
+    result = json.loads(
+        business_handler(
+            {
+                "scope": "scene",
+                "kind": "soft",
+                "action": "set",
+                "preferences": {"style": "travel"},
+            },
+            agent_id="agent-a",
+        )
+    )
+    preference_path = isolated_video_home[0] / "video_edit" / "agent-a" / "preferences.json"
+
+    assert result["code"] == "invalid_arguments"
+    assert result["reason_code"] == "invalid_arguments"
+    assert not preference_path.exists()
 
 
 def test_preference_memory_is_bounded_and_keeps_recent_scene_updates(isolated_video_home):
@@ -1611,6 +1759,78 @@ def test_normalizer_failure_falls_back_to_direct_without_new_workflow(isolated_v
     assert uploaded["workflow_id"] == workflow
     assert uploaded["strategy"] == "raw_direct"
     assert seen == [source.resolve()]
+
+
+def test_oversized_sparse_normalize_checkpoint_can_retry_preparation(
+    isolated_video_home,
+    monkeypatch,
+    tmp_path,
+):
+    source = isolated_video_home[1] / "agent-a" / "oversized-sparse.mp4"
+    source.parent.mkdir(parents=True)
+    _write_video(source, b"sparse-source")
+    os.truncate(source, client.MAX_UPLOAD_BYTES + 1)
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {
+                "task_id": "oversized-sparse-retry",
+                "preferences": {"upload_preference": "normalized"},
+            },
+            agent_id="agent-a",
+        )
+    )["workflow_id"]
+    normalized = tmp_path / "oversized-normalized.mp4"
+    normalized.write_bytes(b"normalized")
+    normalize_calls = 0
+
+    def normalize(files, _workflow_id):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        if normalize_calls == 1:
+            raise normalizer.NormalizeError("hardware preparation failed")
+        return [normalized]
+
+    monkeypatch.setattr(normalizer, "normalize_files", normalize)
+    monkeypatch.setattr(normalizer, "generation", lambda: "generation-retry")
+    monkeypatch.setattr(normalizer, "cleanup", lambda *_args, **_kwargs: None)
+    upload_calls: list[list[Path]] = []
+    monkeypatch.setattr(
+        client,
+        "upload",
+        lambda files, **_kwargs: upload_calls.append(list(files))
+        or {"data": {"uploads": [{"object_key": "asset-normalized"}]}},
+    )
+
+    first = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert first["reason_code"] == "media_preparation_failed"
+    checkpoint = tools.state.get(workflow, "agent-a")
+    assert source.stat().st_size > client.MAX_UPLOAD_BYTES
+    assert checkpoint["source_fingerprint"]
+    assert checkpoint["normalize"] is True
+    assert checkpoint["normalizer_generation"] == ""
+    assert checkpoint.get("object_keys", []) == []
+    assert normalize_calls == 1
+    assert upload_calls == []
+
+    retried = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert retried["ok"] is True
+    assert retried["strategy"] == "normalized"
+    assert retried["uploaded"] == 1
+    assert normalize_calls == 2
+    assert upload_calls == [[normalized]]
+    assert tools.state.get(workflow, "agent-a")["normalizer_generation"] == "generation-retry"
 
 
 def test_initial_normalized_upload_does_not_require_generation_before_fallback(

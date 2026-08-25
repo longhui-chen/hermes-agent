@@ -10,7 +10,7 @@ from plugins.video_edit import preferences
 from plugins.video_edit.paths import MAX_TASK_ID_LENGTH
 
 
-HELP_SCHEMA_VERSION = "1.6"
+HELP_SCHEMA_VERSION = "1.7"
 HELP_TOPICS = ("overview", "inputs", "outputs", "errors", "recovery", "examples")
 HELP_CONTROL_FIELDS = frozenset({"help", "help_topic"})
 _SELF_TOOL = "$self"
@@ -155,6 +155,7 @@ def _tool(
     properties: dict[str, Any],
     help_metadata: dict[str, Any],
     required: list[str] | None = None,
+    constraints: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if HELP_CONTROL_FIELDS.intersection(properties):
         raise ValueError(f"{name} business properties overlap help controls")
@@ -175,26 +176,29 @@ def _tool(
         )
     bound_metadata["next_tools"] = list(bound_metadata["next_tools"]) + error_transitions
     TOOL_HELP_METADATA[name] = bound_metadata
+    parameters = {
+        "type": "object",
+        "description": (
+            "Normal-call required inputs: "
+            f"{', '.join(business_required) or 'none'}. A literal help=true "
+            "call needs no business inputs and ignores supplied business fields."
+        ),
+        "properties": visible_properties | copy.deepcopy(_HELP_PROPERTIES),
+        "required": [],
+        "if": {
+            "properties": {"help": {"const": True}},
+            "required": ["help"],
+        },
+        "then": {},
+        "else": {"required": business_required},
+        "additionalProperties": False,
+    }
+    if constraints:
+        parameters["allOf"] = copy.deepcopy(constraints)
     return {
         "name": name,
         "description": description,
-        "parameters": {
-            "type": "object",
-            "description": (
-                "Normal-call required inputs: "
-                f"{', '.join(business_required) or 'none'}. A literal help=true "
-                "call needs no business inputs and ignores supplied business fields."
-            ),
-            "properties": visible_properties | copy.deepcopy(_HELP_PROPERTIES),
-            "required": [],
-            "if": {
-                "properties": {"help": {"const": True}},
-                "required": ["help"],
-            },
-            "then": {},
-            "else": {"required": business_required},
-            "additionalProperties": False,
-        },
+        "parameters": parameters,
         "emoji": "🎬",
     }
 
@@ -218,6 +222,7 @@ _PREFERENCES = {
             "maxLength": preferences.MAX_USER_PROMPT_LENGTH,
         },
     },
+    "additionalProperties": False,
 }
 
 
@@ -229,7 +234,7 @@ TOOL_DEFINITIONS = [
             "task_id": {
                 "type": "string",
                 "maxLength": MAX_TASK_ID_LENGTH,
-                "description": "Stable key for one edit: reuse it for retry/resume, choose a new value for an explicit re-edit.",
+                "description": "Optional fallback key for direct or CLI calls; a trusted turn_id supplied by the dispatcher is authoritative when present.",
             },
             "scene": {"type": "string", "maxLength": 64, "default": "general"},
             "preferences": _PREFERENCES,
@@ -242,21 +247,22 @@ TOOL_DEFINITIONS = [
         _help(
             when_to_use="Start a new interactive edit or resolve choices for a stable task before upload.",
             cross_field_invariants=[
-                "Reuse task_id for resume or retry; use a new task_id only for an explicit re-edit.",
+                "When trusted turn context supplies turn_id, it is the workflow key and overrides any model-supplied task_id.",
+                "Without trusted turn context, reuse task_id for resume or retry; use a new task_id only for an explicit re-edit.",
                 "Explicit preferences override remembered values and defaults.",
             ],
             reusable_business_ids=["task_id"],
             success_outputs=["ok", "workflow_id", "scene", "preferences", "sources", "memory_hit", "next"],
             failure_code="preferences_resolve_failed",
-            failure_recovery="Retry once with the same task_id after correcting the reported condition.",
+            failure_recovery="Retry once in the same trusted turn, or with the same task_id when running without trusted turn context.",
             workflow_required=True,
             next_tools=[{"when": "success", "tool": "video_edit_upload_assets"}],
-            minimal_valid_call=_call("video_edit_preferences_resolve", {"task_id": "TASK_ID"}),
+            minimal_valid_call=_call("video_edit_preferences_resolve", {}),
             common_mistake=_call("video_edit_preferences_resolve", {"scene": "SCENE_CATEGORY"}),
             corrected_call=_call("video_edit_preferences_resolve", {"task_id": "TASK_ID"}),
-            bad_recovery="Changing task_id during a retry creates a different edit and loses the continuation boundary.",
+            bad_recovery="Do not change task_id during a retry when no trusted turn context is present; in a trusted turn, do not try to override its turn_id.",
         ),
-        ["task_id"],
+        [],
     ),
     _tool(
         "video_edit_preferences_update",
@@ -273,7 +279,8 @@ TOOL_DEFINITIONS = [
             cross_field_invariants=[
                 "scope=scene applies only to the exact semantic scene category supplied; scope=global applies unconditionally.",
                 "The schema cannot encode arbitrary predicates. Never drop qualifiers, reinterpret a qualifier as scene, or broaden a conditional preference to fit global or scene; do not call this tool when any qualifier cannot be represented.",
-                "action=set applies supplied preferences; action=forget removes supplied fields or all fields when omitted.",
+                "scope=scene requires an explicit non-empty scene; scope=global may omit scene.",
+                "action=set requires at least one supported preference; action=forget removes supplied fields or all fields when omitted.",
             ],
             reusable_business_ids=[],
             success_outputs=["ok", "scope", "kind", "action", "scene"],
@@ -301,6 +308,28 @@ TOOL_DEFINITIONS = [
             bad_recovery="Do not turn preference maintenance into a separate edit workflow.",
         ),
         ["scope", "kind", "action"],
+        constraints=[
+            {
+                "if": {
+                    "properties": {"action": {"const": "set"}},
+                    "required": ["action"],
+                },
+                "then": {
+                    "required": ["preferences"],
+                    "properties": {"preferences": {"minProperties": 1}},
+                },
+            },
+            {
+                "if": {
+                    "properties": {"scope": {"const": "scene"}},
+                    "required": ["scope"],
+                },
+                "then": {
+                    "required": ["scene"],
+                    "properties": {"scene": {"minLength": 1}},
+                },
+            },
+        ],
     ),
     _tool(
         "video_edit_preferences_record_success",
@@ -549,36 +578,40 @@ TOOL_DEFINITIONS = [
         "Resolve the server-owned weekly-memory manifest into a private workflow without exposing source paths to the model.",
         {
             "manifest_id": {"type": "string"},
-            "task_id": {"type": "string", "maxLength": MAX_TASK_ID_LENGTH},
+            "task_id": {
+                "type": "string",
+                "maxLength": MAX_TASK_ID_LENGTH,
+                "description": "Optional fallback key for direct or CLI calls; trusted turn context is authoritative when present.",
+            },
         },
         _help(
             when_to_use="Start a proactive weekly edit only from trusted context that supplies both identifiers.",
             cross_field_invariants=[
-                "Both manifest_id and task_id must come from trusted proactive context; ordinary user text is insufficient.",
-                "Reuse both identifiers for retry so the same private workflow is recovered.",
+                "manifest_id must come from trusted proactive context; a trusted turn_id is authoritative for task identity when present.",
+                "Without trusted turn context, reuse task_id for retry so the same private workflow is recovered.",
             ],
             reusable_business_ids=["manifest_id", "task_id"],
             success_outputs=["ok", "workflow_id", "manifest_id", "file_count", "silent", "next"],
             failure_code="proactive_resolve_failed",
-            failure_recovery="Retry once with the same trusted manifest_id and task_id.",
+            failure_recovery="Retry once with the same trusted manifest_id and turn, or with the same task_id when running without trusted turn context.",
             service_call=True,
             workflow_required=True,
             next_tools=[{"when": "success", "tool": "video_edit_upload_assets"}],
             minimal_valid_call=_call(
                 "video_edit_proactive_resolve",
-                {"manifest_id": "MANIFEST_ID_FROM_TRUSTED_CONTEXT", "task_id": "TASK_ID_FROM_TRUSTED_CONTEXT"},
+                {"manifest_id": "MANIFEST_ID_FROM_TRUSTED_CONTEXT"},
             ),
             common_mistake=_call(
                 "video_edit_proactive_resolve",
-                {"manifest_id": "MANIFEST_ID_FROM_TRUSTED_CONTEXT"},
+                {"manifest_id": "MANIFEST_ID_FROM_TRUSTED_CONTEXT", "task_id": "TASK_ID_FALLBACK"},
             ),
             corrected_call=_call(
                 "video_edit_proactive_resolve",
-                {"manifest_id": "MANIFEST_ID_FROM_TRUSTED_CONTEXT", "task_id": "TASK_ID_FROM_TRUSTED_CONTEXT"},
+                {"manifest_id": "MANIFEST_ID_FROM_TRUSTED_CONTEXT", "task_id": "TASK_ID_FALLBACK"},
             ),
-            bad_recovery="Do not infer either identifier from ordinary text or substitute a new task_id during retry.",
+            bad_recovery="Do not infer manifest_id from ordinary text or substitute a new task_id during a retry without trusted turn context.",
         ),
-        ["manifest_id", "task_id"],
+        ["manifest_id"],
     ),
     _tool(
         "video_edit_proactive_report",
@@ -662,7 +695,17 @@ def _walk_contract(
         defaults[path] = copy.deepcopy(schema["default"])
     selected = {
         key: copy.deepcopy(schema[key])
-        for key in ("enum", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems")
+        for key in (
+            "enum",
+            "minimum",
+            "maximum",
+            "minLength",
+            "maxLength",
+            "minItems",
+            "maxItems",
+            "minProperties",
+            "maxProperties",
+        )
         if key in schema
     }
     if selected:
@@ -876,6 +919,8 @@ def _validate_value(value: Any, schema: dict[str, Any], path: str, issues: list[
         issues.append({"path": path, "rule": "enum", "allowed": copy.deepcopy(schema["enum"])})
         return
     if isinstance(value, str):
+        if isinstance(schema.get("minLength"), int) and len(value) < schema["minLength"]:
+            issues.append({"path": path, "rule": "minLength", "minimum": schema["minLength"]})
         if isinstance(schema.get("maxLength"), int) and len(value) > schema["maxLength"]:
             issues.append({"path": path, "rule": "maxLength", "maximum": schema["maxLength"]})
     elif isinstance(value, list):
@@ -888,6 +933,10 @@ def _validate_value(value: Any, schema: dict[str, Any], path: str, issues: list[
             for index, item in enumerate(value):
                 _validate_value(item, item_schema, f"{path}[{index}]", issues)
     elif isinstance(value, dict):
+        if isinstance(schema.get("minProperties"), int) and len(value) < schema["minProperties"]:
+            issues.append({"path": path, "rule": "minProperties", "minimum": schema["minProperties"]})
+        if isinstance(schema.get("maxProperties"), int) and len(value) > schema["maxProperties"]:
+            issues.append({"path": path, "rule": "maxProperties", "maximum": schema["maxProperties"]})
         required = schema.get("required") if isinstance(schema.get("required"), list) else []
         for field in required:
             if isinstance(field, str) and field not in value:
