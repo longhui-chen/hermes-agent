@@ -16,6 +16,36 @@ _ASF_VIDEO_STREAM = bytes.fromhex("c0ef19bc4d5bcf11a8fd00805f5c442b")
 _MATROSKA_HEADER = b"\x1a\x45\xdf\xa3\x42\x82\x88matroska"
 
 
+def _iso_box(kind: bytes, payload: bytes) -> bytes:
+    return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+
+def _iso_ftyp(brand: bytes = b"qt  ") -> bytes:
+    payload = brand + b"\x00\x00\x00\x00" + brand
+    return _iso_box(b"ftyp", payload)
+
+
+def _iso_track_sample(handler_type: bytes, brand: bytes = b"qt  ") -> bytes:
+    hdlr = _iso_box(
+        b"hdlr",
+        b"\x00\x00\x00\x00"  # version + flags
+        + b"\x00\x00\x00\x00"  # pre_defined
+        + handler_type
+        + b"\x00" * 12,  # reserved + empty name
+    )
+    mdia = _iso_box(b"mdia", hdlr)
+    trak = _iso_box(b"trak", mdia)
+    return _iso_ftyp(brand) + _iso_box(b"moov", trak)
+
+
+def _iso_video_sample() -> bytes:
+    return _iso_track_sample(b"vide")
+
+
+def _iso_audio_sample() -> bytes:
+    return _iso_track_sample(b"soun", brand=b"isom")
+
+
 def _install_trusted_normalizer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -121,6 +151,71 @@ def test_complete_small_audio_container_is_delegated_to_packaged_probe(
     try:
         assert paths.inspect_video_descriptor(source, descriptor) == (
             "video/x-matroska",
+            False,
+        )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("suffix", [".mov", ".mp4"])
+def test_iso_bmff_brand_without_video_track_is_inconclusive(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    source = tmp_path / f"ftyp-only{suffix}"
+    source.write_bytes(_iso_ftyp())
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime" if suffix == ".mov" else "video/mp4",
+            False,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def test_iso_bmff_brand_without_video_track_is_rejected_by_sample_validator() -> None:
+    with pytest.raises(paths.VideoPathError, match="supported video"):
+        paths.validate_video_sample(Path("fake.mov"), _iso_ftyp())
+
+
+def test_iso_bmff_proven_requires_video_handler_type(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "video.mov"
+    source.write_bytes(_iso_video_sample())
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            True,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def test_iso_bmff_video_track_cannot_cross_container_extension(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "wrong-container.mkv"
+    source.write_bytes(_iso_video_sample())
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        with pytest.raises(paths.VideoPathError, match="supported video"):
+            paths.validate_video_descriptor(source, descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_iso_bmff_vide_bytes_outside_handler_do_not_prove_a_track(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "forged-vide.mov"
+    source.write_bytes(_iso_ftyp() + _iso_box(b"free", b"vide"))
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
             False,
         )
     finally:
@@ -261,16 +356,71 @@ def test_inspection_capability_error_is_distinct_from_media_failure(
         normalizer.inspect_files([source], "workflow-1")
 
 
-def test_old_helper_capability_error_reaches_raw_upload_fallback(
+@pytest.mark.parametrize(
+    ("sample", "error", "message"),
+    [
+        pytest.param(
+            _iso_ftyp(),
+            normalizer.NormalizeError,
+            "inspection is unavailable",
+            id="ftyp-only",
+        ),
+        pytest.param(
+            _iso_audio_sample(),
+            normalizer.NormalizeError,
+            "inspection is unavailable",
+            id="isom-audio-track",
+        ),
+    ],
+)
+def test_old_helper_capability_error_rejects_unproven_iso_without_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sample: bytes,
+    error: type[Exception],
+    message: str,
+) -> None:
+    source = tmp_path / "old-helper-upload.mov"
+    source.write_bytes(sample)
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        normalizer,
+        "_run_bounded_subprocess",
+        lambda command, **_kwargs: (
+            subprocess.CompletedProcess(
+                command,
+                2,
+                "",
+                "usage: normalize.py [-h]\nnormalize.py: error: unrecognized arguments: --inspect-input",
+            ),
+            False,
+        ),
+    )
+
+    connections: list[bool] = []
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            connections.append(True)
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    with pytest.raises(error, match=message):
+        client.upload(
+            [source],
+            agent_id="agent-a",
+            replay_scope="old-helper-upload",
+        )
+
+    assert connections == []
+
+
+def test_old_helper_capability_error_allows_proven_video_upload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = tmp_path / "old-helper-upload.mov"
-    source.write_bytes(
-        (16).to_bytes(4, "big")
-        + b"ftyp"
-        + b"qt  \x00\x00\x00\x00qt  "
-    )
+    source = tmp_path / "old-helper-video.mov"
+    source.write_bytes(_iso_video_sample())
     _install_trusted_normalizer(tmp_path, monkeypatch)
     monkeypatch.setattr(
         normalizer,
@@ -319,7 +469,7 @@ def test_old_helper_capability_error_reaches_raw_upload_fallback(
     result = client.upload(
         [source],
         agent_id="agent-a",
-        replay_scope="old-helper-upload",
+        replay_scope="old-helper-video",
     )
 
     assert client.extract_upload_keys(result) == ["asset-old"]
@@ -357,11 +507,7 @@ def test_read_only_source_snapshot_uses_local_raw_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "read-only-probe.mov"
-    source.write_bytes(
-        (16).to_bytes(4, "big")
-        + b"ftyp"
-        + b"isom\x00\x00\x02\x00isommp42"
-    )
+    source.write_bytes(_iso_video_sample())
     _install_trusted_normalizer(tmp_path, monkeypatch)
     monkeypatch.setattr(
         normalizer,
@@ -477,11 +623,7 @@ def test_missing_packaged_probe_allows_locally_proven_video_upload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "probe-unavailable.mov"
-    source.write_bytes(
-        (16).to_bytes(4, "big")
-        + b"ftyp"
-        + b"isom\x00\x00\x02\x00isommp42"
-    )
+    source.write_bytes(_iso_video_sample())
 
     monkeypatch.setattr(
         normalizer,

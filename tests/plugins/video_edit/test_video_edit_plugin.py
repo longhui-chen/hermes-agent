@@ -55,12 +55,23 @@ def trusted_upload_media_probe(tmp_path, monkeypatch):
     monkeypatch.setattr(normalizer, "inspect_files", inspect)
 
 
+def _iso_video_sample(brand: bytes, marker: bytes = b"") -> bytes:
+    def box(kind: bytes, payload: bytes) -> bytes:
+        return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+    hdlr = box(b"hdlr", b"\x00" * 8 + b"vide" + b"\x00" * 12)
+    return (
+        box(b"ftyp", brand + b"\x00\x00\x00\x00" + brand)
+        + box(b"moov", box(b"trak", box(b"mdia", hdlr)))
+        + marker
+    )
+
+
 def _video_sample(suffix: str, marker: bytes = b"") -> bytes:
     suffix = suffix.lower()
     if suffix in {".3g2", ".3gp", ".m4v", ".mov", ".mp4"}:
         brand = b"qt  " if suffix == ".mov" else b"isom"
-        payload = brand + b"\x00\x00\x00\x00" + brand + b"mp42"
-        return (len(payload) + 8).to_bytes(4, "big") + b"ftyp" + payload + marker
+        return _iso_video_sample(brand, marker)
     if suffix in {".mkv", ".webm"}:
         doctype = b"matroska" if suffix == ".mkv" else b"webm"
         return (
@@ -1579,7 +1590,18 @@ def test_video_media_admission_rejects_unknown_mismatched_and_non_video_files(
 
 def test_video_descriptor_sniff_reads_only_the_bounded_header(monkeypatch, tmp_path):
     source = tmp_path / "bounded.mp4"
-    _write_video(source, b"x" * (paths.VIDEO_HEADER_BYTES * 2))
+    def box(kind, payload):
+        return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+    hdlr = box(
+        b"hdlr",
+        b"\x00" * 8 + b"vide" + b"\x00" * 12,
+    )
+    source.write_bytes(
+        box(b"ftyp", b"isom\x00\x00\x00\x00isom")
+        + box(b"moov", box(b"trak", box(b"mdia", hdlr)))
+        + b"x" * (paths.VIDEO_HEADER_BYTES * 2)
+    )
     descriptor = os.open(source, os.O_RDONLY)
     read_sizes = []
     real_read = os.read

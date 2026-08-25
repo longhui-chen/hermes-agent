@@ -65,6 +65,7 @@ _ISO_VIDEO_BRANDS = {
     b"msix",
     b"qt  ",
 }
+_ISO_BMFF_MAX_BOX_DEPTH = 8
 
 
 class VideoPathError(ValueError):
@@ -183,6 +184,85 @@ def _iso_bmff_is_video(sample: bytes) -> bool:
     return False
 
 
+def _iso_bmff_boxes(
+    sample: bytes,
+    start: int,
+    end: int,
+):
+    """Yield complete ISO-BMFF child boxes inside one bounded parent."""
+    offset = start
+    while offset < end:
+        if end - offset < 8:
+            return
+        size = int.from_bytes(sample[offset : offset + 4], "big")
+        kind = sample[offset + 4 : offset + 8]
+        header_size = 8
+        if size == 1:
+            if end - offset < 16:
+                return
+            size = int.from_bytes(sample[offset + 8 : offset + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = end - offset
+        if size < header_size or size > end - offset:
+            return
+        box_end = offset + size
+        yield kind, offset + header_size, box_end
+        offset = box_end
+
+
+def _iso_bmff_mdia_has_video_handler(
+    sample: bytes,
+    start: int,
+    end: int,
+    depth: int,
+) -> bool:
+    if depth > _ISO_BMFF_MAX_BOX_DEPTH:
+        return False
+    for kind, payload_start, box_end in _iso_bmff_boxes(sample, start, end):
+        if kind != b"hdlr" or box_end - payload_start < 12:
+            continue
+        # FullBox(version + flags), pre_defined, then handler_type.
+        if sample[payload_start + 8 : payload_start + 12] == b"vide":
+            return True
+    return False
+
+
+def _iso_bmff_trak_has_video_handler(
+    sample: bytes,
+    start: int,
+    end: int,
+    depth: int,
+) -> bool:
+    if depth > _ISO_BMFF_MAX_BOX_DEPTH:
+        return False
+    for kind, payload_start, box_end in _iso_bmff_boxes(sample, start, end):
+        if kind == b"mdia" and _iso_bmff_mdia_has_video_handler(
+            sample, payload_start, box_end, depth + 1
+        ):
+            return True
+    return False
+
+
+def _iso_bmff_has_video_track(sample: bytes) -> bool:
+    """Require an actual ``hdlr=vide`` track, not just an ISO brand."""
+    if not _iso_bmff_is_video(sample):
+        return False
+    for kind, payload_start, box_end in _iso_bmff_boxes(
+        sample, 0, len(sample)
+    ):
+        if kind != b"moov":
+            continue
+        for trak_kind, trak_start, trak_end in _iso_bmff_boxes(
+            sample, payload_start, box_end
+        ):
+            if trak_kind == b"trak" and _iso_bmff_trak_has_video_handler(
+                sample, trak_start, trak_end, 2
+            ):
+                return True
+    return False
+
+
 def _ebml_doctype(sample: bytes) -> str:
     marker = b"\x42\x82"
     offset = sample.find(marker, 4)
@@ -258,7 +338,9 @@ def _detect_video_container_signature(sample: bytes) -> str:
 
 def _detect_video_container(sample: bytes) -> str:
     container = _detect_video_container_signature(sample)
-    if container in {"iso-bmff", "flv", "mxf"}:
+    if container == "iso-bmff":
+        return container if _iso_bmff_has_video_track(sample) else ""
+    if container in {"flv", "mxf"}:
         return container
     if container in {"matroska", "webm"} and b"\x83\x81\x01" in sample:
         return container

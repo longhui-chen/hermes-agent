@@ -26,8 +26,15 @@ def isolated_video_home(tmp_path, monkeypatch):
 
 def _write_video(path: Path, marker: bytes = b"") -> None:
     brand = b"qt  " if path.suffix.lower() == ".mov" else b"isom"
-    payload = brand + b"\x00\x00\x00\x00" + brand + b"mp42"
-    path.write_bytes((len(payload) + 8).to_bytes(4, "big") + b"ftyp" + payload + marker)
+    def box(kind: bytes, payload: bytes) -> bytes:
+        return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+    hdlr = box(b"hdlr", b"\x00" * 8 + b"vide" + b"\x00" * 12)
+    path.write_bytes(
+        box(b"ftyp", brand + b"\x00\x00\x00\x00" + brand)
+        + box(b"moov", box(b"trak", box(b"mdia", hdlr)))
+        + marker
+    )
 
 
 def _hold_upload_lock(
