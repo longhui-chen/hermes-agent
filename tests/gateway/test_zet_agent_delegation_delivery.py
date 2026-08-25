@@ -453,7 +453,8 @@ async def test_session_delegations_interrupt_does_not_stop_live_agent(monkeypatc
     for c in calls:
         assert c.get("reason") == "goal_park"
         assert c.get("suppress_completion") is True
-        assert c.get("session_key") == c.get("parent_session_id")
+        assert not c.get("session_key")
+        assert c.get("parent_session_id") in {"s1", "s1-rotated"}
 
 
 # ---------------------------------------------------------------------------

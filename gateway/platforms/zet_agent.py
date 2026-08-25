@@ -6645,9 +6645,11 @@ class ZetAgentAdapter(APIServerAdapter):
         count = 0
         for psid in {session_id, rotated_sid} - {""}:
             try:
+                # parent_session_id only: session_key is the durable gateway
+                # routing key and survives /new, so OR-matching it would kill
+                # the replacement session's delegations.
                 count += int(interrupt_for_session(
                     parent_session_id=psid,
-                    session_key=psid,
                     reason=reason,
                     suppress_completion=True,
                     profile_home=self._delegation_control_scope(request),
