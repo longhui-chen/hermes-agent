@@ -121,6 +121,26 @@ def _write_video(path: Path, marker: bytes = b"") -> None:
     path.write_bytes(_video_sample(path.suffix, marker))
 
 
+def _normalized_output(path: Path) -> normalizer.NormalizedOutput:
+    info = path.stat()
+    return normalizer.NormalizedOutput(
+        path=path,
+        identity=(
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ),
+    )
+
+
+def _remove_normalized_outputs(items) -> None:
+    for item in items:
+        path = item.path if isinstance(item, normalizer.NormalizedOutput) else Path(item)
+        path.unlink(missing_ok=True)
+
+
 def _install_trusted_normalizer(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(normalizer, "_PRESETS_ANCHOR", None)
     presets = tmp_path / "presets"
@@ -267,7 +287,7 @@ def test_normalizer_is_a_separate_bounded_plugin_adapter(isolated_video_home, mo
             )
         )
         target = Path(command[command.index("--output") + 1])
-        target.write_bytes(b"normalized")
+        target.write_bytes(_video_sample(".mp4"))
         completed = type(
             "Completed",
             (),
@@ -277,7 +297,8 @@ def test_normalizer_is_a_separate_bounded_plugin_adapter(isolated_video_home, mo
 
     monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
     result = normalizer.normalize_file(source, "workflow-1", 0)
-    assert result.read_bytes() == b"normalized"
+    assert result.path.read_bytes() == _video_sample(".mp4")
+    assert result.identity == _normalized_output(result.path).identity
     assert calls and calls[0][0][0] == normalizer.sys.executable
     assert calls[0][0][1] != str(script)
     assert calls[0][0][1].endswith(f"/{calls[0][1]['pass_fds'][0]}")
@@ -288,8 +309,25 @@ def test_normalizer_is_a_separate_bounded_plugin_adapter(isolated_video_home, mo
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in calls[0][1]["env"]
     assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in calls[0][1]["env"]
     normalizer.cleanup([result], "workflow-1")
-    assert not result.exists()
+    assert not result.path.exists()
     assert not input_path.exists()
+
+
+def test_normalized_cleanup_does_not_delete_replaced_inode(
+    isolated_video_home,
+) -> None:
+    workspace = normalizer._temporary_root("cleanup-identity")
+    target = workspace / "vewm_0.mp4"
+    target.write_bytes(_video_sample(".mp4"))
+    output = _normalized_output(target)
+    replacement = workspace / "replacement.mp4"
+    replacement.write_bytes(_video_sample(".mp4"))
+    os.replace(replacement, target)
+
+    normalizer.cleanup([output], "cleanup-identity")
+
+    assert target.exists()
+    assert target.stat().st_ino != output.identity[1]
 
 
 def test_normalizer_subprocess_output_is_bounded(tmp_path):
@@ -423,6 +461,7 @@ def test_normalizer_executes_opened_inode_when_script_path_is_replaced(
     source = tmp_path / "source.mov"
     _write_video(source, b"source")
     script = _install_trusted_normalizer(tmp_path, monkeypatch)
+    normalized_sample = _video_sample(".mp4")
     script.write_text(
         "import argparse, json\n"
         "from pathlib import Path\n"
@@ -430,7 +469,7 @@ def test_normalizer_executes_opened_inode_when_script_path_is_replaced(
         "parser.add_argument('--input', required=True)\n"
         "parser.add_argument('--output', required=True)\n"
         "args = parser.parse_args()\n"
-        "Path(args.output).write_bytes(b'anchored-inode')\n"
+        f"Path(args.output).write_bytes({normalized_sample!r})\n"
         "print(json.dumps({'output': args.output}))\n",
         encoding="utf-8",
     )
@@ -455,7 +494,7 @@ def test_normalizer_executes_opened_inode_when_script_path_is_replaced(
 
     result = normalizer.normalize_file(source, "workflow-fd-pinning", 0)
 
-    assert result.read_bytes() == b"anchored-inode"
+    assert result.path.read_bytes() == normalized_sample
     assert replaced is True
     assert len(inherited) == 1
     script_path, pass_fds = inherited[0]
@@ -1760,14 +1799,180 @@ def test_upload_normalized_intermediates_are_cleaned_after_each_batch(isolated_v
         )
     )["workflow_id"]
     normalized = tmp_path / "normalized.mp4"
-    normalized.write_bytes(b"normalized")
-    monkeypatch.setattr(normalizer, "normalize_files", lambda files, workflow_id: [normalized])
-    monkeypatch.setattr(normalizer, "cleanup", lambda paths, workflow_id: [path.unlink(missing_ok=True) for path in paths])
+    normalized.write_bytes(_video_sample(".mp4"))
+    monkeypatch.setattr(
+        normalizer,
+        "normalize_files",
+        lambda files, workflow_id: [_normalized_output(normalized)],
+    )
+    monkeypatch.setattr(
+        normalizer,
+        "cleanup",
+        lambda items, workflow_id: _remove_normalized_outputs(items),
+    )
     monkeypatch.setattr(client, "upload", lambda files, **kwargs: {"data": {"uploads": [{"object_key": "obj-1"}]}})
     uploaded = json.loads(tools.handle_upload_assets({"workflow_id": workflow, "files": [str(source)]}, agent_id="agent-a"))
     assert uploaded["strategy"] == "normalized"
     assert uploaded["uploaded"] == 1
     assert not normalized.exists()
+
+
+def test_normalized_private_output_uploads_without_second_packaged_probe(
+    isolated_video_home,
+    monkeypatch,
+    tmp_path,
+):
+    source = isolated_video_home[1] / "agent-a" / "private-output.mov"
+    source.parent.mkdir(parents=True)
+    _write_video(source, b"source")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {
+                "task_id": "private-normalized-output",
+                "preferences": {"upload_preference": "normalized"},
+            },
+            agent_id="agent-a",
+        )
+    )["workflow_id"]
+    inspect_calls = 0
+
+    def fake_run(command, **_kwargs):
+        nonlocal inspect_calls
+        if "--inspect-input" in command:
+            inspect_calls += 1
+            completed = subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "ok": False,
+                        "items": [
+                            {
+                                "category": "reject",
+                                "reason": "PATH_NOT_ALLOWED",
+                            }
+                        ],
+                    }
+                ),
+                "",
+            )
+            return completed, False
+        target = Path(command[command.index("--output") + 1])
+        target.write_bytes(_video_sample(".mp4"))
+        return (
+            subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({"output": str(target)}),
+                "",
+            ),
+            False,
+        )
+
+    monkeypatch.setattr(normalizer, "inspect_files", _REAL_INSPECT_FILES)
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-normalized"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    uploaded = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert uploaded.get("ok") is True, uploaded
+    assert uploaded["strategy"] == "normalized"
+    assert uploaded["uploaded"] == 1
+    assert inspect_calls == 0
+    checkpoint = json.dumps(tools.state.get(workflow, "agent-a"), sort_keys=True)
+    assert "vewm_" not in checkpoint
+    assert "identity" not in checkpoint
+
+
+def test_normalized_output_change_is_recoverable_before_http(
+    isolated_video_home,
+    monkeypatch,
+    tmp_path,
+):
+    source = isolated_video_home[1] / "agent-a" / "changed-output.mov"
+    source.parent.mkdir(parents=True)
+    _write_video(source, b"source")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {
+                "task_id": "changed-normalized-output",
+                "preferences": {"upload_preference": "normalized"},
+            },
+            agent_id="agent-a",
+        )
+    )["workflow_id"]
+    normalized = tmp_path / "normalized.mp4"
+    normalized.write_bytes(_video_sample(".mp4"))
+    output = _normalized_output(normalized)
+    monkeypatch.setattr(
+        normalizer,
+        "normalize_files",
+        lambda *_args, **_kwargs: [output],
+    )
+
+    def replace_after_capture():
+        replacement = tmp_path / "replacement.mp4"
+        replacement.write_bytes(_video_sample(".mp4"))
+        os.replace(replacement, normalized)
+        return "generation-after-capture"
+
+    monkeypatch.setattr(normalizer, "generation", replace_after_capture)
+    monkeypatch.setattr(normalizer, "cleanup", lambda *_args, **_kwargs: None)
+    connections: list[bool] = []
+    monkeypatch.setattr(
+        client.http.client,
+        "HTTPConnection",
+        lambda *_args, **_kwargs: connections.append(True),
+    )
+
+    result = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert result["reason_code"] == "media_preparation_failed"
+    assert result["retryable"] is True
+    assert result["next"] == "video_edit_upload_assets"
+    assert connections == []
+    checkpoint = tools.state.get(workflow, "agent-a")
+    assert checkpoint["source_paths"] == [str(source.resolve())]
+    assert checkpoint.get("object_keys", []) == []
 
 
 def test_normalizer_failure_falls_back_to_direct_without_new_workflow(isolated_video_home, monkeypatch):
@@ -1821,7 +2026,7 @@ def test_oversized_sparse_normalize_checkpoint_can_retry_preparation(
         )
     )["workflow_id"]
     normalized = tmp_path / "oversized-normalized.mp4"
-    normalized.write_bytes(b"normalized")
+    normalized.write_bytes(_video_sample(".mp4"))
     normalize_calls = 0
 
     def normalize(files, _workflow_id):
@@ -1829,7 +2034,7 @@ def test_oversized_sparse_normalize_checkpoint_can_retry_preparation(
         normalize_calls += 1
         if normalize_calls == 1:
             raise normalizer.NormalizeError("hardware preparation failed")
-        return [normalized]
+        return [_normalized_output(normalized)]
 
     monkeypatch.setattr(normalizer, "normalize_files", normalize)
     monkeypatch.setattr(normalizer, "generation", lambda: "generation-retry")
@@ -1945,12 +2150,12 @@ def test_normalized_upload_records_generation_after_preparation(
         )
     )["workflow_id"]
     normalized = tmp_path / "normalized.mp4"
-    normalized.write_bytes(b"normalized")
+    normalized.write_bytes(_video_sample(".mp4"))
     events: list[str] = []
 
     def normalize(files, _workflow_id):
         events.append("normalize")
-        return [normalized]
+        return [_normalized_output(normalized)]
 
     def generation():
         events.append("generation")
@@ -1961,7 +2166,7 @@ def test_normalized_upload_records_generation_after_preparation(
     monkeypatch.setattr(
         normalizer,
         "cleanup",
-        lambda items, _workflow_id: [item.unlink(missing_ok=True) for item in items],
+        lambda items, _workflow_id: _remove_normalized_outputs(items),
     )
     monkeypatch.setattr(
         client,
@@ -2012,15 +2217,15 @@ def test_partial_normalized_upload_retry_keeps_normalized_strategy(
         outputs = []
         for index, _source in enumerate(files):
             target = tmp_path / f"vewm_{index}.mp4"
-            target.write_bytes(f"normalized-{index}".encode())
-            outputs.append(target)
+            target.write_bytes(_video_sample(".mp4"))
+            outputs.append(_normalized_output(target))
         return outputs
 
     monkeypatch.setattr(normalizer, "normalize_files", fake_normalize)
     monkeypatch.setattr(
         normalizer,
         "cleanup",
-        lambda items, _workflow_id: [item.unlink(missing_ok=True) for item in items],
+        lambda items, _workflow_id: _remove_normalized_outputs(items),
     )
     upload_calls = 0
     uploaded_batches = []
@@ -2182,7 +2387,11 @@ def test_partial_normalized_upload_rejects_a_new_runtime_generation(
     )["workflow_id"]
     generation = "generation-a"
     monkeypatch.setattr(normalizer, "generation", lambda: generation)
-    monkeypatch.setattr(normalizer, "normalize_files", lambda files, _workflow_id: list(files))
+    monkeypatch.setattr(
+        normalizer,
+        "normalize_files",
+        lambda files, _workflow_id: [_normalized_output(path) for path in files],
+    )
     monkeypatch.setattr(normalizer, "cleanup", lambda _files, _workflow_id: None)
     upload_calls = 0
 
@@ -2250,7 +2459,7 @@ def test_accepted_normalized_upload_without_checkpoint_rejects_new_generation(
     def normalize(files, _workflow_id):
         nonlocal normalize_calls
         normalize_calls += 1
-        return list(files)
+        return [_normalized_output(path) for path in files]
 
     monkeypatch.setattr(normalizer, "normalize_files", normalize)
     monkeypatch.setattr(normalizer, "cleanup", lambda *_args, **_kwargs: None)

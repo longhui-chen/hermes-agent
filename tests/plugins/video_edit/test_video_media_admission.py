@@ -80,6 +80,55 @@ def _install_trusted_normalizer(
     return script
 
 
+def _normalized_output(path: Path) -> normalizer.NormalizedOutput:
+    info = path.stat()
+    return normalizer.NormalizedOutput(
+        path=path,
+        identity=(
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ),
+    )
+
+
+def _install_successful_upload_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connections: list[bool],
+) -> None:
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-normalized"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            connections.append(True)
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+
 def _delayed_video_sample(suffix: str) -> bytes:
     padding = b"\x00" * (paths.VIDEO_HEADER_BYTES * 2)
     if suffix == ".mkv":
@@ -499,6 +548,113 @@ def test_inspection_capability_error_is_distinct_from_media_failure(
         match="capability is unavailable",
     ):
         normalizer.inspect_files([source], "workflow-1")
+
+
+def test_admitted_normalized_identity_skips_packaged_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "normalized.mp4"
+    source.write_bytes(_iso_video_sample())
+    output = _normalized_output(source)
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: pytest.fail(
+            "normalized output must not run the raw-media probe"
+        ),
+    )
+    connections: list[bool] = []
+    _install_successful_upload_connection(monkeypatch, connections)
+
+    result = client.upload(
+        [source],
+        agent_id="agent-a",
+        replay_scope="normalized-output",
+        normalized_outputs=[output],
+    )
+
+    assert client.extract_upload_keys(result) == ["asset-normalized"]
+    assert connections == [True]
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["same_inode_mutation", "inode_replacement", "symlink_replacement"],
+)
+def test_stale_normalized_identity_fails_before_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    source = tmp_path / "normalized.mp4"
+    source.write_bytes(_iso_video_sample())
+    output = _normalized_output(source)
+    before = source.stat()
+    replacement = tmp_path / "replacement.mp4"
+    replacement.write_bytes(_iso_video_sample())
+    if change == "same_inode_mutation":
+        with source.open("r+b") as stream:
+            stream.seek(-1, os.SEEK_END)
+            stream.write(b"X")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    elif change == "inode_replacement":
+        os.replace(replacement, source)
+    else:
+        source.unlink()
+        source.symlink_to(replacement)
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: pytest.fail(
+            "stale normalized output must not run the raw-media probe"
+        ),
+    )
+    connections: list[bool] = []
+    monkeypatch.setattr(
+        client.http.client,
+        "HTTPConnection",
+        lambda *_args, **_kwargs: connections.append(True),
+    )
+
+    with pytest.raises(normalizer.NormalizeError):
+        client.upload(
+            [source],
+            agent_id="agent-a",
+            replay_scope="stale-normalized-output",
+            normalized_outputs=[output],
+        )
+
+    assert connections == []
+
+
+def test_raw_direct_upload_still_runs_packaged_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "raw-direct.mov"
+    source.write_bytes(_iso_video_sample())
+    inspected: list[tuple[list[Path], str]] = []
+
+    def inspect(sources, workflow_id):
+        inspected.append((list(sources), workflow_id))
+        return [_normalized_output(source).identity]
+
+    monkeypatch.setattr(normalizer, "inspect_files", inspect)
+    connections: list[bool] = []
+    _install_successful_upload_connection(monkeypatch, connections)
+
+    result = client.upload(
+        [source],
+        agent_id="agent-a",
+        replay_scope="raw-direct",
+    )
+
+    assert client.extract_upload_keys(result) == ["asset-normalized"]
+    assert inspected == [([source], "raw-direct")]
+    assert connections == [True]
 
 
 @pytest.mark.parametrize(

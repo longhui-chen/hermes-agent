@@ -23,7 +23,12 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from plugins.video_edit.paths import VideoPathError, safe_id, state_root
+from plugins.video_edit.paths import (
+    VideoPathError,
+    inspect_video_descriptor,
+    safe_id,
+    state_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,17 @@ class NormalizeError(RuntimeError):
 
 class NormalizerUnavailableError(NormalizeError):
     """The packaged helper or a requested helper capability is unavailable."""
+
+
+FileIdentity = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class NormalizedOutput:
+    """Process-local normalized artifact bound to the inode the helper produced."""
+
+    path: Path
+    identity: FileIdentity
 
 
 def _run_bounded_subprocess(
@@ -508,7 +524,67 @@ def _inspection_capability_missing(
     )
 
 
-def normalize_file(source: Path, workflow_id: str, index: int) -> Path:
+def _file_identity(info: os.stat_result) -> FileIdentity:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _capture_normalized_output(
+    target: Path,
+    workspace: Path,
+) -> NormalizedOutput:
+    """Bind a helper-produced file to its validated path and inode identity."""
+    try:
+        if target.parent.resolve() != workspace.resolve():
+            raise NormalizeError("video normalization output is invalid")
+        descriptor = os.open(
+            target,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except (OSError, RuntimeError) as exc:
+        raise NormalizeError("video normalization output is invalid") from exc
+    try:
+        initial = os.fstat(descriptor)
+        path_info = os.stat(target, follow_symlinks=False)
+        identity = _file_identity(initial)
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or initial.st_size <= 0
+            or not stat.S_ISREG(path_info.st_mode)
+            or _file_identity(path_info) != identity
+        ):
+            raise NormalizeError("video normalization output is invalid")
+        try:
+            _, proven = inspect_video_descriptor(target, descriptor)
+        except VideoPathError as exc:
+            raise NormalizeError("video normalization output is invalid") from exc
+        current = os.fstat(descriptor)
+        current_path = os.stat(target, follow_symlinks=False)
+        if (
+            not proven
+            or _file_identity(current) != identity
+            or _file_identity(current_path) != identity
+        ):
+            raise NormalizeError("video normalization output changed")
+        return NormalizedOutput(path=target, identity=identity)
+    except OSError as exc:
+        raise NormalizeError("video normalization output changed") from exc
+    finally:
+        os.close(descriptor)
+
+
+def normalize_file(
+    source: Path,
+    workflow_id: str,
+    index: int,
+) -> NormalizedOutput:
     if not source.is_file() or source.is_symlink():
         raise NormalizeError("video input is unavailable")
     pinned_source = _pin_input(source, workflow_id, index)
@@ -565,11 +641,18 @@ def normalize_file(source: Path, workflow_id: str, index: int) -> Path:
     if not isinstance(payload, dict) or str(payload.get("output") or "") != str(target):
         target.unlink(missing_ok=True)
         raise NormalizeError("video normalizer returned invalid metadata")
-    return target
+    try:
+        return _capture_normalized_output(target, workspace)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
 
-def normalize_files(sources: Iterable[Path], workflow_id: str) -> list[Path]:
-    normalized: list[Path] = []
+def normalize_files(
+    sources: Iterable[Path],
+    workflow_id: str,
+) -> list[NormalizedOutput]:
+    normalized: list[NormalizedOutput] = []
     try:
         for index, source in enumerate(sources):
             normalized.append(normalize_file(source, workflow_id, index))
@@ -692,11 +775,25 @@ def inspect_files(
     return identities
 
 
-def cleanup(paths: Iterable[Path], workflow_id: str) -> None:
+def cleanup(
+    outputs: Iterable[NormalizedOutput],
+    workflow_id: str,
+) -> None:
     workspace = _temporary_root(workflow_id)
-    for raw in paths:
-        path = Path(raw)
+    for output in outputs:
+        if type(output) is not NormalizedOutput:
+            continue
+        path = output.path
         if not _under(path.resolve(), workspace.resolve()) or path.is_symlink():
+            continue
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except OSError:
+            continue
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or _file_identity(current) != output.identity
+        ):
             continue
         with contextlib.suppress(OSError):
             path.unlink()
