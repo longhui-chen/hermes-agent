@@ -1026,6 +1026,99 @@ def test_tail_moov_rejects_structurally_incomplete_boxes(
         os.close(descriptor)
 
 
+@pytest.mark.parametrize(
+    "malformed_tail",
+    [b"abc", b"\x00\x00\x00\x04junk", b"\x00\x00\x00\x20junk"],
+)
+def test_fast_start_moov_rejects_structurally_incomplete_boxes(
+    tmp_path: Path,
+    malformed_tail: bytes,
+) -> None:
+    source = tmp_path / "fast-malformed-tail.mov"
+    source.write_bytes(_iso_video_sample() + malformed_tail)
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            False,
+        )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "malformed_trak",
+    [
+        pytest.param(_iso_box(b"trak", b""), id="empty-trak"),
+        pytest.param(_iso_box(b"trak", _iso_box(b"tkhd", b"\x00" * 4)), id="missing-mdia"),
+        pytest.param(
+            _iso_box(b"trak", _iso_box(b"mdia", _iso_box(b"mdhd", b"\x00" * 4))),
+            id="missing-hdlr",
+        ),
+        pytest.param(_iso_box(b"trak", b"\x00\x00\x00\x20junk"), id="truncated-child"),
+    ],
+)
+def test_moov_rejects_malformed_sibling_trak_after_video_track(
+    tmp_path: Path,
+    malformed_trak: bytes,
+) -> None:
+    ftyp = _iso_ftyp()
+    valid_trak = _iso_video_sample()[len(ftyp) + 8 :]
+    source = tmp_path / "malformed-sibling-trak.mov"
+    source.write_bytes(ftyp + _iso_box(b"moov", valid_trak + malformed_trak))
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            False,
+        )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        pytest.param("ftyp", id="duplicate-ftyp"),
+        pytest.param("mdia", id="duplicate-mdia"),
+        pytest.param("hdlr", id="duplicate-hdlr"),
+    ],
+)
+def test_iso_bmff_rejects_duplicate_required_boxes(
+    tmp_path: Path,
+    duplicate: str,
+) -> None:
+    ftyp = _iso_ftyp()
+    video_handler = _iso_box(b"hdlr", b"\x00" * 8 + b"vide")
+    audio_handler = _iso_box(b"hdlr", b"\x00" * 8 + b"soun")
+    if duplicate == "ftyp":
+        payload = ftyp + ftyp + _iso_video_sample()[len(ftyp) :]
+    elif duplicate == "mdia":
+        trak = _iso_box(
+            b"trak",
+            _iso_box(b"mdia", video_handler)
+            + _iso_box(b"mdia", audio_handler),
+        )
+        payload = ftyp + _iso_box(b"moov", trak)
+    else:
+        trak = _iso_box(
+            b"trak",
+            _iso_box(b"mdia", video_handler + audio_handler),
+        )
+        payload = ftyp + _iso_box(b"moov", trak)
+
+    source = tmp_path / f"duplicate-{duplicate}.mov"
+    source.write_bytes(payload)
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert paths.inspect_video_descriptor(source, descriptor) == (
+            "video/quicktime",
+            False,
+        )
+    finally:
+        os.close(descriptor)
+
+
 def test_tail_moov_rejects_unscanned_top_level_box_overflow(
     tmp_path: Path,
 ) -> None:

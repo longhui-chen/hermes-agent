@@ -1594,7 +1594,7 @@ def test_video_media_admission_rejects_unknown_mismatched_and_non_video_files(
         paths.validate_video_sample(Path(name), sample)
 
 
-def test_video_descriptor_sniff_reads_only_the_bounded_header(monkeypatch, tmp_path):
+def test_video_descriptor_sniff_seeks_over_large_payload(monkeypatch, tmp_path):
     source = tmp_path / "bounded.mp4"
     def box(kind, payload):
         return (len(payload) + 8).to_bytes(4, "big") + kind + payload
@@ -1606,22 +1606,35 @@ def test_video_descriptor_sniff_reads_only_the_bounded_header(monkeypatch, tmp_p
     source.write_bytes(
         box(b"ftyp", b"isom\x00\x00\x00\x00isom")
         + box(b"moov", box(b"trak", box(b"mdia", hdlr)))
-        + b"x" * (paths.VIDEO_HEADER_BYTES * 2)
+        + box(b"mdat", b"x" * (paths.VIDEO_HEADER_BYTES * 2))
     )
     descriptor = os.open(source, os.O_RDONLY)
-    read_sizes = []
+    reads = []
     real_read = os.read
+
+    def read(fd, size):
+        reads.append((paths.os.lseek(fd, 0, os.SEEK_CUR), size))
+        return real_read(fd, size)
+
     monkeypatch.setattr(
         paths.os,
         "read",
-        lambda fd, size: read_sizes.append(size) or real_read(fd, size),
+        read,
     )
     try:
         paths.validate_video_descriptor(source, descriptor)
     finally:
         os.close(descriptor)
 
-    assert read_sizes == [paths.VIDEO_HEADER_BYTES]
+    mdat_start = len(box(b"ftyp", b"isom\x00\x00\x00\x00isom")) + len(
+        box(b"moov", box(b"trak", box(b"mdia", hdlr)))
+    )
+    payload_start = mdat_start + 8
+    assert not any(
+        payload_start <= offset < source.stat().st_size
+        for offset, _size in reads
+    )
+    assert max(size for _offset, size in reads) <= 64 * 1024
 
 
 @pytest.mark.parametrize(
