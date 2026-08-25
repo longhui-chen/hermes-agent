@@ -1327,6 +1327,42 @@ def test_output_root_does_not_duplicate_profile_bucket(isolated_video_home):
     assert paths.output_root("agent-a") == isolated_video_home[1].resolve()
 
 
+def test_input_accepts_the_active_agent_upload_workspace(
+    isolated_video_home,
+):
+    uploads = isolated_video_home[1].parent / "uploads"
+    uploads.mkdir()
+    source = uploads / "attached.mov"
+    _write_video(source)
+
+    assert paths.upload_root("agent-a") == uploads.resolve()
+    assert paths.validate_input_file(str(source), "agent-a") == source.resolve()
+
+
+def test_input_rejects_another_agent_upload_workspace(
+    isolated_video_home,
+):
+    other_uploads = isolated_video_home[1].parent / "other" / "uploads"
+    other_uploads.mkdir(parents=True)
+    source = other_uploads / "attached.mov"
+    _write_video(source)
+
+    with pytest.raises(paths.VideoPathError, match="outside the media workspace"):
+        paths.validate_input_file(str(source), "agent-a")
+
+
+def test_input_rejects_a_symlinked_agent_upload_workspace(
+    isolated_video_home,
+):
+    target = isolated_video_home[1].parent / "real-uploads"
+    target.mkdir()
+    link = isolated_video_home[1].parent / "uploads"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(paths.VideoPathError, match="upload directory is a symlink"):
+        paths.upload_root("agent-a")
+
+
 @pytest.mark.parametrize(
     ("suffix", "expected_mime"),
     [
@@ -1575,6 +1611,115 @@ def test_normalizer_failure_falls_back_to_direct_without_new_workflow(isolated_v
     assert uploaded["workflow_id"] == workflow
     assert uploaded["strategy"] == "raw_direct"
     assert seen == [source.resolve()]
+
+
+def test_initial_normalized_upload_does_not_require_generation_before_fallback(
+    isolated_video_home,
+    monkeypatch,
+):
+    source = isolated_video_home[1] / "agent-a" / "helper-missing.mov"
+    source.parent.mkdir(parents=True)
+    _write_video(source, b"helper-missing")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {
+                "task_id": "helper-missing-before-normalize",
+                "preferences": {"upload_preference": "normalized"},
+            },
+            agent_id="agent-a",
+        )
+    )["workflow_id"]
+    generation_calls = 0
+
+    def unavailable_generation():
+        nonlocal generation_calls
+        generation_calls += 1
+        raise normalizer.NormalizeError("video normalizer is unavailable")
+
+    monkeypatch.setattr(normalizer, "generation", unavailable_generation)
+    monkeypatch.setattr(
+        normalizer,
+        "normalize_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizeError("video normalizer is unavailable")
+        ),
+    )
+    seen: list[Path] = []
+    monkeypatch.setattr(
+        client,
+        "upload",
+        lambda files, **_kwargs: seen.extend(files)
+        or {"data": {"uploads": [{"object_key": "asset-raw"}]}},
+    )
+
+    uploaded = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert uploaded["ok"] is True
+    assert uploaded["strategy"] == "raw_direct"
+    assert seen == [source.resolve()]
+    assert generation_calls == 0
+    assert tools.state.get(workflow, "agent-a")["normalizer_generation"] == ""
+
+
+def test_normalized_upload_records_generation_after_preparation(
+    isolated_video_home,
+    monkeypatch,
+    tmp_path,
+):
+    source = isolated_video_home[1] / "agent-a" / "generation-after-normalize.mov"
+    source.parent.mkdir(parents=True)
+    _write_video(source, b"generation-after-normalize")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {
+                "task_id": "generation-after-normalize",
+                "preferences": {"upload_preference": "normalized"},
+            },
+            agent_id="agent-a",
+        )
+    )["workflow_id"]
+    normalized = tmp_path / "normalized.mp4"
+    normalized.write_bytes(b"normalized")
+    events: list[str] = []
+
+    def normalize(files, _workflow_id):
+        events.append("normalize")
+        return [normalized]
+
+    def generation():
+        events.append("generation")
+        return "generation-after"
+
+    monkeypatch.setattr(normalizer, "normalize_files", normalize)
+    monkeypatch.setattr(normalizer, "generation", generation)
+    monkeypatch.setattr(
+        normalizer,
+        "cleanup",
+        lambda items, _workflow_id: [item.unlink(missing_ok=True) for item in items],
+    )
+    monkeypatch.setattr(
+        client,
+        "upload",
+        lambda files, **_kwargs: events.append("upload")
+        or {"data": {"uploads": [{"object_key": "asset-normalized"}]}},
+    )
+
+    uploaded = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert uploaded["ok"] is True
+    assert uploaded["strategy"] == "normalized"
+    assert events == ["normalize", "generation", "upload"]
+    assert tools.state.get(workflow, "agent-a")["normalizer_generation"] == "generation-after"
 
 
 def test_partial_normalized_upload_retry_keeps_normalized_strategy(

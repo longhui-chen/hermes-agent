@@ -370,9 +370,14 @@ def validate_input_file(raw: str, agent_id: str) -> Path:
         raise VideoPathError("input file is unavailable") from exc
     if not resolved.is_file() or stat_result.st_size <= 0:
         raise VideoPathError("input file is unavailable")
-    raw_ok = any(_under(resolved, Path(root).resolve()) for root in _RAW_ROOTS)
     output = output_root(agent_id)
-    if not raw_ok and not _under(resolved, output):
+    uploads = upload_root(agent_id)
+    workspace_roots = [
+        *(Path(root).resolve() for root in _RAW_ROOTS),
+        output.resolve(),
+        uploads,
+    ]
+    if not any(_under(resolved, root) for root in workspace_roots):
         raise VideoPathError("input path is outside the media workspace")
     try:
         _validate_video_file(resolved, stat_result)
@@ -435,6 +440,27 @@ def output_root(agent_id: str) -> Path:
     if not safe_id(agent_id, fallback=""):
         raise VideoPathError("agent id is invalid")
     return root
+
+
+def upload_root(agent_id: str) -> Path:
+    """Return the active agent's App attachment workspace.
+
+    local-server places inbound channel attachments beside the agent output
+    bucket at ``<agents-data>/<agent>/uploads``.  Keep this sibling scoped to
+    the same validated output parent so one profile cannot select another
+    profile's attachments.
+    """
+    output = output_root(agent_id)
+    candidate = output.parent / "uploads"
+    if candidate.is_symlink():
+        raise VideoPathError("agent upload directory is a symlink")
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise VideoPathError("agent upload directory is unavailable") from exc
+    if candidate.exists() and not candidate.is_dir():
+        raise VideoPathError("agent upload directory is unavailable")
+    return resolved
 
 
 def result_path(

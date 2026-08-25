@@ -229,6 +229,187 @@ def test_packaged_probe_maps_missing_video_stream_to_path_rejection(
     assert not list(tmp_path.glob(".hermes-video-input-*"))
 
 
+def test_inspection_capability_error_is_distinct_from_media_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "old-helper.mov"
+    source.write_bytes(
+        (16).to_bytes(4, "big")
+        + b"ftyp"
+        + b"qt  \x00\x00\x00\x00qt  "
+    )
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        normalizer,
+        "_run_bounded_subprocess",
+        lambda command, **_kwargs: (
+            subprocess.CompletedProcess(
+                command,
+                2,
+                "",
+                "usage: normalize.py [-h]\nnormalize.py: error: unrecognized arguments: --inspect-input",
+            ),
+            False,
+        ),
+    )
+
+    with pytest.raises(
+        normalizer.NormalizerUnavailableError,
+        match="capability is unavailable",
+    ):
+        normalizer.inspect_files([source], "workflow-1")
+
+
+def test_old_helper_capability_error_reaches_raw_upload_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "old-helper-upload.mov"
+    source.write_bytes(
+        (16).to_bytes(4, "big")
+        + b"ftyp"
+        + b"qt  \x00\x00\x00\x00qt  "
+    )
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        normalizer,
+        "_run_bounded_subprocess",
+        lambda command, **_kwargs: (
+            subprocess.CompletedProcess(
+                command,
+                2,
+                "",
+                "usage: normalize.py [-h]\nnormalize.py: error: unrecognized arguments: --inspect-input",
+            ),
+            False,
+        ),
+    )
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-old"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    result = client.upload(
+        [source],
+        agent_id="agent-a",
+        replay_scope="old-helper-upload",
+    )
+
+    assert client.extract_upload_keys(result) == ["asset-old"]
+
+
+def test_unavailable_helper_is_reported_before_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "read-only-source.mov"
+    source.write_bytes(b"not inspected")
+    pin_calls: list[Path] = []
+
+    def unavailable():
+        raise normalizer.NormalizeError("video normalizer is unavailable")
+
+    monkeypatch.setattr(normalizer, "_presets_anchor", unavailable)
+    monkeypatch.setattr(
+        normalizer,
+        "_pin_input",
+        lambda path, *_args: pin_calls.append(path),
+    )
+
+    with pytest.raises(
+        normalizer.NormalizerUnavailableError,
+        match="normalizer is unavailable",
+    ):
+        normalizer.inspect_files([source], "workflow-1")
+
+    assert pin_calls == []
+
+
+def test_read_only_source_snapshot_uses_local_raw_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "read-only-probe.mov"
+    source.write_bytes(
+        (16).to_bytes(4, "big")
+        + b"ftyp"
+        + b"isom\x00\x00\x02\x00isommp42"
+    )
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        normalizer,
+        "_pin_input",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizeError("video normalization input cannot be pinned")
+        ),
+    )
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-read-only"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    result = client.upload(
+        [source],
+        agent_id="agent-a",
+        replay_scope="read-only-probe",
+    )
+
+    assert client.extract_upload_keys(result) == ["asset-read-only"]
+
+
 @pytest.mark.parametrize(
     ("filename", "prefix"),
     [
@@ -287,6 +468,134 @@ def test_container_marker_cannot_bypass_packaged_probe(
 
     with pytest.raises(paths.VideoPathError, match="supported video"):
         client.upload([source], agent_id="agent-a", replay_scope="source-v1")
+
+    assert connections == []
+
+
+def test_missing_packaged_probe_allows_locally_proven_video_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "probe-unavailable.mov"
+    source.write_bytes(
+        (16).to_bytes(4, "big")
+        + b"ftyp"
+        + b"isom\x00\x00\x02\x00isommp42"
+    )
+
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizerUnavailableError(
+                "video media inspection capability is unavailable"
+            )
+        ),
+    )
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-local"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+
+    result = client.upload(
+        [source],
+        agent_id="agent-a",
+        replay_scope="probe-unavailable",
+    )
+
+    assert client.extract_upload_keys(result) == ["asset-local"]
+
+
+def test_media_probe_failure_does_not_use_raw_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "probe-failed.mov"
+    source.write_bytes(
+        (16).to_bytes(4, "big")
+        + b"ftyp"
+        + b"isom\x00\x00\x02\x00isommp42"
+    )
+    connections: list[bool] = []
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizeError("video media inspection failed")
+        ),
+    )
+    monkeypatch.setattr(
+        client.http.client,
+        "HTTPConnection",
+        lambda *_args, **_kwargs: connections.append(True),
+    )
+
+    with pytest.raises(normalizer.NormalizeError, match="inspection failed"):
+        client.upload(
+            [source],
+            agent_id="agent-a",
+            replay_scope="probe-failed",
+        )
+
+    assert connections == []
+
+
+def test_missing_packaged_probe_rejects_inconclusive_local_video(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "probe-unavailable-large.mkv"
+    source.write_bytes(
+        _MATROSKA_HEADER
+        + b"\xec\x30\x00\x00"
+        + b"\x00" * (paths.VIDEO_PROBE_BYTES + paths.VIDEO_HEADER_BYTES)
+    )
+    connections: list[bool] = []
+    monkeypatch.setattr(
+        normalizer,
+        "inspect_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            normalizer.NormalizeError("video normalizer is unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        client.http.client,
+        "HTTPConnection",
+        lambda *_args, **_kwargs: connections.append(True),
+    )
+
+    with pytest.raises(normalizer.NormalizeError, match="inspection is unavailable"):
+        client.upload(
+            [source],
+            agent_id="agent-a",
+            replay_scope="probe-unavailable-large",
+        )
 
     assert connections == []
 

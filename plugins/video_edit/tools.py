@@ -500,7 +500,6 @@ def _normalizer_generation_for_upload(
 ) -> str:
     if not normalize:
         return ""
-    current = normalizer.generation()
     raw_persisted = entry.get("normalizer_generation")
     if raw_persisted is None:
         persisted = ""
@@ -508,7 +507,20 @@ def _normalizer_generation_for_upload(
         persisted = raw_persisted.strip()
     else:
         raise _WorkflowUnavailable("video upload checkpoint is invalid")
-    if source_checkpointed and (not persisted or persisted != current):
+    # A new workflow must be able to try normalization even when the optional
+    # presets helper is unavailable.  The helper identity is recorded only
+    # after normalization succeeds below.  Existing normalized checkpoints,
+    # however, must remain pinned to the exact helper generation used for the
+    # accepted uploads.
+    if not source_checkpointed:
+        return ""
+    try:
+        current = normalizer.generation()
+    except normalizer.NormalizeError as exc:
+        raise _WorkflowUnavailable(
+            "video media preparation is unavailable; start a new edit"
+        ) from exc
+    if not persisted or persisted != current:
         raise _WorkflowUnavailable(
             "video media preparation changed; start a new edit"
         )
@@ -622,6 +634,13 @@ def _handle_upload_assets_locked(
         if normalize:
             try:
                 upload_files = normalized = normalizer.normalize_files(files, workflow_id)
+                # Read the helper identity after the output has been produced.
+                # This keeps an unavailable optional helper from blocking the
+                # first attempt before the raw-direct fallback can run.
+                normalizer_generation = normalizer.generation()
+                state.update(workflow_id, agent_id, {
+                    "normalizer_generation": normalizer_generation,
+                })
             except normalizer.NormalizeError:
                 if existing or any(
                     path.stat().st_size > client.MAX_UPLOAD_BYTES for path in files

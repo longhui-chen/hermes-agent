@@ -72,6 +72,10 @@ class NormalizeError(RuntimeError):
     """Raised when the bounded hardware normalization step cannot complete."""
 
 
+class NormalizerUnavailableError(NormalizeError):
+    """The packaged helper or a requested helper capability is unavailable."""
+
+
 def _run_bounded_subprocess(
     command: list[str],
     *,
@@ -413,6 +417,38 @@ def _normalizer_env() -> dict[str, str]:
     }
 
 
+def _require_inspection_helper() -> None:
+    """Check helper availability before creating source-directory snapshots."""
+    try:
+        _presets_anchor()
+    except NormalizeError as exc:
+        if str(exc).strip() == "video normalizer is unavailable":
+            raise NormalizerUnavailableError(
+                "video normalizer is unavailable"
+            ) from exc
+        raise
+
+
+def _inspection_capability_missing(
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    """Recognize an older helper that rejects the inspection flag itself."""
+    detail = f"{completed.stdout}\n{completed.stderr}".lower()
+    if "--inspect-input" not in detail:
+        return False
+    return any(
+        marker in detail
+        for marker in (
+            "unrecognized argument",
+            "unrecognized arguments",
+            "unknown option",
+            "no such option",
+            "invalid option",
+            "invalid argument",
+        )
+    )
+
+
 def normalize_file(source: Path, workflow_id: str, index: int) -> Path:
     if not source.is_file() or source.is_symlink():
         raise NormalizeError("video input is unavailable")
@@ -492,6 +528,11 @@ def inspect_files(
     source_list = list(sources)
     if not 1 <= len(source_list) <= MAX_INSPECT_FILES:
         raise NormalizeError("video media inspection input is invalid")
+    # Do this before _pin_input: snapshots are hard links created beside the
+    # source and therefore require write access to a possibly read-only media
+    # directory.  An unavailable optional helper must be reported without
+    # touching that directory so raw-direct callers can use their local check.
+    _require_inspection_helper()
     pinned: list[Path] = []
     identities: list[tuple[int, int, int, int]] = []
     try:
@@ -512,6 +553,17 @@ def inspect_files(
                 env=_normalizer_env(),
                 pass_fds=pass_fds,
             )
+    except NormalizeError as exc:
+        # A source-directory snapshot is only an implementation detail of the
+        # optional packaged probe.  If the directory is read-only (or cannot
+        # create a same-filesystem hard link), callers may still use the
+        # bounded descriptor admission path for a raw-direct upload.  Invalid
+        # or changed media remains a normal failure and stays fail-closed.
+        if str(exc).strip() == "video normalization input cannot be pinned":
+            raise NormalizerUnavailableError(
+                "video media inspection capability is unavailable"
+            ) from exc
+        raise
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise NormalizeError("video media inspection failed") from exc
     finally:
@@ -519,6 +571,10 @@ def inspect_files(
             snapshot.unlink(missing_ok=True)
 
     if bounded_failure or completed.returncode != 0:
+        if not bounded_failure and _inspection_capability_missing(completed):
+            raise NormalizerUnavailableError(
+                "video media inspection capability is unavailable"
+            )
         raise NormalizeError("video media inspection failed")
     output = _bounded(completed.stdout, MAX_STDOUT_BYTES)
     try:

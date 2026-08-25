@@ -20,6 +20,7 @@ from plugins.video_edit import normalizer
 from plugins.video_edit.paths import (
     VideoPathError,
     agent_id_from_kwargs,
+    inspect_video_descriptor,
     safe_id,
     validate_video_descriptor,
     video_media_type,
@@ -227,10 +228,20 @@ def _inspect_opened_sources(
     opened: list[tuple[Path, int, os.stat_result]],
     replay_scope: str,
 ) -> list[tuple[Path, int, os.stat_result]]:
-    identities = normalizer.inspect_files(
-        [path for path, _, _ in opened],
-        replay_scope,
-    )
+    try:
+        identities = normalizer.inspect_files(
+            [path for path, _, _ in opened],
+            replay_scope,
+        )
+    except normalizer.NormalizeError as exc:
+        # The packaged probe is an additional admission check, but it is an
+        # optional runtime dependency.  If it is unavailable, continue only
+        # when the bounded local descriptor inspection proves a video track;
+        # an inconclusive local signature must remain fail-closed.  Do not
+        # downgrade helper-reported media/metadata failures.
+        if not _is_normalizer_unavailable(exc):
+            raise
+        return _inspect_locally_proven_sources(opened)
     if len(identities) != len(opened):
         raise VideoClientError("video media inspection is invalid")
 
@@ -244,6 +255,48 @@ def _inspect_opened_sources(
             current.st_mtime_ns,
         )
         if current_identity != identity:
+            raise VideoClientError("video upload source changed")
+        refreshed.append((path, descriptor, current))
+    return refreshed
+
+
+def _is_normalizer_unavailable(exc: normalizer.NormalizeError) -> bool:
+    """Keep the raw-direct fallback limited to capability failures."""
+    if isinstance(exc, normalizer.NormalizerUnavailableError):
+        return True
+    # Preserve compatibility with older in-process adapters that predate the
+    # typed exception while refusing generic media/probe failures.
+    return str(exc).strip() == "video normalizer is unavailable"
+
+
+def _inspect_locally_proven_sources(
+    opened: list[tuple[Path, int, os.stat_result]],
+) -> list[tuple[Path, int, os.stat_result]]:
+    """Revalidate opened sources without the optional packaged probe."""
+    refreshed: list[tuple[Path, int, os.stat_result]] = []
+    for path, descriptor, opened_info in opened:
+        try:
+            _, proven = inspect_video_descriptor(path, descriptor)
+        except VideoPathError:
+            raise
+        if not proven:
+            raise normalizer.NormalizeError(
+                "video media inspection is unavailable"
+            )
+        current = os.fstat(descriptor)
+        current_identity = (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        )
+        opened_identity = (
+            opened_info.st_dev,
+            opened_info.st_ino,
+            opened_info.st_size,
+            opened_info.st_mtime_ns,
+        )
+        if current_identity != opened_identity:
             raise VideoClientError("video upload source changed")
         refreshed.append((path, descriptor, current))
     return refreshed
