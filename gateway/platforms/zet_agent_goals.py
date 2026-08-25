@@ -758,6 +758,7 @@ class ZetGoalDriver:
     ) -> None:
         from hermes_cli.goals import GoalManager
 
+        origin_session_id = session_id
         rotated = bool(effective_session_id and effective_session_id != session_id)
         if rotated:
             self._migrate_sidecar(session_id, effective_session_id)
@@ -821,12 +822,16 @@ class ZetGoalDriver:
                 # Judge visibility into live background processes (CI/build/
                 # watch launched by this turn): the WAIT verdict keys off the
                 # snapshot — omitting it makes the judge continue immediately
-                # and re-launch long tasks (codex P1). Same no-arg gather as
-                # gateway/run.py's goal driver.
+                # and re-launch long tasks (codex P1). Scoped to this session
+                # so a concurrent cron job's processes cannot park the Goal.
                 try:
                     from hermes_cli.goals import gather_background_processes
 
-                    bg_procs = gather_background_processes()
+                    extra = [origin_session_id] if origin_session_id != session_id else None
+                    bg_procs = gather_background_processes(
+                        session_key=session_id,
+                        extra_session_keys=extra,
+                    )
                 except Exception:
                     bg_procs = None
                 try:

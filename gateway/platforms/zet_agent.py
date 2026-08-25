@@ -6604,29 +6604,9 @@ class ZetAgentAdapter(APIServerAdapter):
         # dispatch records (delegate_tool captures parent_agent.session_id);
         # include the agent's current session_id too in case compaction
         # rotated it since dispatch.
-        try:
-            from tools.async_delegation import interrupt_for_session
-
-            rotated_sid = str(getattr(agent, "session_id", "") or "") if agent else ""
-            for psid in {session_id, rotated_sid} - {""}:
-                # suppress_completion: the user explicitly stopped this turn —
-                # local-server anchors the batch outcome card onto the
-                # interrupted turn itself, so the killed children must NOT
-                # re-enter the chat with a completion turn afterwards.
-                # profile scope: under a multiplexer this route must not be
-                # able to kill (and suppress-swallow) ANOTHER profile's batch
-                # by quoting its session id (same rule as the control plane).
-                interrupt_for_session(
-                    parent_session_id=psid,
-                    reason="user_cancel",
-                    suppress_completion=True,
-                    profile_home=self._delegation_control_scope(request),
-                )
-        except Exception:
-            logger.debug(
-                "[zet_agent] session interrupt: async delegation interrupt failed",
-                exc_info=True,
-            )
+        self._interrupt_async_delegations_for_session(
+            request, session_id, agent, reason="user_cancel",
+        )
 
         self._interrupt_pending_interactions(session_id, turn_key)
 
@@ -6638,6 +6618,71 @@ class ZetAgentAdapter(APIServerAdapter):
 
         status = "stopping" if (agent is not None or task is not None) else "not_running"
         return web.json_response({"session_id": session_id, "status": status})
+
+    def _interrupt_async_delegations_for_session(
+        self,
+        request: "web.Request",
+        session_id: str,
+        agent: Any,
+        *,
+        reason: str,
+    ) -> int:
+        """Stop background delegate_task children for ``session_id``.
+
+        Does not touch the parent chat agent. Goal park / clear uses this
+        without ``agent.interrupt()`` so a live user interjection on the
+        same session is not cancelled.
+        """
+        try:
+            from tools.async_delegation import interrupt_for_session
+        except Exception:
+            logger.debug(
+                "[zet_agent] session interrupt: async_delegation import failed",
+                exc_info=True,
+            )
+            return 0
+        rotated_sid = str(getattr(agent, "session_id", "") or "") if agent else ""
+        count = 0
+        for psid in {session_id, rotated_sid} - {""}:
+            try:
+                count += int(interrupt_for_session(
+                    parent_session_id=psid,
+                    session_key=psid,
+                    reason=reason,
+                    suppress_completion=True,
+                    profile_home=self._delegation_control_scope(request),
+                ) or 0)
+            except Exception:
+                logger.debug(
+                    "[zet_agent] session interrupt: async delegation interrupt failed",
+                    exc_info=True,
+                )
+        return count
+
+    async def _handle_session_delegations_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/delegations/interrupt
+
+        Kill leftover async subagents for this session without stopping a
+        live chat turn. Used when a Goal parks/clears (cron contention,
+        round failure, user clear) so the banner and task list converge.
+        Additive route (HR#4): unknown to older hermes builds, which 404.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info.get("session_id", "")
+        turn_key = self._active_turn_key(session_id)
+        with self._session_run_lock:
+            agent_ref = self._active_session_agents.get(turn_key) or self._active_session_agents.get(session_id)
+        agent = agent_ref[0] if agent_ref else None
+        count = self._interrupt_async_delegations_for_session(
+            request, session_id, agent, reason="goal_park",
+        )
+        return web.json_response({
+            "session_id": session_id,
+            "status": "stopping" if count else "not_running",
+            "interrupted": count,
+        })
 
     # ------------------------------------------------------------------
     # Delegation control plane (App banner: status / per-id cancel)
@@ -8402,6 +8447,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 "/v1/sessions/{session_id}/interrupt",
                 self._handle_session_interrupt,
             )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/delegations/interrupt",
+                self._handle_session_delegations_interrupt,
+            )
             # Persistent goal loop control surface (create/pause/resume/clear
             # /status) — consumed by zettlab-local-server only.
             self._app.router.add_post(
@@ -8551,6 +8600,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/interrupt",
                 self._profile_handler(self._handle_session_interrupt),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/delegations/interrupt",
+                self._profile_handler(self._handle_session_delegations_interrupt),
             )
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/goal",

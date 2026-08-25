@@ -1055,11 +1055,14 @@ class TestJudgeBackgroundProcesses:
         宿主驱动一样透传 gather_background_processes()（codex P1）。"""
         procs = [{"pid": 4242, "command": "npm run build", "running": True}]
         _create(driver)
-        with patch("hermes_cli.goals.gather_background_processes", return_value=procs), \
+        with patch("hermes_cli.goals.gather_background_processes", return_value=procs) as gather, \
              patch("hermes_cli.goals.judge_goal", return_value=("continue", "build 还在跑", False, None, False)) as jg:
             driver._after_turn_sync(SID, "user msg", "产出")
         assert jg.called
         assert jg.call_args.kwargs.get("background_processes") == procs
+        gather.assert_called_once()
+        assert gather.call_args.kwargs.get("session_key") == SID
+        assert gather.call_args.kwargs.get("extra_session_keys") is None
 
 
 class TestMultiplexReconcile:

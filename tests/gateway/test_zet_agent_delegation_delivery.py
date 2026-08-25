@@ -421,6 +421,41 @@ async def test_session_interrupt_survives_delegation_cancel_failure(monkeypatch)
     assert agent.interrupted
 
 
+@pytest.mark.asyncio
+async def test_session_delegations_interrupt_does_not_stop_live_agent(monkeypatch):
+    import tools.async_delegation as async_delegation
+
+    adapter = _adapter(monkeypatch)
+    agent = _FakeAgent(session_id="s1-rotated")
+    adapter._active_session_agents["s1"] = [agent]
+    adapter._active_session_tasks["s1"] = _FakeTask()
+
+    calls = []
+
+    def _fake_interrupt_for_session(**kwargs):
+        calls.append(kwargs)
+        return 2
+
+    monkeypatch.setattr(
+        async_delegation, "interrupt_for_session", _fake_interrupt_for_session
+    )
+
+    resp = await adapter._handle_session_delegations_interrupt(
+        _FakeRequest(None, match_info={"session_id": "s1"})
+    )
+
+    assert resp.status == 200
+    assert resp.payload["status"] == "stopping"
+    assert resp.payload["interrupted"] == 4  # two sids × 2
+    assert agent.interrupted == []
+    seen_sids = {c.get("parent_session_id") for c in calls}
+    assert seen_sids == {"s1", "s1-rotated"}
+    for c in calls:
+        assert c.get("reason") == "goal_park"
+        assert c.get("suppress_completion") is True
+        assert c.get("session_key") == c.get("parent_session_id")
+
+
 # ---------------------------------------------------------------------------
 # Synthetic-event source resolution (run.py adapter hook + zet_agent resolver)
 #
