@@ -748,6 +748,29 @@ class ZetGoalDriver:
             if at is not None and at > self._cancel_marks.get(new_key, 0.0):
                 self._cancel_marks[new_key] = at
 
+    def _background_process_session_keys(self, *sids: str) -> List[str]:
+        """Keys process_registry uses for Goal-owned terminal/browser jobs.
+
+        Live zet_agent turns register ``ProcessSession.session_key`` as
+        ``_interaction_queue_key(session_id)`` (``<HERMES_HOME>|<sid>``),
+        not the public chat id. Include both the scoped key and the raw
+        sid, plus compaction origin aliases, so WAIT still sees in-flight
+        CI/build/watch after a lineage rotation.
+        """
+        keys: List[str] = []
+        for sid in sids:
+            raw = str(sid or "").strip()
+            if not raw:
+                continue
+            try:
+                scoped = str(self.adapter._interaction_queue_key(raw) or "").strip()
+            except Exception:
+                scoped = raw
+            for key in (scoped, raw):
+                if key and key not in keys:
+                    keys.append(key)
+        return keys
+
     def _after_turn_sync(
         self,
         session_id: str,
@@ -827,10 +850,12 @@ class ZetGoalDriver:
                 try:
                     from hermes_cli.goals import gather_background_processes
 
-                    extra = [origin_session_id] if origin_session_id != session_id else None
+                    keys = self._background_process_session_keys(
+                        session_id, origin_session_id,
+                    )
                     bg_procs = gather_background_processes(
-                        session_key=session_id,
-                        extra_session_keys=extra,
+                        session_key=keys[0] if keys else session_id,
+                        extra_session_keys=keys[1:] or None,
                     )
                 except Exception:
                     bg_procs = None

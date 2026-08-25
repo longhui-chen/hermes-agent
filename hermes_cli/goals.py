@@ -993,7 +993,7 @@ def gather_background_processes(
     to one conversation. Without a key the registry returns the whole profile
     — a concurrent cron job's terminal/browser processes would then look like
     the Goal's own wait targets and park the loop. Zettlab's goal driver
-    always passes the chat session id.
+    passes the profile-scoped process key plus raw/compaction aliases.
     """
     try:
         from tools.process_registry import process_registry
