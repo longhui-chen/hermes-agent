@@ -6,7 +6,6 @@ import hashlib
 import http.client
 import ipaddress
 import json
-import mimetypes
 import os
 import socket
 import stat
@@ -17,7 +16,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
 
-from plugins.video_edit.paths import VideoPathError, agent_id_from_kwargs, safe_id
+from plugins.video_edit import normalizer
+from plugins.video_edit.paths import (
+    VideoPathError,
+    agent_id_from_kwargs,
+    inspect_video_descriptor,
+    safe_id,
+    validate_video_descriptor,
+    video_media_type,
+)
 
 DEFAULT_BASE = "http://127.0.0.1:19090/api/v1/ai-proxy/business"
 DEFAULT_INTERNAL_BASE = "http://127.0.0.1:19090/api/v1/internal/proactive-video"
@@ -25,13 +32,28 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_UPLOAD_FILES = 8
 MAX_UPLOAD_BYTES = 3 * 1024 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
+RESULT_URL_UNAVAILABLE_STATUSES = frozenset(
+    {301, 302, 303, 307, 308, 401, 403, 404, 410}
+)
 
 
 class VideoClientError(RuntimeError):
-    def __init__(self, message: str, *, status: int = 0, body: Any = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 0,
+        body: Any = None,
+        transient: bool = False,
+    ):
         super().__init__(message)
         self.status = status
         self.body = body
+        self.transient = transient
+
+
+class ResultURLUnavailable(VideoClientError):
+    """The signed result URL must be refreshed from its existing project."""
 
 
 def _base_url() -> str:
@@ -150,7 +172,7 @@ def post_json(
         # and hides the real upstream failure.
         raise VideoClientError("video service rejected request", status=exc.code, body=body) from exc
     except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-        raise VideoClientError("video service request failed") from exc
+        raise VideoClientError("video service request failed", transient=True) from exc
 
 
 def _multipart_parts(
@@ -162,7 +184,7 @@ def _multipart_parts(
     epilogues: list[bytes] = []
     total = 0
     for path, size in zip(files, sizes):
-        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        mime = video_media_type(path)
         safe_name = path.name.replace('"', "_").replace("\r", "_").replace("\n", "_")
         preamble = (
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; "
@@ -174,7 +196,9 @@ def _multipart_parts(
     return preambles, epilogues, total
 
 
-def _open_upload_sources(files: list[Path]) -> list[tuple[Path, int, os.stat_result]]:
+def _open_upload_sources(
+    files: list[Path],
+) -> list[tuple[Path, int, os.stat_result]]:
     opened: list[tuple[Path, int, os.stat_result]] = []
     try:
         for path in files:
@@ -188,6 +212,7 @@ def _open_upload_sources(files: list[Path]) -> list[tuple[Path, int, os.stat_res
                 info = os.fstat(descriptor)
                 if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
                     raise VideoClientError("video upload source is invalid")
+                validate_video_descriptor(path, descriptor)
             except Exception:
                 os.close(descriptor)
                 raise
@@ -197,6 +222,133 @@ def _open_upload_sources(files: list[Path]) -> list[tuple[Path, int, os.stat_res
         for _, descriptor, _ in opened:
             os.close(descriptor)
         raise
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Return the identity fields used at every upload trust boundary."""
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _probe_identity_matches(
+    info: os.stat_result,
+    identity: object,
+) -> bool:
+    """Require the complete five-field probe identity contract."""
+    try:
+        values = tuple(identity)  # type: ignore[arg-type]
+    except TypeError:
+        raise VideoClientError("video media inspection is invalid") from None
+    if len(values) != 5:
+        raise VideoClientError("video media inspection is invalid")
+    return _stat_identity(info) == values
+
+
+def _upload_sizes(
+    opened: list[tuple[Path, int, os.stat_result]],
+) -> tuple[list[int], int]:
+    sizes: list[int] = []
+    total_size = 0
+    for _, _, info in opened:
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+            raise VideoClientError("video upload source is invalid")
+        sizes.append(info.st_size)
+        total_size += info.st_size
+    if total_size > MAX_UPLOAD_BYTES:
+        raise VideoClientError("upload exceeds size limit")
+    return sizes, total_size
+
+
+def _assert_upload_source_identity(
+    path: Path,
+    descriptor: int,
+    expected: os.stat_result,
+) -> os.stat_result:
+    """Verify both the opened inode and its path immediately before use."""
+    try:
+        current = os.fstat(descriptor)
+        path_info = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise VideoClientError("video upload source changed") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or not stat.S_ISREG(path_info.st_mode)
+        or _stat_identity(current) != _stat_identity(expected)
+        or _stat_identity(path_info) != _stat_identity(expected)
+    ):
+        raise VideoClientError("video upload source changed")
+    return current
+
+
+def _inspect_opened_sources(
+    opened: list[tuple[Path, int, os.stat_result]],
+    replay_scope: str,
+) -> list[tuple[Path, int, os.stat_result]]:
+    try:
+        identities = normalizer.inspect_files(
+            [path for path, _, _ in opened],
+            replay_scope,
+        )
+    except normalizer.NormalizeError as exc:
+        # The packaged probe is an additional admission check, but it is an
+        # optional runtime dependency.  If it is unavailable, continue only
+        # when the bounded local descriptor inspection proves a video track;
+        # an inconclusive local signature must remain fail-closed.  Do not
+        # downgrade helper-reported media/metadata failures.
+        if not _is_normalizer_unavailable(exc):
+            raise
+        return _inspect_locally_proven_sources(opened)
+    if len(identities) != len(opened):
+        raise VideoClientError("video media inspection is invalid")
+
+    refreshed: list[tuple[Path, int, os.stat_result]] = []
+    for (path, descriptor, _), identity in zip(opened, identities):
+        try:
+            current = os.fstat(descriptor)
+        except OSError as exc:
+            raise VideoClientError("video upload source changed") from exc
+        if not _probe_identity_matches(current, identity):
+            raise VideoClientError("video upload source changed")
+        refreshed.append((path, descriptor, current))
+    return refreshed
+
+
+def _is_normalizer_unavailable(exc: normalizer.NormalizeError) -> bool:
+    """Keep the raw-direct fallback limited to capability failures."""
+    if isinstance(exc, normalizer.NormalizerUnavailableError):
+        return True
+    # Preserve compatibility with older in-process adapters that predate the
+    # typed exception while refusing generic media/probe failures.
+    return str(exc).strip() == "video normalizer is unavailable"
+
+
+def _inspect_locally_proven_sources(
+    opened: list[tuple[Path, int, os.stat_result]],
+) -> list[tuple[Path, int, os.stat_result]]:
+    """Revalidate opened sources without the optional packaged probe."""
+    refreshed: list[tuple[Path, int, os.stat_result]] = []
+    for path, descriptor, opened_info in opened:
+        try:
+            _, proven = inspect_video_descriptor(path, descriptor)
+        except VideoPathError:
+            raise
+        if not proven:
+            raise normalizer.NormalizeError(
+                "video media inspection is unavailable"
+            )
+        current = os.fstat(descriptor)
+        # The descriptor-based packaged path and the bounded local fallback
+        # both inspect the already-open inode.  A metadata-only mutation is
+        # therefore still a source change at this trust boundary.
+        if _stat_identity(current) != _stat_identity(opened_info):
+            raise VideoClientError("video upload source changed")
+        refreshed.append((path, descriptor, current))
+    return refreshed
 
 
 def upload(
@@ -214,18 +366,25 @@ def upload(
         raise VideoClientError("video upload source is unavailable") from exc
     connection: http.client.HTTPConnection | None = None
     try:
-        sizes = [info.st_size for _, _, info in opened]
-        total_size = sum(sizes)
-        if total_size > MAX_UPLOAD_BYTES:
-            raise VideoClientError("upload exceeds size limit")
+        opened = _inspect_opened_sources(opened, replay_scope)
+        # Revalidate every path and descriptor before deriving any request
+        # framing.  A probe-time growth or metadata mutation therefore fails
+        # without constructing HTTPConnection.
+        preconnect: list[tuple[Path, int, os.stat_result]] = []
+        for path, descriptor, opened_info in opened:
+            current = _assert_upload_source_identity(path, descriptor, opened_info)
+            preconnect.append((path, descriptor, current))
+        opened = preconnect
+
+        # The media probe may have rewritten the same inode.  Always derive
+        # the request size and multipart framing from this post-probe snapshot,
+        # then enforce the cap again before opening the network connection.
+        sizes, _ = _upload_sizes(opened)
         boundary = "----hermes-video-edit-" + hashlib.sha256(
             "\x00".join(str(p) for p in files).encode()
         ).hexdigest()[:24]
-        preambles, epilogues, body_size = _multipart_parts(
-            files,
-            sizes,
-            boundary,
-        )
+
+        preambles, epilogues, body_size = _multipart_parts(files, sizes, boundary)
         closing = f"--{boundary}--\r\n".encode()
         body_size += len(closing)
         base = urllib.parse.urlparse(_base_url())
@@ -237,6 +396,7 @@ def upload(
             replay_scope=replay_scope,
         )
         headers["Content-Length"] = str(body_size)
+
         connection = http.client.HTTPConnection(
             base.hostname,
             base.port or 80,
@@ -246,23 +406,15 @@ def upload(
         for key, value in headers.items():
             connection.putheader(key, value)
         connection.endheaders()
+        sent_body_bytes = 0
         for (path, descriptor, opened_info), preamble, epilogue in zip(
             opened,
             preambles,
             epilogues,
         ):
-            try:
-                current_info = os.stat(path, follow_symlinks=False)
-            except OSError as exc:
-                raise VideoClientError("video upload source changed") from exc
-            if (
-                not stat.S_ISREG(current_info.st_mode)
-                or current_info.st_dev != opened_info.st_dev
-                or current_info.st_ino != opened_info.st_ino
-                or current_info.st_size != opened_info.st_size
-            ):
-                raise VideoClientError("video upload source changed")
+            _assert_upload_source_identity(path, descriptor, opened_info)
             connection.send(preamble)
+            sent_body_bytes += len(preamble)
             os.lseek(descriptor, 0, os.SEEK_SET)
             remaining = opened_info.st_size
             while remaining > 0:
@@ -270,16 +422,17 @@ def upload(
                 if not chunk:
                     raise VideoClientError("video upload source changed")
                 connection.send(chunk)
+                sent_body_bytes += len(chunk)
                 remaining -= len(chunk)
             finished_info = os.fstat(descriptor)
-            if (
-                finished_info.st_size != opened_info.st_size
-                or finished_info.st_mtime_ns != opened_info.st_mtime_ns
-                or finished_info.st_ctime_ns != opened_info.st_ctime_ns
-            ):
+            if _stat_identity(finished_info) != _stat_identity(opened_info):
                 raise VideoClientError("video upload source changed")
             connection.send(epilogue)
+            sent_body_bytes += len(epilogue)
         connection.send(closing)
+        sent_body_bytes += len(closing)
+        if sent_body_bytes != body_size:
+            raise VideoClientError("video upload source changed")
         response = connection.getresponse()
         body = response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
@@ -292,7 +445,7 @@ def upload(
             raise VideoClientError("video service rejected upload", status=response.status, body=decoded)
         return decoded
     except (OSError, socket.timeout) as exc:
-        raise VideoClientError("video upload failed") from exc
+        raise VideoClientError("video upload failed", transient=True) from exc
     finally:
         for _, descriptor, _ in opened:
             os.close(descriptor)
@@ -513,6 +666,20 @@ def download(result_url: str, target: Path, *, timeout: float = 1800.0) -> dict[
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(part, target)
+    except urllib.error.HTTPError as exc:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        if exc.code in RESULT_URL_UNAVAILABLE_STATUSES:
+            raise ResultURLUnavailable(
+                "video result URL is unavailable",
+                status=exc.code,
+                transient=True,
+            ) from exc
+        raise
     except Exception:
         if fd >= 0:
             os.close(fd)

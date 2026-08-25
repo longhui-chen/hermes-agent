@@ -26,6 +26,9 @@ VALID_DIRECTIVES = frozenset({
     "keep_original_audio", "add_background_music", "no_background_music", "add_captions",
     "no_captions", "preserve_dialogue",
 })
+MAX_EDITING_DIRECTIVES = 3
+MAX_STYLE_LENGTH = 512
+MAX_USER_PROMPT_LENGTH = 512
 
 # Preference memory is intentionally a small bounded continuity aid, not an
 # unbounded transcript or authorization ledger.  Scene order is used as a
@@ -39,6 +42,10 @@ MAX_PREFERENCE_BYTES = 256 * 1024
 
 class PreferenceError(ValueError):
     pass
+
+
+class PreferenceValidationError(PreferenceError):
+    """Caller-supplied preference data failed the input contract."""
 
 
 def _empty() -> dict[str, Any]:
@@ -113,7 +120,11 @@ def _clean_preferences(raw: Any) -> dict[str, Any]:
         if key == "editing_directives":
             if not isinstance(value, list):
                 continue
-            values = [str(item).strip() for item in value[:3] if str(item).strip() in VALID_DIRECTIVES]
+            values = [
+                str(item).strip()
+                for item in value[:MAX_EDITING_DIRECTIVES]
+                if str(item).strip() in VALID_DIRECTIVES
+            ]
             out[key] = values
         elif key == "duration":
             try:
@@ -128,8 +139,10 @@ def _clean_preferences(raw: Any) -> dict[str, Any]:
             out[key] = str(value)
         elif key == "upload_preference" and str(value) in {"raw_direct", "normalized"}:
             out[key] = str(value)
-        elif key in {"style", "user_prompt"} and isinstance(value, str) and value.strip():
-            out[key] = value.strip()[:512]
+        elif key == "style" and isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:MAX_STYLE_LENGTH]
+        elif key == "user_prompt" and isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:MAX_USER_PROMPT_LENGTH]
     return out
 
 
@@ -158,12 +171,36 @@ def _target(data: dict[str, Any], scope: str, scene: str) -> dict[str, Any]:
     if scope == "global":
         return data["global"]
     if scope != "scene" or not scene:
-        raise PreferenceError("scene scope requires a scene")
+        raise PreferenceValidationError("scene scope requires a scene")
     target = data["scenes"].setdefault(scene, {"hard": {}, "soft": {}})
     # Touch the scene so the bounded tail behaves as an LRU on the next write.
     data["scenes"].pop(scene, None)
     data["scenes"][scene] = target
     return target
+
+
+def _validated_update_preferences(action: str, raw: Any) -> dict[str, Any]:
+    """Validate update payloads before opening or mutating preference state.
+
+    The public tool schema rejects these cases first, but this second boundary
+    keeps direct/plugin callers fail-closed if they bypass schema dispatch.  A
+    cleaning pass may discard unknown or malformed fields, so compare the
+    retained keys with the original object instead of silently accepting a
+    partial write.
+    """
+
+    if raw is None:
+        if action == "set":
+            raise PreferenceValidationError("setting preferences requires at least one preference")
+        return {}
+    if not isinstance(raw, dict):
+        raise PreferenceValidationError("preferences must be an object")
+    cleaned = _clean_preferences(raw)
+    if set(cleaned) != set(raw):
+        raise PreferenceValidationError("preferences contain an unknown or invalid field")
+    if action == "set" and not cleaned:
+        raise PreferenceValidationError("setting preferences requires at least one preference")
+    return cleaned
 
 
 def resolve(agent_id: str, scene: str, explicit: Any, *, silent: bool = False) -> dict[str, Any]:
@@ -202,7 +239,11 @@ def resolve(agent_id: str, scene: str, explicit: Any, *, silent: bool = False) -
 
 def update(agent_id: str, scope: str, scene: str, kind: str, action: str, preferences: Any) -> dict[str, Any]:
     if scope not in {"global", "scene"} or kind not in {"hard", "soft"} or action not in {"set", "forget"}:
-        raise PreferenceError("invalid preference update")
+        raise PreferenceValidationError("invalid preference update")
+    scene_key = str(scene or "").strip()[:64]
+    if scope == "scene" and not scene_key:
+        raise PreferenceValidationError("scene scope requires a scene")
+    cleaned = _validated_update_preferences(action, preferences)
     path = state_path("preferences.json", agent_id)
     lock = path.with_suffix(".lock")
     lock.touch(mode=0o600, exist_ok=True)
@@ -211,13 +252,13 @@ def update(agent_id: str, scope: str, scene: str, kind: str, action: str, prefer
         data = _read(path)
         target = _target(data, scope, str(scene or "").strip()[:64])
         if action == "forget":
-            for key in _clean_preferences(preferences).keys() or VALID_FIELDS:
+            for key in cleaned.keys() or VALID_FIELDS:
                 target[kind].pop(key, None)
         else:
-            target[kind].update(_clean_preferences(preferences))
+            target[kind].update(cleaned)
         data["updated_at"] = int(time.time())
         _write(path, data)
-        return {"ok": True, "scope": scope, "kind": kind, "action": action, "scene": str(scene or "general")}
+        return {"ok": True, "scope": scope, "kind": kind, "action": action, "scene": scene_key or "general"}
 
 
 def record_success(agent_id: str, scene: str, preferences: Any, confirmed_fields: Any) -> dict[str, Any]:

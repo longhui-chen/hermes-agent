@@ -10,11 +10,14 @@ credential; this plugin sends only bounded request identity for replay.
 
 from __future__ import annotations
 
+from plugins.video_edit import normalizer
 from plugins.video_edit.schemas import TOOL_DEFINITIONS
 from plugins.video_edit.tools import HANDLERS
 
 
 def register(ctx) -> None:
+    # Fix either the current release or its absence without disabling Help/tools.
+    normalizer.initialize_runtime()
     for definition in TOOL_DEFINITIONS:
         name = definition["name"]
         ctx.register_tool(

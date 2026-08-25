@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +19,8 @@ MAX_WORKFLOWS = 64
 WORKFLOW_TTL_SECONDS = 90 * 24 * 60 * 60
 MAX_FILES = 8
 MAX_WORKFLOW_BYTES = 2 * 1024 * 1024
+REPORT_LOCK_BUCKETS = 16
+UPLOAD_LOCK_BUCKETS = 16
 
 
 class WorkflowError(ValueError):
@@ -27,6 +30,80 @@ class WorkflowError(ValueError):
 def workflow_id(task_id: str, agent_id: str) -> str:
     digest = hashlib.sha256(f"{agent_id}\x00{task_id}".encode()).hexdigest()[:24]
     return f"vew_{digest}"
+
+
+@contextlib.contextmanager
+def _workflow_operation_lock(
+    workflow: str,
+    agent_id: str,
+    *,
+    name: str,
+    buckets: int,
+) -> Iterator[None]:
+    """Lock one fixed per-profile workflow bucket without following links."""
+
+    workflow = str(workflow or "").strip()
+    if not workflow or len(workflow) > 128 or not name or buckets < 1:
+        raise WorkflowError("invalid video workflow")
+    expected_agent_id = safe_id(agent_id)
+    profile_root = state_path("workflows.json", expected_agent_id).parent
+    digest = hashlib.sha256(workflow.encode()).digest()
+    bucket = int.from_bytes(digest[:2], "big") % buckets
+    lock_path = profile_root / f".{name}-{bucket:02d}.lock"
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if os.name != "posix" or no_follow is None:
+        raise WorkflowError("video workflow lock is unavailable")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    flags |= no_follow
+    fd = -1
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise WorkflowError("video workflow lock is unavailable")
+        os.fchmod(fd, 0o600)
+    except (OSError, WorkflowError) as exc:
+        if fd >= 0:
+            os.close(fd)
+        raise WorkflowError("video workflow lock is unavailable") from exc
+    with os.fdopen(fd, "r+") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise WorkflowError("video workflow lock is unavailable") from exc
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def report_lock(workflow: str, agent_id: str) -> Iterator[None]:
+    """Serialize report delivery for one bounded workflow hash bucket."""
+
+    with _workflow_operation_lock(
+        workflow,
+        agent_id,
+        name="report",
+        buckets=REPORT_LOCK_BUCKETS,
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def upload_lock(workflow: str, agent_id: str) -> Iterator[None]:
+    """Serialize media preparation and upload for one workflow hash bucket."""
+
+    with _workflow_operation_lock(
+        workflow,
+        agent_id,
+        name="upload",
+        buckets=UPLOAD_LOCK_BUCKETS,
+    ):
+        yield
 
 
 def _empty() -> dict[str, Any]:
@@ -137,6 +214,76 @@ def update(workflow: str, agent_id: str, patch: dict[str, Any], *, create: bool 
         if current.get("agent_id") != expected_agent_id:
             raise WorkflowError("video workflow owner is invalid")
         current.update(patch)
+        current["workflow_id"] = workflow
+        current["agent_id"] = expected_agent_id
+        current["updated_at"] = int(time.time())
+        data["workflows"][workflow] = current
+        return dict(current)
+
+
+def create_or_validate_identity(
+    workflow: str,
+    agent_id: str,
+    identity: dict[str, Any],
+    initial: dict[str, Any],
+    *,
+    legacy_identity: dict[str, Any] | None = None,
+    legacy_requires_non_proactive: bool = False,
+) -> dict[str, Any]:
+    """Create once, validate identity, or atomically adopt a proven legacy entry."""
+
+    workflow = str(workflow or "").strip()
+    if (
+        not workflow
+        or len(workflow) > 128
+        or not isinstance(identity, dict)
+        or not identity
+        or not isinstance(initial, dict)
+        or set(identity).intersection(initial)
+        or (
+            legacy_identity is not None
+            and (
+                not isinstance(legacy_identity, dict)
+                or not legacy_identity
+                or set(identity).intersection(legacy_identity)
+            )
+        )
+        or not isinstance(legacy_requires_non_proactive, bool)
+    ):
+        raise WorkflowError("invalid video workflow identity")
+    expected_agent_id = safe_id(agent_id)
+    with _locked(expected_agent_id) as (_, data):
+        current = data["workflows"].get(workflow)
+        if current is None:
+            current = {
+                "workflow_id": workflow,
+                "agent_id": expected_agent_id,
+                "created_at": int(time.time()),
+                **identity,
+                **initial,
+            }
+        if not isinstance(current, dict):
+            raise WorkflowError("video workflow is invalid")
+        if current.get("agent_id") != expected_agent_id:
+            raise WorkflowError("video workflow owner is invalid")
+        if any(current.get(key) != value for key, value in identity.items()):
+            if (
+                legacy_identity is None
+                or any(key in current for key in identity)
+                or any(
+                    current.get(key) != value
+                    for key, value in legacy_identity.items()
+                )
+                or (
+                    legacy_requires_non_proactive
+                    and current.get("proactive") not in (None, False)
+                )
+            ):
+                raise WorkflowError("video workflow identity changed")
+            # Older interactive checkpoints predate the immutable request
+            # marker. Only bind one after their existing durable values prove
+            # the same request; preserve every upload/project field verbatim.
+            current.update(identity)
         current["workflow_id"] = workflow
         current["agent_id"] = expected_agent_id
         current["updated_at"] = int(time.time())

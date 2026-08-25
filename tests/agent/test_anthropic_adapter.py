@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
+from jsonschema import Draft7Validator
 
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
@@ -647,6 +648,42 @@ class TestConvertTools:
             "default": None,
         }
         assert result[0]["input_schema"]["required"] == ["command"]
+
+    def test_preserves_direct_pure_help_conditional(self):
+        parameters = {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string"},
+                "help": {"type": "boolean", "default": False},
+            },
+            "required": [],
+            "if": {
+                "properties": {"help": {"const": True}},
+                "required": ["help"],
+            },
+            "then": {},
+            "else": {"required": ["document_id"]},
+            "additionalProperties": False,
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "conditional_help",
+                    "description": "Execute normally or return Help.",
+                    "parameters": parameters,
+                },
+            }
+        ]
+
+        input_schema = convert_tools_to_anthropic(tools)[0]["input_schema"]
+        validator = Draft7Validator(input_schema)
+
+        assert input_schema["if"] == parameters["if"]
+        assert input_schema["else"] == parameters["else"]
+        assert not validator.is_valid({})
+        assert validator.is_valid({"help": True})
+        assert validator.is_valid({"document_id": "doc-1"})
 
 
 # ---------------------------------------------------------------------------

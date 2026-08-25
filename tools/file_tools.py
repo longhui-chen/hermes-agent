@@ -2431,7 +2431,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 output_mode: str = "content", context: int = 0,
                 semantic: bool = False, video_semantic: bool = False,
                 path_prefix: str = "",
-                task_id: str = "default") -> str:
+                task_id: str = "default",
+                return_references: bool = False) -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
@@ -2439,6 +2440,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
         # results without tripping the repeated-search guard.
+        nas_return_references = target == "nas" and bool(return_references)
         search_key = (
             "search",
             pattern,
@@ -2450,6 +2452,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             bool(semantic),
             bool(video_semantic),
             str(path_prefix or ""),
+            nas_return_references,
         )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
@@ -2485,7 +2488,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             result = nas_search(pattern=pattern, limit=limit,
                                 semantic=bool(semantic),
                                 video_semantic=bool(video_semantic),
-                                path_prefix=str(path_prefix or ""))
+                                path_prefix=str(path_prefix or ""),
+                                return_references=nas_return_references)
             return json.dumps(result.to_dict(densify=True), ensure_ascii=False)
 
         try:
@@ -2663,7 +2667,7 @@ PATCH_SCHEMA = {
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g. '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.\n\nNAS library search (target='nas', Zettlab devices only): searches the user's personal NAS files/photos/videos/documents. Hits render automatically as tappable preview cards in the chat — do NOT re-list them; reply with a short summary only. Set semantic=true for image-only visual matching. Set video_semantic=true, without semantic, when the query describes actions or objects inside videos; this searches videos only and returns the best matching timestamp. The first semantic call may take ~30s. pattern is plain keywords (not regex); path/file_glob/output_mode/context are ignored.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g. '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.\n\nNAS library search (target='nas', Zettlab devices only): searches the user's personal NAS files/photos/videos/documents. Hits render automatically as tappable preview cards in the chat — do NOT re-list them; reply with a short summary only. Set return_references=true only when the same turn must pass a bounded list of matched paths to another native tool. Set semantic=true for image-only visual matching. Set video_semantic=true, without semantic, when the query describes actions or objects inside videos; this searches videos only and returns the best matching timestamp. The first semantic call may take ~30s. pattern is plain keywords (not regex); path/file_glob/output_mode/context are ignored.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2671,6 +2675,7 @@ SEARCH_FILES_SCHEMA = {
             "target": {"type": "string", "enum": ["content", "files", "nas"], "description": "'content' searches inside file contents, 'files' searches for files by name, 'nas' searches the user's NAS library (Zettlab devices; results become chat preview cards)", "default": "content"},
             "semantic": {"type": "boolean", "description": "NAS search only: also run on-device AI visual matching (images). Use for photo/visual queries; first call may take ~30s.", "default": False},
             "video_semantic": {"type": "boolean", "description": "NAS search only: search videos by actions or objects in their visual content and return the best matching timestamp. Use without semantic; first call may take ~30s.", "default": False},
+            "return_references": {"type": "boolean", "description": "NAS search only: return a bounded files list of matched path references for a same-turn downstream native tool call. This is an output mode; it does not grant access or authorize downstream use.", "default": False},
             "path_prefix": {"type": "string", "description": "NAS search only: absolute directory to scope hits to (e.g. the folder you just located), so the preview cards match exactly what you told the user. Must be inside the device's search roots."},
             "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
             "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
@@ -2738,7 +2743,8 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
         semantic=bool(args.get("semantic", False)),
         video_semantic=bool(args.get("video_semantic", False)),
-        path_prefix=str(args.get("path_prefix") or ""), task_id=tid)
+        path_prefix=str(args.get("path_prefix") or ""), task_id=tid,
+        return_references=bool(args.get("return_references", False)))
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)

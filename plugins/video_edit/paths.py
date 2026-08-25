@@ -12,6 +12,64 @@ from hermes_constants import get_hermes_home
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _RAW_ROOTS = ("/volume1/subvol/data", "/volume1/data")
 _MAX_PATH_BYTES = 4096
+MAX_TASK_ID_LENGTH = 256
+VIDEO_HEADER_BYTES = 4096
+VIDEO_PROBE_BYTES = 1024 * 1024
+
+_VIDEO_FORMATS: dict[str, tuple[str, frozenset[str]]] = {
+    ".3g2": ("video/3gpp2", frozenset({"iso-bmff"})),
+    ".3gp": ("video/3gpp", frozenset({"iso-bmff"})),
+    ".asf": ("video/x-ms-asf", frozenset({"asf"})),
+    ".avi": ("video/x-msvideo", frozenset({"avi"})),
+    ".flv": ("video/x-flv", frozenset({"flv"})),
+    ".m2ts": ("video/mp2t", frozenset({"mpeg-ts"})),
+    ".m4v": ("video/mp4", frozenset({"iso-bmff"})),
+    ".mkv": ("video/x-matroska", frozenset({"matroska"})),
+    ".mov": ("video/quicktime", frozenset({"iso-bmff"})),
+    ".mp4": ("video/mp4", frozenset({"iso-bmff"})),
+    ".mpeg": ("video/mpeg", frozenset({"mpeg-ps"})),
+    ".mpg": ("video/mpeg", frozenset({"mpeg-ps"})),
+    ".mts": ("video/mp2t", frozenset({"mpeg-ts"})),
+    ".mxf": ("application/mxf", frozenset({"mxf"})),
+    ".ogv": ("video/ogg", frozenset({"ogg-video"})),
+    ".ts": ("video/mp2t", frozenset({"mpeg-ts"})),
+    ".webm": ("video/webm", frozenset({"webm"})),
+    ".wmv": ("video/x-ms-wmv", frozenset({"asf"})),
+}
+
+_ASF_HEADER = bytes.fromhex("3026b2758e66cf11a6d900aa0062ce6c")
+_ASF_VIDEO_STREAM = bytes.fromhex("c0ef19bc4d5bcf11a8fd00805f5c442b")
+_MXF_HEADER_PREFIX = bytes.fromhex("060e2b34020501010d0102010102")
+_ISO_AUDIO_BRANDS = {b"F4A ", b"F4B ", b"M4A ", b"M4B ", b"M4P "}
+_ISO_VIDEO_BRANDS = {
+    b"avc1",
+    b"avc2",
+    b"avc3",
+    b"avc4",
+    b"dash",
+    b"iso2",
+    b"iso3",
+    b"iso4",
+    b"iso5",
+    b"iso6",
+    b"iso7",
+    b"iso8",
+    b"iso9",
+    b"isom",
+    b"M4V ",
+    b"M4VH",
+    b"M4VP",
+    b"mp41",
+    b"mp42",
+    b"msdh",
+    b"msix",
+    b"qt  ",
+}
+_ISO_BMFF_MAX_BOX_DEPTH = 8
+_ISO_BMFF_MAX_TOP_LEVEL_BOXES = 4096
+_ISO_BMFF_MAX_CHILD_BOXES = 4096
+_ISO_BMFF_MAX_MOOV_BYTES = VIDEO_PROBE_BYTES
+_ISO_BMFF_READ_CHUNK_BYTES = 64 * 1024
 
 
 class VideoPathError(ValueError):
@@ -53,13 +111,13 @@ def task_id_from_kwargs(kwargs: dict | None = None) -> str:
     for key in ("task_id", "turn_id", "session_id"):
         value = str(kwargs.get(key) or "").strip()
         if value:
-            return value[:256]
+            return value[:MAX_TASK_ID_LENGTH]
     try:
         from gateway.session_context import zettlab_turn_id
 
         value = zettlab_turn_id()
         if value:
-            return value[:256]
+            return value[:MAX_TASK_ID_LENGTH]
     except Exception:
         pass
     return "interactive"
@@ -95,6 +153,450 @@ def _under(path: Path, root: Path) -> bool:
         return False
 
 
+def _iso_bmff_is_video(sample: bytes) -> bool:
+    offset = 0
+    while offset + 8 <= len(sample):
+        size = int.from_bytes(sample[offset : offset + 4], "big")
+        kind = sample[offset + 4 : offset + 8]
+        header_size = 8
+        if size == 1:
+            if offset + 16 > len(sample):
+                return False
+            size = int.from_bytes(sample[offset + 8 : offset + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = len(sample) - offset
+        if size < header_size or offset + size > len(sample):
+            return False
+        if kind == b"ftyp":
+            payload = sample[offset + header_size : offset + size]
+            if len(payload) < 8 or (len(payload) - 8) % 4:
+                return False
+            if payload[:4] in _ISO_AUDIO_BRANDS:
+                return False
+            brands = [payload[:4]] + [
+                payload[index : index + 4]
+                for index in range(8, len(payload), 4)
+            ]
+            return any(
+                brand in _ISO_VIDEO_BRANDS
+                or brand.startswith(b"3gp")
+                or brand.startswith(b"3g2")
+                for brand in brands
+            )
+        offset += size
+    return False
+
+
+def _iso_bmff_boxes(
+    sample: bytes,
+    start: int,
+    end: int,
+):
+    """Yield complete ISO-BMFF child boxes inside one bounded parent."""
+    offset = start
+    while offset < end:
+        if end - offset < 8:
+            return
+        size = int.from_bytes(sample[offset : offset + 4], "big")
+        kind = sample[offset + 4 : offset + 8]
+        header_size = 8
+        if size == 1:
+            if end - offset < 16:
+                return
+            size = int.from_bytes(sample[offset + 8 : offset + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = end - offset
+        if size < header_size or size > end - offset:
+            return
+        box_end = offset + size
+        yield kind, offset + header_size, box_end
+        offset = box_end
+
+
+def _iso_bmff_complete_boxes(
+    sample: bytes,
+    start: int,
+    end: int,
+) -> list[tuple[bytes, int, int]] | None:
+    """Return all boxes only when the bounded parent is structurally complete."""
+    if start < 0 or end < start or end > len(sample):
+        return None
+    boxes: list[tuple[bytes, int, int]] = []
+    offset = start
+    while offset < end:
+        if len(boxes) >= _ISO_BMFF_MAX_CHILD_BOXES:
+            return None
+        if end - offset < 8:
+            return None
+        size = int.from_bytes(sample[offset : offset + 4], "big")
+        kind = sample[offset + 4 : offset + 8]
+        header_size = 8
+        if size == 1:
+            if end - offset < 16:
+                return None
+            size = int.from_bytes(sample[offset + 8 : offset + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = end - offset
+        if size < header_size or size > end - offset:
+            return None
+        box_end = offset + size
+        boxes.append((kind, offset + header_size, box_end))
+        offset = box_end
+    return boxes
+
+
+def _iso_bmff_mdia_has_video_handler(
+    sample: bytes,
+    start: int,
+    end: int,
+    depth: int,
+) -> bool:
+    if depth > _ISO_BMFF_MAX_BOX_DEPTH:
+        return False
+    boxes = _iso_bmff_complete_boxes(sample, start, end)
+    if boxes is None:
+        return False
+    for kind, payload_start, box_end in boxes:
+        if kind != b"hdlr" or box_end - payload_start < 12:
+            continue
+        # FullBox(version + flags), pre_defined, then handler_type.
+        if sample[payload_start + 8 : payload_start + 12] == b"vide":
+            return True
+    return False
+
+
+def _iso_bmff_trak_has_video_handler(
+    sample: bytes,
+    start: int,
+    end: int,
+    depth: int,
+) -> bool:
+    if depth > _ISO_BMFF_MAX_BOX_DEPTH:
+        return False
+    boxes = _iso_bmff_complete_boxes(sample, start, end)
+    if boxes is None:
+        return False
+    for kind, payload_start, box_end in boxes:
+        if kind == b"mdia" and _iso_bmff_mdia_has_video_handler(
+            sample, payload_start, box_end, depth + 1
+        ):
+            return True
+    return False
+
+
+def _iso_bmff_moov_has_video_track(
+    sample: bytes,
+    start: int,
+    end: int,
+) -> bool:
+    boxes = _iso_bmff_complete_boxes(sample, start, end)
+    if boxes is None:
+        return False
+    for trak_kind, trak_start, trak_end in boxes:
+        if trak_kind == b"trak" and _iso_bmff_trak_has_video_handler(
+            sample, trak_start, trak_end, 2
+        ):
+            return True
+    return False
+
+
+def _iso_bmff_has_video_track(sample: bytes) -> bool:
+    """Require an actual ``hdlr=vide`` track, not just an ISO brand."""
+    if not _iso_bmff_is_video(sample):
+        return False
+    # ``sample`` is intentionally only a bounded prefix.  A valid fast-start
+    # moov may be followed by an incomplete mdat tail in that prefix; the
+    # descriptor-aware path performs whole-file top-level validation when the
+    # prefix cannot prove the track.
+    for kind, payload_start, box_end in _iso_bmff_boxes(
+        sample, 0, len(sample)
+    ):
+        if kind == b"moov" and _iso_bmff_moov_has_video_track(
+            sample, payload_start, box_end
+        ):
+            return True
+    return False
+
+
+def _iso_bmff_read_top_level_header(
+    descriptor: int,
+    offset: int,
+    file_size: int,
+) -> tuple[bytes, int, int] | None:
+    """Read one bounded top-level header and return kind, end, header size."""
+    if offset < 0 or offset > file_size - 8:
+        return None
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    header = os.read(descriptor, 8)
+    if len(header) < 8:
+        return None
+    size = int.from_bytes(header[:4], "big")
+    kind = header[4:8]
+    header_size = 8
+    if size == 1:
+        largesize = os.read(descriptor, 8)
+        if len(largesize) < 8:
+            return None
+        size = int.from_bytes(largesize, "big")
+        header_size = 16
+    elif size == 0:
+        size = file_size - offset
+    if size < header_size or size > file_size - offset:
+        return None
+    return kind, offset + size, header_size
+
+
+def _iso_bmff_read_range(
+    descriptor: int,
+    offset: int,
+    size: int,
+) -> bytes | None:
+    """Read one bounded box without touching unrelated media payload."""
+    if size < 0 or size > _ISO_BMFF_MAX_MOOV_BYTES:
+        return None
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(
+            descriptor,
+            min(_ISO_BMFF_READ_CHUNK_BYTES, remaining),
+        )
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _iso_bmff_has_video_track_descriptor(
+    descriptor: int,
+    file_size: int,
+) -> bool:
+    """Find a bounded ``moov`` by seeking over trusted top-level sizes."""
+    offset = 0
+    saw_ftyp = False
+    saw_moov = False
+    has_video_track = False
+    for _ in range(_ISO_BMFF_MAX_TOP_LEVEL_BOXES):
+        header = _iso_bmff_read_top_level_header(
+            descriptor, offset, file_size
+        )
+        if header is None:
+            return False
+        kind, box_end, header_size = header
+        if kind == b"ftyp":
+            saw_ftyp = True
+        elif kind == b"moov":
+            if not saw_ftyp or saw_moov:
+                return False
+            saw_moov = True
+            box_size = box_end - offset
+            raw = _iso_bmff_read_range(descriptor, offset, box_size)
+            if raw is None:
+                return False
+            # The header parser has already checked the box size; only parse
+            # complete child boxes inside this bounded moov snapshot.
+            has_video_track = _iso_bmff_moov_has_video_track(
+                raw, header_size, len(raw)
+            )
+        if box_end <= offset:
+            return False
+        offset = box_end
+        if offset == file_size:
+            break
+    if offset != file_size:
+        return False
+    return saw_moov and has_video_track
+
+
+def _ebml_doctype(sample: bytes) -> str:
+    marker = b"\x42\x82"
+    offset = sample.find(marker, 4)
+    if offset < 0 or offset + len(marker) >= len(sample):
+        return ""
+    size_offset = offset + len(marker)
+    first = sample[size_offset]
+    width = next((index for index in range(1, 9) if first & (1 << (8 - index))), 0)
+    if not width or size_offset + width > len(sample):
+        return ""
+    size = first & ((1 << (8 - width)) - 1)
+    for byte in sample[size_offset + 1 : size_offset + width]:
+        size = (size << 8) | byte
+    value_offset = size_offset + width
+    if size <= 0 or value_offset + size > len(sample):
+        return ""
+    try:
+        return sample[value_offset : value_offset + size].decode("ascii").lower()
+    except UnicodeDecodeError:
+        return ""
+
+
+def _mpeg_ts_has_sync(sample: bytes, packet_size: int, sync_offset: int) -> bool:
+    sync_positions = [sync_offset + packet_size * index for index in range(3)]
+    return not any(
+        position >= len(sample) or sample[position] != 0x47
+        for position in sync_positions
+    )
+
+
+def _mpeg_ts_has_video(sample: bytes, packet_size: int, sync_offset: int) -> bool:
+    if not _mpeg_ts_has_sync(sample, packet_size, sync_offset):
+        return False
+    return any(
+        sample[index : index + 3] == b"\x00\x00\x01"
+        and 0xE0 <= sample[index + 3] <= 0xEF
+        for index in range(len(sample) - 3)
+    )
+
+
+def _detect_video_container_signature(sample: bytes) -> str:
+    if _iso_bmff_is_video(sample):
+        return "iso-bmff"
+    if sample.startswith(b"\x1a\x45\xdf\xa3"):
+        doctype = _ebml_doctype(sample)
+        if doctype in {"matroska", "webm"}:
+            return doctype
+    if (
+        len(sample) >= 12
+        and sample.startswith(b"RIFF")
+        and sample[8:12] == b"AVI "
+    ):
+        return "avi"
+    if (
+        len(sample) >= 9
+        and sample.startswith(b"FLV\x01")
+        and sample[4] & 0x01
+        and int.from_bytes(sample[5:9], "big") >= 9
+    ):
+        return "flv"
+    if sample.startswith(_ASF_HEADER):
+        return "asf"
+    if sample.startswith(_MXF_HEADER_PREFIX):
+        return "mxf"
+    if sample.startswith(b"OggS"):
+        return "ogg-video"
+    if sample.startswith(b"\x00\x00\x01\xba"):
+        return "mpeg-ps"
+    if _mpeg_ts_has_sync(sample, 188, 0) or _mpeg_ts_has_sync(sample, 192, 4):
+        return "mpeg-ts"
+    return ""
+
+
+def _detect_video_container(sample: bytes) -> str:
+    container = _detect_video_container_signature(sample)
+    if container == "iso-bmff":
+        return container if _iso_bmff_has_video_track(sample) else ""
+    if container in {"flv", "mxf"}:
+        return container
+    if container in {"matroska", "webm"} and b"\x83\x81\x01" in sample:
+        return container
+    if container == "avi" and b"vids" in sample:
+        return container
+    if container == "asf" and _ASF_VIDEO_STREAM in sample:
+        return container
+    if container == "ogg-video" and b"\x80theora" in sample:
+        return container
+    if container == "mpeg-ps" and any(
+        sample[index : index + 3] == b"\x00\x00\x01"
+        and 0xE0 <= sample[index + 3] <= 0xEF
+        for index in range(len(sample) - 3)
+    ):
+        return container
+    if container == "mpeg-ts" and (
+        _mpeg_ts_has_video(sample, 188, 0)
+        or _mpeg_ts_has_video(sample, 192, 4)
+    ):
+        return container
+    return ""
+
+
+def video_media_type(path: Path) -> str:
+    details = _VIDEO_FORMATS.get(path.suffix.lower())
+    if details is None:
+        raise VideoPathError("input is not a supported video file")
+    return details[0]
+
+
+def validate_video_sample(path: Path, sample: bytes) -> str:
+    details = _VIDEO_FORMATS.get(path.suffix.lower())
+    if details is None or _detect_video_container(sample) not in details[1]:
+        raise VideoPathError("input is not a supported video file")
+    return details[0]
+
+
+def inspect_video_descriptor(path: Path, descriptor: int) -> tuple[str, bool]:
+    """Return the declared MIME and whether bounded bytes prove a video track."""
+    details = _VIDEO_FORMATS.get(path.suffix.lower())
+    if details is None:
+        raise VideoPathError("input is not a supported video file")
+    position = os.lseek(descriptor, 0, os.SEEK_CUR)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        sample = os.read(descriptor, VIDEO_HEADER_BYTES)
+        size = os.fstat(descriptor).st_size
+        signature = _detect_video_container_signature(sample)
+        if _detect_video_container(sample) in details[1]:
+            return details[0], True
+        if signature == "iso-bmff":
+            if "iso-bmff" not in details[1]:
+                raise VideoPathError("input is not a supported video file")
+            if _iso_bmff_has_video_track_descriptor(descriptor, size):
+                return details[0], True
+            # A recognized ISO brand without a bounded, structurally valid
+            # video track is intentionally inconclusive; the upload caller
+            # will fail closed when the packaged probe is unavailable.
+            return details[0], False
+
+        probe_limit = min(size, VIDEO_PROBE_BYTES)
+        chunks = [sample]
+        remaining = probe_limit - len(sample)
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        sample = b"".join(chunks)
+    finally:
+        os.lseek(descriptor, position, os.SEEK_SET)
+    if _detect_video_container(sample) in details[1]:
+        return details[0], True
+    if (
+        len(sample) == probe_limit
+        and _detect_video_container_signature(sample) in details[1]
+    ):
+        return details[0], False
+    raise VideoPathError("input is not a supported video file")
+
+
+def validate_video_descriptor(path: Path, descriptor: int) -> str:
+    return inspect_video_descriptor(path, descriptor)[0]
+
+
+def _validate_video_file(path: Path, expected: os.stat_result) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != expected.st_dev
+            or opened.st_ino != expected.st_ino
+            or opened.st_size != expected.st_size
+        ):
+            raise VideoPathError("input file changed during validation")
+        validate_video_descriptor(path, descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def validate_input_file(raw: str, agent_id: str) -> Path:
     if not isinstance(raw, str) or len(raw.encode()) > _MAX_PATH_BYTES:
         raise VideoPathError("input path is invalid")
@@ -110,10 +612,21 @@ def validate_input_file(raw: str, agent_id: str) -> Path:
         raise VideoPathError("input file is unavailable") from exc
     if not resolved.is_file() or stat_result.st_size <= 0:
         raise VideoPathError("input file is unavailable")
-    raw_ok = any(_under(resolved, Path(root).resolve()) for root in _RAW_ROOTS)
     output = output_root(agent_id)
-    if not raw_ok and not _under(resolved, output):
+    uploads = upload_root(agent_id)
+    workspace_roots = [
+        *(Path(root).resolve() for root in _RAW_ROOTS),
+        output.resolve(),
+        uploads,
+    ]
+    if not any(_under(resolved, root) for root in workspace_roots):
         raise VideoPathError("input path is outside the media workspace")
+    try:
+        _validate_video_file(resolved, stat_result)
+    except VideoPathError:
+        raise
+    except OSError as exc:
+        raise VideoPathError("input file is unavailable") from exc
     return resolved
 
 
@@ -169,6 +682,27 @@ def output_root(agent_id: str) -> Path:
     if not safe_id(agent_id, fallback=""):
         raise VideoPathError("agent id is invalid")
     return root
+
+
+def upload_root(agent_id: str) -> Path:
+    """Return the active agent's App attachment workspace.
+
+    local-server places inbound channel attachments beside the agent output
+    bucket at ``<agents-data>/<agent>/uploads``.  Keep this sibling scoped to
+    the same validated output parent so one profile cannot select another
+    profile's attachments.
+    """
+    output = output_root(agent_id)
+    candidate = output.parent / "uploads"
+    if candidate.is_symlink():
+        raise VideoPathError("agent upload directory is a symlink")
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise VideoPathError("agent upload directory is unavailable") from exc
+    if candidate.exists() and not candidate.is_dir():
+        raise VideoPathError("agent upload directory is unavailable")
+    return resolved
 
 
 def result_path(
