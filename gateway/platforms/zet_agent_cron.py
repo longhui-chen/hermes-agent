@@ -61,10 +61,23 @@ _LATEST_OUTPUT: Dict[str, str] = {}
 # wrote, so the App's per-run history can show delivery failures distinctly.
 _LATEST_OUTPUT_PATH: Dict[str, Any] = {}
 
-# job_id → scheduler's silence verdict, published by _record_silent_run just
-# before save_job_output. Drained with _LATEST_OUTPUT in the mark_job_run
-# wrapper — a verdict surviving into the next run would mute real output.
-_LATEST_SILENT: Dict[str, bool] = {}
+# (hermes_home, job_id) → scheduler's silence verdict, published by
+# _record_silent_run once `success` is final. Keyed like the scheduler's own
+# _running_job_key: under multiplex one process runs several profiles and the
+# same job id can live in more than one, so job_id alone lets one profile's
+# verdict mute another's real output. Drained in the mark_job_run wrapper — a
+# verdict surviving into the next run would mute that run too.
+_LATEST_SILENT: Dict[Tuple[str, str], bool] = {}
+
+
+def _silent_key(job_id: str) -> Tuple[str, str]:
+    """Profile-qualified cache key. Mirrors cron.scheduler._running_job_key."""
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(Path(get_hermes_home()).resolve())
+    except Exception:
+        home = ""
+    return home, str(job_id)
 
 # Tool calls whose successful execution we treat as "produced a file this
 # turn". Keep in sync with zettlab-local-server/internal/chat/handler/
@@ -881,8 +894,12 @@ def install() -> None:
         _LATEST_OUTPUT_PATH[job_id] = saved
         return saved
 
-    def _wrapped_record_silent(job_id: str, silent: bool):
-        _LATEST_SILENT[job_id] = bool(silent)
+    def _wrapped_record_silent(job: dict, silent: bool):
+        try:
+            job_id = str(job["id"])
+        except Exception:
+            return
+        _LATEST_SILENT[_silent_key(job_id)] = bool(silent)
 
     def _wrapped_mark(
         job_id: str,
@@ -968,7 +985,7 @@ def install() -> None:
         finally:
             _LATEST_OUTPUT.pop(job_id, None)
             _LATEST_OUTPUT_PATH.pop(job_id, None)
-            _LATEST_SILENT.pop(job_id, None)
+            _LATEST_SILENT.pop(_silent_key(job_id), None)
 
     setattr(_wrapped_mark, _PATCH_SENTINEL, True)
     setattr(_wrapped_save, _PATCH_SENTINEL, True)
@@ -1463,7 +1480,7 @@ def _is_silent_run(job_id: str) -> bool:
     # Scheduler 的判定优先：它读 final_response，每个 skip 分支都置 SILENT_MARKER。
     # 下面的文本嗅探只能看到分支碰巧写了什么，漏掉不写 "**Status:** silent" 的
     # wake-gate 分支和整个 doc 为空的分支（TB-20260817-007）。
-    recorded = _LATEST_SILENT.get(job_id)
+    recorded = _LATEST_SILENT.get(_silent_key(job_id))
     if recorded is not None:
         return recorded
 

@@ -387,13 +387,17 @@ def _is_cron_silence_response(text: str) -> bool:
     return _is_token(stripped)
 
 
-def _record_silent_run(job_id: str, silent: bool) -> None:
+def _record_silent_run(job: dict, silent: bool) -> None:
     """Publish this run's silence verdict. No-op upstream; embedders override.
 
     ``final_response`` is the only reliable silence signal — every skip branch
     returns ``SILENT_MARKER``, but the saved markdown varies (some branches
     write no ``**Status:** silent`` line, one writes no doc at all). Consumers
     that re-derive silence from that text miss those branches.
+
+    Takes the whole job so overrides can key by ``_running_job_key`` — under
+    multiplex, one process runs jobs from several profiles concurrently and
+    the same job id can exist in more than one of them.
     """
     return None
 
@@ -4447,7 +4451,6 @@ def run_one_job(
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
         try:
-            _record_silent_run(job["id"], success and _is_cron_silence_response(final_response))
             output_file = save_job_output(job["id"], output)
             output_filename = os.path.basename(str(output_file))
             if verbose:
@@ -4546,6 +4549,11 @@ def run_one_job(
             else:
                 success = False
                 error = "no import attempted in this run"
+
+        # Publish only once `success` is final: the empty-response guard, the
+        # interrupted check and the app_slug import verdict above all still
+        # flip it to False. A failure is never silent — it must reach the user.
+        _record_silent_run(job, success and _is_cron_silence_response(final_response))
 
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(

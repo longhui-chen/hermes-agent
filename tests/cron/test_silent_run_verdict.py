@@ -31,9 +31,11 @@ def card_layer(monkeypatch):
 
 
 def _publish(card_layer, job_id, doc, final_response, success=True):
-    """Mirror run_one_job's ordering: record the verdict, then save the doc."""
-    card_layer._LATEST_SILENT[job_id] = success and _is_cron_silence_response(final_response)
+    """Mirror run_one_job: save the doc, then record the verdict once success is final."""
     card_layer._LATEST_OUTPUT[job_id] = doc
+    card_layer._LATEST_SILENT[card_layer._silent_key(job_id)] = (
+        success and _is_cron_silence_response(final_response)
+    )
 
 
 # The exact docs each skip branch hands back, paired with its final_response.
@@ -93,7 +95,7 @@ def test_verdict_does_not_leak_into_the_next_run(card_layer):
     assert card_layer._is_silent_run(JOB_ID) is True
 
     card_layer._LATEST_OUTPUT.pop(JOB_ID, None)
-    card_layer._LATEST_SILENT.pop(JOB_ID, None)
+    card_layer._LATEST_SILENT.pop(card_layer._silent_key(JOB_ID), None)
 
     card_layer._LATEST_OUTPUT[JOB_ID] = "# Cron Job: poll\n\n## Response\n\n真实结果\n"
     assert card_layer._is_silent_run(JOB_ID) is False
@@ -102,4 +104,40 @@ def test_verdict_does_not_leak_into_the_next_run(card_layer):
 def test_falls_back_to_doc_sniffing_without_a_verdict(card_layer):
     """No recorded verdict (older scheduler / partial patch) keeps legacy behavior."""
     card_layer._LATEST_OUTPUT[JOB_ID] = NO_AGENT_GATE_DOC
+    assert card_layer._is_silent_run(JOB_ID) is True
+
+
+def test_late_success_override_is_not_silenced(card_layer):
+    """A skip branch whose success is revoked later must still deliver its card.
+
+    run_one_job flips success to False after the run — empty response, gateway
+    interrupt, or the app_slug import verdict. Publishing the verdict before
+    those would cache silent=True and swallow the failure the user needs to see.
+    """
+    _publish(card_layer, JOB_ID, WAKE_GATE_DOC, SILENT_MARKER, success=False)
+    assert card_layer._is_silent_run(JOB_ID) is False
+
+
+def test_same_job_id_in_two_profiles_does_not_cross_talk(card_layer, monkeypatch, tmp_path):
+    """Multiplex runs several profiles in one process; ids can collide."""
+    prof_a, prof_b = tmp_path / "a", tmp_path / "b"
+    prof_a.mkdir()
+    prof_b.mkdir()
+
+    def _at(home):
+        monkeypatch.setattr(
+            "hermes_constants.get_hermes_home", lambda h=home: h, raising=False
+        )
+
+    # Profile A's run is silent.
+    _at(prof_a)
+    card_layer._LATEST_SILENT[card_layer._silent_key(JOB_ID)] = True
+
+    # Profile B runs the same job id and produces real output.
+    _at(prof_b)
+    card_layer._LATEST_OUTPUT[JOB_ID] = "# Cron Job: poll\n\n## Response\n\n真实结果\n"
+    assert card_layer._is_silent_run(JOB_ID) is False, "A's verdict muted B's output"
+
+    # A's own verdict is untouched by B.
+    _at(prof_a)
     assert card_layer._is_silent_run(JOB_ID) is True
