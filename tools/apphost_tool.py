@@ -55,6 +55,8 @@ _MAX_STAGING_DIR_CHARS = 1024
 _MAX_SOURCE_SUBDIR_CHARS = 1024
 _MAX_APP_PATH_CHARS = 1024
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_EXECUTION_PRINCIPAL_MAX_BYTES = 512
+_EXECUTION_ID_MAX_BYTES = 256
 
 # Credentialed loopback transport (no env proxies, no redirects) — shared
 # with the other action-token call sites via tools.loopback_transport; the
@@ -505,27 +507,52 @@ def _session_key():
     return str(value or "").strip()
 
 
+def _bounded_execution_header(value, max_bytes):
+    raw = str(value or "")
+    if not raw or raw.strip() != raw:
+        return ""
+    try:
+        if len(raw.encode("utf-8")) > max_bytes:
+            return ""
+    except UnicodeError:
+        return ""
+    if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in raw):
+        return ""
+    return raw
+
+
 def _execution_headers():
-    """Forward AppHost-owned request correlation; model arguments never shape it."""
+    """Forward trusted AppHost identity; model arguments never shape it."""
     try:
         from gateway.session_context import (
             current_turn_identity,
             get_session_env,
             zettlab_auth_principal,
         )
+        principal = _bounded_execution_header(
+            zettlab_auth_principal(), _EXECUTION_PRINCIPAL_MAX_BYTES
+        )
         identity = current_turn_identity()
-        turn_id = identity[0] if identity else ""
-        session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
-        owner_principal = str(zettlab_auth_principal() or "").strip()
+        turn_id = _bounded_execution_header(
+            identity[0] if identity else "", _EXECUTION_ID_MAX_BYTES
+        )
+        session_id = _bounded_execution_header(
+            get_session_env("HERMES_SESSION_ID", ""), _EXECUTION_ID_MAX_BYTES
+        )
+        session_key = _bounded_execution_header(
+            get_session_env("HERMES_SESSION_KEY", ""), _EXECUTION_ID_MAX_BYTES
+        )
     except Exception:
         return {}
     headers = {}
+    if principal:
+        headers["X-Zettlab-Auth-Principal-Id"] = principal
     if turn_id:
-        headers["X-Hermes-Turn-Id"] = str(turn_id)
+        headers["X-Hermes-Turn-Id"] = turn_id
     if session_id:
         headers["X-Hermes-Session-Id"] = session_id
-    if owner_principal:
-        headers["X-Zettlab-Auth-Principal-Id"] = owner_principal
+    if session_key:
+        headers["X-Hermes-Session-Key"] = session_key
     # Bound scheduler sessions are server-generated as
     # cron_task_<job-id>_<UTC timestamp>.
     # The task id is therefore derived from trusted execution context, never

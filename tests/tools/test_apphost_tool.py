@@ -20,6 +20,7 @@ from tools.apphost_tool import (
     APP_HOST_SCHEMA,
     _CALL_HTTP_METHODS,
     _check_app_host,
+    _execution_headers,
     _local_error,
     app_host_tool,
 )
@@ -172,27 +173,43 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
 
 def test_request_forwards_only_task_local_execution_headers(monkeypatch):
     from gateway.session_context import (
-        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+        clear_session_vars,
+        clear_turn_vars,
+        pop_zettlab_auth_principal,
+        push_zettlab_auth_principal,
+        set_session_vars,
+        set_turn_vars,
     )
     seen = {}
-    session_tokens = set_session_vars(session_id="cron_task_abcdef123456_20260817_120000")
+    session_tokens = set_session_vars(
+        session_id="cron_task_abcdef123456_20260817_120000",
+        session_key="zettlab:owner-1:agent-1:stable-session",
+    )
     turn_tokens = set_turn_vars(
         turn_id="turn-1", hardware_execution_token="a" * 64
     )
+    principal_token = push_zettlab_auth_principal("iam:issuer:user:owner-1")
     try:
         with mux_profile_scope(monkeypatch, _scope()), patch(
             "tools.apphost_tool._urlopen", _capture_urlopen(seen)
         ):
             assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
     finally:
+        pop_zettlab_auth_principal(principal_token)
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     req = seen["req"]
     retired_header = "X-zettlab-business-" + "execution-token"
     assert req.get_header(retired_header) is None
     assert req.get_header("X-zettlab-hardware-execution-token") is None
+    assert req.get_header("X-zettlab-auth-principal-id") == (
+        "iam:issuer:user:owner-1"
+    )
     assert req.get_header("X-hermes-turn-id") == "turn-1"
     assert req.get_header("X-hermes-session-id") == "cron_task_abcdef123456_20260817_120000"
+    assert req.get_header("X-hermes-session-key") == (
+        "zettlab:owner-1:agent-1:stable-session"
+    )
     assert req.get_header("X-zettlab-app-maintenance-task-id") == "abcdef123456"
 
 
@@ -212,6 +229,52 @@ def test_hardware_execution_token_is_never_forwarded_by_apphost(monkeypatch):
     assert seen["req"].get_header(retired_header) is None
     assert seen["req"].get_header("X-zettlab-hardware-execution-token") is None
     assert seen["req"].get_header("X-hermes-turn-id") is None
+
+
+@pytest.mark.parametrize(
+    "field,value,missing_header",
+    [
+        ("principal", "iam:issuer:user:owner\r\nforged", "X-Zettlab-Auth-Principal-Id"),
+        ("principal", "p" * 513, "X-Zettlab-Auth-Principal-Id"),
+        ("turn_id", "turn\x00forged", "X-Hermes-Turn-Id"),
+        ("turn_id", "t" * 257, "X-Hermes-Turn-Id"),
+        ("session_id", " session-1", "X-Hermes-Session-Id"),
+        ("session_id", "s" * 257, "X-Hermes-Session-Id"),
+        ("session_key", "zettlab:owner:agent:key\nforged", "X-Hermes-Session-Key"),
+        ("session_key", "k" * 257, "X-Hermes-Session-Key"),
+    ],
+)
+def test_execution_headers_drop_invalid_or_oversized_values(
+    field, value, missing_header
+):
+    values = {
+        "principal": "iam:issuer:user:owner-1",
+        "turn_id": "turn-1",
+        "session_id": "session-1",
+        "session_key": "zettlab:owner-1:agent-1:session-1",
+    }
+    values[field] = value
+
+    def session_env(name, default=""):
+        return {
+            "HERMES_SESSION_ID": values["session_id"],
+            "HERMES_SESSION_KEY": values["session_key"],
+        }.get(name, default)
+
+    with patch(
+        "gateway.session_context.zettlab_auth_principal",
+        return_value=values["principal"],
+    ), patch(
+        "gateway.session_context.current_turn_identity",
+        return_value=(values["turn_id"], object()),
+    ), patch(
+        "gateway.session_context.get_session_env",
+        side_effect=session_env,
+    ):
+        headers = _execution_headers()
+
+    assert missing_header not in headers
+    assert all("\r" not in item and "\n" not in item and "\x00" not in item for item in headers.values())
 
 
 def test_app_host_request_keeps_its_own_base_url(monkeypatch):

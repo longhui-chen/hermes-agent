@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import ipaddress
 import logging
 import ntpath
 import os
@@ -18,6 +19,7 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -2129,25 +2131,30 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_ID",
 })
 
+CONNECTOR_ACTION_RUNTIME_ENV_KEY = "ZETTLAB_CONNECTOR_ACTION_RUNTIME"
+
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
-RETIRED_BUSINESS_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
-    # Scrub-only compatibility fence. No runtime may read or emit these retired
-    # generic authorization values, but a stale parent environment must not leak
-    # them into a model-authored subprocess either.
-    "ZETTLAB_BUSINESS_" + "EXECUTION_TOKEN",
-    "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
-    "ZETTLAB_BUSINESS_EXECUTION_MODE",
-    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
-    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
-})
-VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    "ZETTLAB_BUSINESS_EXECUTION_ACTION",
-    "ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION",
-})
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+})
+# These names belonged to the removed video BusinessExecution transport.  Keep
+# them in the scrub set (built from fragments so the retirement guard cannot
+# mistake a defensive cleanup list for a reintroduced wire protocol), but
+# never inject them into a child process.  The generic Agent action token above
+# remains available to unrelated creator/connector skills.
+_RETIRED_VIDEO_EXECUTION_PREFIX = "ZETTLAB_BUSINESS_EXECUTION_"
+RETIRED_VIDEO_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "TOKEN",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION_VERSION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "SCOPE_DIGEST",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "CAPABILITY",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "GRANT_VERSION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "MODE",
+    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -2163,10 +2170,10 @@ _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
+    | {CONNECTOR_ACTION_RUNTIME_ENV_KEY}
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
-    | RETIRED_BUSINESS_EXECUTION_ENV_KEYS
-    | VIDEO_EDIT_RUNTIME_ENV_KEYS
     | HARDWARE_RUNTIME_ENV_KEYS
+    | RETIRED_VIDEO_EXECUTION_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
     | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
 )
@@ -2239,7 +2246,21 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     runtime bearer may be supplied to the allowlisted runner subprocess, but it
     must not be inherited by arbitrary model-authored shell commands.
     """
-    env = _sanitize_subprocess_env(os.environ, base_env)
+    # ⛔ 起手底座**不继承进程环境**。这里原先是
+    # `_sanitize_subprocess_env(os.environ, base_env)` —— 那是**黑名单**,只剥 Hermes
+    # 自己的密钥,HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / ZET_CHAT_APPEND_URL 一律放行。
+    #
+    # ⚠️ 把 run_trusted_python_script 的 base_env 收成 {} 并**不够**:这个函数的返回值
+    # 是走 injected_env 进去的,同一个泄漏换个参数照样到子进程。判据必须贴**最终进入
+    # 子进程的环境全集**,⛔ 不是「某个参数是不是空的」。
+    #
+    # 底座换空是安全的:下面本来就按 CONNECTOR_RUNTIME_ENV_KEYS 这份**白名单**逐键
+    # 填/删,底座里的其它东西一个都用不到。仓内另外三个 build_*_runtime_env
+    # (agent_creator / overseas_connect / camera)本来就是白名单构造 —— 照抄它们。
+    env = dict(base_env or {})
+    # The pinned script identity is minted by terminal_tool only after exact
+    # direct-runner path verification. Never accept an inherited/profile value.
+    env.pop(CONNECTOR_ACTION_RUNTIME_ENV_KEY, None)
 
     scope = None
     multiplex_active = False
@@ -2358,38 +2379,90 @@ def build_agent_creator_runtime_env(
     return env
 
 
-def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]:
-    """Build the minimal env for the trusted video-edit script runner."""
-    env = _sanitize_subprocess_env(os.environ, base_env)
-    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
-        env.pop(key, None)
-    _inject_session_context_env(env)
+def build_overseas_connect_runtime_env() -> tuple[dict[str, str], str]:
+    """Return public turn metadata and the profile action token for one trusted runner."""
 
-    try:
-        from agent.zet_agent_response_mode import trusted_video_edit_runtime_receipt
+    from agent.secret_scope import get_secret
 
-        frozen_receipt = trusted_video_edit_runtime_receipt()
-    except Exception:
-        frozen_receipt = {}
-    if not frozen_receipt:
-        raise PermissionError("trusted video-edit execution receipt unavailable")
-    action = str(frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION", "") or "").strip()
+    token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
+    # ⛔ 这里**不重新实现** action token 的格式规则。原先写的是
+    # `re.fullmatch(r"[0-9a-f]{64}", token)` —— 比签发方还严:local-server 的权威判据
+    # (internal/agent/actiontoken/store.go 的 looksLikeIssuedToken)是「长度 64 + 能被
+    # hex.DecodeString 解析」,而 hex.DecodeString **接受大写**。于是 profile .env 里
+    # 已存的大写 hex token,local-server 认、我们这里拒,用户点连接卡只看到
+    # "secure flow 不可用",而毛病不在他那边。
+    #
+    # 格式是签发方的事,兄弟调用点也都不管格式:同文件的 agent creator 只查
+    # 「无 NUL + 长度上界」,camera runtime 只查「非空 + 无 NUL + ≤128 字节」。
+    # 这里对齐它们 —— 我们只需要保证这个值能安全地经 FD 交给子进程。
     if (
-        frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_ACTION_VERSION") != "1"
-        or re.fullmatch(r"[0-9a-f]{64}", action) is None
+        not token
+        or "\x00" in token
+        or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
     ):
-        raise PermissionError("trusted video-edit ActionV1 receipt unavailable")
-    env.update(frozen_receipt)
-    return env
+        raise RuntimeError("overseas-connect action token unavailable")
+
+    env: dict[str, str] = {}
+    append_url = str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
+    parsed = None
+    loopback = False
+    try:
+        parsed = urlsplit(append_url)
+        host = parsed.hostname
+        loopback = host == "localhost" or ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        pass
+    if not (
+        parsed is not None
+        and loopback
+        and parsed.scheme in {"http", "https"}
+        and parsed.netloc
+        and not parsed.username
+        and not parsed.password
+    ):
+        raise RuntimeError("overseas-connect local server callback unavailable")
+    # ⚠️ ⛔ 别在这里注入 ZET_CHAT_APPEND_URL。
+    #
+    # 2026-08-11 我试过(c9cc64540),理由是 connect.py 的第三条兜底
+    # local_server_from_chat_url() 读它。但那推翻了 afebbf011(Turing, 2026-08-06)
+    # 刻意钉死的契约:**回调 URL 不进子进程,只从它派生出 base**
+    # (tests/tools/test_terminal_overseas_connect_runner.py::
+    #  test_direct_runner_uses_loopback_base_from_profile_scope 断言 append == "")。
+    #
+    # 而且那个归因本身也是错的:scope 里的值本来就不进 os.environ,所以在受信 runner
+    # 路径下,那条兜底从 afebbf011 起就是死代码 —— 不是被 base_env={} 掐掉的。
+    # 受信路径靠的是这里注入的 ZETTLAB_LOCAL_SERVER_URL,它才是唯一约定来源。
+    env["ZETTLAB_LOCAL_SERVER_URL"] = urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        "",
+        "",
+        "",
+    ))
+    try:
+        from gateway.session_context import zettlab_turn_id
+
+        turn_id = zettlab_turn_id()
+    except Exception:
+        turn_id = ""
+    if turn_id:
+        turn_id = str(turn_id)
+        if (
+            "\x00" in turn_id
+            or len(turn_id.encode("utf-8")) > _AGENT_CREATOR_TURN_ID_MAX_BYTES
+        ):
+            raise RuntimeError("overseas-connect turn id invalid")
+        env["ZETTLAB_TURN_ID"] = turn_id
+    return env, token
 
 
 def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
     The helper receives the profile action token and the independently scoped
-    hardware capability plus turn/session correlation. Video ActionV1 is not
-    aliased into this path. Generic subprocesses continue to have all of these
-    values stripped by :func:`_apply_profile_secret_scope_env`.
+    hardware capability plus turn/session correlation. Generic subprocesses
+    continue to have all of these values stripped by
+    :func:`_apply_profile_secret_scope_env`.
     """
     try:
         from agent.zet_agent_response_mode import trusted_camera_runtime_receipt

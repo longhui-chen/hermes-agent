@@ -28755,23 +28755,6 @@ def _start_gateway_cron_schedulers(
     ]
 
 
-def _prepare_trusted_video_edit_runtime_before_gateway_threads() -> bool:
-    """Prepare the trusted video worker while the gateway is single-threaded."""
-    if not os.environ.get("ZETTLAB_PRESETS_DIR"):
-        return False
-    try:
-        from tools import terminal_tool
-
-        terminal_tool._late_prepare_video_edit_worker_before_terminal()
-        return True
-    except Exception as exc:
-        logger.warning(
-            "Trusted video-edit runtime unavailable during gateway startup: %s",
-            type(exc).__name__,
-        )
-        return False
-
-
 async def start_gateway(
     config: Optional[GatewayConfig] = None,
     replace: bool = False,
@@ -28967,11 +28950,6 @@ async def start_gateway(
         sync_skills(quiet=True)
     except Exception:
         pass
-
-    # The trusted worker must fork from a single-threaded CPython process.
-    # Centralized logging starts a queue-listener thread, so this preparation
-    # must also happen before setup_logging().
-    _prepare_trusted_video_edit_runtime_before_gateway_threads()
 
     # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
     # and gateway.log (INFO+, gateway-component records only).

@@ -10,7 +10,6 @@ from pathlib import Path
 
 import hermes_cli.plugins as plugins_mod
 import model_tools
-from agent.trusted_tool_result import TrustedToolResult
 
 
 _UNSET = object()
@@ -135,38 +134,6 @@ def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
         ("post_tool_call", '{"raw": "value"}'),
         ("transform_tool_result", '{"raw": "value"}'),
     ]
-
-
-def test_transform_preserves_process_local_trusted_metadata(monkeypatch):
-    raw = TrustedToolResult(
-        '{"raw":"failure"}',
-        terminal_failure_reason="workflow_checkpoint_identity_invalid",
-    )
-
-    observed = {}
-
-    def _hook(hook_name, **kwargs):
-        if hook_name == "transform_tool_result":
-            observed.update(kwargs)
-            return ['{"model":"rewritten"}']
-        return []
-
-    out = _run_handle_function_call(
-        monkeypatch,
-        tool_name="terminal",
-        dispatch_result=raw,
-        invoke_hook=_hook,
-        turn_id="turn-42",
-        api_request_id="req-42",
-    )
-
-    assert isinstance(out, TrustedToolResult)
-    assert out == '{"model":"rewritten"}'
-    assert out.terminal_failure_reason == "workflow_checkpoint_identity_invalid"
-    assert observed["session_id"] == "s1"
-    assert observed["turn_id"] == "turn-42"
-    assert observed["api_request_id"] == "req-42"
-    assert observed["result"] == '{"raw":"failure"}'
 
 
 def test_dispatch_wrapper_is_inside_plugin_boundary(monkeypatch):

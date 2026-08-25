@@ -1,0 +1,19 @@
+name: video_edit
+version: 1.0.0
+description: "Zettlab Memo video editing tools: preferences, asset upload, rendered projects, recovery, and weekly silent delivery."
+author: Zettlab
+kind: backend
+provides_tools:
+  - video_edit_preferences_resolve
+  - video_edit_preferences_update
+  - video_edit_preferences_record_success
+  - video_edit_upload_assets
+  - video_edit_create_project
+  - video_edit_wait_project
+  - video_edit_download_result
+  - video_edit_proactive_resolve
+  - video_edit_proactive_report
+metadata:
+  hermes:
+    tags: [video, editing, vlog, memory, zettlab]
+    related_skills: [video-edit-workflow-mini, file-search]

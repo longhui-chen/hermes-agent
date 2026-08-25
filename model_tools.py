@@ -1288,6 +1288,7 @@ def handle_function_call(
     dispatch_wrapper: Optional[
         Callable[[str, Dict[str, Any], Callable[[], Any]], Any]
     ] = None,
+    search_memory_manager: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1312,6 +1313,9 @@ def handle_function_call(
         dispatch_wrapper: Internal boundary around the raw registry handler.
                        It runs inside tool-execution middleware and before
                        post/transform hooks, with the final dispatched args.
+        search_memory_manager: Internal per-agent memory manager threaded only
+                       to the search_memory registry handler. This keeps
+                       provider-backed supplemental recall session-scoped.
 
     Returns:
         Function result as a JSON string.
@@ -1403,6 +1407,7 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 dispatch_wrapper=dispatch_wrapper,
+                search_memory_manager=search_memory_manager,
             )
 
     _tool_original_args = dict(function_args)
@@ -1514,7 +1519,6 @@ def handle_function_call(
         # to wrap every tool manually.  We use monotonic() so the value is
         # unaffected by wall-clock adjustments during the call.
         _dispatch_start = time.monotonic()
-        trusted_dispatch_result = None
         _approval_tokens = None
         try:
             from tools.approval import (
@@ -1533,7 +1537,6 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    nonlocal trusted_dispatch_result
                     def _registry_dispatch() -> Any:
                         return registry.dispatch(
                             function_name, next_args,
@@ -1547,43 +1550,38 @@ def handle_function_call(
                         )
 
                     if dispatch_wrapper is not None:
-                        dispatched = dispatch_wrapper(
+                        return dispatch_wrapper(
                             function_name,
                             next_args,
                             _registry_dispatch,
                         )
-                    else:
-                        dispatched = _registry_dispatch()
-                    from agent.trusted_tool_result import TrustedToolResult
-                    if isinstance(dispatched, TrustedToolResult):
-                        trusted_dispatch_result = dispatched
-                    return dispatched
+                    return _registry_dispatch()
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    nonlocal trusted_dispatch_result
                     def _registry_dispatch() -> Any:
+                        dispatch_kwargs = {
+                            "task_id": task_id,
+                            "session_id": session_id,
+                            "user_task": user_task,
+                            "previous_assistant_message": previous_assistant_message,
+                            "turn_id": turn_id,
+                            "tool_call_id": tool_call_id,
+                        }
+                        if function_name == "search_memory":
+                            dispatch_kwargs["memory_manager"] = search_memory_manager
                         return registry.dispatch(
-                            function_name, next_args,
-                            task_id=task_id,
-                            session_id=session_id,
-                            user_task=user_task,
-                            previous_assistant_message=previous_assistant_message,
-                            turn_id=turn_id,
-                            tool_call_id=tool_call_id,
+                            function_name,
+                            next_args,
+                            **dispatch_kwargs,
                         )
 
                     if dispatch_wrapper is not None:
-                        dispatched = dispatch_wrapper(
+                        return dispatch_wrapper(
                             function_name,
                             next_args,
                             _registry_dispatch,
                         )
-                    else:
-                        dispatched = _registry_dispatch()
-                    from agent.trusted_tool_result import TrustedToolResult
-                    if isinstance(dispatched, TrustedToolResult):
-                        trusted_dispatch_result = dispatched
-                    return dispatched
+                    return _registry_dispatch()
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
@@ -1599,12 +1597,6 @@ def handle_function_call(
                     tool_call_id=tool_call_id or "",
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
-                )
-            if trusted_dispatch_result is not None:
-                from agent.trusted_tool_result import preserve_trusted_tool_result
-                result = preserve_trusted_tool_result(
-                    trusted_dispatch_result,
-                    result,
                 )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
@@ -1656,14 +1648,7 @@ def handle_function_call(
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
-                        if trusted_dispatch_result is not None:
-                            from agent.trusted_tool_result import preserve_trusted_tool_result
-                            result = preserve_trusted_tool_result(
-                                trusted_dispatch_result,
-                                hook_result,
-                            )
-                        else:
-                            result = hook_result
+                        result = hook_result
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)

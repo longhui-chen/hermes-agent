@@ -15,7 +15,6 @@ from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
-from agent.trusted_tool_result import TrustedToolResult
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -271,22 +270,6 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return False, ""
 
 
-def _trusted_runtime_terminal_failure(tool_name: str, result: str | None) -> bool:
-    """Recognize a trusted runner's non-retryable input/state exit.
-
-    ``terminal_tool`` adds ``video_edit_runtime_direct`` only after the command
-    passed the signed video-runtime boundary. The trusted helper itself marks a
-    non-retryable workflow input/state response with ``terminal_failure``; exit
-    codes alone are intentionally not treated as control flow because some
-    trusted helpers use exit code 2 for recoverable input guidance.
-    """
-    return (
-        tool_name == "terminal"
-        and isinstance(result, TrustedToolResult)
-        and bool(result.terminal_failure_reason)
-    )
-
-
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
@@ -376,21 +359,6 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
-
-        if _trusted_runtime_terminal_failure(tool_name, result):
-            decision = ToolGuardrailDecision(
-                action="halt",
-                code="trusted_runtime_terminal_failure",
-                message=(
-                    "The trusted workflow runner rejected its input or state. "
-                    "Stop retrying this tool and report the blocker to the user."
-                ),
-                tool_name=tool_name,
-                count=1,
-                signature=signature,
-            )
-            self._halt_decision = decision
-            return decision
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1

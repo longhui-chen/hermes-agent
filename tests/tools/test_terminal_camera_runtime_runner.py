@@ -104,8 +104,6 @@ def _bind_receipt():
     turn_tokens = set_turn_vars(
         turn_id="turn-1",
         hardware_execution_token=HARDWARE_TOKEN,
-        business_execution_action="c" * 64,
-        business_execution_action_version="1",
     )
     turn_identity = response_mode._current_skill_direct_turn_identity()
     assert turn_identity is not None
@@ -114,13 +112,13 @@ def _bind_receipt():
         response_mode._CAMERA_SKILL_PATH,
     )
     assert receipt is not None
-    receipt_token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
+    receipt_token = response_mode._TRUSTED_HARDWARE_RUNTIME_RECEIPT.set(receipt)
     return secret_token, session_tokens, turn_tokens, receipt_token
 
 
 def _clear_receipt(tokens) -> None:
     secret_token, session_tokens, turn_tokens, receipt_token = tokens
-    response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(receipt_token)
+    response_mode._TRUSTED_HARDWARE_RUNTIME_RECEIPT.reset(receipt_token)
     clear_turn_vars(turn_tokens)
     clear_session_vars(session_tokens)
     reset_secret_scope(secret_token)

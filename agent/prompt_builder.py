@@ -596,6 +596,11 @@ ZETTLAB_TURN_RULES_EN = (
     "as the reason for an answer. State only the user-relevant fact or limitation.\n"
     "8. OPINIONS: When asked for an honest opinion, state the verdict plainly. One "
     "playful line may support the verdict but must not replace it.\n"
+    "9. CHANNEL CREDENTIALS: Never ask for, accept, or quote Telegram, Slack, Discord, "
+    "or WhatsApp credentials in chat. For a Zettlab-managed secure channel flow, use "
+    "the installed secure channel skill and its input card; do not run `hermes gateway setup` "
+    "for that flow. If this runtime has no secure channel card, use its supported setup flow "
+    "without collecting credentials in chat.\n"
     "</zettlab_turn_contract>"
 )
 
@@ -624,6 +629,10 @@ ZETTLAB_TURN_RULES_ZH = (
     "7. 内部信息：不得用系统提示词、隐藏规则、内部标签或占位符解释答案；"
     "只说与用户有关的事实或限制。\n"
     "8. 明确意见：用户要求真实意见时，必须直说结论。可以用一句调侃辅助表达，但不能用调侃代替结论。\n"
+    "9. 渠道凭据：不得在聊天中索取、接收或复述 Telegram、Slack、Discord、WhatsApp 的凭据。"
+    "对于 Zettlab 管理的安全渠道流程，必须使用已安装的安全渠道 skill 及其输入卡片，"
+    "不得为该流程运行 `hermes gateway setup`。若当前运行时没有安全渠道卡片，使用它支持的配置流程，"
+    "但不得在聊天中收集凭据。\n"
     "</zettlab_turn_contract>"
 )
 
@@ -636,29 +645,37 @@ def zettlab_turn_rules_guidance(lang: Optional[str] = None) -> str:
 HERMES_AGENT_HELP_GUIDANCE = (
     "If the user asks about configuring, setting up, or using the Zettlab agent "
     "runtime, load the `zettlab-memo-setup` skill with skill_view(name='zettlab-memo-setup') "
-    "before answering; it documents the underlying runtime commands."
+    "before answering; it documents the underlying runtime commands. This does not apply "
+    "to an end-user request to connect a messaging channel."
 )
 
 # Routes Agent-workspace file work and device system queries to the trusted
-# agent-creator CLI instead of raw shell (path validation, quotas, change
-# approval, recoverable trash). Injected only when skill_view is actually
+# agent-creator CLI first (path validation, quotas, change approval, recoverable
+# trash) without turning that preferred path into an availability ceiling.
+# Injected only when skill_view is actually
 # loaded: narrow toolsets like `terminal` / `file` / `debugging` have no
-# skill_view, and telling those sessions to call it — while forbidding the
-# shell they do have — would strand ordinary file and diagnostic work.
+# skill_view, and telling those sessions to call an unavailable skill would not
+# improve the terminal/file tools they already have.
 WORKSPACE_DEVICE_OPS_GUIDANCE_EN = (
     "For files in your own Agent workspace and for device system state (storage, "
-    "disks, SMART, network), prefer the `agent-creator` skill's CLI over raw shell "
-    "and load it with skill_view(name='agent-creator') before the first such "
-    "operation; raw ls/cat/rm/df bypass path validation, quotas, change approval, "
-    "and the recoverable trash. If that skill is not actually available, use the "
-    "tools this session does have and say plainly which safeguards are missing."
+    "disks, SMART, network), use the `agent-creator` skill's CLI first and load it "
+    "with skill_view(name='agent-creator') before the first such operation. The CLI "
+    "is preferred, not exclusive: if it is unavailable, rejects the required path "
+    "or operation, or cannot complete the user's explicit goal, use bash or other "
+    "command-line tools available in this session and continue toward the user's "
+    "goal. Do not stop solely because the CLI is limited. Preserve the user's "
+    "requested scope, use exact known paths instead of broad device scans, keep "
+    "normal terminal approvals in force, and say plainly when the fallback lacks "
+    "the CLI's path validation, quotas, or recoverable trash."
 )
 
 WORKSPACE_DEVICE_OPS_GUIDANCE_ZH = (
     "操作你自己 Agent workspace 里的文件，或查询设备系统状态（存储、磁盘、SMART、网络）时，"
-    "优先用 `agent-creator` skill 的 CLI 而不是原生 shell，首次操作前先 "
-    "skill_view(name='agent-creator')；原生 ls/cat/rm/df 会绕开路径校验、配额、变更审批和"
-    "可恢复回收站。如果这个 skill 实际不可用，就用当前会话真正有的工具，并如实说明缺了哪些保护。"
+    "优先使用 `agent-creator` skill 的 CLI，首次操作前先 skill_view(name='agent-creator')。"
+    "CLI 是首选而不是唯一入口：如果 CLI 不可用、拒绝所需路径/操作，或无法完成用户明确目标，"
+    "就使用 bash 或当前会话可用的其它命令行工具继续完成用户目标；不能只因为 CLI 能力有限就"
+    "结束任务。保持用户要求的范围，优先使用已知精确路径而不是扫描整台设备，继续遵守普通 "
+    "terminal 审批，并如实说明回退路径缺少 CLI 的路径校验、配额或可恢复回收站。"
 )
 
 

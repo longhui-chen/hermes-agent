@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Write a markdown plan to .hermes/plans/; no execution.
+description: "把执行计划写入 .hermes/plans/，但不执行任务。"
 version: 2.0.0
 author: Hermes Agent (writing-craft adapted from obra/superpowers)
 license: MIT

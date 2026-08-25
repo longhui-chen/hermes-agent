@@ -163,6 +163,66 @@ def test_silent_automation_uses_minimal_positive_tool_allowlist():
     } == {"terminal"}
 
 
+def test_silent_video_turn_exposes_ordinary_plugin_tools_without_skill_view():
+    def tool(name):
+        return {"type": "function", "function": {"name": name}}
+
+    video_names = {
+        "video_edit_preferences_resolve",
+        "video_edit_upload_assets",
+        "video_edit_create_project",
+        "video_edit_wait_project",
+        "video_edit_download_result",
+    }
+    agent = type("Agent", (), {})()
+    agent.tools = [
+        tool(name)
+        for name in (*video_names, "video_edit_evil_plugin_tool", "skill_view", "terminal")
+    ]
+    agent.valid_tool_names = {
+        item["function"]["name"] for item in agent.tools
+    }
+
+    _apply_execution_policy(
+        agent,
+        "silent_automation",
+        trusted_skill_slug="video-edit-workflow-mini",
+    )
+
+    assert agent.valid_tool_names == video_names
+    assert {
+        item["function"]["name"] for item in agent.tools
+    } == video_names
+    assert agent._zet_agent_video_edit_turn is True
+    assert "skill_view" not in agent.valid_tool_names
+    assert "terminal" not in agent.valid_tool_names
+    assert "video_edit_evil_plugin_tool" not in agent.valid_tool_names
+
+
+def test_silent_video_policy_rejects_prefixed_skill_slug():
+    def tool(name):
+        return {"type": "function", "function": {"name": name}}
+
+    agent = type("Agent", (), {})()
+    agent.tools = [
+        tool("video_edit_upload_assets"),
+        tool("skill_view"),
+        tool("terminal"),
+    ]
+    agent.valid_tool_names = {
+        item["function"]["name"] for item in agent.tools
+    }
+
+    _apply_execution_policy(
+        agent,
+        "silent_automation",
+        trusted_skill_slug="video-edit-evil",
+    )
+
+    assert agent._zet_agent_video_edit_turn is False
+    assert agent.valid_tool_names == {"skill_view"}
+
+
 def test_unknown_execution_policy_leaves_tool_snapshot_unchanged():
     tools = [{"type": "function", "function": {"name": "clarify"}}]
     agent = type("Agent", (), {})()
@@ -311,14 +371,10 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
             self.session_total_tokens = 0
 
         def run_conversation(self, **_kwargs):
-            from gateway.session_context import (
-                business_execution_action,
-                execution_policy,
-            )
+            from gateway.session_context import execution_policy
 
             observed.update(
                 {
-                    "business_action": business_execution_action(),
                     "execution_policy": execution_policy(),
                     "persist_disabled": self._persist_disabled,
                     "session_db": self._session_db,
@@ -369,8 +425,6 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
         session_id="api-lineage-tip",
         gateway_session_key="zettlab:owner:agent:stable",
         turn_id="pvm-" + "a" * 24,
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
         execution_policy="silent_automation",
         plan_ack={
             "turn_id": "plan-turn-1",
@@ -383,7 +437,6 @@ async def test_cancelled_silent_turn_keeps_full_agent_isolation(monkeypatch):
     assert constructed[0]["skip_memory"] is True
     assert constructed[0]["strict_memory_isolation"] is True
     assert observed == {
-        "business_action": "",
         "execution_policy": "silent_automation",
         "persist_disabled": True,
         "session_db": None,
@@ -728,18 +781,12 @@ async def test_zet_agent_scopes_and_revokes_hardware_capability(monkeypatch):
 
     async def fake_run_agent(self, **kwargs):
         del self
-        from gateway.session_context import (
-            business_execution_action,
-            business_execution_action_version,
-            hardware_execution_token,
-        )
+        from gateway.session_context import hardware_execution_token
 
         observed.append(
             {
                 "kwargs": kwargs,
                 "hardware_token": hardware_execution_token(),
-                "business_action": business_execution_action(),
-                "action_version": business_execution_action_version(),
             }
         )
         return (
@@ -767,15 +814,9 @@ async def test_zet_agent_scopes_and_revokes_hardware_capability(monkeypatch):
         turn_id="camera-cancel-turn",
         plan_ack={"status": "cancelled", "turn_id": "camera-plan-turn"},
         hardware_execution_token=hardware_token,
-        business_execution_action="a" * 64,
-        business_execution_action_version="1",
     )
 
     assert observed[0]["hardware_token"] == hardware_token
-    assert observed[0]["business_action"] == ""
     assert observed[0]["kwargs"]["hardware_execution_token"] == hardware_token
     assert observed[1]["hardware_token"] == ""
-    assert observed[1]["business_action"] == ""
-    assert observed[1]["action_version"] == ""
     assert observed[1]["kwargs"]["hardware_execution_token"] == ""
-    assert observed[1]["kwargs"]["business_execution_action"] == ""
