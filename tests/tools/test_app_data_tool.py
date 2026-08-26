@@ -21,10 +21,12 @@ from tools.app_data_tool import (
     _OPERATION_RE,
     _READ_TIMEOUT,
     _SLUG_RE,
+    _approval_result,
     _base_url,
     _check_app_data,
     _is_cron_session,
     _is_trusted_zet_agent_session,
+    _validate_document,
     app_data_tool,
 )
 
@@ -482,6 +484,76 @@ def test_read_invoke_uses_declared_route_and_profile_token(monkeypatch):
     assert "stale-" not in request_fingerprint(invoke_request)
 
 
+def test_invoke_forwards_turn_execution_headers(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars,
+        clear_turn_vars,
+        set_session_vars,
+        set_turn_vars,
+    )
+
+    seen = []
+    session_tokens = set_session_vars(
+        platform="zet_agent",
+        session_id="session-1",
+        session_key="zettlab:user-1:profile-agent:conversation-1",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1",
+        business_execution_token="b" * 64,
+    )
+    try:
+        with mux_profile_scope(monkeypatch, _scope()), patch(
+            "tools.app_data_tool._urlopen",
+            _sequence(
+                seen,
+                _capabilities((_READ_OPERATION, "read")),
+                {"items": []},
+            ),
+        ):
+            output = json.loads(app_data_tool({
+                "action": "invoke",
+                "slug": _SLUG,
+                "operation": _READ_OPERATION,
+            }))
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+
+    assert output["ok"] is True
+    _, invoke_request = [item[0] for item in seen]
+    assert invoke_request.get_header("X-zettlab-business-execution-token") == "b" * 64
+    assert invoke_request.get_header("X-hermes-turn-id") == "turn-1"
+    assert invoke_request.get_header("X-hermes-session-id") == "session-1"
+    assert invoke_request.get_header("X-hermes-session-key") == (
+        "zettlab:user-1:profile-agent:conversation-1"
+    )
+
+
+def test_operation_transport_fields_match_local_server_contract():
+    payload = {
+        "prompt_version": "focus-v1",
+        "usage": {"input_tokens": 320, "output_tokens": 120},
+    }
+    assert _validate_document(
+        "payload", payload, operation="focus_analysis.apply"
+    ) == payload
+    assert _validate_document(
+        "payload",
+        {"usage": {"input_tokens": 12, "output_tokens": 4}},
+        operation="decision_run.resume",
+    ) == {"usage": {"input_tokens": 12, "output_tokens": 4}}
+
+    with pytest.raises(ValueError, match="受保护字段"):
+        _validate_document("payload", payload, operation="records.store")
+    with pytest.raises(ValueError, match="受保护字段"):
+        _validate_document(
+            "payload",
+            {"nested": {"prompt_version": "focus-v1"}},
+            operation="focus_analysis.apply",
+        )
+
+
 @pytest.mark.parametrize(
     "args,message",
     [
@@ -745,6 +817,36 @@ def test_mutation_requires_key_then_approval_and_carries_exact_envelope(monkeypa
         "capability_digest": _CAPABILITY_DIGEST,
         **approval_envelope,
     }
+
+
+def test_focus_mutation_approval_hides_runtime_fields(monkeypatch):
+    envelope = {
+        "payload": {
+            "focus_id": "focus-private-123",
+            "expected_revision": 6,
+        },
+        "idempotency_key": "private-key-123",
+    }
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.approval.request_tool_approval",
+        return_value={"approved": True},
+    ) as request:
+        result = _approval_result(
+            "plaud-action-dashboard",
+            "focus_attachment.import",
+            envelope,
+        )
+
+    assert result == {"approved": True}
+    _, reason = request.call_args.args
+    kwargs = request.call_args.kwargs
+    assert reason == "把这张图片加入当前焦点会修改本地保存的数据。"
+    assert kwargs["display_target"] == "把这张图片加入当前焦点"
+    assert kwargs["rule_key"].startswith("app_data:focus_attachment.import:")
+    visible = f'{reason}\n{kwargs["display_target"]}'
+    assert "focus-private-123" not in visible
+    assert "private-key-123" not in visible
+    assert "expected_revision" not in visible
 
 
 def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypatch):

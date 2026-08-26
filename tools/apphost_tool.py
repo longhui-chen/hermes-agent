@@ -512,6 +512,7 @@ def _execution_headers():
         identity = current_turn_identity()
         turn_id = identity[0] if identity else ""
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+        session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
     except Exception:
         return {}
     headers = {}
@@ -521,6 +522,8 @@ def _execution_headers():
         headers["X-Hermes-Turn-Id"] = str(turn_id)
     if session_id:
         headers["X-Hermes-Session-Id"] = session_id
+    if session_key:
+        headers["X-Hermes-Session-Key"] = session_key
     return headers
 
 
