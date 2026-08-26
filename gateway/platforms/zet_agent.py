@@ -4094,12 +4094,19 @@ class ZetAgentAdapter(APIServerAdapter):
             )
 
         agent_init_started_mono = time.monotonic()
+        agent_shell_timing = _prestream_timing_context.get()
+        try:
+            if agent_shell_timing is not None:
+                agent_shell_timing.agent_shell_started()
+        except Exception:
+            agent_shell_timing = None
         onboarding_cache_key = None
         runtime_cache_key = None
         runtime_cache_signature = ""
         runtime_cache_message_count = None
         runtime_cache_lease = None
         runtime_cache_reason = "bypass"
+        agent_shell_outcome = "created"
         agent = None
         if onboarding_fast_path:
             onboarding_cache_key = (
@@ -4118,6 +4125,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 session_owner_id,
             )
             agent = self._cached_onboarding_agent(onboarding_cache_key)
+            if agent is not None:
+                agent_shell_outcome = "onboarding_cache_hit"
         else:
             api_credential = runtime_kwargs.get("api_key")
             unsupported_runtime = (
@@ -4188,6 +4197,8 @@ class ZetAgentAdapter(APIServerAdapter):
                     agent = None
                     runtime_cache_lease = None
                     runtime_cache_reason = "unsafe_cached_state"
+                elif agent is not None:
+                    agent_shell_outcome = "runtime_cache_hit"
             elif _zet_runtime_shell_cache_allowed.get():
                 if unsupported_runtime:
                     runtime_cache_reason = "unsupported_runtime"
@@ -4203,7 +4214,12 @@ class ZetAgentAdapter(APIServerAdapter):
                     runtime_cache_reason = "session_db_unavailable"
         reused_onboarding_agent = agent is not None
         if agent is None:
-            agent = AIAgent(**agent_kwargs)
+            try:
+                agent = AIAgent(**agent_kwargs)
+            except BaseException:
+                if agent_shell_timing is not None:
+                    agent_shell_timing.agent_shell_finished("error")
+                raise
             if onboarding_cache_key is not None:
                 self._publish_onboarding_agent(onboarding_cache_key, agent)
             elif runtime_cache_key is not None:
@@ -4250,6 +4266,8 @@ class ZetAgentAdapter(APIServerAdapter):
             agent.session_estimated_cost_usd = 0.0
             agent.session_cost_status = "unknown"
             agent.session_cost_source = "none"
+        if agent_shell_timing is not None:
+            agent_shell_timing.agent_shell_finished(agent_shell_outcome)
         if isinstance(runtime_cache_lease, RuntimeShellLease):
             agent._zet_runtime_shell_lease = runtime_cache_lease
             agent._zet_runtime_shell_session_id = str(session_id or "")

@@ -138,6 +138,48 @@ def test_stage_delays_only_populate_their_own_duration_fields() -> None:
     assert payload["explicit_skill"] is True
 
 
+def test_agent_init_substages_partition_prepare_shell_and_post_bind() -> None:
+    clock = _Clock()
+    logger = _CapturingLogger()
+    timing = PrestreamTiming(logger=logger, clock=clock)
+
+    timing.agent_init_started()
+    clock.advance_ms(5)
+    timing.agent_shell_started()
+    clock.advance_ms(11)
+    timing.agent_shell_finished("created")
+    clock.advance_ms(7)
+    timing.agent_init_finished()
+    timing.public_write_completed(timing.semantic_observed("content"))
+
+    payload = _payload(logger)
+    assert payload["agent_init_ms"] == 23
+    assert payload["agent_prepare_ms"] == 5
+    assert payload["agent_shell_ms"] == 11
+    assert payload["agent_post_bind_ms"] == 7
+    assert payload["agent_shell_outcome"] == "created"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["created", "runtime_cache_hit", "onboarding_cache_hit"],
+)
+def test_agent_shell_outcome_is_bounded_without_runtime_details(outcome: str) -> None:
+    logger = _CapturingLogger()
+    timing = PrestreamTiming(logger=logger)
+    timing.agent_init_started()
+    timing.agent_shell_started()
+    timing.agent_shell_finished(outcome)
+    timing.agent_init_finished()
+    timing.public_write_completed(timing.semantic_observed("content"))
+
+    payload = _payload(logger)
+    assert payload["agent_shell_outcome"] == outcome
+    rendered = logger.records[0]
+    assert "api_key" not in rendered.lower()
+    assert "base_url" not in rendered.lower()
+
+
 def test_provider_dispatch_wait_is_first_wins_and_counts_retries() -> None:
     clock = _Clock()
     logger = _CapturingLogger()
