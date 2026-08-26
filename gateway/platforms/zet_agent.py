@@ -1155,6 +1155,31 @@ class ZetAgentAdapter(APIServerAdapter):
         return hashlib.sha256(encoded).hexdigest()
 
     @classmethod
+    def _runtime_shell_cache_keys(
+        cls,
+        *,
+        user_config: Dict[str, Any],
+        runtime_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return cache keys normalized to the effective runtime values."""
+        from gateway.run import GatewayRunner
+
+        cache_keys = GatewayRunner._extract_cache_busting_config(user_config)
+        # A session model override carries its context window as the explicit
+        # constructor argument. The raw profile config may omit that duplicate
+        # key before prewarm and expose it through a later resolved snapshot;
+        # both still construct the same runtime. Keep the effective value in
+        # the signature so a genuine context-window change continues to bust.
+        if "config_context_length" in runtime_kwargs:
+            cache_keys["model.context_length"] = runtime_kwargs[
+                "config_context_length"
+            ]
+        # MCP registry changes refresh the cached agent's tool snapshot in the
+        # next turn prologue. They do not require destroying its model client.
+        cache_keys.pop("tools.registry_generation", None)
+        return cache_keys
+
+    @classmethod
     def _runtime_shell_signature(
         cls,
         *,
@@ -1171,10 +1196,10 @@ class ZetAgentAdapter(APIServerAdapter):
         """Hash constructor-stable state without retaining plaintext secrets."""
         from gateway.run import GatewayRunner
 
-        cache_keys = GatewayRunner._extract_cache_busting_config(user_config)
-        # MCP registry changes refresh the cached agent's tool snapshot in the
-        # next turn prologue.  They do not require destroying its model client.
-        cache_keys.pop("tools.registry_generation", None)
+        cache_keys = cls._runtime_shell_cache_keys(
+            user_config=user_config,
+            runtime_kwargs=runtime_kwargs,
+        )
         cache_keys.update({
             "zet.fallback": cls._runtime_shell_digest(fallback_model),
             "zet.account": cls._runtime_shell_digest(account_id),
@@ -4371,10 +4396,10 @@ class ZetAgentAdapter(APIServerAdapter):
                         agent_kwargs.get("deep_memory_subject") or ""
                     ),
                 )
-                diagnostic_cache_keys = (
-                    GatewayRunner._extract_cache_busting_config(user_config)
+                diagnostic_cache_keys = self._runtime_shell_cache_keys(
+                    user_config=user_config,
+                    runtime_kwargs=runtime_kwargs,
                 )
-                diagnostic_cache_keys.pop("tools.registry_generation", None)
                 runtime_cache_diagnostics = {
                     "signature": self._runtime_shell_digest(
                         runtime_cache_signature

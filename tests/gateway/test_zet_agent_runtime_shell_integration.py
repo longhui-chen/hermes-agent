@@ -248,6 +248,54 @@ def test_session_prewarm_populates_only_the_exact_identity_shell_without_running
     }
 
 
+def test_session_prewarm_uses_effective_context_length_for_config_signature(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, _db, runtime, retired, _home = runtime_adapter
+    runtime["config_context_length"] = 200_000
+    configs = iter((
+        {},
+        {"model": {"context_length": 200_000}},
+        {"model": {"context_length": 200_000}},
+    ))
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: next(configs),
+    )
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._prewarm_runtime_shell_sync("session-1") is True
+        warmed = _FakeAgent.constructed[0]
+        same_identity = _interactive_create(
+            adapter,
+            session_id="session-1",
+            gateway_session_key="session-1",
+        )
+        assert same_identity is warmed
+        adapter._finish_runtime_shell_turn(same_identity, reusable=True)
+
+        runtime["config_context_length"] = 256_000
+        changed_runtime = _interactive_create(
+            adapter,
+            session_id="session-1",
+            gateway_session_key="session-1",
+        )
+        assert changed_runtime is not warmed
+        adapter._finish_runtime_shell_turn(changed_runtime, reusable=True)
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert len(_FakeAgent.constructed) == 2
+    assert retired == [warmed]
+
+
 def test_runtime_shell_prompt_rebind_invalidates_built_prompt_without_reconstruction(
     runtime_adapter,
 ):
