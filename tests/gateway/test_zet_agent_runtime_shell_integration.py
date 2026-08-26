@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -344,7 +345,7 @@ async def test_public_run_agent_hits_exact_prewarm_with_real_prompt_and_context_
     runtime_adapter,
     monkeypatch,
 ):
-    adapter, db, _runtime, retired, _home = runtime_adapter
+    adapter, db, _runtime, retired, profile_home = runtime_adapter
     monkeypatch.setattr(adapter, "_effective_model", lambda *_args: "")
     monkeypatch.setattr(
         "tools.zettlab_snapshot_guard.finish_turn", lambda *_args, **_kwargs: None
@@ -358,7 +359,10 @@ async def test_public_run_agent_hits_exact_prewarm_with_real_prompt_and_context_
     deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
     deep_subject_token = _deep_memory_subject.set("account-a")
     try:
-        assert adapter._prewarm_runtime_shell_sync("session-1") is True
+        assert await adapter._prewarm_runtime_shell(
+            "session-1",
+            str(profile_home),
+        ) is True
         result, _usage = await adapter._run_agent(
             user_message="[ZETTLAB:test] first",
             conversation_history=[],
@@ -382,6 +386,58 @@ async def test_public_run_agent_hits_exact_prewarm_with_real_prompt_and_context_
         "idle": 1,
         "leased": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_async_session_prewarm_passes_authoritative_profile_home_to_worker(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, _db, _runtime, _retired, profile_home = runtime_adapter
+    calls = []
+
+    def fake_sync(session_id: str, profile_home_key: str) -> bool:
+        calls.append((session_id, profile_home_key))
+        return True
+
+    monkeypatch.setattr(adapter, "_prewarm_runtime_shell_sync", fake_sync)
+
+    assert await adapter._prewarm_runtime_shell(
+        "session-1",
+        str(profile_home),
+    ) is True
+    assert calls == [("session-1", str(profile_home))]
+
+
+def test_sync_session_prewarm_reenters_authoritative_profile_runtime_scope(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, _db, _runtime, _retired, profile_home = runtime_adapter
+    entered = []
+
+    @contextmanager
+    def fake_profile_scope(home):
+        entered.append(Path(home))
+        yield
+
+    monkeypatch.setattr("gateway.run._profile_runtime_scope", fake_profile_scope)
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._prewarm_runtime_shell_sync(
+            "session-1",
+            str(profile_home),
+        ) is True
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert entered == [profile_home]
 
 
 def test_session_prewarm_releases_a_runtime_that_cannot_enter_the_cache(
@@ -418,7 +474,7 @@ async def test_session_prewarm_scheduler_deduplicates_caps_and_releases_profile_
     }
     started = []
 
-    async def fake_prewarm(session_id: str) -> bool:
+    async def fake_prewarm(session_id: str, _profile_home_key: str) -> bool:
         started.append(session_id)
         await releases[session_id].wait()
         return True
@@ -459,7 +515,10 @@ async def test_session_prewarm_scheduler_releases_profile_barrier_after_failure(
 ):
     adapter, _db, _runtime, _retired, profile_home = runtime_adapter
 
-    async def failing_prewarm(_session_id: str) -> bool:
+    async def failing_prewarm(
+        _session_id: str,
+        _profile_home_key: str,
+    ) -> bool:
         raise RuntimeError("private prewarm failure")
 
     monkeypatch.setattr(adapter, "_prewarm_runtime_shell", failing_prewarm)

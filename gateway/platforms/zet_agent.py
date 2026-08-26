@@ -1399,8 +1399,18 @@ class ZetAgentAdapter(APIServerAdapter):
             str(_deep_memory_subject.get() or "").strip(),
         ))
 
-    def _prewarm_runtime_shell_sync(self, session_id: str) -> bool:
+    def _prewarm_runtime_shell_sync(
+        self,
+        session_id: str,
+        profile_home_key: str = "",
+    ) -> bool:
         """Build and release one exact session shell without running an LLM turn."""
+        if profile_home_key:
+            from gateway.run import _profile_runtime_scope
+
+            with _profile_runtime_scope(Path(profile_home_key)):
+                return self._prewarm_runtime_shell_sync(session_id)
+
         from gateway.session_context import (
             clear_session_vars,
             suppress_current_session_id_env_mirror,
@@ -1455,10 +1465,12 @@ class ZetAgentAdapter(APIServerAdapter):
     async def _prewarm_runtime_shell(
         self,
         session_id: str,
+        profile_home_key: str,
     ) -> bool:
         return await _to_thread_with_completion_barrier(
             self._prewarm_runtime_shell_sync,
             session_id,
+            profile_home_key,
         )
 
     async def _run_scheduled_runtime_shell_prewarm(
@@ -1467,7 +1479,10 @@ class ZetAgentAdapter(APIServerAdapter):
         profile_home_key: str,
     ) -> bool:
         try:
-            return await self._prewarm_runtime_shell(session_id)
+            return await self._prewarm_runtime_shell(
+                session_id,
+                profile_home_key,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
