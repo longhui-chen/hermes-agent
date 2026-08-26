@@ -27,7 +27,6 @@ RestartSec=3
 TimeoutStopSec=210
 KillMode=control-group
 MemoryAccounting=true
-MemoryHigh=768M
 MemoryMax=1G
 MemorySwapMax=0
 TasksAccounting=true
