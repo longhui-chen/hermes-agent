@@ -20,8 +20,12 @@ _MANAGED_SUPERVISOR_CGROUP = "agentcomputer-supervisor"
 _CGROUP2_ROOT = Path("/sys/fs/cgroup")
 _PROC_SELF_CGROUP = Path("/proc/self/cgroup")
 _CGROUP_METADATA_MAX_BYTES = 4096
+# 必须与 zpk/init.d/zettlab-claw.service 的 Memory* / TasksMax 逐项对应，
+# tests/zpk 有一致性测试兜底。memory.high 显式要求 "max"（未设 MemoryHigh）：
+# 无 swap + 匿名页场景下 memory.high 只会罚睡不会 OOM，进程假活且
+# Restart= 永不触发（TB-20260826-001）；这里 fail-closed 挡住 drop-in 回加。
 _MANAGED_SERVICE_LIMITS = {
-    "memory.high": "805306368",
+    "memory.high": "max",
     "memory.max": "1073741824",
     "memory.swap.max": "0",
     "pids.max": "512",

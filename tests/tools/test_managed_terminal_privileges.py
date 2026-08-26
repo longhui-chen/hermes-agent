@@ -765,7 +765,7 @@ def test_managed_service_keeps_filesystem_open_for_root_commands():
     launcher = Path("zpk/libexec/hermes-secure-launcher.py").read_text(
         encoding="utf-8"
     )
-    assert '"memory.high": "805306368"' in launcher
+    assert '"memory.high": "max"' in launcher
     assert '"memory.max": "1073741824"' in launcher
     assert '"memory.swap.max": "0"' in launcher
     assert '"pids.max": "512"' in launcher

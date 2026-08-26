@@ -1638,6 +1638,43 @@ def _load_secure_launcher():
     return module
 
 
+def _systemd_size_to_bytes(value: str) -> str:
+    value = value.strip()
+    if value == "infinity":
+        return "max"
+    units = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    if value[-1].upper() in units:
+        return str(int(value[:-1]) * units[value[-1].upper()])
+    return str(int(value))
+
+
+def test_zpk_secure_launcher_limits_match_packaged_unit():
+    """launcher 校验的 cgroup 限额必须与真实 unit 一致，否则网关启动即退出 125。
+
+    TB-20260826-001：unit 删掉 MemoryHigh 后 memory.high 变成 "max"，而 launcher
+    仍要求 768M，会让 zettlab-claw 在 systemd 里无限重启。
+    """
+    launcher = _load_secure_launcher()
+    repo_root = Path(__file__).resolve().parents[2]
+    unit = (repo_root / "zpk" / "init.d" / "zettlab-claw.service").read_text(
+        encoding="utf-8"
+    )
+    directives = {}
+    for line in unit.splitlines():
+        if "=" in line and not line.startswith(("#", "[")):
+            key, _, value = line.partition("=")
+            directives[key.strip()] = value.strip()
+
+    expected = {
+        "memory.high": _systemd_size_to_bytes(directives.get("MemoryHigh", "infinity")),
+        "memory.max": _systemd_size_to_bytes(directives["MemoryMax"]),
+        "memory.swap.max": _systemd_size_to_bytes(directives["MemorySwapMax"]),
+        "pids.max": _systemd_size_to_bytes(directives["TasksMax"]),
+    }
+    assert launcher._MANAGED_SERVICE_LIMITS == expected
+    assert "MemoryHigh" not in directives
+
+
 def test_zpk_secure_launcher_is_nondumpable_without_managed_gateway(
     tmp_path: Path,
 ):
@@ -1847,7 +1884,7 @@ def _write_managed_service_limit_fixture(
     include_swap: bool = True,
 ) -> None:
     limits = {
-        "memory.high": "805306368\n",
+        "memory.high": "max\n",
         "memory.max": "1073741824\n",
         "pids.max": "512\n",
     }
