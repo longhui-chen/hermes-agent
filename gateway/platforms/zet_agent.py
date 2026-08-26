@@ -4356,6 +4356,10 @@ class ZetAgentAdapter(APIServerAdapter):
                         agent_kwargs.get("deep_memory_subject") or ""
                     ),
                 )
+                diagnostic_cache_keys = (
+                    GatewayRunner._extract_cache_busting_config(user_config)
+                )
+                diagnostic_cache_keys.pop("tools.registry_generation", None)
                 runtime_cache_diagnostics = {
                     "signature": self._runtime_shell_digest(
                         runtime_cache_signature
@@ -4365,6 +4369,10 @@ class ZetAgentAdapter(APIServerAdapter):
                     "toolsets": self._runtime_shell_digest(enabled_toolsets)[:12],
                     "config": self._runtime_shell_digest(user_config)[:12],
                     "fallback": self._runtime_shell_digest(fallback_model)[:12],
+                    "cache_keys": ",".join(
+                        f"{key}:{self._runtime_shell_digest(value)[:8]}"
+                        for key, value in sorted(diagnostic_cache_keys.items())
+                    ),
                     "identity_state": "".join(
                         "1" if value else "0"
                         for value in (
@@ -4484,7 +4492,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 "zet_agent runtime shell cache lookup: result=%s acquire=%s "
                 "profile=%s session_hash=%s message_count=%s signature=%s "
                 "model_fp=%s runtime_fp=%s toolsets_fp=%s config_fp=%s "
-                "fallback_fp=%s identities=%s entries=%d idle=%d leased=%d",
+                "fallback_fp=%s identities=%s cache_keys=%s "
+                "entries=%d idle=%d leased=%d",
                 runtime_cache_reason,
                 runtime_cache_acquire_reason,
                 active_profile,
@@ -4497,6 +4506,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 runtime_cache_diagnostics.get("config", "-"),
                 runtime_cache_diagnostics.get("fallback", "-"),
                 runtime_cache_diagnostics.get("identity_state", "-"),
+                runtime_cache_diagnostics.get("cache_keys", "-"),
                 counts["entries"],
                 counts["idle"],
                 counts["leased"],

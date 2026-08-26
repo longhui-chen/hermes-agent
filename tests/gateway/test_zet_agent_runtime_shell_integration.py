@@ -541,6 +541,11 @@ def test_runtime_shell_lookup_log_contains_only_bounded_diagnostics(
         value = message.split(f"{field}=", 1)[1].split(" ", 1)[0]
         assert len(value) == 12
         assert all(char in "0123456789abcdef" for char in value)
+    cache_keys = message.split("cache_keys=", 1)[1].split(" ", 1)[0]
+    assert "model.context_length:" in cache_keys
+    assert "compression.enabled:" in cache_keys
+    assert "memory.deep_memory_mode:" in cache_keys
+    assert "tools.registry_generation" not in cache_keys
     assert "credential-a" not in message
     assert "https://example.invalid" not in message
 
