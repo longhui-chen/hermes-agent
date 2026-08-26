@@ -2624,6 +2624,27 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+def unregister_gateway_notify_if_current(session_key: str, cb: object) -> bool:
+    """Remove one exact notifier without clobbering a newer turn's binding.
+
+    Zet runtime-shell reuse replaces the callback every turn because the
+    callback closes over that turn's SSE queue.  A defensive overlapping turn
+    may publish a newer callback before the older turn finishes, so cleanup
+    must use compare-and-remove rather than an unconditional unregister.
+    """
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        if _gateway_notify_cbs.get(state_key) is not cb:
+            return False
+        _gateway_notify_cbs.pop(state_key, None)
+        entries = _gateway_queues.pop(state_key, [])
+        for key in [key for key in _gateway_prepared if key[0] == state_key]:
+            _gateway_prepared.pop(key, None)
+    for entry in entries:
+        entry.event.set()
+    return True
+
+
 def cancel_gateway_approvals(session_key: str, choice: str = "deny") -> int:
     """Cancel every source entry and prepare lease for a session boundary."""
     state_key = _approval_state_key(session_key)

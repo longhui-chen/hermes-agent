@@ -2,7 +2,7 @@ import signal
 from unittest.mock import patch
 
 if not hasattr(signal, "SIGKILL"):
-    signal.SIGKILL = signal.SIGTERM
+    setattr(signal, "SIGKILL", signal.SIGTERM)
 
 from run_agent import AIAgent
 

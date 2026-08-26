@@ -1694,6 +1694,42 @@ def test_between_turns_refresh_requests_same_turn_snapshot_reuse():
     )
 
 
+def test_reused_zet_shell_refreshes_live_gates_with_no_registered_mcp_tools():
+    """A last-tool removal or core grant change cannot preserve old tools."""
+    agent = _FakeAgent()
+    agent._zet_runtime_shell_force_tool_refresh = True
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
+         patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        _build(agent)
+
+    refresh.assert_called_once_with(
+        agent,
+        quiet_mode=True,
+        reuse_current_turn_snapshot=True,
+    )
+    assert agent._zet_runtime_shell_force_tool_refresh is False
+
+
+def test_reused_zet_shell_tool_refresh_failure_exposes_no_stale_tools():
+    agent = _FakeAgent()
+    agent.tools = [
+        {"type": "function", "function": {"name": "revoked_write"}}
+    ]
+    agent.valid_tool_names = {"revoked_write"}
+    agent._zet_runtime_shell_force_tool_refresh = True
+
+    with patch(
+        "tools.mcp_tool.refresh_agent_mcp_tools",
+        side_effect=RuntimeError("live authorization unavailable"),
+    ):
+        _build(agent)
+
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+    assert agent._tools_disabled_for_request is True
+
+
 
 
 

@@ -416,6 +416,14 @@ def build_turn_context(
     # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
     # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
     # name and leaves the snapshot untouched on no-change).
+    force_runtime_shell_refresh = bool(
+        getattr(agent, "_zet_runtime_shell_force_tool_refresh", False)
+    )
+    if force_runtime_shell_refresh:
+        # One-shot even on failure.  A reused shell sets it again on every
+        # lease, while this turn fails closed below instead of repeatedly
+        # rebuilding inside one request.
+        agent._zet_runtime_shell_force_tool_refresh = False
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
             # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
@@ -427,16 +435,29 @@ def build_turn_context(
             # This keeps the no-MCP first turn off the heavy import path
             # without changing behavior for MCP users.
             import sys as _sys
-            if "tools.mcp_tool" in _sys.modules:
+            if force_runtime_shell_refresh or "tools.mcp_tool" in _sys.modules:
                 from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-                if has_registered_mcp_tools():
+                if force_runtime_shell_refresh or has_registered_mcp_tools():
                     refresh_agent_mcp_tools(
                         agent,
                         quiet_mode=True,
                         reuse_current_turn_snapshot=True,
                     )
     except Exception:
-        logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
+        if force_runtime_shell_refresh:
+            # Reuse must never preserve a stale authorization verdict.  Keep
+            # the conversational turn available, but expose no tools if live
+            # gate reconstruction failed; the next request retries because a
+            # fresh cache lease sets the flag again.
+            agent.tools = []
+            agent.valid_tool_names = set()
+            agent._tools_disabled_for_request = True
+            logger.warning(
+                "cached runtime shell tool refresh failed closed",
+                exc_info=True,
+            )
+        else:
+            logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):
