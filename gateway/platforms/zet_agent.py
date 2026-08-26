@@ -1320,6 +1320,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 pass
         try:
             agent._session_messages = []
+            agent._db_flush_scan_prefix = None
             agent._zet_memory_citations = {}
             agent._zet_memory_saves = {}
         except Exception:
@@ -1458,6 +1459,7 @@ class ZetAgentAdapter(APIServerAdapter):
         for agent in agents:
             try:
                 self._clear_runtime_shell_turn_references(agent)
+                agent._end_session_on_close = False
                 agent.close()
             except Exception as exc:
                 failures.append(exc)
@@ -1477,6 +1479,7 @@ class ZetAgentAdapter(APIServerAdapter):
         for agent in agents:
             try:
                 self._clear_runtime_shell_turn_references(agent)
+                agent._end_session_on_close = False
                 agent.close()
             except Exception as exc:
                 failures.append(exc)

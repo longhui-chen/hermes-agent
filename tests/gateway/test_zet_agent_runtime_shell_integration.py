@@ -35,6 +35,8 @@ class _FakeAgent:
         self._interrupt_requested = False
         self._persist_disabled = False
         self._last_flushed_db_idx = 0
+        self._end_session_on_close = True
+        self.end_session_calls = 0
         self.released = 0
         self.closed = 0
         self.__class__.constructed.append(self)
@@ -44,6 +46,8 @@ class _FakeAgent:
 
     def close(self):
         self.closed += 1
+        if self._end_session_on_close:
+            self.end_session_calls += 1
 
     def run_conversation(self, **_kwargs):
         current = self._session_db.message_counts.get(self.session_id, 0)
@@ -150,8 +154,11 @@ def test_second_interactive_turn_reuses_shell_and_rebinds_request_state(
     first.stream_delta_callback = old_stream
     first.session_total_tokens = 99
     first._current_user_message = "must not survive"
+    first._db_flush_scan_prefix = [{"role": "user", "content": "old"}]
     db.message_counts["session-1"] = 2
     adapter._finish_runtime_shell_turn(first, reusable=True)
+
+    assert first._db_flush_scan_prefix is None
 
     new_stream = object()
     token = _zet_runtime_shell_cache_allowed.set(True)
@@ -447,5 +454,19 @@ def test_profile_cleanup_hard_closes_only_target_shell(runtime_adapter, monkeypa
 
     assert adapter._close_runtime_shells_for_profile(main_home) == 1
     assert main.closed == 1
+    assert main.end_session_calls == 0
+    assert main._end_session_on_close is False
     assert coder.closed == 0
     assert adapter._runtime_shell_cache.counts()["entries"] == 1
+
+
+def test_shutdown_cleanup_closes_shell_without_ending_session(runtime_adapter):
+    adapter, db, _runtime, _retired, _home = runtime_adapter
+    agent = _interactive_create(adapter)
+    db.message_counts["session-1"] = 2
+    adapter._finish_runtime_shell_turn(agent, reusable=True)
+
+    assert adapter._stop_runtime_shell_cache() == 1
+    assert agent.closed == 1
+    assert agent.end_session_calls == 0
+    assert agent._end_session_on_close is False
