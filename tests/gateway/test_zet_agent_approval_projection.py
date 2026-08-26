@@ -126,3 +126,31 @@ def test_projection_payload_and_capacity_are_bounded(monkeypatch):
     with pytest.raises(RuntimeError, match="session limit"):
         notify({"approval_id": "c" * 24, "command": "third"})
     assert len(adapter._pending_approval[scoped_key]) == 2
+
+
+def test_runtime_shell_cleanup_does_not_remove_newer_turn_approval_callback():
+    from tools.approval import (
+        enqueue_gateway_approval,
+        register_gateway_notify,
+        unregister_gateway_notify,
+        unregister_gateway_notify_if_current,
+    )
+
+    session_key = "runtime-shell-overlap"
+    old_callback = object()
+    new_callback = object()
+    try:
+        register_gateway_notify(session_key, old_callback)
+        entry = enqueue_gateway_approval(session_key, {"command": "pending"})
+        register_gateway_notify(session_key, new_callback)
+
+        assert not unregister_gateway_notify_if_current(
+            session_key, old_callback
+        )
+        assert not entry.event.is_set()
+        assert unregister_gateway_notify_if_current(
+            session_key, new_callback
+        )
+        assert entry.event.is_set()
+    finally:
+        unregister_gateway_notify(session_key)

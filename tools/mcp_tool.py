@@ -8030,6 +8030,7 @@ def refresh_agent_mcp_tools(
     enabled_override=None,
     disabled_override=None,
     quiet_mode: bool = True,
+    reuse_current_turn_snapshot: bool = False,
 ) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry.
 
@@ -8058,12 +8059,20 @@ def refresh_agent_mcp_tools(
     under ``_agent_tools_lock`` so a concurrent reader never sees a
     cross-attribute half-swap.
 
+    ``reuse_current_turn_snapshot`` is reserved for the automatic turn
+    prologue. When the agent was built under the exact same server-minted turn
+    binding and the registry generation is unchanged, that prologue consumes a
+    one-shot marker and reuses the just-built snapshot. Explicit reloads and
+    background late-binding callers leave this disabled and always rebuild.
+
     Returns the set of newly-added tool names (empty when nothing changed), so
     callers can decide whether to notify the user / re-emit session info.  The
-    caller owns the prompt-cache contract: this helper does NOT check turn state,
-    because each caller has a different policy (``/reload-mcp`` rebuilds after
-    explicit user consent; the late-binding and between-turns paths only rebuild
-    at a turn boundary, before that turn's ``tools=`` prefix is assembled).
+    caller owns the prompt-cache contract. By default this helper does not check
+    turn state because each caller has a different policy (``/reload-mcp``
+    rebuilds after explicit user consent; the late-binding and between-turns
+    paths only rebuild at a turn boundary, before that turn's ``tools=`` prefix
+    is assembled). The opt-in one-shot reuse above checks only the exact current
+    server turn binding; it does not make a cross-turn cache.
     """
     from model_tools import get_tool_definitions
     from tools.registry import registry
@@ -8088,6 +8097,35 @@ def refresh_agent_mcp_tools(
     # computed an OLDER set must not clobber a newer set another caller already
     # published. registry generation 由全局内建版本和当前 profile MCP 版本组成。
     snapshot_generation = registry.cache_generation()
+
+    if reuse_current_turn_snapshot:
+        try:
+            from gateway.session_context import current_turn_identity
+
+            active_turn_identity = current_turn_identity()
+        except Exception:
+            active_turn_identity = None
+
+        # Consume the marker under the same lock used to publish snapshots, so
+        # concurrent prologues cannot both claim the one-shot reuse. Any
+        # uncertainty falls through to the existing full rebuild.
+        with _agent_tools_lock:
+            built_turn_identity = getattr(
+                agent, "_tool_snapshot_turn_identity", None
+            )
+            agent._tool_snapshot_turn_identity = None
+            published_generation = getattr(
+                agent, "_tool_snapshot_generation", (-1, -1)
+            )
+            if (
+                active_turn_identity is not None
+                and built_turn_identity == active_turn_identity
+                and isinstance(published_generation, tuple)
+                and len(published_generation) == 2
+                and all(isinstance(value, int) for value in published_generation)
+                and published_generation == snapshot_generation
+            ):
+                return set()
 
     # Registry-derived tools (built-ins + MCP), filtered to the agent's toolsets.
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
@@ -8117,8 +8155,8 @@ def refresh_agent_mcp_tools(
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.
     with _agent_tools_lock:
-        # Defensive: the published generation should be an int, but tolerate an
-        # agent that never set it (or set a non-int, e.g. a test mock) rather
+        # Defensive: the published generation should be a two-int tuple, but
+        # tolerate an agent that never set it (or a malformed test mock) rather
         # than throwing TypeError on the comparison and silently failing the
         # whole refresh.
         published_gen_raw = getattr(agent, "_tool_snapshot_generation", (-1, -1))
