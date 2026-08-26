@@ -470,6 +470,10 @@ ZET_AGENT_DEFAULT_PORT = 7900
 ZET_RUNTIME_SHELL_CACHE_CAP = 8
 ZET_RUNTIME_SHELL_CACHE_IDLE_TTL_SECONDS = 15 * 60.0
 ZET_RUNTIME_SHELL_PROMPT_INVALIDATE_TIMEOUT_SECONDS = 5.0
+# Agent construction is CPU-heavy on the 2 GB device.  Keep proactive work
+# below the ordinary runtime-cache capacity and small enough that a burst of
+# fresh sessions cannot monopolize the process before real turns arrive.
+ZET_RUNTIME_SHELL_PREWARM_MAX_TASKS = 2
 
 # How long the agent thread will block waiting for a user response to
 # a clarify prompt before giving up and returning an empty string. The
@@ -843,6 +847,9 @@ class ZetAgentAdapter(APIServerAdapter):
             capacity=ZET_RUNTIME_SHELL_CACHE_CAP,
             idle_ttl_seconds=ZET_RUNTIME_SHELL_CACHE_IDLE_TTL_SECONDS,
         )
+        self._runtime_shell_prewarm_tasks: Dict[
+            tuple[str, ...], asyncio.Task
+        ] = {}
 
         # Pending clarify prompts: {profile-home}|{session_id} ->
         # list[_ClarifyEntry] (FIFO). A bare session id is not a gateway
@@ -1353,6 +1360,159 @@ class ZetAgentAdapter(APIServerAdapter):
                 ).start()
             except Exception:
                 cls._soft_release_runtime_shell(agent)
+
+    @staticmethod
+    def _runtime_shell_prewarm_identity_ready() -> bool:
+        """Require the exact identities that participate in the cache signature."""
+        from gateway.session_context import zettlab_auth_principal
+
+        return all((
+            str(_zettlab_request_account_id.get() or "").strip(),
+            str(zettlab_auth_principal() or "").strip(),
+            str(_deep_memory_principal.get() or "").strip(),
+            str(_deep_memory_subject.get() or "").strip(),
+        ))
+
+    def _prewarm_runtime_shell_sync(self, session_id: str) -> bool:
+        """Build and release one exact session shell without running an LLM turn."""
+        from gateway.session_context import (
+            clear_session_vars,
+            suppress_current_session_id_env_mirror,
+        )
+
+        bounded_session_id = str(session_id or "").strip()
+        account_id = str(_zettlab_request_account_id.get() or "").strip()
+        if not bounded_session_id or not self._runtime_shell_prewarm_identity_ready():
+            return False
+
+        session_tokens = self._bind_api_server_session(
+            chat_id=bounded_session_id,
+            session_key=bounded_session_id,
+            session_id=bounded_session_id,
+            session_user_id=account_id,
+        )
+        cache_token = _zet_runtime_shell_cache_allowed.set(True)
+        agent = None
+        try:
+            with suppress_current_session_id_env_mirror():
+                agent = self._create_agent(
+                    session_id=bounded_session_id,
+                    gateway_session_key=bounded_session_id,
+                )
+            cacheable = isinstance(
+                getattr(agent, "_zet_runtime_shell_lease", None),
+                RuntimeShellLease,
+            )
+            managed_by_runtime_cache = cacheable or bool(
+                getattr(agent, "_zet_runtime_shell_ephemeral", False)
+            )
+            if managed_by_runtime_cache:
+                self._finish_runtime_shell_turn(agent, reusable=cacheable)
+            else:
+                self._soft_release_runtime_shell(agent)
+            return cacheable
+        except Exception as exc:
+            if agent is not None:
+                try:
+                    self._finish_runtime_shell_turn(agent, reusable=False)
+                except Exception:
+                    self._soft_release_runtime_shell(agent)
+            logger.warning(
+                "[zet_agent] runtime shell prewarm failed: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            _zet_runtime_shell_cache_allowed.reset(cache_token)
+            clear_session_vars(session_tokens)
+
+    async def _prewarm_runtime_shell(
+        self,
+        session_id: str,
+    ) -> bool:
+        return await _to_thread_with_completion_barrier(
+            self._prewarm_runtime_shell_sync,
+            session_id,
+        )
+
+    async def _run_scheduled_runtime_shell_prewarm(
+        self,
+        session_id: str,
+        profile_home_key: str,
+    ) -> bool:
+        try:
+            return await self._prewarm_runtime_shell(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[zet_agent] scheduled runtime shell prewarm failed: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            self._end_profile_chat_run(profile_home_key)
+
+    def _schedule_runtime_shell_prewarm(self, session_id: str) -> bool:
+        """Schedule one bounded, deduplicated prewarm in the request identity scope."""
+        if not self._runtime_shell_prewarm_identity_ready():
+            return False
+        session_id = str(session_id or "").strip()
+        profile_home_key = self._profile_home_key()
+        if not session_id or not profile_home_key:
+            return False
+
+        tasks = self._runtime_shell_prewarm_tasks
+        for stale_key, stale_task in tuple(tasks.items()):
+            if stale_task.done() and tasks.get(stale_key) is stale_task:
+                tasks.pop(stale_key, None)
+
+        from gateway.session_context import zettlab_auth_principal
+
+        task_key = (
+            profile_home_key,
+            self._runtime_shell_digest(session_id),
+            self._runtime_shell_digest(_zettlab_request_account_id.get()),
+            self._runtime_shell_digest(zettlab_auth_principal()),
+            self._runtime_shell_digest(_deep_memory_principal.get()),
+            self._runtime_shell_digest(_deep_memory_subject.get()),
+        )
+        existing = tasks.get(task_key)
+        if existing is not None and not existing.done():
+            return False
+        if len(tasks) >= ZET_RUNTIME_SHELL_PREWARM_MAX_TASKS:
+            return False
+
+        barrier_key = self._begin_profile_chat_run(profile_home_key)
+        if not barrier_key:
+            return False
+        try:
+            task = asyncio.create_task(
+                self._run_scheduled_runtime_shell_prewarm(
+                    session_id,
+                    barrier_key,
+                ),
+                name="zet-runtime-shell-prewarm",
+            )
+        except Exception:
+            self._end_profile_chat_run(barrier_key)
+            return False
+        tasks[task_key] = task
+        try:
+            self._background_tasks.add(task)
+        except (AttributeError, TypeError):
+            pass
+
+        def _forget(done_task: asyncio.Task) -> None:
+            if tasks.get(task_key) is done_task:
+                tasks.pop(task_key, None)
+            try:
+                self._background_tasks.discard(done_task)
+            except (AttributeError, TypeError):
+                pass
+
+        task.add_done_callback(_forget)
+        return True
 
     def _finish_runtime_shell_turn(self, agent: Any, *, reusable: bool) -> None:
         lease = getattr(agent, "_zet_runtime_shell_lease", None)
@@ -8045,6 +8205,16 @@ class ZetAgentAdapter(APIServerAdapter):
         })
 
     async def _handle_session_model_switch(self, request: "web.Request") -> "web.Response":
+        """Bind trusted request identity before changing or prewarming a session."""
+        return await self._handle_with_zettlab_identity(
+            request,
+            self._handle_session_model_switch_authorized,
+        )
+
+    async def _handle_session_model_switch_authorized(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
         """POST /v1/sessions/{session_id}/model/switch — session-level model override.
 
         Unlike the agent-level POST /v1/model/switch, this only changes the
@@ -8056,10 +8226,6 @@ class ZetAgentAdapter(APIServerAdapter):
 
         Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "...", "api_mode"?: "..."}
         """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
         session_id = request.match_info.get("session_id", "")
         if not session_id:
             return web.json_response(
@@ -8124,6 +8290,8 @@ class ZetAgentAdapter(APIServerAdapter):
             "session-model-switch: session=%s model=%s provider=%s",
             session_id, new_model, new_provider,
         )
+        if self._runtime_shell_prewarm_identity_ready():
+            self._schedule_runtime_shell_prewarm(session_id)
         return web.json_response({
             "ok": True,
             "session_id": session_id,

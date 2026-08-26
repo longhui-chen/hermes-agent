@@ -1,5 +1,7 @@
 """Zet adapter integration contracts for ordinary runtime-shell reuse."""
 
+import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,14 @@ from gateway.config import PlatformConfig
 from gateway.platforms.zet_agent import (
     ZetAgentAdapter,
     _api_request_profile,
+    _deep_memory_principal,
+    _deep_memory_subject,
+    _zettlab_request_account_id,
     _zet_runtime_shell_cache_allowed,
+)
+from gateway.session_context import (
+    pop_zettlab_auth_principal,
+    push_zettlab_auth_principal,
 )
 
 
@@ -178,6 +187,188 @@ def test_second_interactive_turn_reuses_shell_and_rebinds_request_state(
     assert second.session_total_tokens == 0
     assert second._current_user_message == ""
     assert second._zet_runtime_shell_force_tool_refresh is True
+
+
+def test_session_prewarm_populates_only_the_exact_identity_shell_without_running_llm(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, db, _runtime, retired, _home = runtime_adapter
+    real_init = _FakeAgent.__init__
+
+    def init_with_real_session_mirror(self, **kwargs):
+        from gateway.session_context import set_current_session_id
+
+        set_current_session_id(kwargs["session_id"])
+        real_init(self, **kwargs)
+
+    monkeypatch.setattr(_FakeAgent, "__init__", init_with_real_session_mirror)
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreground-session")
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._prewarm_runtime_shell_sync("session-1") is True
+        assert db.message_counts == {}
+        assert os.environ["HERMES_SESSION_ID"] == "foreground-session"
+        warmed = _FakeAgent.constructed[0]
+
+        same_identity = _interactive_create(
+            adapter,
+            session_id="session-1",
+            gateway_session_key="session-1",
+        )
+        assert same_identity is warmed
+        adapter._finish_runtime_shell_turn(same_identity, reusable=True)
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert len(_FakeAgent.constructed) == 1
+    assert retired == []
+    assert adapter._runtime_shell_cache.counts() == {
+        "entries": 1,
+        "idle": 1,
+        "leased": 0,
+    }
+
+
+def test_session_prewarm_never_reuses_across_account_or_principal(
+    runtime_adapter,
+):
+    adapter, _db, _runtime, retired, _home = runtime_adapter
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._prewarm_runtime_shell_sync("session-1") is True
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    account_token = _zettlab_request_account_id.set("account-b")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-b")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-b")
+    deep_subject_token = _deep_memory_subject.set("account-b")
+    try:
+        other_identity = _interactive_create(
+            adapter,
+            session_id="session-1",
+            gateway_session_key="session-1",
+        )
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert len(_FakeAgent.constructed) == 2
+    assert other_identity is _FakeAgent.constructed[1]
+    assert retired == [_FakeAgent.constructed[0]]
+
+
+def test_session_prewarm_releases_a_runtime_that_cannot_enter_the_cache(
+    runtime_adapter,
+):
+    adapter, _db, runtime, _retired, _home = runtime_adapter
+    runtime["api_mode"] = "codex_app_server"
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._prewarm_runtime_shell_sync("session-1") is False
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert len(_FakeAgent.constructed) == 1
+    assert _FakeAgent.constructed[0].released == 1
+    assert adapter._runtime_shell_cache.counts()["entries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_prewarm_scheduler_deduplicates_caps_and_releases_profile_barriers(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, _db, _runtime, _retired, profile_home = runtime_adapter
+    releases = {
+        "session-1": asyncio.Event(),
+        "session-2": asyncio.Event(),
+    }
+    started = []
+
+    async def fake_prewarm(session_id: str) -> bool:
+        started.append(session_id)
+        await releases[session_id].wait()
+        return True
+
+    monkeypatch.setattr(adapter, "_prewarm_runtime_shell", fake_prewarm)
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._schedule_runtime_shell_prewarm("session-1") is True
+        assert adapter._schedule_runtime_shell_prewarm("session-1") is False
+        assert adapter._schedule_runtime_shell_prewarm("session-2") is True
+        assert adapter._schedule_runtime_shell_prewarm("session-3") is False
+        await asyncio.sleep(0)
+        assert sorted(started) == ["session-1", "session-2"]
+        assert adapter._active_profile_chat_runs(profile_home) == 2
+        releases["session-1"].set()
+        releases["session-2"].set()
+        await asyncio.gather(
+            *tuple(adapter._runtime_shell_prewarm_tasks.values())
+        )
+        await asyncio.sleep(0)
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert adapter._runtime_shell_prewarm_tasks == {}
+    assert adapter._active_profile_chat_runs(profile_home) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_prewarm_scheduler_releases_profile_barrier_after_failure(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, _db, _runtime, _retired, profile_home = runtime_adapter
+
+    async def failing_prewarm(_session_id: str) -> bool:
+        raise RuntimeError("private prewarm failure")
+
+    monkeypatch.setattr(adapter, "_prewarm_runtime_shell", failing_prewarm)
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._schedule_runtime_shell_prewarm("session-1") is True
+        tasks = tuple(adapter._runtime_shell_prewarm_tasks.values())
+        assert await asyncio.gather(*tasks) == [False]
+        await asyncio.sleep(0)
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert adapter._runtime_shell_prewarm_tasks == {}
+    assert adapter._active_profile_chat_runs(profile_home) == 0
 
 
 def test_runtime_shell_timing_distinguishes_created_from_cache_hit(

@@ -83,6 +83,10 @@ _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNS
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+_SESSION_ID_ENV_MIRROR_SUPPRESSED: ContextVar[bool] = ContextVar(
+    "HERMES_SESSION_ID_ENV_MIRROR_SUPPRESSED",
+    default=False,
+)
 # In-process UI session/window id for multi-session desktop/TUI hosts. This is
 # intentionally separate from HERMES_SESSION_ID: the latter is the durable
 # conversation/session-db id, while the UI id is the live frontend tab/window
@@ -532,6 +536,13 @@ def set_current_session_id(session_id: str) -> None:
 
     _SESSION_ID.set(session_id)
 
+    # Background constructors (for example an exact-session runtime-shell
+    # prewarm) need the task-local identity but must never replace the process
+    # compatibility mirror while another root turn may be using it.  Default
+    # false preserves every CLI/gateway/compression call site unchanged.
+    if _SESSION_ID_ENV_MIRROR_SUPPRESSED.get():
+        return
+
     # Skip the process-global os.environ write for delegated children. The
     # child's own tools and subprocesses still resolve their id through the
     # ContextVar (task-local), while the parent's process-wide env keeps the
@@ -562,6 +573,17 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         yield
     finally:
         _SESSION_ID.set(previous)
+
+
+@contextmanager
+def suppress_current_session_id_env_mirror() -> Iterator[None]:
+    """Keep constructor session changes task-local for this lexical scope."""
+    token = _SESSION_ID_ENV_MIRROR_SUPPRESSED.set(True)
+    try:
+        with scoped_current_session_id():
+            yield
+    finally:
+        _SESSION_ID_ENV_MIRROR_SUPPRESSED.reset(token)
 
 
 def set_session_vars(

@@ -10,12 +10,16 @@ import yaml
 from gateway.config import PlatformConfig
 import gateway.platforms.zet_agent as zet_agent
 from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.session_context import zettlab_auth_principal
 
 
 class _FakeRequest:
-    def __init__(self, body, match_info=None):
+    def __init__(self, body, match_info=None, headers=None):
         self._body = body
-        self.headers = {"Authorization": "Bearer test-key"}
+        self.headers = {
+            "Authorization": "Bearer test-key",
+            **(headers or {}),
+        }
         self.match_info = match_info or {}
 
     async def json(self):
@@ -151,6 +155,91 @@ async def test_session_model_switch_persists_override_no_note(monkeypatch):
     assert gw._session_model_overrides[state_key]["auxiliary"] == {"vision": {}}
     assert evicted == [adapter._interaction_queue_key(session_id)]
     assert not hasattr(gw, "_pending_model_notes")
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_schedules_prewarm_only_with_complete_trusted_identity(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides={},
+        _evict_cached_agent=lambda _sid: None,
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_runtime_shell_prewarm",
+        lambda session_id: scheduled.append(
+            {
+                "session_id": session_id,
+                "account_id": zet_agent._zettlab_request_account_id.get(),
+                "principal": zettlab_auth_principal(),
+                "deep_principal": zet_agent._deep_memory_principal.get(),
+                "deep_subject": zet_agent._deep_memory_subject.get(),
+            }
+        )
+        or True,
+    )
+
+    session_id = "zettlab:account-a:agent-1:42"
+    response = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": session_id},
+            headers={
+                "X-Hermes-Session-Key": session_id,
+                "X-Zettlab-Account-Id": "account-a",
+                "X-Zettlab-Auth-Principal-Id": "iam:cn:user:account-a",
+                "X-Zettlab-User-Id": "account-a",
+            },
+        )
+    )
+
+    assert response.status == 200
+    assert scheduled == [{
+        "session_id": session_id,
+        "account_id": "account-a",
+        "principal": "iam:cn:user:account-a",
+        "deep_principal": "iam:cn:user:account-a",
+        "deep_subject": "account-a",
+    }]
+    assert zet_agent._zettlab_request_account_id.get() == ""
+    assert zet_agent._deep_memory_principal.get() == ""
+    assert zet_agent._deep_memory_subject.get() == ""
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_without_identity_keeps_legacy_success_and_skips_prewarm(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides={},
+        _evict_cached_agent=lambda _sid: None,
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_runtime_shell_prewarm",
+        lambda session_id: scheduled.append(session_id) or True,
+    )
+
+    response = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": "zettlab:account-a:agent-1:legacy"},
+        )
+    )
+
+    assert response.status == 200
+    assert scheduled == []
 
 
 @pytest.mark.asyncio
