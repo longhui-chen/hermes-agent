@@ -46,6 +46,9 @@ class _FakeAgent:
         self._persist_disabled = False
         self._last_flushed_db_idx = 0
         self._end_session_on_close = True
+        self._cached_system_prompt = None
+        self._cached_system_prompt_static = None
+        self.prompt_invalidations = 0
         self.end_session_calls = 0
         self.released = 0
         self.closed = 0
@@ -58,6 +61,11 @@ class _FakeAgent:
         self.closed += 1
         if self._end_session_on_close:
             self.end_session_calls += 1
+
+    def _invalidate_system_prompt(self):
+        self.prompt_invalidations += 1
+        self._cached_system_prompt = None
+        self._cached_system_prompt_static = None
 
     def run_conversation(self, **_kwargs):
         current = self._session_db.message_counts.get(self.session_id, 0)
@@ -132,6 +140,7 @@ def _create(
     *,
     session_id="session-1",
     gateway_session_key="/profiles/main|session-1",
+    ephemeral_system_prompt=None,
     request_overrides=None,
     requested_model=None,
     model_options=None,
@@ -140,6 +149,7 @@ def _create(
     return adapter._create_agent(
         session_id=session_id,
         gateway_session_key=gateway_session_key,
+        ephemeral_system_prompt=ephemeral_system_prompt,
         request_overrides=request_overrides,
         requested_model=requested_model,
         model_options=model_options,
@@ -218,6 +228,7 @@ def test_session_prewarm_populates_only_the_exact_identity_shell_without_running
             adapter,
             session_id="session-1",
             gateway_session_key="session-1",
+            ephemeral_system_prompt="LS system prompt",
         )
         assert same_identity is warmed
         adapter._finish_runtime_shell_turn(same_identity, reusable=True)
@@ -234,6 +245,61 @@ def test_session_prewarm_populates_only_the_exact_identity_shell_without_running
         "idle": 1,
         "leased": 0,
     }
+
+
+def test_runtime_shell_prompt_rebind_invalidates_built_prompt_without_reconstruction(
+    runtime_adapter,
+):
+    adapter, db, _runtime, retired, _home = runtime_adapter
+    first = _interactive_create(
+        adapter,
+        ephemeral_system_prompt="prompt-a",
+    )
+    first._cached_system_prompt = "built prompt a"
+    first._cached_system_prompt_static = "static prompt a"
+    db.message_counts["session-1"] = 2
+    adapter._finish_runtime_shell_turn(first, reusable=True)
+
+    second = _interactive_create(
+        adapter,
+        ephemeral_system_prompt="prompt-b",
+    )
+
+    assert second is first
+    assert len(_FakeAgent.constructed) == 1
+    assert second.ephemeral_system_prompt.endswith("prompt-b")
+    assert "prompt-a" not in second.ephemeral_system_prompt
+    assert second._cached_system_prompt is None
+    assert second._cached_system_prompt_static is None
+    assert second.prompt_invalidations == 1
+    assert retired == []
+
+
+def test_runtime_shell_prompt_rebind_failure_retires_and_rebuilds(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, db, _runtime, retired, _home = runtime_adapter
+    first = _interactive_create(
+        adapter,
+        ephemeral_system_prompt="prompt-a",
+    )
+    first._cached_system_prompt = "built prompt a"
+    db.message_counts["session-1"] = 2
+    adapter._finish_runtime_shell_turn(first, reusable=True)
+
+    def fail_invalidation():
+        raise RuntimeError("cannot invalidate")
+
+    monkeypatch.setattr(first, "_invalidate_system_prompt", fail_invalidation)
+    second = _interactive_create(
+        adapter,
+        ephemeral_system_prompt="prompt-b",
+    )
+
+    assert second is not first
+    assert len(_FakeAgent.constructed) == 2
+    assert retired == [first]
 
 
 def test_session_prewarm_never_reuses_across_account_or_principal(

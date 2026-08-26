@@ -1161,7 +1161,6 @@ class ZetAgentAdapter(APIServerAdapter):
         model: str,
         runtime_kwargs: Dict[str, Any],
         enabled_toolsets: List[str],
-        ephemeral_system_prompt: Optional[str],
         user_config: Dict[str, Any],
         fallback_model: Any,
         account_id: str,
@@ -1187,11 +1186,15 @@ class ZetAgentAdapter(APIServerAdapter):
                 deep_memory_subject
             ),
         })
+        # The ephemeral prompt is request-scoped, not constructor-stable.
+        # Reuse rebinds it below and invalidates an already-built prompt when
+        # bytes differ.  Keeping it in this signature made a pristine prewarm
+        # shell miss the first real turn even though no prompt had been built.
         return GatewayRunner._agent_config_signature(
             model,
             runtime_kwargs,
             enabled_toolsets,
-            ephemeral_system_prompt or "",
+            "",
             cache_keys=cache_keys,
             user_id=account_id,
             user_id_alt=session_owner_id,
@@ -1236,7 +1239,30 @@ class ZetAgentAdapter(APIServerAdapter):
         agent.tool_progress_callback = agent_kwargs.get("tool_progress_callback")
         agent.tool_start_callback = agent_kwargs.get("tool_start_callback")
         agent.tool_complete_callback = agent_kwargs.get("tool_complete_callback")
-        agent.ephemeral_system_prompt = agent_kwargs.get("ephemeral_system_prompt")
+        next_ephemeral_prompt = agent_kwargs.get("ephemeral_system_prompt")
+        previous_ephemeral_prompt = getattr(
+            agent, "ephemeral_system_prompt", None
+        )
+        if previous_ephemeral_prompt != next_ephemeral_prompt:
+            has_built_prompt = bool(
+                getattr(agent, "_cached_system_prompt", None)
+                or getattr(agent, "_cached_system_prompt_static", None)
+            )
+            if has_built_prompt:
+                invalidate_prompt = getattr(
+                    agent, "_invalidate_system_prompt", None
+                )
+                if not callable(invalidate_prompt):
+                    return False
+                try:
+                    invalidate_prompt()
+                except Exception:
+                    logger.warning(
+                        "[zet_agent] cached runtime prompt invalidation failed",
+                        exc_info=True,
+                    )
+                    return False
+            agent.ephemeral_system_prompt = next_ephemeral_prompt
         agent.reasoning_config = agent_kwargs.get("reasoning_config")
         agent.service_tier = agent_kwargs.get("service_tier")
         agent.request_overrides = dict(agent_kwargs.get("request_overrides") or {})
@@ -4317,7 +4343,6 @@ class ZetAgentAdapter(APIServerAdapter):
                     model=str(model or ""),
                     runtime_kwargs=runtime_kwargs,
                     enabled_toolsets=enabled_toolsets,
-                    ephemeral_system_prompt=ephemeral_system_prompt,
                     user_config=user_config,
                     fallback_model=fallback_model,
                     account_id=account_id,
