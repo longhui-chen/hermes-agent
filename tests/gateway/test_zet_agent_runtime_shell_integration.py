@@ -40,6 +40,7 @@ class _FakeAgent:
         self.__dict__.update(kwargs)
         self.model = kwargs.get("model")
         self.provider = kwargs.get("provider")
+        self.api_mode = kwargs.get("api_mode", "chat_completions")
         self._session_db = kwargs.get("session_db")
         self._gateway_session_key = kwargs.get("gateway_session_key")
         self._profile_name = kwargs.get("profile_name")
@@ -53,6 +54,8 @@ class _FakeAgent:
         self.end_session_calls = 0
         self.released = 0
         self.closed = 0
+        self.request_clients_created = 0
+        self.request_client_close_reasons = []
         self.__class__.constructed.append(self)
 
     def release_clients(self):
@@ -67,6 +70,13 @@ class _FakeAgent:
         self.prompt_invalidations += 1
         self._cached_system_prompt = None
         self._cached_system_prompt_static = None
+
+    def _create_request_openai_client(self, *, reason, api_kwargs=None):
+        self.request_clients_created += 1
+        return object()
+
+    def _close_request_openai_client(self, _client, *, reason):
+        self.request_client_close_reasons.append(reason)
 
     def run_conversation(self, **_kwargs):
         current = self._session_db.message_counts.get(self.session_id, 0)
@@ -241,6 +251,8 @@ def test_session_prewarm_populates_only_the_exact_identity_shell_without_running
 
     assert len(_FakeAgent.constructed) == 1
     assert retired == []
+    assert warmed.request_clients_created == 1
+    assert warmed.request_client_close_reasons == ["request_complete"]
     assert adapter._runtime_shell_cache.counts() == {
         "entries": 1,
         "idle": 1,
@@ -294,6 +306,38 @@ def test_session_prewarm_uses_effective_context_length_for_config_signature(
 
     assert len(_FakeAgent.constructed) == 2
     assert retired == [warmed]
+
+
+def test_request_client_prewarm_skips_non_openai_and_moa_runtimes(
+    runtime_adapter,
+):
+    adapter, _db, _runtime, _retired, _home = runtime_adapter
+
+    anthropic = _FakeAgent(api_mode="anthropic_messages", provider="anthropic")
+    moa = _FakeAgent(api_mode="chat_completions", provider="moa")
+
+    assert adapter._prewarm_runtime_shell_request_client(anthropic) is False
+    assert adapter._prewarm_runtime_shell_request_client(moa) is False
+    assert anthropic.request_clients_created == 0
+    assert moa.request_clients_created == 0
+
+
+def test_request_client_prewarm_failure_retires_the_partial_client(
+    runtime_adapter,
+):
+    adapter, _db, _runtime, _retired, _home = runtime_adapter
+    agent = _FakeAgent(api_mode="chat_completions", provider="custom")
+    release_calls = []
+
+    def fail_first_release(_client, *, reason):
+        release_calls.append(reason)
+        if reason == "request_complete":
+            raise RuntimeError("cannot publish warm client")
+
+    agent._close_request_openai_client = fail_first_release
+
+    assert adapter._prewarm_runtime_shell_request_client(agent) is False
+    assert release_calls == ["request_complete", "request_error_cleanup"]
 
 
 def test_runtime_shell_prompt_rebind_invalidates_built_prompt_without_reconstruction(

@@ -1424,6 +1424,38 @@ class ZetAgentAdapter(APIServerAdapter):
             str(_deep_memory_subject.get() or "").strip(),
         ))
 
+    @staticmethod
+    def _prewarm_runtime_shell_request_client(agent: Any) -> bool:
+        """Populate the shell's local OpenAI-wire client slot without I/O."""
+        if (
+            str(getattr(agent, "api_mode", "") or "").strip().lower()
+            != "chat_completions"
+            or str(getattr(agent, "provider", "") or "").strip().lower()
+            == "moa"
+        ):
+            return False
+        create = getattr(agent, "_create_request_openai_client", None)
+        release = getattr(agent, "_close_request_openai_client", None)
+        if not callable(create) or not callable(release):
+            return False
+        client = None
+        try:
+            client = create(reason="zet_runtime_shell_prewarm")
+            release(client, reason="request_complete")
+            return True
+        except Exception as exc:
+            if client is not None:
+                try:
+                    release(client, reason="request_error_cleanup")
+                except Exception:
+                    pass
+            logger.debug(
+                "[zet_agent] runtime shell request-client prewarm skipped: "
+                "error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
     def _prewarm_runtime_shell_sync(
         self,
         session_id: str,
@@ -1464,6 +1496,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 getattr(agent, "_zet_runtime_shell_lease", None),
                 RuntimeShellLease,
             )
+            if cacheable:
+                self._prewarm_runtime_shell_request_client(agent)
             managed_by_runtime_cache = cacheable or bool(
                 getattr(agent, "_zet_runtime_shell_ephemeral", False)
             )
