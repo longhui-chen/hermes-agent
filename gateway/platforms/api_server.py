@@ -9345,9 +9345,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import (
+                clear_turn_vars,
                 clear_session_vars,
+                pop_zettlab_auth_principal,
                 pop_current_turn_reference_image,
+                push_zettlab_auth_principal,
                 push_current_turn_reference_image,
+                set_turn_vars,
                 set_zettlab_connector_route_capability,
                 set_zettlab_turn_id,
             )
@@ -9360,6 +9364,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                     session_user_id=session_context_user_id,
+                )
+                turn_tokens = set_turn_vars(
+                    turn_id=str(turn_id or ""),
+                    hardware_execution_token=str(hardware_execution_token or ""),
+                    execution_policy=str(execution_policy or ""),
+                )
+                principal_token = (
+                    push_zettlab_auth_principal(session_user_id)
+                    if session_user_id
+                    else None
                 )
                 agent = None
                 # turn_id is request-scoped correlation for NAS fallback and
@@ -9568,6 +9582,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                     pop_current_turn_reference_image(reference_token)
+                    if principal_token is not None:
+                        pop_zettlab_auth_principal(principal_token)
+                    clear_turn_vars(turn_tokens)
                     clear_session_vars(tokens)
                     set_zettlab_turn_id("")
                     set_zettlab_connector_route_capability("")
