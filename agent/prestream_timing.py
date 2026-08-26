@@ -20,6 +20,9 @@ MAX_CORRELATION_ID_LENGTH = 128
 _SEMANTIC_KINDS = frozenset({"reasoning", "content", "tool_start", "attachment"})
 _PROVIDER_SEMANTIC_KINDS = frozenset({"reasoning", "content", "tool_start"})
 _PROVIDER_DISPATCH_SCOPES = frozenset({"physical", "composite"})
+_AGENT_SHELL_OUTCOMES = frozenset(
+    {"created", "runtime_cache_hit", "onboarding_cache_hit", "error"}
+)
 _LOGGER = logging.getLogger(__name__)
 PRESTREAM_TIMING_CONTEXT: ContextVar[Optional["PrestreamTiming"]] = ContextVar(
     "agent_prestream_timing", default=None
@@ -66,6 +69,9 @@ class PrestreamTiming:
         "_agent_init_finished_at",
         "_agent_init_outcome",
         "_agent_init_started_at",
+        "_agent_shell_finished_at",
+        "_agent_shell_outcome",
+        "_agent_shell_started_at",
         "_clock",
         "_emitted",
         "_executor_queued_at",
@@ -126,6 +132,9 @@ class PrestreamTiming:
         self._agent_init_started_at: Optional[float] = None
         self._agent_init_finished_at: Optional[float] = None
         self._agent_init_outcome = ""
+        self._agent_shell_started_at: Optional[float] = None
+        self._agent_shell_finished_at: Optional[float] = None
+        self._agent_shell_outcome = ""
         self._ingress_at = ingress_at if ingress_at is not None else self._now()
 
     def _now(self) -> Optional[float]:
@@ -210,6 +219,21 @@ class PrestreamTiming:
             with self._lock:
                 self._agent_init_outcome = normalized
                 self._agent_init_finished_at = observed
+        except Exception:
+            return
+
+    def agent_shell_started(self) -> None:
+        """Mark the cache lookup / constructor boundary inside agent init."""
+        self._set_timestamp("_agent_shell_started_at")
+
+    def agent_shell_finished(self, outcome: str) -> None:
+        """Classify one bounded shell creation or cache-hit outcome."""
+        try:
+            normalized = outcome if outcome in _AGENT_SHELL_OUTCOMES else "error"
+            observed = self._now() if normalized != "error" else None
+            with self._lock:
+                self._agent_shell_outcome = normalized
+                self._agent_shell_finished_at = observed
         except Exception:
             return
 
@@ -368,6 +392,8 @@ class PrestreamTiming:
             payload["skill_expand_outcome"] = self._skill_outcome
         if self._agent_init_outcome:
             payload["agent_init_outcome"] = self._agent_init_outcome
+        if self._agent_shell_outcome:
+            payload["agent_shell_outcome"] = self._agent_shell_outcome
         if self._provider_dispatch_count:
             payload["provider_dispatch_count"] = self._provider_dispatch_count
             payload["provider_dispatch_scope"] = self._provider_dispatch_scope
@@ -381,6 +407,19 @@ class PrestreamTiming:
             ),
             "executor_queue_ms": _duration_ms(self._executor_queued_at, self._executor_started_at),
             "agent_init_ms": _duration_ms(self._agent_init_started_at, self._agent_init_finished_at),
+            "agent_prepare_ms": _duration_ms(
+                self._agent_init_started_at, self._agent_shell_started_at
+            ),
+            "agent_shell_ms": (
+                _duration_ms(
+                    self._agent_shell_started_at, self._agent_shell_finished_at
+                )
+                if self._agent_shell_outcome != "error"
+                else None
+            ),
+            "agent_post_bind_ms": _duration_ms(
+                self._agent_shell_finished_at, self._agent_init_finished_at
+            ),
             "ingress_to_provider_dispatch_ms": _duration_ms(
                 self._ingress_at, self._provider_first_dispatch_at
             ),
@@ -415,6 +454,20 @@ class PrestreamTiming:
                 if self._agent_init_outcome
                 else "agent_init"
             )
+        if self._agent_shell_started_at is not None:
+            if durations["agent_prepare_ms"] is None:
+                missing.append("agent_prepare")
+            if durations["agent_shell_ms"] is None:
+                missing.append(
+                    f"agent_shell:{self._agent_shell_outcome}"
+                    if self._agent_shell_outcome
+                    else "agent_shell"
+                )
+            if (
+                self._agent_init_outcome == "success"
+                and durations["agent_post_bind_ms"] is None
+            ):
+                missing.append("agent_post_bind")
         if self._provider_dispatch_count:
             if durations["ingress_to_provider_dispatch_ms"] is None:
                 missing.append("provider_dispatch")

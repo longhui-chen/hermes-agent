@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT
 from gateway.config import PlatformConfig
 from gateway.platforms.zet_agent import (
     ZetAgentAdapter,
@@ -177,6 +178,36 @@ def test_second_interactive_turn_reuses_shell_and_rebinds_request_state(
     assert second.session_total_tokens == 0
     assert second._current_user_message == ""
     assert second._zet_runtime_shell_force_tool_refresh is True
+
+
+def test_runtime_shell_timing_distinguishes_created_from_cache_hit(
+    runtime_adapter,
+):
+    class _Timing:
+        def __init__(self):
+            self.started = 0
+            self.outcomes = []
+
+        def agent_shell_started(self):
+            self.started += 1
+
+        def agent_shell_finished(self, outcome):
+            self.outcomes.append(outcome)
+
+    adapter, db, _runtime, _retired, _home = runtime_adapter
+    timing = _Timing()
+    token = PRESTREAM_TIMING_CONTEXT.set(timing)
+    try:
+        first = _interactive_create(adapter)
+        db.message_counts["session-1"] = 2
+        adapter._finish_runtime_shell_turn(first, reusable=True)
+        second = _interactive_create(adapter)
+    finally:
+        PRESTREAM_TIMING_CONTEXT.reset(token)
+
+    assert second is first
+    assert timing.started == 2
+    assert timing.outcomes == ["created", "runtime_cache_hit"]
 
 
 def test_reuse_refreshes_reasoning_service_tier_and_request_overrides(
