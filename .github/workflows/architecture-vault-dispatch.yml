@@ -16,17 +16,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Create a root-repository token
+      - name: Create an Obsidian-repository token
         id: architecture-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           client-id: ${{ vars.ARCHITECTURE_VAULT_DISPATCH_APP_CLIENT_ID }}
           private-key: ${{ secrets.ARCHITECTURE_VAULT_DISPATCH_APP_PRIVATE_KEY }}
           owner: zettlab
-          repositories: zettlab-product-dev
+          repositories: zettlab-obsidian
           permission-contents: write
 
-      - name: Notify the root workflow
+      - name: Notify the Obsidian workflow
         env:
           GH_TOKEN: ${{ steps.architecture-token.outputs.token }}
           SOURCE_REPOSITORY: ${{ github.repository }}
@@ -35,7 +35,7 @@ jobs:
           set -euo pipefail
           gh api \
             --method POST \
-            repos/zettlab/zettlab-product-dev/dispatches \
+            repos/zettlab/zettlab-obsidian/dispatches \
             --field event_type=architecture-source-updated \
             --field "client_payload[repository]=${SOURCE_REPOSITORY}" \
             --field "client_payload[sha]=${SOURCE_SHA}"
