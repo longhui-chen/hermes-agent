@@ -4292,6 +4292,8 @@ class ZetAgentAdapter(APIServerAdapter):
         runtime_cache_message_count = None
         runtime_cache_lease = None
         runtime_cache_reason = "bypass"
+        runtime_cache_acquire_reason = "not_attempted"
+        runtime_cache_diagnostics: Dict[str, str] = {}
         agent_shell_outcome = "created"
         agent = None
         if onboarding_fast_path:
@@ -4354,6 +4356,25 @@ class ZetAgentAdapter(APIServerAdapter):
                         agent_kwargs.get("deep_memory_subject") or ""
                     ),
                 )
+                runtime_cache_diagnostics = {
+                    "signature": self._runtime_shell_digest(
+                        runtime_cache_signature
+                    )[:12],
+                    "model": self._runtime_shell_digest(model or "")[:12],
+                    "runtime": self._runtime_shell_digest(runtime_kwargs)[:12],
+                    "toolsets": self._runtime_shell_digest(enabled_toolsets)[:12],
+                    "config": self._runtime_shell_digest(user_config)[:12],
+                    "fallback": self._runtime_shell_digest(fallback_model)[:12],
+                    "identity_state": "".join(
+                        "1" if value else "0"
+                        for value in (
+                            account_id,
+                            session_owner_id,
+                            agent_kwargs.get("deep_memory_principal"),
+                            agent_kwargs.get("deep_memory_subject"),
+                        )
+                    ),
+                }
                 runtime_cache_message_count = self._runtime_shell_message_count(
                     agent_kwargs.get("session_db"), session_id
                 )
@@ -4362,6 +4383,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     signature=runtime_cache_signature,
                     message_count=runtime_cache_message_count,
                 )
+                runtime_cache_acquire_reason = cache_decision.reason
                 self._schedule_runtime_shell_retirement(
                     cache_decision.retired_agents
                 )
@@ -4459,11 +4481,22 @@ class ZetAgentAdapter(APIServerAdapter):
         if runtime_cache_reason != "bypass":
             counts = self._runtime_shell_cache.counts()
             logger.info(
-                "zet_agent runtime shell cache lookup: result=%s profile=%s "
-                "session_hash=%s entries=%d idle=%d leased=%d",
+                "zet_agent runtime shell cache lookup: result=%s acquire=%s "
+                "profile=%s session_hash=%s message_count=%s signature=%s "
+                "model_fp=%s runtime_fp=%s toolsets_fp=%s config_fp=%s "
+                "fallback_fp=%s identities=%s entries=%d idle=%d leased=%d",
                 runtime_cache_reason,
+                runtime_cache_acquire_reason,
                 active_profile,
                 self._runtime_shell_digest(session_id or "")[:12],
+                runtime_cache_message_count,
+                runtime_cache_diagnostics.get("signature", "-"),
+                runtime_cache_diagnostics.get("model", "-"),
+                runtime_cache_diagnostics.get("runtime", "-"),
+                runtime_cache_diagnostics.get("toolsets", "-"),
+                runtime_cache_diagnostics.get("config", "-"),
+                runtime_cache_diagnostics.get("fallback", "-"),
+                runtime_cache_diagnostics.get("identity_state", "-"),
                 counts["entries"],
                 counts["idle"],
                 counts["leased"],

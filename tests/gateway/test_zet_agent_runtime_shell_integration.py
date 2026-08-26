@@ -339,6 +339,51 @@ def test_session_prewarm_never_reuses_across_account_or_principal(
     assert retired == [_FakeAgent.constructed[0]]
 
 
+@pytest.mark.asyncio
+async def test_public_run_agent_hits_exact_prewarm_with_real_prompt_and_context_handoff(
+    runtime_adapter,
+    monkeypatch,
+):
+    adapter, db, _runtime, retired, _home = runtime_adapter
+    monkeypatch.setattr(adapter, "_effective_model", lambda *_args: "")
+    monkeypatch.setattr(
+        "tools.zettlab_snapshot_guard.finish_turn", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers.collect_answer_attribution_citations",
+        lambda *_args, **_kwargs: None,
+    )
+    account_token = _zettlab_request_account_id.set("account-a")
+    principal_token = push_zettlab_auth_principal("iam:cn:user:account-a")
+    deep_principal_token = _deep_memory_principal.set("iam:cn:user:account-a")
+    deep_subject_token = _deep_memory_subject.set("account-a")
+    try:
+        assert adapter._prewarm_runtime_shell_sync("session-1") is True
+        result, _usage = await adapter._run_agent(
+            user_message="[ZETTLAB:test] first",
+            conversation_history=[],
+            ephemeral_system_prompt="LS system prompt",
+            session_id="session-1",
+            gateway_session_key="session-1",
+            turn_id="turn-1",
+        )
+    finally:
+        _deep_memory_subject.reset(deep_subject_token)
+        _deep_memory_principal.reset(deep_principal_token)
+        pop_zettlab_auth_principal(principal_token)
+        _zettlab_request_account_id.reset(account_token)
+
+    assert result["final_response"] == "ok"
+    assert len(_FakeAgent.constructed) == 1
+    assert db.message_counts["session-1"] == 2
+    assert retired == []
+    assert adapter._runtime_shell_cache.counts() == {
+        "entries": 1,
+        "idle": 1,
+        "leased": 0,
+    }
+
+
 def test_session_prewarm_releases_a_runtime_that_cannot_enter_the_cache(
     runtime_adapter,
 ):
@@ -465,6 +510,39 @@ def test_runtime_shell_timing_distinguishes_created_from_cache_hit(
     assert second is first
     assert timing.started == 2
     assert timing.outcomes == ["created", "runtime_cache_hit"]
+
+
+def test_runtime_shell_lookup_log_contains_only_bounded_diagnostics(
+    runtime_adapter,
+    caplog,
+):
+    adapter, _db, _runtime, _retired, _home = runtime_adapter
+
+    with caplog.at_level("INFO", logger="gateway.platforms.zet_agent"):
+        _interactive_create(adapter)
+
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(
+            "zet_agent runtime shell cache lookup:"
+        )
+    )
+    assert "result=reserved acquire=miss" in message
+    assert "message_count=0" in message
+    for field in (
+        "signature",
+        "model_fp",
+        "runtime_fp",
+        "toolsets_fp",
+        "config_fp",
+        "fallback_fp",
+    ):
+        value = message.split(f"{field}=", 1)[1].split(" ", 1)[0]
+        assert len(value) == 12
+        assert all(char in "0123456789abcdef" for char in value)
+    assert "credential-a" not in message
+    assert "https://example.invalid" not in message
 
 
 def test_reuse_refreshes_reasoning_service_tier_and_request_overrides(
