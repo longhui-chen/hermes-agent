@@ -2584,6 +2584,16 @@ def build_plaud_runtime_env() -> dict[str, str]:
     return env
 
 
+def _strip_managed_bootstrap_identity(env: dict[str, str]) -> None:
+    """Remove the root gateway's ExecStart identity from child processes.
+
+    The parent consumes these markers when it places model-controlled commands
+    in their profile UID/cgroup boundary. Children must not re-enter bootstrap.
+    """
+    for marker in _MANAGED_BOOTSTRAP_ENV_KEYS:
+        env.pop(marker, None)
+
+
 def _sanitize_subprocess_env(
     base_env: Mapping[str, str] | None,
     extra_env: Mapping[str, str] | None = None,
@@ -2640,11 +2650,7 @@ def _sanitize_subprocess_env(
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
-    # These values authorize only the root gateway's ExecStart bootstrap.
-    # Model-controlled terminal/background/PTY children are already placed in
-    # their profile UID+cgroup boundary and must never re-enter that bootstrap.
-    for _marker in _MANAGED_BOOTSTRAP_ENV_KEYS:
-        sanitized.pop(_marker, None)
+    _strip_managed_bootstrap_identity(sanitized)
 
     _apply_windows_msys_bash_env_defaults(sanitized)
 
@@ -3470,6 +3476,7 @@ def _make_run_env(env: dict) -> dict:
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
+    _strip_managed_bootstrap_identity(run_env)
 
     _apply_windows_msys_bash_env_defaults(run_env)
 
