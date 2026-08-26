@@ -747,7 +747,10 @@ def test_managed_service_keeps_filesystem_open_for_root_commands():
         "/volume1/system/zettos-main-data/com.zettlab.claw/lazy-packages"
     ) in service
     assert "Environment=HERMES_DISABLE_LAZY_INSTALLS=1" in service
-    assert "MemoryHigh=768M" in service
+    # MemoryHigh 是 memory.high 软限流：无 swap + 匿名页涨上去时只会罚睡不会
+    # OOM，进程假活且 Restart= 永不触发（TB-20260826-001）。只保留 MemoryMax，
+    # 触顶被杀走 Restart=on-failure 自愈。
+    assert "MemoryHigh=" not in service
     assert "MemoryMax=1G" in service
     assert "MemorySwapMax=0" in service
     assert "TasksMax=512" in service
