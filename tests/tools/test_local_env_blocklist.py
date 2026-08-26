@@ -313,6 +313,44 @@ class TestActiveVenvMarkerStripping:
         assert "CONDA_PREFIX" in _ACTIVE_VENV_MARKER_VARS
 
 
+class TestManagedBootstrapEnvStripping:
+    """Gateway bootstrap identity must not leak into terminal children."""
+
+    def test_make_run_env_strips_managed_bootstrap_identity(self):
+        from tools.environments.local import _make_run_env
+
+        bootstrap_env = {
+            "HERMES_MANAGED_GATEWAY": "1",
+            "HERMES_MANAGED_CGROUP_UNIT": "zettlab-claw.service",
+            "HERMES_MANAGED_CGROUP_ROOT": "/system.slice/zettlab-claw.service",
+            "PATH": "/usr/bin",
+        }
+        with patch.dict(os.environ, bootstrap_env, clear=True):
+            result = _make_run_env({})
+
+        assert "HERMES_MANAGED_GATEWAY" not in result
+        assert "HERMES_MANAGED_CGROUP_UNIT" not in result
+        assert "HERMES_MANAGED_CGROUP_ROOT" not in result
+
+    def test_foreground_terminal_strips_managed_bootstrap_identity(self):
+        with patch(
+            "tools.environments.local._managed_terminal_cwd",
+            side_effect=lambda cwd, *, env: cwd,
+        ), patch(
+            "tools.environments.local._managed_terminal_argv",
+            side_effect=lambda argv, *, env: argv,
+        ):
+            result = _run_with_env(extra_os_env={
+                "HERMES_MANAGED_GATEWAY": "1",
+                "HERMES_MANAGED_CGROUP_UNIT": "zettlab-claw.service",
+                "HERMES_MANAGED_CGROUP_ROOT": "/system.slice/zettlab-claw.service",
+            })
+
+        assert "HERMES_MANAGED_GATEWAY" not in result
+        assert "HERMES_MANAGED_CGROUP_UNIT" not in result
+        assert "HERMES_MANAGED_CGROUP_ROOT" not in result
+
+
 class TestProfileScopedPassthrough:
     def test_make_run_env_uses_active_profile_for_passthrough(self, monkeypatch):
         """Allowlisted values must come from the routed profile, not os.environ."""

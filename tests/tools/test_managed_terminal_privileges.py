@@ -19,13 +19,17 @@ from tools.environments.local import LocalEnvironment
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
-def test_managed_terminal_inherits_service_identity_inside_profile_cgroup(
+def test_managed_terminal_enters_profile_cgroup_without_bootstrap_identity(
     monkeypatch,
 ):
     captured = {}
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_MANAGED_CGROUP_UNIT", "zettlab-claw.service")
+    monkeypatch.setenv(
+        "HERMES_MANAGED_CGROUP_ROOT",
+        "/system.slice/zettlab-claw.service",
+    )
     monkeypatch.setattr(local_module, "_find_bash", lambda: "/bin/bash")
-    monkeypatch.setattr(local_module, "_make_run_env", lambda _env: {})
     monkeypatch.setattr(
         local_module,
         "_managed_terminal_cwd",
@@ -68,6 +72,10 @@ def test_managed_terminal_inherits_service_identity_inside_profile_cgroup(
     ]
     assert "/usr/bin/setpriv" not in captured["argv"]
     assert "/usr/bin/unshare" not in captured["argv"]
+    child_env = captured["kwargs"]["env"]
+    assert "HERMES_MANAGED_GATEWAY" not in child_env
+    assert "HERMES_MANAGED_CGROUP_UNIT" not in child_env
+    assert "HERMES_MANAGED_CGROUP_ROOT" not in child_env
 
 
 def test_managed_terminal_keeps_existing_root_cwd_without_lark_relay(
