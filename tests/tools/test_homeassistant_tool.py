@@ -308,6 +308,11 @@ class TestCheckAvailable:
         monkeypatch.setenv("HASS_TOKEN", "")
         assert _check_ha_available() is False
 
+    def test_zettlab_bridge_only_disables_legacy_tools(self, monkeypatch):
+        monkeypatch.setenv("HASS_TOKEN", "test-token")
+        monkeypatch.setenv("ZETTLAB_HA_BRIDGE_ONLY", "1")
+        assert _check_ha_available() is False
+
     def test_multiplex_scope_does_not_fall_back_to_another_profile(self, monkeypatch):
         from agent import secret_scope
 

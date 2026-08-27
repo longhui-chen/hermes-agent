@@ -34,6 +34,10 @@ class TestCheckRequirements:
         monkeypatch.setenv("HASS_TOKEN", "test-token")
         assert check_ha_requirements() is False
 
+    def test_returns_false_in_zettlab_bridge_mode(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_HA_BRIDGE_ONLY", "1")
+        assert check_ha_requirements() is False
+
     def test_validate_config_accepts_platform_token(self, monkeypatch):
         monkeypatch.delenv("HASS_TOKEN", raising=False)
         config = PlatformConfig(enabled=True, token="config-token")
@@ -44,6 +48,10 @@ class TestValidateConfig:
     def test_returns_false_without_token_in_config_or_env(self, monkeypatch):
         monkeypatch.delenv("HASS_TOKEN", raising=False)
         assert validate_ha_config(PlatformConfig(enabled=True)) is False
+
+    def test_returns_false_in_zettlab_bridge_mode_even_with_config_token(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_HA_BRIDGE_ONLY", "true")
+        assert validate_ha_config(PlatformConfig(enabled=True, token="legacy-token")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +258,37 @@ class TestConfigIntegration:
         assert ha.token == "env-token"
         assert ha.extra["url"] == "http://10.0.0.5:8123"
 
+    def test_bridge_mode_does_not_create_legacy_ha_platform(self, monkeypatch):
+        monkeypatch.setenv("HASS_TOKEN", "legacy-token")
+        monkeypatch.setenv("HASS_URL", "http://legacy-ha:8123")
+        monkeypatch.setenv("ZETTLAB_HA_BRIDGE_ONLY", "1")
+
+        from gateway.config import GatewayConfig, _apply_env_overrides
+
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        assert Platform.HOMEASSISTANT not in config.platforms
+
+    def test_bridge_mode_disables_stale_yaml_ha_platform(self, monkeypatch):
+        monkeypatch.setenv("HASS_TOKEN", "legacy-token")
+        monkeypatch.setenv("ZETTLAB_HA_BRIDGE_ONLY", "on")
+
+        from gateway.config import GatewayConfig, PlatformConfig, _apply_env_overrides
+
+        config = GatewayConfig(
+            platforms={
+                Platform.HOMEASSISTANT: PlatformConfig(
+                    enabled=True, token="stale-token", extra={"url": "http://stale-ha:8123"}
+                )
+            }
+        )
+        _apply_env_overrides(config)
+
+        ha = config.platforms[Platform.HOMEASSISTANT]
+        assert ha.enabled is False
+        assert ha.token == ""
+
 
 # ---------------------------------------------------------------------------
 # send() via REST API
@@ -317,4 +356,3 @@ class TestWsUrlConstruction:
         adapter = HomeAssistantAdapter(config)
         ws_url = adapter._hass_url.replace("http://", "ws://").replace("https://", "wss://")
         assert ws_url == "ws://ha:8123"
-

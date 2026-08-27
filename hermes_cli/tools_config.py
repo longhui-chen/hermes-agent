@@ -244,6 +244,12 @@ def _xai_credentials_present() -> bool:
 
 def _homeassistant_credentials_present() -> bool:
     """Return whether the active profile has a Home Assistant token."""
+    # Zettlab production uses local-server's protected smart-home bridge.
+    # Ambient legacy HASS_TOKEN must not auto-enable the old Hermes tools.
+    if os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return False
     try:
         from agent.secret_scope import get_secret
 
@@ -2550,6 +2556,14 @@ def _get_platform_tools(
     if disabled_toolsets:
         disabled_set = {str(ts) for ts in disabled_toolsets}
         enabled_toolsets -= disabled_set
+
+    # Final fail-closed guard for packaged Zettlab Claw. This runs after
+    # explicit per-platform config and plugin recovery so a stale config cannot
+    # re-expose the legacy direct Home Assistant tools.
+    if os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        enabled_toolsets.discard("homeassistant")
 
     # #38798: if this platform was explicitly configured but every toolset name
     # is invalid (e.g. a migration or hand-edit left `hermes` instead of
