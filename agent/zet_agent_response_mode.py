@@ -116,6 +116,13 @@ _HARDWARE_ENROLLMENT_BLOCK_RE = re.compile(
     r"\s*```zettlab-hardware-enrollment-intent\s*\r?\n[\s\S]*?\r?\n```",
     re.IGNORECASE,
 )
+_PLAUD_CONTINUATION_INTENT_RE = re.compile(
+    r"\s*(?:"
+    r"(?:再|再次|重新)(?:试(?:一)?次|读取(?:一?下|一次)?|读(?:一?下|一次)?|查(?:一?下|一次)?)"
+    r"|(?:retry|try again|read again|check again)"
+    r")\s*[。！？.!?]*\s*",
+    re.IGNORECASE,
+)
 _CONNECTOR_ENROLLMENT_BLOCK_RE = re.compile(
     r"\s*```zettlab-connector-enrollment-intent\s*\r?\n(?P<payload>[\s\S]*?)\r?\n```",
     re.IGNORECASE,
@@ -223,6 +230,8 @@ _TRUSTED_POLICY_VIOLATION_RETRIES = 2
 _OPAQUE_ACTION_TOKEN_MAX_BYTES = 4096
 _CAMERA_RESUME_TTL_SECONDS = 5 * 60
 _CAMERA_RESUME_MAX_SESSIONS = 8
+_PLAUD_RESUME_TTL_SECONDS = 30 * 60
+_PLAUD_RESUME_MAX_SESSIONS = 8
 _CAMERA_ANALYSIS_QUESTION_LIMIT = 4096
 _GATEWAY_MODEL_SWITCH_NOTE_RE = re.compile(
     r"^\s*\[Note: the model has changed and is now "
@@ -360,6 +369,10 @@ _CAMERA_RESUME_SESSIONS: OrderedDict[
     _CameraResumeKey,
     _CameraResumeGrant,
 ] = OrderedDict()
+_PLAUD_RESUME_SESSIONS: OrderedDict[
+    _CameraResumeKey,
+    _CameraResumeGrant,
+] = OrderedDict()
 _ATTESTATION_LOCK = threading.Lock()
 _SKILL_DIRECT_LOCK = threading.Lock()
 _TRUSTED_HARDWARE_RUNTIME_RECEIPT: ContextVar[
@@ -446,6 +459,41 @@ def _remember_camera_resume_locked(
     )
     sessions.move_to_end(resume_key)
     while len(sessions) > _CAMERA_RESUME_MAX_SESSIONS:
+        sessions.popitem(last=False)
+
+
+def _plaud_resume_sessions_locked(
+    *,
+    now: float,
+) -> OrderedDict[_CameraResumeKey, _CameraResumeGrant]:
+    expired = [
+        resume_key
+        for resume_key, grant in _PLAUD_RESUME_SESSIONS.items()
+        if grant.expires_at <= now
+    ]
+    for resume_key in expired:
+        _PLAUD_RESUME_SESSIONS.pop(resume_key, None)
+    while len(_PLAUD_RESUME_SESSIONS) > _PLAUD_RESUME_MAX_SESSIONS:
+        _PLAUD_RESUME_SESSIONS.popitem(last=False)
+    return _PLAUD_RESUME_SESSIONS
+
+
+def _remember_plaud_resume_locked(
+    *,
+    turn_identity: _TurnIdentity,
+    now: float,
+) -> None:
+    """Remember only that this session attested PLAUD, never its data."""
+    resume_key = _current_resume_key()
+    if resume_key is None:
+        return
+    sessions = _plaud_resume_sessions_locked(now=now)
+    sessions[resume_key] = _CameraResumeGrant(
+        expires_at=now + _PLAUD_RESUME_TTL_SECONDS,
+        source_turn_id=str(turn_identity[0] or "").strip(),
+    )
+    sessions.move_to_end(resume_key)
+    while len(sessions) > _PLAUD_RESUME_MAX_SESSIONS:
         sessions.popitem(last=False)
 
 
@@ -1332,6 +1380,16 @@ def _skill_direct_task_context(
     )
     if camera_resumed and camera_resume_key is not None:
         camera_resume_sessions.move_to_end(camera_resume_key)
+    plaud_resume_sessions = _plaud_resume_sessions_locked(now=time.monotonic())
+    plaud_resume_key = _current_resume_key()
+    plaud_continuation = bool(
+        not plaud_transport_selection
+        and _PLAUD_CONTINUATION_INTENT_RE.fullmatch(normalized)
+        and plaud_resume_key is not None
+        and plaud_resume_key in plaud_resume_sessions
+    )
+    if plaud_continuation and plaud_resume_key is not None:
+        plaud_resume_sessions.move_to_end(plaud_resume_key)
 
     task_binding = (
         f"skill:{normalized_skill_slug}\n{normalized}"
@@ -1373,6 +1431,7 @@ def _skill_direct_task_context(
         plaud_applicable=(
             plaud_transport_selection
             or bool(_PLAUD_INTENT_RE.search(normalized))
+            or plaud_continuation
         ),
         plaud_explicit=plaud_transport_selection,
     )
@@ -1594,6 +1653,11 @@ def _activate_trusted_skill_scope(
             ),
         )
         _activate_execution_policy_tools(agent, allowed_tools)
+        if relative_path == _PLAUD_SKILL_PATH:
+            _remember_plaud_resume_locked(
+                turn_identity=current_turn_identity,
+                now=time.monotonic(),
+            )
     logger.info(
         "zet_agent: trusted skill %s activated bounded execution scope",
         relative_path,
