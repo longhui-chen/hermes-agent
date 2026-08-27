@@ -5378,9 +5378,10 @@ def check_browser_vision_requirements() -> bool:
         return False
     try:
         from tools.vision_tools import check_vision_requirements
+        from tools.registry import _check_fn_cached
     except ImportError:
         return False
-    return check_vision_requirements()
+    return _check_fn_cached(check_vision_requirements)
 
 
 # These checks read profile-scoped browser secrets (including CAMOFOX_URL and

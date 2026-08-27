@@ -305,6 +305,32 @@ def test_check_browser_requirements_probes_host_status(monkeypatch):
     assert seen["timeout"] <= 2
 
 
+def test_browser_vision_checks_expensive_vision_gate_once(monkeypatch):
+    from tools import vision_tools
+    from tools.registry import invalidate_check_fn_cache
+
+    calls = 0
+
+    def vision_available():
+        nonlocal calls
+        calls += 1
+        return True
+
+    monkeypatch.setattr(browser_tool, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(
+        vision_tools,
+        "check_vision_requirements",
+        vision_available,
+    )
+    invalidate_check_fn_cache()
+    try:
+        assert browser_tool.check_browser_vision_requirements() is True
+        assert browser_tool.check_browser_vision_requirements() is True
+        assert calls == 1
+    finally:
+        invalidate_check_fn_cache()
+
+
 def test_router_fails_closed_without_request_scope_token(monkeypatch):
     called = False
 
