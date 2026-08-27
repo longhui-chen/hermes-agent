@@ -1553,14 +1553,17 @@ class ZetAgentAdapter(APIServerAdapter):
         finally:
             self._end_profile_chat_run(profile_home_key)
 
-    def _schedule_runtime_shell_prewarm(self, session_id: str) -> bool:
-        """Schedule one bounded, deduplicated prewarm in the request identity scope."""
+    def _start_runtime_shell_prewarm(
+        self,
+        session_id: str,
+    ) -> Optional[asyncio.Task]:
+        """Start one bounded prewarm and return its shared completion task."""
         if not self._runtime_shell_prewarm_identity_ready():
-            return False
+            return None
         session_id = str(session_id or "").strip()
         profile_home_key = self._profile_home_key()
         if not session_id or not profile_home_key:
-            return False
+            return None
 
         tasks = self._runtime_shell_prewarm_tasks
         for stale_key, stale_task in tuple(tasks.items()):
@@ -1579,13 +1582,13 @@ class ZetAgentAdapter(APIServerAdapter):
         )
         existing = tasks.get(task_key)
         if existing is not None and not existing.done():
-            return False
+            return None
         if len(tasks) >= ZET_RUNTIME_SHELL_PREWARM_MAX_TASKS:
-            return False
+            return None
 
         barrier_key = self._begin_profile_chat_run(profile_home_key)
         if not barrier_key:
-            return False
+            return None
         try:
             task = asyncio.create_task(
                 self._run_scheduled_runtime_shell_prewarm(
@@ -1596,7 +1599,7 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         except Exception:
             self._end_profile_chat_run(barrier_key)
-            return False
+            return None
         tasks[task_key] = task
         try:
             self._background_tasks.add(task)
@@ -1612,7 +1615,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 pass
 
         task.add_done_callback(_forget)
-        return True
+        return task
+
+    def _schedule_runtime_shell_prewarm(self, session_id: str) -> bool:
+        """Schedule one bounded, deduplicated prewarm in the request identity scope."""
+        return self._start_runtime_shell_prewarm(session_id) is not None
 
     def _finish_runtime_shell_turn(self, agent: Any, *, reusable: bool) -> None:
         lease = getattr(agent, "_zet_runtime_shell_lease", None)
@@ -8440,6 +8447,123 @@ class ZetAgentAdapter(APIServerAdapter):
             "model": new_model,
         })
 
+    async def _handle_session_runtime_prewarm(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Bind trusted identity before an ephemeral runtime-shell prewarm."""
+        return await self._handle_with_zettlab_identity(
+            request,
+            self._handle_session_runtime_prewarm_authorized,
+        )
+
+    @staticmethod
+    def _runtime_prewarm_override(body: Dict[str, Any]) -> Dict[str, Any]:
+        override: Dict[str, Any] = {"model": body.get("model", "")}
+        for key in ("provider", "base_url", "api_key", "api_mode"):
+            value = body.get(key, "")
+            if value:
+                override[key] = value
+        if body.get("context_length", None) is not None:
+            override["context_length"] = body["context_length"]
+        if isinstance(body.get("supports_vision"), bool):
+            override["supports_vision"] = body["supports_vision"]
+        if isinstance(body.get("auxiliary"), dict):
+            override["auxiliary"] = body["auxiliary"]
+        return override
+
+    def _start_ephemeral_session_runtime_prewarm(
+        self,
+        session_id: str,
+        override: Dict[str, Any],
+    ) -> tuple[Optional[asyncio.Task], str]:
+        gw = getattr(self, "gateway_runner", None)
+        overrides = (
+            getattr(gw, "_session_model_overrides", None)
+            if gw is not None
+            else None
+        )
+        state_key = self._session_model_state_key(session_id)
+        if overrides is None:
+            return None, "runtime_unavailable"
+        if state_key in overrides:
+            return None, "session_override_exists"
+
+        # This dict exists only while the bounded task constructs the shell.
+        # A real switch replaces the object, so completion cleanup cannot erase
+        # a subsequently published authoritative override.
+        overrides[state_key] = override
+        task = self._start_runtime_shell_prewarm(session_id)
+        if task is None:
+            if overrides.get(state_key) is override:
+                overrides.pop(state_key, None)
+            return None, "prewarm_not_admitted"
+
+        def _remove_ephemeral_override(_done_task: asyncio.Task) -> None:
+            if overrides.get(state_key) is override:
+                overrides.pop(state_key, None)
+
+        task.add_done_callback(_remove_ephemeral_override)
+        return task, ""
+
+    async def _handle_session_runtime_prewarm_authorized(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Warm one exact model shell without publishing a session override."""
+        session_id = str(request.match_info.get("session_id", "") or "").strip()
+        if not session_id or len(session_id) > 512:
+            return web.json_response(
+                _openai_error("invalid session_id"), status=400,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid json"}, status=400,
+            )
+
+        new_model = body.get("model", "")
+        if not new_model:
+            return web.json_response(
+                {"ok": False, "error": "model is required"}, status=400,
+            )
+        if not self._runtime_shell_prewarm_identity_ready():
+            return web.json_response({
+                "ok": True,
+                "session_id": session_id,
+                "model": new_model,
+                "prewarmed": False,
+                "reason": "identity_unavailable",
+            })
+
+        override = self._runtime_prewarm_override(body)
+        task, reason = self._start_ephemeral_session_runtime_prewarm(
+            session_id,
+            override,
+        )
+        if task is None:
+            return web.json_response({
+                "ok": True,
+                "session_id": session_id,
+                "model": new_model,
+                "prewarmed": False,
+                "reason": reason,
+            })
+        try:
+            prewarmed = bool(await asyncio.shield(task))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            prewarmed = False
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "model": new_model,
+            "prewarmed": prewarmed,
+        })
+
     async def _handle_session_model_clear(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/sessions/{session_id}/model — clear a session model override.
 
@@ -9415,6 +9539,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 "/v1/sessions/{session_id}/model/switch",
                 self._handle_session_model_switch,
             )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/runtime/prewarm",
+                self._handle_session_runtime_prewarm,
+            )
             self._app.router.add_delete(
                 "/v1/sessions/{session_id}/model",
                 self._handle_session_model_clear,
@@ -9510,6 +9638,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/model/switch",
                 self._profile_handler(self._handle_session_model_switch),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/runtime/prewarm",
+                self._profile_handler(self._handle_session_runtime_prewarm),
             )
             self._app.router.add_delete(
                 "/p/{profile}/v1/sessions/{session_id}/model",

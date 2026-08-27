@@ -63,6 +63,10 @@ def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapte
         "/p/{profile}/v1/sessions/{session_id}/model/switch",
         adapter._profile_handler(adapter._handle_session_model_switch),
     )
+    app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/runtime/prewarm",
+        adapter._profile_handler(adapter._handle_session_runtime_prewarm),
+    )
     app.router.add_delete(
         "/p/{profile}/v1/sessions/{session_id}/model",
         adapter._profile_handler(adapter._handle_session_model_clear),
@@ -2042,6 +2046,7 @@ async def test_prefixed_control_routes_registered(profile_homes):
         "/p/{profile}/v1/profile/unload",
         "/p/{profile}/v1/model/switch",
         "/p/{profile}/v1/sessions/{session_id}/model/switch",
+        "/p/{profile}/v1/sessions/{session_id}/runtime/prewarm",
         "/p/{profile}/v1/sessions/{session_id}/model",
         "/p/{profile}/v1/sessions/{session_id}/pending",
         "/p/{profile}/v1/sessions/{session_id}/approval/respond",
