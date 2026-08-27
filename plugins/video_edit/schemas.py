@@ -846,6 +846,18 @@ def error_contract(name: str, reason_code: str) -> dict[str, Any]:
 def corrected_call(name: str, args: Any = None) -> dict[str, Any]:
     """Return the schema-bound repair call without exposing mutable metadata."""
     repaired = copy.deepcopy(TOOL_HELP_METADATA[name]["corrected_call"])
+    if isinstance(args, dict):
+        properties = TOOL_DEFINITIONS_BY_NAME[name]["parameters"]["properties"]
+        for field in TOOL_HELP_METADATA[name]["reusable_business_ids"]:
+            value = args.get(field)
+            field_schema = properties.get(field)
+            if value is None or not isinstance(field_schema, dict):
+                continue
+            issues: list[dict[str, Any]] = []
+            _validate_value(value, field_schema, f"$.{field}", issues)
+            if issues or (isinstance(value, str) and not value.strip()):
+                continue
+            repaired["arguments"][field] = copy.deepcopy(value)
     if (
         name == "video_edit_preferences_resolve"
         and isinstance(args, dict)

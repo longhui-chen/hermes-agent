@@ -814,6 +814,51 @@ def test_preferences_resolve_help_keeps_full_prompt_inside_preferences():
     ] == "FULL_USER_REQUEST"
 
 
+@pytest.mark.parametrize(
+    ("handler", "arguments", "expected_ids"),
+    [
+        (
+            tools.handle_preferences_resolve,
+            {"task_id": "task-live-123", "scene": 7},
+            {"task_id": "task-live-123"},
+        ),
+        (
+            tools.handle_wait_project,
+            {"workflow_id": "workflow-live-123", "max_wait_seconds": 1},
+            {"workflow_id": "workflow-live-123"},
+        ),
+        (
+            tools.handle_download_result,
+            {"workflow_id": "workflow-live-123", "filename": "杭州成片.mp4"},
+            {"workflow_id": "workflow-live-123"},
+        ),
+        (
+            tools.handle_proactive_resolve,
+            {
+                "manifest_id": "manifest-live-123",
+                "task_id": "task-live-123",
+                "unexpected": True,
+            },
+            {
+                "manifest_id": "manifest-live-123",
+                "task_id": "task-live-123",
+            },
+        ),
+    ],
+)
+def test_invalid_argument_recovery_preserves_valid_reusable_business_ids(
+    handler,
+    arguments,
+    expected_ids,
+):
+    rejected = _parsed(handler, arguments)
+
+    assert rejected["reason_code"] == "invalid_arguments"
+    repaired = rejected["corrected_call"]["arguments"]
+    for field, value in expected_ids.items():
+        assert repaired[field] == value
+
+
 def test_download_filename_pattern_is_schema_derived_and_enforced():
     name = "video_edit_download_result"
     filename_schema = schemas.TOOL_DEFINITIONS_BY_NAME[name]["parameters"][
