@@ -1,3 +1,4 @@
+import asyncio
 import os
 import queue
 import types
@@ -240,6 +241,148 @@ async def test_session_model_switch_without_identity_keeps_legacy_success_and_sk
 
     assert response.status == 200
     assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_prewarm_is_ephemeral_and_real_switch_wins_flow(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    evicted = []
+    overrides = {}
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides=overrides,
+        _evict_cached_agent=lambda sid: evicted.append(sid),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_prewarm():
+        started.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(
+        adapter,
+        "_start_runtime_shell_prewarm",
+        lambda _session_id: asyncio.create_task(run_prewarm()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_runtime_shell_prewarm",
+        lambda _session_id: False,
+    )
+
+    session_id = "zettlab:account-a:agent-1:prewarm"
+    headers = {
+        "X-Hermes-Session-Key": session_id,
+        "X-Zettlab-Account-Id": "account-a",
+        "X-Zettlab-Auth-Principal-Id": "iam:cn:user:account-a",
+        "X-Zettlab-User-Id": "account-a",
+    }
+    prewarm = asyncio.create_task(
+        adapter._handle_session_runtime_prewarm(
+            _FakeRequest(
+                {"model": "deepseek-v4", "provider": "custom"},
+                match_info={"session_id": session_id},
+                headers=headers,
+            )
+        )
+    )
+    await started.wait()
+
+    state_key = f"agent:main:zet_agent:dm:{session_id}"
+    ephemeral_override = overrides[state_key]
+    assert ephemeral_override["model"] == "deepseek-v4"
+    assert evicted == []
+
+    switched = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {
+                "model": "deepseek-v4",
+                "provider": "custom",
+                "supports_vision": False,
+            },
+            match_info={"session_id": session_id},
+            headers=headers,
+        )
+    )
+    assert switched.status == 200
+    durable_override = overrides[state_key]
+    assert durable_override is not ephemeral_override
+    assert durable_override["supports_vision"] is False
+
+    release.set()
+    response = await prewarm
+    await asyncio.sleep(0)
+
+    assert response.status == 200
+    assert response.payload["prewarmed"] is True
+    assert overrides[state_key] is durable_override
+    assert evicted == [adapter._interaction_queue_key(session_id)]
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_prewarm_without_identity_is_a_stateless_noop(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    overrides = {}
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides=overrides,
+        _evict_cached_agent=lambda _sid: None,
+    )
+    started = []
+    monkeypatch.setattr(
+        adapter,
+        "_start_runtime_shell_prewarm",
+        lambda session_id: started.append(session_id),
+        raising=False,
+    )
+
+    response = await adapter._handle_session_runtime_prewarm(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": "zettlab:account-a:agent-1:no-identity"},
+        )
+    )
+
+    assert response.status == 200
+    assert response.payload["prewarmed"] is False
+    assert response.payload["reason"] == "identity_unavailable"
+    assert overrides == {}
+    assert started == []
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_prewarm_rejects_oversized_session_id(monkeypatch):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = types.SimpleNamespace(_session_model_overrides={})
+
+    response = await adapter._handle_session_runtime_prewarm(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": "s" * 513},
+            headers={
+                "X-Zettlab-Account-Id": "account-a",
+                "X-Zettlab-Auth-Principal-Id": "iam:cn:user:account-a",
+                "X-Zettlab-User-Id": "account-a",
+            },
+        )
+    )
+
+    assert response.status == 400
+    assert adapter.gateway_runner._session_model_overrides == {}
 
 
 @pytest.mark.asyncio
