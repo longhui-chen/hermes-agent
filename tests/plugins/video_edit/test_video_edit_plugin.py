@@ -165,6 +165,18 @@ def _write_video(path: Path, marker: bytes = b"") -> None:
     path.write_bytes(_video_sample(path.suffix, marker))
 
 
+def _validated_result_sample(marker: bytes = b"") -> bytes:
+    """Return a structurally complete MP4 while preserving a test marker."""
+    payload = _video_sample(".mp4")
+    if not marker:
+        return payload
+    return payload + (len(marker) + 8).to_bytes(4, "big") + b"mdat" + marker
+
+
+def _write_result_video(path: Path, marker: bytes = b"") -> None:
+    path.write_bytes(_validated_result_sample(marker))
+
+
 def _normalized_output(path: Path) -> normalizer.NormalizedOutput:
     info = path.stat()
     return normalizer.NormalizedOutput(
@@ -919,13 +931,15 @@ def test_l1_chain_is_idempotent_and_uses_no_video_authorization_headers(isolated
     assert "result_url" not in waited
 
     def fake_download(url, target):
-        target.write_bytes(b"rendered")
-        return {"path": str(target), "size": 8, "sha256": "digest"}
+        _write_result_video(target, b"rendered")
+        return client.file_evidence(target)
 
     monkeypatch.setattr(client, "download", fake_download)
     delivered = json.loads(tools.handle_download_result({"workflow_id": workflow, "filename": "hangzhou.mp4"}, agent_id="agent-a"))
     assert delivered["ok"] is True
-    assert Path(delivered["output"]).read_bytes() == b"rendered"
+    assert Path(delivered["output"]).read_bytes() == _validated_result_sample(
+        b"rendered"
+    )
     assert "authorization" not in json.dumps(delivered).lower()
 
 
@@ -1279,7 +1293,7 @@ def test_download_recovers_file_committed_before_state_checkpoint(isolated_video
             "status": "downloading",
         },
     )
-    target.write_bytes(b"already-downloaded")
+    _write_result_video(target, b"already-downloaded")
     monkeypatch.setattr(
         client,
         "download",
@@ -1296,7 +1310,7 @@ def test_download_recovers_file_committed_before_state_checkpoint(isolated_video
     assert delivered["ok"] is True
     assert delivered["recovered"] is True
     assert delivered["output"] == str(target)
-    assert delivered["size"] == len(b"already-downloaded")
+    assert delivered["size"] == len(_validated_result_sample(b"already-downloaded"))
 
 
 def test_interactive_download_uses_stable_app_session_bucket_despite_flat_collision(
@@ -1328,7 +1342,7 @@ def test_interactive_download_uses_stable_app_session_bucket_despite_flat_collis
 
     def fake_download(_url, target):
         downloads.append(target)
-        target.write_bytes(b"current-session-render")
+        _write_result_video(target, b"current-session-render")
         return client.file_evidence(target)
 
     monkeypatch.setattr(client, "download", fake_download)
@@ -1348,7 +1362,7 @@ def test_interactive_download_uses_stable_app_session_bucket_despite_flat_collis
     assert delivered["ok"] is True
     assert delivered["output"] == str(expected)
     assert downloads == [expected]
-    assert expected.read_bytes() == b"current-session-render"
+    assert expected.read_bytes() == _validated_result_sample(b"current-session-render")
     assert flat_collision.read_bytes() == b"older-session-render"
     checkpoint = tools.state.get(workflow, "agent-a")
     assert checkpoint["output_session_id"] == "app-session-a"
@@ -1391,7 +1405,7 @@ def test_expired_result_url_repolls_existing_project_and_downloads_refreshed_url
                 status=404,
                 transient=True,
             )
-        target.write_bytes(b"refreshed-render")
+        _write_result_video(target, b"refreshed-render")
         return client.file_evidence(target)
 
     def fake_poll(requested_project_id, **_kwargs):
@@ -1471,7 +1485,7 @@ def test_unrenewed_result_url_is_not_downloaded_again_before_next_repoll(
                 status=404,
                 transient=True,
             )
-        target.write_bytes(b"rendered-after-refresh")
+        _write_result_video(target, b"rendered-after-refresh")
         return client.file_evidence(target)
 
     def fake_poll(requested_project_id, **_kwargs):
@@ -2642,7 +2656,7 @@ def test_proactive_report_is_exactly_once(isolated_video_home, monkeypatch, tmp_
         "weekly.mp4",
         session_id="proactive-pvm-report-exactly-once",
     )
-    output.write_bytes(b"rendered")
+    _write_result_video(output, b"rendered")
     tools.state.update(
         workflow,
         "agent-a",
@@ -2673,7 +2687,7 @@ def test_proactive_report_is_exactly_once_under_concurrent_calls(
         "weekly.mp4",
         session_id=f"proactive-{trigger_id}",
     )
-    output.write_bytes(b"rendered")
+    _write_result_video(output, b"rendered")
     tools.state.update(
         workflow,
         "agent-a",
@@ -3049,7 +3063,7 @@ def test_damaged_proactive_output_recovers_in_same_workflow_then_reports_once(
                 "temporary download failure",
                 transient=True,
             )
-        target.write_bytes(b"recovered-render")
+        _write_result_video(target, b"recovered-render")
         return client.file_evidence(target)
 
     monkeypatch.setattr(client, "download", flaky_download)
@@ -3065,7 +3079,7 @@ def test_damaged_proactive_output_recovers_in_same_workflow_then_reports_once(
     assert delivered["ok"] is True
     assert delivered["workflow_id"] == workflow
     assert delivered["output"] == str(output)
-    assert output.read_bytes() == b"recovered-render"
+    assert output.read_bytes() == _validated_result_sample(b"recovered-render")
     assert download_calls == [output, output]
 
     reports = []
@@ -3162,8 +3176,8 @@ def test_proactive_download_uses_server_trigger_output_bucket(
     )
 
     def fake_download(_url, target):
-        target.write_bytes(b"rendered")
-        return {"path": str(target), "size": 8, "sha256": "digest"}
+        _write_result_video(target, b"rendered")
+        return client.file_evidence(target)
 
     monkeypatch.setattr(client, "download", fake_download)
     delivered = json.loads(
@@ -4056,7 +4070,7 @@ def test_download_uses_random_no_follow_part_file(monkeypatch, tmp_path):
             if self.sent:
                 return b""
             self.sent = True
-            return b"rendered"
+            return _validated_result_sample(b"rendered")
 
     class Opener:
         def open(self, *_args, **_kwargs):
@@ -4073,6 +4087,62 @@ def test_download_uses_random_no_follow_part_file(monkeypatch, tmp_path):
 
     evidence = client.download("https://cdn.example.test/result.mp4", target)
 
-    assert target.read_bytes() == b"rendered"
+    assert target.read_bytes() == _validated_result_sample(b"rendered")
     assert victim.read_bytes() == b"keep"
-    assert evidence["size"] == len(b"rendered")
+    assert evidence["size"] == len(_validated_result_sample(b"rendered"))
+    assert evidence["validated"] is True
+    assert evidence["media_type"] == "video/mp4"
+    assert evidence["video_track"] is True
+
+
+def test_download_rejects_non_video_before_committing_target(monkeypatch, tmp_path):
+    target = tmp_path / "result.mp4"
+
+    class Response:
+        def __init__(self):
+            self.sent = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            if self.sent:
+                return b""
+            self.sent = True
+            return b"not-a-video"
+
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(client.urllib.request, "build_opener", lambda *_args: Opener())
+    monkeypatch.setattr(
+        client.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (client.socket.AF_INET, client.socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))
+        ],
+    )
+
+    with pytest.raises(client.VideoClientError, match="not a valid video result"):
+        client.download("https://cdn.example.test/result.mp4", target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(f".{target.name}.*.part"))
+
+
+def test_file_evidence_rejects_non_video_and_describes_valid_media(tmp_path):
+    valid = tmp_path / "valid.mp4"
+    valid.write_bytes(_validated_result_sample(b"valid"))
+    evidence = client.file_evidence(valid)
+    assert evidence["validated"] is True
+    assert evidence["media_type"] == "video/mp4"
+    assert evidence["video_track"] is True
+
+    invalid = tmp_path / "invalid.mp4"
+    invalid.write_bytes(b"not-a-video")
+    with pytest.raises(client.VideoClientError, match="not a valid video result"):
+        client.file_evidence(invalid)

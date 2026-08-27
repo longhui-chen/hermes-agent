@@ -690,6 +690,7 @@ def download(result_url: str, target: Path, *, timeout: float = 1800.0) -> dict[
     )
     total = 0
     digest = hashlib.sha256()
+    media_type = ""
     try:
         with opener.open(request, timeout=timeout) as response, os.fdopen(fd, "wb") as stream:
             fd = -1
@@ -704,6 +705,22 @@ def download(result_url: str, target: Path, *, timeout: float = 1800.0) -> dict[
                 stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
+            try:
+                media_type, proven = inspect_video_descriptor(target, stream.fileno())
+            except (OSError, VideoPathError) as exc:
+                raise VideoClientError(
+                    "downloaded result is not a valid video result"
+                ) from exc
+            if not proven:
+                raise VideoClientError("downloaded result is not a valid video result")
+            descriptor_info = os.fstat(stream.fileno())
+            part_info = os.stat(part, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(descriptor_info.st_mode)
+                or _stat_identity(descriptor_info) != _stat_identity(part_info)
+                or descriptor_info.st_size != total
+            ):
+                raise VideoClientError("downloaded result changed during validation")
         os.replace(part, target)
     except urllib.error.HTTPError as exc:
         if fd >= 0:
@@ -727,30 +744,74 @@ def download(result_url: str, target: Path, *, timeout: float = 1800.0) -> dict[
         except OSError:
             pass
         raise
-    return {"path": str(target), "size": total, "sha256": digest.hexdigest()}
+    return {
+        "path": str(target),
+        "size": total,
+        "sha256": digest.hexdigest(),
+        "validated": True,
+        "media_type": media_type,
+        "video_track": True,
+    }
 
 
 def file_evidence(target: Path) -> dict[str, Any]:
     """Rebuild bounded evidence for a result committed before state persistence."""
-    if target.is_symlink() or not target.is_file():
-        raise VideoClientError("video result is unavailable")
+    descriptor = -1
     total = 0
     digest = hashlib.sha256()
     try:
-        with target.open("rb") as stream:
-            while True:
-                chunk = stream.read(CHUNK_BYTES)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > 4 * 1024 * 1024 * 1024:
-                    raise VideoClientError("video result exceeds size limit")
-                digest.update(chunk)
+        descriptor = os.open(
+            target,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        path_info = os.stat(target, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size <= 0
+            or _stat_identity(opened) != _stat_identity(path_info)
+        ):
+            raise VideoClientError("video result is unavailable")
+        try:
+            media_type, proven = inspect_video_descriptor(target, descriptor)
+        except VideoPathError as exc:
+            raise VideoClientError(
+                "downloaded result is not a valid video result"
+            ) from exc
+        if not proven:
+            raise VideoClientError("downloaded result is not a valid video result")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(descriptor, CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 4 * 1024 * 1024 * 1024:
+                raise VideoClientError("video result exceeds size limit")
+            digest.update(chunk)
+        current = os.fstat(descriptor)
+        current_path = os.stat(target, follow_symlinks=False)
+        if (
+            _stat_identity(current) != _stat_identity(opened)
+            or _stat_identity(current_path) != _stat_identity(opened)
+            or total != opened.st_size
+        ):
+            raise VideoClientError("video result changed during validation")
     except OSError as exc:
         raise VideoClientError("video result is unavailable") from exc
-    if total <= 0:
-        raise VideoClientError("video result is unavailable")
-    return {"path": str(target), "size": total, "sha256": digest.hexdigest()}
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return {
+        "path": str(target),
+        "size": total,
+        "sha256": digest.hexdigest(),
+        "validated": True,
+        "media_type": media_type,
+        "video_track": True,
+    }
 
 
 def proactive_resolve(manifest_id: str, *, agent_id: str = "") -> dict[str, Any]:

@@ -1368,7 +1368,10 @@ def handle_function_call(
         if function_name == _ts_mod.TOOL_CALL_NAME:
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
-                return tool_error(err or "tool_call could not be resolved")
+                return _ts_mod.render_tool_call_resolution_error(
+                    function_args or {},
+                    err or "tool_call could not be resolved",
+                )
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate

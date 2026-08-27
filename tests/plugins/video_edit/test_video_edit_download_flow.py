@@ -11,6 +11,18 @@ from gateway.session_context import (
 from plugins.video_edit import client, paths, state, tools
 
 
+def _result_sample(marker: bytes) -> bytes:
+    def box(kind: bytes, payload: bytes) -> bytes:
+        return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+    hdlr = box(b"hdlr", b"\x00" * 8 + b"vide" + b"\x00" * 12)
+    return (
+        box(b"ftyp", b"isom\x00\x00\x00\x00isom")
+        + box(b"moov", box(b"trak", box(b"mdia", hdlr)))
+        + box(b"mdat", marker)
+    )
+
+
 @pytest.fixture
 def isolated_download_flow(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
@@ -53,7 +65,7 @@ def test_interactive_download_flow_allocates_once_and_reuses_across_lineage_tip(
 
     def fake_download(_url, target):
         downloads.append(target)
-        target.write_bytes(b"new-edit")
+        target.write_bytes(_result_sample(b"new-edit"))
         return client.file_evidence(target)
 
     monkeypatch.setattr(client, "download", fake_download)
@@ -77,7 +89,7 @@ def test_interactive_download_flow_allocates_once_and_reuses_across_lineage_tip(
     )
     assert delivered_path != existing
     assert delivered_path.name.startswith("hangzhou-vlog-")
-    assert delivered_path.read_bytes() == b"new-edit"
+    assert delivered_path.read_bytes() == _result_sample(b"new-edit")
     assert existing.read_bytes() == b"previous-edit"
 
     token = push_execution_session_key("zettlab:user-a:agent-a:app-session-flow")
@@ -104,7 +116,7 @@ def test_interactive_download_flow_rehomes_legacy_flat_checkpoint_once(
 ):
     workflow = state.workflow_id("turn-legacy-download", "agent-a")
     legacy = paths.result_path("agent-a", "legacy-vlog.mp4")
-    legacy.write_bytes(b"legacy-render")
+    legacy.write_bytes(_result_sample(b"legacy-render"))
     state.update(
         workflow,
         "agent-a",
@@ -141,7 +153,7 @@ def test_interactive_download_flow_rehomes_legacy_flat_checkpoint_once(
     assert delivered["ok"] is True
     assert delivered["reused"] is True
     assert delivered["output"] == str(expected)
-    assert expected.read_bytes() == b"legacy-render"
+    assert expected.read_bytes() == _result_sample(b"legacy-render")
     assert not legacy.exists()
     checkpoint = state.get(workflow, "agent-a")
     assert checkpoint["output_path"] == str(expected)
