@@ -12,6 +12,7 @@ from gateway.session_context import (
     _SESSION_ID,
     _UNSET,
     get_session_env,
+    suppress_current_session_id_env_mirror,
     set_current_session_id,
 )
 from tools.environments.local import build_subprocess_env
@@ -46,6 +47,43 @@ def test_root_agent_keeps_contextvar_and_environment_in_sync():
     assert _SESSION_ID.get() == "parent-session"
     assert os.environ["HERMES_SESSION_ID"] == "parent-session"
     assert get_session_env("HERMES_SESSION_ID") == "parent-session"
+
+
+def test_scoped_env_mirror_suppression_is_context_local_and_restores_root_behavior():
+    set_current_session_id("foreground-session")
+
+    with suppress_current_session_id_env_mirror():
+        set_current_session_id("prewarm-session")
+        assert get_session_env("HERMES_SESSION_ID") == "prewarm-session"
+        assert os.environ["HERMES_SESSION_ID"] == "foreground-session"
+
+    assert get_session_env("HERMES_SESSION_ID") == "foreground-session"
+    assert os.environ["HERMES_SESSION_ID"] == "foreground-session"
+
+    set_current_session_id("foreground-session-v2")
+    assert get_session_env("HERMES_SESSION_ID") == "foreground-session-v2"
+    assert os.environ["HERMES_SESSION_ID"] == "foreground-session-v2"
+
+
+def test_parallel_suppressed_scopes_never_replace_the_root_environment():
+    set_current_session_id("foreground-session")
+
+    def construct_prewarm(index: int) -> tuple[str, str | None]:
+        with suppress_current_session_id_env_mirror():
+            set_current_session_id(f"prewarm-{index}")
+            return (
+                str(get_session_env("HERMES_SESSION_ID")),
+                os.environ.get("HERMES_SESSION_ID"),
+            )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        observations = list(pool.map(construct_prewarm, range(8)))
+
+    assert observations == [
+        (f"prewarm-{index}", "foreground-session")
+        for index in range(8)
+    ]
+    assert os.environ["HERMES_SESSION_ID"] == "foreground-session"
 
 
 def test_child_construction_restores_both_parent_id_paths():
