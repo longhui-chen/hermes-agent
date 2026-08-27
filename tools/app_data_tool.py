@@ -592,19 +592,47 @@ def _approval_result(
         "decision_feedback.apply": "更新决策依据",
         "decision_revision.apply": "保存决策版本",
         "focus_result.feedback": "更新焦点结果",
+        "decision_run.resume": "更新焦点分析进度",
+        "focus_analysis.apply": "保存焦点分析结果",
     }
-    display = friendly_labels.get(operation, "更新应用数据")
+    display = friendly_labels.get(operation, f"更新应用 {slug}（{operation}）")
     reason = f"{display}会修改本地保存的数据。"
+    scope_digest = _focus_approval_scope_digest(operation, envelope)
+    rule_suffix = f"{scope_digest}:{digest}" if scope_digest else digest
     from tools.approval import request_tool_approval
 
     return request_tool_approval(
         "app_data",
         reason,
-        rule_key=f"app_data:{operation}:{digest}",
+        rule_key=f"app_data:{operation}:{rule_suffix}",
         one_shot=True,
         allow_yolo_bypass=False,
         display_target=display,
     )
+
+
+def _focus_approval_scope_digest(
+    operation: str,
+    envelope: dict[str, object],
+) -> str:
+    """Bind host auto-approval to the owning focus or decision run."""
+    if operation not in {"decision_run.resume", "focus_analysis.apply"}:
+        return ""
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    if operation == "focus_analysis.apply":
+        focus_id = payload.get("focus_id")
+        if not isinstance(focus_id, str) or not focus_id.strip():
+            return ""
+        scope_id = focus_id.strip()
+    else:
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            return ""
+        scope_id = run_id.strip()
+    canonical_scope = "\x00".join((operation, scope_id))
+    return hashlib.sha256(canonical_scope.encode("utf-8")).hexdigest()
 
 
 def _approval_failure(operation: str, approval: dict) -> str:

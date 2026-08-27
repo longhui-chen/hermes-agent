@@ -854,6 +854,48 @@ def test_focus_mutation_approval_hides_runtime_fields(monkeypatch):
     assert "expected_revision" not in visible
 
 
+def test_generic_mutation_approval_names_app_and_operation_flow(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.approval.request_tool_approval",
+        return_value={"approved": True},
+    ) as request:
+        result = _approval_result(
+            "project-workbench",
+            "records.store",
+            {"payload": {"record_id": "record-1"}},
+        )
+
+    assert result == {"approved": True}
+    _, reason = request.call_args.args
+    display = request.call_args.kwargs["display_target"]
+    assert display == "更新应用 project-workbench（records.store）"
+    assert reason == f"{display}会修改本地保存的数据。"
+
+
+def test_focus_analysis_approval_rule_binds_focus_and_run(monkeypatch):
+    with mux_profile_scope(monkeypatch, _scope()), patch(
+        "tools.approval.request_tool_approval",
+        return_value={"approved": True},
+    ) as request:
+        _approval_result(
+            "plaud-action-dashboard",
+            "focus_analysis.apply",
+            {
+                "payload": {
+                    "focus_id": "focus-1",
+                    "run_id": "analysis-run-1",
+                },
+                "idempotency_key": "analysis:1",
+            },
+        )
+
+    rule_key = request.call_args.kwargs["rule_key"]
+    parts = rule_key.split(":")
+    assert parts[:2] == ["app_data", "focus_analysis.apply"]
+    assert len(parts) == 4
+    assert all(len(part) == 64 for part in parts[2:])
+
+
 def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypatch):
     capability_seen = []
     with mux_profile_scope(monkeypatch, _scope()), patch(
