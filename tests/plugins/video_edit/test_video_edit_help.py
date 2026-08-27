@@ -46,6 +46,7 @@ HELP_SCHEMA_DIGEST_BY_VERSION = {
     "1.5": "57a5b21662652e76059efdec848c1b55500c9463fbdc82a363489003aacaa541",
     "1.6": "e8fa7a6778e0f60d8690db7a6ae4ebf0a7dfb3f7f8b1b8c77271644cdcf62709",
     "1.7": "baccd822ed985b1b0b69008be51083bc1009d86060fc12a76d792d19dcd1ff08",
+    "1.8": "b9ecbee9306e6cd0213d59e22bee78cb824a537ac55057148fc55685685725a2",
 }
 
 OVERVIEW_FIELDS = {
@@ -204,6 +205,7 @@ def _walk_schema_contract(
             "maxItems",
             "minProperties",
             "maxProperties",
+            "pattern",
         )
         if key in value
     }
@@ -784,6 +786,105 @@ def test_preference_schema_reuses_runtime_cleaning_constraints():
         preferences.VALID_DIRECTIVES
     )
     assert preference_container["additionalProperties"] is False
+
+
+def test_preferences_resolve_help_keeps_full_prompt_inside_preferences():
+    definition = schemas.TOOL_DEFINITIONS_BY_NAME[
+        "video_edit_preferences_resolve"
+    ]
+    properties = definition["parameters"]["properties"]
+    assert "user_prompt" not in properties
+    assert "user_prompt" in properties["preferences"]["properties"]
+
+    examples = _parsed(
+        tools.handle_preferences_resolve,
+        {"help": True, "help_topic": "examples"},
+    )["examples"]
+    corrected = examples[-1]["arguments"]
+    assert "user_prompt" not in corrected
+    assert corrected["preferences"]["user_prompt"] == "FULL_USER_REQUEST"
+
+    rejected = _parsed(
+        tools.handle_preferences_resolve,
+        {"user_prompt": "FULL_USER_REQUEST"},
+    )
+    assert rejected["reason_code"] == "invalid_arguments"
+    assert rejected["corrected_call"]["arguments"]["preferences"][
+        "user_prompt"
+    ] == "FULL_USER_REQUEST"
+
+
+@pytest.mark.parametrize(
+    ("handler", "arguments", "expected_ids"),
+    [
+        (
+            tools.handle_preferences_resolve,
+            {"task_id": "task-live-123", "scene": 7},
+            {"task_id": "task-live-123"},
+        ),
+        (
+            tools.handle_wait_project,
+            {"workflow_id": "workflow-live-123", "max_wait_seconds": 1},
+            {"workflow_id": "workflow-live-123"},
+        ),
+        (
+            tools.handle_download_result,
+            {"workflow_id": "workflow-live-123", "filename": "杭州成片.mp4"},
+            {"workflow_id": "workflow-live-123"},
+        ),
+        (
+            tools.handle_proactive_resolve,
+            {
+                "manifest_id": "manifest-live-123",
+                "task_id": "task-live-123",
+                "unexpected": True,
+            },
+            {
+                "manifest_id": "manifest-live-123",
+                "task_id": "task-live-123",
+            },
+        ),
+    ],
+)
+def test_invalid_argument_recovery_preserves_valid_reusable_business_ids(
+    handler,
+    arguments,
+    expected_ids,
+):
+    rejected = _parsed(handler, arguments)
+
+    assert rejected["reason_code"] == "invalid_arguments"
+    repaired = rejected["corrected_call"]["arguments"]
+    for field, value in expected_ids.items():
+        assert repaired[field] == value
+
+
+def test_download_filename_pattern_is_schema_derived_and_enforced():
+    name = "video_edit_download_result"
+    filename_schema = schemas.TOOL_DEFINITIONS_BY_NAME[name]["parameters"][
+        "properties"
+    ]["filename"]
+    assert filename_schema["pattern"] == r"^[A-Za-z0-9_.-]{1,128}$"
+    assert "appends .mp4" in filename_schema["description"]
+
+    accepted = schemas.validate_tool_arguments(
+        name,
+        {"workflow_id": "WORKFLOW_ID", "filename": "family_clip.mp4"},
+    )
+    rejected = schemas.validate_tool_arguments(
+        name,
+        {"workflow_id": "WORKFLOW_ID", "filename": "家庭成片.mp4"},
+    )
+    assert accepted == []
+    assert "pattern" in {issue["rule"] for issue in rejected}
+
+    rendered = _parsed(
+        tools.handle_download_result,
+        {"help": True, "help_topic": "inputs"},
+    )
+    assert rendered["enums_and_ranges"]["filename"]["pattern"] == (
+        filename_schema["pattern"]
+    )
 
 
 def test_help_examples_and_contract_do_not_contain_sensitive_or_escape_material():

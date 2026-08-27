@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from typing import Any
 
 from plugins.video_edit import preferences
 from plugins.video_edit.paths import MAX_TASK_ID_LENGTH
 
 
-HELP_SCHEMA_VERSION = "1.7"
+HELP_SCHEMA_VERSION = "1.8"
 HELP_TOPICS = ("overview", "inputs", "outputs", "errors", "recovery", "examples")
 HELP_CONTROL_FIELDS = frozenset({"help", "help_topic"})
 _SELF_TOOL = "$self"
@@ -220,6 +221,10 @@ _PREFERENCES = {
         "user_prompt": {
             "type": "string",
             "maxLength": preferences.MAX_USER_PROMPT_LENGTH,
+            "description": (
+                "The complete current user request, preserved inside preferences; "
+                "do not place user_prompt at the tool's top level."
+            ),
         },
     },
     "additionalProperties": False,
@@ -250,6 +255,7 @@ TOOL_DEFINITIONS = [
                 "When trusted turn context supplies turn_id, it is the workflow key and overrides any model-supplied task_id.",
                 "Without trusted turn context, reuse task_id for resume or retry; use a new task_id only for an explicit re-edit.",
                 "Explicit preferences override remembered values and defaults.",
+                "Preserve the complete current user request in preferences.user_prompt; user_prompt is not a top-level input.",
             ],
             reusable_business_ids=["task_id"],
             success_outputs=["ok", "workflow_id", "scene", "preferences", "sources", "memory_hit", "next"],
@@ -258,8 +264,14 @@ TOOL_DEFINITIONS = [
             workflow_required=True,
             next_tools=[{"when": "success", "tool": "video_edit_upload_assets"}],
             minimal_valid_call=_call("video_edit_preferences_resolve", {}),
-            common_mistake=_call("video_edit_preferences_resolve", {"scene": "SCENE_CATEGORY"}),
-            corrected_call=_call("video_edit_preferences_resolve", {"task_id": "TASK_ID"}),
+            common_mistake=_call(
+                "video_edit_preferences_resolve",
+                {"user_prompt": "FULL_USER_REQUEST"},
+            ),
+            corrected_call=_call(
+                "video_edit_preferences_resolve",
+                {"preferences": {"user_prompt": "FULL_USER_REQUEST"}},
+            ),
             bad_recovery="Do not change task_id during a retry when no trusted turn context is present; in a trusted turn, do not try to override its turn_id.",
         ),
         [],
@@ -520,16 +532,36 @@ TOOL_DEFINITIONS = [
         "Download a completed rendered result into the active agent output directory and persist the resume checkpoint.",
         {
             "workflow_id": {"type": "string"},
-            "filename": {"type": "string", "maxLength": 128},
+            "filename": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": r"^[A-Za-z0-9_.-]{1,128}$",
+                "description": (
+                    "Optional safe output basename; the plugin appends .mp4 when absent."
+                ),
+            },
         },
         _help(
             when_to_use="Download only after the project reached completed status, or resume the same pending download.",
             cross_field_invariants=[
                 "The workflow must contain a completed project result.",
                 "Reuse workflow_id so an existing or partially committed result is recovered rather than downloaded twice.",
+                "A success response with validated=true is the final media-integrity evidence; do not re-check the file through another tool.",
             ],
             reusable_business_ids=["workflow_id"],
-            success_outputs=["ok", "workflow_id", "output", "size", "sha256", "reused", "recovered", "next"],
+            success_outputs=[
+                "ok",
+                "workflow_id",
+                "output",
+                "size",
+                "sha256",
+                "validated",
+                "media_type",
+                "video_track",
+                "reused",
+                "recovered",
+                "next",
+            ],
             failure_code="download_result_failed",
             failure_recovery="Retry with the same workflow_id so the saved download checkpoint is reused.",
             recoverable_errors=[
@@ -567,8 +599,20 @@ TOOL_DEFINITIONS = [
                 {"when": "proactive_success", "tool": "video_edit_proactive_report"},
             ],
             minimal_valid_call=_call("video_edit_download_result", {"workflow_id": "WORKFLOW_ID_FROM_WAIT"}),
-            common_mistake=_call("video_edit_download_result", {"filename": "OUTPUT_FILENAME"}),
-            corrected_call=_call("video_edit_download_result", {"workflow_id": "WORKFLOW_ID_FROM_WAIT"}),
+            common_mistake=_call(
+                "video_edit_download_result",
+                {
+                    "workflow_id": "WORKFLOW_ID_FROM_WAIT",
+                    "filename": "FINAL VIDEO.mp4",
+                },
+            ),
+            corrected_call=_call(
+                "video_edit_download_result",
+                {
+                    "workflow_id": "WORKFLOW_ID_FROM_WAIT",
+                    "filename": "output_clip.mp4",
+                },
+            ),
             bad_recovery="Do not change workflow_id or bypass the pending download checkpoint.",
         ),
         ["workflow_id"],
@@ -705,6 +749,7 @@ def _walk_contract(
             "maxItems",
             "minProperties",
             "maxProperties",
+            "pattern",
         )
         if key in schema
     }
@@ -796,6 +841,30 @@ def error_contract(name: str, reason_code: str) -> dict[str, Any]:
         if item["reason_code"] == reason_code:
             return copy.deepcopy(item)
     raise KeyError(f"unknown video error reason: {name}:{reason_code}")
+
+
+def corrected_call(name: str, args: Any = None) -> dict[str, Any]:
+    """Return the schema-bound repair call without exposing mutable metadata."""
+    repaired = copy.deepcopy(TOOL_HELP_METADATA[name]["corrected_call"])
+    if isinstance(args, dict):
+        properties = TOOL_DEFINITIONS_BY_NAME[name]["parameters"]["properties"]
+        for field in TOOL_HELP_METADATA[name]["reusable_business_ids"]:
+            value = args.get(field)
+            field_schema = properties.get(field)
+            if value is None or not isinstance(field_schema, dict):
+                continue
+            issues: list[dict[str, Any]] = []
+            _validate_value(value, field_schema, f"$.{field}", issues)
+            if issues or (isinstance(value, str) and not value.strip()):
+                continue
+            repaired["arguments"][field] = copy.deepcopy(value)
+    if (
+        name == "video_edit_preferences_resolve"
+        and isinstance(args, dict)
+        and isinstance(args.get("user_prompt"), str)
+    ):
+        repaired["arguments"]["preferences"]["user_prompt"] = args["user_prompt"]
+    return repaired
 
 
 def terminal_failure_code(name: str) -> str:
@@ -923,6 +992,9 @@ def _validate_value(value: Any, schema: dict[str, Any], path: str, issues: list[
             issues.append({"path": path, "rule": "minLength", "minimum": schema["minLength"]})
         if isinstance(schema.get("maxLength"), int) and len(value) > schema["maxLength"]:
             issues.append({"path": path, "rule": "maxLength", "maximum": schema["maxLength"]})
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str) and re.fullmatch(pattern, value) is None:
+            issues.append({"path": path, "rule": "pattern", "pattern": pattern})
     elif isinstance(value, list):
         if isinstance(schema.get("minItems"), int) and len(value) < schema["minItems"]:
             issues.append({"path": path, "rule": "minItems", "minimum": schema["minItems"]})

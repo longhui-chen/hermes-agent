@@ -154,6 +154,7 @@ def _video_tool(tool_name: str):
                     "invalid video tool arguments",
                     tool=tool_name,
                     issues=issues,
+                    corrected_call=schemas.corrected_call(tool_name, args),
                 )
             return handler(args, **kwargs)
 
@@ -1079,6 +1080,9 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
                     "output": evidence["path"],
                     "size": evidence["size"],
                     "sha256": evidence["sha256"],
+                    "validated": evidence["validated"],
+                    "media_type": evidence["media_type"],
+                    "video_track": evidence["video_track"],
                     "reused": True,
                     "next": (
                         "video_edit_proactive_report"
@@ -1201,6 +1205,9 @@ def handle_download_result(args: dict, **kwargs: Any) -> str:
         return _ok({
             "ok": True, "workflow_id": workflow_id, "output": evidence["path"],
             "size": evidence["size"], "sha256": evidence["sha256"],
+            "validated": evidence["validated"],
+            "media_type": evidence["media_type"],
+            "video_track": evidence["video_track"],
             "recovered": recovered,
             "next": (
                 "video_edit_proactive_report"

@@ -318,6 +318,87 @@ class TestBridgeDispatch:
         assert err is not None
         assert "bridge tool" in err.lower()
 
+    @pytest.mark.parametrize(
+        "bridge_args",
+        [
+            {
+                "name": "tool_call",
+                "arguments": {
+                    "name": "mcp_bridge_repair_target",
+                    "arguments": {"value": "literal"},
+                    "misplaced_context": "must-not-be-forwarded",
+                },
+            },
+            {
+                "name": "tool_call",
+                "arguments": {
+                    "name": "tool_call",
+                    "arguments": {
+                        "name": "mcp_bridge_repair_target",
+                        "arguments": {"value": "literal"},
+                    },
+                },
+            },
+        ],
+    )
+    def test_recursive_bridge_error_returns_one_safe_corrected_call(
+        self,
+        bridge_args,
+    ):
+        """A redundant bridge envelope is explained, never executed or guessed."""
+        import model_tools
+        from tools.registry import registry
+
+        calls = []
+        registry.register(
+            name="mcp_bridge_repair_target",
+            toolset="mcp-bridge-repair",
+            schema={
+                "type": "function",
+                "function": {
+                    "name": "mcp_bridge_repair_target",
+                    "description": "repair target",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+            handler=lambda args, **_kwargs: calls.append(args) or "{}",
+        )
+
+        result = json.loads(
+            model_tools.handle_function_call(
+                function_name="tool_call",
+                function_args=bridge_args,
+                enabled_toolsets=["mcp-bridge-repair"],
+            )
+        )
+
+        assert result["code"] == "invalid_bridge_target"
+        assert result["retryable"] is True
+        assert result["next"] == "tool_call"
+        assert result["corrected_call"] == {
+            "name": "mcp_bridge_repair_target",
+            "arguments": {"value": "literal"},
+        }
+        assert calls == []
+
+    def test_tool_call_schema_forbids_bridge_targets_in_plain_language(self):
+        from tools.tool_search import bridge_tool_schemas
+
+        schema = bridge_tool_schemas(1)[2]["function"]
+        description = " ".join(
+            (
+                schema["description"],
+                schema["parameters"]["properties"]["name"]["description"],
+            )
+        ).lower()
+        for bridge_name in ("tool_search", "tool_describe", "tool_call"):
+            assert bridge_name in description
+        assert "do not" in description or "never" in description
+
 
 # ---------------------------------------------------------------------------
 # End-to-end via the real handle_function_call (smoke test).

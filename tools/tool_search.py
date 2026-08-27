@@ -738,11 +738,17 @@ def bridge_tool_schemas(
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Exact tool name to invoke.",
+                            "description": (
+                                "Exact deferred tool name to invoke. Do not use "
+                                "tool_search, tool_describe, or tool_call here."
+                            ),
                         },
                         "arguments": {
                             "type": "object",
-                            "description": "Arguments for the tool, matching its schema.",
+                            "description": (
+                                "Only the target tool's arguments, matching its schema; "
+                                "never another bridge call envelope."
+                            ),
                         },
                     },
                     "required": ["name", "arguments"],
@@ -1141,6 +1147,66 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     return name, raw_args, None
 
 
+def _safe_corrected_bridge_call(
+    args: Dict[str, Any],
+    *,
+    max_depth: int = 4,
+) -> Optional[Dict[str, Any]]:
+    """Extract one literal target call from redundant bridge envelopes.
+
+    The extracted call is advisory only.  The dispatcher never executes it in
+    the failing turn, so malformed wrappers cannot silently drop or reinterpret
+    sibling fields while still giving the model one deterministic repair.
+    """
+    current: Any = args
+    for _ in range(max_depth):
+        if not isinstance(current, dict):
+            return None
+        name = str(current.get("name") or "").strip()
+        raw_args = current.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                return None
+        if name and name not in BRIDGE_TOOL_NAMES:
+            if not isinstance(raw_args, dict):
+                return None
+            return {"name": name, "arguments": raw_args}
+        if name not in BRIDGE_TOOL_NAMES or not isinstance(raw_args, dict):
+            return None
+        current = raw_args
+    return None
+
+
+def render_tool_call_resolution_error(args: Dict[str, Any], message: str) -> str:
+    """Return one machine-readable, side-effect-free bridge repair result."""
+    name = str(args.get("name") or "").strip()
+    recursive_target = name in BRIDGE_TOOL_NAMES
+    direct_target = bool(name) and not recursive_target and not is_deferrable_tool_name(name)
+    fields: Dict[str, Any] = {
+        "code": (
+            "invalid_bridge_target"
+            if recursive_target or direct_target
+            else "invalid_bridge_arguments"
+        ),
+        "retryable": True,
+        "next": name if direct_target else TOOL_CALL_NAME,
+        "recovery": (
+            (
+                "Call the named directly-listed tool once without the bridge."
+                if direct_target
+                else "Invoke the exact deferred target once with its arguments "
+                "directly; do not wrap it in another bridge call."
+            )
+        ),
+    }
+    corrected = _safe_corrected_bridge_call(args) if recursive_target else None
+    if corrected is not None:
+        fields["corrected_call"] = corrected
+    return tool_error(message, **fields)
+
+
 __all__ = [
     "TOOL_SEARCH_NAME",
     "TOOL_DESCRIBE_NAME",
@@ -1165,6 +1231,7 @@ __all__ = [
     "dispatch_tool_search",
     "dispatch_tool_describe",
     "resolve_underlying_call",
+    "render_tool_call_resolution_error",
     "scoped_deferrable_names",
     "validate_deferred_call_args",
 ]
