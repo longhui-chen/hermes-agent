@@ -106,8 +106,8 @@ _PRINTER3D_INTENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _PLAUD_INTENT_RE = re.compile(
-    r"(?:plaud|录音|录音笔|转写|逐字稿).{0,40}(?:查看|列出|搜索|查找|读取|笔记|摘要|list|search|read|transcript|note)"
-    r"|(?:查看|列出|搜索|查找|读取|笔记|摘要|list|search|read|transcript|note).{0,40}(?:plaud|录音|录音笔|转写|逐字稿)",
+    r"(?:plaud|录音|录音笔|转写|逐字稿).{0,40}(?:获取|查看|列出|搜索|查找|读取|笔记|摘要|list|search|read|transcript|note)"
+    r"|(?:获取|查看|列出|搜索|查找|读取|笔记|摘要|list|search|read|transcript|note).{0,40}(?:plaud|录音|录音笔|转写|逐字稿)",
     re.IGNORECASE | re.DOTALL,
 )
 _HARDWARE_ENROLLMENT_FENCE = "zettlab-hardware-enrollment-intent"
