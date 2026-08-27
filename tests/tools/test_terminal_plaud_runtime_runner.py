@@ -326,3 +326,50 @@ def test_plaud_retry_continuation_requires_recent_attested_same_session(
         clear_turn_vars(other_turn)
         clear_session_vars(other_session_tokens)
         response_mode._PLAUD_RESUME_SESSIONS.clear()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("获取下 How to use Plaud 的内容", True),
+        ("获取下 How to use 的内容", False),
+    ],
+)
+def test_plaud_named_content_intent_requires_explicit_plaud(message, expected):
+    task = response_mode._skill_direct_task_context(SimpleNamespace(), message)
+
+    assert task.plaud_applicable is expected
+
+
+def test_plaud_named_content_followup_forces_fresh_skill_read():
+    session_tokens = set_session_vars(
+        session_key="zettlab:owner-1:agent-1:plaud-content",
+        session_id="session-plaud-content",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="turn-plaud-content",
+        hardware_execution_token=HARDWARE_TOKEN,
+    )
+    agent = SimpleNamespace(platform="zet_agent", _zet_agent_execution_policy="")
+    try:
+        response_mode.reset_trusted_skill_execution(
+            agent,
+            "获取下 How to use Plaud 的内容",
+        )
+
+        def _dispatch():
+            assert response_mode.trusted_skill_view_fresh_read_required()
+            return '{"success": true}'
+
+        result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args={"name": "plaud-recordings"},
+            dispatch=_dispatch,
+        )
+
+        assert result == '{"success": true}'
+        assert not response_mode.trusted_skill_view_fresh_read_required()
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
