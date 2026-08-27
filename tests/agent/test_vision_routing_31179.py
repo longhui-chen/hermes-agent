@@ -256,3 +256,34 @@ model:
         import tools.browser_tool
         with patch.object(tools.browser_tool, "check_browser_requirements", return_value=True):
             assert tools.browser_tool.check_browser_vision_requirements() is True
+
+    def test_browser_vision_uses_registry_canonical_check(
+        self, isolated_home, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        _fresh_modules()
+
+        import tools.browser_tool
+        import tools.vision_tools
+
+        with (
+            patch.object(
+                tools.browser_tool,
+                "check_browser_requirements",
+                return_value=True,
+            ),
+            patch(
+                "tools.registry._check_fn_cached",
+                return_value=True,
+            ) as canonical_check,
+            patch.object(
+                tools.vision_tools,
+                "check_vision_requirements",
+                return_value=True,
+            ) as vision_check,
+        ):
+            assert tools.browser_tool.check_browser_vision_requirements() is True
+
+        canonical_check.assert_called_once_with(vision_check)
+        vision_check.assert_not_called()
