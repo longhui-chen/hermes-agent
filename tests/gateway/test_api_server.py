@@ -963,6 +963,46 @@ class TestAgentExecution:
         ]
 
     @pytest.mark.asyncio
+    async def test_run_agent_plan_ack_survives_executor_handoff_flow(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        captured = {}
+
+        def _capture_plan_ack(**_kwargs):
+            from gateway.session_context import get_session_env
+
+            captured.update({
+                "status": get_session_env("HERMES_PLAN_ACK_STATUS"),
+                "turn_id": get_session_env("HERMES_PLAN_ACK_TURN_ID"),
+                "revision_requested": get_session_env(
+                    "HERMES_PLAN_ACK_REVISION_REQUESTED"
+                ),
+            })
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _capture_plan_ack
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="确认并继续",
+                conversation_history=[],
+                session_id="session-plan-1",
+                turn_id="turn-current",
+                plan_ack={
+                    "status": "confirmed",
+                    "turn_id": "turn-plan-1",
+                    "revision_requested": True,
+                },
+            )
+
+        assert captured == {
+            "status": "confirmed",
+            "turn_id": "turn-plan-1",
+            "revision_requested": "1",
+        }
+
+    @pytest.mark.asyncio
     async def test_run_agent_sets_and_clears_process_ownership_markers(self, adapter):
         """#76188 review: this surface runs its own agent lifecycle outside
         TurnRunner, so it needs its own baseline snapshot/clear — verify the

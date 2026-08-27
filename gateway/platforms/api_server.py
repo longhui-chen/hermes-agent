@@ -6913,7 +6913,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if prestream_timing is None:
             prestream_timing = _prestream_timing_context.get()
-
         timing_terminal_completed = False
 
         def _complete_timing_terminal_once() -> None:
@@ -9342,6 +9341,20 @@ class APIServerAdapter(BasePlatformAdapter):
         ).strip()
         if prestream_timing is None:
             prestream_timing = _prestream_timing_context.get()
+        turn_plan_ack_status = str(
+            (plan_ack or {}).get("status", "") or ""
+        ).strip().lower()
+        turn_plan_ack_turn_id = str(
+            (plan_ack or {}).get("turn_id", "") or ""
+        ).strip()
+        turn_plan_ack_revision_requested = ""
+        if turn_plan_ack_status not in {"confirmed", "cancelled"}:
+            turn_plan_ack_status = ""
+            turn_plan_ack_turn_id = ""
+        else:
+            turn_plan_ack_revision_requested = (
+                "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
+            )
 
         def _run():
             from gateway.session_context import (
@@ -9367,6 +9380,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 turn_tokens = set_turn_vars(
                     turn_id=str(turn_id or ""),
+                    plan_ack_status=turn_plan_ack_status,
+                    plan_ack_turn_id=turn_plan_ack_turn_id,
+                    plan_ack_revision_requested=turn_plan_ack_revision_requested,
                     hardware_execution_token=str(hardware_execution_token or ""),
                     execution_policy=str(execution_policy or ""),
                 )
