@@ -6913,7 +6913,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if prestream_timing is None:
             prestream_timing = _prestream_timing_context.get()
-
         timing_terminal_completed = False
 
         def _complete_timing_terminal_once() -> None:
@@ -9342,12 +9341,30 @@ class APIServerAdapter(BasePlatformAdapter):
         ).strip()
         if prestream_timing is None:
             prestream_timing = _prestream_timing_context.get()
+        turn_plan_ack_status = str(
+            (plan_ack or {}).get("status", "") or ""
+        ).strip().lower()
+        turn_plan_ack_turn_id = str(
+            (plan_ack or {}).get("turn_id", "") or ""
+        ).strip()
+        turn_plan_ack_revision_requested = ""
+        if turn_plan_ack_status not in {"confirmed", "cancelled"}:
+            turn_plan_ack_status = ""
+            turn_plan_ack_turn_id = ""
+        else:
+            turn_plan_ack_revision_requested = (
+                "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
+            )
 
         def _run():
             from gateway.session_context import (
+                clear_turn_vars,
                 clear_session_vars,
+                pop_zettlab_auth_principal,
                 pop_current_turn_reference_image,
+                push_zettlab_auth_principal,
                 push_current_turn_reference_image,
+                set_turn_vars,
                 set_zettlab_connector_route_capability,
                 set_zettlab_turn_id,
             )
@@ -9360,6 +9377,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                     session_user_id=session_context_user_id,
+                )
+                turn_tokens = set_turn_vars(
+                    turn_id=str(turn_id or ""),
+                    plan_ack_status=turn_plan_ack_status,
+                    plan_ack_turn_id=turn_plan_ack_turn_id,
+                    plan_ack_revision_requested=turn_plan_ack_revision_requested,
+                    hardware_execution_token=str(hardware_execution_token or ""),
+                    execution_policy=str(execution_policy or ""),
+                )
+                principal_token = (
+                    push_zettlab_auth_principal(session_user_id)
+                    if session_user_id
+                    else None
                 )
                 agent = None
                 # turn_id is request-scoped correlation for NAS fallback and
@@ -9568,6 +9598,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                     pop_current_turn_reference_image(reference_token)
+                    if principal_token is not None:
+                        pop_zettlab_auth_principal(principal_token)
+                    clear_turn_vars(turn_tokens)
                     clear_session_vars(tokens)
                     set_zettlab_turn_id("")
                     set_zettlab_connector_route_capability("")

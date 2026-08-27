@@ -912,6 +912,97 @@ class TestAgentExecution:
         )
 
     @pytest.mark.asyncio
+    async def test_run_agent_forwards_natural_language_write_context_into_tool_worker_flow(
+        self, adapter
+    ):
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        captured_headers = []
+
+        def _capture_execution_headers(**_kwargs):
+            from tools.apphost_tool import _execution_headers
+
+            captured_headers.append(_execution_headers())
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _capture_execution_headers
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="把这张图放进刚才的焦点",
+                conversation_history=[],
+                session_id="lineage-session-1",
+                gateway_session_key="zettlab:user-1:agent-1:conversation-1",
+                turn_id="turn-1",
+                request_overrides={
+                    "_zettlab_auth_principal": "iam:issuer:user:user-1",
+                },
+            )
+            await adapter._run_agent(
+                user_message="普通只读问题",
+                conversation_history=[],
+                session_id="lineage-session-2",
+                gateway_session_key="zettlab:user-1:agent-1:conversation-2",
+                turn_id="turn-2",
+            )
+
+        assert captured_headers == [
+            {
+                "X-Zettlab-Auth-Principal-Id": "iam:issuer:user:user-1",
+                "X-Hermes-Turn-Id": "turn-1",
+                "X-Hermes-Session-Id": "lineage-session-1",
+                "X-Hermes-Session-Key": "zettlab:user-1:agent-1:conversation-1",
+            },
+            {
+                "X-Hermes-Turn-Id": "turn-2",
+                "X-Hermes-Session-Id": "lineage-session-2",
+                "X-Hermes-Session-Key": "zettlab:user-1:agent-1:conversation-2",
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_agent_plan_ack_survives_executor_handoff_flow(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        captured = {}
+
+        def _capture_plan_ack(**_kwargs):
+            from gateway.session_context import get_session_env
+
+            captured.update({
+                "status": get_session_env("HERMES_PLAN_ACK_STATUS"),
+                "turn_id": get_session_env("HERMES_PLAN_ACK_TURN_ID"),
+                "revision_requested": get_session_env(
+                    "HERMES_PLAN_ACK_REVISION_REQUESTED"
+                ),
+            })
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _capture_plan_ack
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="确认并继续",
+                conversation_history=[],
+                session_id="session-plan-1",
+                turn_id="turn-current",
+                plan_ack={
+                    "status": "confirmed",
+                    "turn_id": "turn-plan-1",
+                    "revision_requested": True,
+                },
+            )
+
+        assert captured == {
+            "status": "confirmed",
+            "turn_id": "turn-plan-1",
+            "revision_requested": "1",
+        }
+
+    @pytest.mark.asyncio
     async def test_run_agent_sets_and_clears_process_ownership_markers(self, adapter):
         """#76188 review: this surface runs its own agent lifecycle outside
         TurnRunner, so it needs its own baseline snapshot/clear — verify the
