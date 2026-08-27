@@ -3029,7 +3029,8 @@ def _plaud_runtime_shell_guard_result(command: str) -> Optional[str]:
         "error": (
             "PLAUD actions require one exact foreground signed helper command "
             "with fixed read-only arguments and no shell operators, wrappers, "
-            "account identifier, credential, URL, path, audio, write, or control input."
+            "account identifier, credential, URL, path, audio, write, or control "
+            "input. For list, --page-size must be between 10 and 100."
         ),
         "plaud_runtime_direct": False,
         "plaud_runtime_blocked": True,

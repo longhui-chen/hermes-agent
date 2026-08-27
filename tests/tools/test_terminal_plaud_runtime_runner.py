@@ -120,6 +120,7 @@ def test_plaud_runtime_parser_accepts_only_fixed_read_argv(monkeypatch, tmp_path
         prefix + " transcript --file-id ../../tokens.json",
         prefix + " note --file-id recording_1 --output /tmp/note",
         prefix + " list --page 1 --page 2",
+        prefix + " list --page 1 --page-size 2",
         prefix + " search planning --from 2026-02-31",
         prefix + " list; id",
         prefix + " list --account-id account_1",
@@ -137,6 +138,12 @@ def test_plaud_runtime_parser_accepts_only_fixed_read_argv(monkeypatch, tmp_path
     assert not response_mode._plaud_command_policy(
         {"command": accepted[0], "background": True}
     )
+    blocked = json.loads(
+        terminal_tool_module._plaud_runtime_shell_guard_result(
+            prefix + " list --page 1 --page-size 2"
+        )
+    )
+    assert "--page-size must be between 10 and 100" in blocked["error"]
 
 
 def test_plaud_runtime_direct_runner_uses_private_fds(monkeypatch, tmp_path):
@@ -255,3 +262,114 @@ def test_plaud_trusted_scope_binds_exact_command_to_current_turn(monkeypatch, tm
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
         reset_secret_scope(secret_token)
+
+
+def test_plaud_retry_continuation_requires_recent_attested_same_session(
+    monkeypatch,
+    tmp_path,
+):
+    _write_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    response_mode._PLAUD_RESUME_SESSIONS.clear()
+    secret_token = set_secret_scope(
+        {"ZET_AGENT_ID": "agent-1", "ZETTLAB_AGENT_ACTION_TOKEN": ACTION_TOKEN}
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:owner-1:agent-1:plaud-retry",
+        session_id="session-plaud-retry",
+    )
+    first_turn = set_turn_vars(
+        turn_id="turn-plaud-source",
+        hardware_execution_token=HARDWARE_TOKEN,
+    )
+    agent = SimpleNamespace(platform="zet_agent", _zet_agent_execution_policy="")
+    try:
+        response_mode.reset_trusted_skill_execution(agent, "读取我的 PLAUD 录音")
+        turn_identity = response_mode._current_skill_direct_turn_identity()
+        assert turn_identity is not None
+        assert response_mode._activate_trusted_skill_scope(
+            agent,
+            relative_path="skills/plaud-recordings/SKILL.md",
+            attested_turn_identity=turn_identity,
+        )
+    finally:
+        clear_turn_vars(first_turn)
+
+    retry_turn = set_turn_vars(
+        turn_id="turn-plaud-retry",
+        hardware_execution_token=HARDWARE_TOKEN,
+    )
+    try:
+        response_mode.reset_trusted_skill_execution(agent, "再次读取下")
+        assert agent._zet_agent_skill_direct_task.plaud_applicable
+        assert response_mode._trusted_skill_view_refresh_required(
+            agent,
+            {"name": "plaud-recordings"},
+        )
+    finally:
+        clear_turn_vars(retry_turn)
+        clear_session_vars(session_tokens)
+        reset_secret_scope(secret_token)
+
+    other_session_tokens = set_session_vars(
+        session_key="zettlab:owner-1:agent-1:other-session",
+        session_id="session-other",
+    )
+    other_turn = set_turn_vars(
+        turn_id="turn-other",
+        hardware_execution_token=HARDWARE_TOKEN,
+    )
+    try:
+        response_mode.reset_trusted_skill_execution(agent, "再次读取下")
+        assert not agent._zet_agent_skill_direct_task.plaud_applicable
+    finally:
+        clear_turn_vars(other_turn)
+        clear_session_vars(other_session_tokens)
+        response_mode._PLAUD_RESUME_SESSIONS.clear()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("获取下 How to use Plaud 的内容", True),
+        ("获取下 How to use 的内容", False),
+    ],
+)
+def test_plaud_named_content_intent_requires_explicit_plaud(message, expected):
+    task = response_mode._skill_direct_task_context(SimpleNamespace(), message)
+
+    assert task.plaud_applicable is expected
+
+
+def test_plaud_named_content_followup_forces_fresh_skill_read():
+    session_tokens = set_session_vars(
+        session_key="zettlab:owner-1:agent-1:plaud-content",
+        session_id="session-plaud-content",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="turn-plaud-content",
+        hardware_execution_token=HARDWARE_TOKEN,
+    )
+    agent = SimpleNamespace(platform="zet_agent", _zet_agent_execution_policy="")
+    try:
+        response_mode.reset_trusted_skill_execution(
+            agent,
+            "获取下 How to use Plaud 的内容",
+        )
+
+        def _dispatch():
+            assert response_mode.trusted_skill_view_fresh_read_required()
+            return '{"success": true}'
+
+        result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="skill_view",
+            function_args={"name": "plaud-recordings"},
+            dispatch=_dispatch,
+        )
+
+        assert result == '{"success": true}'
+        assert not response_mode.trusted_skill_view_fresh_read_required()
+    finally:
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
