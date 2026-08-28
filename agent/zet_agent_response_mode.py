@@ -59,6 +59,8 @@ _PRINTER3D_SKILL_PATHS = frozenset({
 _PRINTER3D_DIRECT_TOOLS = frozenset({"terminal"})
 _PLAUD_SKILL_PATH = "skills/plaud-recordings/SKILL.md"
 _PLAUD_DIRECT_TOOLS = frozenset({"terminal"})
+_SMART_HOME_SKILL_PATH = "skills/smart-home-light-control/SKILL.md"
+_SMART_HOME_DIRECT_TOOLS = frozenset({"terminal"})
 _CAMERA_INTENT_RE = re.compile(
     r"(?:摄像头|镜头|camera).{0,48}(?:查看|看下|看看|获取|列出|截图|快照|画面|短视频|录像|统计|分析|识别|人数|多少人|有没有人|view|list|snap|snapshot|image|frame|clip|doctor|analy[sz]e|count|people|person)"
     r"|(?:查看|看下|看看|获取|列出|截图|快照|画面|短视频|录像|统计|分析|识别|人数|多少人|有没有人|view|list|snap|snapshot|image|frame|clip|doctor|analy[sz]e|count|people|person).{0,48}(?:摄像头|镜头|camera)",
@@ -302,6 +304,8 @@ class _SkillDirectTaskContext:
     printer3d_explicit: bool = False
     plaud_applicable: bool = False
     plaud_explicit: bool = False
+    smart_home_applicable: bool = False
+    smart_home_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -517,6 +521,7 @@ def _capture_trusted_execution_receipt(
         _CAMERA_SKILL_PATH,
         *_PRINTER3D_SKILL_PATHS,
         _PLAUD_SKILL_PATH,
+        _SMART_HOME_SKILL_PATH,
     }:
         return None
     try:
@@ -642,6 +647,11 @@ def trusted_printer3d_runtime_receipt() -> Mapping[str, str]:
 
 def trusted_plaud_runtime_receipt() -> Mapping[str, str]:
     """Return the private one-operation receipt for the PLAUD helper."""
+    return trusted_camera_runtime_receipt()
+
+
+def trusted_smart_home_runtime_receipt() -> Mapping[str, str]:
+    """Return the private one-operation receipt for the light helper."""
     return trusted_camera_runtime_receipt()
 
 
@@ -974,6 +984,9 @@ def _capture_trusted_presets_snapshot(
         expected_plaud_sha256 = expected_hashes.get(_PLAUD_SKILL_PATH)
         if expected_plaud_sha256:
             expected_trusted_skill_hashes[_PLAUD_SKILL_PATH] = expected_plaud_sha256
+        expected_smart_home_sha256 = expected_hashes.get(_SMART_HOME_SKILL_PATH)
+        if expected_smart_home_sha256:
+            expected_trusted_skill_hashes[_SMART_HOME_SKILL_PATH] = expected_smart_home_sha256
 
         trusted_skills: list[_TrustedDirectSkillSnapshot] = []
         scanned = 0
@@ -1369,6 +1382,7 @@ def _skill_direct_task_context(
         "printer3d-control",
     }
     plaud_transport_selection = normalized_skill_slug == "plaud-recordings"
+    smart_home_transport_selection = normalized_skill_slug == "smart-home-light-control"
     camera_resume_sessions = _camera_resume_sessions_locked(now=time.monotonic())
     camera_resume_key = _current_resume_key()
     camera_continuation = _camera_continuation_intent(normalized)
@@ -1397,6 +1411,7 @@ def _skill_direct_task_context(
             camera_transport_selection
             or printer3d_transport_selection
             or plaud_transport_selection
+            or smart_home_transport_selection
         )
         else normalized
     )
@@ -1434,6 +1449,8 @@ def _skill_direct_task_context(
             or plaud_continuation
         ),
         plaud_explicit=plaud_transport_selection,
+        smart_home_applicable=smart_home_transport_selection,
+        smart_home_explicit=smart_home_transport_selection,
     )
 
 
@@ -1506,6 +1523,8 @@ def _trusted_skill_view_refresh_required(
         task_paths.update(_PRINTER3D_SKILL_PATHS)
     if task.plaud_applicable:
         task_paths.add(_PLAUD_SKILL_PATH)
+    if task.smart_home_applicable:
+        task_paths.add(_SMART_HOME_SKILL_PATH)
     if requested_path not in task_paths:
         return False
 
@@ -1571,6 +1590,7 @@ def _activate_trusted_skill_scope(
         _CAMERA_SKILL_PATH,
         *_PRINTER3D_SKILL_PATHS,
         _PLAUD_SKILL_PATH,
+        _SMART_HOME_SKILL_PATH,
     }:
         return False
 
@@ -1589,6 +1609,10 @@ def _activate_trusted_skill_scope(
             or (
                 relative_path == _PLAUD_SKILL_PATH
                 and task.plaud_applicable
+            )
+            or (
+                relative_path == _SMART_HOME_SKILL_PATH
+                and task.smart_home_applicable
             )
         )
     )
@@ -1637,6 +1661,8 @@ def _activate_trusted_skill_scope(
         else _PRINTER3D_DIRECT_TOOLS
         if relative_path in _PRINTER3D_SKILL_PATHS
         else _PLAUD_DIRECT_TOOLS
+        if relative_path == _PLAUD_SKILL_PATH
+        else _SMART_HOME_DIRECT_TOOLS
     )
 
     with _SKILL_DIRECT_LOCK:
@@ -1932,6 +1958,27 @@ def _plaud_command_policy(function_args: Mapping[str, Any]) -> bool:
     )
 
 
+def _smart_home_runtime_argv(function_args: Mapping[str, Any]) -> list[str] | None:
+    command = function_args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        from tools.terminal_tool import _parse_smart_home_runtime_command
+        parsed = _parse_smart_home_runtime_command(command)
+    except Exception:
+        return None
+    argv = getattr(parsed, "argv", None)
+    if not isinstance(argv, list) or len(argv) < 3 or not all(isinstance(value, str) for value in argv):
+        return None
+    return list(argv)
+
+
+def _smart_home_command_policy(function_args: Mapping[str, Any]) -> bool:
+    if any(bool(function_args.get(field)) for field in ("background", "force", "notify_on_complete", "pty", "watch_patterns", "workdir")):
+        return False
+    return _smart_home_runtime_argv(function_args) is not None
+
+
 def _silent_skill_view_scope_block_message(
     agent: Any,
     function_args: Mapping[str, Any],
@@ -2078,6 +2125,18 @@ def trusted_skill_operation_block_message(
                     "minted by the attested `plaud-recordings` skill. Load that "
                     "trusted skill and retry the exact operation."
                 )
+            if (
+                function_name == "terminal"
+                and _smart_home_runtime_argv(function_args) is not None
+            ):
+                logger.warning(
+                    "zet_agent: blocked smart-home runtime command without a current trusted scope"
+                )
+                return (
+                    "Trusted smart-home commands require a current request-bound "
+                    "scope minted by the attested `smart-home-light-control` skill. "
+                    "Load that trusted skill and retry the exact operation."
+                )
             return None
 
         if scope.policy_exhausted:
@@ -2111,6 +2170,8 @@ def trusted_skill_operation_block_message(
                     )
                 elif scope.relative_path == _PLAUD_SKILL_PATH:
                     allowed = _plaud_command_policy(normalized_args)
+                elif scope.relative_path == _SMART_HOME_SKILL_PATH:
+                    allowed = _smart_home_command_policy(normalized_args)
                 else:
                     allowed = False
                 authorized_args_sha256 = _canonical_tool_args_sha256(
@@ -2217,6 +2278,7 @@ def _claim_trusted_terminal_dispatch(
                 _camera_runtime_argv(function_args) is not None
                 or _printer3d_runtime_argv(function_args) is not None
                 or _plaud_runtime_argv(function_args) is not None
+                or _smart_home_runtime_argv(function_args) is not None
             ):
                 return None, (
                     "Trusted runtime commands require a current "
@@ -2268,6 +2330,8 @@ def _claim_trusted_terminal_dispatch(
             )
         elif scope.relative_path == _PLAUD_SKILL_PATH:
             allowed = _plaud_command_policy(normalized_args)
+        elif scope.relative_path == _SMART_HOME_SKILL_PATH:
+            allowed = _smart_home_command_policy(normalized_args)
         else:
             allowed = False
         receipt = scope.execution_receipt
@@ -2522,6 +2586,9 @@ def _rearm_skill_direct_scope_after_success(
             elif scope.relative_path == _PLAUD_SKILL_PATH:
                 runtime_direct_field = "plaud_runtime_direct"
                 runtime_blocked_field = "plaud_runtime_blocked"
+            elif scope.relative_path == _SMART_HOME_SKILL_PATH:
+                runtime_direct_field = "smart_home_runtime_direct"
+                runtime_blocked_field = "smart_home_runtime_blocked"
             else:
                 return False
             successful = bool(
