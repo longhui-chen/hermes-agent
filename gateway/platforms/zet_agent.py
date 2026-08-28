@@ -1860,6 +1860,7 @@ class ZetAgentAdapter(APIServerAdapter):
     _APPROVAL_PROJECTION_MAX_BYTES = 512 * 1024
     _APPROVAL_PROJECTION_COMMAND_CHARS = 4096
     _APPROVAL_PROJECTION_DESCRIPTION_CHARS = 1024
+    _APPROVAL_PROJECTION_VALIDATION_CHARS = 4096
 
     @staticmethod
     def _bounded_approval_projection_text(value: Any, limit: int) -> str:
@@ -1895,6 +1896,11 @@ class ZetAgentAdapter(APIServerAdapter):
             payload.get("description", ""),
             self._APPROVAL_PROJECTION_DESCRIPTION_CHARS,
         )
+        if payload.get("validation_target"):
+            bounded["validation_target"] = self._bounded_approval_projection_text(
+                payload.get("validation_target", ""),
+                self._APPROVAL_PROJECTION_VALIDATION_CHARS,
+            )
         bounded["pattern_key"] = self._bounded_approval_projection_text(
             payload.get("pattern_key", ""), 512
         )
@@ -2156,6 +2162,10 @@ class ZetAgentAdapter(APIServerAdapter):
                     ),
                     "expires_at_ms": expires_at_ms,
                 }
+                if approval_data.get("validation_target"):
+                    legacy_payload["validation_target"] = approval_data[
+                        "validation_target"
+                    ]
                 self._cache_approval_projection(
                     stream_q,
                     internal_key,
@@ -2183,6 +2193,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 "pattern_keys": list(approval_data.get("pattern_keys", []) or []),
                 "expires_at_ms": expires_at_ms,
             }
+            if approval_data.get("validation_target"):
+                payload["validation_target"] = approval_data[
+                    "validation_target"
+                ]
             if turn_id:
                 payload["turn_id"] = turn_id
             if not self._store_pending_interaction(

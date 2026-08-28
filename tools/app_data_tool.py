@@ -585,12 +585,19 @@ def _approval_result(
         separators=(",", ":"),
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    validation_target = canonical
+    if len(validation_target) > 2048:
+        validation_target = (
+            f"{validation_target[:1800]}\n[truncated sha256={digest}]"
+        )
     friendly_labels = {
         "focus_attachment.import": "把这张图片加入当前焦点",
         "focus_space.update": "更新当前焦点",
         "entry.write": "保存文章资料",
         "decision_feedback.apply": "更新决策依据",
         "decision_revision.apply": "保存决策版本",
+        "decision_run.resume": "继续焦点分析",
+        "focus_analysis.apply": "保存焦点分析",
         "focus_result.feedback": "更新焦点结果",
     }
     display = friendly_labels.get(operation, "更新应用数据")
@@ -604,6 +611,7 @@ def _approval_result(
         one_shot=True,
         allow_yolo_bypass=False,
         display_target=display,
+        validation_target=validation_target,
     )
 
 

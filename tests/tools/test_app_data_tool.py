@@ -1,5 +1,6 @@
 """Unit tests for the generic, owner-scoped Generated App data bridge."""
 
+import hashlib
 import io
 import json
 import urllib.error
@@ -843,10 +844,46 @@ def test_focus_mutation_approval_hides_runtime_fields(monkeypatch):
     assert reason == "把这张图片加入当前焦点会修改本地保存的数据。"
     assert kwargs["display_target"] == "把这张图片加入当前焦点"
     assert kwargs["rule_key"].startswith("app_data:focus_attachment.import:")
+    validation_target = kwargs["validation_target"]
+    assert json.loads(validation_target) == {
+        "envelope": envelope,
+        "operation": "focus_attachment.import",
+        "profile_scope": hashlib.sha256(b"profile-agent").hexdigest(),
+        "slug": "plaud-action-dashboard",
+    }
+    assert hashlib.sha256(validation_target.encode("utf-8")).hexdigest() == (
+        kwargs["rule_key"].rsplit(":", 1)[-1]
+    )
     visible = f'{reason}\n{kwargs["display_target"]}'
     assert "focus-private-123" not in visible
     assert "private-key-123" not in visible
     assert "expected_revision" not in visible
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_label"),
+    [
+        ("decision_run.resume", "继续焦点分析"),
+        ("focus_analysis.apply", "保存焦点分析"),
+    ],
+)
+def test_focus_analysis_approval_uses_operation_specific_label(operation, expected_label):
+    with patch("tools.app_data_tool._is_cron_session", return_value=False), patch(
+        "tools.app_data_tool._profile_scope_digest", return_value="scope"
+    ), patch(
+        "tools.approval.request_tool_approval",
+        return_value={"approved": True, "message": None},
+    ) as request:
+        result = _approval_result(
+            "plaud-action-dashboard",
+            operation,
+            {"focus_id": "focus-1", "decision_run_id": "run-1"},
+        )
+
+    assert result["approved"] is True
+    _, reason = request.call_args.args
+    assert request.call_args.kwargs["display_target"] == expected_label
+    assert reason == f"{expected_label}会修改本地保存的数据。"
 
 
 def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypatch):

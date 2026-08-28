@@ -95,11 +95,44 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval, "submit_pending",
                             lambda sk, data: submitted.update(data)
                             or "test-approval-id-1234567890")
-        res = request_tool_approval("browser_navigate", "external URL",
-                                    rule_key="ext-nav")
+        res = request_tool_approval(
+            "browser_navigate",
+            "external URL",
+            rule_key="ext-nav",
+            validation_target='{"url":"https://example.com"}',
+        )
         assert res["approved"] is False
         assert res["status"] == "approval_required"
         assert submitted["pattern_key"] == "plugin_rule:ext-nav"
+        assert submitted["validation_target"] == '{"url":"https://example.com"}'
+
+    def test_gateway_live_callback_carries_validation_target(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        state_key = approval._approval_state_key("test-session")
+        monkeypatch.setattr(
+            approval,
+            "_gateway_notify_cbs",
+            {state_key: lambda _data: None},
+        )
+        seen = {}
+
+        def decide(_session_key, _notify, data, *, surface):
+            seen.update(data)
+            assert surface == "gateway"
+            return {"resolved": True, "choice": "once"}
+
+        monkeypatch.setattr(approval, "_await_gateway_decision", decide)
+        result = request_tool_approval(
+            "app_data",
+            "保存焦点分析会修改本地保存的数据。",
+            rule_key="app_data:decision_run.resume:digest",
+            one_shot=True,
+            validation_target='{"operation":"decision_run.resume"}',
+        )
+
+        assert result == {"approved": True, "message": None}
+        assert seen["validation_target"] == '{"operation":"decision_run.resume"}'
 
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)

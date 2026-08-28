@@ -3794,6 +3794,7 @@ def _run_approval_gate(
     no_human_block_message: str = "",
     one_shot: bool = False,
     allow_yolo_bypass: bool = True,
+    validation_target: str = "",
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3834,6 +3835,11 @@ def _run_approval_gate(
             choices, and never save the response beyond this operation.
         allow_yolo_bypass: When False, active yolo mode cannot replace the
             human decision for newly discovered, operation-specific risk.
+        validation_target: Optional non-display operation record used by a
+            trusted consumer to validate that the approval still covers the
+            exact structured mutation. This is transported separately from
+            ``display_target`` so the user can see a concise label without
+            weakening payload ownership checks.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3927,6 +3933,8 @@ def _run_approval_gate(
                 "allow_permanent": not one_shot,
                 "allow_session": not one_shot,
             }
+            if validation_target:
+                approval_data["validation_target"] = validation_target
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
             )
@@ -3974,13 +3982,16 @@ def _run_approval_gate(
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
-        approval_id = submit_pending(session_key, {
+        pending_data = {
             "command": display_target,
             "pattern_key": pattern_key,
             "description": description,
             "allow_permanent": not one_shot,
             "one_shot": one_shot,
-        })
+        }
+        if validation_target:
+            pending_data["validation_target"] = validation_target
+        approval_id = submit_pending(session_key, pending_data)
         if approval_id is None:
             return {
                 "approved": False,
@@ -4146,6 +4157,7 @@ def request_tool_approval(
     one_shot: bool = False,
     allow_yolo_bypass: bool = True,
     display_target: str = "",
+    validation_target: str = "",
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -4178,9 +4190,12 @@ def request_tool_approval(
         allow_yolo_bypass: Whether process/session yolo can auto-approve this
             gate. Set False when the user must see newly discovered risk.
         display_target: Optional bounded, human-readable operation record.
-            Callers gating a structured operation should include escaped
-            arguments and a digest that is derived from the same bytes as
-            ``rule_key``. Empty keeps the generic plugin label.
+            Keep internal identifiers and structured arguments out of this
+            value; empty keeps the generic plugin label.
+        validation_target: Optional bounded, non-display operation record for
+            a trusted downstream validator. It must describe the same bytes
+            used to derive ``rule_key``; normal approval UIs must continue to
+            render only ``display_target``.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or
@@ -4234,6 +4249,7 @@ def request_tool_approval(
         ),
         one_shot=one_shot,
         allow_yolo_bypass=allow_yolo_bypass,
+        validation_target=validation_target,
     )
 
 
