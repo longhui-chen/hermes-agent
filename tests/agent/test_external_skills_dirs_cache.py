@@ -166,3 +166,71 @@ def test_cache_key_is_per_config_path(tmp_path, monkeypatch):
     # And switching back still works — both entries coexist in the cache.
     monkeypatch.setenv("HERMES_HOME", str(home_a))
     assert get_external_skills_dirs() == [ext_a.resolve()]
+
+
+def test_self_contained_marker_disables_external_dirs(hermes_home_with_config):
+    """A verified self-contained profile never scans the shared preset root."""
+    home, _external, _config = hermes_home_with_config
+    marker = home / ".zettlab-self-contained-agent"
+    marker.touch()
+
+    assert get_external_skills_dirs() == []
+
+def test_self_contained_marker_bypasses_existing_cache(hermes_home_with_config):
+    """Publishing the marker takes effect without a config/mtime change."""
+    home, external, _config = hermes_home_with_config
+    assert get_external_skills_dirs() == [external.resolve()]
+
+    (home / ".zettlab-self-contained-agent").touch()
+
+    assert get_external_skills_dirs() == []
+
+
+@pytest.mark.parametrize("marker_kind", ["symlink", "directory"])
+def test_invalid_self_contained_marker_fails_closed(
+    hermes_home_with_config, marker_kind, tmp_path
+):
+    """A marker that is not a regular file must not re-enable shared skills."""
+    home, _external, _config = hermes_home_with_config
+    marker = home / ".zettlab-self-contained-agent"
+    if marker_kind == "symlink":
+        target = tmp_path / "marker-target"
+        target.touch()
+        marker.symlink_to(target)
+    else:
+        marker.mkdir()
+
+    assert get_external_skills_dirs() == []
+
+
+def test_unreadable_self_contained_marker_fails_closed(hermes_home_with_config, monkeypatch):
+    """An inspection failure is conservative and hides external skills."""
+    home, _external, _config = hermes_home_with_config
+    marker = home / ".zettlab-self-contained-agent"
+    marker.touch()
+
+    real_open = skill_utils.os.open
+
+    def fail_marker_open(path, flags, *args, **kwargs):
+        if os.fspath(path) == os.fspath(marker):
+            raise OSError("simulated marker read failure")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(skill_utils.os, "open", fail_marker_open)
+    assert get_external_skills_dirs() == []
+
+
+def test_unstatable_self_contained_marker_fails_closed(hermes_home_with_config, monkeypatch):
+    """An fd stat failure is also isolated without escaping the hook."""
+    home, _external, _config = hermes_home_with_config
+    marker = home / ".zettlab-self-contained-agent"
+    marker.touch()
+
+    real_fstat = skill_utils.os.fstat
+
+    def fail_marker_fstat(fd):
+        raise OSError("simulated marker stat failure")
+
+    monkeypatch.setattr(skill_utils.os, "fstat", fail_marker_fstat)
+    assert get_external_skills_dirs() == []
+    monkeypatch.setattr(skill_utils.os, "fstat", real_fstat)

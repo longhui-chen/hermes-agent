@@ -100,6 +100,33 @@ class TestExternalSkillsInFindAll:
         assert len(matching) == 1
         assert matching[0]["description"] == "Local version"
 
+    def test_self_contained_profile_ignores_duplicate_external_skill(
+        self, hermes_home, external_skills_dir
+    ):
+        """The real discovery path sees only the profile-local skill."""
+        local_skills = hermes_home / "skills"
+        local_skill = local_skills / "my-external-skill"
+        local_skill.mkdir(parents=True)
+        (local_skill / "SKILL.md").write_text(
+            "---\nname: my-external-skill\ndescription: Local version\n---\n\nLocal.\n"
+        )
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        (hermes_home / ".zettlab-self-contained-agent").touch()
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import _find_all_skills
+
+            skills = _find_all_skills()
+
+        matching = [s for s in skills if s["name"] == "my-external-skill"]
+        assert len(matching) == 1
+        assert matching[0]["description"] == "Local version"
+
 
 class TestExternalSkillView:
     def test_skill_view_finds_external(self, hermes_home, external_skills_dir):
