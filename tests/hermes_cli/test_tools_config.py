@@ -101,6 +101,14 @@ def test_get_platform_tools_homeassistant_toolset_enabled_for_cron_when_hass_tok
     assert "homeassistant" in cli_enabled
 
 
+def test_get_platform_tools_disables_legacy_homeassistant_in_zettlab_bridge_mode(monkeypatch):
+    monkeypatch.setenv("HASS_TOKEN", "fake-test-token")
+    monkeypatch.setenv("ZETTLAB_HA_BRIDGE_ONLY", "1")
+
+    assert "homeassistant" not in _get_platform_tools({}, "cron")
+    assert "homeassistant" not in _get_platform_tools({}, "cli")
+
+
 def test_get_platform_tools_homeassistant_uses_active_profile_token(monkeypatch):
     from agent import secret_scope
 

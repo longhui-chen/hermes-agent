@@ -1556,6 +1556,7 @@ def test_zpk_agent_service_names_are_device_facing():
     )
     assert "RequiresMountsFor=/volume1" in service
     assert "Environment=GATEWAY_MULTIPLEX_PROFILES=true" in service
+    assert "Environment=ZETTLAB_HA_BRIDGE_ONLY=1" in service
     assert "Environment=HERMES_MANAGED_GATEWAY=1" in service
     assert "HERMES_NEMO_RELAY_CORE_ENABLED" not in service
     assert (

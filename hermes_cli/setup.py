@@ -607,7 +607,13 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Modal Execution (optional via Nous subscription)", True, None))
 
     # Home Assistant
-    if get_env_value("HASS_TOKEN"):
+    # In the packaged Zettlab runtime, smart-home access is owned by
+    # local-server's protected bridge; do not advertise the legacy direct HA
+    # platform merely because an old HASS_TOKEN remains in the environment.
+    bridge_only = os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if get_env_value("HASS_TOKEN") and not bridge_only:
         tool_status.append(("Smart Home (Home Assistant)", True, None))
 
     # Spotify (OAuth via hermes auth spotify — check auth.json, not env vars)
