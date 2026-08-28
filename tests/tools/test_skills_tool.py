@@ -936,6 +936,29 @@ class TestSkillViewCollisionDetection:
         assert any("external" in p for p in result["matches"])
         assert "hint" in result
 
+    def test_self_contained_profile_ignores_external_collision(self, tmp_path):
+        """A cloned profile resolves its local application skill unambiguously."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "application-create", body="LOCAL APPLICATION CREATE")
+        _make_skill(external_dir, "application-create", body="PRESET APPLICATION CREATE")
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_dir}\n"
+        )
+        (tmp_path / ".zettlab-self-contained-agent").touch()
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+        ):
+            result = json.loads(skill_view("application-create"))
+
+        assert result["success"] is True
+        assert "LOCAL APPLICATION CREATE" in result["content"]
+        assert "PRESET APPLICATION CREATE" not in result["content"]
+
 
     def test_support_markdown_does_not_collide_with_real_skill(self, tmp_path):
         """Supporting reference docs named <skill>.md are not skills.
