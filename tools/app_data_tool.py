@@ -470,7 +470,14 @@ def _request_json(
         if len(encoded) > _MAX_ENVELOPE_BYTES:
             raise _BridgeError("invalid_request", "请求体过大", 0)
 
-    attempts = 2 if retry_read else 1
+    retry_idempotent_mutation = bool(
+        method == "POST"
+        and isinstance(body, dict)
+        and isinstance(body.get("idempotency_key"), str)
+        and _IDEMPOTENCY_RE.fullmatch(body["idempotency_key"]) is not None
+    )
+    retry_safe = retry_read or retry_idempotent_mutation
+    attempts = 2 if retry_safe else 1
     for attempt in range(attempts):
         headers = {
             _ACTION_TOKEN_HEADER: token,
@@ -490,7 +497,7 @@ def _request_json(
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             raw = exc.read(_MAX_RESPONSE_BYTES + 1) or b""
-            if retry_read and exc.code in {429, 502, 503, 504} and attempt + 1 < attempts:
+            if retry_safe and exc.code in {408, 425, 429, 500, 502, 503, 504} and attempt + 1 < attempts:
                 time.sleep(0.05)
                 continue
             upstream = _safe_error(raw)
@@ -502,7 +509,7 @@ def _request_json(
                 exc.code,
             ) from exc
         except Exception as exc:
-            if retry_read and attempt + 1 < attempts:
+            if retry_safe and attempt + 1 < attempts:
                 time.sleep(0.05)
                 continue
             raise _BridgeError(
@@ -779,7 +786,7 @@ def _run_app_data_tool(args) -> str:
             method="POST",
             path=path,
             body=transport_envelope,
-            retry_read=False,
+            retry_read=mode == "read",
             timeout=_READ_TIMEOUT if mode == "read" else _MUTATION_TIMEOUT,
         )
     except _BridgeError as exc:

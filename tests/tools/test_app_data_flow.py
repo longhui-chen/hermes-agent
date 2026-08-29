@@ -33,6 +33,7 @@ _CHANGED_CAPABILITY_DIGEST = "b" * 64
 class _AppDataHandler(BaseHTTPRequestHandler):
     calls = []
     rotate_capabilities_before_post = False
+    transient_mutation_failures = 0
 
     def _send(self, payload, status=200):
         raw = json.dumps(payload).encode()
@@ -59,6 +60,16 @@ class _AppDataHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length) or b"{}")
         self.__class__.calls.append(("POST", self.path, self.headers, body))
+        if (
+            body.get("idempotency_key")
+            and self.__class__.transient_mutation_failures > 0
+        ):
+            self.__class__.transient_mutation_failures -= 1
+            self._send(
+                {"code": "temporarily_unavailable", "message": "retry"},
+                status=503,
+            )
+            return
         expected_digest = (
             _CHANGED_CAPABILITY_DIGEST
             if self.__class__.rotate_capabilities_before_post
@@ -84,6 +95,7 @@ class _AppDataHandler(BaseHTTPRequestHandler):
 def _app_data_server():
     _AppDataHandler.calls = []
     _AppDataHandler.rotate_capabilities_before_post = False
+    _AppDataHandler.transient_mutation_failures = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _AppDataHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -479,6 +491,33 @@ def test_declared_operations_flow_through_real_loopback_transport(monkeypatch):
     assert calls[2][1].endswith(f"/operations/{_READ_OPERATION}")
     assert calls[4][1].endswith(f"/operations/{_MUTATION_OPERATION}")
     assert all("flow-agent" not in json.dumps(body) for *_prefix, body in calls if body)
+
+
+def test_idempotent_mutation_recovers_from_transient_loopback_failure(monkeypatch):
+    with _app_data_server() as (base_url, calls), mux_profile_scope(
+        monkeypatch,
+        _scope(base_url),
+        poison_environ=True,
+    ), patch(
+        "tools.app_data_tool._approval_result",
+        return_value={"approved": True},
+    ):
+        _AppDataHandler.transient_mutation_failures = 1
+        result = json.loads(app_data_tool({
+            "action": "invoke",
+            "slug": _SLUG,
+            "operation": _MUTATION_OPERATION,
+            "payload": {"record_id": "record-1", "state": "accepted"},
+            "idempotency_key": "focus-analysis:run-1:revision-3",
+        }))
+
+    assert result["ok"] is True
+    mutation_calls = [call for call in calls if call[0] == "POST"]
+    assert len(mutation_calls) == 2
+    assert mutation_calls[0][3] == mutation_calls[1][3]
+    assert mutation_calls[0][3]["idempotency_key"] == (
+        "focus-analysis:run-1:revision-3"
+    )
 
 
 def test_legacy_apphost_base_derives_real_app_data_route(monkeypatch):
