@@ -95,11 +95,58 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval, "submit_pending",
                             lambda sk, data: submitted.update(data)
                             or "test-approval-id-1234567890")
-        res = request_tool_approval("browser_navigate", "external URL",
-                                    rule_key="ext-nav")
+        res = request_tool_approval(
+            "browser_navigate",
+            "external URL",
+            rule_key="ext-nav",
+            validation_target='{"payload_digest":"abc"}',
+        )
         assert res["approved"] is False
         assert res["status"] == "approval_required"
         assert submitted["pattern_key"] == "plugin_rule:ext-nav"
+        assert submitted["validation_target"] == '{"payload_digest":"abc"}'
+
+    def test_gateway_live_callback_carries_validation_target(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        captured = []
+
+        def notify(data):
+            captured.append(dict(data))
+            approval.resolve_gateway_approval(
+                "test-session",
+                "deny",
+                approval_id=data["approval_id"],
+            )
+
+        approval.register_gateway_notify("test-session", notify)
+        try:
+            res = request_tool_approval(
+                "app_data",
+                "save focus analysis",
+                rule_key="focus-analysis",
+                validation_target='{"payload_digest":"abc"}',
+            )
+        finally:
+            approval.unregister_gateway_notify("test-session")
+
+        assert res["approved"] is False
+        assert captured[0]["validation_target"] == '{"payload_digest":"abc"}'
+
+    def test_oversized_validation_target_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(
+            approval,
+            "prompt_dangerous_approval",
+            lambda *a, **k: pytest.fail("oversized validation must not prompt"),
+        )
+        res = request_tool_approval(
+            "app_data",
+            "save focus analysis",
+            rule_key="focus-analysis",
+            validation_target="v" * 2049,
+        )
+        assert res["approved"] is False
+        assert res["status"] == "approval_validation_target_too_large"
 
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)

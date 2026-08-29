@@ -573,9 +573,10 @@ def _approval_result(
             "message": "Cron 运行不能替用户执行应用数据修改。",
             "status": "blocked",
         }
+    profile_scope = _profile_scope_digest()
     canonical = json.dumps(
         {
-            "profile_scope": _profile_scope_digest(),
+            "profile_scope": profile_scope,
             "slug": slug,
             "operation": operation,
             "envelope": envelope,
@@ -597,8 +598,24 @@ def _approval_result(
     }
     display = friendly_labels.get(operation, f"更新应用 {slug}（{operation}）")
     reason = f"{display}会修改本地保存的数据。"
+    scope_id = _focus_approval_scope_id(operation, envelope)
     scope_digest = _focus_approval_scope_digest(operation, envelope)
     rule_suffix = f"{scope_digest}:{digest}" if scope_digest else digest
+    validation_record: dict[str, object] = {
+        "schema_version": 1,
+        "profile_scope": profile_scope,
+        "slug": slug,
+        "operation": operation,
+        "payload_digest": digest,
+    }
+    if scope_id:
+        validation_record["scope_id"] = scope_id
+    validation_target = json.dumps(
+        validation_record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     from tools.approval import request_tool_approval
 
     return request_tool_approval(
@@ -608,14 +625,14 @@ def _approval_result(
         one_shot=True,
         allow_yolo_bypass=False,
         display_target=display,
+        validation_target=validation_target,
     )
 
 
-def _focus_approval_scope_digest(
+def _focus_approval_scope_id(
     operation: str,
     envelope: dict[str, object],
 ) -> str:
-    """Bind host auto-approval to the owning focus or decision run."""
     if operation not in {"decision_run.resume", "focus_analysis.apply"}:
         return ""
     payload = envelope.get("payload")
@@ -625,12 +642,22 @@ def _focus_approval_scope_digest(
         focus_id = payload.get("focus_id")
         if not isinstance(focus_id, str) or not focus_id.strip():
             return ""
-        scope_id = focus_id.strip()
+        return focus_id.strip()
     else:
         run_id = payload.get("run_id")
         if not isinstance(run_id, str) or not run_id.strip():
             return ""
-        scope_id = run_id.strip()
+        return run_id.strip()
+
+
+def _focus_approval_scope_digest(
+    operation: str,
+    envelope: dict[str, object],
+) -> str:
+    """Bind host auto-approval to the owning focus or decision run."""
+    scope_id = _focus_approval_scope_id(operation, envelope)
+    if not scope_id:
+        return ""
     canonical_scope = "\x00".join((operation, scope_id))
     return hashlib.sha256(canonical_scope.encode("utf-8")).hexdigest()
 
