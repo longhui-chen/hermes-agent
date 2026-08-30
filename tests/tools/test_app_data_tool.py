@@ -943,7 +943,7 @@ def test_decision_resume_approval_validation_binds_run(monkeypatch):
     assert request.call_args.kwargs["display_target"] == "更新焦点分析进度"
 
 
-def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypatch):
+def test_capability_reads_and_idempotent_mutations_retry_transient_failures(monkeypatch):
     capability_seen = []
     with mux_profile_scope(monkeypatch, _scope()), patch(
         "tools.app_data_tool._urlopen",
@@ -973,6 +973,7 @@ def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypat
             read_seen,
             _capabilities((_READ_OPERATION, "read")),
             TimeoutError("unknown read outcome"),
+            {"items": []},
         ),
     ):
         read_output = json.loads(app_data_tool({
@@ -980,10 +981,11 @@ def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypat
             "slug": _SLUG,
             "operation": _READ_OPERATION,
         }))
-    assert read_output["ok"] is False
-    assert len(read_seen) == 2
+    assert read_output["ok"] is True
+    assert len(read_seen) == 3
     assert [item[1] for item in read_seen] == [
         _CAPABILITY_TIMEOUT,
+        _READ_TIMEOUT,
         _READ_TIMEOUT,
     ]
 
@@ -996,6 +998,7 @@ def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypat
             mutation_seen,
             _capabilities((_MUTATION_OPERATION, "mutation")),
             TimeoutError("lost"),
+            {"record_id": "record-1", "state": "stored"},
         ),
     ):
         mutation_output = json.loads(app_data_tool({
@@ -1005,13 +1008,18 @@ def test_only_capability_discovery_retries_and_invokes_are_not_retried(monkeypat
             "payload": {"record_id": "record-1"},
             "idempotency_key": "record:record-1",
         }))
-    assert mutation_output["ok"] is False
-    assert mutation_output["status"] is None
-    assert len(mutation_seen) == 2
+    assert mutation_output["ok"] is True
+    assert mutation_output["data"]["state"] == "stored"
+    assert len(mutation_seen) == 3
     assert [item[1] for item in mutation_seen] == [
         _CAPABILITY_TIMEOUT,
         _MUTATION_TIMEOUT,
+        _MUTATION_TIMEOUT,
     ]
+    first_mutation = json.loads(mutation_seen[1][0].data)
+    second_mutation = json.loads(mutation_seen[2][0].data)
+    assert first_mutation["idempotency_key"] == "record:record-1"
+    assert second_mutation == first_mutation
 
 
 def test_structured_http_error_is_bounded_and_never_leaks_credentials(monkeypatch):
