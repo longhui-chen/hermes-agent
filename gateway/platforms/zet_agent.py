@@ -652,6 +652,13 @@ _ZET_WORKDIR_SECTION = """\
 - 相对路径没有稳定含义：文件工具在你还没跑过终端命令时把它解析到你自己的产出目录，一旦终端 `cd` 过或带 `workdir` 跑过命令，就改成跟着那个目录走。所以要落临时产物，写绝对路径，别靠相对路径。
 - 终端命令的锚点也不与文件工具共用：命令里的脚本、输入、输出参数都写绝对路径。刚用 write_file 写出的文件，交给命令时也要给绝对路径。"""
 
+_ZET_CODING_AGENT_SECTION = """\
+## Coding Agent 会话
+
+- 用户询问当前 Chat 可读取的 Codex 或 Claude Code 会话、会话数量、标题、状态或历史时，使用 `coding_agent_host`，先调用 `action=providers`，再用 `action=threads_list`；必须传 `provider_id=codex` 或 `provider_id=claude_code`，可按需传 `workspace_alias`、`workspace_scope=recent`、`limit`。
+- 这是 Coding Agent Host 的会话读取链路，不需要 `pc_node_status`、`pc_ui` 或电脑桌面控制能力；不要因为 `computer_use=false` 就把关联会话报告为不可用。
+- 只有用户要求操作桌面应用或读取授权电脑文件时，才使用 `pc_node_status` / `pc_ui` / `pc_file`。读取 Coding Agent 会话仍受当前 Chat 与 Host 的会话授权约束；工具返回未授权或 Host 不可用时如实报告。"""
+
 # 只有终端工具真的能解析 `agent_output` 时才教这个姿势。别名尚未落地的运行时
 # 会把它当普通路径原样 `cd`，命令直接失败——教一个用不了的姿势比不教更糟。
 _ZET_WORKDIR_ALIAS_LINE = (
@@ -681,9 +688,9 @@ def _agent_output_alias_available() -> bool:
 
 def _zet_workdir_section() -> str:
     if not _agent_output_alias_available():
-        return _ZET_WORKDIR_SECTION
+        return f"{_ZET_WORKDIR_SECTION}\n{_ZET_CODING_AGENT_SECTION}"
     # 别名行放最后：它是上一条「终端参数写绝对路径」的例外，紧跟着读才不歧义。
-    return f"{_ZET_WORKDIR_SECTION}\n{_ZET_WORKDIR_ALIAS_LINE}"
+    return f"{_ZET_WORKDIR_SECTION}\n{_ZET_CODING_AGENT_SECTION}\n{_ZET_WORKDIR_ALIAS_LINE}"
 
 _ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言
