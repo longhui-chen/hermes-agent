@@ -2775,3 +2775,54 @@ def test_shutdown_interrupt_mark_does_not_schedule_catchup(tmp_path, monkeypatch
     assert stored["last_status"] == "error"
     assert _seconds_until(stored["next_run_at"]) > 3600  # 自然 slot，未被拉近
     assert "jobCU7" not in zc._CATCHUP_ROUNDS
+
+
+def test_catchup_rounds_dict_is_fifo_capped(tmp_path, monkeypatch):
+    """_CATCHUP_ROUNDS 超上限 FIFO 淘汰，删除的 job 不会永久泄漏条目。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    retry_state = {}
+    for jid in ("jobE1", "jobE2", "jobE3"):
+        _save_interval_job(cron_jobs, jid, 1440)
+        retry_state[jid] = {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}
+    # 三个 job 都存进同一个 store（_save_interval_job 是整表覆盖，重存一次全量）
+    cron_jobs.save_jobs([
+        dict(_save_interval_job(cron_jobs, jid, 1440)) for jid in ("jobE1", "jobE2", "jobE3")
+    ])
+    zc = _catchup_env(monkeypatch, retry_state=retry_state)
+    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS_LIMIT", 2)
+
+    for jid in ("jobE1", "jobE2", "jobE3"):
+        cron_jobs.mark_job_run(jid, False, "connection refused")
+        zc._maybe_schedule_failure_catchup(jid)
+
+    assert len(zc._CATCHUP_ROUNDS) == 2
+    assert "jobE1" not in zc._CATCHUP_ROUNDS  # 最早的被淘汰
+    assert set(zc._CATCHUP_ROUNDS) == {"jobE2", "jobE3"}
+
+
+def test_catchup_abandoned_on_concurrent_user_edit(tmp_path, monkeypatch):
+    """helper 读 job 后用户并发编辑（revision 前进）→ CAS 冲突 → 放弃补跑。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobCAS", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobCAS": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}},
+    )
+
+    cron_jobs.mark_job_run("jobCAS", False, "connection refused")
+    natural = cron_jobs.get_job("jobCAS")["next_run_at"]
+
+    real_update = cron_jobs.update_job
+
+    def racing_update(job_id, updates, **kw):
+        if "expected_revision" in updates:
+            real_update(job_id, {"name": "edited-by-user"})  # 模拟并发编辑，revision +1
+        return real_update(job_id, updates, **kw)
+
+    monkeypatch.setattr(cron_jobs, "update_job", racing_update)
+    zc._maybe_schedule_failure_catchup("jobCAS")  # 不得抛异常
+
+    stored = cron_jobs.get_job("jobCAS")
+    assert stored["next_run_at"] == natural  # 补跑放弃，用户编辑赢
+    assert stored["name"] == "edited-by-user"
+    assert "jobCAS" not in zc._CATCHUP_ROUNDS

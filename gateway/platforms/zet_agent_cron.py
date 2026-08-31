@@ -1570,7 +1570,9 @@ _RETRY_BACKOFF_S = _env_int("ZET_CRON_RETRY_BACKOFF_S", 45, lo=0, hi=600)
 _CATCHUP_DELAY_S = _env_int("ZET_CRON_CATCHUP_DELAY_S", 900, lo=60, hi=7200)
 _CATCHUP_MAX = _env_int("ZET_CRON_CATCHUP_MAX", 2, lo=0, hi=10)
 # Consecutive catch-up rounds per job; in-memory, cleared on success.
+# FIFO-capped like _LAST_RETRY_STATE so deleted jobs cannot leak entries.
 _CATCHUP_ROUNDS: Dict[str, int] = {}
+_CATCHUP_ROUNDS_LIMIT = 512
 
 # Set at exit so a backoff wait aborts instead of stalling the pool's wait=True drain.
 _shutdown = threading.Event()
@@ -1837,7 +1839,7 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
         _CATCHUP_ROUNDS.pop(job_id, None)  # 预算用尽；下一轮失败流重新开
         _dbg(f"catchup: budget exhausted job={job_id}")
         return
-    from cron.jobs import get_job, update_job
+    from cron.jobs import JobRevisionConflict, get_job, update_job
 
     job = get_job(job_id)
     if not job:
@@ -1865,8 +1867,19 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
         if catchup_at >= natural_dt:
             _dbg(f"catchup: natural slot sooner job={job_id}")
             return
-    update_job(job_id, {"next_run_at": catchup_at.isoformat()})
+    try:
+        # CAS 栅栏：用户在上面 get_job 之后改了 schedule/timezone 的话放弃补跑
+        update_job(job_id, {
+            "next_run_at": catchup_at.isoformat(),
+            "expected_revision": int(job.get("revision") or 0),
+        })
+    except JobRevisionConflict:
+        _dbg(f"catchup: revision conflict, user edit wins job={job_id}")
+        return
     _CATCHUP_ROUNDS[job_id] = rounds + 1
+    if len(_CATCHUP_ROUNDS) > _CATCHUP_ROUNDS_LIMIT:
+        for key in list(_CATCHUP_ROUNDS)[: len(_CATCHUP_ROUNDS) - _CATCHUP_ROUNDS_LIMIT]:
+            _CATCHUP_ROUNDS.pop(key, None)
     _dbg(
         f"catchup: scheduled job={job_id} round={rounds + 1}/{_CATCHUP_MAX} "
         f"at={catchup_at.isoformat()}"
