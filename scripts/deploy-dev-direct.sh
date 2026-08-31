@@ -59,7 +59,10 @@ esac
 
 stage=$(mktemp -d "${hermes_src}.new.XXXXXX")
 keep=$(mktemp -d /tmp/hermes-runtime.XXXXXX)
-cleanup() { rm -rf "$stage" "$keep" /tmp/hermes-src.new.tgz; }
+cleanup() {
+  rm -rf "$stage" "$keep" /tmp/hermes-src.new.tgz
+  systemctl is-active --quiet zettlab-local-server || systemctl start zettlab-local-server || true
+}
 trap cleanup EXIT
 tar xzf /tmp/hermes-src.new.tgz -C "$stage"
 
