@@ -2,9 +2,12 @@
 
 set -euo pipefail
 
-archive=/tmp/hermes-src.new.tgz
-hermes_link=$(readlink -f /usr/local/bin/hermes 2>/dev/null || true)
-[[ -n "$hermes_link" && -e "$hermes_link" ]] || { echo "missing /usr/local/bin/hermes" >&2; exit 1; }
+archive=${HERMES_DEPLOY_ARCHIVE:-/tmp/hermes-src.new.tgz}
+hermes_bin=${HERMES_DEPLOY_HERMES_BIN:-/usr/local/bin/hermes}
+service_name=${HERMES_DEPLOY_SERVICE:-zettlab-local-server}
+health_url=${HERMES_DEPLOY_HEALTH_URL:-http://127.0.0.1:9090/health}
+hermes_link=$(readlink -f "$hermes_bin" 2>/dev/null || true)
+[[ -n "$hermes_link" && -e "$hermes_link" ]] || { echo "missing Hermes launcher: $hermes_bin" >&2; exit 1; }
 app_root=$(dirname "$(dirname "$hermes_link")")
 hermes_src="$app_root/lib/hermes-agent"
 wrapper="$app_root/bin/hermes"
@@ -19,9 +22,23 @@ stage=$(mktemp -d "${hermes_src}.new.XXXXXX")
 # Keep the large venv beside the app source so mv remains a same-filesystem
 # metadata operation. /tmp is tmpfs on the 2 GB boards and must never receive it.
 keep=$(mktemp -d "${hermes_src}.runtime.XXXXXX")
+rollback=$(mktemp -d "${hermes_src}.rollback.XXXXXX")
+rmdir "$rollback"
+activated=0
+succeeded=0
 cleanup() {
-  rm -rf "$stage" "$keep" "$archive" "${plugin_output:-}" /tmp/hermes-src.XXXXXX.tgz /tmp/deploy-dev-direct-remote.sh
-  systemctl is-active --quiet zettlab-local-server || systemctl start zettlab-local-server || true
+  if [[ "$succeeded" != "1" && "$activated" == "1" && -d "$rollback" ]]; then
+    systemctl stop "$service_name" || true
+    [[ -d "$hermes_src/venv" ]] && mv "$hermes_src/venv" "$keep/venv"
+    [[ -f "$hermes_src/.env" ]] && mv "$hermes_src/.env" "$keep/.env"
+    rm -rf "$hermes_src"
+    mv "$rollback" "$hermes_src"
+    [[ -d "$keep/venv" ]] && mv "$keep/venv" "$hermes_src/venv"
+    [[ -f "$keep/.env" ]] && mv "$keep/.env" "$hermes_src/.env"
+    echo "deployment failed; restored previous Hermes source" >&2
+  fi
+  rm -rf "$stage" "$keep" "$rollback" "$archive" "${plugin_output:-}" "${sync_output:-}" /tmp/hermes-src.XXXXXX.tgz /tmp/deploy-dev-direct-remote.sh
+  systemctl is-active --quiet "$service_name" || systemctl start "$service_name" || true
 }
 trap cleanup EXIT
 tar xzf "$archive" -C "$stage"
@@ -32,11 +49,12 @@ for dependency_file in pyproject.toml uv.lock; do
   fi
 done
 
-systemctl stop zettlab-local-server
+systemctl stop "$service_name"
 [[ -d "$hermes_src/venv" ]] && mv "$hermes_src/venv" "$keep/venv"
 [[ -f "$hermes_src/.env" ]] && mv "$hermes_src/.env" "$keep/.env"
-find "$hermes_src" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-cp -a "$stage"/. "$hermes_src"/
+mv "$hermes_src" "$rollback"
+activated=1
+mv "$stage" "$hermes_src"
 [[ -d "$keep/venv" ]] && mv "$keep/venv" "$hermes_src/venv"
 [[ -f "$keep/.env" ]] && mv "$keep/.env" "$hermes_src/.env"
 
@@ -48,35 +66,42 @@ cd "$hermes_src"
 if [[ "$deps_changed" == "1" ]]; then
   uv_bin=$(command -v uv || true)
   [[ -n "$uv_bin" ]] || uv_bin="$HOME/.local/bin/uv"
-  if [[ -x "$uv_bin" && -x venv/bin/python ]]; then
-    "$uv_bin" pip install --python venv/bin/python -e ".[all,langfuse]" 2>&1 | tail -20
-  else
-    ./init-hermes-env.sh 2>&1 | tail -20
+  [[ -x "$uv_bin" ]] || { echo "uv is required for locked dependency sync" >&2; exit 1; }
+  [[ -x venv/bin/python ]] || { echo "existing Hermes venv is unavailable" >&2; exit 1; }
+  sync_output=$(mktemp /tmp/hermes-sync.XXXXXX)
+  if ! UV_PROJECT_ENVIRONMENT="$hermes_src/venv" "$uv_bin" sync \
+    --locked --no-dev \
+    --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
+    >"$sync_output" 2>&1; then
+    tail -40 "$sync_output" >&2
+    exit 1
   fi
+  tail -20 "$sync_output"
 else
   echo "dependency metadata unchanged; reusing existing venv"
 fi
 venv/bin/python -c 'import langfuse'
 
-ln -sfn "$wrapper" /usr/local/bin/hermes
+ln -sfn "$wrapper" "$hermes_bin"
 echo "=== bundled plugins ==="
 plugin_output=$(mktemp /tmp/hermes-plugins.XXXXXX)
-/usr/local/bin/hermes plugins list >"$plugin_output" 2>&1
+"$hermes_bin" plugins list >"$plugin_output" 2>&1
 head -25 "$plugin_output"
 grep -q 'bundled' "$plugin_output" || { echo "no bundled plugins found" >&2; exit 1; }
 
-systemctl start zettlab-local-server
+systemctl start "$service_name"
 for attempt in $(seq 1 30); do
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:9090/health 2>/dev/null || true)
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "$health_url" 2>/dev/null || true)
   if [[ "$code" == "200" ]]; then
     echo "health: 200 (attempt $attempt)"
     echo "deployed source: $hermes_src"
+    succeeded=1
     exit 0
   fi
   sleep 2
 done
 
-systemctl status zettlab-local-server --no-pager | tail -20 || true
-journalctl -u zettlab-local-server --since '2 minutes ago' --no-pager | tail -40 || true
+systemctl status "$service_name" --no-pager | tail -20 || true
+journalctl -u "$service_name" --since '2 minutes ago' --no-pager | tail -40 || true
 echo "local-server health check failed" >&2
 exit 1
