@@ -16,7 +16,9 @@ esac
 [[ -f "$archive" ]] || { echo "missing source archive: $archive" >&2; exit 1; }
 
 stage=$(mktemp -d "${hermes_src}.new.XXXXXX")
-keep=$(mktemp -d /tmp/hermes-runtime.XXXXXX)
+# Keep the large venv beside the app source so mv remains a same-filesystem
+# metadata operation. /tmp is tmpfs on the 2 GB boards and must never receive it.
+keep=$(mktemp -d "${hermes_src}.runtime.XXXXXX")
 cleanup() {
   rm -rf "$stage" "$keep" "$archive" /tmp/hermes-src.XXXXXX.tgz /tmp/deploy-dev-direct-remote.sh
   systemctl is-active --quiet zettlab-local-server || systemctl start zettlab-local-server || true
