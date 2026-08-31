@@ -119,33 +119,37 @@ export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 export UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple/"
 export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple/"
 export UV_PYTHON_DOWNLOADS=never
-if [[ "$deps_changed" == "1" ]]; then
+uv_bin=$(find_uv || true)
+if [[ -z "$uv_bin" ]]; then
+  bootstrap_uv
   uv_bin=$(find_uv || true)
-  if [[ -z "$uv_bin" ]]; then
-    bootstrap_uv
-    uv_bin=$(find_uv || true)
-  fi
-  [[ -n "$uv_bin" && -x "$uv_bin" ]] || { echo "uv bootstrap failed" >&2; exit 1; }
-  sync_output=$(mktemp /tmp/hermes-sync.XXXXXX)
+fi
+[[ -n "$uv_bin" && -x "$uv_bin" ]] || { echo "uv bootstrap failed" >&2; exit 1; }
+sync_output=$(mktemp /tmp/hermes-sync.XXXXXX)
+if [[ "$deps_changed" == "1" ]]; then
   if ! UV_PROJECT_ENVIRONMENT="$stage/venv" "$uv_bin" sync \
-    --frozen --no-dev --no-editable --no-install-project --no-build \
+    --project "$stage" --frozen --no-dev --no-editable --no-install-project --no-build \
     --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
     >"$sync_output" 2>&1; then
     tail -40 "$sync_output" >&2
     exit 1
   fi
-  if ! UV_PROJECT_ENVIRONMENT="$stage/venv" "$uv_bin" sync \
-    --frozen --no-dev --no-editable --no-build-isolation \
-    --reinstall-package hermes-agent \
-    --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
-    >>"$sync_output" 2>&1; then
-    tail -40 "$sync_output" >&2
-    exit 1
-  fi
-  tail -20 "$sync_output"
 else
-  echo "dependency metadata unchanged; copied existing venv"
+  echo "dependency metadata unchanged; copied existing dependencies"
 fi
+
+# Always reinstall the project itself. The packaged runtime intentionally uses
+# a non-editable wheel, so skipping this phase would leave the previous source
+# running whenever pyproject.toml and uv.lock are unchanged.
+if ! UV_PROJECT_ENVIRONMENT="$stage/venv" "$uv_bin" sync \
+  --project "$stage" --frozen --no-dev --no-editable --no-build-isolation \
+  --reinstall-package hermes-agent \
+  --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
+  >>"$sync_output" 2>&1; then
+  tail -40 "$sync_output" >&2
+  exit 1
+fi
+tail -20 "$sync_output"
 
 # uv writes absolute shebangs for the staging environment. The activated source
 # returns to the stable ZPK path, so rewrite only those generated first lines.

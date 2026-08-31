@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_DEPLOY = REPO_ROOT / "scripts" / "deploy-dev-direct.sh"
 REMOTE_DEPLOY = REPO_ROOT / "scripts" / "deploy-dev-direct-remote.sh"
 
 
@@ -22,9 +23,28 @@ def test_uv_bootstrap_is_pinned_and_precedes_runtime_activation() -> None:
     assert "HERMES_DEPLOY_UV_VERSION:-0.12.5" in source
     assert "https://astral.sh/uv/install.sh" in source
     assert "--proto '=https' --tlsv1.2" in source
-    assert source.index("    bootstrap_uv\n") < source.index(
+    assert source.index("  bootstrap_uv\n") < source.index(
         'systemctl stop "$service_name"\nrm -rf "$rollback"'
     )
+
+
+def test_controller_validates_target_ref_lock_before_copying() -> None:
+    source = LOCAL_DEPLOY.read_text(encoding="utf-8")
+
+    lock_check = 'uv lock --check --project "$validation_dir"'
+    assert lock_check in source
+    assert source.index(lock_check) < source.index(
+        'copy_file "$archive" /tmp/hermes-src.new.tgz'
+    )
+
+
+def test_remote_reinstalls_project_for_every_source_deploy() -> None:
+    source = REMOTE_DEPLOY.read_text(encoding="utf-8")
+
+    unchanged_branch_end = 'echo "dependency metadata unchanged; copied existing dependencies"\nfi'
+    reinstall = '--reinstall-package hermes-agent'
+    assert unchanged_branch_end in source
+    assert source.index(unchanged_branch_end) < source.index(reinstall)
 
 
 def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> None:
@@ -129,11 +149,13 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
 
     command_log = calls.read_text(encoding="utf-8")
     assert (
-        "uv sync --frozen --no-dev --no-editable --no-install-project --no-build"
+        "uv sync --project "
+        in command_log
+        and "--frozen --no-dev --no-editable --no-install-project --no-build"
         in command_log
     ), result.stdout + result.stderr
     assert (
-        "uv sync --frozen --no-dev --no-editable --no-build-isolation "
+        "--frozen --no-dev --no-editable --no-build-isolation "
         "--reinstall-package hermes-agent"
         in command_log
     )

@@ -30,6 +30,7 @@ done
 [[ "$port" =~ ^[0-9]+$ ]] || { echo "--port must be numeric" >&2; exit 2; }
 [[ -n "${BOARD_SSH_PASSWORD:-}" ]] || { echo "BOARD_SSH_PASSWORD is required" >&2; exit 2; }
 command -v git >/dev/null
+command -v uv >/dev/null || { echo "uv is required for lock validation" >&2; exit 2; }
 if command -v sshpass >/dev/null 2>&1; then
   transport="sshpass"
 elif command -v expect >/dev/null 2>&1; then
@@ -42,8 +43,11 @@ fi
 repo_root=$(git rev-parse --show-toplevel)
 git -C "$repo_root" rev-parse --verify "${ref}^{commit}" >/dev/null
 archive=$(mktemp "${TMPDIR:-/tmp}/hermes-src.XXXXXX")
-trap 'rm -f "$archive"' EXIT
+validation_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermes-lock-check.XXXXXX")
+trap 'rm -f "$archive"; rm -rf "$validation_dir"' EXIT
 git -C "$repo_root" archive --format=tar.gz -o "$archive" "$ref"
+tar xzf "$archive" -C "$validation_dir"
+uv lock --check --project "$validation_dir"
 remote_helper="$repo_root/scripts/deploy-dev-direct-remote.sh"
 [[ -x "$remote_helper" ]] || { echo "missing remote helper: $remote_helper" >&2; exit 1; }
 
