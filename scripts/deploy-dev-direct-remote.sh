@@ -25,6 +25,12 @@ cleanup() {
 }
 trap cleanup EXIT
 tar xzf "$archive" -C "$stage"
+deps_changed=0
+for dependency_file in pyproject.toml uv.lock; do
+  if ! cmp -s "$hermes_src/$dependency_file" "$stage/$dependency_file"; then
+    deps_changed=1
+  fi
+done
 
 systemctl stop zettlab-local-server
 [[ -d "$hermes_src/venv" ]] && mv "$hermes_src/venv" "$keep/venv"
@@ -39,12 +45,16 @@ export UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple/"
 export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple/"
 export UV_PYTHON_DOWNLOADS=never
 cd "$hermes_src"
-uv_bin=$(command -v uv || true)
-[[ -n "$uv_bin" ]] || uv_bin="$HOME/.local/bin/uv"
-if [[ -x "$uv_bin" && -x venv/bin/python ]]; then
-  "$uv_bin" pip install --python venv/bin/python -e ".[all,langfuse]"
+if [[ "$deps_changed" == "1" ]]; then
+  uv_bin=$(command -v uv || true)
+  [[ -n "$uv_bin" ]] || uv_bin="$HOME/.local/bin/uv"
+  if [[ -x "$uv_bin" && -x venv/bin/python ]]; then
+    "$uv_bin" pip install --python venv/bin/python -e ".[all,langfuse]" 2>&1 | tail -20
+  else
+    ./init-hermes-env.sh 2>&1 | tail -20
+  fi
 else
-  ./init-hermes-env.sh
+  echo "dependency metadata unchanged; reusing existing venv"
 fi
 venv/bin/python -c 'import langfuse'
 
