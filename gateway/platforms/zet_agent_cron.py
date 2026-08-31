@@ -1817,6 +1817,8 @@ def _run_job_with_retry(orig_run_job, job, *, before_retry=None):
         state["retryable"] = True
         if not state.get("skipped_reason") and attempts >= _MAX_RUN_RETRIES:
             state["skipped_reason"] = "retry_exhausted"
+            # 循环只在重试前查活动，末次尝试的没查过；补上，供补跑判定
+            state["tool_activity"] = _attempt_tool_activity(job_id, baseline)
         _remember_retry_state(job_id, state)
     return result
 
@@ -1834,6 +1836,8 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
     state = _LAST_RETRY_STATE.get(job_id) or {}
     if state.get("skipped_reason") != "retry_exhausted":
         return
+    if state.get("tool_activity") != 0:
+        return  # 末次尝试有工具活动（或无法确认）→ 不重复副作用
     rounds = _CATCHUP_ROUNDS.get(job_id, 0)
     if rounds >= _CATCHUP_MAX:
         _CATCHUP_ROUNDS.pop(job_id, None)  # 预算用尽；下一轮失败流重新开
@@ -1848,6 +1852,8 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
         return
     if not job.get("enabled", True) or job.get("state") != "scheduled":
         return
+    if job.get("deferred_until"):
+        return  # 显式延期水位在场，补跑不得早于它
 
     import random
     from datetime import datetime, timedelta
@@ -1878,8 +1884,18 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
         return
     _CATCHUP_ROUNDS[job_id] = rounds + 1
     if len(_CATCHUP_ROUNDS) > _CATCHUP_ROUNDS_LIMIT:
-        for key in list(_CATCHUP_ROUNDS)[: len(_CATCHUP_ROUNDS) - _CATCHUP_ROUNDS_LIMIT]:
-            _CATCHUP_ROUNDS.pop(key, None)
+        # 先剪已删除 job 的死条目，仍溢出才 FIFO（活预算尽量不丢）
+        try:
+            from cron.jobs import list_jobs
+            live = {j.get("id") for j in list_jobs()}
+            for key in [k for k in _CATCHUP_ROUNDS if k not in live]:
+                _CATCHUP_ROUNDS.pop(key, None)
+        except Exception:
+            pass
+        overflow = len(_CATCHUP_ROUNDS) - _CATCHUP_ROUNDS_LIMIT
+        if overflow > 0:
+            for key in list(_CATCHUP_ROUNDS)[:overflow]:
+                _CATCHUP_ROUNDS.pop(key, None)
     _dbg(
         f"catchup: scheduled job={job_id} round={rounds + 1}/{_CATCHUP_MAX} "
         f"at={catchup_at.isoformat()}"

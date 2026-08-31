@@ -2647,7 +2647,7 @@ def test_catchup_scheduled_after_transient_retry_exhausted(tmp_path, monkeypatch
     job = _save_interval_job(cron_jobs, "jobCU1", 1440)
     zc = _catchup_env(
         monkeypatch,
-        retry_state={"jobCU1": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}},
+        retry_state={"jobCU1": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
     )
 
     cron_jobs.mark_job_run("jobCU1", False, "connection refused")
@@ -2698,7 +2698,7 @@ def test_catchup_budget_cap_then_reset(tmp_path, monkeypatch):
     _save_interval_job(cron_jobs, "jobCU4", 1440)
     zc = _catchup_env(
         monkeypatch,
-        retry_state={"jobCU4": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}},
+        retry_state={"jobCU4": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
         rounds={"jobCU4": 2},  # 已达默认上限 _CATCHUP_MAX=2
     )
 
@@ -2716,7 +2716,7 @@ def test_catchup_skipped_when_natural_slot_sooner(tmp_path, monkeypatch):
     _save_interval_job(cron_jobs, "jobCU5", 5)
     zc = _catchup_env(
         monkeypatch,
-        retry_state={"jobCU5": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}},
+        retry_state={"jobCU5": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
     )
 
     cron_jobs.mark_job_run("jobCU5", False, "connection refused")
@@ -2740,7 +2740,7 @@ def test_catchup_wired_through_installed_mark_and_success_clears_rounds(tmp_path
     monkeypatch.setattr(zc, "_detect_fake_success", lambda job_id: None)
     monkeypatch.setattr(
         zc, "_LAST_RETRY_STATE",
-        {"jobCU6": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}},
+        {"jobCU6": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
     )
     monkeypatch.setattr(zc, "_CATCHUP_ROUNDS", {})
 
@@ -2783,7 +2783,7 @@ def test_catchup_rounds_dict_is_fifo_capped(tmp_path, monkeypatch):
     retry_state = {}
     for jid in ("jobE1", "jobE2", "jobE3"):
         _save_interval_job(cron_jobs, jid, 1440)
-        retry_state[jid] = {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}
+        retry_state[jid] = {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}
     # 三个 job 都存进同一个 store（_save_interval_job 是整表覆盖，重存一次全量）
     cron_jobs.save_jobs([
         dict(_save_interval_job(cron_jobs, jid, 1440)) for jid in ("jobE1", "jobE2", "jobE3")
@@ -2806,7 +2806,7 @@ def test_catchup_abandoned_on_concurrent_user_edit(tmp_path, monkeypatch):
     _save_interval_job(cron_jobs, "jobCAS", 1440)
     zc = _catchup_env(
         monkeypatch,
-        retry_state={"jobCAS": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2}},
+        retry_state={"jobCAS": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
     )
 
     cron_jobs.mark_job_run("jobCAS", False, "connection refused")
@@ -2826,3 +2826,81 @@ def test_catchup_abandoned_on_concurrent_user_edit(tmp_path, monkeypatch):
     assert stored["next_run_at"] == natural  # 补跑放弃，用户编辑赢
     assert stored["name"] == "edited-by-user"
     assert "jobCAS" not in zc._CATCHUP_ROUNDS
+
+
+def test_final_attempt_tool_activity_blocks_catchup(tmp_path, monkeypatch):
+    """末次重试有工具活动 → retry_exhausted 仍记录 activity → 补跑跳过。
+    重试循环只在每次重试前查活动，末次尝试的活动此前从未被检查。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobFA", 1440)
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_LAST_RETRY_STATE", {})
+    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS", {})
+    monkeypatch.setattr(zc, "_MAX_RUN_RETRIES", 2)
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda jid: set())
+    activity_seq = iter([0, 0, 5])  # 重试前两查=0，循环退出后末次检查=5
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda jid, base: next(activity_seq))
+
+    result = zc._run_job_with_retry(
+        lambda j: (False, None, None, "connection refused"), {"id": "jobFA"}
+    )
+    assert result[0] is False
+    st = zc._LAST_RETRY_STATE["jobFA"]
+    assert st["skipped_reason"] == "retry_exhausted"
+    assert st["tool_activity"] == 5
+
+    cron_jobs.mark_job_run("jobFA", False, "connection refused")
+    natural = cron_jobs.get_job("jobFA")["next_run_at"]
+    zc._maybe_schedule_failure_catchup("jobFA")
+    assert cron_jobs.get_job("jobFA")["next_run_at"] == natural  # 不补跑
+    assert "jobFA" not in zc._CATCHUP_ROUNDS
+
+
+def test_catchup_does_not_cross_deferred_until(tmp_path, monkeypatch):
+    """deferred_until 水位在场 → 补跑不得把 next_run_at 拉到水位之前。"""
+    from datetime import timedelta
+    from hermes_time import now as hermes_now
+
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobDF", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobDF": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+    )
+
+    cron_jobs.mark_job_run("jobDF", False, "connection refused")
+    # 模拟 mark_job_run 尊重 deferral 后的状态：next_run_at = deferred_until，字段保留
+    deferred = (hermes_now() + timedelta(hours=6)).isoformat()
+    jobs = cron_jobs.load_jobs()
+    for j in jobs:
+        if j["id"] == "jobDF":
+            j["deferred_until"] = deferred
+            j["next_run_at"] = deferred
+    cron_jobs.save_jobs(jobs)
+
+    zc._maybe_schedule_failure_catchup("jobDF")
+    stored = cron_jobs.get_job("jobDF")
+    assert stored["next_run_at"] == deferred  # 水位未被越过
+    assert "jobDF" not in zc._CATCHUP_ROUNDS
+
+
+def test_catchup_eviction_prunes_dead_entries_before_fifo(tmp_path, monkeypatch):
+    """溢出时先剪已删除 job 的死条目，活 job 的进行中预算保留。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobLive", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobLive": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+        rounds={"deadA": 1, "deadB": 1},  # 两个已不存在的 job 的遗留条目
+    )
+    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS_LIMIT", 2)
+
+    cron_jobs.mark_job_run("jobLive", False, "connection refused")
+    zc._maybe_schedule_failure_catchup("jobLive")
+
+    # 死条目被剪，活 job 的预算在
+    assert "deadA" not in zc._CATCHUP_ROUNDS
+    assert "deadB" not in zc._CATCHUP_ROUNDS
+    assert zc._CATCHUP_ROUNDS.get("jobLive") == 1
