@@ -16,6 +16,7 @@ def test_deferred_payload_is_bounded_and_fingerprinted(monkeypatch):
         {
             "command": "x" * 1_000_000,
             "description": "d" * 50_000,
+            "validation_target": "v" * 50_000,
             "pattern_key": "danger",
             "pattern_keys": ["danger"],
         },
@@ -25,6 +26,8 @@ def test_deferred_payload_is_bounded_and_fingerprinted(monkeypatch):
         item = approval._pending["bounded-session"][0]
         assert len(item["command"]) < 5000
         assert len(item["description"]) < 2000
+        assert len(item["validation_target"]) < 2200
+        assert "[truncated sha256=" in item["validation_target"]
         assert len(item["payload_fingerprint"]) == 64
         assert item["_estimated_bytes"] < 10_000
     _reset_state()

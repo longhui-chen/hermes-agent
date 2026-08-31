@@ -1176,6 +1176,49 @@ def skill_view(
                     _record(None, found_md)
 
         if len(candidates) > 1:
+            # A self-contained profile may intentionally carry the exact same
+            # Skill document as an external preset directory.  Treat that as
+            # one logical Skill only when there is exactly one active/local
+            # candidate and every duplicate is byte-identical.  Different
+            # content (or multiple external-only candidates) remains
+            # ambiguous and must still fail closed.
+            local_candidates: List[Tuple[Optional[Path], Path]] = []
+            try:
+                active_root = active_skills_dir.resolve()
+                local_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate[1].resolve().is_relative_to(active_root)
+                ]
+            except (OSError, RuntimeError):
+                local_candidates = []
+
+            if len(local_candidates) == 1:
+                local_md = local_candidates[0][1]
+
+                def _same_document(candidate_md: Path) -> bool:
+                    with local_md.open("rb") as local_file, candidate_md.open(
+                        "rb"
+                    ) as candidate_file:
+                        while True:
+                            local_chunk = local_file.read(64 * 1024)
+                            candidate_chunk = candidate_file.read(64 * 1024)
+                            if local_chunk != candidate_chunk:
+                                return False
+                            if not local_chunk:
+                                return True
+
+                try:
+                    identical = all(
+                        _same_document(candidate_md)
+                        for _, candidate_md in candidates
+                    )
+                except OSError:
+                    identical = False
+                if identical:
+                    candidates = [local_candidates[0]]
+
+        if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",

@@ -117,11 +117,16 @@ def test_projection_payload_and_capacity_are_bounded(monkeypatch):
     adapter._APPROVAL_PROJECTION_MAX_BYTES = 32_000
     stream = queue.Queue()
     notify = adapter._make_approval_cb(stream, "session-a")
-    notify({"approval_id": "a" * 24, "command": "x" * 100_000})
+    notify({
+        "approval_id": "a" * 24,
+        "command": "x" * 100_000,
+        "validation_target": "v" * 50_000,
+    })
     notify({"approval_id": "b" * 24, "command": "second"})
     scoped_key = adapter._active_turn_key("session-a")
     head = adapter._approval_projection_head(scoped_key)
     assert len(head["command"]) < 5000
+    assert len(head["validation_target"]) < 2200
     assert len(head["payload_fingerprint"]) == 64
     with pytest.raises(RuntimeError, match="session limit"):
         notify({"approval_id": "c" * 24, "command": "third"})
