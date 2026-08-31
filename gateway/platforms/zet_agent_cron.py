@@ -982,9 +982,7 @@ def install() -> None:
                     )
 
             # Catch-up must run after _orig_mark's next_run_at overwrite.
-            if success:
-                _CATCHUP_ROUNDS.pop(job_id, None)
-            else:
+            if not success:
                 try:
                     _maybe_schedule_failure_catchup(job_id)
                 except Exception as e:
@@ -1569,10 +1567,6 @@ _RETRY_BACKOFF_S = _env_int("ZET_CRON_RETRY_BACKOFF_S", 45, lo=0, hi=600)
 # slot. ZET_CRON_CATCHUP_MAX=0 disables.
 _CATCHUP_DELAY_S = _env_int("ZET_CRON_CATCHUP_DELAY_S", 900, lo=60, hi=7200)
 _CATCHUP_MAX = _env_int("ZET_CRON_CATCHUP_MAX", 2, lo=0, hi=10)
-# Consecutive catch-up rounds per job; in-memory, cleared on success.
-# FIFO-capped like _LAST_RETRY_STATE so deleted jobs cannot leak entries.
-_CATCHUP_ROUNDS: Dict[str, int] = {}
-_CATCHUP_ROUNDS_LIMIT = 512
 
 # Set at exit so a backoff wait aborts instead of stalling the pool's wait=True drain.
 _shutdown = threading.Event()
@@ -1829,7 +1823,10 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
     Must run AFTER _orig_mark, which overwrites next_run_at with the natural
     slot. Fires only on the retry wrapper's retry_exhausted (transient error +
     zero tool activity), for recurring jobs, never later than the natural
-    slot, at most _CATCHUP_MAX consecutive rounds.
+    slot, and only while the persisted trailing-failure streak is within
+    _CATCHUP_MAX — the streak comes from the occurrence journal, so the
+    budget holds across restarts and store-sharing replicas, and a success
+    is what resets it.
     """
     if _CATCHUP_MAX <= 0:
         return
@@ -1838,12 +1835,12 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
         return
     if state.get("tool_activity") != 0:
         return  # 末次尝试有工具活动（或无法确认）→ 不重复副作用
-    rounds = _CATCHUP_ROUNDS.get(job_id, 0)
-    if rounds >= _CATCHUP_MAX:
-        _CATCHUP_ROUNDS.pop(job_id, None)  # 预算用尽；下一轮失败流重新开
-        _dbg(f"catchup: budget exhausted job={job_id}")
-        return
-    from cron.jobs import JobRevisionConflict, get_job, update_job
+    from cron.jobs import (
+        JobRevisionConflict,
+        _read_occurrence_journal,
+        get_job,
+        update_job,
+    )
 
     job = get_job(job_id)
     if not job:
@@ -1854,6 +1851,17 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
         return
     if job.get("deferred_until"):
         return  # 显式延期水位在场，补跑不得早于它
+    # 预算 = journal 里的连续 failed 尾串（本次失败已由 _orig_mark 记入）。
+    # 读不到（streak=0）按不可验证处理，不补。
+    records, _truncated = _read_occurrence_journal(job)
+    streak = 0
+    for rec in reversed(records or []):
+        if rec.get("status") != "failed":
+            break
+        streak += 1
+    if not (1 <= streak <= _CATCHUP_MAX):
+        _dbg(f"catchup: streak={streak} outside budget job={job_id}")
+        return
 
     import random
     from datetime import datetime, timedelta
@@ -1882,22 +1890,8 @@ def _maybe_schedule_failure_catchup(job_id: str) -> None:
     except JobRevisionConflict:
         _dbg(f"catchup: revision conflict, user edit wins job={job_id}")
         return
-    _CATCHUP_ROUNDS[job_id] = rounds + 1
-    if len(_CATCHUP_ROUNDS) > _CATCHUP_ROUNDS_LIMIT:
-        # 先剪已删除 job 的死条目，仍溢出才 FIFO（活预算尽量不丢）
-        try:
-            from cron.jobs import list_jobs
-            live = {j.get("id") for j in list_jobs()}
-            for key in [k for k in _CATCHUP_ROUNDS if k not in live]:
-                _CATCHUP_ROUNDS.pop(key, None)
-        except Exception:
-            pass
-        overflow = len(_CATCHUP_ROUNDS) - _CATCHUP_ROUNDS_LIMIT
-        if overflow > 0:
-            for key in list(_CATCHUP_ROUNDS)[:overflow]:
-                _CATCHUP_ROUNDS.pop(key, None)
     _dbg(
-        f"catchup: scheduled job={job_id} round={rounds + 1}/{_CATCHUP_MAX} "
+        f"catchup: scheduled job={job_id} round={streak}/{_CATCHUP_MAX} "
         f"at={catchup_at.isoformat()}"
     )
 

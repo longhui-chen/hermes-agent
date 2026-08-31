@@ -2622,11 +2622,10 @@ def _save_interval_job(cron_jobs, jid, minutes):
     return job
 
 
-def _catchup_env(monkeypatch, retry_state=None, rounds=None):
+def _catchup_env(monkeypatch, retry_state=None):
     import gateway.platforms.zet_agent_cron as zc
 
     monkeypatch.setattr(zc, "_LAST_RETRY_STATE", dict(retry_state or {}))
-    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS", dict(rounds or {}))
     return zc
 
 
@@ -2658,7 +2657,6 @@ def test_catchup_scheduled_after_transient_retry_exhausted(tmp_path, monkeypatch
     delta = _seconds_until(cron_jobs.get_job("jobCU1")["next_run_at"])
     # 900s ± 20% jitter
     assert 700 < delta < 1100
-    assert zc._CATCHUP_ROUNDS["jobCU1"] == 1
 
 
 def test_catchup_skipped_for_non_transient_failure(tmp_path, monkeypatch):
@@ -2672,7 +2670,6 @@ def test_catchup_skipped_for_non_transient_failure(tmp_path, monkeypatch):
     zc._maybe_schedule_failure_catchup("jobCU2")
 
     assert cron_jobs.get_job("jobCU2")["next_run_at"] == natural
-    assert "jobCU2" not in zc._CATCHUP_ROUNDS
 
 
 def test_catchup_skipped_when_run_had_tool_activity(tmp_path, monkeypatch):
@@ -2689,26 +2686,29 @@ def test_catchup_skipped_when_run_had_tool_activity(tmp_path, monkeypatch):
     zc._maybe_schedule_failure_catchup("jobCU3")
 
     assert cron_jobs.get_job("jobCU3")["next_run_at"] == natural
-    assert "jobCU3" not in zc._CATCHUP_ROUNDS
 
 
-def test_catchup_budget_cap_then_reset(tmp_path, monkeypatch):
-    """连续补跑到上限 → 回归自然调度，且清空计数让下一轮失败可重新补。"""
+def test_catchup_budget_derived_from_persisted_streak(tmp_path, monkeypatch):
+    """预算 = occurrence journal 连续失败尾串：1、2 次补，第 3 次回自然 slot；
+    成功打断后新失败链重新可补。持久化 → 跨重启/共享 store 的 replica 一致。"""
     cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
-    _save_interval_job(cron_jobs, "jobCU4", 1440)
+    _save_interval_job(cron_jobs, "jobBD", 1440)
     zc = _catchup_env(
         monkeypatch,
-        retry_state={"jobCU4": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
-        rounds={"jobCU4": 2},  # 已达默认上限 _CATCHUP_MAX=2
+        retry_state={"jobBD": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
     )
 
-    cron_jobs.mark_job_run("jobCU4", False, "connection refused")
-    natural = cron_jobs.get_job("jobCU4")["next_run_at"]
-    zc._maybe_schedule_failure_catchup("jobCU4")
+    def fail_and_catchup():
+        cron_jobs.mark_job_run("jobBD", False, "connection refused")
+        zc._maybe_schedule_failure_catchup("jobBD")
+        return _seconds_until(cron_jobs.get_job("jobBD")["next_run_at"])
 
-    assert cron_jobs.get_job("jobCU4")["next_run_at"] == natural
-    assert "jobCU4" not in zc._CATCHUP_ROUNDS  # 预算清空，下个失败流重新开
+    assert 700 < fail_and_catchup() < 1100   # streak=1 → 补
+    assert 700 < fail_and_catchup() < 1100   # streak=2 → 补
+    assert fail_and_catchup() > 3600         # streak=3 → 预算耗尽，回自然 slot
 
+    cron_jobs.mark_job_run("jobBD", True, None)  # 成功打断失败链
+    assert 700 < fail_and_catchup() < 1100   # 新链 streak=1 → 重新可补
 
 def test_catchup_skipped_when_natural_slot_sooner(tmp_path, monkeypatch):
     """高频任务（every 5m）自然 slot 比补跑窗更近 → 不补跑。"""
@@ -2725,7 +2725,6 @@ def test_catchup_skipped_when_natural_slot_sooner(tmp_path, monkeypatch):
     zc._maybe_schedule_failure_catchup("jobCU5")
 
     assert cron_jobs.get_job("jobCU5")["next_run_at"] == natural
-    assert "jobCU5" not in zc._CATCHUP_ROUNDS
 
 
 def test_catchup_wired_through_installed_mark_and_success_clears_rounds(tmp_path, monkeypatch):
@@ -2742,15 +2741,16 @@ def test_catchup_wired_through_installed_mark_and_success_clears_rounds(tmp_path
         zc, "_LAST_RETRY_STATE",
         {"jobCU6": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
     )
-    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS", {})
 
     scheduler.mark_job_run("jobCU6", False, "connection refused")
     delta = _seconds_until(cron_jobs.get_job("jobCU6")["next_run_at"])
     assert 700 < delta < 1100  # 补跑写入在 _orig_mark 之后，没被冲掉
-    assert zc._CATCHUP_ROUNDS["jobCU6"] == 1
 
+    # 成功打断持久化失败链；再失败 → 新链 streak=1 → 仍可补跑
     scheduler.mark_job_run("jobCU6", True, None)
-    assert "jobCU6" not in zc._CATCHUP_ROUNDS  # 成功清空失败流计数
+    scheduler.mark_job_run("jobCU6", False, "connection refused")
+    delta = _seconds_until(cron_jobs.get_job("jobCU6")["next_run_at"])
+    assert 700 < delta < 1100
 
 
 def test_shutdown_interrupt_mark_does_not_schedule_catchup(tmp_path, monkeypatch):
@@ -2764,7 +2764,6 @@ def test_shutdown_interrupt_mark_does_not_schedule_catchup(tmp_path, monkeypatch
     zc.install()
     monkeypatch.setattr(zc, "_try_persist_to_session", lambda *a, **k: None)
     monkeypatch.setattr(zc, "_LAST_RETRY_STATE", {})
-    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS", {})
     monkeypatch.setattr(scheduler, "_running_job_ids", {"jobCU7"})
     monkeypatch.setattr(scheduler, "_interrupted_job_ids", set())
 
@@ -2774,30 +2773,6 @@ def test_shutdown_interrupt_mark_does_not_schedule_catchup(tmp_path, monkeypatch
     stored = cron_jobs.get_job("jobCU7")
     assert stored["last_status"] == "error"
     assert _seconds_until(stored["next_run_at"]) > 3600  # 自然 slot，未被拉近
-    assert "jobCU7" not in zc._CATCHUP_ROUNDS
-
-
-def test_catchup_rounds_dict_is_fifo_capped(tmp_path, monkeypatch):
-    """_CATCHUP_ROUNDS 超上限 FIFO 淘汰，删除的 job 不会永久泄漏条目。"""
-    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
-    retry_state = {}
-    for jid in ("jobE1", "jobE2", "jobE3"):
-        _save_interval_job(cron_jobs, jid, 1440)
-        retry_state[jid] = {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}
-    # 三个 job 都存进同一个 store（_save_interval_job 是整表覆盖，重存一次全量）
-    cron_jobs.save_jobs([
-        dict(_save_interval_job(cron_jobs, jid, 1440)) for jid in ("jobE1", "jobE2", "jobE3")
-    ])
-    zc = _catchup_env(monkeypatch, retry_state=retry_state)
-    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS_LIMIT", 2)
-
-    for jid in ("jobE1", "jobE2", "jobE3"):
-        cron_jobs.mark_job_run(jid, False, "connection refused")
-        zc._maybe_schedule_failure_catchup(jid)
-
-    assert len(zc._CATCHUP_ROUNDS) == 2
-    assert "jobE1" not in zc._CATCHUP_ROUNDS  # 最早的被淘汰
-    assert set(zc._CATCHUP_ROUNDS) == {"jobE2", "jobE3"}
 
 
 def test_catchup_abandoned_on_concurrent_user_edit(tmp_path, monkeypatch):
@@ -2825,7 +2800,6 @@ def test_catchup_abandoned_on_concurrent_user_edit(tmp_path, monkeypatch):
     stored = cron_jobs.get_job("jobCAS")
     assert stored["next_run_at"] == natural  # 补跑放弃，用户编辑赢
     assert stored["name"] == "edited-by-user"
-    assert "jobCAS" not in zc._CATCHUP_ROUNDS
 
 
 def test_final_attempt_tool_activity_blocks_catchup(tmp_path, monkeypatch):
@@ -2836,7 +2810,6 @@ def test_final_attempt_tool_activity_blocks_catchup(tmp_path, monkeypatch):
     import gateway.platforms.zet_agent_cron as zc
 
     monkeypatch.setattr(zc, "_LAST_RETRY_STATE", {})
-    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS", {})
     monkeypatch.setattr(zc, "_MAX_RUN_RETRIES", 2)
     monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
     monkeypatch.setattr(zc, "_list_cron_session_ids", lambda jid: set())
@@ -2855,7 +2828,6 @@ def test_final_attempt_tool_activity_blocks_catchup(tmp_path, monkeypatch):
     natural = cron_jobs.get_job("jobFA")["next_run_at"]
     zc._maybe_schedule_failure_catchup("jobFA")
     assert cron_jobs.get_job("jobFA")["next_run_at"] == natural  # 不补跑
-    assert "jobFA" not in zc._CATCHUP_ROUNDS
 
 
 def test_catchup_does_not_cross_deferred_until(tmp_path, monkeypatch):
@@ -2883,24 +2855,3 @@ def test_catchup_does_not_cross_deferred_until(tmp_path, monkeypatch):
     zc._maybe_schedule_failure_catchup("jobDF")
     stored = cron_jobs.get_job("jobDF")
     assert stored["next_run_at"] == deferred  # 水位未被越过
-    assert "jobDF" not in zc._CATCHUP_ROUNDS
-
-
-def test_catchup_eviction_prunes_dead_entries_before_fifo(tmp_path, monkeypatch):
-    """溢出时先剪已删除 job 的死条目，活 job 的进行中预算保留。"""
-    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
-    _save_interval_job(cron_jobs, "jobLive", 1440)
-    zc = _catchup_env(
-        monkeypatch,
-        retry_state={"jobLive": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
-        rounds={"deadA": 1, "deadB": 1},  # 两个已不存在的 job 的遗留条目
-    )
-    monkeypatch.setattr(zc, "_CATCHUP_ROUNDS_LIMIT", 2)
-
-    cron_jobs.mark_job_run("jobLive", False, "connection refused")
-    zc._maybe_schedule_failure_catchup("jobLive")
-
-    # 死条目被剪，活 job 的预算在
-    assert "deadA" not in zc._CATCHUP_ROUNDS
-    assert "deadB" not in zc._CATCHUP_ROUNDS
-    assert zc._CATCHUP_ROUNDS.get("jobLive") == 1
