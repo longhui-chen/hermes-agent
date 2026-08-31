@@ -1,5 +1,5 @@
 # 手动把指定分支的 hermes-agent 源码 dev 覆盖到 Infist 办公室 OTA 板
-# （board13 / board154 / board4）。hermes 纯 Python，无需 build。
+# （board13 / board154 / board4 / board110）。hermes 纯 Python，无需 build。
 #
 # 触发：仅 workflow_dispatch（手动）。无 push 自动触发 —— 推 main 不会自动刷
 #   任何板，必须显式 dispatch（或经 skill infist-office-update-hermes）。
@@ -9,7 +9,8 @@
 # 板子分工：
 #   board13 / board154 → 默认刷（不指定 targets 时就这俩）
 #   board4 → "模拟生产"板，须显式 targets 点名（或 all）才刷
-#   board229 / board28 等跨子网板 → 不在本 workflow 范围（board184 LAN 够不到）。
+#   board110 → Zettlab 35.x VLAN 测试板，须显式 targets 点名。
+#   board229 / board28 等未登记板 → 不在本 workflow 范围。
 #   注：板清单唯一真相源 = prepare job 的 HOSTS。
 #
 # 部署语义（dev 源码覆盖，对称 local-server 的 infist-dev-deploy）：
@@ -33,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "CSV of board names. Default deploys board13,board154 only; board4 must be named explicitly. 'all' = whole matrix (incl board4)."
+        description: "CSV of board names. Default deploys board13,board154 only; board4/board110 must be named explicitly. 'all' = whole matrix."
         required: false
         default: 'board13,board154'
 
@@ -58,16 +59,16 @@ jobs:
         run: |
           set -euo pipefail
           # 内置板清单（新增板改这里；deploy 的 matrix 从本 job 的输出展开）。
-          declare -A HOSTS=( [board13]=192.168.1.13 [board154]=192.168.1.154 [board4]=192.168.1.4 [board26]=192.168.1.26 [board39]=192.168.1.39 )
+          declare -A HOSTS=( [board13]=192.168.1.13 [board154]=192.168.1.154 [board4]=192.168.1.4 [board26]=192.168.1.26 [board39]=192.168.1.39 [board110]=192.168.35.110 )
           SEL="${TARGETS_INPUT:-board13,board154}"
-          [ "$SEL" = "all" ] && SEL="board13,board154,board4,board26,board39"
+          [ "$SEL" = "all" ] && SEL="board13,board154,board4,board26,board39,board110"
           ITEMS=""; COUNT=0
           IFS=',' read -ra NAMES <<< "$SEL"
           for raw in "${NAMES[@]}"; do
             n="${raw// /}"
             [ -z "$n" ] && continue
             if [ -z "${HOSTS[$n]:-}" ]; then
-              echo "::warning::unknown board '$n' ignored (valid: board13, board154, board4, board26, board39, all)"
+              echo "::warning::unknown board '$n' ignored (valid: board13, board154, board4, board26, board39, board110, all)"
               continue
             fi
             ITEMS="${ITEMS}{\"name\":\"$n\",\"host\":\"${HOSTS[$n]}\",\"port\":22},"
