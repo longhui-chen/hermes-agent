@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import copy
 
+from jsonschema import Draft7Validator
+
 from tools.schema_sanitizer import (
     sanitize_tool_schemas,
     strip_pattern_and_format,
@@ -168,6 +170,36 @@ def test_well_formed_schema_unchanged():
     tools = [_tool("read_file", copy.deepcopy(schema))]
     out = sanitize_tool_schemas(tools)
     assert out[0]["function"]["parameters"] == schema
+
+
+def test_direct_conditional_required_survives_sanitization_and_rejects_empty():
+    schema = {
+        "type": "object",
+        "properties": {
+            "document_id": {"type": "string"},
+            "help": {"type": "boolean", "default": False},
+        },
+        "required": [],
+        "if": {
+            "properties": {"help": {"const": True}},
+            "required": ["help"],
+        },
+        "then": {},
+        "else": {"required": ["document_id"]},
+        "additionalProperties": False,
+    }
+
+    out = sanitize_tool_schemas([_tool("conditional_help", schema)])
+    parameters = out[0]["function"]["parameters"]
+    validator = Draft7Validator(parameters)
+
+    assert "allOf" not in parameters
+    assert parameters["if"] == schema["if"]
+    assert parameters["else"] == schema["else"]
+    assert not validator.is_valid({})
+    assert not validator.is_valid({"help": False})
+    assert validator.is_valid({"help": True})
+    assert validator.is_valid({"document_id": "doc-1"})
 
 
 def test_additional_properties_schema_sanitized():

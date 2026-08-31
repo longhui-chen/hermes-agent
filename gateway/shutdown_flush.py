@@ -32,6 +32,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ def flush_pending_to_file(
     pending: Dict[str, Any],
     *,
     reason: str = "shutdown",
+    session_store: Any = None,
 ) -> int:
     """Serialise non-empty ``_pending_messages`` slots to disk.
 
@@ -113,6 +115,12 @@ def flush_pending_to_file(
             serialised = _serialise_value(value)
             if serialised is None:
                 continue
+            session_id = _session_id_for_key(session_store, session_key)
+            if session_id:
+                serialised.setdefault("session_id", session_id)
+                for event in serialised.get("events", []):
+                    if isinstance(event, dict):
+                        event.setdefault("session_id", session_id)
             _write_payload(
                 flush_dir,
                 {
@@ -137,21 +145,26 @@ def flush_pending_to_file(
     return flushed
 
 
+def _session_id_for_key(session_store: Any, session_key: str) -> str:
+    """Resolve the canonical session id under SessionStore's own lock."""
+    if session_store is None or not session_key:
+        return ""
+    try:
+        with session_store._lock:
+            session_store._ensure_loaded_locked()
+            entry = session_store._entries.get(session_key)
+            return str(getattr(entry, "session_id", "") or "")
+    except (AttributeError, TypeError):
+        return ""
+
+
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     # MessageEvent objects have a .text attribute and other fields
     if hasattr(value, "text"):
-        result: Dict[str, Any] = {"text": getattr(value, "text", "")}
-        # Preserve additional fields if present
-        for attr in ("session_id", "platform", "sender_id", "sender_name",
-                      "reply_to", "media", "raw_event"):
-            val = getattr(value, attr, None)
-            if val is not None:
-                try:
-                    json.dumps(val)
-                    result[attr] = val
-                except (TypeError, ValueError):
-                    result[attr] = str(val)
+        events = _serialise_event_fifo(value)
+        result = dict(events[0])
+        result["events"] = events
         return result
     # Plain string (runner-level _pending_messages)
     if isinstance(value, str):
@@ -164,6 +177,58 @@ def _serialise_value(value: Any) -> Optional[dict]:
         except (TypeError, ValueError):
             return {"text": str(value)}
     return {"text": str(value)}
+
+
+def _serialise_event_fifo(head: Any) -> list[dict]:
+    """Flatten a pending MessageEvent head and every ordered hidden tail."""
+    events: list[dict] = []
+    queue = [head]
+    seen: set[int] = set()
+    while queue:
+        value = queue.pop(0)
+        marker = id(value)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        # Preserve additional fields if present
+        for attr in ("session_id", "platform", "sender_id", "sender_name",
+                      "reply_to", "media", "raw_event"):
+            val = getattr(value, attr, None)
+            if val is not None:
+                try:
+                    json.dumps(val)
+                    result[attr] = val
+                except (TypeError, ValueError):
+                    result[attr] = str(val)
+        source = getattr(value, "source", None)
+        if source is not None and callable(getattr(source, "to_dict", None)):
+            result["source"] = source.to_dict()
+        message_type = getattr(value, "message_type", None)
+        if message_type is not None:
+            result["message_type"] = getattr(message_type, "value", str(message_type))
+        for attr in (
+            "media_urls", "media_types", "message_id", "platform_update_id",
+            "reply_to_message_id", "reply_to_text", "reply_to_author_id",
+            "reply_to_author_name", "reply_to_is_own_message", "metadata",
+        ):
+            val = getattr(value, attr, None)
+            if val not in (None, [], {}):
+                try:
+                    json.dumps(val)
+                    result[attr] = val
+                except (TypeError, ValueError):
+                    result[attr] = str(val)
+        timestamp = getattr(value, "timestamp", None)
+        if timestamp is not None:
+            result["timestamp"] = (
+                timestamp.timestamp() if hasattr(timestamp, "timestamp") else timestamp
+            )
+        events.append(result)
+        tail = getattr(value, "_gateway_pending_event_queue", [])
+        if isinstance(tail, (list, tuple)):
+            queue[0:0] = list(tail)
+    return events
 
 
 def recover_pending_to_db(
@@ -210,6 +275,50 @@ def recover_pending_to_db(
                 continue
             session_key = payload.get("session_key", "")
             data = payload.get("data", {})
+            events = data.get("events") if isinstance(data, dict) else None
+            if isinstance(events, list) and events:
+                recovered_here = 0
+                for event in events:
+                    if not isinstance(event, dict):
+                        raise ValueError("invalid pending event payload")
+                    text = event.get("text", "")
+                    session_id = event.get("session_id", "")
+                    if not text or not session_id:
+                        raise ValueError("pending event is missing text or session_id")
+                    display_metadata = {
+                        key: event[key]
+                        for key in (
+                            "source", "message_type", "media_types",
+                            "message_id", "reply_to_message_id", "metadata",
+                        )
+                        if key in event
+                    }
+                    media_urls = [str(item) for item in event.get("media_urls", [])]
+                    if media_urls:
+                        display_metadata["media_names"] = [
+                            Path(urlsplit(item).path).name or "attachment"
+                            for item in media_urls
+                        ]
+                    api_content = text
+                    if media_urls:
+                        api_content = "\n".join([
+                            text,
+                            *(f"[file:{item}]" for item in media_urls),
+                        ])
+                    session_db.append_message(
+                        session_id=session_id,
+                        role="user",
+                        content=text,
+                        platform_message_id=event.get("message_id"),
+                        timestamp=event.get("timestamp", payload.get("ts", int(time.time()))),
+                        api_content=api_content if media_urls else None,
+                        display_kind="gateway_pending_recovery",
+                        display_metadata=display_metadata,
+                    )
+                    recovered_here += 1
+                recovered += recovered_here
+                path.unlink(missing_ok=True)
+                continue
             text = data.get("text", "")
             if not text or not session_key:
                 logger.warning(

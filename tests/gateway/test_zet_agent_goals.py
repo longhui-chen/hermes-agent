@@ -1055,11 +1055,70 @@ class TestJudgeBackgroundProcesses:
         宿主驱动一样透传 gather_background_processes()（codex P1）。"""
         procs = [{"pid": 4242, "command": "npm run build", "running": True}]
         _create(driver)
-        with patch("hermes_cli.goals.gather_background_processes", return_value=procs), \
+        with patch("hermes_cli.goals.gather_background_processes", return_value=procs) as gather, \
              patch("hermes_cli.goals.judge_goal", return_value=("continue", "build 还在跑", False, None, False)) as jg:
             driver._after_turn_sync(SID, "user msg", "产出")
         assert jg.called
         assert jg.call_args.kwargs.get("background_processes") == procs
+        gather.assert_called_once()
+        scoped = driver.adapter._interaction_queue_key(SID)
+        assert gather.call_args.kwargs.get("session_key") == scoped
+        assert gather.call_args.kwargs.get("extra_session_keys") == [SID]
+
+    def test_evaluate_reads_real_registry_by_scoped_key(self, driver, reports, hermes_home):
+        """terminal_tool registers ProcessSession.session_key as the
+        profile-scoped queue key. A fake registry that matches the public
+        sid would hide a empty-snapshot WAIT miss."""
+        from pathlib import Path
+
+        from tools.process_registry import ProcessSession, process_registry
+
+        scoped = driver.adapter._interaction_queue_key(SID)
+        owner = str(Path(hermes_home).expanduser().resolve())
+        goal_proc = ProcessSession(
+            id="proc_goal_build",
+            command="npm run build",
+            task_id="t_goal",
+            session_key=scoped,
+            profile_owner=owner,
+            started_at=time.time(),
+        )
+        cron_proc = ProcessSession(
+            id="proc_cron",
+            command="cron weather",
+            task_id="t_cron",
+            session_key="cron_other",
+            profile_owner=owner,
+            started_at=time.time(),
+        )
+        process_registry._running[goal_proc.id] = goal_proc
+        process_registry._running[cron_proc.id] = cron_proc
+        captured: dict = {}
+
+        def _judge(*_args, **kwargs):
+            captured["bg"] = kwargs.get("background_processes")
+            return ("continue", "build 还在跑", False, None, False)
+
+        try:
+            _create(driver)
+            with patch("hermes_cli.goals.judge_goal", side_effect=_judge):
+                driver._after_turn_sync(SID, "user msg", "产出")
+        finally:
+            process_registry._running.pop(goal_proc.id, None)
+            process_registry._running.pop(cron_proc.id, None)
+
+        ids = {row["session_id"] for row in (captured.get("bg") or [])}
+        assert "proc_goal_build" in ids
+        assert "proc_cron" not in ids
+
+    def test_background_process_keys_include_scoped_and_compaction_origin(self, driver):
+        origin = SID
+        rotated = SID + "-tip"
+        keys = driver._background_process_session_keys(rotated, origin)
+        assert keys[0] == driver.adapter._interaction_queue_key(rotated)
+        assert driver.adapter._interaction_queue_key(origin) in keys
+        assert rotated in keys
+        assert origin in keys
 
 
 class TestMultiplexReconcile:

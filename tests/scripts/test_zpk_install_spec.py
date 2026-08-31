@@ -122,9 +122,10 @@ def test_zpk_runtime_bootstrap_is_exact_and_hash_locked() -> None:
         for package in lock["package"]
         if package["name"] in {"pip", "setuptools"}
     }
-    assert {
-        name: package["version"] for name, package in locked_packages.items()
-    } == {"pip": "26.1.2", "setuptools": "83.0.0"}
+    assert {name: package["version"] for name, package in locked_packages.items()} == {
+        "pip": "26.1.2",
+        "setuptools": "83.0.0",
+    }
 
     for package in locked_packages.values():
         artifacts = [package["sdist"], *package["wheels"]]
@@ -139,9 +140,10 @@ def test_zpk_project_build_uses_exact_locked_backend() -> None:
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)
     assert pyproject["build-system"]["requires"] == ["setuptools==83.0.0"]
-    assert "setuptools==83.0.0" in pyproject["project"][
-        "optional-dependencies"
-    ]["zpk-runtime"]
+    assert (
+        "setuptools==83.0.0"
+        in pyproject["project"]["optional-dependencies"]["zpk-runtime"]
+    )
 
 
 def test_zpk_payload_checker_rejects_cached_project_wheel(
@@ -176,6 +178,29 @@ def test_zpk_payload_checker_rejects_cached_project_wheel(
         check_zpk_payload._check_project_source_parity()
 
 
+def test_zpk_python_is_explicit_target_compatible_path() -> None:
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    match = re.search(r"^ZPK_PYTHON\s*\?=\s*(\S+)", makefile, re.MULTILINE)
+    assert match, "ZPK_PYTHON must have a reviewed default"
+    assert match.group(1) == "/usr/bin/python3.11"
+    assert "--python 3.11" not in makefile
+
+
+def test_zpk_uv_config_matches_locked_resolver_policy() -> None:
+    with (REPO_ROOT / "zpk" / "uv.toml").open("rb") as handle:
+        zpk_uv = tomllib.load(handle)
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        project_uv = tomllib.load(handle)["tool"]["uv"]
+
+    # uv 0.7.x accepts an absolute RFC3339 cutoff, but not relative durations
+    # or the later per-package config table. The lockfile already pins the
+    # exceptional packages, so the unsupported table is unnecessary here.
+    assert zpk_uv["exclude-newer"] == "2026-08-04T00:00:00Z"
+    assert project_uv["exclude-newer"] == zpk_uv["exclude-newer"]
+    assert "exclude-newer-package" not in zpk_uv
+    assert "exclude-newer-package" not in project_uv
+
+
 def test_zpk_payload_checker_covers_deep_memory_runtime() -> None:
     from scripts.check_zpk_payload import PROJECT_RUNTIME_MODULES
 
@@ -199,9 +224,20 @@ def test_zpk_make_flow_uses_locked_sync_and_reviewed_uv_path(
     assert "python -m pip install" not in makefile
     assert makefile.count('"$(UV)" --no-progress') == 6
     (tmp_path / "Makefile").write_text(makefile, encoding="utf-8")
+    (tmp_path / "zpk").mkdir()
+    shutil.copyfile(REPO_ROOT / "zpk" / "uv.toml", tmp_path / "zpk" / "uv.toml")
 
     uv_log = tmp_path / "uv-calls.jsonl"
     fake_uv = tmp_path / "reviewed-uv"
+    target_python = tmp_path / "target-python3.11"
+    target_python.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo \'Python 3.11.2\'; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    target_python.chmod(0o755)
+
     fake_uv.write_text(
         """#!/usr/bin/env python3
 import json
@@ -224,8 +260,8 @@ if "venv" in sys.argv[1:]:
     venv = Path(sys.argv[venv_index + 1])
     python = venv / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
-    python.write_text("#!/bin/sh\\nexit 0\\n", encoding="utf-8")
-    python.chmod(0o755)
+    target = sys.argv[sys.argv.index("--python") + 1]
+    python.symlink_to(target)
 
 if (
     "sync" in sys.argv[1:]
@@ -268,6 +304,7 @@ if (
             "--no-print-directory",
             "ZPK_VERBOSE=1",
             f"UV={fake_uv}",
+            f"ZPK_PYTHON={target_python}",
             "zpk-venv",
         ],
         cwd=tmp_path,
@@ -279,11 +316,12 @@ if (
     assert result.returncode == 0, result.stdout + result.stderr
 
     calls = [
-        json.loads(line)
-        for line in uv_log.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in uv_log.read_text(encoding="utf-8").splitlines()
     ]
     assert len(calls) == 3
     assert "venv" in calls[0]["argv"]
+    python_index = calls[0]["argv"].index("--python")
+    assert calls[0]["argv"][python_index + 1] == str(target_python)
     assert "--no-managed-python" in calls[0]["argv"]
     assert "--no-python-downloads" in calls[0]["argv"]
 
@@ -296,6 +334,8 @@ if (
         assert "--no-editable" in sync_argv
         assert "pip" not in sync_argv
         assert "install" not in sync_argv
+        assert "--exclude-newer" not in sync_argv
+        assert "--exclude-newer-package" not in sync_argv
         assert {
             sync_argv[index + 1]
             for index, argument in enumerate(sync_argv[:-1])
@@ -311,16 +351,15 @@ if (
     assert project_sync[reinstall_index + 1] == "hermes-agent"
 
     for call in calls:
-        assert call["uv_env"]["UV_NO_CONFIG"] == "1"
+        assert call["uv_env"]["UV_CONFIG_FILE"] == str(tmp_path / "zpk" / "uv.toml")
+        assert "UV_NO_CONFIG" not in call["uv_env"]
         for variable in poisoned_uv_env:
-            if variable not in {"UV_NO_CONFIG", "UV_PROJECT_ENVIRONMENT"}:
+            if variable not in {"UV_CONFIG_FILE", "UV_PROJECT_ENVIRONMENT"}:
                 assert variable not in call["uv_env"]
     assert "UV_PROJECT_ENVIRONMENT" not in calls[0]["uv_env"]
     for call in calls[1:]:
         assert call["uv_env"]["UV_LINK_MODE"] == "copy"
-        assert call["uv_env"]["UV_PROJECT_ENVIRONMENT"] == str(
-            tmp_path / "venv"
-        )
+        assert call["uv_env"]["UV_PROJECT_ENVIRONMENT"] == str(tmp_path / "venv")
 
     uv_log.unlink()
     env["ZPK_FAKE_UV_FAIL_DEPENDENCY"] = "1"
@@ -330,6 +369,7 @@ if (
             "--no-print-directory",
             "ZPK_VERBOSE=1",
             f"UV={fake_uv}",
+            f"ZPK_PYTHON={target_python}",
             "zpk-venv",
         ],
         cwd=tmp_path,
@@ -341,16 +381,13 @@ if (
     assert failed_result.returncode != 0
 
     failed_calls = [
-        json.loads(line)
-        for line in uv_log.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in uv_log.read_text(encoding="utf-8").splitlines()
     ]
     assert len(failed_calls) == 2
     assert "venv" in failed_calls[0]["argv"]
     assert "--no-install-project" in failed_calls[1]["argv"]
     assert "--no-build" in failed_calls[1]["argv"]
-    assert all(
-        "--no-build-isolation" not in call["argv"] for call in failed_calls
-    )
+    assert all("--no-build-isolation" not in call["argv"] for call in failed_calls)
 
 
 def test_uv_lock_check_rejects_project_drift(tmp_path: Path) -> None:
@@ -383,7 +420,11 @@ def test_uv_lock_check_rejects_project_drift(tmp_path: Path) -> None:
         "UV_WORKING_DIR",
     ):
         clean_env.pop(variable, None)
-    clean_env["UV_NO_CONFIG"] = "1"
+    clean_env.pop("UV_NO_CONFIG", None)
+    zpk_dir = tmp_path / "zpk"
+    zpk_dir.mkdir()
+    shutil.copyfile(REPO_ROOT / "zpk" / "uv.toml", zpk_dir / "uv.toml")
+    clean_env["UV_CONFIG_FILE"] = str(zpk_dir / "uv.toml")
 
     current = subprocess.run(
         [uv, "lock", "--check", "--offline"],
@@ -395,9 +436,7 @@ def test_uv_lock_check_rejects_project_drift(tmp_path: Path) -> None:
     )
     assert current.returncode == 0, current.stdout + current.stderr
 
-    zpk_runtime = (
-        'zpk-runtime = ["pip==26.1.2", "setuptools==83.0.0"]'
-    )
+    zpk_runtime = 'zpk-runtime = ["pip==26.1.2", "setuptools==83.0.0"]'
     drifted_pyproject = pyproject.replace(
         zpk_runtime,
         f"{zpk_runtime}\ndrift-probe = []",
@@ -421,7 +460,9 @@ def test_uv_lock_check_rejects_project_drift(tmp_path: Path) -> None:
 
 # Version group must stop at ';' so PEP 508 environment markers
 # ("pkg==1.0; sys_platform != 'win32'") don't leak into the version.
-_PIN_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*(?:\[[A-Za-z0-9_,\- ]+\])?\s*==\s*([^\s;]+)")
+_PIN_RE = re.compile(
+    r"^\s*([A-Za-z0-9_.\-]+)\s*(?:\[[A-Za-z0-9_,\- ]+\])?\s*==\s*([^\s;]+)"
+)
 
 
 def _normalize(name: str) -> str:
@@ -442,8 +483,12 @@ def test_anthropic_pin_matches_lazy_deps() -> None:
     extra_pins = _pins_from(_optional_dependencies()["anthropic"])
     lazy_pins = _pins_from(_lazy_deps_specs()["provider.anthropic"])
 
-    assert extra_pins.get("anthropic"), "anthropic extra no longer pins the anthropic package"
-    assert lazy_pins.get("anthropic"), "LAZY_DEPS['provider.anthropic'] no longer pins anthropic"
+    assert extra_pins.get(
+        "anthropic"
+    ), "anthropic extra no longer pins the anthropic package"
+    assert lazy_pins.get(
+        "anthropic"
+    ), "LAZY_DEPS['provider.anthropic'] no longer pins anthropic"
     assert extra_pins["anthropic"] == lazy_pins["anthropic"], (
         f"anthropic pin drifted: pyproject extra {sorted(extra_pins['anthropic'])} vs "
         f"lazy_deps {sorted(lazy_pins['anthropic'])}. Keep them in sync so the ZPK bundles "

@@ -71,6 +71,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sys
 import tempfile
 import time
@@ -78,7 +79,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote as _urlquote
+from urllib.parse import quote as _urlquote, urlsplit as _urlsplit
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -120,7 +121,12 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_image_from_url,
     cache_video_from_bytes,
+    get_inbound_media_max_bytes,
+    inbound_media_download_permit,
+    read_aiohttp_body_with_limit,
+    safe_exc,
 )
 from gateway.config import Platform
 
@@ -140,6 +146,12 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
+LINE_REQUEST_CACHE_MAX_TOTAL_CHARS = 8_000_000
+LINE_MORE_REPLY_TEXT = "More of this answer is ready."
+LINE_MORE_BUTTON_LABEL = "Show more"
+LINE_RESPONSE_TOO_LARGE_TEXT = (
+    "The response was too large to deliver. Ask for a shorter answer or a file."
+)
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -178,11 +190,111 @@ DEFAULT_PENDING_REPLY_TEXT = (
 DEFAULT_BUTTON_LABEL = "Get answer"
 DEFAULT_DELIVERED_TEXT = "Already replied ✅"
 DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
+DEFAULT_EXPIRED_REPLY_TEXT = "This answer expired. Please send the request again."
 
 # Media defaults
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
+LINE_PREVIEW_MAX_BYTES = 1 * 1024 * 1024
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+# 双轴上限照抄仓内长驻 runtime source cache 的 128-entry 先例；64 MiB 由
+# cloud-gt002 实测 403 KiB 真图推导：可留满 128 张实测尺寸（约 50.4 MiB，
+# 另留约 27% 余量），同时最多只容纳 6 张 10 MiB 极限图，数量/字节两轴都承重。
+# 这是资源硬顶，不是吞吐承诺：容量满时拒绝新 snapshot，绝不挤掉已发出、
+# 尚待 LINE 首次回拉的旧 snapshot；远程图由调用方降级为原文本链接。
+LINE_IMAGE_SNAPSHOT_MAX_COUNT = 128
+LINE_IMAGE_SNAPSHOT_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+LINE_AV_SNAPSHOT_MAX_COUNT = 16
+LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+LINE_IMAGE_SNAPSHOT_CAPACITY_ERROR = "LINE image snapshot capacity is full"
+_LINE_NATIVE_IMAGE_MIMES = frozenset({"image/jpeg", "image/png"})
+
+
+def _line_native_image_url_mime(url: str) -> str:
+    # 这里只做无网络的成本预筛；真正放行 LINE image 必须再过文件魔数闭集。
+    try:
+        mime = mimetypes.guess_type(_urlsplit(url).path)[0]
+    except ValueError:
+        return ""
+    return mime if mime in _LINE_NATIVE_IMAGE_MIMES else ""
+
+
+def _line_native_image_file_mime(path: Path) -> str:
+    try:
+        with path.open("rb") as image:
+            header = image.read(8)
+    except OSError:
+        return ""
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return ""
+
+
+def _snapshot_line_image(path: Path, expected_mime: str) -> Optional[Path]:
+    suffix = ".png" if expected_mime == "image/png" else ".jpg"
+    temp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    snapshot = Path(temp.name)
+    copied = False
+    total = 0
+    try:
+        with path.open("rb") as source:
+            while chunk := source.read(64 * 1024):
+                total += len(chunk)
+                if total > LINE_IMAGE_MAX_BYTES:
+                    break
+                temp.write(chunk)
+            else:
+                copied = True
+    except OSError:
+        pass
+    finally:
+        temp.close()
+    if not copied or _line_native_image_file_mime(snapshot) != expected_mime:
+        snapshot.unlink(missing_ok=True)
+        return None
+    return snapshot
+
+
+def _snapshot_line_file(path: Path) -> Optional[Path]:
+    """给 LINE 异步回拉持有不可变副本。"""
+    fd, temp_name = tempfile.mkstemp(suffix=path.suffix)
+    os.close(fd)
+    snapshot = Path(temp_name)
+    try:
+        shutil.copy2(path, snapshot)
+    except OSError:
+        snapshot.unlink(missing_ok=True)
+        return None
+    return snapshot
+
+
+def _snapshot_line_preview(path: Path) -> Optional[Path]:
+    """生成 LINE 要求的 <=1 MiB JPEG preview。"""
+    try:
+        from PIL import Image
+
+        temp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp.close()
+        preview = Path(temp.name)
+        with Image.open(path) as image:
+            image.thumbnail((240, 240))
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            image.save(preview, format="JPEG", quality=85, optimize=True)
+        if (
+            preview.stat().st_size <= LINE_PREVIEW_MAX_BYTES
+            and _line_native_image_file_mime(preview) == "image/jpeg"
+        ):
+            return preview
+        preview.unlink(missing_ok=True)
+    except Exception:
+        try:
+            preview.unlink(missing_ok=True)
+        except (NameError, OSError):
+            pass
+    return None
 
 # Map LINE webhook message types to the normalized MessageType the gateway
 # routes on. LINE has no separate "voice" type — audio messages are recorded
@@ -263,9 +375,7 @@ def strip_markdown_preserving_urls(text: str) -> str:
 def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[str]:
     """Split ``text`` into LINE-sized bubbles, preferring paragraph/line breaks.
 
-    Returns at most ``LINE_MAX_MESSAGES_PER_CALL`` chunks; longer text is
-    truncated with an ellipsis on the final chunk to keep the response
-    deliverable in a single Reply/Push call.
+    The caller batches these chunks into groups of five for Reply/Push.
     """
     if not text:
         return []
@@ -274,7 +384,7 @@ def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[s
 
     chunks: List[str] = []
     remaining = text
-    while remaining and len(chunks) < LINE_MAX_MESSAGES_PER_CALL:
+    while remaining:
         if len(remaining) <= max_chars:
             chunks.append(remaining)
             remaining = ""
@@ -290,16 +400,24 @@ def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[s
         chunks.append(remaining[:cut].rstrip())
         remaining = remaining[cut:].lstrip()
 
-    if remaining:
-        # Truncate gracefully — caller already burned its 5-bubble budget.
-        if chunks:
-            tail = chunks[-1]
-            if len(tail) > max_chars - 1:
-                tail = tail[: max_chars - 1]
-            chunks[-1] = tail.rstrip() + "…"
-        else:
-            chunks.append(remaining[: max_chars - 1] + "…")
     return chunks
+
+
+def _bounded_line_text(text: str) -> str:
+    if len(text) > LINE_REQUEST_CACHE_MAX_TOTAL_CHARS:
+        keep = LINE_REQUEST_CACHE_MAX_TOTAL_CHARS - len(LINE_RESPONSE_TOO_LARGE_TEXT) - 2
+        return f"{text[:keep]}\n\n{LINE_RESPONSE_TOO_LARGE_TEXT}"
+    return text
+
+
+def _line_text_page(text: str) -> Tuple[List[str], str]:
+    """Return one five-message LINE page and a cacheable remainder."""
+    chunks = split_for_line(_bounded_line_text(text))
+    if len(chunks) <= LINE_MAX_MESSAGES_PER_CALL:
+        return chunks, ""
+    return chunks[:LINE_MAX_MESSAGES_PER_CALL - 1], "\n".join(
+        chunks[LINE_MAX_MESSAGES_PER_CALL - 1:]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +454,7 @@ def verify_line_signature(body: bytes, signature: str, channel_secret: str) -> b
 class State(enum.Enum):
     PENDING = "pending"  # button sent, LLM still running
     READY = "ready"      # LLM done, response cached, waiting for postback tap
+    DELIVERING = "delivering"  # one postback owns the READY payload in flight
     DELIVERED = "delivered"
     ERROR = "error"      # LLM raised / interrupted; cached error text waiting
 
@@ -361,29 +480,60 @@ class RequestCache:
         self,
         ttl_seconds: int = 3600,
         pending_ttl_seconds: int = 86400,
+        max_entries: int = 128,
+        max_total_chars: int = LINE_REQUEST_CACHE_MAX_TOTAL_CHARS,
     ) -> None:
         self._entries: Dict[str, _CacheEntry] = {}
         self._ttl = ttl_seconds
         self._pending_ttl = pending_ttl_seconds
+        # 8M 字符 × Python 最坏 4 bytes/char ≈ 30.5 MiB payload；超预算的
+        # 单条答案不缓存，调用方改走完整 push，不能静默截尾。
+        self._max_entries = max(1, max_entries)
+        self._max_total_chars = max(1, max_total_chars)
 
-    def register_pending(self, chat_id: str) -> str:
+    def register_pending(self, chat_id: str) -> Optional[str]:
+        self.prune()
+        if len(self._entries) >= self._max_entries:
+            return None
         rid = str(uuid.uuid4())
         self._entries[rid] = _CacheEntry(state=State.PENDING, chat_id=chat_id)
         return rid
 
+    def register_ready(self, chat_id: str, payload: Any) -> Optional[str]:
+        rid = self.register_pending(chat_id)
+        if rid is None:
+            return None
+        if not self.set_ready(rid, payload):
+            self.delete(rid)
+            return None
+        return rid
+
     def get(self, request_id: str) -> Optional[_CacheEntry]:
+        self.prune()
         return self._entries.get(request_id)
 
-    def set_ready(self, request_id: str, payload: Any) -> None:
-        entry = self._entries.get(request_id)
+    def delete(self, request_id: str) -> None:
+        self._entries.pop(request_id, None)
+
+    def set_ready(self, request_id: str, payload: Any) -> bool:
+        entry = self.get(request_id)
         if entry is None or entry.state is not State.PENDING:
-            return
+            return False
+        rendered = str(payload) if payload is not None else None
+        current_chars = sum(
+            len(str(item.payload))
+            for item in self._entries.values()
+            if item.payload is not None and item is not entry
+        )
+        if rendered is not None and current_chars + len(rendered) > self._max_total_chars:
+            return False
         entry.state = State.READY
-        entry.payload = payload
+        entry.payload = rendered
         entry.updated_at = time.time()
+        return True
 
     def set_error(self, request_id: str, message: str) -> None:
-        entry = self._entries.get(request_id)
+        entry = self.get(request_id)
         if entry is None or entry.state is not State.PENDING:
             return
         entry.state = State.ERROR
@@ -391,13 +541,32 @@ class RequestCache:
         entry.updated_at = time.time()
 
     def mark_delivered(self, request_id: str) -> None:
-        entry = self._entries.get(request_id)
-        if entry is None or entry.state not in {State.READY, State.ERROR}:
+        entry = self.get(request_id)
+        if entry is None or entry.state not in {
+            State.READY, State.ERROR, State.DELIVERING,
+        }:
             return
         entry.state = State.DELIVERED
         entry.updated_at = time.time()
 
+    def claim_ready(self, request_id: str) -> Optional[Any]:
+        entry = self.get(request_id)
+        if entry is None or entry.state is not State.READY:
+            return None
+        entry.state = State.DELIVERING
+        entry.updated_at = time.time()
+        return entry.payload
+
+    def release_ready(self, request_id: str, payload: Any = None) -> None:
+        entry = self.get(request_id)
+        if entry is not None and entry.state is State.DELIVERING:
+            if payload is not None:
+                entry.payload = str(payload)
+            entry.state = State.READY
+            entry.updated_at = time.time()
+
     def find_pending_for_chat(self, chat_id: str) -> Optional[str]:
+        self.prune()
         for rid, entry in self._entries.items():
             if entry.state is State.PENDING and entry.chat_id == chat_id:
                 return rid
@@ -441,6 +610,10 @@ class _MessageDeduplicator:
             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
         self._seen[event_id] = time.time()
         return False
+
+    def forget(self, event_id: str) -> None:
+        if event_id:
+            self._seen.pop(event_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -555,16 +728,22 @@ class _LineClient:
         except Exception as exc:  # best-effort; never raise
             logger.debug("LINE loading indicator failed: %s", exc)
 
-    async def fetch_content(self, message_id: str) -> bytes:
+    async def fetch_content(
+        self, message_id: str, *, max_bytes: Optional[int] = None,
+    ) -> bytes:
         """Download an inbound media message's binary content."""
         import aiohttp
         url = LINE_CONTENT_URL_FMT.format(message_id=message_id)
         timeout = aiohttp.ClientTimeout(total=30.0)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"LINE content {resp.status}")
-                return await resp.read()
+            async with inbound_media_download_permit():
+                async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"LINE content {resp.status}")
+                    return await read_aiohttp_body_with_limit(
+                        resp, media_type="LINE inbound media", max_bytes=max_bytes,
+                        permit_acquired=True,
+                    )
 
     async def get_bot_user_id(self) -> Optional[str]:
         """Fetch this channel's own userId so we can filter self-messages."""
@@ -787,6 +966,9 @@ class LineAdapter(BasePlatformAdapter):
         # Media state
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
         self._media_temp_paths: Set[str] = set()
+        self._media_temp_sizes: Dict[str, int] = {}
+        self._media_temp_pools: Dict[str, str] = {}
+        self._media_expiry_handles: Dict[str, asyncio.TimerHandle] = {}
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
 
         # Pending-button slot per chat — ensures one outstanding postback
@@ -811,7 +993,8 @@ class LineAdapter(BasePlatformAdapter):
             from gateway.status import acquire_scoped_lock
             # Use a hash of the token so we don't write the secret to disk.
             tok_hash = hashlib.sha256(self.channel_access_token.encode()).hexdigest()[:16]
-            if not acquire_scoped_lock("line", tok_hash):
+            acquired, _existing = acquire_scoped_lock("line", tok_hash)
+            if not acquired:
                 self._set_fatal_error(
                     "lock_conflict",
                     "LINE channel already in use by another profile",
@@ -910,12 +1093,17 @@ class LineAdapter(BasePlatformAdapter):
         self._app = None
 
         # Cleanup any tracked tempfiles.
+        for handle in self._media_expiry_handles.values():
+            handle.cancel()
+        self._media_expiry_handles.clear()
         for path in list(self._media_temp_paths):
             try:
                 os.unlink(path)
             except OSError:
                 pass
         self._media_temp_paths.clear()
+        self._media_temp_sizes.clear()
+        self._media_temp_pools.clear()
         self._media_tokens.clear()
 
         if self._lock_key:
@@ -937,8 +1125,20 @@ class LineAdapter(BasePlatformAdapter):
     async def _handle_webhook(self, request) -> Any:
         from aiohttp import web
 
-        # Body cap defends against memory-exhaustion via crafted Content-Length
-        # (aiohttp's client_max_size only applies to certain body modes).
+        # Body cap defends against memory-exhaustion via crafted Content-Length.
+        #
+        # ⚠️ 括号里原本写着「aiohttp's client_max_size only applies to certain body
+        # modes」—— **实查 aiohttp 3.14.1 源码,这句话不成立**,已删。
+        # ``web_request.py`` 里每一条 body 读取路径都受 ``client_max_size`` 约束:
+        #   · ``read()``      :702-705  每读一块就查累计字节,超限抛 413
+        #   · ``text()``      :711      → ``read()``
+        #   · ``json()``      :716      → ``text()`` → ``read()``
+        #   · ``multipart()`` :723-729  把 cap 传给 ``MultipartReader``
+        #   · ``post()``      :754/:800 multipart 分支 · :819 urlencoded 分支 → ``read()``
+        # 唯一前提是 cap 非零(``if self._client_max_size``);本适配器传的是
+        # ``WEBHOOK_BODY_MAX_BYTES``(1 MiB,常量),⛔ 不可配成 0。
+        # ⇒ 下面这道显式检查是**冗余的第二道**,保留无害(它也挡住 cap 之内、
+        #   但仍超过本适配器自定上限的体),⛔ 但它不是唯一防线。
         try:
             body = await request.read()
         except Exception as exc:
@@ -957,13 +1157,19 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
+        failed = False
         for event in events:
             try:
                 await self._dispatch_event(event)
-            except Exception:
-                logger.exception("LINE: dispatch_event failed")
+            except Exception as exc:
+                self._dedup.forget(str(event.get("webhookEventId", "") or ""))
+                logger.error("LINE: dispatch_event failed: %s", safe_exc(exc))
+                failed = True
 
-        return web.Response(status=200, text="ok")
+        return web.Response(
+            status=500 if failed else 200,
+            text="retry" if failed else "ok",
+        )
 
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -1011,9 +1217,15 @@ class LineAdapter(BasePlatformAdapter):
 
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
+            now = time.time()
+            self._reply_tokens = {
+                key: value
+                for key, value in self._reply_tokens.items()
+                if value[1] > now
+            }
             self._reply_tokens[chat_id] = (
                 reply_token,
-                time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
+                now + LINE_REPLY_TOKEN_TTL_SECONDS,
             )
 
         # Handle media inbound — fetch the binary, cache it, and surface a
@@ -1025,14 +1237,31 @@ class LineAdapter(BasePlatformAdapter):
         if msg_type == "text":
             text = msg.get("text", "") or ""
         elif msg_type in ("image", "audio", "video", "file"):
-            local_path, media_type = await self._download_media(
-                message_id,
-                msg_type,
-                filename=msg.get("fileName") or msg.get("file_name"),
+            provider = msg.get("contentProvider") or {}
+            external_url = (
+                provider.get("originalContentUrl")
+                if isinstance(provider, dict) and provider.get("type") == "external"
+                else ""
             )
-            if local_path:
-                media_urls.append(local_path)
-                media_types.append(media_type)
+            if external_url:
+                from tools.url_safety import is_safe_url
+
+                if is_safe_url(external_url):
+                    media_urls.append(external_url)
+                    media_types.append({
+                        "image": "image/*",
+                        "audio": "audio/*",
+                        "video": "video/*",
+                    }.get(msg_type, "application/octet-stream"))
+            else:
+                local_path, media_type = await self._download_media(
+                    message_id,
+                    msg_type,
+                    filename=msg.get("fileName") or msg.get("file_name"),
+                )
+                if local_path:
+                    media_urls.append(local_path)
+                    media_types.append(media_type)
             text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
@@ -1088,25 +1317,64 @@ class LineAdapter(BasePlatformAdapter):
             return
 
         entry = self._cache.get(request_id)
-        if not self._client or not reply_token or not entry:
+        if not self._client or not reply_token:
+            return
+        if entry is not None and entry.chat_id != chat_id:
+            logger.warning("LINE: rejecting cross-chat postback request")
+            return
+        if not entry:
+            try:
+                await self._client.reply(
+                    reply_token, [_text_message(DEFAULT_EXPIRED_REPLY_TEXT)]
+                )
+            except Exception:
+                pass
             return
 
         if entry.state is State.READY:
-            payload = entry.payload or ""
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
-            messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+            payload = self._cache.claim_ready(request_id)
+            if payload is None:
+                return
+            chunks = split_for_line(_bounded_line_text(
+                strip_markdown_preserving_urls(str(payload))
+            ))
+            first_batch = [_text_message(c) for c in chunks[:LINE_MAX_MESSAGES_PER_CALL]]
+            remaining = "\n".join(chunks[LINE_MAX_MESSAGES_PER_CALL:])
             try:
-                await self._client.reply(reply_token, messages)
-                self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
+                await self._client.reply(reply_token, first_batch)
             except Exception as exc:
                 logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, messages)
+                    delivered = await self._send_text_chunks(
+                        chat_id, str(payload), force_push=True,
+                    )
+                    if not delivered.success:
+                        raise RuntimeError(delivered.error or "push failed")
                     self._cache.mark_delivered(request_id)
                     self._pending_buttons.pop(chat_id, None)
                 except Exception as exc2:
+                    self._cache.release_ready(request_id)
                     logger.error("LINE: postback push fallback failed: %s", exc2)
+                return
+
+            if remaining:
+                page, remainder = _line_text_page(remaining)
+                follow_up = [_text_message(c) for c in page]
+                if remainder:
+                    follow_up.append(build_postback_button_message(
+                        LINE_MORE_REPLY_TEXT, LINE_MORE_BUTTON_LABEL, request_id,
+                    ))
+                try:
+                    await self._client.push(chat_id, follow_up)
+                except Exception as exc:
+                    self._cache.release_ready(request_id, remaining)
+                    logger.error("LINE: postback follow-up push failed: %s", exc)
+                    return
+                if remainder:
+                    self._cache.release_ready(request_id, remainder)
+                    return
+            self._cache.mark_delivered(request_id)
+            self._pending_buttons.pop(chat_id, None)
         elif entry.state is State.ERROR:
             text = str(entry.payload or self.interrupted_text)
             try:
@@ -1126,6 +1394,11 @@ class LineAdapter(BasePlatformAdapter):
                 await self._client.reply(reply_token, [_text_message(self.pending_text)])
             except Exception:
                 pass
+        elif entry.state is State.DELIVERING:
+            try:
+                await self._client.reply(reply_token, [_text_message(self.pending_text)])
+            except Exception:
+                pass
 
     async def _download_media(
         self,
@@ -1136,8 +1409,21 @@ class LineAdapter(BasePlatformAdapter):
     ) -> Tuple[Optional[str], str]:
         if not self._client or not message_id:
             return None, ""
+        configured_limit = get_inbound_media_max_bytes()
+        platform_limit = {
+            "image": LINE_IMAGE_MAX_BYTES,
+            "audio": LINE_AV_MAX_BYTES,
+            "video": LINE_AV_MAX_BYTES,
+        }.get(msg_type)
+        positive_limits = [
+            limit for limit in (configured_limit, platform_limit)
+            if limit is not None and limit > 0
+        ]
+        max_bytes = min(positive_limits) if positive_limits else 0
         try:
-            data = await self._client.fetch_content(message_id)
+            data = await self._client.fetch_content(
+                message_id, max_bytes=max_bytes,
+            )
         except Exception as exc:
             logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
             return None, ""
@@ -1189,8 +1475,14 @@ class LineAdapter(BasePlatformAdapter):
         # response into the cache for the user to fetch via tap.
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
-            self._cache.set_ready(pending_rid, content)
-            return SendResult(success=True, message_id=pending_rid)
+            entry = self._cache.get(pending_rid)
+            if entry is not None and entry.state is State.PENDING:
+                if self._cache.set_ready(pending_rid, content):
+                    return SendResult(success=True, message_id=pending_rid)
+                self._pending_buttons.pop(chat_id, None)
+                self._cache.delete(pending_rid)
+            # READY/ERROR/DELIVERED 属于上一 turn；不能让旧按钮吞掉新答案。
+            self._pending_buttons.pop(chat_id, None)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
 
@@ -1204,26 +1496,49 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
-        chunks = split_for_line(strip_markdown_preserving_urls(content))
+        chunks, remainder = _line_text_page(
+            strip_markdown_preserving_urls(content)
+        )
         if not chunks:
             return SendResult(success=True, message_id=None)
-        messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+        messages = [_text_message(c) for c in chunks]
+        continuation_id = None
+        if remainder:
+            continuation_id = self._cache.register_ready(chat_id, remainder)
+            if continuation_id:
+                messages.append(build_postback_button_message(
+                    LINE_MORE_REPLY_TEXT,
+                    LINE_MORE_BUTTON_LABEL,
+                    continuation_id,
+                ))
+            else:
+                messages.append(_text_message(LINE_RESPONSE_TOO_LARGE_TEXT))
 
-        token, used_reply = self._consume_reply_token(chat_id)
+        token, used_reply = (
+            ("", False) if force_push else self._consume_reply_token(chat_id)
+        )
         if used_reply and not force_push:
             try:
                 await self._client.reply(token, messages)
-                return SendResult(success=True, message_id=token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
-
-        try:
-            await self._client.push(chat_id, messages)
-            return SendResult(success=True, message_id=None)
-        except Exception as exc:
-            logger.error("LINE: push send failed: %s", exc)
-            return SendResult(success=False, error=str(exc))
+                try:
+                    await self._client.push(chat_id, messages)
+                except Exception as push_exc:
+                    if continuation_id:
+                        self._cache.delete(continuation_id)
+                    logger.error("LINE: push send failed: %s", push_exc)
+                    return SendResult(success=False, error=str(push_exc))
+        else:
+            try:
+                await self._client.push(chat_id, messages)
+            except Exception as exc:
+                if continuation_id:
+                    self._cache.delete(continuation_id)
+                logger.error("LINE: push send failed: %s", exc)
+                return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=token if used_reply else None)
 
     def _consume_reply_token(self, chat_id: str) -> Tuple[str, bool]:
         """Consume a stashed reply token if present and unexpired.
@@ -1290,6 +1605,11 @@ class LineAdapter(BasePlatformAdapter):
             if chat_id in self._pending_buttons:
                 return
             rid = self._cache.register_pending(chat_id)
+            if not rid:
+                logger.warning(
+                    "LINE: slow-response cache full; skipping postback button"
+                )
+                return
             self._pending_buttons[chat_id] = rid
             token, used = self._consume_reply_token(chat_id)
             if not used:
@@ -1304,6 +1624,15 @@ class LineAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("LINE: postback button send failed: %s", exc)
                 self._pending_buttons.pop(chat_id, None)
+                entry = self._cache.get(rid)
+                if entry is not None and entry.state is State.READY:
+                    delivered = await self._send_text_chunks(
+                        chat_id, str(entry.payload or ""), force_push=True,
+                    )
+                    if delivered.success:
+                        self._cache.mark_delivered(rid)
+                elif entry is not None and entry.state is State.PENDING:
+                    self._cache.delete(rid)
 
         post_task = asyncio.create_task(_fire_postback())
         try:
@@ -1327,27 +1656,102 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound media (image / voice / video)
     # ------------------------------------------------------------------
 
-    def _register_media(self, file_path: str, *, cleanup: bool = False) -> str:
+    def _register_media(
+        self,
+        file_path: str,
+        *,
+        cleanup: bool = False,
+        max_count: Optional[int] = None,
+        max_total_bytes: Optional[int] = None,
+        pool: str = "image",
+    ) -> Optional[str]:
         """Register a local file for HTTPS serving; return the URL token."""
         # Evict expired tokens first.
         now = time.time()
-        for token in list(self._media_tokens.keys()):
-            path, exp = self._media_tokens[token]
+        for token, (_path, exp) in list(self._media_tokens.items()):
             if now > exp:
-                self._media_tokens.pop(token, None)
-                if path in self._media_temp_paths:
-                    self._media_temp_paths.discard(path)
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+                self._discard_media_token(token)
 
         resolved = str(Path(file_path).resolve())
+        if cleanup:
+            max_count = (
+                LINE_IMAGE_SNAPSHOT_MAX_COUNT if max_count is None else max_count
+            )
+            max_total_bytes = (
+                LINE_IMAGE_SNAPSHOT_MAX_TOTAL_BYTES
+                if max_total_bytes is None else max_total_bytes
+            )
+            incoming_bytes = Path(resolved).stat().st_size
+            if not self._has_media_snapshot_capacity(
+                incoming_bytes,
+                max_count=max_count,
+                max_total_bytes=max_total_bytes,
+                pool=pool,
+            ):
+                logger.warning(
+                    "LINE: image snapshot capacity full; rejecting new snapshot "
+                    "(count=%d bytes=%d incoming=%d)",
+                    len(self._media_temp_sizes),
+                    sum(self._media_temp_sizes.values()),
+                    incoming_bytes,
+                )
+                Path(resolved).unlink(missing_ok=True)
+                return None
         token = secrets.token_urlsafe(32)
         self._media_tokens[token] = (resolved, now + self._media_ttl)
         if cleanup:
             self._media_temp_paths.add(resolved)
+            self._media_temp_sizes[resolved] = incoming_bytes
+            self._media_temp_pools[resolved] = pool
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._media_expiry_handles[token] = loop.call_later(
+                self._media_ttl, self._discard_media_token, token,
+            )
         return token
+
+    def _has_media_snapshot_capacity(
+        self,
+        incoming_bytes: int,
+        *,
+        max_count: Optional[int] = None,
+        max_total_bytes: Optional[int] = None,
+        pool: str = "image",
+    ) -> bool:
+        max_count = LINE_IMAGE_SNAPSHOT_MAX_COUNT if max_count is None else max_count
+        max_total_bytes = (
+            LINE_IMAGE_SNAPSHOT_MAX_TOTAL_BYTES
+            if max_total_bytes is None else max_total_bytes
+        )
+        pool_paths = {
+            path for path, path_pool in self._media_temp_pools.items()
+            if path_pool == pool
+        }
+        return (
+            len(pool_paths) < max_count
+            and sum(self._media_temp_sizes[path] for path in pool_paths) + incoming_bytes
+            <= max_total_bytes
+        )
+
+    def _discard_media_token(self, token: str) -> None:
+        handle = self._media_expiry_handles.pop(token, None)
+        if handle is not None:
+            handle.cancel()
+        entry = self._media_tokens.pop(token, None)
+        if not entry:
+            return
+        path, _expires_at = entry
+        if path in self._media_temp_paths:
+            self._media_temp_paths.discard(path)
+            self._media_temp_sizes.pop(path, None)
+            self._media_temp_pools.pop(path, None)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _media_url(self, token: str, filename: str) -> str:
         """Build the public HTTPS URL for a media token. PR #8398 style."""
@@ -1369,11 +1773,13 @@ class LineAdapter(BasePlatformAdapter):
         return f"{base}{DEFAULT_MEDIA_PATH_PREFIX}/{token}/{safe_name}"
 
     def _missing_public_url(self) -> bool:
-        """True when outbound media cannot work: no LINE_PUBLIC_URL and the
-        bind host is a wildcard (or the dual-stack ``None`` default), i.e.
-        not an address LINE's fetchers could ever reach."""
+        """True when outbound media lacks a fetchable HTTPS endpoint."""
         if self.public_base_url:
-            return False
+            try:
+                parsed = _urlsplit(self.public_base_url)
+                return parsed.scheme.lower() != "https" or not parsed.hostname
+            except ValueError:
+                return True
         return self.webhook_host is None or self.webhook_host in _WILDCARD_HOSTS
 
     async def _handle_media(self, request) -> Any:
@@ -1394,7 +1800,7 @@ class LineAdapter(BasePlatformAdapter):
 
         file_path, expires_at = entry
         if time.time() > expires_at:
-            self._media_tokens.pop(token, None)
+            self._discard_media_token(token)
             return web.Response(status=410, text="gone")
 
         path = Path(file_path)
@@ -1417,11 +1823,102 @@ class LineAdapter(BasePlatformAdapter):
             logger.warning("LINE: refusing to serve outside allowed roots: %s", resolved)
             return web.Response(status=403, text="forbidden")
 
-        content_type, _ = mimetypes.guess_type(str(path))
+        content_type = _line_native_image_file_mime(path) or mimetypes.guess_type(str(path))[0]
+        if file_path in self._media_temp_paths:
+            # FileResponse 会到 prepare 阶段才打开文件；TTL/容量回收若在这段窗口
+            # unlink，已被 HTTP 接受的请求会变成 404。先持有文件描述符再 await，
+            # POSIX 下随后 unlink 只移除目录项，不会截断当前响应。
+            try:
+                stream = resolved.open("rb")
+                content_length = os.fstat(stream.fileno()).st_size
+            except OSError:
+                return web.Response(status=404, text="not found")
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": content_type or "application/octet-stream",
+                    "Content-Length": str(content_length),
+                },
+            )
+            try:
+                await response.prepare(request)
+                while chunk := stream.read(64 * 1024):
+                    await response.write(chunk)
+                await response.write_eof()
+                return response
+            finally:
+                stream.close()
         return web.FileResponse(
             path,
             headers={"Content-Type": content_type or "application/octet-stream"},
         )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """只把已下载并按魔数确认的 JPEG/PNG 作为 LINE 原生图片发送。
+
+        LINE 平台会自行回拉消息里的 URL；校验源 URL 后仍把源 URL 交给 LINE，
+        无法抵御内容协商差异。因此这里复用共享 SSRF-safe 下载器取得确定字节，
+        再交给 ``send_image_file`` 的快照、双配额和主动 TTL 路径托管。
+        """
+        url = (image_url or "").strip()
+        if not url.lower().startswith("https://") or not _line_native_image_url_mime(url):
+            return await super().send_image(
+                chat_id, image_url, caption=caption,
+                reply_to=reply_to, metadata=metadata,
+            )
+        if not self._client:
+            return SendResult(success=False, error="LINE adapter not connected")
+        if self._missing_public_url():
+            return await super().send_image(
+                chat_id, image_url, caption=caption,
+                reply_to=reply_to, metadata=metadata,
+            )
+
+        downloaded_path: Optional[str] = None
+        try:
+            # 一次最多 10 MiB；失败直接文本降级，不为原生展示重复下载。
+            downloaded_path = await cache_image_from_url(
+                url,
+                ext=".img",
+                retries=0,
+                max_bytes=LINE_IMAGE_MAX_BYTES,
+            )
+            if not _line_native_image_file_mime(Path(downloaded_path)):
+                return await super().send_image(
+                    chat_id, image_url, caption=caption,
+                    reply_to=reply_to, metadata=metadata,
+                )
+            result = await self.send_image_file(
+                chat_id,
+                downloaded_path,
+                caption=caption,
+                metadata=metadata,
+            )
+            if not result.success and result.error == LINE_IMAGE_SNAPSHOT_CAPACITY_ERROR:
+                return await super().send_image(
+                    chat_id, image_url, caption=caption,
+                    reply_to=reply_to, metadata=metadata,
+                )
+            return result
+        except Exception as exc:
+            logger.warning(
+                "LINE: remote image validation failed; using text fallback: %s",
+                safe_exc(exc),
+            )
+            return await super().send_image(
+                chat_id, image_url, caption=caption,
+                reply_to=reply_to, metadata=metadata,
+            )
+        finally:
+            if downloaded_path:
+                Path(downloaded_path).unlink(missing_ok=True)
 
     async def send_image_file(
         self,
@@ -1433,6 +1930,11 @@ class LineAdapter(BasePlatformAdapter):
         path = Path(image_path)
         if not path.exists() or not path.is_file():
             return SendResult(success=False, error=f"image file not found: {image_path}")
+        image_mime = _line_native_image_file_mime(path)
+        if not image_mime:
+            return await super().send_image_file(
+                chat_id, image_path, caption=caption, metadata=metadata,
+            )
         if path.stat().st_size > LINE_IMAGE_MAX_BYTES:
             return SendResult(success=False, error="image exceeds 10 MB LINE limit")
         if not self._client:
@@ -1440,25 +1942,67 @@ class LineAdapter(BasePlatformAdapter):
         if self._missing_public_url():
             return SendResult(
                 success=False,
-                error="LINE_PUBLIC_URL must be set to send images "
-                "(LINE only accepts publicly reachable HTTPS URLs)",
+                error="LINE_PUBLIC_URL must be a publicly reachable HTTPS URL to send images",
             )
 
-        token = self._register_media(str(path.resolve()))
-        url = self._media_url(token, path.name)
-        if not url.lower().startswith("https://"):
-            return SendResult(success=False, error=f"LINE image URL must be HTTPS: {url}")
-        msgs: List[Dict[str, Any]] = [_image_message(url)]
-        if caption:
-            msgs.append(_text_message(caption))
-        return await self._send_messages(chat_id, msgs)
+        snapshot = _snapshot_line_image(path, image_mime)
+        if snapshot is None:
+            logger.warning("LINE: local image changed while preparing delivery")
+            return await super().send_image_file(
+                chat_id, image_path, caption=caption, metadata=metadata,
+            )
+        preview = (
+            snapshot
+            if snapshot.stat().st_size <= LINE_PREVIEW_MAX_BYTES
+            else _snapshot_line_preview(snapshot)
+        )
+        if preview is None:
+            snapshot.unlink(missing_ok=True)
+            return SendResult(success=False, error="Could not build LINE image preview")
+        token = self._register_media(str(snapshot), cleanup=True)
+        if token is None:
+            if preview != snapshot:
+                preview.unlink(missing_ok=True)
+            return SendResult(
+                success=False,
+                error=LINE_IMAGE_SNAPSHOT_CAPACITY_ERROR,
+            )
+        url = self._media_url(token, snapshot.name)
+        preview_token = token
+        preview_url = url
+        if preview != snapshot:
+            preview_token = self._register_media(str(preview), cleanup=True)
+            if preview_token is None:
+                self._discard_media_token(token)
+                return SendResult(
+                    success=False,
+                    error=LINE_IMAGE_SNAPSHOT_CAPACITY_ERROR,
+                )
+            preview_url = self._media_url(preview_token, preview.name)
+        result: Optional[SendResult] = None
+        try:
+            if not url.lower().startswith("https://"):
+                return SendResult(success=False, error=f"LINE image URL must be HTTPS: {url}")
+            msgs: List[Dict[str, Any]] = [_image_message(url, preview_url)]
+            if caption:
+                msgs.append(_text_message(caption))
+            result = await self._send_messages(chat_id, msgs)
+            return result
+        finally:
+            if result is None or not result.success:
+                self._discard_media_token(token)
+                if preview_token != token:
+                    self._discard_media_token(preview_token)
 
     async def send_voice(
         self,
         chat_id: str,
         audio_path: str,
         duration_ms: int = 1000,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
         path = Path(audio_path)
         if not path.exists() or not path.is_file():
@@ -1470,19 +2014,63 @@ class LineAdapter(BasePlatformAdapter):
         if self._missing_public_url():
             return SendResult(
                 success=False,
-                error="LINE_PUBLIC_URL must be set to send audio",
+                error="LINE_PUBLIC_URL must be a publicly reachable HTTPS URL to send audio",
             )
+        from tools.audio_container import sniff_container
 
-        token = self._register_media(str(path.resolve()))
-        url = self._media_url(token, path.name)
-        return await self._send_messages(chat_id, [_audio_message(url, duration_ms)])
+        with path.open("rb") as handle:
+            if sniff_container(handle.read(12)) not in {"mp3", "m4a"}:
+                return await super().send_voice(
+                    chat_id, audio_path, caption=caption, metadata=metadata,
+                )
+
+        size = path.stat().st_size
+        if not self._has_media_snapshot_capacity(
+            size,
+            max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
+            max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
+        ):
+            return SendResult(
+                success=False,
+                error="LINE audio snapshot capacity is full",
+            )
+        snapshot = _snapshot_line_file(path)
+        if snapshot is None:
+            return SendResult(success=False, error="Could not snapshot LINE audio")
+        token = self._register_media(
+            str(snapshot),
+            cleanup=True,
+            max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
+            max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
+        )
+        if token is None:
+            return SendResult(
+                success=False,
+                error="LINE audio snapshot capacity is full",
+            )
+        url = self._media_url(token, snapshot.name)
+        result: Optional[SendResult] = None
+        try:
+            messages = [_audio_message(url, duration_ms)]
+            if caption:
+                messages.append(_text_message(caption))
+            result = await self._send_messages(chat_id, messages)
+            return result
+        finally:
+            if result is None or not result.success:
+                self._discard_media_token(token)
 
     async def send_video(
         self,
         chat_id: str,
         video_path: str,
         preview_path: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
         path = Path(video_path)
         if not path.exists() or not path.is_file():
@@ -1494,14 +2082,49 @@ class LineAdapter(BasePlatformAdapter):
         if self._missing_public_url():
             return SendResult(
                 success=False,
-                error="LINE_PUBLIC_URL must be set to send video",
+                error="LINE_PUBLIC_URL must be a publicly reachable HTTPS URL to send video",
             )
+        from tools.audio_container import sniff_container
+
+        with path.open("rb") as handle:
+            if sniff_container(handle.read(12)) != "mp4":
+                return await super().send_video(
+                    chat_id, video_path, caption=caption, metadata=metadata,
+                )
+        video_size = path.stat().st_size
+        if not self._has_media_snapshot_capacity(
+            video_size,
+            max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
+            max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
+        ):
+            return SendResult(
+                success=False, error="LINE video snapshot capacity is full",
+            )
+        video_snapshot = _snapshot_line_file(path)
+        if video_snapshot is None:
+            return SendResult(success=False, error="Could not snapshot LINE video")
 
         # LINE requires a previewImageUrl. Use one if supplied, otherwise
         # write a stdlib 1×1 PNG to /tmp and serve it. PR #8398.
-        if preview_path and Path(preview_path).is_file():
-            preview_token = self._register_media(str(Path(preview_path).resolve()))
-            preview_filename = Path(preview_path).name
+        if (
+            preview_path
+            and Path(preview_path).is_file()
+            and Path(preview_path).stat().st_size <= LINE_PREVIEW_MAX_BYTES
+            and _line_native_image_file_mime(Path(preview_path))
+        ):
+            preview_snapshot = _snapshot_line_file(Path(preview_path))
+            if preview_snapshot is None:
+                video_snapshot.unlink(missing_ok=True)
+                return SendResult(success=False, error="Could not snapshot LINE video preview")
+            preview_token = self._register_media(str(preview_snapshot), cleanup=True)
+            if preview_token is None:
+                video_snapshot.unlink(missing_ok=True)
+                return SendResult(
+                    success=False,
+                    error="LINE video preview snapshot capacity is full",
+                )
+            preview_filename = preview_snapshot.name
         else:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             try:
@@ -1509,61 +2132,110 @@ class LineAdapter(BasePlatformAdapter):
                 tmp.flush()
                 tmp.close()
                 preview_token = self._register_media(tmp.name, cleanup=True)
+                if preview_token is None:
+                    video_snapshot.unlink(missing_ok=True)
+                    return SendResult(
+                        success=False,
+                        error="LINE video preview snapshot capacity is full",
+                    )
                 preview_filename = "preview.png"
             except Exception:
+                video_snapshot.unlink(missing_ok=True)
                 try:
                     os.unlink(tmp.name)
                 except OSError:
                     pass
                 raise
 
-        video_token = self._register_media(str(path.resolve()))
-        video_url = self._media_url(video_token, path.name)
+        video_token = self._register_media(
+            str(video_snapshot),
+            cleanup=True,
+            max_count=LINE_AV_SNAPSHOT_MAX_COUNT,
+            max_total_bytes=LINE_AV_SNAPSHOT_MAX_TOTAL_BYTES,
+            pool="av",
+        )
+        if video_token is None:
+            self._discard_media_token(preview_token)
+            return SendResult(
+                success=False, error="LINE video snapshot capacity is full",
+            )
+        video_url = self._media_url(video_token, video_snapshot.name)
         preview_url = self._media_url(preview_token, preview_filename)
-        return await self._send_messages(chat_id, [_video_message(video_url, preview_url)])
+        result: Optional[SendResult] = None
+        try:
+            result = await self._send_messages(
+                chat_id,
+                [_video_message(video_url, preview_url)]
+                + ([_text_message(caption)] if caption else []),
+            )
+            return result
+        finally:
+            if result is None or not result.success:
+                self._discard_media_token(video_token)
+                self._discard_media_token(preview_token)
 
     async def _send_messages(
         self,
         chat_id: str,
         messages: List[Dict[str, Any]],
     ) -> SendResult:
-        """Send already-built message objects, batched at 5/call."""
+        """Send at most one LINE-sized batch of already-built messages."""
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
         if not messages:
             return SendResult(success=True, message_id=None)
+        if len(messages) > LINE_MAX_MESSAGES_PER_CALL:
+            return SendResult(
+                success=False,
+                error="LINE delivery exceeds the five-message call limit",
+            )
 
-        first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
-        rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
-
-        # First batch: try reply token, fall back to push.
+        # One bounded call: try reply token, then fall back to one push.
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply:
             try:
-                await self._client.reply(token, first_batch)
+                await self._client.reply(token, messages)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, first_batch)
+                    await self._client.push(chat_id, messages)
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
         else:
             try:
-                await self._client.push(chat_id, first_batch)
+                await self._client.push(chat_id, messages)
             except Exception as exc:
                 return SendResult(success=False, error=str(exc))
 
-        # Subsequent batches: always push (reply token is single-use).
-        while rest:
-            batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
-            rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
-            try:
-                await self._client.push(chat_id, batch)
-            except Exception as exc:
-                logger.warning("LINE: push for follow-up batch failed: %s", exc)
-                return SendResult(success=False, error=str(exc))
-
+        await self._settle_pending_visible_delivery(chat_id)
         return SendResult(success=True, message_id=None)
+
+    async def _settle_pending_visible_delivery(self, chat_id: str) -> None:
+        """原生媒体已可见：结算 slow-response cache，解除旧按钮对后续回复的截流。"""
+        request_id = self._pending_buttons.get(chat_id)
+        if not request_id:
+            return
+        entry = self._cache.get(request_id)
+        if entry is None:
+            self._pending_buttons.pop(chat_id, None)
+            return
+        if entry.state is State.READY:
+            # 图文混发先经 send() 把正文缓存为 READY；媒体成功后必须把正文
+            # 真正送达，⛔ 不能直接 mark DELIVERED 后把它吞掉。发送失败则保留
+            # READY，让用户仍可通过已发出的按钮取回正文。
+            text_result = await self._send_text_chunks(
+                chat_id, str(entry.payload or ""), force_push=True,
+            )
+            if not text_result.success:
+                return
+        elif entry.state is State.PENDING:
+            # 纯媒体（含 caption）本身就是完整可见回答，不需要再缓存一份。
+            self._cache.set_ready(request_id, None)
+        else:
+            return
+        self._cache.mark_delivered(request_id)
+        if self._pending_buttons.get(chat_id) == request_id:
+            self._pending_buttons.pop(chat_id, None)
 
 
 def _is_relative_to(child: Path, parent: Path) -> bool:
@@ -1666,12 +2338,17 @@ async def _standalone_send(
         return {"error": "LINE standalone send: missing token or chat_id"}
 
     plain = strip_markdown_preserving_urls(message or "")
-    chunks = split_for_line(plain) or [""]
-    messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+    chunks, remainder = _line_text_page(plain)
+    notices = []
+    if remainder:
+        notices.append(_text_message(LINE_RESPONSE_TOO_LARGE_TEXT))
     if media_files:
         # Tack on a hint so the recipient knows media was generated but not delivered.
-        messages.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))
-        messages = messages[:LINE_MAX_MESSAGES_PER_CALL]
+        notices.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))
+    available = max(0, LINE_MAX_MESSAGES_PER_CALL - len(notices))
+    messages = [_text_message(c) for c in chunks[:available]] + notices
+    if not messages:
+        messages = [_text_message("")]
 
     client = _LineClient(token)
     try:

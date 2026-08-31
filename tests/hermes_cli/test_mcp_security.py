@@ -88,7 +88,7 @@ def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch)
 
     connected = []
 
-    async def _discover_one(name, config):
+    async def _discover_one(name, config, **_kwargs):
         connected.append(name)
         return []
 

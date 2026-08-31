@@ -2096,7 +2096,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     # Home Assistant
     hass_token = getenv("HASS_TOKEN")
-    if hass_token:
+    bridge_only = os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if bridge_only:
+        # Also neutralize a stale YAML platform entry; otherwise the legacy
+        # adapter could still be constructed even though no env override is
+        # applied.
+        existing_ha = config.platforms.get(Platform.HOMEASSISTANT)
+        if existing_ha is not None:
+            existing_ha.enabled = False
+            existing_ha.token = ""
+    elif hass_token:
         if Platform.HOMEASSISTANT not in config.platforms:
             config.platforms[Platform.HOMEASSISTANT] = PlatformConfig()
         config.platforms[Platform.HOMEASSISTANT].enabled = True

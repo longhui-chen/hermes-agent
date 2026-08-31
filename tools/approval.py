@@ -2219,6 +2219,7 @@ _MAX_DEFERRED_APPROVAL_BYTES_GLOBAL = 512 * 1024
 _MAX_DEFERRED_COMMAND_CHARS = 4096
 _MAX_DEFERRED_DESCRIPTION_CHARS = 1024
 _MAX_DEFERRED_PATTERN_CHARS = 512
+_MAX_DEFERRED_VALIDATION_TARGET_CHARS = 2048
 _DEFERRED_SWEEP_INTERVAL_SECONDS = 30.0
 _ApprovalStateKey = str | tuple[str, str]
 _pending: dict[_ApprovalStateKey, list[dict]] = {}
@@ -2340,6 +2341,11 @@ def _bounded_deferred_payload(approval: dict) -> dict:
         ),
         "payload_fingerprint": hashlib.sha256(fingerprint_source).hexdigest(),
     }
+    if approval.get("validation_target"):
+        queued["validation_target"] = _bounded_deferred_text(
+            approval["validation_target"],
+            _MAX_DEFERRED_VALIDATION_TARGET_CHARS,
+        )
     for key in ("one_shot_pattern_key",):
         if approval.get(key):
             queued[key] = _bounded_deferred_text(
@@ -2622,6 +2628,27 @@ def unregister_gateway_notify(session_key: str) -> None:
             _gateway_prepared.pop(key, None)
     for entry in entries:
         entry.event.set()
+
+
+def unregister_gateway_notify_if_current(session_key: str, cb: object) -> bool:
+    """Remove one exact notifier without clobbering a newer turn's binding.
+
+    Zet runtime-shell reuse replaces the callback every turn because the
+    callback closes over that turn's SSE queue.  A defensive overlapping turn
+    may publish a newer callback before the older turn finishes, so cleanup
+    must use compare-and-remove rather than an unconditional unregister.
+    """
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        if _gateway_notify_cbs.get(state_key) is not cb:
+            return False
+        _gateway_notify_cbs.pop(state_key, None)
+        entries = _gateway_queues.pop(state_key, [])
+        for key in [key for key in _gateway_prepared if key[0] == state_key]:
+            _gateway_prepared.pop(key, None)
+    for entry in entries:
+        entry.event.set()
+    return True
 
 
 def cancel_gateway_approvals(session_key: str, choice: str = "deny") -> int:
@@ -3835,16 +3862,25 @@ def _run_approval_gate(
             choices, and never save the response beyond this operation.
         allow_yolo_bypass: When False, active yolo mode cannot replace the
             human decision for newly discovered, operation-specific risk.
-        validation_target: Optional non-display operation record used by a
-            trusted consumer to validate that the approval still covers the
-            exact structured mutation. This is transported separately from
-            ``display_target`` so the user can see a concise label without
-            weakening payload ownership checks.
+        validation_target: Optional bounded, non-display operation binding.
+            Trusted consumers may use it to verify the exact structured
+            mutation while normal approval surfaces render only
+            ``display_target``.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
+    validation_target = str(validation_target or "")
+    if len(validation_target) > _MAX_DEFERRED_VALIDATION_TARGET_CHARS:
+        return {
+            "approved": False,
+            "message": "BLOCKED: approval validation target exceeds the safe size limit.",
+            "pattern_key": pattern_key,
+            "description": description,
+            "status": "approval_validation_target_too_large",
+        }
+
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
@@ -4192,10 +4228,9 @@ def request_tool_approval(
         display_target: Optional bounded, human-readable operation record.
             Keep internal identifiers and structured arguments out of this
             value; empty keeps the generic plugin label.
-        validation_target: Optional bounded, non-display operation record for
-            a trusted downstream validator. It must describe the same bytes
-            used to derive ``rule_key``; normal approval UIs must continue to
-            render only ``display_target``.
+        validation_target: Optional bounded, non-display operation binding
+            for a trusted downstream validator. It must describe the same
+            payload digest used by ``rule_key``.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or

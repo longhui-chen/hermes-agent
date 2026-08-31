@@ -23,10 +23,11 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 from gateway.response_filters import is_intentional_silence_response
 from hermes_constants import get_hermes_home
@@ -41,6 +42,7 @@ AUXILIARY_TASK_NAME = "creation_governor_checkpoint"
 AUXILIARY_MODEL_ALIAS = "zettlab-creation-fast"
 EVALUATION_TIMEOUT_SECONDS = 25.0
 MAIN_MODEL_FALLBACK_TIMEOUT_SECONDS = 15.0
+EVALUATION_EXECUTION_MODE: Literal["synchronous", "fast_bypass"] = "synchronous"
 PROPOSAL_TTL_SECONDS = 30 * 60
 DISMISS_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_RECENT_PROPOSALS = 128
@@ -49,6 +51,7 @@ EVALUATION_INTERVAL_TURNS = 3
 PROMPT_COOLDOWN_TURNS = 10
 SESSION_STATE_TTL_SECONDS = 24 * 60 * 60
 MAX_SESSION_STATES = 512
+MAX_PENDING_ACTION_RESULTS = 16
 CREATION_TYPES = {"agent", "skill", "task"}
 # agent 品类落地缺口（2026-08-07 真机实测）：hermes 侧没有 create_agent 工具
 # （task 走原生定时、skill 有 skill_manager_tool，唯独 agent 档案的增删归
@@ -79,8 +82,80 @@ MAX_EMITTED_CONNECTION_PROPOSALS = 256
 RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
 SESSION_PREFERENCES_DB = "creation_governor.db"
 UNSUPPORTED_API_MODES = {"codex_app_server"}
-UNSUPPORTED_PLATFORMS = {"acp", "api_server"}
+UNSUPPORTED_PLATFORMS = {"acp"}
 _NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
+_ACTION_RECEIPT_TRANSPORT = "canonical_final_v1"
+
+
+def _evaluation_execution_mode() -> Literal["synchronous", "fast_bypass"]:
+    """Return the bounded experiment seam without changing the production default.
+
+    The default remains the existing synchronous checkpoint. A future cohort
+    controller can select ``fast_bypass`` at this seam after the latency and
+    recommendation-quality experiment is approved; this slice intentionally
+    does not add another configuration source or asynchronous execution path.
+    """
+
+    if EVALUATION_EXECUTION_MODE == "fast_bypass":
+        return "fast_bypass"
+    return "synchronous"
+
+
+def _record_pre_llm_timing(
+    timing: dict[str, Any] | None,
+    *,
+    route: str | None = None,
+    fast_started_at: float | None = None,
+    fast_outcome: str | None = None,
+    fallback_started_at: float | None = None,
+    fallback_outcome: str | None = None,
+) -> None:
+    """Accumulate bounded phase data on this hook's local call stack only."""
+
+    if timing is None:
+        return
+    if route is not None:
+        timing["route"] = route
+    if fast_outcome is not None:
+        timing["fast_outcome"] = fast_outcome
+    if fast_started_at is not None:
+        timing["fast_ms"] = round(
+            max(0.0, time.perf_counter() - fast_started_at) * 1000,
+            3,
+        )
+    if fallback_outcome is not None:
+        timing["fallback_outcome"] = fallback_outcome
+    if fallback_started_at is not None:
+        timing["fallback_ms"] = round(
+            max(0.0, time.perf_counter() - fallback_started_at) * 1000,
+            3,
+        )
+
+
+def _log_pre_llm_summary(timing: dict[str, Any], *, outcome: str) -> None:
+    """Write one formatter-stable summary without identity or conversation data."""
+
+    fields: list[tuple[str, Any]] = [
+        ("stage", "exit"),
+        (
+            "total_ms",
+            round(
+                max(0.0, time.perf_counter() - float(timing["started_at"])) * 1000,
+                3,
+            ),
+        ),
+        ("outcome", outcome),
+        ("evaluation_mode", timing["evaluation_mode"]),
+        ("route", timing.get("route", "not_evaluated")),
+    ]
+    for key in ("fast_outcome", "fast_ms", "fallback_outcome", "fallback_ms"):
+        if key in timing:
+            fields.append((key, timing[key]))
+    logger.info(
+        "creation_governor_pre_llm_summary %s",
+        " ".join(f"{key}={value}" for key, value in fields),
+    )
+
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
@@ -93,10 +168,30 @@ _emitted_connection_proposals: OrderedDict[str, tuple[str, str]] = OrderedDict()
 _state_lock = threading.Lock()
 _plugin_llm: Any = None
 _plugin_ctx: Any = None
-_invocation_scope: ContextVar[tuple[str, str, str | None, str] | None] = ContextVar(
+# (raw_session_id, scoped_session_id, suppression_reason, owner_id,
+#  receipt_transport, turn_id)
+_invocation_scope: ContextVar[
+    tuple[str, str, str | None, str, str, str] | None
+] = ContextVar(
     "creation_governor_invocation_scope",
     default=None,
 )
+# turn_key → invocation_id：把创建配额绑到**这一次请求**而不是 turn_id 上。同一个
+# turn_id 可能有两个并发在途请求（双击 / 传输重发），结局天然相反。
+#
+# 为什么单独一个 ContextVar、而且按 turn 分条，不塞进 _invocation_scope：一个
+# context 里可以同时活着多个 turn。delegate_task 的子任务经
+# ``tools/thread_context.py`` 的 propagate_context_to_thread 继承父请求的**整份**
+# ContextVars（``ctx.run``），然后在父请求还没收尾时用另一个 turn_id 进
+# pre_llm_call。按 turn 分条之后，子任务只会给自己那个 turn 建 id，读不到也动不了
+# 父请求那条；ContextVar 的写又是 context-local 的，子任务的 set() 不会回灌父
+# context。
+_invocation_turn_ids: ContextVar[dict[str, str] | None] = ContextVar(
+    "creation_governor_invocation_turn_ids",
+    default=None,
+)
+# 一个 context 里同时活着的 turn 数量上限。正常是 1（父请求）或 2（父 + 子任务）。
+MAX_INVOCATION_TURNS_PER_CONTEXT = 32
 
 _SELF_QUERY_RE = re.compile(
     r"(?:creation[\s_-]*governor|detect_creation_opportunity|propose_creation)",
@@ -104,7 +199,8 @@ _SELF_QUERY_RE = re.compile(
 )
 _FAST_ROUTE_UNAVAILABLE_RE = re.compile(
     r"(?:404|not found|not in public manifest|unknown (?:model|route)|"
-    r"model .+ does not exist|invalid model)",
+    r"model .+ does not exist|invalid model|model_not_found|"
+    r"no available channel for model)",
     re.IGNORECASE,
 )
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -166,11 +262,38 @@ _CAPABILITY_DELIVERED_RE = re.compile(
     r"(?:created|configured|updated|deployed|seeded|synchronized|synced)",
     re.IGNORECASE,
 )
+# 花括号定界是刻意的，别改成 `(.*?)`。结束标签在后面锚着，非贪婪匹配会一路
+# 回溯扩展到配对的那个 `}`——title 里含 `}`（"JSON {schema}"）或 payload 有嵌套
+# 对象都解得对。反过来 `(.*?)` 在 JSON 字符串里恰好出现结束标签时会提前收尾，
+# 比现在更脆弱。（2026-08-19 有一轮 review 按「非贪婪会在第一个 `}` 收尾」报过
+# 这里，实测不成立。）
 _RECOMMENDATION_RESPONSE_RE = re.compile(
     r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
     r"\[/creation_recommendation_response\]",
     re.DOTALL,
 )
+_ACTION_RESULT_ENVELOPE_RE = re.compile(
+    r"<!--creation-recommendation-action-result(?:\s+[^>]*)?-->"
+)
+
+
+class _ActionReceipt(NamedTuple):
+    proposal_id: str
+    action: str
+    status: Literal["accepted", "rejected"]
+    reason_code: Literal[
+        "proposal_not_actionable",
+        "preference_not_persisted",
+    ] | None = None
+
+
+class _ActionHandlingOutcome(NamedTuple):
+    context: str
+    receipt: _ActionReceipt | None
+    # 这次动作针对的创建品类。只有 create 被接管时才有意义——创建配额按品类
+    # 发放，接受一张 Skill 卡换来的票不该放行一次 cronjob(create)。
+    creation_type: str = ""
+
 _ONBOARDING_WELCOME_RE = re.compile(
     r"<!--zettlab-onboarding-welcome\s+([A-Za-z0-9_-]+)-->",
 )
@@ -262,6 +385,34 @@ def _text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+# 用户消息进 governor 前的字符预算。动作信封挂在消息末尾，而 Web 会在它前面
+# 放一段给模型看的动作说明文案——文案一长就能把信封挤出这个窗口。
+USER_MESSAGE_LIMIT = 2000
+
+
+def _bounded_user_message(raw: Any) -> str:
+    """把用户消息压到预算内，但**不能把结尾的动作信封切掉**。
+
+    信封被切掉的后果不是「少看见一段文字」：governor 完全看不到这次动作，
+    既不接管也不生成回执，而 HTTP 请求照常以普通模型结果收尾——版本化端点
+    那边已经按「这是一次动作」放行了，Web 于是把这次创建永久停在「不确定
+    且不能重试」。准入和这里必须看到同一个信封。
+    """
+    normalized = " ".join(str(raw or "").split())
+    if len(normalized) <= USER_MESSAGE_LIMIT:
+        return normalized
+    match = _RECOMMENDATION_RESPONSE_RE.search(normalized)
+    if match is None:
+        return normalized[:USER_MESSAGE_LIMIT]
+    envelope = normalized[match.start():match.end()]
+    if len(envelope) >= USER_MESSAGE_LIMIT:
+        # 信封本身就超预算。截断它只会让解析失败，原样交出去反而是更诚实的
+        # 输入——payload 大小另有上限把关。
+        return envelope
+    head = normalized[: USER_MESSAGE_LIMIT - len(envelope) - 1].rstrip()
+    return f"{head} {envelope}" if head else envelope
+
+
 def _normalize_creation_type(value: Any) -> str:
     normalized = _text(value, 40).lower().replace("-", "_")
     if normalized == "scheduled_task":
@@ -344,12 +495,52 @@ def _latch_dismissal(session_id: str, dedup_key: str, now: float) -> None:
 
 
 def _raw_session_key(kwargs: dict[str, Any]) -> str:
-    return _text(kwargs.get("session_id") or kwargs.get("task_id"), 160)
+    """会话作用域的内部标识。
+
+    不能用 `_text()`：它是给展示文本用的，会折叠内部空白并截断到 160 字符，
+    而 `APIServerAdapter._parse_session_key_header()` 允许最长 256 且保留内部
+    空白。两个合法的不同会话因此可能塌成同一个 scope，`last_proposal`、mute
+    偏好和 pending receipt 会串到别人的会话上。
+
+    短且无需归一的键原样保留（与既有 scope 兼容，不会因升级重置用户偏好）；
+    其余用完整值的摘要，碰撞由 sha256 保证而不是由截断决定。
+    """
+    raw = str(
+        kwargs.get("conversation_session_id")
+        or kwargs.get("session_id")
+        or kwargs.get("task_id")
+        or ""
+    )
+    if not raw:
+        return ""
+    if len(raw) <= 160 and raw == " ".join(raw.split()):
+        return raw
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def _scoped_session_key(raw_session_id: str, owner_id: str) -> str:
     profile = str(get_hermes_home().resolve())
     return f"{profile}|{_text(owner_id, 160)}|{raw_session_id}"
+
+
+def _is_current_invocation(kwargs: dict[str, Any]) -> bool:
+    """Whether this hook/tool call belongs to the turn that set the scope.
+
+    钩子（pre_llm_call / transform_llm_output）拿得到稳定的
+    conversation_session_id，直接按它认；工具链拿不到——
+    ``model_tools`` 只把 transcript 级 ``session_id`` 递进
+    ``registry.dispatch``，稳定 scope 传不进来。turn_id 两侧都在且比 session
+    更细，用它作为同一次调用的凭据，让工具写候选与钩子读候选落在同一个
+    conversation scope。
+    """
+    invocation = _invocation_scope.get()
+    if invocation is None:
+        return False
+    raw_session_id = _raw_session_key(kwargs)
+    if raw_session_id and invocation[0] == raw_session_id:
+        return True
+    turn_id = _text(kwargs.get("turn_id"), 160)
+    return bool(turn_id and invocation[5] == turn_id)
 
 
 def _session_key(kwargs: dict[str, Any]) -> str:
@@ -365,12 +556,17 @@ def _session_key(kwargs: dict[str, Any]) -> str:
     )
     if (
         invocation is not None
-        and invocation[0] == raw_session_id
+        and _is_current_invocation(kwargs)
         and invocation[1].startswith(profile_prefix)
         and (not explicit_owner or explicit_owner == invocation[3])
     ):
         return invocation[1]
     return _scoped_session_key(raw_session_id, explicit_owner)
+
+
+def _receipt_transport(kwargs: dict[str, Any]) -> str:
+    raw = kwargs.get("creation_action_receipt_transport")
+    return _ACTION_RECEIPT_TRANSPORT if raw == _ACTION_RECEIPT_TRANSPORT else ""
 
 
 def _preferences_db_path() -> Path:
@@ -429,22 +625,12 @@ def _set_session_muted(session_id: str, muted: bool) -> bool:
     return True
 
 
-def _is_session_muted(session_id: str) -> bool:
-    now = time.monotonic()
-    with _state_lock:
-        _prune_known_unmuted_sessions(now)
-        _prune_muted_sessions(now)
-        if session_id in _muted_sessions:
-            _remember_muted_session(session_id, now)
-            return True
-        if session_id in _known_unmuted_sessions:
-            _remember_unmuted_session(session_id, now)
-            return False
+def _read_persisted_session_preference(
+    session_id: str,
+) -> Literal["muted", "unmuted", "absent", "read_error"]:
     path = _preferences_db_path()
     if not path.exists():
-        with _state_lock:
-            _remember_unmuted_session(session_id, now)
-        return False
+        return "absent"
     try:
         with sqlite3.connect(path, timeout=2.0) as connection:
             row = connection.execute(
@@ -460,8 +646,27 @@ def _is_session_muted(session_id: str) -> bool:
             "creation recommendation session preference read failed",
             exc_info=True,
         )
-        return False
-    muted = bool(row and row[0])
+        return "read_error"
+    if row is None:
+        return "absent"
+    return "muted" if bool(row[0]) else "unmuted"
+
+
+def _is_session_muted(session_id: str) -> bool:
+    now = time.monotonic()
+    with _state_lock:
+        _prune_known_unmuted_sessions(now)
+        _prune_muted_sessions(now)
+        if session_id in _muted_sessions:
+            _remember_muted_session(session_id, now)
+            return True
+        if session_id in _known_unmuted_sessions:
+            _remember_unmuted_session(session_id, now)
+            return False
+    preference = _read_persisted_session_preference(session_id)
+    if preference == "read_error":
+        return True
+    muted = preference == "muted"
     with _state_lock:
         if muted:
             _remember_muted_session(session_id, now)
@@ -525,6 +730,7 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "last_candidate": None,
             "last_proposal": None,
             "proposal_stage": None,
+            "pending_action_results": OrderedDict(),
             "draft_only_turn": None,
             "draft_delivered_turn": None,
             "awaiting_proposal_id": None,
@@ -539,6 +745,306 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
         state["last_seen"] = now
         _session_states.move_to_end(session_id)
     return state
+
+
+# pending_action_results 有条目数上限，但没有单条键长上限：调用方给的 turn_id
+# 原样当键，MAX_PENDING_ACTION_RESULTS 条超长键就能在端侧吃掉数百 MB。超过这个
+# 长度的 turn_id 改用定长摘要——存和取走同一个归一化，查找语义不变。
+MAX_RAW_PENDING_TURN_KEY_LEN = 256
+
+
+def _pending_turn_key(turn_id: str) -> str:
+    if len(turn_id) <= MAX_RAW_PENDING_TURN_KEY_LEN:
+        return turn_id
+    return "sha256:" + hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+
+
+# 被判为无效/过期的 recommendation action，本轮不允许落地任何创建。
+# 只靠 pre_llm_call 往上下文里塞一句「别创建」是劝阻不是约束：那条被拒的动作
+# 正文照样进模型，模型完全可以照着它去调 skill_manage(create) / cronjob(create)。
+# 闸门必须落在执行点，也就是 pre_tool_call。
+#
+# 作用域是单个 turn_id：拿不到 turn_id 时无法界定范围，此时保持放行——宁可漏挡
+# 一次，也不能因为一个无 id 的请求把全设备的创建工具锁死。
+#
+# 只列了 skill 和 task 两种品类的落地工具，因为 agent 品类的推荐当前是关的
+# （`AGENT_RECOMMENDATION_ENABLED = False`，硬闸在 `_detect_creation_opportunity`
+# 里事后过滤），生产上不存在 creation_type=agent 的 proposal。
+# **打开那个开关时必须回来补这里**：agent 的落地路径是 agent-creator 经 terminal
+# 跑 create_agent.py，不是一个能按工具名挡住的独立工具，需要单独设计执行点。
+DENIED_CREATION_TOOL_ACTIONS = {
+    "skill_manage": {"create"},
+    "cronjob": {"create"},
+}
+# 哪个工具落地哪个品类。票是按品类发的：接受一张 Skill 卡不该顺带放行一次
+# cronjob(create)。
+CREATION_TOOL_TYPES = {
+    "skill_manage": "skill",
+    "cronjob": "task",
+}
+MAX_CREATION_INVOCATIONS = 256
+
+# 闸门是**配额**，不是布尔开关：允许落地的创建次数，等于被真正接管的动作次数。
+# 一次 accepted 只买一张票，票绑定品类，谁先用掉都行，但总共只有一张。
+#
+# 配额的键是**这一次请求**（invocation），不是 turn_id。双击或传输重发会让两个
+# 并发请求复用同一个 turn_id：先到的原子消费掉 proposal 拿到 accepted，后到的
+# 因为 proposal 已被消费而判无效。一个 turn 级的键要同时表达这两件相反的事实，
+# 怎么摆都会在某个时序下失真：
+#   - 只记「拒绝」→ 后到那个的拒绝把先到那个真实的创建也挡掉；
+#   - 让「接管」压过「拒绝」→ 后到那个重放请求的创建也被放行，重复创建又回来；
+#   - 改成 turn 级配额 → 先跑完的请求撤掉闸门，还在途的那个命中「键不存在」被
+#     当普通轮次放行，只好再加一层引用计数。
+# 每个请求一条独立条目之后，「先完成的请求撤掉了还在途那个的闸门」从结构上不
+# 可能发生，引用计数因此不再需要。跨 profile / owner 撞同一个 turn_id 也不再
+# 互相消耗配额——条目本来就不共享。
+#
+# invocation id 从 _invocation_scope 取。api_server 的 _run_agent 把整轮对话
+# （pre_llm_call → 工具循环 → transform_llm_output）跑在同一个 executor 线程
+# 里，ContextVar 因此天然按请求隔离，并发请求落在不同线程上互相看不见。
+#
+# 条目存在 = 这次请求出现过推荐动作、进入配额管控；不存在 = 普通轮次，用户直接
+# 说「帮我建个 skill」不受影响。
+#
+# invocation_id → {"turn_key": str, "quota": {creation_type: 剩余票数}}
+_creation_invocations: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+# turn_key → 该 turn 上还在途的 invocation id 集合。工具链万一读不到 invocation
+# scope 时靠它兜底定位，同时也是「回执还能不能删」的判据。
+_creation_turn_invocations: dict[str, set[str]] = {}
+
+
+def _bind_invocation_to_turn(turn_key: str) -> str:
+    """给这一次请求在 ``turn_key`` 这一轮上取一个稳定的身份。
+
+    同一个 turn 内 pre_llm_call 会反复触发（工具循环每转一圈一次），已经绑过就
+    沿用，否则新生成——每次都换的话，工具链读到的 id 会跟建闸门时用的那个对不上。
+    """
+    if not turn_key:
+        return ""
+    mapping = _invocation_turn_ids.get()
+    if mapping and mapping.get(turn_key):
+        return str(mapping[turn_key])
+    updated = dict(mapping or {})
+    invocation_id = uuid.uuid4().hex
+    updated[turn_key] = invocation_id
+    while len(updated) > MAX_INVOCATION_TURNS_PER_CONTEXT:
+        updated.pop(next(iter(updated)))
+    _invocation_turn_ids.set(updated)
+    return invocation_id
+
+
+def _unbind_invocation_from_turn(turn_key: str) -> None:
+    mapping = _invocation_turn_ids.get()
+    if not mapping or turn_key not in mapping:
+        return
+    updated = dict(mapping)
+    updated.pop(turn_key, None)
+    _invocation_turn_ids.set(updated or None)
+
+
+def _quota_key(turn_key: str) -> str:
+    """这次请求在 ``turn_key`` 这一轮上的配额条目键。
+
+    绑过就是那个 invocation id；没绑过（这条 context 没在这一轮开过闸门）退回
+    turn 级键——退化后的语义就是本次改动之前的老行为，而不是「闸门直接消失」。
+    """
+    mapping = _invocation_turn_ids.get()
+    invocation_id = str((mapping or {}).get(turn_key) or "") if turn_key else ""
+    if invocation_id:
+        return invocation_id
+    return f"turn:{turn_key}" if turn_key else ""
+
+
+def _drop_turn_index_locked(turn_key: str, quota_key: str) -> None:
+    holders = _creation_turn_invocations.get(turn_key)
+    if not holders:
+        return
+    holders.discard(quota_key)
+    if not holders:
+        _creation_turn_invocations.pop(turn_key, None)
+
+
+def _trim_creation_invocations_locked() -> None:
+    while len(_creation_invocations) > MAX_CREATION_INVOCATIONS:
+        evicted, entry = _creation_invocations.popitem(last=False)
+        _drop_turn_index_locked(str(entry.get("turn_key") or ""), evicted)
+
+
+def _open_creation_quota_locked(quota_key: str, turn_key: str) -> dict[str, Any]:
+    entry = _creation_invocations.get(quota_key)
+    if entry is None:
+        entry = {"turn_key": turn_key, "quota": {}}
+        _creation_invocations[quota_key] = entry
+    _creation_invocations.move_to_end(quota_key)
+    _creation_turn_invocations.setdefault(turn_key, set()).add(quota_key)
+    _trim_creation_invocations_locked()
+    return entry
+
+
+def _enter_creation_quota_for_turn(turn_id: str) -> None:
+    """这一次请求出现了推荐动作：从此刻起它的创建工具受配额管控。"""
+    turn_key = _pending_turn_key(turn_id)
+    if not turn_key:
+        return
+    quota_key = _bind_invocation_to_turn(turn_key) or f"turn:{turn_key}"
+    with _state_lock:
+        _open_creation_quota_locked(quota_key, turn_key)
+
+
+def _grant_creation_for_turn(turn_id: str, creation_type: str) -> None:
+    """一次 create 动作被真正接管，为**它那个品类**发一张票。
+
+    只给 create 发票：dismiss / mute_session / unmute_session 也会拿到 accepted
+    回执，但用户表达的恰恰是「别建」或「只改偏好」——给它们发票等于模型无视
+    内部提示去调 create 时闸门主动让路。
+
+    票绑定品类：接受一张 Skill 卡换来的票不该放行一次 cronjob(create)。
+    """
+    turn_key = _pending_turn_key(turn_id)
+    normalized = _normalize_creation_type(creation_type)
+    if not turn_key or not normalized:
+        return
+    quota_key = _bind_invocation_to_turn(turn_key) or f"turn:{turn_key}"
+    with _state_lock:
+        entry = _open_creation_quota_locked(quota_key, turn_key)
+        quota = entry["quota"]
+        quota[normalized] = quota.get(normalized, 0) + 1
+
+
+def _release_creation_deny_locked(turn_key: str, quota_key: str) -> None:
+    """这一次请求收尾，撤掉**它自己**的闸门。
+
+    同 turn 的其它在途请求各有各的条目，不受影响——这正是引用计数被取消的原因。
+    """
+    if not quota_key:
+        return
+    entry = _creation_invocations.pop(quota_key, None)
+    _drop_turn_index_locked(
+        str(entry.get("turn_key") or "") if entry is not None else turn_key,
+        quota_key,
+    )
+
+
+def _release_and_claim_action_result(
+    session_id: str, turn_key: str, quota_key: str, now: float
+) -> Any:
+    """释放本请求的闸门，并领走本轮回执。两件事必须在同一把锁里完成。
+
+    分两次拿锁的话，同 turn 的两个请求可能都先释放完、再都判定「没有别的在途请求
+    了」，于是都去 pop：先到的拿到回执，后到的拿到 None，那个响应就不含 receipt。
+    Local Server 恰好采用了那一个，已经接管的创建就会被标成不确定且不可重试。
+
+    回执是 **turn 级**事实：同一个 turn 的每个在途请求都要拿到同一份权威结果，所以
+    还有别人在途时只读不删，最后一个收尾的才真正删掉。
+    """
+    with _state_lock:
+        _release_creation_deny_locked(turn_key, quota_key)
+        if not turn_key:
+            return None
+        pending = _state_locked(session_id, now)["pending_action_results"]
+        if _creation_turn_invocations.get(turn_key):
+            return pending.get(turn_key)
+        return pending.pop(turn_key, None)
+
+
+def _take_quota_locked(entry: dict[str, Any], creation_type: str) -> bool:
+    quota = entry["quota"]
+    remaining = quota.get(creation_type, 0)
+    if remaining <= 0:
+        return False
+    quota[creation_type] = remaining - 1
+    return True
+
+
+def _consume_creation_quota(turn_id: str, creation_type: str) -> bool:
+    """这次创建能不能放行。该品类有票就消耗一张放行，没票就挡。
+
+    不受管控的普通轮次（没有条目）永远放行——这道闸门只针对推荐动作那条路径。
+    """
+    turn_key = _pending_turn_key(turn_id)
+    if not turn_key:
+        return True
+    # _quota_key 已经是按 turn 精确解析过的，不会拿 A 轮的键去查 B 轮。
+    quota_key = _quota_key(turn_key)
+    with _state_lock:
+        entry = _creation_invocations.get(quota_key) if quota_key else None
+        if entry is not None:
+            return _take_quota_locked(entry, creation_type)
+        # 本次调用在这一轮上没有自己的条目：可能是闸门建立时这条 context 还没绑过
+        # id。不能就此放行，继续走下面的 turn 兜底。
+        holders = _creation_turn_invocations.get(turn_key)
+        if not holders:
+            return True
+        if len(holders) > 1:
+            # 同一个 turn_id 上有多个在途请求，而这次工具调用又认不出自己属于
+            # 哪一个——票是谁的判不了。拦下来：漏建可以让用户重来，重复建不能撤。
+            return False
+        entry = _creation_invocations.get(next(iter(holders)))
+        if entry is None:
+            return True
+        return _take_quota_locked(entry, creation_type)
+
+
+def _on_pre_tool_call(
+    tool_name: str = "",
+    args: Any = None,
+    turn_id: str = "",
+    **_: Any,
+) -> dict[str, str] | None:
+    denied_actions = DENIED_CREATION_TOOL_ACTIONS.get(tool_name)
+    if not denied_actions:
+        return None
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, TypeError):
+            args = None
+    # args 解析不出来时无法确认这次是不是 create，按拒绝处理：这一轮本来就
+    # 不该有任何创建落地。
+    action = ""
+    if isinstance(args, dict):
+        action = str(args.get("action") or "").strip().lower()
+        if action and action not in denied_actions:
+            return None
+    # 配额在这里消耗：判定「是不是一次创建」之后、放行之前。放在更早会让
+    # list / patch 这类调用白白吃掉一张票。
+    if _consume_creation_quota(turn_id, CREATION_TOOL_TYPES.get(tool_name, "")):
+        return None
+    return {
+        "action": "block",
+        "message": (
+            "creation-governor refused this creation: it originates from a "
+            "creation recommendation action that was already rejected as "
+            "invalid or expired. Tell the user the recommendation is no longer "
+            "actionable instead of creating anything."
+        ),
+    }
+
+
+def _store_pending_action_result_locked(
+    state: dict[str, Any], turn_id: str, receipt: _ActionReceipt
+) -> None:
+    if not turn_id:
+        return
+    turn_id = _pending_turn_key(turn_id)
+    pending = state["pending_action_results"]
+    existing = pending.get(turn_id)
+    # 同一个 turn_id 上的结果是**单调**的：接管过就接管过了，后到的重放请求
+    # 拿到的 rejected 不能把它盖掉。双击 / 传输重发会让两个请求复用同一个
+    # turn_id，先到的消费掉 proposal 拿到 accepted、后到的必然判无效——覆盖
+    # 之后先结束的那个请求会取走 rejected，客户端把一次已经接管的创建显示成
+    # 失败，用户重来一次就是重复创建。
+    if (
+        isinstance(existing, _ActionReceipt)
+        and existing.status == "accepted"
+        and receipt.status != "accepted"
+    ):
+        pending.move_to_end(turn_id)
+        return
+    pending[turn_id] = receipt
+    pending.move_to_end(turn_id)
+    while len(pending) > MAX_PENDING_ACTION_RESULTS:
+        pending.popitem(last=False)
 
 
 def _prompt_is_cooling_down(state: dict[str, Any]) -> bool:
@@ -579,6 +1085,19 @@ def _discard_staged_proposal_locked(
     state["candidate_turn"] = -10_000
 
 
+def _delivery_turn_mismatch(proposal: dict[str, Any], turn_id: str) -> bool:
+    """Whether a staged proposal belongs to a different turn than this one.
+
+    两侧都拿到 turn_id 时才判定；老链路（transform 钩子没有 turn_id、或候选
+    来自没有 turn_id 的调用）保持原行为，不因为缺字段就吞掉卡片。
+    """
+    # 两侧都过 _text：source_turn_id 是收敛空白并截断后存下来的，拿原始
+    # turn_id 直接比会把带空白/超长的 id 一律判成不同轮、把卡片吞掉。
+    current_turn_id = _text(turn_id, 160)
+    source_turn_id = _text(proposal.get("source_turn_id"), 160)
+    return bool(current_turn_id and source_turn_id and source_turn_id != current_turn_id)
+
+
 def _response_delivery_block_reason(response_text: str) -> str:
     """Explain why a staged card must stay hidden for an unfinished task."""
 
@@ -598,14 +1117,17 @@ def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
     return bool(
         _text(kwargs.get("platform"), 40).lower() in _NONINTERACTIVE_PLATFORMS
         or _text(kwargs.get("execution_origin"), 80).lower() == "background_review"
+        or _text(kwargs.get("execution_policy"), 80).lower() == "silent_automation"
         or kwargs.get("is_kanban_worker")
     )
 
 
 def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
+    platform = _text(kwargs.get("platform"), 40).lower()
     return bool(
         _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
-        or _text(kwargs.get("platform"), 40).lower() in UNSUPPORTED_PLATFORMS
+        or platform in UNSUPPORTED_PLATFORMS
+        or (platform == "api_server" and not _receipt_transport(kwargs))
         or kwargs.get("supports_followup_turns") is False
     )
 
@@ -1115,9 +1637,15 @@ def _run_forced_evaluation(
     user_message: str,
     conversation_history: Any,
     connection_context: str = "",
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     llm = _plugin_llm
     if llm is None:
+        _record_pre_llm_timing(
+            timing,
+            route="no_client",
+            fast_outcome="skipped_no_client",
+        )
         return None
     evidence = _conversation_evidence(conversation_history, user_message)
     if connection_context:
@@ -1145,6 +1673,8 @@ def _run_forced_evaluation(
         },
         {"role": "user", "content": evidence},
     ]
+    fast_route_started_at = time.perf_counter()
+    _record_pre_llm_timing(timing, route="auxiliary")
     try:
         result = llm.complete(
             messages,
@@ -1155,18 +1685,35 @@ def _run_forced_evaluation(
             purpose="creation_opportunity_checkpoint_json",
             auxiliary_task=AUXILIARY_TASK_NAME,
         )
+        _record_pre_llm_timing(
+            timing,
+            fast_started_at=fast_route_started_at,
+            fast_outcome="completed",
+        )
     except Exception as fast_error:
         if not _FAST_ROUTE_UNAVAILABLE_RE.search(str(fast_error)):
+            _record_pre_llm_timing(
+                timing,
+                fast_started_at=fast_route_started_at,
+                fast_outcome="failed",
+            )
             logger.warning(
                 "creation opportunity fast-model checkpoint failed",
                 exc_info=True,
             )
             return None
+        _record_pre_llm_timing(
+            timing,
+            route="main_model_fallback",
+            fast_started_at=fast_route_started_at,
+            fast_outcome="unavailable",
+        )
         logger.warning(
             "creation opportunity fast-model route unavailable; retrying once "
             "on the active main model: %s",
             fast_error,
         )
+        fallback_started_at = time.perf_counter()
         try:
             result = llm.complete(
                 messages,
@@ -1176,7 +1723,17 @@ def _run_forced_evaluation(
                 fail_fast=True,
                 purpose="creation_opportunity_checkpoint_main_fallback",
             )
+            _record_pre_llm_timing(
+                timing,
+                fallback_started_at=fallback_started_at,
+                fallback_outcome="completed",
+            )
         except Exception:
+            _record_pre_llm_timing(
+                timing,
+                fallback_started_at=fallback_started_at,
+                fallback_outcome="failed",
+            )
             logger.warning(
                 "creation opportunity main-model fallback failed",
                 exc_info=True,
@@ -1222,7 +1779,7 @@ def _parse_detector_json(value: Any) -> dict[str, Any] | None:
 
 
 def _normalize_candidate(
-    args: dict[str, Any], state: dict[str, Any]
+    args: dict[str, Any], state: dict[str, Any], turn_id: str = ""
 ) -> tuple[dict[str, Any] | None, str]:
     decision = _normalize_creation_type(
         args.get("decision") or args.get("creation_type")
@@ -1307,7 +1864,10 @@ def _normalize_candidate(
         "proposal_text": proposal_text,
         **({"target": target} if target else {}),
         "current_request": _text(state.get("last_user_message"), 1000),
-        "source_turn_id": _text(state.get("last_turn_id"), 160),
+        # 优先用调用方自己的 turn_id：state["last_turn_id"] 是共享的，同一
+        # conversation 并发两轮时慢的那轮会读到后来者的 id，卡片就会挂到
+        # 另一轮的回复下面。
+        "source_turn_id": turn_id or _text(state.get("last_turn_id"), 160),
     }, "candidate"
 
 
@@ -1331,13 +1891,13 @@ def _proposal_payload(candidate: dict[str, Any], *, status: str) -> dict[str, An
 
 
 def _consider_candidate(
-    session_id: str, args: dict[str, Any], now: float
+    session_id: str, args: dict[str, Any], now: float, turn_id: str = ""
 ) -> dict[str, Any]:
     if _is_session_muted(session_id):
         return {"status": "candidate_recorded", "reason": "session_muted"}
     with _state_lock:
         state = _state_locked(session_id, now)
-        candidate, reason = _normalize_candidate(args, state)
+        candidate, reason = _normalize_candidate(args, state, turn_id)
         state["last_candidate"] = dict(candidate) if candidate else None
     if candidate is None:
         return {
@@ -1384,7 +1944,7 @@ def _parse_recommendation_response(user_message: str) -> dict[str, Any] | None:
     title = _text(payload.get("title"), 80)
     dedup_key = _text(payload.get("dedup_key"), 160)
     proposal_id = _text(payload.get("proposal_id"), 80)
-    if not title or not dedup_key or (action != "unmute_session" and not proposal_id):
+    if not title or not dedup_key or not proposal_id:
         return None
     return {
         "action": action,
@@ -1396,9 +1956,16 @@ def _parse_recommendation_response(user_message: str) -> dict[str, Any] | None:
 
 
 def _handle_previous_proposal_action(
-    session_id: str, user_message: str, now: float
-) -> str:
+    session_id: str,
+    user_message: str,
+    now: float,
+    *,
+    turn_id: str = "",
+    receipt_transport: str = "",
+) -> _ActionHandlingOutcome:
     structured = _parse_recommendation_response(user_message)
+    if structured is None and "[creation_recommendation_response]" in user_message:
+        return _ActionHandlingOutcome("", None)
     if structured:
         action = structured["action"]
         with _state_lock:
@@ -1413,13 +1980,76 @@ def _handle_previous_proposal_action(
                 and structured["title"] == proposal.get("suggested_name")
                 and structured["dedup_key"] == proposal.get("dedup_key")
             )
+            # 校验与消费同处一个临界区：双击、重发或两路并发流会让两个线程都读到
+            # proposal_shown，各自返回 accepted 并各自触发一次原生创建。只有赢下
+            # 这次状态跃迁的请求才继续走到 accepted 回执。
+            if current and action == "create":
+                _discard_staged_proposal_locked(
+                    session_id, state, release_claim=False
+                )
+                # 消费 proposal 和发布 accepted 回执必须在**同一个**临界区。分开
+                # 的话中间有个窗口：并发重放读到「proposal 已被消费」、写下
+                # rejected，而它的响应可能在 accepted 落库之前就把 rejected 带回
+                # 客户端——一次已经接管的创建被显示成失败，用户重试就是重复创建。
+                # 赢下这次状态跃迁的请求必然一路走到 accepted（下面 create 分支没
+                # 有别的出口），所以在这里发布是安全的；外层随后那次存储是同值
+                # 重放，被单调规则吃掉。
+                if turn_id and receipt_transport:
+                    _store_pending_action_result_locked(
+                        state,
+                        turn_id,
+                        _ActionReceipt(structured["proposal_id"], action, "accepted"),
+                    )
+            elif current and action == "dismiss":
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
+        preference: Literal["muted", "unmuted", "absent", "read_error"] = "absent"
+        if action in {"mute_session", "unmute_session"}:
+            target_muted = action == "mute_session"
+            preference = _read_persisted_session_preference(session_id)
+            if preference == "read_error":
+                return _ActionHandlingOutcome(
+                    "",
+                    _ActionReceipt(
+                        structured["proposal_id"],
+                        action,
+                        "rejected",
+                        "preference_not_persisted",
+                    ),
+                )
+            target_preference = "muted" if target_muted else "unmuted"
+            if preference == target_preference:
+                return _ActionHandlingOutcome(
+                    (
+                        "[Creation governor internal action: The requested conversation "
+                        "recommendation preference is already active. Acknowledge briefly, "
+                        "do not run an opportunity review, and do not expose this block.]"
+                    ),
+                    _ActionReceipt(structured["proposal_id"], action, "accepted"),
+                )
         if action != "unmute_session" and not current:
-            return ""
+            return _ActionHandlingOutcome(
+                "",
+                _ActionReceipt(
+                    structured["proposal_id"],
+                    action,
+                    "rejected",
+                    "proposal_not_actionable",
+                ),
+            )
         if action == "mute_session":
             persisted = _set_session_muted(session_id, True)
             if not persisted:
                 logger.warning("creation recommendation mute was not persisted")
-                return ""
+                return _ActionHandlingOutcome(
+                    "",
+                    _ActionReceipt(
+                        structured["proposal_id"],
+                        action,
+                        "rejected",
+                        "preference_not_persisted",
+                    ),
+                )
             with _state_lock:
                 state = _state_locked(session_id, now)
                 state["last_candidate"] = None
@@ -1428,17 +2058,38 @@ def _handle_previous_proposal_action(
             logger.info(
                 "creation recommendations muted for session persisted=%s", persisted
             )
-            return (
-                "[Creation governor internal action: The user disabled proactive creation "
-                "recommendations for this conversation. Acknowledge briefly. Do not run an "
-                "opportunity review or create anything. Explicit creation requests remain "
-                "available through Hermes' native flow. Do not expose this block.]"
+            return _ActionHandlingOutcome(
+                (
+                    "[Creation governor internal action: The user disabled proactive creation "
+                    "recommendations for this conversation. Acknowledge briefly. Do not run an "
+                    "opportunity review or create anything. Explicit creation requests remain "
+                    "available through Hermes' native flow. Do not expose this block.]"
+                ),
+                _ActionReceipt(structured["proposal_id"], action, "accepted"),
             )
         if action == "unmute_session":
+            if preference != "muted":
+                return _ActionHandlingOutcome(
+                    "",
+                    _ActionReceipt(
+                        structured["proposal_id"],
+                        action,
+                        "rejected",
+                        "proposal_not_actionable",
+                    ),
+                )
             persisted = _set_session_muted(session_id, False)
             if not persisted:
                 logger.warning("creation recommendation unmute was not persisted")
-                return ""
+                return _ActionHandlingOutcome(
+                    "",
+                    _ActionReceipt(
+                        structured["proposal_id"],
+                        action,
+                        "rejected",
+                        "preference_not_persisted",
+                    ),
+                )
             with _state_lock:
                 state = _state_locked(session_id, now)
                 state["last_candidate"] = None
@@ -1447,61 +2098,75 @@ def _handle_previous_proposal_action(
             logger.info(
                 "creation recommendations re-enabled for session persisted=%s", persisted
             )
-            return (
-                "[Creation governor internal action: The user re-enabled proactive creation "
-                "recommendations for this conversation. Acknowledge briefly and do not run an "
-                "opportunity review on this action turn. Do not expose this block.]"
+            return _ActionHandlingOutcome(
+                (
+                    "[Creation governor internal action: The user re-enabled proactive creation "
+                    "recommendations for this conversation. Acknowledge briefly and do not run an "
+                    "opportunity review on this action turn. Do not expose this block.]"
+                ),
+                _ActionReceipt(structured["proposal_id"], action, "accepted"),
             )
         if action == "dismiss":
             _latch_dismissal(session_id, structured["dedup_key"], now)
-            with _state_lock:
-                state = _state_locked(session_id, now)
-                state["last_proposal"] = None
-                state["proposal_stage"] = None
-            return (
-                "[Creation governor internal action: The user dismissed the previous "
-                "recommendation. Acknowledge briefly, do not create anything, and do not run "
-                "another opportunity review this turn.]"
+            return _ActionHandlingOutcome(
+                (
+                    "[Creation governor internal action: The user dismissed the previous "
+                    "recommendation. Acknowledge briefly, do not create anything, and do not run "
+                    "another opportunity review this turn.]"
+                ),
+                _ActionReceipt(structured["proposal_id"], action, "accepted"),
             )
-        with _state_lock:
-            _state_locked(session_id, now)["proposal_stage"] = "create_action_pending"
-        return (
-            "[Creation governor internal action: The user accepted the previous recommendation "
-            f"for {structured['creation_type']} '{structured['title']}'. "
-            f"{_native_creation_route(structured['creation_type'])} Preserve its normal "
-            "confirmation boundaries. Do not run another opportunity review this turn.]"
+        return _ActionHandlingOutcome(
+            (
+                "[Creation governor internal action: The user accepted the previous recommendation "
+                f"for {structured['creation_type']} '{structured['title']}'. "
+                f"{_native_creation_route(structured['creation_type'])} Preserve its normal "
+                "confirmation boundaries. Do not run another opportunity review this turn.]"
+            ),
+            _ActionReceipt(structured["proposal_id"], action, "accepted"),
+            structured["creation_type"],
         )
 
     with _state_lock:
         state = _state_locked(session_id, now)
         proposal = state.get("last_proposal")
         if not isinstance(proposal, dict):
-            return ""
+            return _ActionHandlingOutcome("", None)
         name = _text(proposal.get("suggested_name"), 80)
         dedup_key = _text(proposal.get("dedup_key"), 160)
     if name and name.casefold() not in user_message.casefold():
-        return ""
+        return _ActionHandlingOutcome("", None)
     if _DISMISS_RE.search(user_message):
         if dedup_key:
             _latch_dismissal(session_id, dedup_key, now)
         with _state_lock:
             state = _state_locked(session_id, now)
             state["last_proposal"] = None
-        return (
-            "[Creation governor internal action: The user dismissed the previous recommendation. "
-            "Acknowledge briefly, do not create anything, and do not run another opportunity "
-            "review this turn.]"
+        return _ActionHandlingOutcome(
+            (
+                "[Creation governor internal action: The user dismissed the previous recommendation. "
+                "Acknowledge briefly, do not create anything, and do not run another opportunity "
+                "review this turn.]"
+            ),
+            None,
         )
     if _ACCEPT_RE.search(user_message):
-        return (
-            "[Creation governor internal action: The user accepted the previous recommendation. "
-            f"{_native_creation_route(proposal.get('creation_type'))} Preserve its normal "
-            "confirmation boundaries. Do not run another opportunity review this turn.]"
+        return _ActionHandlingOutcome(
+            (
+                "[Creation governor internal action: The user accepted the previous recommendation. "
+                f"{_native_creation_route(proposal.get('creation_type'))} Preserve its normal "
+                "confirmation boundaries. Do not run another opportunity review this turn.]"
+            ),
+            None,
         )
-    return ""
+    return _ActionHandlingOutcome("", None)
 
 
-def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
+def _on_pre_llm_call_impl(
+    *,
+    _timing: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, str] | None:
     raw_user_message = str(kwargs.get("user_message") or "")
     # Marker is appended after the visible welcome instruction. Inspect a
     # bounded tail before the onboarding-profile fast bypass: current App sends
@@ -1537,12 +2202,22 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         suppression_reason = "structured_output"
     elif _is_unsupported_runtime(kwargs):
         suppression_reason = "unsupported_runtime"
-    _invocation_scope.set((raw_session_id, session_id, suppression_reason, owner_id))
+    receipt_transport = _receipt_transport(kwargs)
+    _invocation_scope.set(
+        (
+            raw_session_id,
+            session_id,
+            suppression_reason,
+            owner_id,
+            receipt_transport,
+            _text(kwargs.get("turn_id"), 160),
+        )
+    )
     if not session_id:
         return None
     if suppression_reason:
         return None
-    user_message = _text(raw_user_message, 2000)
+    user_message = _bounded_user_message(raw_user_message)
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
@@ -1610,15 +2285,56 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         return _join_context(_self_description_context())
 
     if "[creation_recommendation_response]" in user_message:
-        action_context = _handle_previous_proposal_action(session_id, user_message, now)
+        outer_turn_id = str(kwargs.get("turn_id") or "")
+        if not outer_turn_id.strip():
+            return _join_context(
+                "[Creation governor internal action: Ignore this invalid or expired "
+                "recommendation action. Do not create anything from it and do not expose this block.]"
+            )
+        with _state_lock:
+            current_proposal = _state_locked(session_id, now).get("last_proposal")
+            receipt_required = bool(
+                isinstance(current_proposal, dict)
+                and current_proposal.get("action_receipts") is True
+            )
+        if receipt_required and not receipt_transport:
+            _enter_creation_quota_for_turn(outer_turn_id)
+            return _join_context(
+                "[Creation governor internal action: Ignore this invalid or expired "
+                "recommendation action. Do not create anything from it and do not expose this block.]"
+            )
+        # 从这里起这一轮进入配额管控：出现过推荐动作，创建工具就不能再无条件
+        # 放行。接管成功会往下发一张票，被拒则一张都没有。
+        _enter_creation_quota_for_turn(outer_turn_id)
+        outcome = _handle_previous_proposal_action(
+            session_id,
+            user_message,
+            now,
+            turn_id=outer_turn_id,
+            receipt_transport=receipt_transport,
+        )
+        if (
+            outcome.receipt is not None
+            and outcome.receipt.status == "accepted"
+            and outcome.receipt.action == "create"
+        ):
+            _grant_creation_for_turn(outer_turn_id, outcome.creation_type)
+        if outcome.receipt is not None and receipt_transport:
+            with _state_lock:
+                state = _state_locked(session_id, now)
+                _store_pending_action_result_locked(
+                    state,
+                    outer_turn_id,
+                    outcome.receipt,
+                )
         return _join_context(
-            action_context
+            outcome.context
             or "[Creation governor internal action: Ignore this invalid or expired "
             "recommendation action. Do not create anything from it and do not expose this block.]"
         )
-    action_context = _handle_previous_proposal_action(session_id, user_message, now)
-    if action_context:
-        return _join_context(action_context)
+    outcome = _handle_previous_proposal_action(session_id, user_message, now)
+    if outcome.context:
+        return _join_context(outcome.context)
     if _uses_native_creation_path(user_message):
         with _state_lock:
             state = _state_locked(session_id, now)
@@ -1640,13 +2356,21 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             _state_locked(session_id, now)["last_evaluation_turn"] = turn
         inventory = _connection_inventory(session_id, now)
         availability_context = _channel_availability_context(inventory)
-        candidate = _run_forced_evaluation(
-            user_message=user_message,
-            conversation_history=kwargs.get("conversation_history"),
-            connection_context=_connection_inventory_context(inventory),
-        )
+        evaluation_mode = _evaluation_execution_mode()
+        if evaluation_mode == "fast_bypass":
+            _record_pre_llm_timing(_timing, route="fast_bypass")
+            candidate = None
+        else:
+            candidate = _run_forced_evaluation(
+                user_message=user_message,
+                conversation_history=kwargs.get("conversation_history"),
+                connection_context=_connection_inventory_context(inventory),
+                timing=_timing,
+            )
         if candidate is not None:
-            candidate_result = _consider_candidate(session_id, candidate, now)
+            candidate_result = _consider_candidate(
+                session_id, candidate, now, _text(kwargs.get("turn_id"), 160)
+            )
             logger.info(
                 "creation opportunity checkpoint result status=%s reason=%s "
                 "decision=%s confidence=%s title=%s",
@@ -1695,6 +2419,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             "creation opportunity checkpoint unavailable; falling back to main-model review"
         )
     else:
+        _record_pre_llm_timing(_timing, route="not_due")
         # 非评估轮不发起网络请求，只复用会话内缓存的库存（TTL 内），
         # 保证主模型每一轮都有区域口径而不增加时延。
         with _state_lock:
@@ -1711,6 +2436,28 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         availability_context,
         _main_model_review_context(evaluation_completed=False),
     )
+
+
+def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
+    """Observe the synchronous hook boundary while preserving its return contract."""
+
+    timing: dict[str, Any] = {
+        "started_at": time.perf_counter(),
+        "evaluation_mode": _evaluation_execution_mode(),
+    }
+    try:
+        result = _on_pre_llm_call_impl(_timing=timing, **kwargs)
+    except Exception:
+        _log_pre_llm_summary(timing, outcome="failed")
+        raise
+
+    handoff_outcome = (
+        "context_injected"
+        if isinstance(result, dict) and bool(result.get("context"))
+        else "pass_through"
+    )
+    _log_pre_llm_summary(timing, outcome=handoff_outcome)
+    return result
 
 
 def _encode_recommendation(candidate: dict[str, Any]) -> str:
@@ -1731,6 +2478,8 @@ def _encode_recommendation(candidate: dict[str, Any]) -> str:
         "evidence_turn_ids": candidate.get("evidence_turn_ids") or [],
         "source_turn_id": candidate.get("source_turn_id") or "",
     }
+    if candidate.get("action_receipts") is True:
+        payload["action_receipts"] = True
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -1803,6 +2552,21 @@ def _recommendation_envelope(candidate: dict[str, Any]) -> str:
         f"{_fallback_text(candidate)}\n\n"
         "<!--creation-recommendation:end-->"
     )
+
+
+def _action_result_envelope(result: _ActionReceipt) -> str:
+    payload = {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": result.proposal_id,
+        "action": result.action,
+        "status": result.status,
+    }
+    if result.reason_code is not None:
+        payload["reason_code"] = result.reason_code
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"<!--creation-recommendation-action-result {encoded}-->"
 
 
 def _build_recommendation_attachment(proposal: dict[str, Any]) -> dict[str, Any] | None:
@@ -1920,24 +2684,80 @@ def _on_attachment_action(**kwargs: Any) -> None:
 
 def _transform_llm_output(**kwargs: Any) -> str | None:
     session_id = _session_key(kwargs)
-    response_text = str(kwargs.get("response_text") or "")
+    turn_id = str(kwargs.get("turn_id") or "")
+    turn_key = _pending_turn_key(turn_id)
+    # 闸门键要在解绑 / 清 scope **之前**取。
+    release_key = _quota_key(turn_key)
+    _invocation_scope.set(None)
+    original_response = str(kwargs.get("response_text") or "")
     if not session_id:
         return None
+    # 本轮的工具派发已经结束，deny 闸门到此失效；本轮回执也在这里一并领走——
+    # 释放和领取必须原子，理由见 _release_and_claim_action_result。
+    action_result = _release_and_claim_action_result(
+        session_id, turn_key, release_key, time.monotonic()
+    )
+    _unbind_invocation_from_turn(turn_key)
     if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
         "structured_output"
     ):
+        # 回执已经在上面领走了（同 turn 还有在途请求时是只读不删，留给它们）。
+        # 这条路径本来就不发回执，领到什么都丢掉。
         return None
+
+    response_text = _ACTION_RESULT_ENVELOPE_RE.sub("", original_response).rstrip()
+    stripped_forged_result = response_text != original_response.rstrip()
+    usable_response = bool(response_text) and not is_intentional_silence_response(
+        response_text
+    )
+    turn_failed = bool(
+        not usable_response
+        or kwargs.get("failed")
+        or kwargs.get("interrupted")
+        or kwargs.get("completed") is False
+    )
+    now = time.monotonic()
+    require_canonical_response = kwargs.get("require_canonical_response")
+    if (
+        stripped_forged_result or isinstance(action_result, _ActionReceipt)
+    ) and callable(require_canonical_response):
+        # 把权威回执原值交给 finalizer，而不是让它在 hook 链的结果里猜哪个
+        # marker 是真的。只做了清洗、本轮没有真回执时传 None：finalizer 会清掉
+        # 链末所有 marker 而不是从别的 hook 结果里补一个进来。
+        require_canonical_response(
+            _action_result_envelope(action_result)
+            if isinstance(action_result, _ActionReceipt)
+            else None
+        )
+
+    if isinstance(action_result, _ActionReceipt):
+        visible_response = response_text if usable_response else ""
+        separator = "\n\n" if visible_response else ""
+        return visible_response + separator + _action_result_envelope(action_result)
+
+    if turn_id:
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            if state.get("proposal_stage") == "create_action_pending":
+                return response_text or ("\n" if stripped_forged_result else None)
+
+
     with _state_lock:
         state = _state_locked(session_id, time.monotonic())
-        welcome = state.pop("onboarding_welcome", None)
+        # 只有产生这张 welcome 卡的那一轮能取走它。onboarding_welcome 挂在会话
+        # 级 state 上，而同一 conversation 可能有并发的 API 请求——谁先进
+        # transform 谁就 pop 掉，于是卡片被附到另一个请求的正文上、按那个请求
+        # 的 transport 标 action_receipts（能力可能不同），而真正的 welcome
+        # 响应再也拿不到卡。按 source_turn_id 认领，认不上就原样留着。
+        _pending_welcome = state.get("onboarding_welcome")
+        welcome = None
+        if isinstance(_pending_welcome, dict):
+            _owner_turn = _text(_pending_welcome.get("source_turn_id"), 160)
+            if not _owner_turn or _owner_turn == turn_id:
+                welcome = state.pop("onboarding_welcome", None)
     if isinstance(welcome, dict):
-        if (
-            kwargs.get("failed")
-            or kwargs.get("interrupted")
-            or kwargs.get("completed") is False
-            or not response_text
-            or is_intentional_silence_response(response_text)
-        ):
+        # HEAD 已按同一组信号算好 turn_failed，这里不重复判定。
+        if turn_failed:
             return None
         source_turn_id = _text(welcome.get("source_turn_id"), 160)
         expires_at = time.time() + PROPOSAL_TTL_SECONDS
@@ -1973,6 +2793,12 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             "expires_at": expires_at,
             "evidence_turn_ids": [source_turn_id] if source_turn_id else [],
             "source_turn_id": source_turn_id,
+            # 引导页最后一屏的 Task 卡跟常规推荐走同一个文本信封，却是从这里
+            # 直接返回的，绕过了下面那次统一的 action_receipts 标注。漏标的后果
+            # 不是「少个字段」：Web 会把它当老卡按猜测结算，而下一轮用户真点
+            # 「创建」时 receipt_required 读到 False、不落 pending receipt，
+            # local-server 那边照样要收据，于是这张卡必然 fail-closed。
+            "action_receipts": bool(_receipt_transport(kwargs)),
         }
         channel_target = _text(welcome.get("channel_target"), 80).lower()
         channel_emitted = False
@@ -2027,31 +2853,28 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             agent_templates_emitted,
         )
         return response_text + "\n\n" + _recommendation_envelope(task)
-    if not response_text or is_intentional_silence_response(response_text):
+
+    if not usable_response:
         with _state_lock:
-            state = _state_locked(session_id, time.monotonic())
             if state.get("proposal_stage") == "create_action_pending":
                 state["proposal_stage"] = "proposal_shown"
-        return None
-    if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
+        return response_text or ("\n" if stripped_forged_result else None)
+    if turn_failed:
         with _state_lock:
-            state = _state_locked(session_id, time.monotonic())
             if state.get("proposal_stage") == "create_action_pending":
                 state["proposal_stage"] = "proposal_shown"
             elif state.get("proposal_stage") == "proposal_shown":
                 _discard_staged_proposal_locked(
                     session_id, state, release_claim=True
                 )
-        return None
-    now = time.monotonic()
+        return response_text if stripped_forged_result else None
     with _state_lock:
-        state = _state_locked(session_id, now)
         if state.get("proposal_stage") == "create_action_pending":
             _discard_staged_proposal_locked(
                 session_id, state, release_claim=False
             )
     if _is_session_muted(session_id):
-        return None
+        return response_text if stripped_forged_result else None
     with _state_lock:
         state = _state_locked(session_id, now)
         proposal = state.get("last_proposal")
@@ -2060,13 +2883,17 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             not isinstance(proposal, dict)
             or int(state["candidate_turn"]) != current_turn
             or int(state["last_delivery_turn"]) == current_turn
+            # 候选只允许产生它的那一轮消费：state["turn"] 是共享计数器，同一
+            # conversation 并发两轮时它认不出「这张卡是谁的」，会把 A 轮的卡
+            # 挂到 B 轮的回复下面。
+            or _delivery_turn_mismatch(proposal, turn_id)
         ):
-            return None
+            return response_text if stripped_forged_result else None
 
     if "<!--creation-recommendation:start " in response_text:
-        return None
+        return response_text if stripped_forged_result else None
     if _is_session_muted(session_id):
-        return None
+        return response_text if stripped_forged_result else None
     delivery_block_reason = _response_delivery_block_reason(response_text)
     if delivery_block_reason:
         with _state_lock:
@@ -2085,7 +2912,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             _text(proposal.get("suggested_name"), 80),
             current_turn,
         )
-        return None
+        return response_text if stripped_forged_result else None
     with _state_lock:
         state = _state_locked(session_id, now)
         current = state.get("last_proposal")
@@ -2094,7 +2921,9 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             or current.get("proposal_id") != proposal.get("proposal_id")
             or int(state["last_delivery_turn"]) == current_turn
         ):
-            return None
+            return response_text if stripped_forged_result else None
+        current["action_receipts"] = bool(_receipt_transport(kwargs))
+        proposal = dict(current)
         state["last_prompt_turn"] = current_turn
         state["last_delivery_turn"] = current_turn
         state["candidate_turn"] = -10_000
@@ -2127,21 +2956,26 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
 
 def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
     invocation = _invocation_scope.get()
-    if invocation is not None and invocation[2]:
+    current_invocation = _is_current_invocation(kwargs)
+    if current_invocation and invocation is not None and invocation[2]:
         return json.dumps({"status": "not_proposed", "reason": invocation[2]})
-    if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
-        "structured_output"
+    if not current_invocation and (
+        _is_noninteractive(kwargs)
+        or _is_unsupported_runtime(kwargs)
+        or kwargs.get("structured_output")
     ):
         return json.dumps({"status": "not_proposed", "reason": "unsupported_runtime"})
     session_id = _session_key(kwargs)
     if not session_id:
         return json.dumps({"status": "invalid", "error": "missing_session_id"})
-    result = _consider_candidate(session_id, args, time.monotonic())
+    result = _consider_candidate(
+        session_id, args, time.monotonic(), _text(kwargs.get("turn_id"), 160)
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
 def _reset_state_for_tests() -> None:
-    global _plugin_llm, _plugin_ctx
+    global EVALUATION_EXECUTION_MODE, _plugin_llm, _plugin_ctx
     with _state_lock:
         _recent_proposals.clear()
         _dismissed_proposals.clear()
@@ -2149,12 +2983,26 @@ def _reset_state_for_tests() -> None:
         _muted_sessions.clear()
         _known_unmuted_sessions.clear()
         _emitted_connection_proposals.clear()
+        # 这两个是进程级的，不清会在测试之间泄漏（同 turn_id 复用时表现成
+        # 「闸门莫名已经在了」）。
+        _creation_invocations.clear()
+        _creation_turn_invocations.clear()
     _plugin_llm = None
     _plugin_ctx = None
+    EVALUATION_EXECUTION_MODE = "synchronous"
     _invocation_scope.set(None)
+    _invocation_turn_ids.set(None)
 
 
-def register(ctx: Any) -> None:
+def register(_ctx: Any) -> None:
+    """Keep Creation Governor fully disabled, including explicit plugin opt-in."""
+
+    logger.info("Creation Governor is disabled in this build")
+
+
+def _register_capabilities(ctx: Any) -> None:
+    """Register the dormant implementation for focused regression tests only."""
+
     global _plugin_llm, _plugin_ctx
     _plugin_ctx = ctx
     try:
@@ -2176,6 +3024,8 @@ def register(ctx: Any) -> None:
     # 连接推荐卡（channel.connect / connector.connect）的按钮回执：dismiss
     # 落 30 天拒绝闩锁。hook 由 zet_agent 的 attachment/action 入站派发。
     ctx.register_hook("attachment_action", _on_attachment_action)
+    # 排在最后：flow 测试按索引取前两个 hook，新增注册不该挤动它们的位置。
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset="creation_governor",

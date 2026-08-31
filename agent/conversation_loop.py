@@ -41,6 +41,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import (
     FailoverReason,
     classify_api_error,
+    client_safe_error_text as _client_safe_error_text,
     content_policy_fallback_disabled,
 )
 from agent.iteration_budget import IterationBudget
@@ -89,6 +90,7 @@ from agent.retry_utils import (
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.zet_agent_response_mode import (
+    hardware_enrollment_preflight_response,
     reset_trusted_skill_execution,
     trusted_skill_allowed_tool_names,
     trusted_skill_scope_active,
@@ -360,46 +362,6 @@ def _should_force_present_plan_tool_choice(agent: Any, _user_message: str) -> bo
     return response_mode == "plan"
 
 
-_VIDEO_EDIT_SKILL_NAME = "video-edit-workflow-mini"
-
-
-def _video_edit_skill_load_required(agent: Any) -> bool:
-    """Return whether this App call must first attest the video-edit skill."""
-    if (getattr(agent, "platform", "") or "") != "zet_agent":
-        return False
-    if bool(getattr(agent, "_tools_disabled_for_request", False)):
-        return False
-    # The production Zettlab route uses Chat Completions. Leave other
-    # transports on their existing skill-selection behavior until their
-    # provider-specific forced-tool contracts are covered independently.
-    if getattr(agent, "api_mode", "") != "chat_completions":
-        return False
-    if (
-        bool(getattr(agent, "_zet_agent_plan_mode_active", False))
-        and not bool(getattr(agent, "_zet_agent_plan_presented", False))
-    ):
-        return False
-    task = getattr(agent, "_zet_agent_skill_direct_task", None)
-    return bool(
-        getattr(task, "video_edit_applicable", False)
-        and not trusted_skill_scope_active(agent)
-    )
-
-
-def _video_edit_skill_load_error(agent: Any) -> Optional[str]:
-    """Return a recoverable configuration error for a required skill load."""
-    if not _video_edit_skill_load_required(agent):
-        return None
-    valid_tool_names = set(getattr(agent, "valid_tool_names", set()) or set())
-    if "skill_view" not in valid_tool_names:
-        return (
-            "Video editing requires the trusted "
-            f"`{_VIDEO_EDIT_SKILL_NAME}` skill, but the `skill_view` tool is "
-            "not enabled. Enable `skill_view`, then retry the turn."
-        )
-    return None
-
-
 def _apply_zet_agent_plan_tool_visibility(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
     """Apply only the trusted skill's exact execution scope.
 
@@ -411,7 +373,23 @@ def _apply_zet_agent_plan_tool_visibility(agent: Any, api_kwargs: Dict[str, Any]
     if not trusted_skill_scope_active(agent):
         return False
 
-    scoped_tools = trusted_skill_allowed_tool_names(agent) | {"present_plan"}
+    trusted_tools = trusted_skill_allowed_tool_names(agent)
+    if getattr(agent, "_zet_agent_execution_policy", "") == "silent_automation":
+        # Middleware/Relay may replace the provider payload after the first
+        # visibility pass.  Silent requests must be sealed by the intersection
+        # of the attested skill scope and the request-local policy snapshot;
+        # never re-add clarify/todo/present_plan from the broader skill scope.
+        policy_tools = set(
+            getattr(
+                agent,
+                "_zet_agent_execution_policy_valid_tool_names",
+                (),
+            )
+            or ()
+        )
+        scoped_tools = trusted_tools & policy_tools
+    else:
+        scoped_tools = trusted_tools | {"present_plan"}
 
     def _tool_name(tool: Any) -> str:
         if not isinstance(tool, dict):
@@ -501,6 +479,22 @@ def _error_text(error: Exception) -> str:
             except Exception:
                 pass
     return " ".join(parts).lower()
+
+
+def _is_reasoning_echo_required_error(error: Exception) -> bool:
+    """Return True only for an upstream-declared reasoning replay requirement."""
+    if getattr(error, "status_code", None) not in {400, 422}:
+        return False
+    text = _error_text(error)
+    if "reasoning_content" not in text:
+        return False
+    return (
+        "must be passed back" in text
+        or (
+            "thinking mode" in text
+            and ("is required" in text or "required field" in text)
+        )
+    )
 
 
 def _is_deepseek_thinking_default_model(agent: Any) -> bool:
@@ -615,6 +609,19 @@ def _consume_trusted_skill_slug(agent: Any) -> str:
     return trusted_skill_slug if isinstance(trusted_skill_slug, str) else ""
 
 
+def _hardware_scope_skill_slug(skill_slug: str) -> str:
+    """Keep ordinary video plugins out of the hardware attestation channel."""
+    normalized = str(skill_slug or "").strip().lower().strip("/")
+    if normalized in {
+        "video-edit-workflow-mini",
+        "video-edit-workflow",
+        "video-edit",
+        "video_edit",
+    } or normalized.startswith(("video-edit-", "video_edit_")):
+        return ""
+    return skill_slug
+
+
 def _plan_mode_interaction_error(agent: Any) -> Optional[str]:
     """Return a recoverable error when Plan mode cannot satisfy its protocol."""
     if not getattr(agent, "_zet_agent_plan_mode_active", False):
@@ -649,25 +656,6 @@ def _tool_call_name(tool_call: Any) -> str:
     return ""
 
 
-def _is_exact_video_edit_skill_view_call(tool_call: Any) -> bool:
-    if _tool_call_name(tool_call) != "skill_view":
-        return False
-    function = getattr(tool_call, "function", None)
-    arguments = getattr(function, "arguments", None)
-    if arguments is None and isinstance(tool_call, dict):
-        function = tool_call.get("function")
-        if isinstance(function, dict):
-            arguments = function.get("arguments")
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except (TypeError, ValueError):
-            return False
-    if not isinstance(arguments, dict):
-        return False
-    return arguments == {"name": _VIDEO_EDIT_SKILL_NAME}
-
-
 def _enforce_single_plan_interaction_tool_call(
     agent: Any, assistant_message: Any
 ) -> bool:
@@ -677,33 +665,6 @@ def _enforce_single_plan_interaction_tool_call(
     tool_calls = getattr(assistant_message, "tool_calls", None)
     if not isinstance(tool_calls, list):
         return False
-
-    if _video_edit_skill_load_required(agent):
-        selected = next(
-            (
-                call
-                for call in tool_calls
-                if _is_exact_video_edit_skill_view_call(call)
-            ),
-            None,
-        )
-        if selected is None:
-            assistant_message.tool_calls = []
-            _filter_provider_replay_tool_calls(assistant_message, None)
-            logger.warning(
-                "zet_agent video edit: provider violated forced skill_view; "
-                "dropping all tool calls before execution"
-            )
-            return bool(tool_calls)
-        if len(tool_calls) == 1:
-            return False
-        assistant_message.tool_calls = [selected]
-        _filter_provider_replay_tool_calls(assistant_message, selected)
-        logger.warning(
-            "zet_agent video edit: provider returned parallel tools; keeping "
-            "only the exact trusted skill_view"
-        )
-        return True
 
     if len(tool_calls) <= 1:
         return False
@@ -913,6 +874,30 @@ def _append_api_system_instruction(
     api_kwargs["messages"] = patched
 
 
+def _append_api_system_instruction_once(
+    api_kwargs: Dict[str, Any], instruction: str
+) -> bool:
+    """Append an API-only instruction once across repeated provider sealing."""
+    messages = api_kwargs.get("messages")
+    if not instruction or not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and instruction in content:
+            return False
+        if isinstance(content, list) and any(
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and instruction in str(part.get("text") or "")
+            for part in content
+        ):
+            return False
+    _append_api_system_instruction(api_kwargs, instruction)
+    return True
+
+
 def _user_image_fallback_state(content: Any) -> tuple[bool, bool]:
     """Return whether user content has images and independent authored text."""
     if isinstance(content, str):
@@ -1046,82 +1031,6 @@ def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
     _append_api_system_instruction(api_kwargs, _ZET_AGENT_PLAN_MODE_PROTOCOL)
 
 
-_ZET_AGENT_VIDEO_EDIT_SKILL_LOAD_PROTOCOL = (
-    "Zettlab trusted video-edit bootstrap protocol (system instruction):\n"
-    f"1. You MUST call `skill_view` with exactly "
-    f'{{"name":"{_VIDEO_EDIT_SKILL_NAME}"}} now.\n'
-    "2. Do not answer the user, ask a plain-text question, load a linked file, "
-    "or call any other tool before that skill is loaded.\n"
-    "3. Follow the loaded skill for all subsequent clarification and execution."
-)
-
-
-def _apply_forced_video_edit_skill_view(
-    agent: Any, api_kwargs: Dict[str, Any]
-) -> bool:
-    """Force the exact signed video-edit skill to be the first model action."""
-    if not _video_edit_skill_load_required(agent):
-        return False
-
-    selected_tool = None
-    tools = api_kwargs.get("tools")
-    if not isinstance(tools, list):
-        tools = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        function = tool.get("function")
-        if not isinstance(function, dict) or function.get("name") != "skill_view":
-            continue
-        selected_tool = copy.deepcopy(tool)
-        selected_function = selected_tool["function"]
-        parameters = selected_function.get("parameters")
-        if not isinstance(parameters, dict):
-            parameters = {}
-        original_properties = parameters.get("properties")
-        if not isinstance(original_properties, dict):
-            original_properties = {}
-        original_name = original_properties.get("name")
-        name_schema = (
-            dict(original_name) if isinstance(original_name, dict) else {}
-        )
-        name_schema.update({"type": "string", "enum": [_VIDEO_EDIT_SKILL_NAME]})
-        selected_function["parameters"] = {
-            "type": "object",
-            "properties": {"name": name_schema},
-            "required": ["name"],
-            "additionalProperties": False,
-        }
-        break
-
-    # Filtering is unconditional: a misconfigured request must not expose a
-    # side-effect tool while the trusted execution scope is absent.
-    api_kwargs["tools"] = [selected_tool] if selected_tool is not None else []
-    api_kwargs["parallel_tool_calls"] = False
-    _append_api_system_instruction(
-        api_kwargs,
-        _ZET_AGENT_VIDEO_EDIT_SKILL_LOAD_PROTOCOL,
-    )
-    if selected_tool is None:
-        logger.warning(
-            "zet_agent video edit requires skill_view, but the request has no "
-            "skill_view schema"
-        )
-        return False
-
-    api_kwargs["tool_choice"] = "required"
-    disabled_thinking = _should_disable_thinking_for_forced_tool_choice(agent)
-    if disabled_thinking:
-        agent._zet_agent_force_present_plan_disable_thinking = True
-        _disable_thinking_for_forced_tool_choice(api_kwargs)
-        logger.info(
-            "zet_agent video edit: requiring trusted skill_view with thinking disabled"
-        )
-    else:
-        logger.info("zet_agent video edit: requiring trusted skill_view")
-    return True
-
-
 def _drop_trailing_protocol_messages(
     messages: List[Dict[str, Any]], marker: str
 ) -> None:
@@ -1135,15 +1044,6 @@ def _drop_trailing_protocol_messages(
 
 def _drop_trailing_plan_protocol_messages(messages: List[Dict[str, Any]]) -> None:
     _drop_trailing_protocol_messages(messages, "_plan_protocol_synthetic")
-
-
-def _drop_trailing_video_edit_skill_protocol_messages(
-    messages: List[Dict[str, Any]],
-) -> None:
-    _drop_trailing_protocol_messages(
-        messages,
-        "_video_edit_skill_protocol_synthetic",
-    )
 
 
 _PLAN_MODE_PROTOCOL_RETRY_PROMPT = (
@@ -1186,53 +1086,6 @@ def _record_plan_mode_protocol_violation(
         "content": _PLAN_MODE_PROTOCOL_RETRY_PROMPT,
         "_plan_protocol_synthetic": True,
     })
-    agent._session_messages = messages
-    return None
-
-
-_VIDEO_EDIT_SKILL_PROTOCOL_RETRY_PROMPT = (
-    "[System: This video-edit turn requires the trusted skill bootstrap. "
-    f"Call skill_view with exactly "
-    f'{{"name":"{_VIDEO_EDIT_SKILL_NAME}"}}. Do not answer with text or call '
-    "another tool.]"
-)
-_VIDEO_EDIT_SKILL_PROTOCOL_ERROR = (
-    "Video-edit skill protocol error: the model did not load the trusted "
-    f"`{_VIDEO_EDIT_SKILL_NAME}` skill after 2 retries. Please retry the turn."
-)
-
-
-def _record_video_edit_skill_protocol_violation(
-    agent: Any,
-    messages: List[Dict[str, Any]],
-    assistant_message: Any,
-    violation: str,
-) -> Optional[str]:
-    """Append one private skill-load retry, or return the terminal error."""
-    protocol_retries = int(
-        getattr(agent, "_zet_agent_video_edit_skill_protocol_retries", 0)
-    )
-    if protocol_retries >= 2:
-        _drop_trailing_video_edit_skill_protocol_messages(messages)
-        return _VIDEO_EDIT_SKILL_PROTOCOL_ERROR
-
-    agent._zet_agent_video_edit_skill_protocol_retries = protocol_retries + 1
-    logger.warning(
-        "zet_agent video edit: model returned %s without the trusted "
-        "skill_view; retrying protocol (%d/2)",
-        violation,
-        protocol_retries + 1,
-    )
-    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
-    interim_msg["_video_edit_skill_protocol_synthetic"] = True
-    messages.append(interim_msg)
-    messages.append(
-        {
-            "role": "user",
-            "content": _VIDEO_EDIT_SKILL_PROTOCOL_RETRY_PROMPT,
-            "_video_edit_skill_protocol_synthetic": True,
-        }
-    )
     agent._session_messages = messages
     return None
 
@@ -1467,9 +1320,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    skip_memory_context = getattr(agent, "_skip_memory_context", False) is True
     stored_prompt = None
     stored_state = "missing"
-    if conversation_history and agent._session_db:
+    if conversation_history and agent._session_db and not skip_memory_context:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:
@@ -1546,7 +1400,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
     is_brand_new_session = not conversation_history
-    if is_brand_new_session:
+    if is_brand_new_session and not skip_memory_context:
         # Plugin hook: on_session_start — fired once when a brand-new
         # session is created (not on continuation, not after a
         # hot-reload-driven rebuild).  Plugins can use this to
@@ -1579,7 +1433,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # to log at DEBUG, which silently broke prefix-cache reuse on the
     # gateway path (fresh AIAgent per turn → reads from this row every
     # subsequent turn).
-    if agent._session_db:
+    if agent._session_db and not skip_memory_context:
         try:
             updated = agent._session_db.update_system_prompt(
                 agent.session_id, agent._cached_system_prompt
@@ -2275,6 +2129,12 @@ def _apply_context_engine_selection(
     value yields the unmodified ``api_messages``. The result is request-only —
     persisted conversation history is never mutated here.
     """
+    # Strict/silent executions must not expose frozen workflow context to an
+    # external context-engine plugin.  The agent initializer records this
+    # policy before any turn starts; keep the guard here as a second, local
+    # enforcement point for resumed turns and custom callers.
+    if bool(getattr(agent, "_strict_memory_isolation", False)):
+        return api_messages
     engine = getattr(agent, "context_compressor", None)
     if engine is None or not hasattr(engine, "select_context"):
         return api_messages
@@ -2357,6 +2217,8 @@ def _notify_context_engine_turn_complete(
     ``messages`` is passed as a shallow copy so the engine cannot mutate the
     persisted transcript.
     """
+    if bool(getattr(agent, "_strict_memory_isolation", False)):
+        return
     engine = getattr(agent, "context_compressor", None)
     hook = getattr(engine, "on_turn_complete", None)
     if engine is None or not callable(hook):
@@ -2549,7 +2411,9 @@ def run_conversation(
         agent,
         original_user_message,
     )
-    trusted_skill_slug = _consume_trusted_skill_slug(agent)
+    trusted_skill_slug = _hardware_scope_skill_slug(
+        _consume_trusted_skill_slug(agent)
+    )
     tools_disabled_for_request = bool(
         getattr(agent, "_tools_disabled_for_request", False)
     )
@@ -2570,7 +2434,6 @@ def run_conversation(
     agent._zet_agent_plan_presented = False
     agent._zet_agent_plan_fallback_response = ""
     agent._zet_agent_plan_protocol_retries = 0
-    agent._zet_agent_video_edit_skill_protocol_retries = 0
     plan_mode_error = _plan_mode_interaction_error(agent)
     if plan_mode_error:
         agent._persist_session(messages, conversation_history)
@@ -2581,17 +2444,6 @@ def run_conversation(
             "completed": False,
             "failed": True,
             "error": plan_mode_error,
-        }
-    video_edit_skill_error = _video_edit_skill_load_error(agent)
-    if video_edit_skill_error:
-        agent._persist_session(messages, conversation_history)
-        return {
-            "final_response": video_edit_skill_error,
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "failed": True,
-            "error": video_edit_skill_error,
         }
     api_call_count = 0
     final_response = None
@@ -2641,6 +2493,33 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+
+    # Subnet discovery is a trusted-client workflow. Return its actionable
+    # card before Codex/provider/tool execution; the scan starts only after the
+    # user confirms in the first-party client.
+    _hardware_preflight_response = hardware_enrollment_preflight_response(
+        agent,
+        trusted_skill_task,
+    )
+    if _hardware_preflight_response:
+        messages.append({"role": "assistant", "content": _hardware_preflight_response})
+        from agent.turn_finalizer import finalize_turn as _finalize_preflight_turn
+
+        return _finalize_preflight_turn(
+            agent,
+            final_response=_hardware_preflight_response,
+            api_call_count=0,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(hardware_enrollment_preflight)",
+        )
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -3479,7 +3358,6 @@ def run_conversation(
                     )
                 _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
                 _apply_forced_present_plan_tool_choice(agent, api_kwargs)
-                _apply_forced_video_edit_skill_view(agent, api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -5233,7 +5111,6 @@ def run_conversation(
                 if (
                     (
                         getattr(agent, "_zet_agent_plan_mode_active", False) is True
-                        or _video_edit_skill_load_required(agent)
                     )
                     and getattr(agent, "_zet_agent_force_present_plan_disable_thinking", False) is False
                     and _is_thinking_tool_choice_rejection(api_error)
@@ -6569,11 +6446,42 @@ def run_conversation(
                 #
                 # 只跳过「尝试 fallback」这一步，后面的终止/上报路径要照常走：
                 # 这一轮必须以内容拦截结束，而不是悄悄中止。
+                # internal_error 同理:代码里抛出的 AttributeError/NameError
+                # 换个备用模型一样会抛,fallback 只会多烧一次调用,并且先
+                # 打出「trying fallback...」——用户以为在恢复,其实是我们自己
+                # 的 bug。分类器已经把它的 should_fallback 留为 False。
+                #
+                # ⛔ 故意只列这两个 reason,而不是笼统写「should_fallback 为
+                # False 就不 fallback」:auth / timeout 等也有 should_fallback
+                # 为 False 的分支,它们换 provider 是有意义的,一并拦掉会弄坏
+                # 现有的恢复路径。作用域刚好等于缺陷。
                 _policy_no_fallback = (
-                    classified.reason == FailoverReason.content_policy_blocked
+                    classified.reason in {
+                        FailoverReason.content_policy_blocked,
+                        FailoverReason.internal_error,
+                    }
                     and not classified.should_fallback
                 )
                 if is_client_error:
+                    # Opaque model aliases may switch upstream families without
+                    # changing the public provider/model name. Learn the
+                    # capability only from the upstream's explicit validation
+                    # response, repair the replay payload, and retry once. A
+                    # different route gets a different capability key; strict
+                    # providers that reject the field never enter this branch.
+                    if (
+                        getattr(agent, "api_mode", "") == "chat_completions"
+                        and not _retry.reasoning_echo_retry_attempted
+                        and _is_reasoning_echo_required_error(api_error)
+                    ):
+                        _retry.reasoning_echo_retry_attempted = True
+                        agent._learn_reasoning_echo_for_current_route()
+                        if agent._reapply_reasoning_echo_for_provider(api_messages):
+                            agent._buffer_vprint(
+                                "🧠 Upstream requires reasoning_content replay; "
+                                "repaired assistant tool-call history and retrying once."
+                            )
+                            continue
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /
@@ -6633,7 +6541,19 @@ def run_conversation(
                     # returned ``error`` field and downstream consumers deliver
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
-                    _nonretryable_summary = agent._summarize_api_error(api_error)
+                    # Same reason the Cloudflare collapse above exists, one
+                    # source further in: for `internal_error` this summary is
+                    # *our* exception text — attribute names, class names,
+                    # file paths — and it flows into `_emit_status`,
+                    # `final_response` and `error`, all of which reach the
+                    # client (chat/completions renders `final_response`).
+                    # Routed through the single safe-text helper so no outbound
+                    # field can be forgotten; the raw text is already logged.
+                    _nonretryable_summary = _client_safe_error_text(
+                        classified,
+                        agent._summarize_api_error(api_error),
+                        error=api_error,
+                    )
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
@@ -7254,7 +7174,6 @@ def run_conversation(
             _guarded_interaction_tool_response = bool(
                 (
                     getattr(agent, "_zet_agent_plan_mode_active", False)
-                    or _video_edit_skill_load_required(agent)
                 )
                 and (getattr(assistant_message, "tool_calls", None) or [])
             )
@@ -7814,7 +7733,6 @@ def run_conversation(
                 # private retry prompt. Remove it before persisting the valid
                 # clarify/present_plan tool call.
                 _drop_trailing_plan_protocol_messages(messages)
-                _drop_trailing_video_edit_skill_protocol_messages(messages)
 
                 previous_msg = messages[-1] if messages else None
                 current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
@@ -8232,25 +8150,6 @@ def run_conversation(
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
-                    if _video_edit_skill_load_required(agent):
-                        error_message = _record_video_edit_skill_protocol_violation(
-                            agent,
-                            messages,
-                            assistant_message,
-                            "an empty or reasoning-only response",
-                        )
-                        if error_message is None:
-                            continue
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
-                        return {
-                            "final_response": error_message,
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "failed": True,
-                            "error": error_message,
-                        }
                     if (
                         getattr(agent, "_zet_agent_plan_mode_active", False)
                         and not getattr(agent, "_zet_agent_plan_presented", False)
@@ -8661,25 +8560,6 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
-                if _video_edit_skill_load_required(agent):
-                    error_message = _record_video_edit_skill_protocol_violation(
-                        agent,
-                        messages,
-                        assistant_message,
-                        "plain text",
-                    )
-                    if error_message is None:
-                        continue
-                    agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": error_message,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "failed": True,
-                        "error": error_message,
-                    }
                 if (
                     getattr(agent, "_zet_agent_plan_mode_active", False)
                     and not getattr(agent, "_zet_agent_plan_presented", False)
@@ -8778,9 +8658,6 @@ def run_conversation(
                         or messages[-1].get("_dropped_toolcall_nudge")
                         or messages[-1].get("_length_continuation_synthetic")
                         or messages[-1].get("_plan_protocol_synthetic")
-                        or messages[-1].get(
-                            "_video_edit_skill_protocol_synthetic"
-                        )
                     )
                 ):
                     messages.pop()

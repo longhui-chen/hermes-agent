@@ -1143,6 +1143,11 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
 _WECOM_CLI_CONFIG_DIR_NAME = "wecom-cli-config"
 
 
+def profile_wecom_cli_config_dir(profile_home) -> str:
+    """返回指定 profile 的 wecom-cli 配置目录。"""
+    return str(Path(profile_home) / _WECOM_CLI_CONFIG_DIR_NAME)
+
+
 def apply_profile_scoped_env(env: dict[str, str], profile_home) -> None:
     """Point every profile-scoped path in *env* at *profile_home*, in place.
 
@@ -1162,14 +1167,41 @@ def apply_profile_scoped_env(env: dict[str, str], profile_home) -> None:
     (``hermespath.AgentSkillsGlobalDir`` = ``/root/.agents/skills``); deriving
     them per profile would aim them at a directory with no skills in it.
     """
-    home = Path(profile_home)
-    env["HERMES_HOME"] = str(home)
+    # 保留调用方已经解析好的原始路径；Path 往返会去掉尾随斜杠，令子进程与
+    # 父进程对自身 home 的认知不一致。
+    env["HERMES_HOME"] = str(profile_home)
     # hermespath.WeComConfigDir joins <profileRoot>/<agent> with the dir name,
     # and profile_home is already <profileRoot>/<agent>.
-    env[_WECOM_CLI_CONFIG_DIR_NAME_ENV] = str(home / _WECOM_CLI_CONFIG_DIR_NAME)
+    env[_WECOM_CLI_CONFIG_DIR_NAME_ENV] = profile_wecom_cli_config_dir(profile_home)
 
 
 _WECOM_CLI_CONFIG_DIR_NAME_ENV = "WECOM_CLI_CONFIG_DIR"
+
+
+def apply_context_profile_scoped_env(env: dict[str, str]) -> None:
+    """把 context-local 的 profile pin 写入子进程环境。
+
+    ContextVar 不会跨进程传播。所有按当前请求档案启动的子进程都必须经过此处，
+    让 ``HERMES_HOME`` 与 ``WECOM_CLI_CONFIG_DIR`` 始终来自同一个档案。
+    单 profile 没有 pin 时，从子进程最终的 ``HERMES_HOME`` 派生企微目录；
+    multiplex 没有 pin 时删除继承值，不能把进程启动身份冒充为当前 profile。
+    """
+    override = get_hermes_home_override()
+    if override:
+        apply_profile_scoped_env(env, override)
+        return
+
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        env.pop(_WECOM_CLI_CONFIG_DIR_NAME_ENV, None)
+        return
+
+    profile_home = str(env.get("HERMES_HOME") or "").strip()
+    if profile_home:
+        env[_WECOM_CLI_CONFIG_DIR_NAME_ENV] = profile_wecom_cli_config_dir(
+            profile_home
+        )
 
 
 VALID_REASONING_EFFORTS = (

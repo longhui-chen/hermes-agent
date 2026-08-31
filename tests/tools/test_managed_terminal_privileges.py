@@ -19,13 +19,17 @@ from tools.environments.local import LocalEnvironment
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
-def test_managed_terminal_inherits_service_identity_inside_profile_cgroup(
+def test_managed_terminal_enters_profile_cgroup_without_bootstrap_identity(
     monkeypatch,
 ):
     captured = {}
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_MANAGED_CGROUP_UNIT", "zettlab-claw.service")
+    monkeypatch.setenv(
+        "HERMES_MANAGED_CGROUP_ROOT",
+        "/system.slice/zettlab-claw.service",
+    )
     monkeypatch.setattr(local_module, "_find_bash", lambda: "/bin/bash")
-    monkeypatch.setattr(local_module, "_make_run_env", lambda _env: {})
     monkeypatch.setattr(
         local_module,
         "_managed_terminal_cwd",
@@ -68,6 +72,10 @@ def test_managed_terminal_inherits_service_identity_inside_profile_cgroup(
     ]
     assert "/usr/bin/setpriv" not in captured["argv"]
     assert "/usr/bin/unshare" not in captured["argv"]
+    child_env = captured["kwargs"]["env"]
+    assert "HERMES_MANAGED_GATEWAY" not in child_env
+    assert "HERMES_MANAGED_CGROUP_UNIT" not in child_env
+    assert "HERMES_MANAGED_CGROUP_ROOT" not in child_env
 
 
 def test_managed_terminal_keeps_existing_root_cwd_without_lark_relay(
@@ -747,7 +755,10 @@ def test_managed_service_keeps_filesystem_open_for_root_commands():
         "/volume1/system/zettos-main-data/com.zettlab.claw/lazy-packages"
     ) in service
     assert "Environment=HERMES_DISABLE_LAZY_INSTALLS=1" in service
-    assert "MemoryHigh=768M" in service
+    # MemoryHigh 是 memory.high 软限流：无 swap + 匿名页涨上去时只会罚睡不会
+    # OOM，进程假活且 Restart= 永不触发（TB-20260826-001）。只保留 MemoryMax，
+    # 触顶被杀走 Restart=on-failure 自愈。
+    assert "MemoryHigh=" not in service
     assert "MemoryMax=1G" in service
     assert "MemorySwapMax=0" in service
     assert "TasksMax=512" in service
@@ -762,7 +773,7 @@ def test_managed_service_keeps_filesystem_open_for_root_commands():
     launcher = Path("zpk/libexec/hermes-secure-launcher.py").read_text(
         encoding="utf-8"
     )
-    assert '"memory.high": "805306368"' in launcher
+    assert '"memory.high": "max"' in launcher
     assert '"memory.max": "1073741824"' in launcher
     assert '"memory.swap.max": "0"' in launcher
     assert '"pids.max": "512"' in launcher

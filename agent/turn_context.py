@@ -366,6 +366,7 @@ def build_turn_context(
     if recovered_history is not None:
         conversation_history = recovered_history
 
+
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
     # Creating it here — before _cached_system_prompt is populated — inserts a
@@ -415,6 +416,14 @@ def build_turn_context(
     # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
     # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
     # name and leaves the snapshot untouched on no-change).
+    force_runtime_shell_refresh = bool(
+        getattr(agent, "_zet_runtime_shell_force_tool_refresh", False)
+    )
+    if force_runtime_shell_refresh:
+        # One-shot even on failure.  A reused shell sets it again on every
+        # lease, while this turn fails closed below instead of repeatedly
+        # rebuilding inside one request.
+        agent._zet_runtime_shell_force_tool_refresh = False
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
             # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
@@ -426,12 +435,29 @@ def build_turn_context(
             # This keeps the no-MCP first turn off the heavy import path
             # without changing behavior for MCP users.
             import sys as _sys
-            if "tools.mcp_tool" in _sys.modules:
+            if force_runtime_shell_refresh or "tools.mcp_tool" in _sys.modules:
                 from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-                if has_registered_mcp_tools():
-                    refresh_agent_mcp_tools(agent, quiet_mode=True)
+                if force_runtime_shell_refresh or has_registered_mcp_tools():
+                    refresh_agent_mcp_tools(
+                        agent,
+                        quiet_mode=True,
+                        reuse_current_turn_snapshot=True,
+                    )
     except Exception:
-        logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
+        if force_runtime_shell_refresh:
+            # Reuse must never preserve a stale authorization verdict.  Keep
+            # the conversational turn available, but expose no tools if live
+            # gate reconstruction failed; the next request retries because a
+            # fresh cache lease sets the flag again.
+            agent.tools = []
+            agent.valid_tool_names = set()
+            agent._tools_disabled_for_request = True
+            logger.warning(
+                "cached runtime shell tool refresh failed closed",
+                exc_info=True,
+            )
+        else:
+            logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):
@@ -1098,6 +1124,19 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
+    # governor 的会话作用域必须跟这一轮**最终生效**的 session 一致，所以绑定放在
+    # 这里——本轮所有会旋转 session 的动作（turn-start 的旋转恢复、idle 压缩、
+    # preflight 压缩）都已经跑完，紧接着就是 pre_llm_call。
+    #
+    # 绑早了会怎样：压缩把 agent.session_id 旋转成 canonical child，而响应头回给
+    # 客户端的是 child；推荐卡却存进了父 scope，客户端照响应头提交动作时 governor
+    # 在 child scope 里找不到刚展示的 proposal，只能拒绝——那张卡从此点不动。
+    #
+    # 显式的 gateway key 不受影响：它本来就是调用方指定的稳定作用域，压缩不动它。
+    agent._creation_governor_conversation_session_id = (
+        getattr(agent, "_gateway_session_key", None) or agent.session_id
+    )
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
@@ -1108,6 +1147,9 @@ def build_turn_context(
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
+            conversation_session_id=(
+                agent._creation_governor_conversation_session_id
+            ),
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,
@@ -1124,12 +1166,18 @@ def build_turn_context(
                 or ""
             ),
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+            execution_policy=(
+                getattr(agent, "_zet_agent_execution_policy", None) or ""
+            ),
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
             structured_output=_structured_output,
             supports_followup_turns=bool(
                 getattr(agent, "_supports_followup_turns", True)
             ),
             streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
+            creation_action_receipt_transport=getattr(
+                agent, "_creation_action_receipt_transport", ""
+            ),
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

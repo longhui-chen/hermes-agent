@@ -28,6 +28,7 @@ Optional hooks (override to opt in):
   on_pre_compress(messages) -> str       — extract before context compression
   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
+  search_memory_mode() -> str           — optional search_memory integration policy
   backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
 """
 
@@ -279,6 +280,16 @@ class MemoryProvider(ABC):
         result: the subagent's final response
         child_session_id: the subagent's session_id
         """
+
+    def search_memory_mode(self) -> str:
+        """How an optional ``search(query, top_k)`` integrates with search_memory.
+
+        ``replace`` preserves the historical provider-first behaviour,
+        ``supplement`` combines provider and native curated results, and
+        ``disabled`` keeps search_memory native-only. Providers that implement
+        ``search`` but do not override this method remain replacement providers.
+        """
+        return "replace"
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         """Return config fields this provider needs for setup.

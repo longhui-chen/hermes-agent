@@ -20,6 +20,7 @@ from tools.apphost_tool import (
     APP_HOST_SCHEMA,
     _CALL_HTTP_METHODS,
     _check_app_host,
+    _execution_headers,
     _local_error,
     app_host_tool,
 )
@@ -172,32 +173,51 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
 
 def test_request_forwards_only_task_local_execution_headers(monkeypatch):
     from gateway.session_context import (
-        clear_session_vars, clear_turn_vars, set_session_vars, set_turn_vars,
+        clear_session_vars,
+        clear_turn_vars,
+        pop_zettlab_auth_principal,
+        push_zettlab_auth_principal,
+        set_session_vars,
+        set_turn_vars,
     )
     seen = {}
-    session_tokens = set_session_vars(session_id="session-1")
-    turn_tokens = set_turn_vars(
-        turn_id="turn-1", business_execution_token="a" * 64
+    session_tokens = set_session_vars(
+        session_id="cron_task_abcdef123456_20260817_120000",
+        session_key="zettlab:owner-1:agent-1:stable-session",
     )
+    turn_tokens = set_turn_vars(
+        turn_id="turn-1", hardware_execution_token="a" * 64
+    )
+    principal_token = push_zettlab_auth_principal("iam:issuer:user:owner-1")
     try:
         with mux_profile_scope(monkeypatch, _scope()), patch(
             "tools.apphost_tool._urlopen", _capture_urlopen(seen)
         ):
             assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
     finally:
+        pop_zettlab_auth_principal(principal_token)
         clear_turn_vars(turn_tokens)
         clear_session_vars(session_tokens)
     req = seen["req"]
-    assert req.get_header("X-zettlab-business-execution-token") == "a" * 64
+    retired_header = "X-zettlab-business-" + "execution-token"
+    assert req.get_header(retired_header) is None
+    assert req.get_header("X-zettlab-hardware-execution-token") is None
+    assert req.get_header("X-zettlab-auth-principal-id") == (
+        "iam:issuer:user:owner-1"
+    )
     assert req.get_header("X-hermes-turn-id") == "turn-1"
-    assert req.get_header("X-hermes-session-id") == "session-1"
+    assert req.get_header("X-hermes-session-id") == "cron_task_abcdef123456_20260817_120000"
+    assert req.get_header("X-hermes-session-key") == (
+        "zettlab:owner-1:agent-1:stable-session"
+    )
+    assert req.get_header("X-zettlab-app-maintenance-task-id") == "abcdef123456"
 
 
-def test_business_execution_token_is_not_lost_when_turn_correlation_is_absent(monkeypatch):
+def test_hardware_execution_token_is_never_forwarded_by_apphost(monkeypatch):
     from gateway.session_context import clear_turn_vars, set_turn_vars
 
     seen = {}
-    turn_tokens = set_turn_vars(business_execution_token="b" * 64)
+    turn_tokens = set_turn_vars(hardware_execution_token="b" * 64)
     try:
         with mux_profile_scope(monkeypatch, _scope()), patch(
             "tools.apphost_tool._urlopen", _capture_urlopen(seen)
@@ -205,8 +225,56 @@ def test_business_execution_token_is_not_lost_when_turn_correlation_is_absent(mo
             assert json.loads(app_host_tool({"action": "probe"}))["ok"] is True
     finally:
         clear_turn_vars(turn_tokens)
-    assert seen["req"].get_header("X-zettlab-business-execution-token") == "b" * 64
+    retired_header = "X-zettlab-business-" + "execution-token"
+    assert seen["req"].get_header(retired_header) is None
+    assert seen["req"].get_header("X-zettlab-hardware-execution-token") is None
     assert seen["req"].get_header("X-hermes-turn-id") is None
+
+
+@pytest.mark.parametrize(
+    "field,value,missing_header",
+    [
+        ("principal", "iam:issuer:user:owner\r\nforged", "X-Zettlab-Auth-Principal-Id"),
+        ("principal", "p" * 513, "X-Zettlab-Auth-Principal-Id"),
+        ("turn_id", "turn\x00forged", "X-Hermes-Turn-Id"),
+        ("turn_id", "t" * 257, "X-Hermes-Turn-Id"),
+        ("session_id", " session-1", "X-Hermes-Session-Id"),
+        ("session_id", "s" * 257, "X-Hermes-Session-Id"),
+        ("session_key", "zettlab:owner:agent:key\nforged", "X-Hermes-Session-Key"),
+        ("session_key", "k" * 257, "X-Hermes-Session-Key"),
+    ],
+)
+def test_execution_headers_drop_invalid_or_oversized_values(
+    field, value, missing_header
+):
+    values = {
+        "principal": "iam:issuer:user:owner-1",
+        "turn_id": "turn-1",
+        "session_id": "session-1",
+        "session_key": "zettlab:owner-1:agent-1:session-1",
+    }
+    values[field] = value
+
+    def session_env(name, default=""):
+        return {
+            "HERMES_SESSION_ID": values["session_id"],
+            "HERMES_SESSION_KEY": values["session_key"],
+        }.get(name, default)
+
+    with patch(
+        "gateway.session_context.zettlab_auth_principal",
+        return_value=values["principal"],
+    ), patch(
+        "gateway.session_context.current_turn_identity",
+        return_value=(values["turn_id"], object()),
+    ), patch(
+        "gateway.session_context.get_session_env",
+        side_effect=session_env,
+    ):
+        headers = _execution_headers()
+
+    assert missing_header not in headers
+    assert all("\r" not in item and "\n" not in item and "\x00" not in item for item in headers.values())
 
 
 def test_app_host_request_keeps_its_own_base_url(monkeypatch):
@@ -352,19 +420,231 @@ def test_app_operation_requires_capability_digest_before_sending(monkeypatch):
     open_request.assert_not_called()
 
 
+# --- ADIC v1: turn-scoped data.import ledger ---------------------------------
+# app_host records EVERY app_operation outcome, tagged with its operation
+# name, into a bounded, turn-scoped ledger (gateway.session_context) that
+# cron/scheduler.py reads right before mark_job_run to judge success by
+# whether the app's own declared write operation actually landed this round,
+# not by whether the agent produced a plausible reply. See
+# zettlab-local-docs/app-fullstack/2026-08-17-应用数据导入契约-ADIC-v1.md §4.5
+# and the paired interface-freeze doc §7-8. Recording is deliberately NOT
+# filtered to the literal "data.import" here — local-server stamps
+# job["import_operation"] with the app's own declared mutation name (e.g.
+# "records.refresh" for a blueprint app), and cron/scheduler.py does the name
+# filtering at verdict time against that per-job value. A read call like
+# data.import_schema IS recorded (see the test below) — it is excluded from
+# the verdict purely because its name never matches any job's
+# import_operation, not because this layer special-cases read calls. The
+# call() two-layer status (tested above) is a completely separate code path
+# and must stay untouched.
+
+_IMPORT_ARGS = {
+    "action": "app_operation", "slug": "hangzhou-weather-live",
+    "app_operation": "data.import",
+    "payload": {"daily": [{"forecast_date": "2026-08-18"}]},
+    "capability_digest": "b" * 64,
+}
+
+
+def test_data_import_success_is_recorded_in_active_ledger(monkeypatch):
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _capture_urlopen({}, {"import_receipt": {"committed": True}}),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is True
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import", "ok": True, "error_code": "", "error_message": "",
+    }]
+
+
+def test_data_import_rejection_is_recorded_with_upstream_code(monkeypatch):
+    upstream = {"code": "import_rejected", "message": "湿度必须是 0-100 的整数"}
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _http_error(400, json.dumps(upstream).encode("utf-8")),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is False and out["error"]["code"] == "import_rejected"
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import", "ok": False, "error_code": "import_rejected",
+        "error_message": "湿度必须是 0-100 的整数",
+    }]
+
+
+def test_data_import_not_confirmed_is_recorded_with_upstream_code(monkeypatch):
+    """502 import_not_confirmed (2xx from the app but no valid receipt) must
+    be distinguishable from import_rejected in the ledger, per the interface
+    freeze's error-code table (§4)."""
+    upstream = {"code": "import_not_confirmed", "message": "app answered without a receipt"}
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch(
+                "tools.apphost_tool._urlopen",
+                _http_error(502, json.dumps(upstream).encode("utf-8")),
+            ):
+                out = json.loads(app_host_tool(_IMPORT_ARGS))
+        assert out["ok"] is False and out["error"]["code"] == "import_not_confirmed"
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger[0]["error_code"] == "import_not_confirmed"
+
+
+def test_data_import_schema_read_is_recorded_under_its_own_operation_name(monkeypatch):
+    """A read call (data.import_schema) IS recorded — this layer does not
+    special-case reads. It is kept out of a job's import verdict purely
+    because cron/scheduler.py filters the ledger by job["import_operation"],
+    and "data.import_schema" never equals that value. If this layer instead
+    pre-filtered by name, an app whose declared write operation isn't
+    literally "data.import" (e.g. "records.refresh") would never get
+    anything recorded and would fail every round — see the P0 this test
+    guards against in tests/cron/test_import_contract_verdict.py."""
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, {"daily_forecast": {}})):
+                app_host_tool({
+                    "action": "app_operation", "slug": "app1",
+                    "app_operation": "data.import_schema", "payload": {},
+                    "capability_digest": "c" * 64,
+                })
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == [{
+        "operation": "data.import_schema", "ok": True, "error_code": "", "error_message": "",
+    }]
+
+
+def test_call_action_never_touches_the_import_ledger(monkeypatch):
+    """The legacy call() two-layer status (app-level 400/500 arrives as
+    ok:true) must never be mistaken for a data.import outcome."""
+    from gateway.session_context import (
+        import_attempts_snapshot, pop_import_attempts_scope, push_import_attempts_scope,
+    )
+    token = push_import_attempts_scope()
+    try:
+        payload = {"status": 500, "content_type": "application/json", "body": {"error": "boom"}}
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen({}, payload)):
+                out = json.loads(app_host_tool(dict(_CALL_ARGS)))
+        assert out["ok"] is True
+        ledger = import_attempts_snapshot()
+    finally:
+        pop_import_attempts_scope(token)
+    assert ledger == []
+
+
+def test_data_import_outside_a_pushed_scope_is_a_silent_noop(monkeypatch):
+    """Interactive turns never push a ledger scope. Recording must not raise
+    and must not fabricate a ledger visible to a later reader."""
+    from gateway.session_context import import_attempts_snapshot
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch(
+            "tools.apphost_tool._urlopen",
+            _capture_urlopen({}, {"import_receipt": {"committed": True}}),
+        ):
+            out = json.loads(app_host_tool(_IMPORT_ARGS))
+    assert out["ok"] is True
+    assert import_attempts_snapshot() == []
+
+
 def test_publish_operation_is_passed_through_unchanged(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, pop_zettlab_auth_principal,
+        push_zettlab_auth_principal, set_session_vars, set_turn_vars,
+    )
+
     seen = {}
     operation = {"operation_id": "op-1", "purpose": "每天同步汇率", "data_refresh": "user_confirmed_auto", "maintenance": {"schedule": "0 9 * * *"}}
-    with mux_profile_scope(monkeypatch, _scope()), patch(
-        "tools.apphost_tool._urlopen",
-        _capture_urlopen(seen, {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}),
-    ):
+    session_tokens = set_session_vars(session_id="session-1")
+    turn_tokens = set_turn_vars(turn_id="turn-1")
+    principal_token = push_zettlab_auth_principal("iam:user-1")
+    try:
+        with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+            "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
+        ) as mint, patch(
+            "tools.apphost_tool._urlopen",
+            _capture_urlopen(seen, {"operation": {"operation_id": "op-1", "terminal": "succeeded"}}),
+        ):
+            out = json.loads(app_host_tool({
+                "action": "publish", "mode": "install", "source_subdir": "runs/app",
+                "data_refresh": "user_confirmed_auto", "operation": operation,
+            }))
+    finally:
+        pop_zettlab_auth_principal(principal_token)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+    assert out["ok"] is True
+    mint.assert_called_once()
+    assert mint.call_args.kwargs["owner_agent_id"] == "main"
+    assert mint.call_args.kwargs["turn_id"] == "turn-1"
+    assert mint.call_args.kwargs["session_id"] == "session-1"
+    assert mint.call_args.kwargs["operation_kind"] == "apphost_publish_v1"
+    assert mint.call_args.kwargs["operation"] == {
+        "mode": "install",
+        "source_subdir": "runs/app",
+        "data_refresh": "user_confirmed_auto",
+        "operation": operation,
+    }
+    assert mint.call_args.kwargs["owner_principal"] == "iam:user-1"
+    assert json.loads(seen["req"].data)["operation"] == operation
+    assert seen["req"].get_header("X-zettlab-agent-action-token") == "a" * 64
+
+
+def test_auto_publish_requires_an_active_user_turn_before_minting_scope(monkeypatch):
+    operation = {"operation_id": "op-1", "data_refresh": "user_confirmed_auto"}
+    with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+        "tools.apphost_tool.request_app_auto_refresh_token"
+    ) as mint, patch("tools.apphost_tool._urlopen") as open_request:
         out = json.loads(app_host_tool({
             "action": "publish", "mode": "install", "source_subdir": "runs/app",
             "data_refresh": "user_confirmed_auto", "operation": operation,
         }))
-    assert out["ok"] is True
-    assert json.loads(seen["req"].data)["operation"] == operation
+    assert out["ok"] is False
+    assert out["error"]["code"] == "automatic_maintenance_unavailable"
+    assert out["status"] == 0
+    mint.assert_not_called()
+    open_request.assert_not_called()
+
+
+def test_auto_publish_without_operation_is_rejected_before_credentials_or_network(monkeypatch):
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool.request_app_auto_refresh_token", side_effect=AssertionError("scope must not be minted")
+    ), patch("tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")):
+        out = json.loads(app_host_tool({
+            "action": "publish", "mode": "install", "source_subdir": "runs/app",
+            "data_refresh": "user_confirmed_auto",
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
 
 
 def test_operation_enabled_publish_202_returns_verified_pending_receipt(monkeypatch):
@@ -398,16 +678,29 @@ def test_operation_enabled_publish_200_returns_verified_terminal_receipt(monkeyp
 
 
 def test_operation_enabled_publish_reload_derives_outer_data_refresh_from_intent(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars, clear_turn_vars, pop_zettlab_auth_principal,
+        push_zettlab_auth_principal, set_session_vars, set_turn_vars,
+    )
+
     seen = {}
     operation = {"operation_id": "op-reload", "data_refresh": "user_confirmed_auto"}
     response = {"operation": {"operation_id": "op-reload", "terminal": "succeeded"}}
-    with mux_profile_scope(monkeypatch, _scope()), patch(
-        "tools.apphost_tool._urlopen", _capture_urlopen(seen, response)
-    ):
-        out = json.loads(app_host_tool({
-            "action": "publish", "mode": "reload", "source_subdir": "runs/app",
-            "operation": operation,
-        }))
+    session_tokens = set_session_vars(session_id="session-1")
+    turn_tokens = set_turn_vars(turn_id="turn-1")
+    principal_token = push_zettlab_auth_principal("iam:user-1")
+    try:
+        with mux_profile_scope(monkeypatch, _scope(ZET_AGENT_ID="main")), patch(
+            "tools.apphost_tool.request_app_auto_refresh_token", return_value="a" * 64
+        ), patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, response)):
+            out = json.loads(app_host_tool({
+                "action": "publish", "mode": "reload", "source_subdir": "runs/app",
+                "operation": operation,
+            }))
+    finally:
+        pop_zettlab_auth_principal(principal_token)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
     assert out["ok"] is True
     assert json.loads(seen["req"].data) == {
         "mode": "reload", "source_subdir": "runs/app",
@@ -450,6 +743,20 @@ def test_legacy_mutations_reject_workflow_operation_before_secret_or_network(mon
     assert out["error"]["code"] == "invalid_request"
     assert out["status"] == 0
     assert hint in out["error"]["message"]
+
+
+def test_legacy_install_rejects_auto_refresh_before_secret_or_network(monkeypatch):
+    with patch("tools.apphost_tool._secret", side_effect=AssertionError("secret must not be read")), patch(
+        "tools.apphost_tool._urlopen", side_effect=AssertionError("network must not be used")
+    ):
+        out = json.loads(app_host_tool({
+            "action": "install", "slug": "weather", "staging_dir": "/tmp/stage",
+            "data_refresh": "user_confirmed_auto",
+        }))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+    assert out["status"] == 0
+    assert "publish(mode=install)" in out["error"]["message"]
 
 
 @pytest.mark.parametrize("response", [
@@ -1573,6 +1880,16 @@ def test_publish_install_carries_stable_session_key(monkeypatch):
     assert body["session_id"] == _SESSION_KEY
 
 
+def test_publish_install_uses_current_session_build_when_path_is_omitted(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
+    body = _routed_body(monkeypatch, {
+        "action": "publish", "mode": "install", "data_refresh": "static",
+    })
+    assert body["mode"] == "install"
+    assert "source_subdir" not in body
+    assert body["session_id"] == _SESSION_KEY
+
+
 def test_publish_reload_never_rewrites_creation_provenance(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
     body = _routed_body(monkeypatch, {
@@ -1582,7 +1899,7 @@ def test_publish_reload_never_rewrites_creation_provenance(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "data_refresh", ["static", "external_unconfirmed", "user_confirmed_auto", "user_declined"]
+    "data_refresh", ["static", "external_unconfirmed", "user_declined"]
 )
 def test_legacy_install_carries_session_key_and_data_refresh(monkeypatch, data_refresh):
     monkeypatch.setenv("HERMES_SESSION_KEY", _SESSION_KEY)
@@ -1656,10 +1973,8 @@ def test_install_rejects_values_outside_the_enum(monkeypatch, value):
 
 
 @pytest.mark.parametrize(
-    "value", ["static", "external_unconfirmed", "user_confirmed_auto", "user_declined"])
+    "value", ["static", "external_unconfirmed", "user_declined"])
 def test_install_forwards_every_accepted_answer(monkeypatch, value):
-    captured = {}
-
     seen = {}
 
     with mux_profile_scope(monkeypatch, _scope()):

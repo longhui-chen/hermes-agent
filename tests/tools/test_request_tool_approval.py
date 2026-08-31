@@ -99,40 +99,54 @@ class TestRequestToolApproval:
             "browser_navigate",
             "external URL",
             rule_key="ext-nav",
-            validation_target='{"url":"https://example.com"}',
+            validation_target='{"payload_digest":"abc"}',
         )
         assert res["approved"] is False
         assert res["status"] == "approval_required"
         assert submitted["pattern_key"] == "plugin_rule:ext-nav"
-        assert submitted["validation_target"] == '{"url":"https://example.com"}'
+        assert submitted["validation_target"] == '{"payload_digest":"abc"}'
 
     def test_gateway_live_callback_carries_validation_target(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
-        state_key = approval._approval_state_key("test-session")
+        captured = []
+
+        def notify(data):
+            captured.append(dict(data))
+            approval.resolve_gateway_approval(
+                "test-session",
+                "deny",
+                approval_id=data["approval_id"],
+            )
+
+        approval.register_gateway_notify("test-session", notify)
+        try:
+            res = request_tool_approval(
+                "app_data",
+                "save focus analysis",
+                rule_key="focus-analysis",
+                validation_target='{"payload_digest":"abc"}',
+            )
+        finally:
+            approval.unregister_gateway_notify("test-session")
+
+        assert res["approved"] is False
+        assert captured[0]["validation_target"] == '{"payload_digest":"abc"}'
+
+    def test_oversized_validation_target_fails_closed(self, monkeypatch):
         monkeypatch.setattr(
             approval,
-            "_gateway_notify_cbs",
-            {state_key: lambda _data: None},
+            "prompt_dangerous_approval",
+            lambda *a, **k: pytest.fail("oversized validation must not prompt"),
         )
-        seen = {}
-
-        def decide(_session_key, _notify, data, *, surface):
-            seen.update(data)
-            assert surface == "gateway"
-            return {"resolved": True, "choice": "once"}
-
-        monkeypatch.setattr(approval, "_await_gateway_decision", decide)
-        result = request_tool_approval(
+        res = request_tool_approval(
             "app_data",
-            "保存焦点分析会修改本地保存的数据。",
-            rule_key="app_data:decision_run.resume:digest",
-            one_shot=True,
-            validation_target='{"operation":"decision_run.resume"}',
+            "save focus analysis",
+            rule_key="focus-analysis",
+            validation_target="v" * 2049,
         )
-
-        assert result == {"approved": True, "message": None}
-        assert seen["validation_target"] == '{"operation":"decision_run.resume"}'
+        assert res["approved"] is False
+        assert res["status"] == "approval_validation_target_too_large"
 
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)

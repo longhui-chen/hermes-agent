@@ -532,7 +532,8 @@ export const ja = defineLocale({
         userProfileEnabled: 'ユーザープロファイル',
         memoryCharLimit: 'メモリ予算',
         userCharLimit: 'プロファイル予算',
-        provider: 'メモリプロバイダー'
+        provider: 'メモリプロバイダー',
+        deepMemoryMode: 'Deep Memory モード'
       },
       context: {
         engine: 'コンテキストエンジン'
@@ -595,7 +596,8 @@ export const ja = defineLocale({
       },
       memory: {
         memoryEnabled: '将来のセッションに役立つ永続メモリを保存します。',
-        userProfileEnabled: 'ユーザーの好みをまとめた簡潔なプロファイルを維持します。'
+        userProfileEnabled: 'ユーザーの好みをまとめた簡潔なプロファイルを維持します。',
+        deepMemoryMode: '新しいチャットセッションで Deep Memory をどう呼び出すかを制御します。'
       },
       context: {
         engine: '長い会話がコンテキスト上限に近づいたときの管理戦略です。'
@@ -661,7 +663,17 @@ export const ja = defineLocale({
       imported: '設定をインポートしました',
       invalidJson: '設定 JSON が無効です',
       keepAwakeTitle: 'コンピューターをスリープさせない',
-      keepAwakeDesc: '本体のスリープを防ぎ、長時間や夜通しの実行を継続します。画面は暗転できます。'
+      keepAwakeDesc: '本体のスリープを防ぎ、長時間や夜通しの実行を継続します。画面は暗転できます。',
+      deepMemoryModeTitle: 'Deep Memory の呼び出し',
+      deepMemoryModeOff: 'オフ',
+      deepMemoryModeSmart: 'スマート',
+      deepMemoryModeAlways: 'オン',
+      deepMemoryModeOffDesc:
+        'チャットは Hermes のネイティブメモリのみを使います。Deep の呼び出しとツールは無効ですが、ネイティブ書き込みのミラーは継続します。新しいチャットセッションから適用されます。',
+      deepMemoryModeSmartDesc:
+        'search_memory の実行時に memo_recall も呼び出し、ネイティブと Deep の結果を統合します。新しいチャットセッションから適用されます。',
+      deepMemoryModeAlwaysDesc:
+        '各ターンの開始時に Deep Memory を自動呼び出しします。現在の動作と同じです。新しいチャットセッションから適用されます。'
     },
     quickEntry: {
       enabledTitle: 'クイック入力',

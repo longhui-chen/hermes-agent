@@ -44,7 +44,8 @@ class TestStdioEncodingErrorHandler:
                 patch("tools.mcp_tool.StdioServerParameters") as mock_params,
                 patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm),
                 patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm),
-                patch("tools.mcp_tool._snapshot_child_pids", return_value=set()),
+                patch("tools.mcp_tool._observe_child_pids",
+return_value=(True, set())),
                 patch("tools.mcp_tool._write_stderr_log_header"),
                 patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
             ):
@@ -83,7 +84,8 @@ class TestStdioEncodingErrorHandler:
                 patch("tools.mcp_tool.StdioServerParameters") as mock_params,
                 patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm),
                 patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm),
-                patch("tools.mcp_tool._snapshot_child_pids", return_value=set()),
+                patch("tools.mcp_tool._observe_child_pids",
+return_value=(True, set())),
                 patch("tools.mcp_tool._write_stderr_log_header"),
                 patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
             ):

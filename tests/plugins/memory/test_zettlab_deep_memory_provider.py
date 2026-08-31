@@ -1,9 +1,14 @@
 import json
 import logging
+import signal
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
 
+import pytest
+
+from agent.memory_manager import MemoryManager
 from plugins.memory.zettlab_deep_memory import (
     DeepMemoryMCPToolError,
     ZettlabDeepMemoryProvider,
@@ -49,15 +54,306 @@ def test_model_tool_schemas_exclude_memo_write():
     names = {
         schema["name"] for schema in ZettlabDeepMemoryProvider().get_tool_schemas()
     }
-    assert names == {"memo_recall", "memo_confirm", "memo_forget"}
+    assert names == {"memo_confirm", "memo_forget"}
+
+
+def test_smart_mode_supplements_search_memory_without_turn_prefetch(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "smart"},
+    )
+    calls = []
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append((endpoint, arguments, timeout, trusted))
+        return {"items": [{"memory_id": "fact-1", "statement": "Frank 认识 Bob"}]}
+
+    provider._request = fake_request
+    provider.on_turn_start(1, "Frank 有哪些朋友")
+    assert provider._prefetch_thread is None
+    assert provider.prefetch("Frank 有哪些朋友", session_id="session-1") == ""
+
+    result = provider.search("Frank 有哪些朋友", 7)
+
+    assert provider.search_memory_mode() == "supplement"
+    assert {schema["name"] for schema in provider.get_tool_schemas()} == {
+        "memo_confirm",
+        "memo_forget",
+    }
+    assert result["status"] == "ok"
+    assert result["items"][0]["memory_id"] == "fact-1"
+    assert len(calls) == 1
+    assert calls[0][0] == "recall"
+    assert calls[0][1] == {"query": "Frank 有哪些朋友", "limit": 7}
+    assert calls[0][2] == 7.5
+    assert calls[0][3]["tool_call_id"].startswith("search-memory:")
+    assert calls[0][3]["source_text"] == "Frank 有哪些朋友"
+    provider.shutdown()
+
+
+def test_smart_mode_search_memory_tool_runs_real_provider_recall_flow(monkeypatch, tmp_path):
+    from agent.memory_manager import MemoryManager
+    from tools.search_memory_tool import search_memory_tool
+
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "smart"},
+    )
+    calls = []
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append((endpoint, arguments, trusted))
+        return {
+            "items": [{
+                "id": "fact-real-flow",
+                "statement": "Frank 认识 Bob",
+                "recall_score": 87,
+            }]
+        }
+
+    provider._request = fake_request
+    provider.on_turn_start(1, "Frank 有哪些朋友")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+
+    result = json.loads(search_memory_tool(
+        {"query": "Frank 朋友", "top_k": 3},
+        memory_manager=manager,
+    ))
+
+    assert calls[0][0] == "recall"
+    assert calls[0][1] == {"query": "Frank 朋友", "limit": 3}
+    assert calls[0][2]["source_text"] == "Frank 有哪些朋友"
+    assert result["provider"] == "zettlab_deep_memory"
+    assert result["provider_status"] == "ok"
+    deep_item = next(item for item in result["items"] if item["id"] == "fact-real-flow")
+    assert deep_item["excerpt"] == "Frank 认识 Bob"
+    assert deep_item["score"] == 87.0
+    provider.shutdown()
+
+
+def test_smart_mode_registry_dispatch_runs_provider_recall_flow(monkeypatch, tmp_path):
+    from agent.memory_manager import MemoryManager
+    from model_tools import handle_function_call
+
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "smart"},
+    )
+    calls = []
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append((endpoint, arguments, trusted))
+        return {
+            "items": [{
+                "id": "fact-registry-flow",
+                "statement": "Frank 认识 Bob",
+                "recall_score": 91,
+            }]
+        }
+
+    provider._request = fake_request
+    provider.on_turn_start(1, "Frank 有哪些朋友")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+
+    result = json.loads(handle_function_call(
+        "search_memory",
+        {"query": "Frank 朋友", "top_k": 3},
+        search_memory_manager=manager,
+    ))
+
+    assert calls[0][0] == "recall"
+    assert calls[0][1] == {"query": "Frank 朋友", "limit": 3}
+    assert calls[0][2]["source_text"] == "Frank 有哪些朋友"
+    assert result["provider"] == "zettlab_deep_memory"
+    assert result["provider_status"] == "ok"
+    deep_item = next(
+        item for item in result["items"] if item["id"] == "fact-registry-flow"
+    )
+    assert deep_item["excerpt"] == "Frank 认识 Bob"
+    assert deep_item["score"] == 91.0
+    provider.shutdown()
+
+
+def test_production_tool_executor_threads_live_manager_to_search_memory(monkeypatch):
+    monkeypatch.setattr(signal, "SIGKILL", signal.SIGTERM, raising=False)
+    from agent import tool_executor
+
+    manager = object()
+    captured = {}
+
+    def fake_handle_function_call(name, args, task_id, **kwargs):
+        captured.update(kwargs)
+        return json.dumps({"items": []})
+
+    monkeypatch.setattr(
+        tool_executor,
+        "_ra",
+        lambda: SimpleNamespace(handle_function_call=fake_handle_function_call),
+    )
+    agent = SimpleNamespace(
+        platform="",
+        session_id="session-1",
+        _current_turn_id="turn-1",
+        _current_api_request_id="request-1",
+        _current_user_message="Frank 有哪些朋友",
+        _previous_assistant_message="",
+        valid_tool_names={"search_memory"},
+        enabled_toolsets=["memory"],
+        disabled_toolsets=[],
+        _memory_manager=manager,
+    )
+
+    result = tool_executor._handle_registry_function_call(
+        agent,
+        function_name="search_memory",
+        function_args={"query": "Frank 朋友"},
+        effective_task_id="task-1",
+        tool_call_id="call-1",
+        middleware_trace=[],
+    )
+
+    assert json.loads(result) == {"items": []}
+    assert captured["search_memory_manager"] is manager
+
+
+def test_off_mode_disables_chat_recall_but_keeps_native_write_mirroring(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="subject-1",
+        memory_config={"deep_memory_mode": "off"},
+    )
+    calls = []
+    completed = threading.Event()
+
+    def fake_request(endpoint, arguments, *, timeout, trusted):
+        calls.append(endpoint)
+        completed.set()
+        return {"status": "stored"}
+
+    provider._request = fake_request
+    provider.on_turn_start(2, "记住 Frank 认识 Alice")
+
+    assert provider.get_tool_schemas() == []
+    assert provider.search_memory_mode() == "disabled"
+    assert provider.prefetch("Frank", session_id="session-1") == ""
+    assert provider._prefetch_thread is None
+    assert json.loads(provider.handle_tool_call("memo_recall", {"query": "Frank"})) == {
+        "error": "Deep Memory chat access is disabled"
+    }
+
+    provider.on_memory_write(
+        "add",
+        "memory",
+        "Frank 认识 Alice",
+        {"turn_id": "turn-2"},
+    )
+    assert completed.wait(1.0)
+    assert calls == ["write"]
+    provider.shutdown()
+
+
+@pytest.mark.parametrize("configured_mode", [None, "future-mode"])
+def test_missing_or_unknown_mode_falls_back_to_smart(monkeypatch, tmp_path, configured_mode):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+    provider = ZettlabDeepMemoryProvider()
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        memory_config=(
+            {}
+            if configured_mode is None
+            else {"deep_memory_mode": configured_mode}
+        ),
+    )
+    provider._request = lambda *_args, **_kwargs: {"items": []}
+
+    provider.on_turn_start(1, "只在搜索时召回")
+
+    assert provider.search_memory_mode() == "supplement"
+    assert {schema["name"] for schema in provider.get_tool_schemas()} == {
+        "memo_confirm",
+        "memo_forget",
+    }
+    assert provider._prefetch_thread is None
+    provider.shutdown()
 
 
 def test_native_memory_is_mirrored_to_deep_memory():
     prompt = ZettlabDeepMemoryProvider().system_prompt_block()
 
-    assert "call the native memory tool once" in prompt
+    assert "written once through the native memory tool" in prompt
     assert "on_memory_write hook" in prompt
-    assert "memo_write is not exposed as a model tool" in prompt
+    assert "memo_write and memo_recall are not exposed as model tools" in prompt
+
+
+def test_three_modes_have_distinct_recall_contracts(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZETTLAB_DEEP_MEMORY_URL", "http://127.0.0.1:8400")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
+
+    expected_tools = {
+        "off": set(),
+        "smart": {"memo_confirm", "memo_forget"},
+        "always": {"memo_recall", "memo_confirm", "memo_forget"},
+    }
+    for mode in ("off", "smart", "always"):
+        provider = ZettlabDeepMemoryProvider()
+        manager = MemoryManager()
+        manager.add_provider(provider)
+        manager.initialize_all(
+            "session-1",
+            hermes_home=str(tmp_path / mode),
+            deep_memory_principal="user-1",
+            memory_config={"deep_memory_mode": mode},
+        )
+        prompt = provider.system_prompt_block()
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        assert names == expected_tools[mode]
+        assert manager.get_all_tool_names() == expected_tools[mode]
+        if mode == "off":
+            assert "Deep Memory chat recall is disabled" in prompt
+            assert provider.search_memory_mode() == "disabled"
+        elif mode == "smart":
+            assert "No Deep Memory recall runs at turn start" in prompt
+            assert "Do not call memo_recall directly" in prompt
+            assert provider.search_memory_mode() == "supplement"
+        else:
+            assert "already been attempted automatically" in prompt
+            assert "Do not call memo_recall merely to repeat the same query" in prompt
+            assert "multi-hop retrieval" in prompt
+            assert "does not trigger another Deep Memory recall" in prompt
+            assert provider.search_memory_mode() == "disabled"
+            provider._request = lambda *_args, **_kwargs: {"items": []}
+            assert json.loads(manager.handle_tool_call(
+                "memo_recall", {"query": "Frank 的更多关系"}
+            )) == {"items": []}
+        manager.shutdown_all()
 
 
 def test_provider_does_not_repurpose_generic_account_identity(monkeypatch, tmp_path):
@@ -177,7 +473,11 @@ def test_prefetch_recall_uses_mcp_and_builds_provider_context(monkeypatch, tmp_p
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
     _initialize(
-        provider, tmp_path, deep_memory_principal="user-1", deep_memory_subject="user-1"
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        deep_memory_subject="user-1",
+        memory_config={"deep_memory_mode": "always"},
     )
     captured = []
     started = threading.Event()
@@ -212,7 +512,12 @@ def test_on_turn_start_prefetch_is_non_blocking(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "secret")
     provider = ZettlabDeepMemoryProvider()
-    _initialize(provider, tmp_path, deep_memory_principal="user-1")
+    _initialize(
+        provider,
+        tmp_path,
+        deep_memory_principal="user-1",
+        memory_config={"deep_memory_mode": "always"},
+    )
     started = threading.Event()
     release = threading.Event()
 
@@ -368,6 +673,7 @@ def test_mcp_tool_error_is_not_treated_as_a_success(monkeypatch, caplog, tmp_pat
         tmp_path,
         deep_memory_principal="iam:issuer:user-1",
         deep_memory_subject="user-1",
+        memory_config={"deep_memory_mode": "always"},
     )
 
     class Response:

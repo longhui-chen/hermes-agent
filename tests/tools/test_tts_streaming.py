@@ -6,11 +6,17 @@ synth path are all mocked. Covers the registry/resolver, provider availability,
 the chunked-streamer playback path, and the universal per-sentence sync fallback.
 """
 
+import json
 import os
 import queue
+import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -105,14 +111,18 @@ def test_elevenlabs_available_reflects_key(monkeypatch):
 
 
 def test_openai_available_reflects_audio_key_resolution(monkeypatch):
-    monkeypatch.setattr(ts, "_openai_config_api_key", lambda: "")
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "voice-key")
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: ("voice-key", "https://api.openai.com/v1"),
+    )
     assert ts.OpenAIStreamer.available() is True
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "")
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: None,
+    )
     assert ts.OpenAIStreamer.available() is False
-    # tts.openai.api_key from config.yaml counts too
-    monkeypatch.setattr(ts, "_openai_config_api_key", lambda: "cfg-key")
-    assert ts.OpenAIStreamer.available() is True
 
 
 def test_openai_streamer_prefers_configured_api_key(monkeypatch):
@@ -139,8 +149,11 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
             self.audio = MagicMock()
             self.audio.speech.with_streaming_response = _StreamingCreate()
 
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "env-key")
-    monkeypatch.setattr(ts, "get_env_value", lambda key, *args: None)
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: ("cfg-key", "http://local-tts.example/v1"),
+    )
     monkeypatch.setattr("openai.OpenAI", _OpenAI)
 
     config = {
@@ -152,6 +165,17 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert streamer is not None
     assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
     assert captured["client"]["api_key"] == "cfg-key"
+    assert captured["client"]["base_url"] == "http://local-tts.example/v1"
+    assert captured["client"]["max_retries"] == 0
+
+
+def test_managed_openai_backend_uses_sync_pipeline(monkeypatch):
+    monkeypatch.setattr(
+        ts,
+        "_resolve_openai_streaming_config",
+        lambda _config=None: None,
+    )
+    assert ts.resolve_streaming_provider({"provider": "openai"}) is None
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
@@ -829,6 +853,7 @@ def _timed_sync_run(monkeypatch, sentences, *, synth_s=0.12, play_s=0.12,
             fh.write(b"x" * 100)
         with lock:
             events.append(("synth", text, t0, time.monotonic() - origin))
+        return json.dumps({"success": True, "file_path": output_path})
 
     def fake_play(path):
         t0 = time.monotonic() - origin
@@ -896,6 +921,32 @@ def test_sync_pipeline_stop_skips_queued_playback(monkeypatch):
     assert stop.is_set() and done.is_set()
 
 
+def test_sync_pipeline_propagates_stop_to_inflight_synthesis(monkeypatch):
+    from tools import tts_tool
+
+    started = threading.Event()
+    cancelled = threading.Event()
+    stop = threading.Event()
+
+    def fake_synth(**_kwargs):
+        active_cancel_event = tts_tool._current_tts_cancel_event()
+        assert active_cancel_event is stop
+        started.set()
+        assert active_cancel_event.wait(timeout=1)
+        cancelled.set()
+        return json.dumps({"success": False, "error": "cancelled"})
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+
+    pipeline = tts_tool._SyncSentencePipeline(stop)
+    pipeline.speak("Cancel this synthesis.")
+    assert started.wait(timeout=1)
+    stop.set()
+    pipeline.close()
+
+    assert cancelled.is_set()
+
+
 def test_sync_pipeline_cleans_temp_files(monkeypatch):
     from tools import tts_tool
 
@@ -915,3 +966,411 @@ def test_sync_pipeline_cleans_temp_files(monkeypatch):
     assert created, "expected temp files to be created via mkstemp"
     leftovers = [p for p in created if os.path.exists(p)]
     assert not leftovers, f"temp files not cleaned: {leftovers}"
+
+
+@pytest.mark.parametrize("suffix", [".opus", ".m4a"])
+def test_sync_pipeline_plays_provider_returned_path_and_cleans_placeholder(
+    monkeypatch, suffix
+):
+    from tools import tts_tool
+
+    placeholders = []
+    provider_outputs = []
+    played = []
+    real_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        placeholders.append(path)
+        return fd, path
+
+    def fake_synth(text, output_path):
+        del text
+        provider_path = os.path.splitext(output_path)[0] + suffix
+        with open(provider_path, "wb") as output:
+            output.write(b"opus")
+        provider_outputs.append(provider_path)
+        return json.dumps({"success": True, "file_path": provider_path})
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = lambda path: played.append(
+        (path, Path(path).read_bytes())
+    )
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Provider-selected output format.")
+    pipeline.close()
+
+    assert len(played) == 1
+    assert Path(played[0][0]).suffix == suffix
+    assert played[0][1] == b"opus"
+    assert not [path for path in placeholders + provider_outputs if os.path.exists(path)]
+
+
+def test_sync_pipeline_uses_real_command_provider_returned_path(monkeypatch):
+    from tools import tts_tool
+
+    provider_outputs = []
+    played = []
+
+    def fake_command(command, _timeout, env_passthrough=None):
+        del env_passthrough
+        output_path = shlex.split(command, posix=os.name != "nt")[-1].strip('"')
+        Path(output_path).write_bytes(b"command audio")
+        provider_outputs.append(output_path)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(
+        tts_tool,
+        "_load_tts_config",
+        lambda: {
+            "provider": "test-command",
+            "providers": {
+                "test-command": {
+                    "type": "command",
+                    "command": "fake-tts {output_path}",
+                    "output_format": "m4a",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(tts_tool, "_run_command_tts", fake_command)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = lambda path: played.append(
+        (path, Path(path).read_bytes())
+    )
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Real command provider path.")
+    pipeline.close()
+
+    assert len(played) == 1
+    assert Path(played[0][0]).suffix == ".m4a"
+    assert played[0][1] == b"command audio"
+    assert not [path for path in provider_outputs if os.path.exists(path)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires directory symlinks")
+def test_sync_pipeline_accepts_equivalent_symlink_path(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    alias_dir = tmp_path / "alias"
+    try:
+        alias_dir.symlink_to(real_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+    returned_paths = []
+    played = []
+    real_mkdtemp = tempfile.mkdtemp
+    mkdtemp_calls = 0
+
+    def synthesis_dir_first(**kwargs):
+        nonlocal mkdtemp_calls
+        mkdtemp_calls += 1
+        if mkdtemp_calls == 1:
+            return str(real_dir)
+        return real_mkdtemp(**kwargs)
+
+    def fake_synth(text, output_path):
+        del text
+        with open(output_path, "wb") as output:
+            output.write(b"mp3")
+        alias_path = str(alias_dir / os.path.basename(output_path))
+        returned_paths.append(alias_path)
+        return json.dumps({"success": True, "file_path": alias_path})
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", synthesis_dir_first)
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = lambda path: played.append(
+        (path, Path(path).read_bytes())
+    )
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Equivalent temporary path.")
+    pipeline.close()
+
+    assert len(played) == 1
+    assert played[0][1] == b"mp3"
+    assert not [path for path in returned_paths if os.path.exists(path)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires directory symlinks")
+def test_sync_pipeline_uses_canonical_path_after_symlink_switch(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    alias_dir = tmp_path / "alias"
+    try:
+        alias_dir.symlink_to(real_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+    provider_paths = []
+    real_mkdtemp = tempfile.mkdtemp
+    mkdtemp_calls = 0
+
+    def synthesis_dir_first(**kwargs):
+        nonlocal mkdtemp_calls
+        mkdtemp_calls += 1
+        if mkdtemp_calls == 1:
+            return str(real_dir)
+        return real_mkdtemp(**kwargs)
+
+    def fake_synth(text, output_path):
+        del text
+        provider_path = Path(output_path).with_suffix(".wav")
+        provider_path.write_bytes(b"provider audio")
+        provider_paths.append(provider_path)
+        alias_path = alias_dir / provider_path.name
+        return json.dumps({"success": True, "file_path": str(alias_path)})
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkdtemp", synthesis_dir_first)
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    artifact = None
+    try:
+        artifact = pipeline._synthesize_to_tmp("Canonical temporary path.")
+        assert artifact is not None
+        assert Path(artifact.path).parent == Path(artifact.directory)
+
+        alias_dir.unlink()
+        alias_dir.symlink_to(decoy_dir, target_is_directory=True)
+        decoy_path = decoy_dir / provider_paths[0].name
+        decoy_path.write_bytes(b"keep me")
+
+        artifact.cleanup()
+        assert decoy_path.read_bytes() == b"keep me"
+    finally:
+        if artifact is not None:
+            artifact.cleanup()
+        pipeline.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires file symlinks")
+def test_sync_pipeline_rejects_placeholder_replaced_with_external_symlink(
+    monkeypatch, tmp_path
+):
+    from tools import tts_tool
+
+    protected_path = tmp_path / "protected.mp3"
+    protected_path.write_bytes(b"keep me")
+    probe_path = tmp_path / "symlink-probe"
+    try:
+        probe_path.symlink_to(protected_path)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this platform")
+    probe_path.unlink()
+    played = []
+    synthesis_dirs = []
+
+    def fake_synth(text, output_path):
+        del text
+        synthesis_dirs.append(str(Path(output_path).parent))
+        os.unlink(output_path)
+        os.symlink(protected_path, output_path)
+        return json.dumps({"success": True, "file_path": output_path})
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Replaced placeholder path.")
+    pipeline.close()
+
+    assert played == []
+    assert protected_path.read_bytes() == b"keep me"
+    assert synthesis_dirs
+    assert all(not os.path.exists(path) for path in synthesis_dirs)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires directory symlinks")
+def test_sync_pipeline_cleanup_does_not_follow_replaced_root(tmp_path):
+    from tools import tts_tool
+
+    synthesis_dir = tmp_path / "hermes-tts-synthesis-owned"
+    synthesis_dir.mkdir()
+    synthesis_dir_stat = os.lstat(synthesis_dir)
+    victim_dir = tmp_path / "victim"
+    victim_dir.mkdir()
+    victim_file = victim_dir / "keep.txt"
+    victim_file.write_text("keep me", encoding="utf-8")
+
+    synthesis_dir.rmdir()
+    try:
+        synthesis_dir.symlink_to(victim_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+
+    tts_tool._SyncSentencePipeline._cleanup_private_temp_dir(
+        str(synthesis_dir), synthesis_dir_stat, -1, ()
+    )
+
+    assert victim_file.read_text(encoding="utf-8") == "keep me"
+    assert synthesis_dir.is_symlink()
+
+
+def test_sync_pipeline_cleanup_does_not_delete_replacement_directory(tmp_path):
+    from tools import tts_tool
+
+    synthesis_dir = tmp_path / "hermes-tts-synthesis-owned"
+    synthesis_dir.mkdir()
+    synthesis_dir_stat = os.lstat(synthesis_dir)
+    synthesis_dir.rmdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    marker = replacement / "keep.txt"
+    marker.write_text("keep me", encoding="utf-8")
+    replacement.rename(synthesis_dir)
+
+    tts_tool._SyncSentencePipeline._cleanup_private_temp_dir(
+        str(synthesis_dir), synthesis_dir_stat, -1, ()
+    )
+
+    assert (synthesis_dir / "keep.txt").read_text(encoding="utf-8") == "keep me"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires O_NOFOLLOW symlinks")
+def test_sync_pipeline_rejects_symlink_swap_during_output_open(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    protected_path = tmp_path / "protected.wav"
+    protected_path.write_bytes(b"keep me")
+    provider_output = []
+    played = []
+    synthesis_dirs = []
+    real_os_open = os.open
+
+    def fake_synth(text, output_path):
+        del text
+        synthesis_dirs.append(str(Path(output_path).parent))
+        path = str(Path(output_path).with_suffix(".wav"))
+        Path(path).write_bytes(b"provider audio")
+        provider_output.append(path)
+        return json.dumps({"success": True, "file_path": path})
+
+    def swapping_open(path, flags, *args, **kwargs):
+        same_path = provider_output and (
+            os.path.normcase(os.path.realpath(path))
+            == os.path.normcase(os.path.realpath(provider_output[0]))
+        )
+        if same_path:
+            os.unlink(path)
+            os.symlink(protected_path, path)
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    monkeypatch.setattr(tts_tool.os, "open", swapping_open)
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Swap during output open.")
+    pipeline.close()
+
+    assert played == []
+    assert protected_path.read_bytes() == b"keep me"
+    assert synthesis_dirs
+    assert all(not os.path.exists(path) for path in synthesis_dirs)
+
+
+def test_sync_pipeline_rejects_unowned_provider_path(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    protected_path = tmp_path / "existing.wav"
+    protected_path.write_bytes(b"keep me")
+    placeholders = []
+    played = []
+    real_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        placeholders.append(path)
+        return fd, path
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(
+        tts_tool,
+        "text_to_speech_tool",
+        lambda **_kwargs: json.dumps(
+            {"success": True, "file_path": str(protected_path)}
+        ),
+    )
+    fake_vm = MagicMock()
+    fake_vm.play_audio_file.side_effect = played.append
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    pipeline.speak("Unexpected output path.")
+    pipeline.close()
+
+    assert played == []
+    assert protected_path.read_bytes() == b"keep me"
+    assert not [path for path in placeholders if os.path.exists(path)]
+
+
+def test_sync_pipeline_rejects_unsuccessful_tool_result(monkeypatch):
+    from tools import tts_tool
+
+    placeholders = []
+    real_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        placeholders.append(path)
+        return fd, path
+
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(
+        tts_tool,
+        "text_to_speech_tool",
+        lambda **_kwargs: json.dumps({"success": False, "error": "quota exhausted"}),
+    )
+
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    try:
+        assert pipeline._synthesize_to_tmp("Rejected synthesis.") is None
+    finally:
+        pipeline.close()
+
+    assert not [path for path in placeholders if os.path.exists(path)]
+
+
+def test_sync_pipeline_propagates_profile_context(monkeypatch):
+    from tools import tts_tool
+
+    profile_marker: ContextVar[str] = ContextVar("profile_marker", default="missing")
+    seen = []
+
+    def fake_synth(text, output_path):
+        seen.append((text, profile_marker.get()))
+        with open(output_path, "wb") as output:
+            output.write(b"mp3")
+        return json.dumps({"success": True, "file_path": output_path})
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synth)
+    fake_vm = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "tools.voice_mode", fake_vm)
+
+    token = profile_marker.set("profile-a")
+    try:
+        pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+        pipeline.speak("Profile scoped sentence.")
+        pipeline.close()
+    finally:
+        profile_marker.reset(token)
+
+    assert seen == [("Profile scoped sentence.", "profile-a")]

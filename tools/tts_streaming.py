@@ -27,7 +27,6 @@ import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
 
-from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
 
 logger = logging.getLogger(__name__)
@@ -252,13 +251,28 @@ class ElevenLabsStreamer(StreamingTTSProvider):
         )
 
 
-def _openai_config_api_key() -> str:
-    """Return ``tts.openai.api_key`` from config.yaml, or empty string."""
+def _resolve_openai_streaming_config(
+    tts_config: Optional[Dict] = None,
+) -> Optional[tuple[str, str]]:
+    """Return a direct OpenAI key/base pair, never managed credentials.
+
+    A managed OpenAI gateway returns encoded MP3/Opus, not the raw PCM
+    contract required by this streamer. In that case the caller deliberately
+    falls back to the shared per-sentence sync pipeline. Non-OpenAI plugin
+    providers, including Zettlab, naturally take that same sync path.
+    """
     try:
-        openai_cfg = (_load_tts_config().get("openai") or {})
+        from tools.tts_tool import _resolve_openai_audio_client_config
+
+        resolved = tts_config if tts_config is not None else _load_tts_config()
+        api_key, base_url, is_managed = _resolve_openai_audio_client_config(
+            resolved
+        )
     except Exception:
-        return ""
-    return openai_cfg.get("api_key") or ""
+        return None
+    if is_managed:
+        return None
+    return api_key, base_url
 
 
 @register("openai")
@@ -269,19 +283,16 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     @staticmethod
     def available() -> bool:
-        return bool(_openai_config_api_key() or resolve_openai_audio_api_key())
+        return _resolve_openai_streaming_config() is not None
 
     def stream(self, text: str) -> Iterator[bytes]:
         from openai import OpenAI
 
-        client = OpenAI(
-            api_key=(self.section.get("api_key") or resolve_openai_audio_api_key()),
-            base_url=(
-                self.section.get("base_url")
-                or get_env_value("OPENAI_BASE_URL")
-                or None
-            ),
-        )
+        direct = _resolve_openai_streaming_config(self.tts_config)
+        if direct is None:
+            raise RuntimeError("managed OpenAI TTS uses the sync audio pipeline")
+        api_key, base_url = direct
+        client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         model = self.section.get("model", "gpt-4o-mini-tts")
         voice = self.section.get("voice", "alloy")
         with client.audio.speech.with_streaming_response.create(

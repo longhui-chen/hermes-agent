@@ -1,17 +1,15 @@
 """Search Memory Tool — unified read-only recall over persistent memory.
 
 Two-layer retrieval:
-  1. If an activated memory provider object exposes a callable
-     ``search(query, top_k)`` method (an OPTIONAL provider extension point —
-     none of the in-tree providers implement it today; detected via hasattr,
-     skipped when absent), the query is proxied to it.
-  2. Otherwise the built-in curated memory is searched: MEMORY.md and USER.md
-     entries (``§``-delimited, see tools/memory_tool.py) are scored with a
-     case-insensitive token-level match (hit count + full-phrase bonus — no
-     external dependencies, no embeddings) and the top_k entries returned.
+  1. Built-in curated memory searches MEMORY.md and USER.md entries.
+  2. An activated provider may expose ``search(query, top_k)`` plus a
+     ``search_memory_mode()`` policy. ``replace`` preserves the legacy
+     provider-first contract, ``supplement`` combines both sources, and
+     ``disabled`` leaves native recall untouched.
 
 Result contract (JSON string):
-    {"items": [{"id", "source", "excerpt", "score"}, ...], "provider"?: str}
+    {"items": [{"id", "source", "excerpt", "score"}, ...],
+     "provider"?: str, "provider_status"?: str}
 
 ``id`` is a short content hash (sha1, first 12 hex chars) of the full entry —
 stable across sessions so later memory.citations work can reference it.
@@ -177,14 +175,28 @@ def _normalize_provider_items(raw, provider_name: str, top_k: int):
                 element.get("excerpt")
                 or element.get("text")
                 or element.get("content")
+                or element.get("statement")
+                or element.get("fact")
                 or ""
             )
             try:
-                score = float(element.get("score", 0.0))
+                score = float(
+                    element.get(
+                        "score",
+                        element.get(
+                            "relevance_score",
+                            element.get("recall_score", element.get("relevance", 0.0)),
+                        ),
+                    )
+                )
             except (TypeError, ValueError):
                 score = 0.0
             items.append({
-                "id": str(element.get("id") or _entry_id(text)),
+                "id": str(
+                    element.get("id")
+                    or element.get("memory_id")
+                    or _entry_id(text)
+                ),
                 "source": str(element.get("source") or provider_name),
                 "excerpt": _excerpt(text),
                 "score": score,
@@ -200,9 +212,7 @@ def _normalize_provider_items(raw, provider_name: str, top_k: int):
 
 
 def _find_provider_search(memory_manager):
-    """Return (provider_name, search_callable) for the first active provider
-    exposing a callable ``search``, or None. Optional extension point — none
-    of the in-tree providers implement it today."""
+    """Return the first active provider's name, search callable, and policy."""
     if memory_manager is None:
         return None
     try:
@@ -212,12 +222,77 @@ def _find_provider_search(memory_manager):
     for provider in providers:
         search_fn = getattr(provider, "search", None)
         if callable(search_fn):
+            mode = "replace"
+            mode_fn = getattr(provider, "search_memory_mode", None)
+            if callable(mode_fn):
+                try:
+                    mode = str(mode_fn() or "replace").strip().lower()
+                except Exception:
+                    logger.warning(
+                        "memory provider search policy failed; disabling its search",
+                        exc_info=True,
+                    )
+                    continue
+            if mode == "disabled":
+                continue
+            if mode not in {"replace", "supplement"}:
+                logger.warning(
+                    "memory provider returned unsupported search policy %r; disabling its search",
+                    mode,
+                )
+                continue
             try:
                 name = str(getattr(provider, "name", "") or "")
             except Exception:
                 name = ""
-            return (name or type(provider).__name__, search_fn)
+            return (name or type(provider).__name__, search_fn, mode)
     return None
+
+
+def _provider_status(raw) -> str:
+    if isinstance(raw, dict):
+        status = str(raw.get("status") or "").strip().lower()
+        if status:
+            return status[:64]
+        items = raw.get("items")
+        return "ok" if isinstance(items, list) and items else "empty"
+    return "ok" if isinstance(raw, list) and raw else "empty"
+
+
+def _failure_status(failure) -> str:
+    if isinstance(failure, TimeoutError) or "timed out" in str(failure).lower():
+        return "timeout"
+    return "unavailable"
+
+
+def _merge_supplement_items(curated, provider_items, top_k):
+    """Round-robin native-first so both ranked sources can contribute.
+
+    Scores from local token matching and external retrieval are not directly
+    comparable. Interleaving preserves each source's own ranking, keeps native
+    memory primary, and still gives a supplemental provider useful slots.
+    """
+    merged = []
+    seen_ids = set()
+    seen_text = set()
+    width = max(len(curated), len(provider_items))
+    for index in range(width):
+        for items in (curated, provider_items):
+            if index >= len(items):
+                continue
+            item = items[index]
+            item_id = str(item.get("id") or "").strip()
+            text_key = re.sub(r"\s+", " ", str(item.get("excerpt") or "").strip().lower())
+            if (item_id and item_id in seen_ids) or (text_key and text_key in seen_text):
+                continue
+            merged.append(item)
+            if item_id:
+                seen_ids.add(item_id)
+            if text_key:
+                seen_text.add(text_key)
+            if len(merged) >= top_k:
+                return merged
+    return merged
 
 
 def _call_provider_search_bounded(provider_name, search_fn, query, top_k):
@@ -262,17 +337,31 @@ def search_memory_tool(args, **kw):
         if not query:
             return json.dumps({"items": []}, ensure_ascii=False)
 
-        # Layer 1: proxy to an activated provider's optional search().
+        # A provider can replace or supplement the native curated layer.
         # ``memory_manager`` is threaded in by the agent runtime
         # (agent/agent_runtime_helpers.py), mirroring how the memory tool
         # receives its store; registry-only dispatch paths fall through to
         # the curated layer.
-        found = _find_provider_search(kw.get("memory_manager"))
+        found = (
+            _find_provider_search(kw.get("memory_manager"))
+            if kw.get("supplement_external", True)
+            else None
+        )
         if found is not None:
-            provider_name, search_fn = found
+            provider_name, search_fn, mode = found
             raw, failure = _call_provider_search_bounded(provider_name, search_fn, query, top_k)
             if failure is None:
                 items = _normalize_provider_items(raw, provider_name, top_k)
+                if mode == "supplement":
+                    curated = _search_curated(query, top_k)
+                    return json.dumps(
+                        {
+                            "items": _merge_supplement_items(curated, items, top_k),
+                            "provider": provider_name,
+                            "provider_status": _provider_status(raw),
+                        },
+                        ensure_ascii=False,
+                    )
                 return json.dumps(
                     {"items": items, "provider": provider_name},
                     ensure_ascii=False,
@@ -283,6 +372,15 @@ def search_memory_tool(args, **kw):
                 "memory provider '%s' search unusable (%s), falling back to curated memory",
                 provider_name, failure,
             )
+            if mode == "supplement":
+                return json.dumps(
+                    {
+                        "items": _search_curated(query, top_k),
+                        "provider": provider_name,
+                        "provider_status": _failure_status(failure),
+                    },
+                    ensure_ascii=False,
+                )
 
         # Layer 2: built-in curated memory (MEMORY.md + USER.md).
         return json.dumps({"items": _search_curated(query, top_k)}, ensure_ascii=False)
@@ -304,5 +402,8 @@ registry.register(
     # registry merge, not the static catalog, so platform composite
     # reverse-mapping keeps working (see toolsets issue #49622).
     check_fn=check_memory_requirements,
+    # Explicit native memory recall should be directly available. In smart
+    # Deep Memory mode this is also the only model-facing recall entry point.
+    defer_to_tool_search=False,
     emoji="🔎",
 )

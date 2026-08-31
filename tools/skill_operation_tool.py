@@ -766,7 +766,7 @@ def _run_skill_operation(args: object) -> str:
             method="POST",
             path=path,
             body=envelope,
-            retry_read=False,
+            retry_read=declared.mode == "read",
             timeout=(
                 _app_data._READ_TIMEOUT
                 if declared.mode == "read"

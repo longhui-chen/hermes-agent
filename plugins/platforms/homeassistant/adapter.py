@@ -65,11 +65,17 @@ logger = logging.getLogger(__name__)
 
 def check_ha_requirements() -> bool:
     """Check if Home Assistant runtime dependencies are available."""
-    return AIOHTTP_AVAILABLE
+    return AIOHTTP_AVAILABLE and os.environ.get(
+        "ZETTLAB_HA_BRIDGE_ONLY", ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}
 
 
 def validate_ha_config(config: PlatformConfig) -> bool:
     """Return True when Home Assistant has enough credential config to connect."""
+    if os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return False
     token = (getattr(config, "token", None) or _get_scoped_secret("HASS_TOKEN", "")).strip()
     return bool(token)
 
@@ -507,6 +513,15 @@ async def _standalone_send(
     signature parity with other standalone senders.  HA notifications have
     no native threading or attachment model — these arguments are ignored.
     """
+    if os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return {
+            "error": (
+                "Home Assistant direct Hermes access is disabled; use the "
+                "Zettlab smart-home bridge"
+            )
+        }
     if not AIOHTTP_AVAILABLE:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
 
@@ -565,6 +580,10 @@ def _is_connected(config) -> bool:
     vars.  Matches what the legacy connected-platforms check did before
     this migration.
     """
+    if os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return False
     import hermes_cli.gateway as gateway_mod
     return bool((gateway_mod.get_env_value("HASS_TOKEN") or "").strip())
 

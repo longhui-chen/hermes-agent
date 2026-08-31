@@ -470,6 +470,13 @@ export interface Translations {
       attachmentSizeDesc: string
       attachmentSizeUnit: string
       attachmentSizeLabel: string
+      deepMemoryModeTitle: string
+      deepMemoryModeOff: string
+      deepMemoryModeSmart: string
+      deepMemoryModeAlways: string
+      deepMemoryModeOffDesc: string
+      deepMemoryModeSmartDesc: string
+      deepMemoryModeAlwaysDesc: string
     }
     quickEntry: {
       enabledTitle: string

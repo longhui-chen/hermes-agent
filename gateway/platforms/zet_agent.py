@@ -96,6 +96,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.prestream_timing import PrestreamTiming
+
 try:
     from aiohttp import web  # noqa: F401  -- import for type only
 except ImportError:
@@ -114,6 +116,7 @@ from gateway.platforms.api_server import (
     _REQUEST_OPTION_MISSING,
     _ProviderAuthResolutionError,
     _api_request_profile,
+    _prestream_timing_context,
     _apply_runtime_agent_overrides,
     _chat_finish_reason_from_result,
     _clean_request_string,
@@ -125,6 +128,11 @@ from gateway.platforms.api_server import (
     _strip_skill_display_token,
 )
 from gateway.platforms.base import SendResult
+from gateway.zet_agent_runtime_cache import (
+    RuntimeShellCache,
+    RuntimeShellCacheKey,
+    RuntimeShellLease,
+)
 from gateway.deep_memory_identity import bounded_identity_header as _bounded_identity_header
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
@@ -135,8 +143,24 @@ _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
 
+
+def _observe_queued_attachment(
+    prestream_timing: Optional[PrestreamTiming] = None,
+) -> None:
+    """Mark an attachment enqueue without retaining or inspecting its payload."""
+    try:
+        timing = prestream_timing or _prestream_timing_context.get()
+        if timing is not None:
+            timing.observe_queued_semantic("attachment")
+    except Exception:
+        return
+
+
 _zettlab_request_account_id: ContextVar[str] = ContextVar(
     "zettlab_request_account_id", default=""
+)
+_zet_runtime_shell_cache_allowed: ContextVar[bool] = ContextVar(
+    "zet_runtime_shell_cache_allowed", default=False
 )
 
 
@@ -241,6 +265,150 @@ _deep_memory_subject: ContextVar[str] = ContextVar(
     "zettlab_deep_memory_subject", default=""
 )
 
+#: onboarding agent 关闭的硬期限。
+#: ⛔ 不许拍脑袋:与 ``gateway/run.py`` 的
+#: ``_ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT`` 同量纲的一个量级
+#: (关一个 agent 比断一个 adapter 重,给 6 倍余量)。
+#: ⭐ 关键是它**有界** —— 裸 barrier 会让 unload/reload 永久挂住。
+_ONBOARDING_CLOSE_TIMEOUT_SECONDS = 30.0
+
+
+_SILENT_AUTOMATION_ALLOWED_TOOLS = frozenset({
+    # Generic silent turns retain the existing narrow bootstrap. Hardware
+    # helpers still require their independent attested scope before dispatch.
+    "skill_view",
+    "terminal",
+})
+
+_VIDEO_EDIT_SKILL_SLUGS = frozenset({
+    "video-edit-workflow-mini",
+    "video-edit-workflow",
+    "video-edit",
+    "video_edit",
+})
+
+
+def _is_video_edit_skill_slug(slug: str) -> bool:
+    normalized = str(slug or "").strip().lower().strip("/")
+    return normalized in _VIDEO_EDIT_SKILL_SLUGS
+
+
+def _video_edit_tool_names() -> frozenset[str]:
+    """Return the plugin's canonical tool names for silent policy filtering."""
+    try:
+        from plugins.video_edit.tools import HANDLERS
+
+        return frozenset(str(name).strip() for name in HANDLERS)
+    except Exception:
+        # A missing plugin must fail closed rather than turn a name prefix into
+        # an implicit capability for an unrelated installed plugin.
+        return frozenset()
+
+
+def _is_video_edit_tool_name(name: str) -> bool:
+    return str(name or "").strip() in _video_edit_tool_names()
+
+
+def _agent_tool_name(tool: Any) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return str(tool.get("name") or "")
+
+
+def _apply_execution_policy(
+    agent: Any,
+    execution_policy: str,
+    trusted_skill_slug: str = "",
+) -> None:
+    """Apply silent tool visibility without creating a video auth channel.
+
+    Video editing is an ordinary plugin toolset.  A silent video turn gets the
+    same bounded plugin tools directly; it does not first expose ``skill_view``
+    or wait for a trusted-skill attestation.  Other silent turns retain the
+    existing generic bootstrap and hardware fail-closed scope.
+    """
+    if execution_policy != "silent_automation":
+        return
+    video_edit_turn = _is_video_edit_skill_slug(trusted_skill_slug)
+
+    def _allowed_name(name: str) -> bool:
+        if video_edit_turn:
+            return _is_video_edit_tool_name(name)
+        return name in _SILENT_AUTOMATION_ALLOWED_TOOLS
+
+    allowed_tools = [
+        tool
+        for tool in list(getattr(agent, "tools", ()) or ())
+        if _allowed_name(_agent_tool_name(tool))
+    ]
+    allowed_names = {
+        name
+        for name in set(getattr(agent, "valid_tool_names", ()) or ())
+        if _allowed_name(name)
+    }
+    has_video_tools = any(
+        _is_video_edit_tool_name(_agent_tool_name(tool))
+        for tool in allowed_tools
+    )
+    if video_edit_turn and not has_video_tools:
+        # ``model_tools`` may have replaced non-core plugin schemas with the
+        # tool-search bridge before this policy is applied.  Filtering that
+        # assembled list would leave a silent video turn with zero executable
+        # tools, because ``tool_search``/``tool_call`` are intentionally not
+        # video business tools.  Re-read the same enabled toolsets with the
+        # progressive-disclosure assembly disabled, then apply the canonical
+        # plugin HANDLERS allowlist below. This is tool discovery, not an auth hop.
+        try:
+            from model_tools import get_tool_definitions
+
+            direct_tools = get_tool_definitions(
+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            direct_video_tools = [
+                tool for tool in direct_tools
+                if _is_video_edit_tool_name(_agent_tool_name(tool))
+            ]
+            if direct_video_tools:
+                allowed_tools = direct_video_tools
+                allowed_names = {
+                    _agent_tool_name(tool) for tool in direct_video_tools
+                }
+        except Exception:
+            # Keep the original filtered snapshot as a bounded degradation;
+            # the model will receive a structured unavailable-tool response.
+            logger.warning(
+                "[zet_agent] direct video plugin tool refresh failed",
+                exc_info=True,
+            )
+    # Keep the bounded snapshot private on the agent so a later MCP refresh
+    # cannot widen the toolset behind the policy.
+    agent._zet_agent_execution_policy = execution_policy
+    agent._zet_agent_execution_policy_tools = allowed_tools
+    agent._zet_agent_execution_policy_valid_tool_names = allowed_names
+    if video_edit_turn:
+        # The plugin owns its own bounded request/replay adapter.  Keeping the
+        # tools visible avoids a synthetic skill_view/attestation hop and lets
+        # the model continue a long or resumed edit directly from durable state.
+        agent.tools = list(allowed_tools)
+        agent.valid_tool_names = set(allowed_names)
+    else:
+        agent.tools = [
+            tool for tool in allowed_tools if _agent_tool_name(tool) == "skill_view"
+        ]
+        agent.valid_tool_names = {"skill_view"} & allowed_names
+    agent._zet_agent_video_edit_turn = video_edit_turn
+    # A between-turn MCP refresh rebuilds the complete configured toolset and
+    # would silently reintroduce non-allowlisted tools before model dispatch.
+    # This agent exists for one internal turn, so preserve the exact snapshot.
+    agent._skip_mcp_refresh = True
+
+
 async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
     """Keep a cancelled request alive until its non-cancellable worker exits.
 
@@ -295,6 +463,17 @@ _SEEN_INIT_LOCK = threading.Lock()
 # Default port for the Zet Agent platform. Distinct from API_SERVER's
 # 8642 so both platforms can run side-by-side during the migration.
 ZET_AGENT_DEFAULT_PORT = 7900
+
+# Phase-2 conservative starting point.  These are deliberately process-local
+# implementation bounds rather than device configuration until .112 RSS tests
+# establish a product-level budget.
+ZET_RUNTIME_SHELL_CACHE_CAP = 8
+ZET_RUNTIME_SHELL_CACHE_IDLE_TTL_SECONDS = 15 * 60.0
+ZET_RUNTIME_SHELL_PROMPT_INVALIDATE_TIMEOUT_SECONDS = 5.0
+# Agent construction is CPU-heavy on the 2 GB device.  Keep proactive work
+# below the ordinary runtime-cache capacity and small enough that a burst of
+# fresh sessions cannot monopolize the process before real turns arrive.
+ZET_RUNTIME_SHELL_PREWARM_MAX_TASKS = 2
 
 # How long the agent thread will block waiting for a user response to
 # a clarify prompt before giving up and returning an empty string. The
@@ -351,6 +530,52 @@ def _approval_timeout_seconds() -> float:
 # reconnects ONLY this server so a connector-policy change is picked up
 # without bouncing any other MCP server the agent may have connected.
 ZETTLAB_CONNECTORS_SERVER_NAME = "zettlab_connectors"
+
+
+def _correlated_error_response(
+    operation: str,
+    code: str,
+    *,
+    status: int,
+    err_type: str,
+    exc_info: bool = True,
+    user_message: str,
+) -> "web.Response":
+    """记录完整异常，仅向调用方返回稳定、可追踪的安全错误。"""
+    correlation_id = uuid.uuid4().hex[:12]
+    logger.error(
+        "[zet_agent] %s failed (correlation_id=%s)",
+        operation,
+        correlation_id,
+        exc_info=exc_info,
+    )
+    return web.json_response(
+        _openai_error(
+            f"{user_message} If the "
+            f"problem persists, provide reference {correlation_id}.",
+            err_type=err_type,
+            code=code,
+        ),
+        status=status,
+    )
+
+
+def _reload_unavailable_response(
+    operation: str,
+    code: str,
+    *,
+    exc_info: bool = True,
+    user_message: str = "Runtime configuration could not be refreshed.",
+) -> "web.Response":
+    """记录完整异常，仅向调用方返回稳定、可追踪的重载错误。"""
+    return _correlated_error_response(
+        operation,
+        code,
+        status=500,
+        err_type="server_error",
+        exc_info=exc_info,
+        user_message=f"{user_message} Retry the request.",
+    )
 
 
 # Zettlab APP 平台的工作风格补丁。
@@ -421,6 +646,9 @@ _ZET_WORKDIR_SECTION = """\
 ## 工作目录与路径
 
 - 读写用户文件：一律用绝对路径（如 `/volume1/subvol/data/...`），不要依赖相对路径。
+- 已连接电脑的授权文件夹是唯一例外：`pc_file` 的路径只能相对于用户已授权的文件夹。用户只说“查看电脑文件”而没有指定子目录时，立即调用 `pc_file`，用 `action="list"`、`path="."` 列出授权根目录；不要索要、猜测或生成电脑绝对路径。
+- 操作已连接电脑上的本机应用时使用 `pc_ui`：名称不确定或用户使用“浏览器”“飞书”等泛称时，先调用 `list_apps`，再把返回的准确 `name` 传给 `launch`；随后调用 `list_windows`，按 `title`、`role` 和用户目标选择主窗口，把它返回的准确 `pid`、`window_id` 连同 `app` 传给 `snapshot`。若首次快照只是通知、助手或非目标弹窗，不要立刻要求用户手工切窗：重新 `list_windows`，最多再检查 3 个同应用可见窗口；需要检查隐藏或其它 Space 的已知窗口时用 `list_windows(include_hidden=true)`，再仅对返回的精确 `pid + window_id` 调用 `snapshot(include_hidden=true)`，对匹配目标的窗口执行 `focus` 后刷新普通快照。不得自动关闭登录、授权、权限、未保存内容或其它敏感对话框。每次交互只复用最新快照返回的 `pid`、`window_id` 和 `element`。优先按语义元素使用 `invoke`、`set_value`、`type_text`、`scroll` 和 `keystroke`；也可使用 Codex Computer Use 兼容别名 `capture`、`double_click`、`right_click`、`middle_click`、`type`、`key`，但 `click`/别名必须传最新快照的 `element` 或 `coordinate=[x,y]`，不能把计算器上的按钮文字放进 `button`（`button` 仅表示鼠标 left/right/middle）。`keystroke` 只传按键或组合键，绝不能把网址或普通文本当作按键。如果可访问性树没有目标控件，对同一精确窗口重新 `snapshot(include_screenshot=true)`，仅基于这张新鲜截图使用 `click`、`drag`、`type_text`、`scroll`、`keystroke`、`zoom` 的窗口坐标；需要跨应用整屏定位时先 `desktop_snapshot`，桌面坐标 `click`、`move_cursor`、`drag`、`type_text`、`scroll`、`keystroke` 会在目标电脑逐次确认。变更动作默认会自动返回同一目标的新鲜观察；仍需读取该观察确认结果，不要假定点击成功。菜单操作用 `invoke_menu`，窗口位置大小用 `set_window_frame`，剪贴板正文和 `kill_app` 均会触发目标电脑确认。不要改用 terminal、脚本、裸 CDP、模型猜测的坐标或控件。执行前若需要判断电脑状态，调用 `pc_node_status`；`connected=true` 且 `computer_use=false` 表示电脑 Host 在线但尚未发布桌面控制能力，应明确引导用户在硬件连接器中点击“开启电脑操作”并完成目标电脑的系统权限，而不是笼统声称当前会话没有工具。只有同应用候选窗口已有限检查完、视觉 fallback 也失败，或工具明确提示本机确认/权限不足时，才让用户在目标电脑处理。
+- 用户明确要求把电脑截图发送到当前聊天时，调用 `pc_ui` 或 `computer_use` 时设置 `share_screenshot=true`；否则截图仅用于模型观察，不要发送。
 - 相对路径没有稳定含义：文件工具在你还没跑过终端命令时把它解析到你自己的产出目录，一旦终端 `cd` 过或带 `workdir` 跑过命令，就改成跟着那个目录走。所以要落临时产物，写绝对路径，别靠相对路径。
 - 终端命令的锚点也不与文件工具共用：命令里的脚本、输入、输出参数都写绝对路径。刚用 write_file 写出的文件，交给命令时也要给绝对路径。"""
 
@@ -463,8 +691,22 @@ _ZET_ADDENDUM_TAIL = """\
 写入长期用户画像（memory 工具 target="user"，即 USER.md）时，必须使用简体中文。
 姓名、产品名、命令、代码标识符可以保留原文，但描述用户特征、偏好、沟通风格的正文必须写成中文。"""
 
+_ZET_SILENT_AUTOMATION_ADDENDUM = """\
+## 可信静默自动化
 
-def _zettlab_workflow_addendum(auto_execute: bool) -> str:
+这是由可信 transport 发起、无需用户交互的内部任务。直接执行请求中显式选择的工作流：
+- 不调用澄清、计划、todo 或消息发送工具；
+- 不读取或修改用户画像；工作流只能使用其受信输入中已经冻结的偏好；
+- 不等待用户确认，也不创建面向用户的中间进度或失败消息；
+- 只通过工作流规定的确定性结果边界报告最终产物。
+
+普通对话不得套用本段规则。"""
+
+
+def _zettlab_workflow_addendum(
+    auto_execute: bool,
+    execution_policy: str = "",
+) -> str:
     """Assemble the zet_agent workflow addendum with a capability-aware Plan-First
     section.
 
@@ -475,6 +717,8 @@ def _zettlab_workflow_addendum(auto_execute: bool) -> str:
     confirmation, matching the legacy confirm card and the global stop-and-wait
     PLAN_SCHEMA so no side effect runs before the user confirms.
     """
+    if execution_policy == "silent_automation":
+        return _ZET_SILENT_AUTOMATION_ADDENDUM + "\n"
     plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
     return "\n\n".join(
         (_ZET_ADDENDUM_HEAD, plan_first, _zet_workdir_section(), _ZET_ADDENDUM_TAIL)
@@ -590,8 +834,22 @@ class ZetAgentAdapter(APIServerAdapter):
         self._onboarding_agent_cache: "OrderedDict[tuple, tuple[Any, float]]" = (
             OrderedDict()
         )
+        self._onboarding_cleanup_retry_agents: Dict[int, tuple[str, Any]] = {}
+        self._onboarding_retiring_agents: Dict[int, tuple[str, Any]] = {}
         self._onboarding_agent_cache_cap = 8
         self._onboarding_agent_cache_ttl_seconds = 15 * 60
+
+        # Ordinary interactive Zet turns retain only a bounded, exclusively
+        # leased runtime shell.  Request callbacks/history are rebound and
+        # cleared every turn; profile/session identity and runtime signatures
+        # are checked before an idle entry can be leased again.
+        self._runtime_shell_cache = RuntimeShellCache(
+            capacity=ZET_RUNTIME_SHELL_CACHE_CAP,
+            idle_ttl_seconds=ZET_RUNTIME_SHELL_CACHE_IDLE_TTL_SECONDS,
+        )
+        self._runtime_shell_prewarm_tasks: Dict[
+            tuple[str, ...], asyncio.Task
+        ] = {}
 
         # Pending clarify prompts: {profile-home}|{session_id} ->
         # list[_ClarifyEntry] (FIFO). A bare session id is not a gateway
@@ -682,41 +940,825 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return self._api_key
 
+    @staticmethod
+    def _onboarding_profile_name(key: tuple) -> str:
+        return str(key[0]).strip().lower() if key else ""
+
+    def _claim_onboarding_owner_locked(self, profile_name: str, agent: Any) -> None:
+        owner_id = id(agent)
+        current = self._onboarding_retiring_agents.get(owner_id)
+        if current is not None:
+            if current[1] is agent:
+                raise RuntimeError("onboarding cache cleanup already in progress")
+            raise RuntimeError("onboarding cache ownership changed during cleanup")
+        self._onboarding_retiring_agents[owner_id] = (profile_name, agent)
+
+    def _claim_onboarding_owner(self, profile_name: str, agent: Any) -> None:
+        with self._onboarding_agent_cache_lock:
+            self._claim_onboarding_owner_locked(profile_name, agent)
+
+    def _finish_onboarding_owner(
+        self, profile_name: str, agent: Any, *, success: bool
+    ) -> None:
+        owner_id = id(agent)
+        with self._onboarding_agent_cache_lock:
+            retiring = self._onboarding_retiring_agents.get(owner_id)
+            if retiring is not None and retiring[1] is not agent:
+                raise RuntimeError("onboarding cache ownership changed during cleanup")
+            if success:
+                for cache_key, entry in list(self._onboarding_agent_cache.items()):
+                    if entry[0] is agent:
+                        self._onboarding_agent_cache.pop(cache_key, None)
+                pending = self._onboarding_cleanup_retry_agents.get(owner_id)
+                if pending is not None and pending[1] is agent:
+                    self._onboarding_cleanup_retry_agents.pop(owner_id, None)
+            else:
+                self._onboarding_cleanup_retry_agents[owner_id] = (
+                    profile_name,
+                    agent,
+                )
+            if retiring is not None and retiring[1] is agent:
+                self._onboarding_retiring_agents.pop(owner_id, None)
+
+    def _close_onboarding_owner(
+        self, profile_name: str, agent: Any, *, claimed: bool = False
+    ) -> None:
+        if not claimed:
+            self._claim_onboarding_owner(profile_name, agent)
+        try:
+            agent.close()
+        except BaseException:
+            self._finish_onboarding_owner(profile_name, agent, success=False)
+            raise
+        self._finish_onboarding_owner(profile_name, agent, success=True)
+
     def _cached_onboarding_agent(self, key: tuple) -> Optional[Any]:
         now = time.monotonic()
-        expired = []
+        profile_name = self._onboarding_profile_name(key)
+        self._retry_onboarding_cleanup(profile_name)
+        while True:
+            with self._onboarding_agent_cache_lock:
+                stale = None
+                for cache_key, (candidate, last_used) in self._onboarding_agent_cache.items():
+                    if (
+                        self._onboarding_profile_name(cache_key) == profile_name
+                        and now - last_used > self._onboarding_agent_cache_ttl_seconds
+                        and id(candidate) not in self._onboarding_retiring_agents
+                    ):
+                        stale = candidate
+                        self._claim_onboarding_owner_locked(profile_name, stale)
+                        break
+            if stale is None:
+                break
+            try:
+                self._close_onboarding_owner(profile_name, stale, claimed=True)
+            except Exception as exc:
+                logger.error("onboarding cache eviction close failed", exc_info=True)
+                raise RuntimeError(
+                    "onboarding cache eviction cleanup failed"
+                ) from exc
         with self._onboarding_agent_cache_lock:
-            for cache_key, (_, last_used) in list(self._onboarding_agent_cache.items()):
-                if now - last_used > self._onboarding_agent_cache_ttl_seconds:
-                    expired.append(self._onboarding_agent_cache.pop(cache_key)[0])
-            entry = self._onboarding_agent_cache.pop(key, None)
+            entry = self._onboarding_agent_cache.get(key)
+            if entry is not None and id(entry[0]) in self._onboarding_retiring_agents:
+                raise RuntimeError("onboarding cache cleanup already in progress")
+            self._onboarding_agent_cache.pop(key, None)
             if entry is not None:
                 agent, _ = entry
                 self._onboarding_agent_cache[key] = (agent, now)
             else:
                 agent = None
-        for stale in expired:
-            try:
-                stale.close()
-            except Exception:
-                logger.debug("onboarding cache eviction close failed", exc_info=True)
         return agent
 
-    def _cache_onboarding_agent(self, key: tuple, agent: Any) -> None:
-        evicted = []
-        with self._onboarding_agent_cache_lock:
-            replaced = self._onboarding_agent_cache.pop(key, None)
-            if replaced is not None and replaced[0] is not agent:
-                evicted.append(replaced[0])
-            self._onboarding_agent_cache[key] = (agent, time.monotonic())
-            while len(self._onboarding_agent_cache) > self._onboarding_agent_cache_cap:
-                _, (stale, _) = self._onboarding_agent_cache.popitem(last=False)
-                evicted.append(stale)
-        for stale in evicted:
+    def _retry_onboarding_cleanup(self, profile_name: str) -> None:
+        """重试尚未发布但首次 close 失败的 onboarding agent。"""
+        while True:
+            with self._onboarding_agent_cache_lock:
+                agent = None
+                for owner_profile, candidate in self._onboarding_cleanup_retry_agents.values():
+                    if owner_profile == profile_name:
+                        self._claim_onboarding_owner_locked(profile_name, candidate)
+                        agent = candidate
+                        break
+            if agent is None:
+                return
             try:
-                stale.close()
+                self._close_onboarding_owner(profile_name, agent, claimed=True)
+            except Exception as exc:
+                logger.error(
+                    "onboarding incoming-agent cleanup retry failed",
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    "onboarding incoming-agent cleanup failed"
+                ) from exc
+
+    def _publish_onboarding_agent(self, key: tuple, agent: Any) -> None:
+        """发布新 owner；提交失败时严格回收未发布 agent。"""
+        profile_name = self._onboarding_profile_name(key)
+        try:
+            self._retry_onboarding_cleanup(profile_name)
+            self._cache_onboarding_agent(key, agent)
+        except BaseException as publish_exc:
+            try:
+                self._close_onboarding_owner(profile_name, agent)
+            except BaseException as cleanup_exc:
+                logger.error(
+                    "onboarding incoming-agent cleanup failed after cache publish failure",
+                    exc_info=(
+                        type(cleanup_exc), cleanup_exc, cleanup_exc.__traceback__
+                    ),
+                )
+                raise RuntimeError(
+                    "onboarding incoming-agent cleanup failed"
+                ) from cleanup_exc
+            raise publish_exc
+
+    def _close_onboarding_agents_for_profile(self, profile_name: str) -> int:
+        """逐 owner 关闭目标 profile 的 onboarding cache，失败项留待重试。"""
+        normalized = (profile_name or "").strip().lower()
+        self._retry_onboarding_cleanup(normalized)
+        closed = 0
+        while True:
+            with self._onboarding_agent_cache_lock:
+                candidate = None
+                for cache_key, (agent, _last_used) in self._onboarding_agent_cache.items():
+                    if (
+                        self._onboarding_profile_name(cache_key) == normalized
+                        and id(agent) not in self._onboarding_retiring_agents
+                    ):
+                        candidate = agent
+                        self._claim_onboarding_owner_locked(normalized, candidate)
+                        break
+            if candidate is None:
+                with self._onboarding_agent_cache_lock:
+                    if any(
+                        owner_profile == normalized
+                        for owner_profile, _agent in self._onboarding_retiring_agents.values()
+                    ):
+                        raise RuntimeError(
+                            "onboarding profile cleanup already in progress"
+                        )
+                return closed
+            try:
+                self._close_onboarding_owner(normalized, candidate, claimed=True)
+            except Exception as exc:
+                logger.error("onboarding profile-unload cleanup failed", exc_info=True)
+                raise RuntimeError(
+                    "onboarding profile-unload cleanup failed"
+                ) from exc
+            closed += 1
+
+    def _cache_onboarding_agent(self, key: tuple, agent: Any) -> None:
+        profile_name = self._onboarding_profile_name(key)
+        while True:
+            with self._onboarding_agent_cache_lock:
+                replaced = self._onboarding_agent_cache.get(key)
+                if replaced is not None and replaced[0] is agent:
+                    self._onboarding_agent_cache.pop(key, None)
+                    self._onboarding_agent_cache[key] = (agent, time.monotonic())
+                    return
+                if replaced is not None:
+                    candidate = replaced[0]
+                    candidate_profile = profile_name
+                elif len(self._onboarding_agent_cache) >= self._onboarding_agent_cache_cap:
+                    candidates = [
+                        (self._onboarding_profile_name(cache_key), entry[0])
+                        for cache_key, entry in self._onboarding_agent_cache.items()
+                        if id(entry[0]) not in self._onboarding_retiring_agents
+                    ]
+                    if not candidates:
+                        raise RuntimeError("onboarding cache cleanup already in progress")
+                    candidate_profile, candidate = candidates[0]
+                else:
+                    self._onboarding_agent_cache[key] = (agent, time.monotonic())
+                    return
+                self._claim_onboarding_owner_locked(candidate_profile, candidate)
+            try:
+                self._close_onboarding_owner(candidate_profile, candidate, claimed=True)
+            except Exception as exc:
+                logger.error("onboarding cache owner cleanup failed", exc_info=True)
+                raise RuntimeError(
+                    "onboarding cache owner cleanup failed"
+                ) from exc
+
+    @staticmethod
+    def _runtime_shell_digest(value: Any) -> str:
+        try:
+            encoded = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        except Exception:
+            encoded = repr(value).encode("utf-8", errors="replace")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _runtime_shell_cache_keys(
+        cls,
+        *,
+        user_config: Dict[str, Any],
+        runtime_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return cache keys normalized to the effective runtime values."""
+        from gateway.run import GatewayRunner
+
+        cache_keys = GatewayRunner._extract_cache_busting_config(user_config)
+        # A session model override carries its context window as the explicit
+        # constructor argument. The raw profile config may omit that duplicate
+        # key before prewarm and expose it through a later resolved snapshot;
+        # both still construct the same runtime. Keep the effective value in
+        # the signature so a genuine context-window change continues to bust.
+        if "config_context_length" in runtime_kwargs:
+            cache_keys["model.context_length"] = runtime_kwargs[
+                "config_context_length"
+            ]
+        # MCP registry changes refresh the cached agent's tool snapshot in the
+        # next turn prologue. They do not require destroying its model client.
+        cache_keys.pop("tools.registry_generation", None)
+        return cache_keys
+
+    @classmethod
+    def _runtime_shell_signature(
+        cls,
+        *,
+        model: str,
+        runtime_kwargs: Dict[str, Any],
+        enabled_toolsets: List[str],
+        user_config: Dict[str, Any],
+        fallback_model: Any,
+        account_id: str,
+        session_owner_id: str,
+        deep_memory_principal: str,
+        deep_memory_subject: str,
+    ) -> str:
+        """Hash constructor-stable state without retaining plaintext secrets."""
+        from gateway.run import GatewayRunner
+
+        cache_keys = cls._runtime_shell_cache_keys(
+            user_config=user_config,
+            runtime_kwargs=runtime_kwargs,
+        )
+        cache_keys.update({
+            "zet.fallback": cls._runtime_shell_digest(fallback_model),
+            "zet.account": cls._runtime_shell_digest(account_id),
+            "zet.session_owner": cls._runtime_shell_digest(session_owner_id),
+            "zet.deep_memory_principal": cls._runtime_shell_digest(
+                deep_memory_principal
+            ),
+            "zet.deep_memory_subject": cls._runtime_shell_digest(
+                deep_memory_subject
+            ),
+        })
+        # The ephemeral prompt is request-scoped, not constructor-stable.
+        # Reuse rebinds it below and invalidates an already-built prompt when
+        # bytes differ.  Keeping it in this signature made a pristine prewarm
+        # shell miss the first real turn even though no prompt had been built.
+        return GatewayRunner._agent_config_signature(
+            model,
+            runtime_kwargs,
+            enabled_toolsets,
+            "",
+            cache_keys=cache_keys,
+            user_id=account_id,
+            user_id_alt=session_owner_id,
+            skip_context_files=False,
+        )
+
+    @staticmethod
+    def _runtime_shell_message_count(
+        session_db: Any, session_id: Optional[str]
+    ) -> Optional[int]:
+        if session_db is None or not session_id:
+            return None
+        try:
+            row = session_db.get_session(session_id)
+            if not row:
+                return 0
+            value = row.get("message_count", 0)
+            return int(value or 0)
+        except Exception:
+            logger.warning(
+                "[zet_agent] runtime shell SessionDB revision read failed",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _prepare_cached_runtime_shell(agent: Any, agent_kwargs: Dict[str, Any]) -> bool:
+        """Rebind request state after identity/signature checks have passed."""
+        if (
+            str(getattr(agent, "session_id", "") or "")
+            != str(agent_kwargs.get("session_id") or "")
+            or str(getattr(agent, "_gateway_session_key", "") or "")
+            != str(agent_kwargs.get("gateway_session_key") or "")
+            or str(getattr(agent, "_profile_name", "") or "").strip().lower()
+            != str(agent_kwargs.get("profile_name") or "").strip().lower()
+            or bool(getattr(agent, "_interrupt_requested", False))
+            or bool(getattr(agent, "_persist_disabled", False))
+        ):
+            return False
+
+        agent.stream_delta_callback = agent_kwargs.get("stream_delta_callback")
+        agent.tool_progress_callback = agent_kwargs.get("tool_progress_callback")
+        agent.tool_start_callback = agent_kwargs.get("tool_start_callback")
+        agent.tool_complete_callback = agent_kwargs.get("tool_complete_callback")
+        next_ephemeral_prompt = agent_kwargs.get("ephemeral_system_prompt")
+        previous_ephemeral_prompt = getattr(
+            agent, "ephemeral_system_prompt", None
+        )
+        if previous_ephemeral_prompt != next_ephemeral_prompt:
+            has_built_prompt = bool(
+                getattr(agent, "_cached_system_prompt", None)
+                or getattr(agent, "_cached_system_prompt_static", None)
+            )
+            if has_built_prompt:
+                invalidate_prompt = getattr(
+                    agent, "_invalidate_system_prompt", None
+                )
+                if not callable(invalidate_prompt):
+                    return False
+                try:
+                    invalidate_prompt()
+                except Exception:
+                    logger.warning(
+                        "[zet_agent] cached runtime prompt invalidation failed",
+                        exc_info=True,
+                    )
+                    return False
+            agent.ephemeral_system_prompt = next_ephemeral_prompt
+        agent.reasoning_config = agent_kwargs.get("reasoning_config")
+        agent.service_tier = agent_kwargs.get("service_tier")
+        agent.request_overrides = dict(agent_kwargs.get("request_overrides") or {})
+        agent.max_iterations = agent_kwargs.get(
+            "max_iterations", getattr(agent, "max_iterations", 1)
+        )
+        agent._session_db = agent_kwargs.get("session_db")
+        agent._tools_disabled_for_request = False
+        agent._skip_mcp_refresh = False
+        # A cached shell's schema is intentionally retained, but every new
+        # request must re-run live profile/session authorization gates before
+        # the model can see it.  The turn prologue consumes this one-shot flag
+        # and performs exactly one full refresh even when the last MCP tool was
+        # removed (where has_registered_mcp_tools() would otherwise be false).
+        agent._zet_runtime_shell_force_tool_refresh = True
+        agent._zet_agent_execution_policy = ""
+        agent._zet_agent_execution_policy_tools = None
+        agent._zet_agent_execution_policy_valid_tool_names = None
+        agent._zet_agent_video_edit_turn = False
+
+        # Extension callbacks close over a turn-local queue.  Clear every one
+        # before the current request's queue is sniffed and rebound below.
+        for callback_name in (
+            "reasoning_callback",
+            "status_callback",
+            "clarify_callback",
+            "todo_emit_callback",
+            "plan_emit_callback",
+            "interim_assistant_callback",
+        ):
+            setattr(agent, callback_name, None)
+
+        for counter_name in (
+            "session_prompt_tokens",
+            "session_completion_tokens",
+            "session_total_tokens",
+            "session_api_calls",
+            "session_input_tokens",
+            "session_output_tokens",
+            "session_cache_read_tokens",
+            "session_cache_write_tokens",
+            "session_reasoning_tokens",
+        ):
+            setattr(agent, counter_name, 0)
+        agent.session_estimated_cost_usd = 0.0
+        agent.session_cost_status = "unknown"
+        agent.session_cost_source = "none"
+        agent._api_call_count = 0
+        agent._last_turn_usage = None
+        if hasattr(agent, "_last_flushed_db_idx"):
+            agent._last_flushed_db_idx = 0
+        return True
+
+    @staticmethod
+    def _clear_runtime_shell_turn_references(agent: Any) -> None:
+        for callback_name in (
+            "stream_delta_callback",
+            "tool_progress_callback",
+            "tool_start_callback",
+            "tool_complete_callback",
+            "reasoning_callback",
+            "status_callback",
+            "clarify_callback",
+            "todo_emit_callback",
+            "plan_emit_callback",
+            "interim_assistant_callback",
+        ):
+            try:
+                setattr(agent, callback_name, None)
             except Exception:
-                logger.debug("onboarding cache eviction close failed", exc_info=True)
+                pass
+        for attr_name, empty_value in (
+            ("_stream_callback", None),
+            ("_current_user_message", ""),
+            ("_previous_assistant_message", ""),
+            ("_zet_agent_trusted_user_message", None),
+            ("_zet_agent_trusted_skill_slug", ""),
+            ("_creation_action_receipt_transport", ""),
+            ("_zettlab_active_turn_id", ""),
+            ("_zet_runtime_shell_force_tool_refresh", False),
+            ("runtime_auxiliary_task_configs", None),
+            ("runtime_supports_vision", None),
+            ("request_overrides", {}),
+        ):
+            try:
+                setattr(agent, attr_name, empty_value)
+            except Exception:
+                pass
+        try:
+            agent._session_messages = []
+            agent._db_flush_scan_prefix = None
+            agent._zet_memory_citations = {}
+            agent._zet_memory_saves = {}
+        except Exception:
+            pass
+
+    @classmethod
+    def _soft_release_runtime_shell(cls, agent: Any) -> None:
+        cls._clear_runtime_shell_turn_references(agent)
+        try:
+            release = getattr(agent, "release_clients", None)
+            if callable(release):
+                release()
+            else:
+                agent.close()
+        except Exception:
+            logger.warning(
+                "[zet_agent] runtime shell soft cleanup failed",
+                exc_info=True,
+            )
+
+    @classmethod
+    def _schedule_runtime_shell_retirement(cls, agents: Any) -> None:
+        for agent in tuple(agents or ()):
+            try:
+                threading.Thread(
+                    target=cls._soft_release_runtime_shell,
+                    args=(agent,),
+                    daemon=True,
+                    name="zet-runtime-shell-retire",
+                ).start()
+            except Exception:
+                cls._soft_release_runtime_shell(agent)
+
+    @staticmethod
+    def _runtime_shell_prewarm_identity_ready() -> bool:
+        """Require the exact identities that participate in the cache signature."""
+        from gateway.session_context import zettlab_auth_principal
+
+        return all((
+            str(_zettlab_request_account_id.get() or "").strip(),
+            str(zettlab_auth_principal() or "").strip(),
+            str(_deep_memory_principal.get() or "").strip(),
+            str(_deep_memory_subject.get() or "").strip(),
+        ))
+
+    @staticmethod
+    def _prewarm_runtime_shell_request_client(agent: Any) -> bool:
+        """Populate the shell's local OpenAI-wire client slot without I/O."""
+        if (
+            str(getattr(agent, "api_mode", "") or "").strip().lower()
+            != "chat_completions"
+            or str(getattr(agent, "provider", "") or "").strip().lower()
+            == "moa"
+        ):
+            return False
+        create = getattr(agent, "_create_request_openai_client", None)
+        release = getattr(agent, "_close_request_openai_client", None)
+        if not callable(create) or not callable(release):
+            return False
+        client = None
+        try:
+            client = create(reason="zet_runtime_shell_prewarm")
+            release(client, reason="request_complete")
+            return True
+        except Exception as exc:
+            if client is not None:
+                try:
+                    release(client, reason="request_error_cleanup")
+                except Exception:
+                    pass
+            logger.debug(
+                "[zet_agent] runtime shell request-client prewarm skipped: "
+                "error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    def _prewarm_runtime_shell_sync(
+        self,
+        session_id: str,
+        profile_home_key: str = "",
+    ) -> bool:
+        """Build and release one exact session shell without running an LLM turn."""
+        if profile_home_key:
+            from gateway.run import _profile_runtime_scope
+
+            with _profile_runtime_scope(Path(profile_home_key)):
+                return self._prewarm_runtime_shell_sync(session_id)
+
+        from gateway.session_context import (
+            clear_session_vars,
+            suppress_current_session_id_env_mirror,
+        )
+
+        bounded_session_id = str(session_id or "").strip()
+        account_id = str(_zettlab_request_account_id.get() or "").strip()
+        if not bounded_session_id or not self._runtime_shell_prewarm_identity_ready():
+            return False
+
+        session_tokens = self._bind_api_server_session(
+            chat_id=bounded_session_id,
+            session_key=bounded_session_id,
+            session_id=bounded_session_id,
+            session_user_id=account_id,
+        )
+        cache_token = _zet_runtime_shell_cache_allowed.set(True)
+        agent = None
+        try:
+            with suppress_current_session_id_env_mirror():
+                agent = self._create_agent(
+                    session_id=bounded_session_id,
+                    gateway_session_key=bounded_session_id,
+                )
+            cacheable = isinstance(
+                getattr(agent, "_zet_runtime_shell_lease", None),
+                RuntimeShellLease,
+            )
+            if cacheable:
+                self._prewarm_runtime_shell_request_client(agent)
+            managed_by_runtime_cache = cacheable or bool(
+                getattr(agent, "_zet_runtime_shell_ephemeral", False)
+            )
+            if managed_by_runtime_cache:
+                self._finish_runtime_shell_turn(agent, reusable=cacheable)
+            else:
+                self._soft_release_runtime_shell(agent)
+            return cacheable
+        except Exception as exc:
+            if agent is not None:
+                try:
+                    self._finish_runtime_shell_turn(agent, reusable=False)
+                except Exception:
+                    self._soft_release_runtime_shell(agent)
+            logger.warning(
+                "[zet_agent] runtime shell prewarm failed: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            _zet_runtime_shell_cache_allowed.reset(cache_token)
+            clear_session_vars(session_tokens)
+
+    async def _prewarm_runtime_shell(
+        self,
+        session_id: str,
+        profile_home_key: str,
+    ) -> bool:
+        return await _to_thread_with_completion_barrier(
+            self._prewarm_runtime_shell_sync,
+            session_id,
+            profile_home_key,
+        )
+
+    async def _run_scheduled_runtime_shell_prewarm(
+        self,
+        session_id: str,
+        profile_home_key: str,
+    ) -> bool:
+        try:
+            return await self._prewarm_runtime_shell(
+                session_id,
+                profile_home_key,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[zet_agent] scheduled runtime shell prewarm failed: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            self._end_profile_chat_run(profile_home_key)
+
+    def _start_runtime_shell_prewarm(
+        self,
+        session_id: str,
+    ) -> Optional[asyncio.Task]:
+        """Start one bounded prewarm and return its shared completion task."""
+        if not self._runtime_shell_prewarm_identity_ready():
+            return None
+        session_id = str(session_id or "").strip()
+        profile_home_key = self._profile_home_key()
+        if not session_id or not profile_home_key:
+            return None
+
+        tasks = self._runtime_shell_prewarm_tasks
+        for stale_key, stale_task in tuple(tasks.items()):
+            if stale_task.done() and tasks.get(stale_key) is stale_task:
+                tasks.pop(stale_key, None)
+
+        from gateway.session_context import zettlab_auth_principal
+
+        task_key = (
+            profile_home_key,
+            self._runtime_shell_digest(session_id),
+            self._runtime_shell_digest(_zettlab_request_account_id.get()),
+            self._runtime_shell_digest(zettlab_auth_principal()),
+            self._runtime_shell_digest(_deep_memory_principal.get()),
+            self._runtime_shell_digest(_deep_memory_subject.get()),
+        )
+        existing = tasks.get(task_key)
+        if existing is not None and not existing.done():
+            return None
+        if len(tasks) >= ZET_RUNTIME_SHELL_PREWARM_MAX_TASKS:
+            return None
+
+        barrier_key = self._begin_profile_chat_run(profile_home_key)
+        if not barrier_key:
+            return None
+        try:
+            task = asyncio.create_task(
+                self._run_scheduled_runtime_shell_prewarm(
+                    session_id,
+                    barrier_key,
+                ),
+                name="zet-runtime-shell-prewarm",
+            )
+        except Exception:
+            self._end_profile_chat_run(barrier_key)
+            return None
+        tasks[task_key] = task
+        try:
+            self._background_tasks.add(task)
+        except (AttributeError, TypeError):
+            pass
+
+        def _forget(done_task: asyncio.Task) -> None:
+            if tasks.get(task_key) is done_task:
+                tasks.pop(task_key, None)
+            try:
+                self._background_tasks.discard(done_task)
+            except (AttributeError, TypeError):
+                pass
+
+        task.add_done_callback(_forget)
+        return task
+
+    def _schedule_runtime_shell_prewarm(self, session_id: str) -> bool:
+        """Schedule one bounded, deduplicated prewarm in the request identity scope."""
+        return self._start_runtime_shell_prewarm(session_id) is not None
+
+    def _finish_runtime_shell_turn(self, agent: Any, *, reusable: bool) -> None:
+        lease = getattr(agent, "_zet_runtime_shell_lease", None)
+        ephemeral = bool(getattr(agent, "_zet_runtime_shell_ephemeral", False))
+        if not isinstance(lease, RuntimeShellLease) and not ephemeral:
+            return
+
+        approval_binding = getattr(
+            agent, "_zet_runtime_shell_approval_binding", None
+        )
+        if (
+            isinstance(approval_binding, tuple)
+            and len(approval_binding) == 2
+        ):
+            try:
+                from tools.approval import unregister_gateway_notify_if_current
+
+                removed = unregister_gateway_notify_if_current(
+                    approval_binding[0], approval_binding[1]
+                )
+                if removed:
+                    with self._session_lock:
+                        self._approval_session_ids.discard(approval_binding[0])
+            except Exception:
+                logger.warning(
+                    "[zet_agent] runtime shell approval cleanup failed",
+                    exc_info=True,
+                )
+
+        self._clear_runtime_shell_turn_references(agent)
+        retired: tuple[Any, ...] = ()
+        finish_reason = "ephemeral"
+        if isinstance(lease, RuntimeShellLease):
+            expected_session_id = str(
+                getattr(agent, "_zet_runtime_shell_session_id", "") or ""
+            )
+            if str(getattr(agent, "session_id", "") or "") != expected_session_id:
+                reusable = False
+            message_count = (
+                self._runtime_shell_message_count(
+                    getattr(agent, "_session_db", None),
+                    getattr(agent, "session_id", None),
+                )
+                if reusable
+                else None
+            )
+            decision = self._runtime_shell_cache.finish(
+                lease,
+                reusable=reusable,
+                message_count=message_count,
+            )
+            retired = decision.retired_agents
+            finish_reason = decision.reason
+        elif ephemeral:
+            retired = (agent,)
+
+        for attr_name in (
+            "_zet_runtime_shell_lease",
+            "_zet_runtime_shell_ephemeral",
+            "_zet_runtime_shell_session_id",
+            "_zet_runtime_shell_approval_binding",
+        ):
+            try:
+                delattr(agent, attr_name)
+            except Exception:
+                pass
+        self._schedule_runtime_shell_retirement(retired)
+        counts = self._runtime_shell_cache.counts()
+        logger.info(
+            "zet_agent runtime shell cache finish: result=%s reusable=%s "
+            "entries=%d idle=%d leased=%d",
+            finish_reason,
+            reusable,
+            counts["entries"],
+            counts["idle"],
+            counts["leased"],
+        )
+
+    def _invalidate_runtime_shell_prompts(
+        self, *, profile_home: Optional[str] = None
+    ) -> int:
+        agents = self._runtime_shell_cache.agents_for_prompt_invalidation(
+            profile_home=profile_home
+        )
+        invalidated = 0
+        for agent in agents:
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                invalidated += 1
+            except Exception:
+                logger.warning(
+                    "[zet_agent] runtime shell prompt invalidation failed",
+                    exc_info=True,
+                )
+        return invalidated
+
+    def _close_runtime_shells_for_profile(self, profile_home: Any) -> int:
+        key = self._profile_home_key(profile_home)
+        agents = self._runtime_shell_cache.detach_profile(key)
+        failures = []
+        for agent in agents:
+            try:
+                self._clear_runtime_shell_turn_references(agent)
+                agent._end_session_on_close = False
+                agent.close()
+            except Exception as exc:
+                failures.append(exc)
+                logger.warning(
+                    "[zet_agent] profile runtime shell close failed",
+                    exc_info=True,
+                )
+        if failures:
+            raise RuntimeError(
+                f"failed to close {len(failures)} profile runtime shell(s)"
+            ) from failures[0]
+        return len(agents)
+
+    def _stop_runtime_shell_cache(self) -> int:
+        agents = self._runtime_shell_cache.stop()
+        failures = []
+        for agent in agents:
+            try:
+                self._clear_runtime_shell_turn_references(agent)
+                agent._end_session_on_close = False
+                agent.close()
+            except Exception as exc:
+                failures.append(exc)
+                logger.warning(
+                    "[zet_agent] shutdown runtime shell close failed",
+                    exc_info=True,
+                )
+        if failures:
+            raise RuntimeError(
+                f"failed to close {len(failures)} shutdown runtime shell(s)"
+            ) from failures[0]
+        return len(agents)
 
     def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
         """Atomically enter a profile unless unload already owns its barrier."""
@@ -1013,7 +2055,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
             set_session_vars(
                 platform="zet_agent",
-                chat_id=session_id,
+                chat_id=session_key,
                 chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
                 thread_id="",
                 # HERMES_SESSION_USER_ID reaches managed Memo MCP metadata;
@@ -1022,6 +2064,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 user_id=_zettlab_request_account_id.get(),
                 user_name="",
                 session_key=session_key or session_id,
+                session_id=session_id,
                 profile=str(_api_request_profile.get() or "main").strip() or "main",
                 async_delivery=self.supports_async_delivery,
                 exec_ask="1",
@@ -1411,6 +2454,9 @@ class ZetAgentAdapter(APIServerAdapter):
             async with asyncio.timeout(self._SKILL_INVOKE_ACQUIRE_TIMEOUT):
                 await sema.acquire()
         except asyncio.TimeoutError:
+            prestream_timing = _prestream_timing_context.get()
+            if prestream_timing is not None:
+                prestream_timing.skill_expand_completed("error")
             logger.warning(
                 "[zet_agent] skill expansion saturated; passing message through",
             )
@@ -1558,6 +2604,12 @@ class ZetAgentAdapter(APIServerAdapter):
         bound to zet_agent (see caller). The fork's skill-scope resolvers
         read that ContextVar BEFORE the process HERMES_PLATFORM env, so the
         binding is authoritative here without touching global state."""
+        prestream_timing = _prestream_timing_context.get()
+
+        def _mark_expand_error() -> None:
+            if prestream_timing is not None:
+                prestream_timing.skill_expand_completed("error")
+
         try:
             from agent.skill_commands import (
                 build_skill_invocation_message,
@@ -1565,6 +2617,7 @@ class ZetAgentAdapter(APIServerAdapter):
             )
             commands = scan_skill_commands()
         except Exception:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill scan failed; passing message through",
                 exc_info=True,
@@ -1572,6 +2625,7 @@ class ZetAgentAdapter(APIServerAdapter):
             return user_message
         info = commands.get(token)
         if not info:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] requested skill %s not installed (App inventory "
                 "drift?); passing message through", skill_slug,
@@ -1611,12 +2665,14 @@ class ZetAgentAdapter(APIServerAdapter):
                 token, user_instruction=task_text, task_id=session_id or None,
             )
         except Exception:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill %s build failed; passing message through",
                 skill_slug, exc_info=True,
             )
             return user_message
         if not part:
+            _mark_expand_error()
             logger.warning(
                 "[zet_agent] skill %s resolved by scan but failed to "
                 "load; passing message through", skill_slug,
@@ -1860,7 +2916,7 @@ class ZetAgentAdapter(APIServerAdapter):
     _APPROVAL_PROJECTION_MAX_BYTES = 512 * 1024
     _APPROVAL_PROJECTION_COMMAND_CHARS = 4096
     _APPROVAL_PROJECTION_DESCRIPTION_CHARS = 1024
-    _APPROVAL_PROJECTION_VALIDATION_CHARS = 4096
+    _APPROVAL_PROJECTION_VALIDATION_TARGET_CHARS = 2048
 
     @staticmethod
     def _bounded_approval_projection_text(value: Any, limit: int) -> str:
@@ -1896,11 +2952,6 @@ class ZetAgentAdapter(APIServerAdapter):
             payload.get("description", ""),
             self._APPROVAL_PROJECTION_DESCRIPTION_CHARS,
         )
-        if payload.get("validation_target"):
-            bounded["validation_target"] = self._bounded_approval_projection_text(
-                payload.get("validation_target", ""),
-                self._APPROVAL_PROJECTION_VALIDATION_CHARS,
-            )
         bounded["pattern_key"] = self._bounded_approval_projection_text(
             payload.get("pattern_key", ""), 512
         )
@@ -1909,6 +2960,11 @@ class ZetAgentAdapter(APIServerAdapter):
             for value in list(payload.get("pattern_keys", []) or [])[:32]
             if value
         ]
+        if payload.get("validation_target"):
+            bounded["validation_target"] = self._bounded_approval_projection_text(
+                payload.get("validation_target", ""),
+                self._APPROVAL_PROJECTION_VALIDATION_TARGET_CHARS,
+            )
         bounded["payload_fingerprint"] = fingerprint
         return bounded
 
@@ -2508,6 +3564,7 @@ class ZetAgentAdapter(APIServerAdapter):
             anchor = str(turn_id or "").strip() or uuid.uuid5(
                 uuid.NAMESPACE_OID, f"mc:{session_id}"
             ).hex[:12]
+            _observe_queued_attachment()
             stream_q.put((
                 "__tool_progress__",
                 {
@@ -2556,6 +3613,7 @@ class ZetAgentAdapter(APIServerAdapter):
             anchor = str(turn_id or "").strip() or uuid.uuid5(
                 uuid.NAMESPACE_OID, f"ms:{session_id}"
             ).hex[:12]
+            _observe_queued_attachment()
             stream_q.put((
                 "__tool_progress__",
                 {
@@ -2985,8 +4043,29 @@ class ZetAgentAdapter(APIServerAdapter):
         onboarding_received_mono = agent_request_overrides.pop(
             "_zet_onboarding_received_mono", None
         )
-        disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
         active_profile = str(_api_request_profile.get() or "main").strip() or "main"
+        execution_policy = str(
+            agent_request_overrides.pop("_zet_execution_policy", "") or ""
+        ).strip().lower()
+        trusted_skill_slug = str(
+            agent_request_overrides.pop("_zet_trusted_skill_slug", "") or ""
+        ).strip()
+        silent_execution = execution_policy == "silent_automation"
+        disable_tools = (
+            not silent_execution
+            and agent_request_overrides.pop("tool_choice", None) == "none"
+        )
+        if silent_execution:
+            # The silent capability is bound to the configured runtime. Do not
+            # let direct callers smuggle model/provider/session/format choices
+            # through this adapter after the gateway has verified the receipt.
+            agent_request_overrides.pop("tool_choice", None)
+            agent_request_overrides.pop("response_format", None)
+            requested_model = None
+            requested_provider = None
+            model_options = None
+            route = None
+            session_model = None
 
         # 在 ephemeral_system_prompt 头部接 zettlab 工作风格 addendum。
         # 上游传进来的 ephemeral 通常是 SOUL.md / IDENTITY.md 的拼接（per-agent
@@ -2995,7 +4074,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # 时仍能压过去。
         if active_profile.lower() != "onboarding":
             ephemeral_system_prompt = (
-                _zettlab_workflow_addendum(bool(plan_auto_execute))
+                _zettlab_workflow_addendum(
+                    bool(plan_auto_execute),
+                    execution_policy,
+                )
                 + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
             )
 
@@ -3075,7 +4157,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 except Exception:
                     pass
                 if required:
-                    raise _ProviderAuthResolutionError(str(exc)) from exc
+                    # ⛔ 只有**真的**是凭据/配置类失败才配这个标签 —— 上游
+                    # (`_resolve_request_runtime_agent_kwargs` /
+                    # `_resolve_runtime_agent_kwargs_for_provider`)现在只把
+                    # AuthError/ValueError 包成 RuntimeError,其余原样上抛。
+                    # 🔴 这里原来无条件包:内部 bug 会以 **HTTP 200** 当作
+                    # assistant 的回答送出「Provider authentication failed: …」
+                    # 并带内部路径。与 api_server 那处同形,兄弟点跟上。
+                    if isinstance(exc, RuntimeError):
+                        raise _ProviderAuthResolutionError(str(exc)) from exc
+                    raise
                 logger.debug(
                     "zet_agent provider-runtime refresh failed for provider=%s model=%s",
                     provider_name,
@@ -3093,7 +4184,7 @@ class ZetAgentAdapter(APIServerAdapter):
         runtime_auxiliary_task_configs = None
         runtime_supports_vision = None
         session_override = None
-        if not confirmed_runtime_lock and gw is not None and override_key:
+        if not confirmed_runtime_lock and not silent_execution and gw is not None and override_key:
             session_override = self._session_model_override_for(override_key)
 
         from hermes_cli.model_switch import resolve_effective_model
@@ -3132,7 +4223,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     "zet_agent request selection skipped: session /model override wins for %s",
                     override_key or "",
                 )
-        elif session_row_model and not confirmed_runtime_lock:
+        elif session_row_model and not confirmed_runtime_lock and not silent_execution:
             current_provider = _clean_request_string(runtime_kwargs.get("provider"))
             provider_runtime = _resolve_provider_runtime(
                 current_provider,
@@ -3232,7 +4323,9 @@ class ZetAgentAdapter(APIServerAdapter):
 
         max_iterations = _current_max_iterations()
         fallback_model = (
-            None if confirmed_runtime_lock else GatewayRunner._load_fallback_model()
+            None
+            if silent_execution or confirmed_runtime_lock
+            else GatewayRunner._load_fallback_model()
         )
 
         agent_kwargs = {
@@ -3251,10 +4344,13 @@ class ZetAgentAdapter(APIServerAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            "session_db": None if silent_execution else self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "skip_memory": execution_policy == "silent_automation",
+            "strict_memory_isolation": execution_policy == "silent_automation",
+            "skip_context_files": execution_policy == "silent_automation",
             "request_overrides": agent_request_overrides or None,
             # Generic user_id remains the authenticated account for managed
             # Memo and legacy SessionDB migration.  Deep Memory gets its
@@ -3279,7 +4375,21 @@ class ZetAgentAdapter(APIServerAdapter):
             )
 
         agent_init_started_mono = time.monotonic()
+        agent_shell_timing = _prestream_timing_context.get()
+        try:
+            if agent_shell_timing is not None:
+                agent_shell_timing.agent_shell_started()
+        except Exception:
+            agent_shell_timing = None
         onboarding_cache_key = None
+        runtime_cache_key = None
+        runtime_cache_signature = ""
+        runtime_cache_message_count = None
+        runtime_cache_lease = None
+        runtime_cache_reason = "bypass"
+        runtime_cache_acquire_reason = "not_attempted"
+        runtime_cache_diagnostics: Dict[str, str] = {}
+        agent_shell_outcome = "created"
         agent = None
         if onboarding_fast_path:
             onboarding_cache_key = (
@@ -3298,11 +4408,144 @@ class ZetAgentAdapter(APIServerAdapter):
                 session_owner_id,
             )
             agent = self._cached_onboarding_agent(onboarding_cache_key)
+            if agent is not None:
+                agent_shell_outcome = "onboarding_cache_hit"
+        else:
+            api_credential = runtime_kwargs.get("api_key")
+            unsupported_runtime = (
+                callable(api_credential)
+                or runtime_kwargs.get("credential_pool") is not None
+                or bool(runtime_kwargs.get("command"))
+                or str(runtime_kwargs.get("api_mode") or "").strip().lower()
+                == "codex_app_server"
+            )
+            runtime_cache_eligible = (
+                _zet_runtime_shell_cache_allowed.get()
+                and execution_policy == ""
+                and not disable_tools
+                and not confirmed_runtime_lock
+                and bool(gateway_session_key)
+                and bool(session_id)
+                and agent_kwargs.get("session_db") is not None
+                and not unsupported_runtime
+            )
+            if runtime_cache_eligible:
+                runtime_cache_key = RuntimeShellCacheKey(
+                    profile_home=self._profile_home_key(),
+                    profile_name=active_profile.strip().lower(),
+                    gateway_session_key=str(gateway_session_key),
+                    session_id=str(session_id),
+                )
+                runtime_cache_signature = self._runtime_shell_signature(
+                    model=str(model or ""),
+                    runtime_kwargs=runtime_kwargs,
+                    enabled_toolsets=enabled_toolsets,
+                    user_config=user_config,
+                    fallback_model=fallback_model,
+                    account_id=account_id,
+                    session_owner_id=session_owner_id,
+                    deep_memory_principal=str(
+                        agent_kwargs.get("deep_memory_principal") or ""
+                    ),
+                    deep_memory_subject=str(
+                        agent_kwargs.get("deep_memory_subject") or ""
+                    ),
+                )
+                diagnostic_cache_keys = self._runtime_shell_cache_keys(
+                    user_config=user_config,
+                    runtime_kwargs=runtime_kwargs,
+                )
+                runtime_cache_diagnostics = {
+                    "signature": self._runtime_shell_digest(
+                        runtime_cache_signature
+                    )[:12],
+                    "model": self._runtime_shell_digest(model or "")[:12],
+                    "runtime": self._runtime_shell_digest(runtime_kwargs)[:12],
+                    "toolsets": self._runtime_shell_digest(enabled_toolsets)[:12],
+                    "config": self._runtime_shell_digest(user_config)[:12],
+                    "fallback": self._runtime_shell_digest(fallback_model)[:12],
+                    "cache_keys": ",".join(
+                        f"{key}:{self._runtime_shell_digest(value)[:8]}"
+                        for key, value in sorted(diagnostic_cache_keys.items())
+                    ),
+                    "identity_state": "".join(
+                        "1" if value else "0"
+                        for value in (
+                            account_id,
+                            session_owner_id,
+                            agent_kwargs.get("deep_memory_principal"),
+                            agent_kwargs.get("deep_memory_subject"),
+                        )
+                    ),
+                }
+                runtime_cache_message_count = self._runtime_shell_message_count(
+                    agent_kwargs.get("session_db"), session_id
+                )
+                cache_decision = self._runtime_shell_cache.acquire(
+                    runtime_cache_key,
+                    signature=runtime_cache_signature,
+                    message_count=runtime_cache_message_count,
+                )
+                runtime_cache_acquire_reason = cache_decision.reason
+                self._schedule_runtime_shell_retirement(
+                    cache_decision.retired_agents
+                )
+                agent = cache_decision.agent
+                runtime_cache_lease = cache_decision.lease
+                runtime_cache_reason = cache_decision.reason
+                if agent is not None and not self._prepare_cached_runtime_shell(
+                    agent, agent_kwargs
+                ):
+                    retired_decision = self._runtime_shell_cache.finish(
+                        runtime_cache_lease,
+                        reusable=False,
+                        message_count=None,
+                    )
+                    self._schedule_runtime_shell_retirement(
+                        retired_decision.retired_agents
+                    )
+                    agent = None
+                    runtime_cache_lease = None
+                    runtime_cache_reason = "unsafe_cached_state"
+                elif agent is not None:
+                    agent_shell_outcome = "runtime_cache_hit"
+            elif _zet_runtime_shell_cache_allowed.get():
+                if unsupported_runtime:
+                    runtime_cache_reason = "unsupported_runtime"
+                elif confirmed_runtime_lock:
+                    runtime_cache_reason = "confirmed_runtime_lock"
+                elif disable_tools:
+                    runtime_cache_reason = "tools_disabled"
+                elif execution_policy:
+                    runtime_cache_reason = "special_execution_policy"
+                elif not gateway_session_key or not session_id:
+                    runtime_cache_reason = "unstable_session_identity"
+                elif agent_kwargs.get("session_db") is None:
+                    runtime_cache_reason = "session_db_unavailable"
         reused_onboarding_agent = agent is not None
         if agent is None:
-            agent = AIAgent(**agent_kwargs)
+            try:
+                agent = AIAgent(**agent_kwargs)
+            except BaseException:
+                if agent_shell_timing is not None:
+                    agent_shell_timing.agent_shell_finished("error")
+                raise
             if onboarding_cache_key is not None:
-                self._cache_onboarding_agent(onboarding_cache_key, agent)
+                self._publish_onboarding_agent(onboarding_cache_key, agent)
+            elif runtime_cache_key is not None:
+                reserve_decision = self._runtime_shell_cache.reserve_new(
+                    runtime_cache_key,
+                    signature=runtime_cache_signature,
+                    message_count=runtime_cache_message_count,
+                    agent=agent,
+                )
+                self._schedule_runtime_shell_retirement(
+                    reserve_decision.retired_agents
+                )
+                runtime_cache_lease = reserve_decision.lease
+                runtime_cache_reason = reserve_decision.reason
+                if runtime_cache_lease is None:
+                    agent._zet_runtime_shell_ephemeral = True
         else:
             # Request-scoped callbacks close over this response's stream queue.
             # Replace them on every reuse so a reconnect never writes into the
@@ -3333,6 +4576,36 @@ class ZetAgentAdapter(APIServerAdapter):
             agent.session_estimated_cost_usd = 0.0
             agent.session_cost_status = "unknown"
             agent.session_cost_source = "none"
+        if agent_shell_timing is not None:
+            agent_shell_timing.agent_shell_finished(agent_shell_outcome)
+        if isinstance(runtime_cache_lease, RuntimeShellLease):
+            agent._zet_runtime_shell_lease = runtime_cache_lease
+            agent._zet_runtime_shell_session_id = str(session_id or "")
+        if runtime_cache_reason != "bypass":
+            counts = self._runtime_shell_cache.counts()
+            logger.info(
+                "zet_agent runtime shell cache lookup: result=%s acquire=%s "
+                "profile=%s session_hash=%s message_count=%s signature=%s "
+                "model_fp=%s runtime_fp=%s toolsets_fp=%s config_fp=%s "
+                "fallback_fp=%s identities=%s cache_keys=%s "
+                "entries=%d idle=%d leased=%d",
+                runtime_cache_reason,
+                runtime_cache_acquire_reason,
+                active_profile,
+                self._runtime_shell_digest(session_id or "")[:12],
+                runtime_cache_message_count,
+                runtime_cache_diagnostics.get("signature", "-"),
+                runtime_cache_diagnostics.get("model", "-"),
+                runtime_cache_diagnostics.get("runtime", "-"),
+                runtime_cache_diagnostics.get("toolsets", "-"),
+                runtime_cache_diagnostics.get("config", "-"),
+                runtime_cache_diagnostics.get("fallback", "-"),
+                runtime_cache_diagnostics.get("identity_state", "-"),
+                runtime_cache_diagnostics.get("cache_keys", "-"),
+                counts["entries"],
+                counts["idle"],
+                counts["leased"],
+            )
         if onboarding_fast_path:
             # One initial attempt plus one quick retry.  The retry loop reads
             # this marker to replace its multi-second generic 502 backoff.
@@ -3354,10 +4627,24 @@ class ZetAgentAdapter(APIServerAdapter):
                 int((time.monotonic() - agent_init_started_mono) * 1000),
                 reused_onboarding_agent,
             )
+        if execution_policy == "silent_automation":
+            # A silent turn may share a lineage identifier for continuity, but
+            # it is not part of the user's canonical chat.
+            # Disable every SessionDB/JSON persistence path before the turn can
+            # append its internal prompt, tool results, or final response.
+            agent._persist_disabled = True
+            agent._session_db = None
+            agent._session_json_enabled = False
         if disable_tools:
             agent.tools = []
             agent.valid_tool_names = set()
             agent._skip_mcp_refresh = True
+        else:
+            _apply_execution_policy(
+                agent,
+                execution_policy,
+                trusted_skill_slug,
+            )
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider")
             or getattr(agent, "provider", "")
@@ -3410,10 +4697,14 @@ class ZetAgentAdapter(APIServerAdapter):
 
         # 1. Reasoning: late-bind on the agent (AIAgent reads
         # ``self.reasoning_callback`` at runtime).
+        prestream_timing = _prestream_timing_context.get()
+
         def _reasoning_cb(text: str) -> None:
             if not text:
                 return
             try:
+                if prestream_timing is not None:
+                    prestream_timing.observe_queued_semantic("reasoning")
                 stream_q.put(("__tool_progress__", {"type": "reasoning.delta", "text": text}))
             except Exception:
                 logger.debug("[zet_agent] reasoning_cb push failed", exc_info=True)
@@ -3494,16 +4785,30 @@ class ZetAgentAdapter(APIServerAdapter):
         if session_id:
             try:
                 from tools.approval import register_gateway_notify
+                approval_callback = self._make_approval_cb(
+                    stream_q,
+                    session_id,
+                    interaction_queue_key,
+                    agent,
+                    bound_turn_id=extension_turn_id,
+                )
                 register_gateway_notify(
                     interaction_queue_key,
-                    self._make_approval_cb(
-                        stream_q,
-                        session_id,
-                        interaction_queue_key,
-                        agent,
-                        bound_turn_id=extension_turn_id,
-                    ),
+                    approval_callback,
                 )
+                if (
+                    isinstance(
+                        getattr(agent, "_zet_runtime_shell_lease", None),
+                        RuntimeShellLease,
+                    )
+                    or bool(
+                        getattr(agent, "_zet_runtime_shell_ephemeral", False)
+                    )
+                ):
+                    agent._zet_runtime_shell_approval_binding = (
+                        interaction_queue_key,
+                        approval_callback,
+                    )
                 with self._session_lock:
                     self._approval_session_ids.add(interaction_queue_key)
                 with self._pending_lock:
@@ -3551,11 +4856,14 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
-        business_execution_token: Optional[str] = None,
+        creation_action_receipt_transport: str = "",
+        hardware_execution_token: Optional[str] = None,
+        execution_policy: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
+        prestream_timing: Optional[PrestreamTiming] = None,
     ):
         """Wrap base ``_run_agent`` to bind the App and interaction scopes.
 
@@ -3574,6 +4882,10 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         from gateway.session_context import zettlab_auth_principal
         request_overrides = dict(request_overrides or {})
+        # Private bootstrap metadata consumed and removed by this adapter's
+        # _create_agent. It selects the ordinary video plugin toolset for a
+        # silent task and never reaches AIAgent or a provider request.
+        request_overrides["_zet_trusted_skill_slug"] = trusted_skill_slug
         # Capture before base _run_agent hops to its executor. The principal
         # remains private request metadata, never a model argument.
         principal = zettlab_auth_principal()
@@ -3594,10 +4906,7 @@ class ZetAgentAdapter(APIServerAdapter):
             request_overrides = dict(request_overrides or {})
             request_overrides["_zet_onboarding_received_mono"] = time.monotonic()
 
-        if (
-            business_execution_token
-            and not gateway_sensitive_process_boundary_ready()
-        ):
+        if hardware_execution_token and not gateway_sensitive_process_boundary_ready():
             raise PermissionError(
                 "gateway process memory boundary is unavailable"
             )
@@ -3612,12 +4921,22 @@ class ZetAgentAdapter(APIServerAdapter):
             ack_revision_requested = (
                 "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
             )
-        scoped_business_execution_token = str(business_execution_token or "")
+        scoped_hardware_execution_token = str(
+            hardware_execution_token or ""
+        ).strip()
         if ack_status == "cancelled" or (ack_status and not ack_turn_id):
-            # Legacy receipts remain visible to released clients, but cannot
-            # carry the newer turn-bound side-effect capability. Cancellation
-            # similarly preserves the receipt while revoking execution.
-            scoped_business_execution_token = ""
+            # A cancelled or malformed plan acknowledgement cannot carry the
+            # turn-bound side-effect capability into the resumed turn.
+            scoped_hardware_execution_token = ""
+        # A plan acknowledgement is a UI receipt; it must not alter the
+        # ordinary plugin/tool path or create a second execution channel.
+        scoped_execution_policy = str(execution_policy or "").strip().lower()
+        if scoped_execution_policy == "silent_automation":
+            # Silent execution is a receipt-bound workflow, never a caller
+            # supplied interaction mode or plan acknowledgement.
+            response_mode = None
+            plan_ack = None
+            plan_auto_execute = False
 
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
@@ -3654,6 +4973,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         # Round-trip JSON to detach the queued frame from plugin
                         # mutation after emit_attachment returns.
                         safe_attachment = json.loads(encoded)
+                        _observe_queued_attachment(prestream_timing)
                         stream_q.put((
                             "__tool_progress__",
                             {
@@ -3679,7 +4999,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
 
         try:
-            if session_id:
+            if (
+                scoped_execution_policy != "silent_automation"
+                and session_id
+            ):
                 _eff_model = self._effective_model(session_id, gateway_session_key)
                 if _eff_model:
                     with self._seen_lock():
@@ -3708,7 +5031,9 @@ class ZetAgentAdapter(APIServerAdapter):
 
         from gateway.session_context import (
             clear_turn_vars,
+            pop_execution_session_key,
             pop_zettlab_turn_title,
+            push_execution_session_key,
             push_zettlab_turn_title,
             set_turn_vars,
             summarize_turn_title,
@@ -3719,7 +5044,11 @@ class ZetAgentAdapter(APIServerAdapter):
             plan_ack_status=ack_status,
             plan_ack_turn_id=ack_turn_id,
             plan_ack_revision_requested=ack_revision_requested,
-            business_execution_token=scoped_business_execution_token,
+            hardware_execution_token=scoped_hardware_execution_token,
+            execution_policy=scoped_execution_policy,
+        )
+        execution_session_token = push_execution_session_key(
+            str(gateway_session_key or "")
         )
         # This turn's ledger card title (X-Task-Title). Bound here, before the
         # base adapter's copy_context() hands the request to its executor, so
@@ -3741,6 +5070,10 @@ class ZetAgentAdapter(APIServerAdapter):
             if isinstance(trusted_user_message, str)
             else title_user_message
         )
+        if scoped_execution_policy == "silent_automation":
+            # Silent automation must not leak its frozen task text into the
+            # billing/ledger X-Task-Title header or a user-visible card.
+            title_source = ""
         turn_title_token = push_zettlab_turn_title(
             ""
             if not str(turn_id or "").strip() or title_source.startswith("[ZETTLAB:")
@@ -3755,6 +5088,8 @@ class ZetAgentAdapter(APIServerAdapter):
         )
 
         approval_session_token = set_current_session_key(interaction_queue_key or "")
+        runtime_shell_cache_token = _zet_runtime_shell_cache_allowed.set(True)
+        runtime_shell_reusable = False
 
         try:
             result = await super()._run_agent(
@@ -3781,11 +5116,14 @@ class ZetAgentAdapter(APIServerAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
-                business_execution_token=scoped_business_execution_token,
+                creation_action_receipt_transport=creation_action_receipt_transport,
+                hardware_execution_token=scoped_hardware_execution_token,
+                execution_policy=scoped_execution_policy,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
                 trusted_skill_slug=trusted_skill_slug,
+                prestream_timing=prestream_timing,
             )
             # Early-return steer salvage: many conversation_loop retry/error
             # paths return without running finalize_turn, so the closing
@@ -3875,7 +5213,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 has_pending_steer = False
                 if isinstance(result, tuple) and result and isinstance(result[0], dict):
                     has_pending_steer = bool(result[0].get("pending_steer"))
-                if run_ok and not has_pending_steer:
+                if (
+                    scoped_execution_policy != "silent_automation"
+                    and run_ok
+                    and not has_pending_steer
+                ):
                     # Consumed mid-turn steer = the user intervened in this
                     # round. The goal judge keys user_initiated off the
                     # message NOT starting with CONTINUATION_MARKER — pass
@@ -3893,6 +5235,11 @@ class ZetAgentAdapter(APIServerAdapter):
                         _consumed_steer or user_message,
                         final_response,
                         effective_session_id=effective_sid,
+                    )
+                elif scoped_execution_policy == "silent_automation":
+                    logger.debug(
+                        "[zet_agent] goal post-turn hook skipped for silent automation session=%s",
+                        session_id,
                     )
                 elif run_ok:
                     logger.info(
@@ -3915,7 +5262,10 @@ class ZetAgentAdapter(APIServerAdapter):
             # close sentinel is enqueued by agent_task's done callback, and
             # anything put on stream_q after that may never be drained.
             self._push_steer_dropped_if_any(stream_q, result)
-            if not title_user_message.startswith("[ZETTLAB:"):
+            if (
+                scoped_execution_policy != "silent_automation"
+                and not title_user_message.startswith("[ZETTLAB:")
+            ):
                 try:
                     await self._emit_native_session_title(
                         result=result,
@@ -3929,6 +5279,20 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
                 except Exception:
                     logger.debug("[zet_agent] native auto-title hook failed", exc_info=True)
+            result_payload = (
+                result[0]
+                if isinstance(result, tuple)
+                and result
+                and isinstance(result[0], dict)
+                else {}
+            )
+            runtime_agent = agent_ref[0] if agent_ref else None
+            runtime_shell_reusable = bool(
+                runtime_agent is not None
+                and not result_payload.get("failed")
+                and not result_payload.get("interrupted")
+                and not getattr(runtime_agent, "_interrupt_requested", False)
+            )
             return result
         finally:
             if attachment_emitter_token is not None:
@@ -3992,10 +5356,32 @@ class ZetAgentAdapter(APIServerAdapter):
                     "[zet_agent] onboarding callback cleanup failed", exc_info=True
                 )
             try:
-                reset_current_session_key(approval_session_token)
+                runtime_agent = agent_ref[0] if agent_ref else None
+                if runtime_agent is not None:
+                    await _to_thread_with_completion_barrier(
+                        self._finish_runtime_shell_turn,
+                        runtime_agent,
+                        reusable=runtime_shell_reusable,
+                    )
+            except Exception:
+                logger.warning(
+                    "[zet_agent] runtime shell turn cleanup failed",
+                    exc_info=True,
+                )
             finally:
-                clear_turn_vars(turn_context_tokens)
-                pop_zettlab_turn_title(turn_title_token)
+                try:
+                    _zet_runtime_shell_cache_allowed.reset(
+                        runtime_shell_cache_token
+                    )
+                finally:
+                    try:
+                        reset_current_session_key(approval_session_token)
+                    finally:
+                        try:
+                            clear_turn_vars(turn_context_tokens)
+                        finally:
+                            pop_execution_session_key(execution_session_token)
+                            pop_zettlab_turn_title(turn_title_token)
 
     def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
         """Return the model this session will actually use this turn: the
@@ -4121,6 +5507,7 @@ class ZetAgentAdapter(APIServerAdapter):
         self, request, completion_id: str, model: str, created: int,
         stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        prestream_timing: Optional[PrestreamTiming] = None,
     ):
         """Register the active turn under session_id for the lifetime of
         the SSE response, then delegate to the base writer. The
@@ -4148,6 +5535,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 active_ref,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                prestream_timing=prestream_timing,
             )
         finally:
             self._clear_active_session_turn(session_id, active_ref, agent_task)
@@ -5203,11 +6591,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 approval_session_key_for_id,
                 resolve_gateway_approval,
             )
-        except Exception as exc:
-            logger.exception("[zet_agent] tools.approval import failed")
-            return web.json_response(
-                _openai_error(f"approval module unavailable: {exc}", err_type="server_error"),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "approval module import",
+                "approval_module_unavailable",
+                user_message="Approval handling is temporarily unavailable.",
             )
 
         protocol, protocol_err = self._delivery_protocol_fields(body)
@@ -6106,29 +7494,9 @@ class ZetAgentAdapter(APIServerAdapter):
         # dispatch records (delegate_tool captures parent_agent.session_id);
         # include the agent's current session_id too in case compaction
         # rotated it since dispatch.
-        try:
-            from tools.async_delegation import interrupt_for_session
-
-            rotated_sid = str(getattr(agent, "session_id", "") or "") if agent else ""
-            for psid in {session_id, rotated_sid} - {""}:
-                # suppress_completion: the user explicitly stopped this turn —
-                # local-server anchors the batch outcome card onto the
-                # interrupted turn itself, so the killed children must NOT
-                # re-enter the chat with a completion turn afterwards.
-                # profile scope: under a multiplexer this route must not be
-                # able to kill (and suppress-swallow) ANOTHER profile's batch
-                # by quoting its session id (same rule as the control plane).
-                interrupt_for_session(
-                    parent_session_id=psid,
-                    reason="user_cancel",
-                    suppress_completion=True,
-                    profile_home=self._delegation_control_scope(request),
-                )
-        except Exception:
-            logger.debug(
-                "[zet_agent] session interrupt: async delegation interrupt failed",
-                exc_info=True,
-            )
+        self._interrupt_async_delegations_for_session(
+            request, session_id, agent, reason="user_cancel",
+        )
 
         self._interrupt_pending_interactions(session_id, turn_key)
 
@@ -6140,6 +7508,73 @@ class ZetAgentAdapter(APIServerAdapter):
 
         status = "stopping" if (agent is not None or task is not None) else "not_running"
         return web.json_response({"session_id": session_id, "status": status})
+
+    def _interrupt_async_delegations_for_session(
+        self,
+        request: "web.Request",
+        session_id: str,
+        agent: Any,
+        *,
+        reason: str,
+    ) -> int:
+        """Stop background delegate_task children for ``session_id``.
+
+        Does not touch the parent chat agent. Goal park / clear uses this
+        without ``agent.interrupt()`` so a live user interjection on the
+        same session is not cancelled.
+        """
+        try:
+            from tools.async_delegation import interrupt_for_session
+        except Exception:
+            logger.debug(
+                "[zet_agent] session interrupt: async_delegation import failed",
+                exc_info=True,
+            )
+            return 0
+        rotated_sid = str(getattr(agent, "session_id", "") or "") if agent else ""
+        count = 0
+        for psid in {session_id, rotated_sid} - {""}:
+            try:
+                # parent_session_id only: session_key is the durable gateway
+                # routing key and survives /new, so OR-matching it would kill
+                # the replacement session's delegations.
+                count += int(interrupt_for_session(
+                    parent_session_id=psid,
+                    reason=reason,
+                    suppress_completion=True,
+                    profile_home=self._delegation_control_scope(request),
+                ) or 0)
+            except Exception:
+                logger.debug(
+                    "[zet_agent] session interrupt: async delegation interrupt failed",
+                    exc_info=True,
+                )
+        return count
+
+    async def _handle_session_delegations_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/delegations/interrupt
+
+        Kill leftover async subagents for this session without stopping a
+        live chat turn. Used when a Goal parks/clears (cron contention,
+        round failure, user clear) so the banner and task list converge.
+        Additive route (HR#4): unknown to older hermes builds, which 404.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info.get("session_id", "")
+        turn_key = self._active_turn_key(session_id)
+        with self._session_run_lock:
+            agent_ref = self._active_session_agents.get(turn_key) or self._active_session_agents.get(session_id)
+        agent = agent_ref[0] if agent_ref else None
+        count = self._interrupt_async_delegations_for_session(
+            request, session_id, agent, reason="goal_park",
+        )
+        return web.json_response({
+            "session_id": session_id,
+            "status": "stopping" if count else "not_running",
+            "interrupted": count,
+        })
 
     # ------------------------------------------------------------------
     # Delegation control plane (App banner: status / per-id cancel)
@@ -6199,8 +7634,12 @@ class ZetAgentAdapter(APIServerAdapter):
 
             active = list_active_subagents(profile_home)
             async_records = list_async_delegations(profile_home)
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "delegation status",
+                "delegation_status_unavailable",
+                user_message="Delegation status is temporarily unavailable.",
+            )
         return web.json_response({"active": active, "async": async_records})
 
     async def _handle_delegation_cancel(self, request: "web.Request") -> "web.Response":
@@ -6216,8 +7655,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 delegation_id,
                 profile_home=self._delegation_control_scope(request),
             )
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "delegation cancel",
+                "delegation_cancel_unavailable",
+                user_message="The delegation could not be cancelled.",
+            )
         return web.json_response(
             {"delegation_id": delegation_id, "interrupted": bool(ok)},
             status=200 if ok else 404,
@@ -6236,8 +7679,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 subagent_id,
                 profile_home=self._delegation_control_scope(request),
             )
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "subagent interrupt",
+                "subagent_interrupt_unavailable",
+                user_message="The subagent could not be interrupted.",
+            )
         return web.json_response(
             {"subagent_id": subagent_id, "interrupted": bool(ok)},
             status=200 if ok else 404,
@@ -6358,17 +7805,43 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception as exc:
             from hermes_state import RuntimeImportConflict, RuntimeImportIncomplete
             if isinstance(exc, RuntimeImportConflict):
-                status, code = 409, "runtime_import_conflict"
-            elif isinstance(exc, RuntimeImportIncomplete):
-                status, code = 409, "runtime_import_incomplete"
-            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
-                status, code = 400, "invalid_runtime_import"
-            else:
-                logger.exception("[zet_agent] completed transcript import failed")
-                status, code = 500, "runtime_import_failed"
-            return web.json_response(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
-                status=status,
+                return _correlated_error_response(
+                    "completed transcript import conflict",
+                    "runtime_import_conflict",
+                    status=409,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The transcript conflicts with current session state. "
+                        "Refresh the session and retry the import."
+                    ),
+                )
+            if isinstance(exc, RuntimeImportIncomplete):
+                return _correlated_error_response(
+                    "incomplete transcript import",
+                    "runtime_import_incomplete",
+                    status=409,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The transcript import is incomplete. Upload all chunks "
+                        "and retry the commit."
+                    ),
+                )
+            if isinstance(exc, ValueError):
+                return _correlated_error_response(
+                    "invalid transcript import request",
+                    "invalid_runtime_import",
+                    status=400,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The transcript import request is invalid. Correct "
+                        "operation, IDs, payload_sha256, chunk metadata, and "
+                        "message fields, then retry."
+                    ),
+                )
+            return _reload_unavailable_response(
+                "completed transcript import",
+                "runtime_import_failed",
+                user_message="The transcript could not be imported.",
             )
         finally:
             self._end_runtime_import_operation(operation_key)
@@ -6423,17 +7896,42 @@ class ZetAgentAdapter(APIServerAdapter):
                 MemoryImportUnsupported,
             )
             if isinstance(exc, MemoryImportUnsupported):
-                status, code = 501, "memory_import_unsupported"
-            elif isinstance(exc, MemoryImportConflict):
-                status, code = 409, "memory_import_conflict"
-            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
-                status, code = 400, "invalid_memory_import"
-            else:
-                logger.exception("[zet_agent] curated memory import failed")
-                status, code = 500, "memory_import_failed"
-            return web.json_response(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
-                status=status,
+                return _correlated_error_response(
+                    "unsupported curated memory import",
+                    "memory_import_unsupported",
+                    status=501,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "Curated memory import is unavailable on this profile "
+                        "storage. Move the profile to supported local storage."
+                    ),
+                )
+            if isinstance(exc, MemoryImportConflict):
+                return _correlated_error_response(
+                    "conflicting curated memory import",
+                    "memory_import_conflict",
+                    status=409,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The profile memory state changed or is not safe to "
+                        "replace. Refresh the profile and retry."
+                    ),
+                )
+            if isinstance(exc, ValueError):
+                return _correlated_error_response(
+                    "invalid curated memory import request",
+                    "invalid_memory_import",
+                    status=400,
+                    err_type="invalid_request_error",
+                    user_message=(
+                        "The memory import request is invalid. Correct mode, "
+                        "target, import_id, payload_sha256, and entries, then retry."
+                    ),
+                )
+            return _reload_unavailable_response(
+                "curated memory import",
+                "memory_import_failed",
+                user_message="The memory data could not be imported.",
             )
         finally:
             self._end_runtime_import_operation(operation_key)
@@ -6747,19 +8245,6 @@ class ZetAgentAdapter(APIServerAdapter):
         downstream ``await request.json()`` inside the base handler reuses
         them — we only pay one read.
         """
-        raw_business_token = request.headers.get(
-            "X-Zettlab-Business-Execution-Token",
-            "",
-        )
-        if raw_business_token and not gateway_sensitive_process_boundary_ready():
-            return web.json_response(
-                _openai_error(
-                    "ZetAgent process memory boundary is unavailable",
-                    code="process_boundary_unavailable",
-                ),
-                status=503,
-            )
-
         try:
             raw = await request.read()
         except Exception as e:
@@ -6866,9 +8351,12 @@ class ZetAgentAdapter(APIServerAdapter):
             override_home = get_hermes_home_override()
             config_path = (Path(override_home) if override_home else _hermes_home) / "config.yaml"
             atomic_yaml_write(config_path, cfg)
-        except Exception as exc:
-            logger.warning("model-switch: config write failed: %s", exc)
-            return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
+        except Exception:
+            return _reload_unavailable_response(
+                "model switch config write",
+                "model_config_write_failed",
+                user_message="The model setting could not be saved.",
+            )
 
         # Identity note is handled by _run_agent's open-time compare, not here.
         logger.info(
@@ -6880,6 +8368,16 @@ class ZetAgentAdapter(APIServerAdapter):
         })
 
     async def _handle_session_model_switch(self, request: "web.Request") -> "web.Response":
+        """Bind trusted request identity before changing or prewarming a session."""
+        return await self._handle_with_zettlab_identity(
+            request,
+            self._handle_session_model_switch_authorized,
+        )
+
+    async def _handle_session_model_switch_authorized(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
         """POST /v1/sessions/{session_id}/model/switch — session-level model override.
 
         Unlike the agent-level POST /v1/model/switch, this only changes the
@@ -6891,10 +8389,6 @@ class ZetAgentAdapter(APIServerAdapter):
 
         Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "...", "api_mode"?: "..."}
         """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
         session_id = request.match_info.get("session_id", "")
         if not session_id:
             return web.json_response(
@@ -6959,10 +8453,129 @@ class ZetAgentAdapter(APIServerAdapter):
             "session-model-switch: session=%s model=%s provider=%s",
             session_id, new_model, new_provider,
         )
+        if self._runtime_shell_prewarm_identity_ready():
+            self._schedule_runtime_shell_prewarm(session_id)
         return web.json_response({
             "ok": True,
             "session_id": session_id,
             "model": new_model,
+        })
+
+    async def _handle_session_runtime_prewarm(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Bind trusted identity before an ephemeral runtime-shell prewarm."""
+        return await self._handle_with_zettlab_identity(
+            request,
+            self._handle_session_runtime_prewarm_authorized,
+        )
+
+    @staticmethod
+    def _runtime_prewarm_override(body: Dict[str, Any]) -> Dict[str, Any]:
+        override: Dict[str, Any] = {"model": body.get("model", "")}
+        for key in ("provider", "base_url", "api_key", "api_mode"):
+            value = body.get(key, "")
+            if value:
+                override[key] = value
+        if body.get("context_length", None) is not None:
+            override["context_length"] = body["context_length"]
+        if isinstance(body.get("supports_vision"), bool):
+            override["supports_vision"] = body["supports_vision"]
+        if isinstance(body.get("auxiliary"), dict):
+            override["auxiliary"] = body["auxiliary"]
+        return override
+
+    def _start_ephemeral_session_runtime_prewarm(
+        self,
+        session_id: str,
+        override: Dict[str, Any],
+    ) -> tuple[Optional[asyncio.Task], str]:
+        gw = getattr(self, "gateway_runner", None)
+        overrides = (
+            getattr(gw, "_session_model_overrides", None)
+            if gw is not None
+            else None
+        )
+        state_key = self._session_model_state_key(session_id)
+        if overrides is None:
+            return None, "runtime_unavailable"
+        if state_key in overrides:
+            return None, "session_override_exists"
+
+        # This dict exists only while the bounded task constructs the shell.
+        # A real switch replaces the object, so completion cleanup cannot erase
+        # a subsequently published authoritative override.
+        overrides[state_key] = override
+        task = self._start_runtime_shell_prewarm(session_id)
+        if task is None:
+            if overrides.get(state_key) is override:
+                overrides.pop(state_key, None)
+            return None, "prewarm_not_admitted"
+
+        def _remove_ephemeral_override(_done_task: asyncio.Task) -> None:
+            if overrides.get(state_key) is override:
+                overrides.pop(state_key, None)
+
+        task.add_done_callback(_remove_ephemeral_override)
+        return task, ""
+
+    async def _handle_session_runtime_prewarm_authorized(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Warm one exact model shell without publishing a session override."""
+        session_id = str(request.match_info.get("session_id", "") or "").strip()
+        if not session_id or len(session_id) > 512:
+            return web.json_response(
+                _openai_error("invalid session_id"), status=400,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid json"}, status=400,
+            )
+
+        new_model = body.get("model", "")
+        if not new_model:
+            return web.json_response(
+                {"ok": False, "error": "model is required"}, status=400,
+            )
+        if not self._runtime_shell_prewarm_identity_ready():
+            return web.json_response({
+                "ok": True,
+                "session_id": session_id,
+                "model": new_model,
+                "prewarmed": False,
+                "reason": "identity_unavailable",
+            })
+
+        override = self._runtime_prewarm_override(body)
+        task, reason = self._start_ephemeral_session_runtime_prewarm(
+            session_id,
+            override,
+        )
+        if task is None:
+            return web.json_response({
+                "ok": True,
+                "session_id": session_id,
+                "model": new_model,
+                "prewarmed": False,
+                "reason": reason,
+            })
+        try:
+            prewarmed = bool(await asyncio.shield(task))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            prewarmed = False
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "model": new_model,
+            "prewarmed": prewarmed,
         })
 
     async def _handle_session_model_clear(self, request: "web.Request") -> "web.Response":
@@ -7076,27 +8689,18 @@ class ZetAgentAdapter(APIServerAdapter):
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             from agent.skill_commands import scan_skill_commands
-        except Exception as exc:
-            logger.exception("[zet_agent] skills-reload: import failed")
-            return web.json_response(
-                _openai_error(
-                    f"skills reload modules unavailable: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "skills-reload import", "skills_reload_unavailable"
             )
 
         try:
             clear_skills_system_prompt_cache(clear_snapshot=True)
             skill_commands = scan_skill_commands()
             skills_total = len(skill_commands)
-        except Exception as exc:
-            logger.exception("[zet_agent] skills-reload failed")
-            return web.json_response(
-                _openai_error(
-                    f"skills reload failed: {exc}", err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "skills-reload scan", "skills_reload_unavailable"
             )
 
         # ZET-1139 — also push the invalidation through to existing sessions.
@@ -7115,26 +8719,20 @@ class ZetAgentAdapter(APIServerAdapter):
         #     whether we managed to drop the in-process cache too.
         gw = getattr(self, "gateway_runner", None)
         if gw is None:
-            logger.error("[zet_agent] skills-reload: no gateway_runner")
-            return web.json_response(
-                _openai_error(
-                    "skills reload incomplete: no gateway runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "skills-reload gateway lookup",
+                "skills_reload_unavailable",
+                exc_info=False,
             )
         if _request_value(request, "hermes_profile_home"):
             session_db = await self._ensure_session_db_async()
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:
-            logger.error("[zet_agent] skills-reload: no SessionDB on runner")
-            return web.json_response(
-                _openai_error(
-                    "skills reload incomplete: no session db on runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "skills-reload SessionDB lookup",
+                "skills_reload_unavailable",
+                exc_info=False,
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
@@ -7145,17 +8743,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 # a silent no-op AND the coroutine leaked into the JSON
                 # response (TypeError → 500) — ZET-1139 regression class.
                 db_rows_cleared = await db_rows_cleared
-        except Exception as exc:
-            logger.exception(
-                "[zet_agent] skills-reload: DB clear failed; "
-                "returning 500 so caller can fall back",
-            )
-            return web.json_response(
-                _openai_error(
-                    f"skills reload db clear failed: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "skills-reload DB clear", "skills_reload_unavailable"
             )
 
         invalidated = 0
@@ -7165,6 +8755,23 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning(
                 "[zet_agent] skills-reload: invalidate-all failed "
                 "(DB cleared, sessions still rebuild next turn)",
+                exc_info=True,
+            )
+        try:
+            runtime_profile_home = self._profile_home_key(
+                _request_value(request, "hermes_profile_home") or None
+            )
+            invalidated += await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._invalidate_runtime_shell_prompts,
+                    profile_home=runtime_profile_home,
+                ),
+                timeout=ZET_RUNTIME_SHELL_PROMPT_INVALIDATE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "[zet_agent] skills-reload: runtime-shell invalidate failed "
+                "(DB cleared, sessions still rebuild after cache replacement)",
                 exc_info=True,
             )
 
@@ -7202,8 +8809,10 @@ class ZetAgentAdapter(APIServerAdapter):
         Runs the (blocking) reconnect in an executor so the aiohttp event loop
         is not stalled while the MCP handshake happens on its background loop.
 
-        This only serves *new* sessions — it does not invalidate the current
-        session's cached agent. That matches the skills-reload boundary.
+        Existing ordinary chat sessions do not need a synchronous cache sweep:
+        a reused runtime shell is required to re-derive its complete live tool
+        snapshot at the next turn boundary.  This also removes tools after an
+        uninstall, including the last MCP tool in a profile.
 
         Auth: ZET_AGENT_KEY Bearer (same as chat).
 
@@ -7217,34 +8826,20 @@ class ZetAgentAdapter(APIServerAdapter):
 
         try:
             from tools.mcp_tool import reload_single_mcp_server
-        except Exception as exc:
-            logger.exception("[zet_agent] connectors-reload: import failed")
-            return web.json_response(
-                _openai_error(
-                    f"mcp reload module unavailable: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "connectors-reload import", "connector_reload_unavailable"
             )
 
         import asyncio
-        loop = asyncio.get_running_loop()
         try:
-            tools = await loop.run_in_executor(
-                None,
+            tools = await asyncio.to_thread(
                 reload_single_mcp_server,
                 ZETTLAB_CONNECTORS_SERVER_NAME,
             )
-        except Exception as exc:
-            logger.warning(
-                "[zet_agent] connectors-reload failed for server '%s': %s",
-                ZETTLAB_CONNECTORS_SERVER_NAME, exc,
-            )
-            return web.json_response(
-                _openai_error(
-                    f"connector reload failed: {exc}", err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "connectors-reload worker", "connector_reload_unavailable"
             )
 
         tools_total = len(tools or [])
@@ -7315,13 +8910,10 @@ class ZetAgentAdapter(APIServerAdapter):
 
         gw = getattr(self, "gateway_runner", None)
         if gw is None:
-            logger.error("[zet_agent] profile-reload: no gateway_runner")
-            return web.json_response(
-                _openai_error(
-                    "profile reload unavailable: no gateway runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "profile-reload gateway lookup",
+                "profile_reload_unavailable",
+                exc_info=False,
             )
 
         # Step 1 (CRITICAL): clear DB-stored prompts. Without this the
@@ -7335,13 +8927,10 @@ class ZetAgentAdapter(APIServerAdapter):
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:
-            logger.error("[zet_agent] profile-reload: no SessionDB on runner")
-            return web.json_response(
-                _openai_error(
-                    "profile reload unavailable: no session db on runner",
-                    err_type="server_error",
-                ),
-                status=500,
+            return _reload_unavailable_response(
+                "profile-reload SessionDB lookup",
+                "profile_reload_unavailable",
+                exc_info=False,
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
@@ -7349,17 +8938,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 # Same AsyncSessionDB facade as skills-reload above: await or
                 # the clear silently no-ops and the coroutine breaks the JSON.
                 db_rows_cleared = await db_rows_cleared
-        except Exception as exc:
-            logger.exception(
-                "[zet_agent] profile-reload: DB clear failed; "
-                "returning 500 so local-server falls back to Stop",
-            )
-            return web.json_response(
-                _openai_error(
-                    f"profile reload db clear failed: {exc}",
-                    err_type="server_error",
-                ),
-                status=500,
+        except Exception:
+            return _reload_unavailable_response(
+                "profile-reload DB clear", "profile_reload_unavailable"
             )
 
         # Step 2 (FAIL-SOFT): drop in-process cached prompts so existing
@@ -7380,6 +8961,23 @@ class ZetAgentAdapter(APIServerAdapter):
                 "(DB cleared, sessions still rebuild next turn)",
                 exc_info=True,
             )
+        try:
+            runtime_profile_home = self._profile_home_key(
+                _request_value(request, "hermes_profile_home") or None
+            )
+            invalidated += await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._invalidate_runtime_shell_prompts,
+                    profile_home=runtime_profile_home,
+                ),
+                timeout=ZET_RUNTIME_SHELL_PROMPT_INVALIDATE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "[zet_agent] profile-reload: runtime-shell invalidate failed "
+                "(DB cleared, sessions still rebuild after cache replacement)",
+                exc_info=True,
+            )
 
         logger.info(
             "[zet_agent] profile-reload: %d session(s) invalidated, "
@@ -7392,6 +8990,62 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({
             "reloaded": True,
             "invalidated_sessions": invalidated,
+            "db_rows_cleared": db_rows_cleared,
+        })
+
+    async def _handle_memory_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/memory/reload — apply memory policy on the next turn.
+
+        The gateway reads profile ``config.yaml`` for every inbound message.
+        ``memory.deep_memory_mode`` is part of the AIAgent cache signature, so
+        the next turn replaces an agent built with a different mode and gets a
+        matching provider, system-prompt block and tool schema set.
+
+        Do not invalidate the live AIAgent here: this endpoint may arrive while
+        a turn is using it, and a mode switch must never change semantics in
+        the middle of that turn. Clearing persisted system prompts is the only
+        synchronous step needed; the ordinary next-turn config read performs
+        the in-process replacement. A failure is critical and returns 500 so
+        local-server can fall back to restarting this profile runtime.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        gw = getattr(self, "gateway_runner", None)
+        if gw is None:
+            return _reload_unavailable_response(
+                "memory-reload gateway lookup",
+                "memory_reload_unavailable",
+                exc_info=False,
+            )
+        if _request_value(request, "hermes_profile_home"):
+            session_db = await self._ensure_session_db_async()
+        else:
+            session_db = getattr(gw, "_session_db", None)
+        if session_db is None:
+            return _reload_unavailable_response(
+                "memory-reload SessionDB lookup",
+                "memory_reload_unavailable",
+                exc_info=False,
+            )
+        try:
+            db_rows_cleared = session_db.clear_all_system_prompts()
+            if inspect.isawaitable(db_rows_cleared):
+                db_rows_cleared = await db_rows_cleared
+        except Exception:
+            return _reload_unavailable_response(
+                "memory-reload DB clear", "memory_reload_unavailable"
+            )
+
+        logger.info(
+            "[zet_agent] memory-reload: next-turn config snapshot armed; "
+            "%d DB row(s) cleared",
+            db_rows_cleared,
+        )
+        return web.json_response({
+            "reloaded": True,
+            "effective": "next_turn",
             "db_rows_cleared": db_rows_cleared,
         })
 
@@ -7408,9 +9062,8 @@ class ZetAgentAdapter(APIServerAdapter):
     async def _handle_profile_unload(self, request: "web.Request") -> "web.Response":
         """POST /v1/profile/unload — release cached state for one profile.
 
-        local-server calls this before deleting the profile directory. The
-        endpoint is deliberately best-effort: it never deletes files and only
-        releases in-process caches owned by this adapter / runner.
+        local-server 会在删除 profile 目录前调用此接口。接口不删除文件，
+        但必须严格释放每个进程内 owner；任一清理失败都显式返回，供调用方重试。
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -7476,16 +9129,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner
                 )
-                logger.warning(
-                    "[zet_agent] profile-unload: goal callbacks did not drain",
-                    exc_info=True,
-                )
-                return web.json_response(
-                    _openai_error(
-                        "profile unload failed: goal callbacks could not be released",
-                        err_type="server_error",
-                    ),
-                    status=500,
+                return _reload_unavailable_response(
+                    "profile-unload goal callback cleanup",
+                    "profile_unload_unavailable",
+                    user_message="Profile goal activity could not be safely released.",
                 )
 
         # A callback that began just before invalidation can finish one last
@@ -7514,7 +9161,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 profile = _request_value(request, "hermes_profile")
                 unload = getattr(gw, "unload_profile_runtime", None)
                 if callable(unload):
-                    runtime_unload = await unload(profile)
+                    unload_kwargs = (
+                        {"profile_home": Path(profile_home)} if profile_home else {}
+                    )
+                    runtime_unload = await unload(profile, **unload_kwargs)
                 else:
                     runtime_unload = {
                         "evicted_sessions": gw.invalidate_all_cached_agents(),
@@ -7529,16 +9179,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner
                 )
-                logger.warning(
-                    "[zet_agent] profile-unload: runtime unload failed",
-                    exc_info=True,
-                )
-                return web.json_response(
-                    _openai_error(
-                        "profile unload failed: runtime state could not be released",
-                        err_type="server_error",
-                    ),
-                    status=500,
+                return _reload_unavailable_response(
+                    "profile-unload runtime cleanup",
+                    "profile_unload_unavailable",
+                    user_message="Profile runtime could not be safely released.",
                 )
 
         if runtime_unload.get("blocked"):
@@ -7607,73 +9251,119 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner
                 )
-                logger.warning(
-                    "[zet_agent] profile-unload: process identity cleanup failed",
-                    exc_info=True,
-                )
-                return web.json_response(
-                    _openai_error(
-                        "profile unload failed: managed processes could not be released",
-                        err_type="server_error",
-                    ),
-                    status=500,
+                return _reload_unavailable_response(
+                    "profile-unload process identity cleanup",
+                    "profile_unload_unavailable",
+                    user_message="Profile processes could not be safely released.",
                 )
 
         closed_session_db = False
         if profile_home:
-            db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
-            if db is not None:
-                if db is self._session_db:
-                    self._session_db = None
+            profile = _request_value(request, "hermes_profile") or ""
+            try:
+                closed_runtime_shells = await asyncio.wait_for(
+                    _to_thread_with_completion_barrier(
+                        self._close_runtime_shells_for_profile,
+                        profile_home,
+                    ),
+                    timeout=_ONBOARDING_CLOSE_TIMEOUT_SECONDS,
+                )
+                runtime_unload["evicted_sessions"] = int(
+                    runtime_unload.get("evicted_sessions", 0) or 0
+                ) + int(closed_runtime_shells or 0)
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                return _reload_unavailable_response(
+                    "profile-unload runtime shell cache cleanup",
+                    "profile_unload_unavailable",
+                    user_message=(
+                        "Profile Agent runtime state could not be safely released."
+                    ),
+                )
+            try:
+                # 🔴 **必须有硬期限。** ``_to_thread_with_completion_barrier``
+                # 刻意「取消后仍等 worker 结束」(它的 docstring 就是这么写的),
+                # 而 ``agent.close()`` 里的进程 / sandbox / browser / client 清理
+                # 一旦卡住 ⇒ **unload/reload 永久挂住**,后续请求还一直被 profile
+                # barrier 挡着。⭐「barrier 语义是不许提前放手」和「必须有上限」
+                # 不冲突:上限到了就**显式失败 + 保留可重试 owner**,
+                # ⛔ 不是偷偷放手。
+                # ⛔ 上限不许拍脑袋:沿用本文件既有的 adapter 断连量纲。
+                await asyncio.wait_for(
+                    _to_thread_with_completion_barrier(
+                        self._close_onboarding_agents_for_profile,
+                        profile,
+                    ),
+                    timeout=_ONBOARDING_CLOSE_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                return _reload_unavailable_response(
+                    "profile-unload onboarding cache cleanup",
+                    "profile_unload_unavailable",
+                    user_message=(
+                        "Profile onboarding state could not be safely released."
+                    ),
+                )
+            session_db_key = self._profile_home_key(profile_home)
 
-                async def _close_detached_session_db() -> None:
-                    close = getattr(db, "close", None)
-                    if not callable(close):
-                        return
-                    try:
-                        await _to_thread_with_completion_barrier(close)
-                    except Exception:
-                        logger.warning(
-                            "[zet_agent] profile-unload: SessionDB close failed",
-                            exc_info=True,
-                        )
-
-                discard_staging = getattr(db, "discard_runtime_import_staging", None)
-                if callable(discard_staging):
-                    try:
-                        await _to_thread_with_completion_barrier(discard_staging)
-                    except asyncio.CancelledError as cancelled:
-                        # The discard worker has finished before this branch is
-                        # entered. Close in a second completion barrier, then
-                        # release the profile barrier and preserve cancellation.
-                        try:
-                            await _close_detached_session_db()
-                        except asyncio.CancelledError:
-                            # A repeated cancellation is delivered only after
-                            # the close worker has completed.
-                            pass
-                        self._unblock_runtime_import_profile(
-                            profile_home, unload_barrier_owner
-                        )
-                        raise cancelled
-                    except Exception:
-                        # Unload remains best-effort, but always attempt to
-                        # remove unpublished external transcripts before the
-                        # DB leaves the background sweeper's cache.
-                        logger.warning(
-                            "[zet_agent] profile-unload: runtime import staging cleanup failed",
-                            exc_info=True,
-                        )
-                try:
-                    await _close_detached_session_db()
-                except asyncio.CancelledError:
-                    # _to_thread_with_completion_barrier has already observed
-                    # close completion, so it is now safe to release unload.
-                    self._unblock_runtime_import_profile(
-                        profile_home, unload_barrier_owner
+            def _close_owned_session_db() -> bool:
+                # 既有 init lock 同时保护打开、关闭和 owner 提交。
+                with self._session_db_init_lock:
+                    db = self._session_dbs.get(session_db_key)
+                    if db is None:
+                        return False
+                    discard_staging = getattr(
+                        db, "discard_runtime_import_staging", None
                     )
-                    raise
-                closed_session_db = True
+                    if callable(discard_staging):
+                        discard_staging()
+                    close = getattr(db, "close", None)
+                    if callable(close):
+                        close()
+                    if self._session_dbs.get(session_db_key) is not db:
+                        raise RuntimeError(
+                            "profile SessionDB ownership changed during unload"
+                        )
+                    self._session_dbs.pop(session_db_key, None)
+                    if self._session_db is db:
+                        self._session_db = None
+                    return True
+
+            try:
+                closed_session_db = await _to_thread_with_completion_barrier(
+                    _close_owned_session_db
+                )
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                return _reload_unavailable_response(
+                    "profile-unload SessionDB cleanup",
+                    "profile_unload_unavailable",
+                    user_message=(
+                        "Profile session data could not be safely released."
+                    ),
+                )
             # Goal callbacks/timers were invalidated and drained before
             # runtime teardown. Only the cached goal DB remains to close.
             if drv is not None:
@@ -7684,9 +9374,13 @@ class ZetAgentAdapter(APIServerAdapter):
                     # 上（codex P1）。
                     drv.close_goal_db_for_home(profile_home)
                 except Exception:
-                    logger.warning(
-                        "[zet_agent] profile-unload: goal timer cleanup failed",
-                        exc_info=True,
+                    self._unblock_runtime_import_profile(
+                        profile_home, unload_barrier_owner
+                    )
+                    return _reload_unavailable_response(
+                        "profile-unload goal database cleanup",
+                        "profile_unload_unavailable",
+                        user_message="Profile goal data could not be safely released.",
                     )
 
             self._drop_profile_local_model_caches(profile_home)
@@ -7833,6 +9527,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 "/v1/sessions/{session_id}/interrupt",
                 self._handle_session_interrupt,
             )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/delegations/interrupt",
+                self._handle_session_delegations_interrupt,
+            )
             # Persistent goal loop control surface (create/pause/resume/clear
             # /status) — consumed by zettlab-local-server only.
             self._app.router.add_post(
@@ -7854,6 +9552,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/model/switch",
                 self._handle_session_model_switch,
+            )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/runtime/prewarm",
+                self._handle_session_runtime_prewarm,
             )
             self._app.router.add_delete(
                 "/v1/sessions/{session_id}/model",
@@ -7880,6 +9582,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/profile/reload",
                 self._handle_profile_reload,
+            )
+            self._app.router.add_post(
+                "/v1/memory/reload",
+                self._handle_memory_reload,
             )
             self._app.router.add_post(
                 "/v1/runtime/reset",
@@ -7928,6 +9634,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._profile_handler(self._handle_profile_reload),
             )
             self._app.router.add_post(
+                "/p/{profile}/v1/memory/reload",
+                self._profile_handler(self._handle_memory_reload),
+            )
+            self._app.router.add_post(
                 "/p/{profile}/v1/runtime/reset",
                 self._profile_handler(self._handle_runtime_reset),
             )
@@ -7942,6 +9652,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/model/switch",
                 self._profile_handler(self._handle_session_model_switch),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/runtime/prewarm",
+                self._profile_handler(self._handle_session_runtime_prewarm),
             )
             self._app.router.add_delete(
                 "/p/{profile}/v1/sessions/{session_id}/model",
@@ -7974,6 +9688,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/interrupt",
                 self._profile_handler(self._handle_session_interrupt),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/delegations/interrupt",
+                self._profile_handler(self._handle_session_delegations_interrupt),
             )
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/goal",
@@ -8065,6 +9783,20 @@ class ZetAgentAdapter(APIServerAdapter):
     async def disconnect(self) -> None:
         """Tear down the aiohttp server and unregister approval callbacks
         for any sessions we registered."""
+        try:
+            await asyncio.wait_for(
+                _to_thread_with_completion_barrier(
+                    self._stop_runtime_shell_cache
+                ),
+                timeout=_ONBOARDING_CLOSE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[zet_agent] runtime shell shutdown cleanup failed",
+                exc_info=True,
+            )
         # Goal barrier timers are daemon threading.Timers OUTSIDE
         # _background_tasks — cancel them here or a reloaded/replaced
         # adapter's stale timers keep firing wakeups and double-drive the

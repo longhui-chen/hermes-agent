@@ -171,6 +171,11 @@ class _NoSearchProvider:
     name = "no-search"
 
 
+class _SupplementSearchProvider(_FakeSearchProvider):
+    def search_memory_mode(self):
+        return "supplement"
+
+
 def test_provider_with_search_is_proxied():
     provider = _FakeSearchProvider(result=[
         {"id": "abc123", "source": "graph", "excerpt": "user prefers dark mode", "score": 0.9},
@@ -221,6 +226,68 @@ def test_provider_results_respect_top_k():
     assert len(parsed["items"]) == 4
 
 
+def test_supplement_provider_runs_with_native_search_and_interleaves_results(
+    tmp_path, monkeypatch
+):
+    _write_memory_files(
+        tmp_path,
+        monkeypatch,
+        memory_entries=[
+            "Frank 的朋友包括 Alice",
+            "Frank 喜欢周五打网球",
+        ],
+    )
+    provider = _SupplementSearchProvider(
+        result={
+            "status": "ok",
+            "items": [
+                {"memory_id": "deep-1", "statement": "Frank 的朋友包括 Bob", "relevance_score": 0.9},
+                {"memory_id": "deep-2", "statement": "Frank 认识 Carol", "relevance_score": 0.8},
+            ],
+        }
+    )
+
+    parsed = _call("Frank 朋友", top_k=4, memory_manager=_FakeManager(provider))
+
+    assert provider.calls == [("Frank 朋友", 4)]
+    assert parsed["provider"] == "fake-recall"
+    assert parsed["provider_status"] == "ok"
+    assert [item["source"] for item in parsed["items"]] == [
+        "memory",
+        "fake-recall",
+        "memory",
+        "fake-recall",
+    ]
+    assert parsed["items"][1]["id"] == "deep-1"
+    assert parsed["items"][1]["excerpt"] == "Frank 的朋友包括 Bob"
+
+
+def test_supplement_provider_failure_returns_native_items_and_status(tmp_path, monkeypatch):
+    _write_memory_files(tmp_path, monkeypatch, memory_entries=["Frank 的朋友包括 Alice"])
+    provider = _SupplementSearchProvider(error=RuntimeError("backend down"))
+
+    parsed = _call("Frank 朋友", memory_manager=_FakeManager(provider))
+
+    assert parsed["items"][0]["excerpt"] == "Frank 的朋友包括 Alice"
+    assert parsed["provider"] == "fake-recall"
+    assert parsed["provider_status"] == "unavailable"
+
+
+def test_internal_native_only_search_skips_supplement_provider(tmp_path, monkeypatch):
+    _write_memory_files(tmp_path, monkeypatch, memory_entries=["Frank 的朋友包括 Alice"])
+    provider = _SupplementSearchProvider(result=[{"text": "Frank 的朋友包括 Bob"}])
+
+    parsed = _call(
+        "Frank 朋友",
+        memory_manager=_FakeManager(provider),
+        supplement_external=False,
+    )
+
+    assert provider.calls == []
+    assert parsed["items"][0]["source"] == "memory"
+    assert "provider" not in parsed
+
+
 # --- Wiring ------------------------------------------------------------------
 
 
@@ -236,6 +303,7 @@ def test_registered_in_memory_toolset_with_memory_gate():
     assert entry is not None
     assert entry.toolset == "memory"
     assert entry.check_fn is check_memory_requirements
+    assert entry.defer_to_tool_search is False
     assert "search_memory" in toolsets.resolve_toolset("memory")
     # The static catalog view must stay untouched so platform composite
     # reverse-mapping (issue #49622) keeps inferring the memory toolset.

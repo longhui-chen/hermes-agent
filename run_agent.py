@@ -150,7 +150,7 @@ from tools.browser_tool import cleanup_browser
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import is_trivial_prompt
-from agent.error_classifier import normalized_provider_error_code, FailoverReason
+from agent.error_classifier import normalized_provider_error_code, FailoverReason, client_safe_error_text
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
 from agent.session_activity import ActivityProvenance
@@ -508,6 +508,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        strict_memory_isolation: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -598,6 +599,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            strict_memory_isolation=strict_memory_isolation,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
@@ -2716,7 +2718,10 @@ class AIAgent:
     def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
         """Build the safe, structured provider-error payload for chat surfaces."""
         payload: Dict[str, Any] = {
-            "code": normalized_provider_error_code(classified),
+            # ⭐ 带上 error:码和文案必须用同一个判据(见 is_our_own_failure)。
+            # ⛔ 不传的话,本地 RuntimeError("… timed out: /volume1/…") 会拿到
+            # provider_network_error,界面劝用户「检查网络后重试」——重试无用。
+            "code": normalized_provider_error_code(classified, error=error),
             "reason": classified.reason.value,
         }
         if classified.provider:
@@ -2732,6 +2737,16 @@ class AIAgent:
         if classified.provider_error_code:
             payload["provider_error_code"] = classified.provider_error_code
         message = classified.message or self._summarize_api_error(error)
+        # This payload calls itself "safe" (see the docstring) and is handed to
+        # chat surfaces.  For an upstream failure `message` is the provider's
+        # own text — useful, safe to pass through.  For an internal_error it is
+        # *our* exception string (class names, attribute names, file paths).
+        #
+        # Routed through the shared helper rather than rewritten here: the same
+        # collapse is needed on `final_response` / `error` / status lines in
+        # conversation_loop, and a second copy of the rule is a second source of
+        # truth — which is precisely how the first fix left those three leaking.
+        message = client_safe_error_text(classified, message, error=error)
         if message:
             payload["provider_message"] = message[:500]
         payload["retryable"] = bool(classified.retryable)
@@ -7220,6 +7235,42 @@ class AIAgent:
                 message["reasoning_content"] = " "
         return message
 
+    def _reasoning_echo_route_key(self) -> tuple[str, str, str]:
+        """Return the normalized route identity used for echo capability state."""
+        return (
+            str(getattr(self, "provider", "") or "").strip().lower(),
+            str(getattr(self, "model", "") or "").strip().lower(),
+            str(
+                getattr(
+                    self,
+                    "_base_url_lower",
+                    getattr(self, "base_url", ""),
+                )
+                or ""
+            ).strip().lower(),
+        )
+
+    def _learn_reasoning_echo_for_current_route(self) -> bool:
+        """Remember an upstream-declared echo requirement for this chat route.
+
+        Public model aliases can resolve to different upstream families over
+        time, so static model-name matching cannot safely express this
+        capability. The conversation loop calls this only after an explicit
+        pre-delivery validation error. State is agent-local and bounded so it
+        neither leaks across profiles nor grows with arbitrary model switches.
+        """
+        if getattr(self, "api_mode", "chat_completions") != "chat_completions":
+            return False
+
+        key = self._reasoning_echo_route_key()
+        learned = list(getattr(self, "_reasoning_echo_required_routes", ()))
+        if key in learned:
+            return False
+        learned.append(key)
+        self._reasoning_echo_required_routes = learned[-8:]
+        self._thinking_pad_cache = None
+        return True
+
     def _needs_thinking_reasoning_pad(self) -> bool:
         """Return True when the active provider enforces reasoning_content echo-back.
 
@@ -7235,12 +7286,13 @@ class AIAgent:
         ``urlparse``) calls under it. Caching drops the per-turn cost from
         ~5us × 16 = ~80us to <1us.
         """
-        key = (self.provider, self.model, getattr(self, "_base_url_lower", self.base_url))
+        key = self._reasoning_echo_route_key()
         cached = getattr(self, "_thinking_pad_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
         result = (
-            self._needs_deepseek_tool_reasoning()
+            key in getattr(self, "_reasoning_echo_required_routes", ())
+            or self._needs_deepseek_tool_reasoning()
             or self._needs_kimi_tool_reasoning()
             or self._needs_mimo_tool_reasoning()
         )

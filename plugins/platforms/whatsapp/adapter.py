@@ -294,6 +294,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
     cache_audio_from_url,
+    safe_exc,
 )
 from utils import env_int
 
@@ -1491,7 +1492,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         media_types.append(bridge_mime or "image/jpeg")
                         print(f"[{self.name}] Cached user image: {cached_path}", flush=True)
                     except Exception as e:
-                        print(f"[{self.name}] Failed to cache image: {e}", flush=True)
+                        logger.warning(
+                            "[%s] Failed to cache image: %s", self.name, safe_exc(e)
+                        )
                         cached_urls.append(url)
                         media_types.append(bridge_mime or "image/jpeg")
                 elif msg_type == MessageType.PHOTO and os.path.isabs(url):
@@ -1509,7 +1512,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         media_types.append(bridge_mime or ("audio/ogg" if msg_type == MessageType.VOICE else "audio/mpeg"))
                         print(f"[{self.name}] Cached user audio: {cached_path}", flush=True)
                     except Exception as e:
-                        print(f"[{self.name}] Failed to cache audio: {e}", flush=True)
+                        logger.warning(
+                            "[%s] Failed to cache audio: %s", self.name, safe_exc(e)
+                        )
                         cached_urls.append(url)
                         media_types.append(bridge_mime or ("audio/ogg" if msg_type == MessageType.VOICE else "audio/mpeg"))
                 elif msg_type in {MessageType.VOICE, MessageType.AUDIO} and os.path.isabs(url):
@@ -1539,7 +1544,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         print(f"[{self.name}] Rejected bridge video path outside cache dir: {url}", flush=True)
                 else:
                     cached_urls.append(url)
-                    media_types.append("unknown")
+                    media_types.append(bridge_mime or {
+                        MessageType.PHOTO: "image/*",
+                        MessageType.VOICE: "audio/*",
+                        MessageType.AUDIO: "audio/*",
+                        MessageType.VIDEO: "video/*",
+                        MessageType.DOCUMENT: "application/octet-stream",
+                    }.get(msg_type, "application/octet-stream"))
 
             # For text-readable documents, inject file content directly into
             # the message text so the agent can read it inline.

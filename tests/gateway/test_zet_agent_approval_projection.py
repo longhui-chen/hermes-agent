@@ -117,12 +117,45 @@ def test_projection_payload_and_capacity_are_bounded(monkeypatch):
     adapter._APPROVAL_PROJECTION_MAX_BYTES = 32_000
     stream = queue.Queue()
     notify = adapter._make_approval_cb(stream, "session-a")
-    notify({"approval_id": "a" * 24, "command": "x" * 100_000})
+    notify({
+        "approval_id": "a" * 24,
+        "command": "x" * 100_000,
+        "validation_target": "v" * 50_000,
+    })
     notify({"approval_id": "b" * 24, "command": "second"})
     scoped_key = adapter._active_turn_key("session-a")
     head = adapter._approval_projection_head(scoped_key)
     assert len(head["command"]) < 5000
+    assert len(head["validation_target"]) < 2200
     assert len(head["payload_fingerprint"]) == 64
     with pytest.raises(RuntimeError, match="session limit"):
         notify({"approval_id": "c" * 24, "command": "third"})
     assert len(adapter._pending_approval[scoped_key]) == 2
+
+
+def test_runtime_shell_cleanup_does_not_remove_newer_turn_approval_callback():
+    from tools.approval import (
+        enqueue_gateway_approval,
+        register_gateway_notify,
+        unregister_gateway_notify,
+        unregister_gateway_notify_if_current,
+    )
+
+    session_key = "runtime-shell-overlap"
+    old_callback = object()
+    new_callback = object()
+    try:
+        register_gateway_notify(session_key, old_callback)
+        entry = enqueue_gateway_approval(session_key, {"command": "pending"})
+        register_gateway_notify(session_key, new_callback)
+
+        assert not unregister_gateway_notify_if_current(
+            session_key, old_callback
+        )
+        assert not entry.event.is_set()
+        assert unregister_gateway_notify_if_current(
+            session_key, new_callback
+        )
+        assert entry.event.is_set()
+    finally:
+        unregister_gateway_notify(session_key)

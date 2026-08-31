@@ -110,7 +110,7 @@ def _build_subprocess_env() -> dict[str, str]:
     # fallback never fired and the ACP child got the /tmp-or-pwd guess from
     # _resolve_home_dir() instead of the profile home. Only use that guess as
     # a last resort so the child is never launched with a blank HOME.
-    from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+    from hermes_constants import apply_context_profile_scoped_env, apply_subprocess_home_env
 
     # Bridge the context-local Hermes home override into the child's HERMES_HOME
     # before the contract runs. ContextVars don't cross process boundaries and
@@ -118,9 +118,7 @@ def _build_subprocess_env() -> dict[str, str]:
     # HERMES_HOME (stale process-global) and its HOME (override's profile home)
     # would split. Mirrors the MCP/LSP/codex spawn paths and the terminal
     # _inject_context_hermes_home.
-    _override = get_hermes_home_override()
-    if _override:
-        env["HERMES_HOME"] = _override
+    apply_context_profile_scoped_env(env)
     apply_subprocess_home_env(env)
     if not env.get("HOME", "").strip():
         env["HOME"] = _resolve_home_dir()
@@ -608,9 +606,17 @@ class CopilotACPClient:
                     continue
                 if "error" in msg:
                     err = msg.get("error") or {}
-                    raise RuntimeError(
+                    # ⭐ 出身声明模式的**第五个**兄弟,而且是**第一个不在 Responses
+                    # 那条链上的** —— 我那道闭集门按「文案提到 Responses 协议异常」
+                    # 取样,**这条一个关键词都不带**,正好落在我自己声明的开集里。
+                    # ⇒ 子进程给的 JSON-RPC error 是**上游**(认证/限流/服务端故障),
+                    # 裸构造抹掉出身 ⇒ 判成我们的 bug、不重试不 fallback,
+                    # 还把说明换成「服务内部异常」。
+                    from agent.error_classifier import declare_upstream_origin
+
+                    raise declare_upstream_origin(RuntimeError(
                         f"Copilot ACP {method} failed: {err.get('message') or err}"
-                    )
+                    ))
                 return msg.get("result")
 
             stderr_text = "\n".join(stderr_tail).strip()

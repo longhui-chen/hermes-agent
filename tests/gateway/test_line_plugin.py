@@ -141,6 +141,29 @@ class TestRequestCache:
         assert c.get(rid).payload == "first"
         assert c.get(rid).state is State.DELIVERED
 
+    def test_expired_entry_is_not_returned(self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(_line.time, "time", lambda: now[0])
+        c = RequestCache(ttl_seconds=1, pending_ttl_seconds=1)
+        rid = c.register_pending("Uchat")
+        assert rid and c.get(rid) is not None, "夹具必须先创建真实 cache entry"
+        c.set_ready(rid, "secret response")
+
+        now[0] = 102.0
+
+        assert c.get(rid) is None, "TTL 到期后旧按钮不能无限期取回缓存正文"
+
+    def test_full_cache_refuses_new_button_without_evicting_pending(self):
+        c = RequestCache(max_entries=2)
+        first = c.register_pending("U1")
+        second = c.register_pending("U2")
+        assert first and second and c.get(first).state is State.PENDING
+
+        assert c.register_pending("U3") is None
+        assert c.get(first).state is State.PENDING, (
+            "达到上限必须降级为不发新按钮，不能挤掉仍在计算的旧请求"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 6. Markdown stripping + chunking
@@ -161,11 +184,11 @@ class TestMarkdownAndChunking:
         assert all(len(c) <= 8 for c in chunks), chunks
         assert len(chunks) >= 2
 
-    def test_split_caps_at_five_chunks(self):
-        # 1000 paragraphs of 100 chars each — must cap at 5 LINE bubbles.
+    def test_split_keeps_content_beyond_first_api_batch(self):
         text = "\n\n".join(["x" * 100 for _ in range(1000)])
         chunks = split_for_line(text)
-        assert len(chunks) <= 5
+        assert len(chunks) > 5
+        assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
 
 
 # ---------------------------------------------------------------------------
@@ -209,10 +232,83 @@ class TestInboundMedia:
             asyncio.run(adapter._handle_message_event(self._event("image")))
 
         cache.assert_called_once_with(b"line-bytes", ext=".jpg")
+        adapter._client.fetch_content.assert_awaited_once_with(
+            "image-1", max_bytes=_line.LINE_IMAGE_MAX_BYTES,
+        )
         event = self._captured_event(adapter)
         assert event.message_type is _line.MessageType.PHOTO
         assert event.media_urls == ["/cache/image.jpg"]
         assert event.media_types == ["image/jpeg"]
+
+    @pytest.mark.parametrize(
+        "msg_type,expected_type,expected_mime,cache_name",
+        [
+            ("audio", _line.MessageType.VOICE, "audio/", "cache_audio_from_bytes"),
+            ("video", _line.MessageType.VIDEO, "video/mp4", "cache_video_from_bytes"),
+            ("file", _line.MessageType.DOCUMENT, "application/octet-stream", "cache_document_from_bytes"),
+        ],
+    )
+    def test_other_inbound_media_shapes_share_bounded_fetch_and_one_event(
+        self, adapter, msg_type, expected_type, expected_mime, cache_name,
+    ):
+        with patch.object(_line, cache_name, return_value=f"/cache/{msg_type}.bin"):
+            asyncio.run(adapter._handle_message_event(self._event(msg_type)))
+
+        configured = _line.get_inbound_media_max_bytes()
+        platform_limit = (
+            _line.LINE_AV_MAX_BYTES if msg_type in {"audio", "video"} else configured
+        )
+        assert configured > 0, "夹具必须启用真实全局媒体上限"
+        adapter._client.fetch_content.assert_awaited_once_with(
+            f"{msg_type}-1", max_bytes=min(configured, platform_limit),
+        )
+        event = self._captured_event(adapter)
+        assert event.message_type is expected_type
+        assert event.text == f"[{msg_type}]"
+        assert event.media_urls == [f"/cache/{msg_type}.bin"]
+        if expected_mime.endswith("/"):
+            assert len(event.media_types) == 1
+            assert event.media_types[0].startswith(expected_mime)
+        else:
+            assert event.media_types == [expected_mime]
+
+    @pytest.mark.asyncio
+    async def test_line_client_rejects_actual_stream_over_platform_cap(self, monkeypatch):
+        import aiohttp
+
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"x" * 11
+
+        class Response:
+            status = 200
+            headers = {}
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def read(self):
+                return b"x" * 11
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: Session())
+        client = _line._LineClient("token")
+
+        with pytest.raises(ValueError, match="11 bytes > 10 bytes"):
+            await client.fetch_content("image-1", max_bytes=10)
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +354,47 @@ class TestSendRouting:
             # We invoked client.push(chat_id, messages) — check first batch
             sent_messages = adapter._client.push.call_args.args[1]
         assert len(sent_messages) <= 5
+        assert adapter._client.push.await_count == 1, (
+            "一个 turn 只能产生一次文本交付调用，不能按答案长度无界 push"
+        )
+        assert sent_messages[-1]["type"] == "template", (
+            "未发送的后缀必须进入可领取分页，不能静默截断"
+        )
+        action = sent_messages[-1]["template"]["actions"][0]
+        request_id = json.loads(action["data"])["request_id"]
+        cached = adapter._cache.get(request_id)
+        assert cached is not None and cached.state is State.READY
+        assert "x" * 4500 in cached.payload
+
+    def test_postback_claim_delivers_one_page_and_keeps_remainder_ready(self, adapter):
+        payload = "\n\n".join(["y" * 4500 for _ in range(20)])
+        request_id = adapter._cache.register_ready("Uchat", payload)
+        event = {
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "Uchat"},
+            "postback": {"data": json.dumps({
+                "action": "show_response", "request_id": request_id,
+            })},
+        }
+
+        asyncio.run(adapter._handle_postback_event(event))
+
+        adapter._client.reply.assert_awaited_once()
+        adapter._client.push.assert_awaited_once()
+        messages = adapter._client.push.await_args.args[1]
+        assert len(messages) == 5 and messages[-1]["type"] == "template"
+        cached = adapter._cache.get(request_id)
+        assert cached is not None and cached.state is State.READY
+        assert 0 < len(cached.payload) < len(payload)
+
+    def test_prebuilt_media_messages_cannot_fan_out_across_calls(self, adapter):
+        result = asyncio.run(adapter._send_messages(
+            "Uchat", [{"type": "text", "text": str(i)} for i in range(6)]
+        ))
+
+        assert result.success is False
+        adapter._client.reply.assert_not_awaited()
+        adapter._client.push.assert_not_awaited()
 
     def test_format_message_strips_markdown(self, adapter):
         out = adapter.format_message("**bold** [link](https://x.com)")
@@ -322,6 +459,24 @@ class TestStandaloneSend:
         cfg = PlatformConfig(enabled=True, extra={})
         result = asyncio.run(_standalone_send(cfg, "Uchat", "hi"))
         assert "error" in result
+
+    def test_long_response_is_one_visible_bounded_push(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "token", "channel_secret": "secret",
+        })
+        client = MagicMock()
+        client.push = AsyncMock()
+        monkeypatch.setattr(_line, "_LineClient", lambda _token: client)
+        big = "\n\n".join(["z" * 4500 for _ in range(20)])
+
+        result = asyncio.run(_standalone_send(cfg, "Uchat", big))
+
+        assert result["success"] is True
+        client.push.assert_awaited_once()
+        messages = client.push.await_args.args[1]
+        assert len(messages) == 5
+        assert "too large" in messages[-1]["text"].lower()
 
 
 class TestPostbackButtonShape:
@@ -506,4 +661,3 @@ class TestMediaPublicUrlGuard:
         result = asyncio.run(ad.send_image_file("Uchat", str(img)))
         assert not result.success
         assert "LINE_PUBLIC_URL" in (result.error or "")
-

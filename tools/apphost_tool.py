@@ -22,9 +22,11 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote, urlsplit
 
+from agent.credential_broker import request_app_auto_refresh_token
 from agent.secret_scope import get_secret
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
+_AGENT_ID_SECRET = "ZET_AGENT_ID"
 _DEFAULT_TIMEOUT = 30.0
 # install/reload need headroom over the server's own pipeline (Start alone is
 # capped at 30s, selfCheck adds 5s), and the stakes are asymmetric: the server
@@ -53,6 +55,8 @@ _MAX_STAGING_DIR_CHARS = 1024
 _MAX_SOURCE_SUBDIR_CHARS = 1024
 _MAX_APP_PATH_CHARS = 1024
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_EXECUTION_PRINCIPAL_MAX_BYTES = 512
+_EXECUTION_ID_MAX_BYTES = 256
 
 # Credentialed loopback transport (no env proxies, no redirects) — shared
 # with the other action-token call sites via tools.loopback_transport; the
@@ -200,18 +204,17 @@ APP_HOST_SCHEMA = {
             "source_subdir": {
                 "type": "string",
                 "description": (
-                    "Required for publish: relative path below the current "
-                    "agent output root (note: that root does NOT include the "
-                    "per-session subdirectory the system prompt appends). "
-                    "Never an absolute path."
+                    "Legacy publish override only. Leave omitted for a new "
+                    "application: App Host publishes the sole verified build "
+                    "from the current session automatically."
                 ),
             },
             "data_refresh": {
                 "type": "string",
                 "enum": list(_DATA_REFRESH_CHOICES),
                 "description": (
-                    "Required for both install paths: publish(mode=install) "
-                    "and legacy action=install. Does this app's data "
+                    "Required for publish(mode=install), and recorded by "
+                    "legacy action=install for non-automatic apps. Does this app's data "
                     "need to keep refreshing on its own? "
                     "static = the user types the data in themselves (ledger, "
                     "to-do, notes) and nothing outside the device changes it. "
@@ -219,8 +222,8 @@ APP_HOST_SCHEMA = {
                     "the device could not ask for refresh consent because the "
                     "optional capability was unavailable. "
                     "user_confirmed_auto = the data comes from outside and the "
-                    "user agreed to a schedule — you must finish configuring it "
-                    "before reporting done. "
+                    "user agreed to a schedule — it requires publish(mode=install) "
+                    "with a complete operation; legacy install is forbidden. "
                     "user_declined = you asked and the user said no. "
                     "Answer from what the user actually said, not from what the "
                     "app could get away with: an app that shows prices, weather "
@@ -388,6 +391,10 @@ class _BadRequest(ValueError):
     """Model-facing validation error (message is safe to return verbatim)."""
 
 
+class _AutoRefreshScopeUnavailable(ValueError):
+    """The automatic-maintenance capability was not minted or is unsafe to use."""
+
+
 def _require_slug(args):
     slug = str(args.get("slug", "") or "").strip()
     if not slug:
@@ -429,7 +436,7 @@ def _require_source_subdir(args):
     """
     source_subdir = str(args.get("source_subdir", "") or "").strip()
     if not source_subdir:
-        raise _BadRequest("publish 需要提供 source_subdir 参数")
+        return ""
     if len(source_subdir) > _MAX_SOURCE_SUBDIR_CHARS:
         raise _BadRequest("source_subdir 过长")
     if any(ch in source_subdir for ch in ("\x00", "\n", "\r", "\\")):
@@ -500,31 +507,112 @@ def _session_key():
     return str(value or "").strip()
 
 
+def _bounded_execution_header(value, max_bytes):
+    raw = str(value or "")
+    if not raw or raw.strip() != raw:
+        return ""
+    try:
+        if len(raw.encode("utf-8")) > max_bytes:
+            return ""
+    except UnicodeError:
+        return ""
+    if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in raw):
+        return ""
+    return raw
+
+
 def _execution_headers():
-    """Forward server-issued execution context; model arguments never shape it."""
+    """Forward trusted AppHost identity; model arguments never shape it."""
     try:
         from gateway.session_context import (
-            business_execution_token,
             current_turn_identity,
             get_session_env,
+            zettlab_auth_principal,
         )
-        token = str(business_execution_token() or "").strip()
+        principal = _bounded_execution_header(
+            zettlab_auth_principal(), _EXECUTION_PRINCIPAL_MAX_BYTES
+        )
         identity = current_turn_identity()
-        turn_id = identity[0] if identity else ""
-        session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
-        session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+        turn_id = _bounded_execution_header(
+            identity[0] if identity else "", _EXECUTION_ID_MAX_BYTES
+        )
+        session_id = _bounded_execution_header(
+            get_session_env("HERMES_SESSION_ID", ""), _EXECUTION_ID_MAX_BYTES
+        )
+        session_key = _bounded_execution_header(
+            get_session_env("HERMES_SESSION_KEY", ""), _EXECUTION_ID_MAX_BYTES
+        )
     except Exception:
         return {}
     headers = {}
-    if token:
-        headers["X-Zettlab-Business-Execution-Token"] = token
+    if principal:
+        headers["X-Zettlab-Auth-Principal-Id"] = principal
     if turn_id:
-        headers["X-Hermes-Turn-Id"] = str(turn_id)
+        headers["X-Hermes-Turn-Id"] = turn_id
     if session_id:
         headers["X-Hermes-Session-Id"] = session_id
     if session_key:
         headers["X-Hermes-Session-Key"] = session_key
+    # Bound scheduler sessions are server-generated as
+    # cron_task_<job-id>_<UTC timestamp>.
+    # The task id is therefore derived from trusted execution context, never
+    # supplied by a model tool argument.
+    match = re.fullmatch(r"cron_task_([a-f0-9]{12})_\d{8}_\d{6}", session_id)
+    if match:
+        headers["X-Zettlab-App-Maintenance-Task-Id"] = match.group(1)
     return headers
+
+
+def _auto_refresh_scope_token(action, body, execution_headers):
+    """Mint the one-shot scope for a user-confirmed App Host operation.
+
+    ``user_confirmed_auto`` is durable user intent in the immutable operation;
+    the execution headers bind this particular publication to the active user
+    turn. Hermes forwards the same request object to local-server's broker and
+    then to App Host; local-server computes and verifies the operation binding.
+    Hermes never derives a digest or decides whether a capability matches.
+    The model never receives the resulting bearer: it is sent once to App
+    Host, which claims it before it can provision the maintainer and cron job.
+    """
+    if action != "publish" or not isinstance(body, dict):
+        return None
+    operation = body.get("operation")
+    if not isinstance(operation, dict) or operation.get("data_refresh") != "user_confirmed_auto":
+        return None
+
+    required_execution_headers = {
+        "X-Hermes-Turn-Id",
+        "X-Hermes-Session-Id",
+        "X-Zettlab-Auth-Principal-Id",
+    }
+    if not required_execution_headers.issubset(execution_headers):
+        raise _AutoRefreshScopeUnavailable(
+            "自动维护只能在当前已验证的用户会话中发布；未发送发布请求"
+        )
+    agent_id = _secret(_AGENT_ID_SECRET)
+    if not agent_id:
+        raise _AutoRefreshScopeUnavailable(
+            "当前 Agent 身份不可用，无法授权自动维护；未发送发布请求"
+        )
+    try:
+        token = request_app_auto_refresh_token(
+            agent_id,
+            operation_kind="apphost_publish_v1",
+            operation=body,
+            owner_principal=execution_headers.get("X-Zettlab-Auth-Principal-Id", ""),
+            owner_agent_id=agent_id,
+            turn_id=execution_headers["X-Hermes-Turn-Id"],
+            session_id=execution_headers["X-Hermes-Session-Id"],
+        )
+    except Exception:
+        raise _AutoRefreshScopeUnavailable(
+            "自动维护授权暂不可用；未发送发布请求"
+        ) from None
+    if re.fullmatch(r"[0-9a-f]{64}", token or "") is None:
+        raise _AutoRefreshScopeUnavailable(
+            "自动维护授权无效；未发送发布请求"
+        )
+    return token
 
 
 def _build_request(action, args):
@@ -586,10 +674,10 @@ def _build_request(action, args):
         mode = str(args.get("mode", "") or "").strip()
         if mode not in _PUBLISH_MODES:
             raise _BadRequest("publish 需要 mode 参数（install/reload）")
-        body = {
-            "mode": mode,
-            "source_subdir": _require_source_subdir(args),
-        }
+        body = {"mode": mode}
+        source_subdir = _require_source_subdir(args)
+        if source_subdir:
+            body["source_subdir"] = source_subdir
         note = str(args.get("note", "") or "").strip()
         if note:
             body["note"] = note
@@ -622,6 +710,10 @@ def _build_request(action, args):
             # source of truth, so callers never need to duplicate it for reload.
             body["data_refresh"] = operation_data_refresh
             body["operation"] = operation
+        elif body.get("data_refresh") == "user_confirmed_auto":
+            raise _BadRequest(
+                "自动维护必须通过 publish 提供完整 operation，才能原子创建维护者和定时任务"
+            )
         return "POST", "/publish", body, _LONG_TIMEOUT
     if action == "install":
         if args.get("operation") is not None:
@@ -635,6 +727,11 @@ def _build_request(action, args):
                 "install 需要 data_refresh 参数（"
                 + "/".join(_DATA_REFRESH_CHOICES)
                 + "）：这个应用的数据要不要自己持续更新？照用户说过的话答"
+            )
+        if data_refresh == "user_confirmed_auto":
+            raise _BadRequest(
+                "legacy install 不能启用 user_confirmed_auto；请使用 "
+                "publish(mode=install) 并提供完整 operation，才能原子创建维护者和定时任务"
             )
         body = {
             "staging_dir": _require_staging_dir(args),
@@ -811,11 +908,66 @@ def _mutation_operation_outcome(status, request_body, parsed):
     return _ok({"outcome": outcome, "operation_id": operation_id, "state": terminal, "operation": receipt})
 
 
+def _record_app_operation_attempt(args, result_json):
+    """ADIC v1: log every app_operation outcome, tagged with its operation
+    name, to the active turn-scoped ledger (see
+    gateway.session_context.record_import_attempt).
+
+    Deliberately NOT filtered to the literal "data.import" here: local-server
+    stamps job["import_operation"] with the APP's own declared write
+    operation name (e.g. "records.refresh" for a blueprint app), not a fixed
+    string. cron/scheduler.py does the name filtering at verdict time against
+    that per-job value. Pre-filtering by a hardcoded name here would silently
+    stop recording for any app whose write operation isn't literally named
+    "data.import" — every round would then read an empty ledger and judge
+    the job a hard failure, which is the mirror image of the bug this
+    workstream exists to fix (false success flipped into false failure).
+
+    Every other action — including call(), whose app-level errors are
+    deliberately surfaced as ok:true (two-layer status) so the interactive
+    model can self-correct — is left completely untouched by this function.
+    Outside a cron run no scope is open, so this is a no-op: interactive
+    behavior does not change at all.
+    """
+    if str(args.get("action", "") or "").strip() != "app_operation":
+        return
+    operation = str(args.get("app_operation", "") or "").strip()
+    if not operation:
+        return
+    try:
+        parsed = json.loads(result_json)
+        if not isinstance(parsed, dict):
+            return
+        ok = parsed.get("ok") is True
+        error_code, error_message = "", ""
+        if not ok:
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                error_code = str(error.get("code", "") or "")
+                error_message = str(error.get("message", "") or "")
+            elif error is not None:
+                error_message = str(error)
+        from gateway.session_context import record_import_attempt
+        record_import_attempt(
+            operation=operation, ok=ok, error_code=error_code, error_message=error_message
+        )
+    except Exception:
+        # Bookkeeping must never break the tool response the model is
+        # waiting on.
+        pass
+
+
 def app_host_tool(args, **_kw):
     # Tool handlers must return a STRING (json-encoded) — a raw dict reaches
     # the model provider as non-string content and gets rejected (same
     # contract as list_my_channels).
     args = args or {}
+    result = _app_host_tool_dispatch(args, **_kw)
+    _record_app_operation_attempt(args, result)
+    return result
+
+
+def _app_host_tool_dispatch(args, **_kw):
     action = str(args.get("action", "") or "").strip()
 
     if action == "build_env":
@@ -824,8 +976,16 @@ def app_host_tool(args, **_kw):
 
     try:
         method, path, body, timeout = _build_request(action, args)
+        execution_headers = _execution_headers()
+        scoped_auto_refresh_token = _auto_refresh_scope_token(
+            action, body, execution_headers
+        )
     except _BadRequest as exc:
         return _local_error("invalid_request", str(exc), status=_STATUS_NOT_SENT)
+    except _AutoRefreshScopeUnavailable as exc:
+        return _local_error(
+            "automatic_maintenance_unavailable", str(exc), status=_STATUS_NOT_SENT
+        )
 
     base = _base_url()
     token = _secret("ZETTLAB_AGENT_ACTION_TOKEN")
@@ -837,8 +997,11 @@ def app_host_tool(args, **_kw):
         )
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-    headers = {_ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
-    headers.update(_execution_headers())
+    headers = {
+        _ACTION_TOKEN_HEADER: scoped_auto_refresh_token or token,
+        "Accept": "application/json",
+    }
+    headers.update(execution_headers)
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(base + path, data=data, headers=headers, method=method)

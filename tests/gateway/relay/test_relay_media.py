@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -176,3 +177,128 @@ async def test_client_upload_rejects_oversize_and_missing(tmp_path: Path):
     empty = tmp_path / "empty.bin"
     empty.write_bytes(b"")
     assert await c.upload(str(empty)) is None
+
+
+def test_rehost_auth_is_scoped_to_the_configured_origin():
+    c = RelayMediaClient("https://conn.example", "gw1", "sec")
+
+    assert c.is_relay_media_url("https://conn.example/relay/media/ok")
+    assert not c.is_relay_media_url("https://evil.example/relay/media/steal")
+    assert not c.is_relay_media_url("https://conn.example.evil/relay/media/steal")
+
+
+def test_rehost_auth_preserves_the_configured_connector_base_path():
+    base_url = media_base_url("wss://conn.example/hermes/relay")
+    assert base_url == "https://conn.example/hermes", (
+        "夹具必须真实经过带前缀的 relay dial URL 解析链"
+    )
+    c = RelayMediaClient(base_url, "gw1", "sec")
+    generated_shape = "https://conn.example/hermes/relay/media/ok"
+
+    assert generated_shape == f"{c._base_url}/relay/media/ok"
+    assert c.is_relay_media_url(generated_shape)
+    assert not c.is_relay_media_url("https://conn.example/relay/media/wrong-root")
+
+
+@pytest.mark.asyncio
+async def test_oversize_upload_is_rejected_before_full_file_read(tmp_path, monkeypatch):
+    from gateway.relay import media as relay_media
+
+    path = tmp_path / "huge.bin"
+    with path.open("wb") as fh:
+        fh.truncate(relay_media.MEDIA_MAX_BYTES + 1)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _self: (_ for _ in ()).throw(
+            AssertionError("超限文件不能先整份读进内存再检查大小")
+        ),
+    )
+
+    c = RelayMediaClient("https://conn.example", "gw1", "sec")
+    assert await c.upload(str(path)) is None
+
+
+@pytest.mark.asyncio
+async def test_public_download_uses_ssrf_safe_client(monkeypatch, tmp_path):
+    from gateway.relay import media as relay_media
+
+    calls = []
+
+    class Response:
+        headers = {"content-type": "image/png"}
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield b"png"
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def stream(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return Stream()
+
+    monkeypatch.setattr(
+        "tools.url_safety.create_ssrf_safe_async_client",
+        lambda **_kwargs: Client(),
+    )
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+    monkeypatch.setattr(relay_media.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    c = RelayMediaClient("https://conn.example", "gw1", "sec")
+    localized = await c.download("https://cdn.example/media.png")
+
+    assert calls and calls[0][1] == "https://cdn.example/media.png"
+    assert "Authorization" not in calls[0][2].get("headers", {})
+    assert Path(localized).read_bytes() == b"png"
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_before_opening_response_when_permits_are_full(monkeypatch):
+    opened = []
+    permit_checked = []
+
+    @asynccontextmanager
+    async def no_capacity():
+        permit_checked.append(True)
+        raise ValueError("full")
+        yield
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def stream(self, *_args, **_kwargs):
+            opened.append(True)
+            raise AssertionError("HTTP response opened before media permit")
+
+    monkeypatch.setattr(
+        "tools.url_safety.create_ssrf_safe_async_client",
+        lambda **_kwargs: Client(),
+    )
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        "gateway.platforms.base.inbound_media_download_permit", no_capacity,
+    )
+
+    client = RelayMediaClient("https://conn.example", "gw1", "sec")
+    assert await client.download("https://cdn.example/file.png") is None
+    assert permit_checked == [True]
+    assert opened == []

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
+from agent.prestream_timing import observe_provider_dispatch
 from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
@@ -519,6 +520,7 @@ class CodexAppServerSession:
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
         try:
+            observe_provider_dispatch()
             ts = self._client.request(
                 "turn/start",
                 {

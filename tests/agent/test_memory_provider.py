@@ -109,6 +109,22 @@ class BlockingPrefetchProvider(FakeMemoryProvider):
         return self._prefetch_result
 
 
+class InitializeChangingToolsProvider(FakeMemoryProvider):
+    """Provider whose mode-dependent tool surface changes at initialize."""
+
+    def __init__(self):
+        super().__init__(name="dynamic", tools=[
+            {"name": "memo_confirm", "description": "Confirm", "parameters": {}},
+        ])
+
+    def initialize(self, session_id, **kwargs):
+        super().initialize(session_id, **kwargs)
+        self._tools = [
+            {"name": "memo_recall", "description": "Recall", "parameters": {}},
+            {"name": "memo_confirm", "description": "Confirm", "parameters": {}},
+        ]
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -237,6 +253,21 @@ class TestMemoryManager:
         assert r1["handled"] == "builtin_tool"
         r2 = json.loads(mgr.handle_tool_call("ext_tool", {"b": 2}))
         assert r2["handled"] == "ext_tool"
+
+    def test_initialize_refreshes_mode_dependent_tool_routes(self, tmp_path):
+        mgr = MemoryManager()
+        provider = InitializeChangingToolsProvider()
+        mgr.add_provider(provider)
+
+        assert not mgr.has_tool("memo_recall")
+        assert mgr.has_tool("memo_confirm")
+
+        mgr.initialize_all("session-1", hermes_home=str(tmp_path))
+
+        assert mgr.has_tool("memo_recall")
+        assert mgr.has_tool("memo_confirm")
+        result = json.loads(mgr.handle_tool_call("memo_recall", {"query": "Frank"}))
+        assert result["handled"] == "memo_recall"
 
     # -- Lifecycle hooks -----------------------------------------------------
 

@@ -13,6 +13,7 @@ The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.loc
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, Optional
 
@@ -27,6 +28,19 @@ logger = logging.getLogger(__name__)
 # Kept for backward compatibility (e.g. test monkeypatching); prefer _get_config().
 _HASS_URL: str = ""
 _HASS_TOKEN: str = ""
+
+
+def _zettlab_bridge_only() -> bool:
+    """Return whether the Zettlab bridge owns smart-home access.
+
+    Zettlab production routes Home Assistant through local-server's protected
+    bridge.  Keep Hermes' generic HA tools available for upstream users, but
+    make the packaged Zettlab runtime fail closed so a legacy HASS_TOKEN
+    cannot bypass the bridge authorization and device-selection flow.
+    """
+    return os.environ.get("ZETTLAB_HA_BRIDGE_ONLY", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 def _get_config():
@@ -344,6 +358,8 @@ def _handle_list_services(args: dict, **kw) -> str:
 
 def _check_ha_available() -> bool:
     """Tool is only available when HASS_TOKEN is set."""
+    if _zettlab_bridge_only():
+        return False
     return bool(get_secret("HASS_TOKEN"))
 
 

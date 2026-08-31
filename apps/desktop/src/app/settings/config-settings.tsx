@@ -28,7 +28,15 @@ import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 import { PanelEmpty } from '../overlays/panel'
 
 import { ConfigField } from './config-field'
-import { enumOptionsFor, getNested, isExternalMemoryProvider, sectionFieldEntries, setNested } from './helpers'
+import { DeepMemoryModeField } from './deep-memory-mode-field'
+import {
+  enumOptionsFor,
+  getNested,
+  isExternalMemoryProvider,
+  memoryFieldVisible,
+  sectionFieldEntries,
+  setNested
+} from './helpers'
 import { MemoryConnect } from './memory/connect'
 import { ProviderConfigPanel } from './memory/provider-config-panel'
 import { ModelSettings, ModelSettingsSkeleton } from './model-settings'
@@ -293,7 +301,13 @@ export function ConfigSettings({
     return <SettingsSkeleton sections={[{ rows: 6 }]} />
   }
 
-  const visibleFields = activeSectionId === 'voice' ? fields.filter(([key]) => voiceFieldVisible(key, config)) : fields
+  const visibleFields = fields.filter(([key]) => {
+    if (activeSectionId === 'voice' && !voiceFieldVisible(key, config)) {
+      return false
+    }
+
+    return activeSectionId !== 'memory' || memoryFieldVisible(key, config)
+  })
 
   return (
     <SettingsContent>
@@ -326,23 +340,30 @@ export function ConfigSettings({
         <div className="grid gap-1">
           {visibleFields.map(([key, field]) => (
             <div className="scroll-mt-6 rounded-lg" id={`setting-field-${key}`} key={key}>
-              <ConfigField
-                descriptionExtra={
-                  key === 'memory.provider' && isExternalMemoryProvider(getNested(config, key)) ? (
-                    <MemoryConnect provider={String(getNested(config, key))} />
-                  ) : undefined
-                }
-                enumOptions={
-                  key === 'tts.elevenlabs.voice_id'
-                    ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
-                    : enumOptionsFor(key, getNested(config, key), config)
-                }
-                onChange={value => updateConfig(setNested(config, key, value))}
-                optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
-                schema={field}
-                schemaKey={key}
-                value={getNested(config, key)}
-              />
+              {key === 'memory.deep_memory_mode' ? (
+                <DeepMemoryModeField
+                  onChange={value => updateConfig(setNested(config, key, value))}
+                  value={getNested(config, key)}
+                />
+              ) : (
+                <ConfigField
+                  descriptionExtra={
+                    key === 'memory.provider' && isExternalMemoryProvider(getNested(config, key)) ? (
+                      <MemoryConnect provider={String(getNested(config, key))} />
+                    ) : undefined
+                  }
+                  enumOptions={
+                    key === 'tts.elevenlabs.voice_id'
+                      ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
+                      : enumOptionsFor(key, getNested(config, key), config)
+                  }
+                  onChange={value => updateConfig(setNested(config, key, value))}
+                  optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
+                  schema={field}
+                  schemaKey={key}
+                  value={getNested(config, key)}
+                />
+              )}
               {key === 'memory.provider' && isExternalMemoryProvider(getNested(config, key)) ? (
                 <ProviderConfigPanel key={String(getNested(config, key))} provider={String(getNested(config, key))} />
               ) : null}

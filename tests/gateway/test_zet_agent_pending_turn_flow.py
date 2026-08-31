@@ -40,7 +40,7 @@ def test_pending_interaction_flow_carries_exact_turn_id(monkeypatch):
     approval_data = {
         "command": "render",
         "description": "Render video",
-        "validation_target": '{"operation":"render"}',
+        "validation_target": '{"payload_digest":"abc"}',
     }
     queue_key = adapter._interaction_queue_key("session-1")
     approval.enqueue_gateway_approval(queue_key, approval_data)
@@ -57,7 +57,7 @@ def test_pending_interaction_flow_carries_exact_turn_id(monkeypatch):
     approval_event = stream_q.get_nowait()[1]
     clarify_event = stream_q.get_nowait()[1]
     assert approval_event["turn_id"] == "turn-video-42"
+    assert approval_event["validation_target"] == '{"payload_digest":"abc"}'
     assert clarify_event["turn_id"] == "turn-video-42"
     assert approval_event["interaction_delivery_version"] == 1
-    assert approval_event["validation_target"] == '{"operation":"render"}'
     assert clarify_event["interaction_delivery_version"] == 1

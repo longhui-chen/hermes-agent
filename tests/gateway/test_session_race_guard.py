@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    merge_pending_message_event,
+    pop_pending_message_event,
+)
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
 
@@ -149,6 +154,158 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.text == "first follow-up\n\nsee screenshot"
     assert merged.media_urls == ["/tmp/test.png"]
     assert merged.media_types == ["image/png"]
+
+
+def test_merge_preserves_url_to_mime_alignment_when_types_are_sparse():
+    pending = {}
+    source = SessionSource(
+        platform=Platform("teams"),
+        chat_id="chat",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+    first = MessageEvent(
+        text="first",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=["/a.png", "/unknown.bin"],
+        media_types=["image/png"],
+    )
+    second = MessageEvent(
+        text="second",
+        message_type=MessageType.AUDIO,
+        source=source,
+        media_urls=["/song.mp3"],
+        media_types=["audio/mpeg"],
+    )
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, second, merge_text=True)
+
+    merged = pending[session_key]
+    assert merged.media_urls == ["/a.png", "/unknown.bin", "/song.mp3"]
+    assert merged.media_types == ["image/png", "", "audio/mpeg"], (
+        "稀疏 MIME 必须先补空位再合并，不能把 song 的 MIME 错配给前一个文件"
+    )
+
+
+def test_pending_merge_never_inherits_another_senders_authorization():
+    pending = {}
+    source_a = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="A",
+    )
+    source_b = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="B",
+    )
+    session_key = build_session_key(source_a)
+    first = MessageEvent(
+        text="A", message_type=MessageType.PHOTO, source=source_a,
+        media_urls=["/a.png"], media_types=["image/png"],
+    )
+    second = MessageEvent(
+        text="B", message_type=MessageType.PHOTO, source=source_b,
+        media_urls=["/b.png"], media_types=["image/png"],
+    )
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, second, merge_text=True)
+
+    first_out = pop_pending_message_event(pending, session_key)
+    second_out = pop_pending_message_event(pending, session_key)
+    assert first_out.source.user_id == "A" and first_out.media_urls == ["/a.png"]
+    assert second_out.source.user_id == "B" and second_out.media_urls == ["/b.png"]
+    assert session_key not in pending
+
+
+def test_cross_sender_fifo_and_queue_overflow_do_not_overwrite_each_other():
+    runner = _make_runner()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    source_a = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="group", chat_type="group", user_id="A",
+    )
+    source_b = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="group", chat_type="group", user_id="B",
+    )
+    session_key = build_session_key(source_a)
+    a = MessageEvent(text="A", message_type=MessageType.TEXT, source=source_a)
+    b = MessageEvent(text="B", message_type=MessageType.TEXT, source=source_b)
+    c = MessageEvent(text="C", message_type=MessageType.TEXT, source=source_a)
+    merge_pending_message_event(adapter._pending_messages, session_key, a)
+    merge_pending_message_event(adapter._pending_messages, session_key, b)
+    runner._session_state(session_key).conversation.queued_events.append(c)
+
+    assert runner._queue_depth(session_key, adapter=adapter) == 3, (
+        "busy queue 深度必须同时统计 head、跨 sender tail 与 overflow"
+    )
+
+    first = pop_pending_message_event(adapter._pending_messages, session_key)
+    first = runner._promote_queued_event(session_key, adapter, first)
+    second = pop_pending_message_event(adapter._pending_messages, session_key)
+    second = runner._promote_queued_event(session_key, adapter, second)
+    third = runner._promote_queued_event(
+        session_key, adapter,
+        pop_pending_message_event(adapter._pending_messages, session_key),
+    )
+
+    assert [first.text, second.text, third.text] == ["A", "C", "B"]
+
+
+def test_cross_sender_fifo_is_bounded_and_counted_by_busy_queue():
+    runner = _make_runner()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "telegram:shared-group"
+    cap = GatewayRunner._BUSY_QUEUE_MAX_PENDING
+
+    for index in range(cap + 5):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="shared-group",
+            chat_type="group",
+            user_id=f"sender-{index}",
+        )
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            MessageEvent(
+                text=f"message-{index}",
+                message_type=MessageType.TEXT,
+                source=source,
+            ),
+        )
+
+    head = adapter._pending_messages[session_key]
+    assert len(getattr(head, "_gateway_pending_event_queue", [])) > 0, (
+        "夹具必须真实进入跨 sender FIFO，不能只测普通 pending slot"
+    )
+    assert runner._queue_depth(session_key, adapter=adapter) == cap
+
+    drained = []
+    while session_key in adapter._pending_messages:
+        drained.append(pop_pending_message_event(adapter._pending_messages, session_key).text)
+    assert len(drained) == cap
+    assert drained[-1] == f"message-{cap - 1}"
+
+
+def test_same_sender_head_replacement_preserves_cross_sender_tail():
+    pending = {}
+    source_a = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="A",
+    )
+    source_b = SessionSource(
+        platform=Platform("teams"), chat_id="group", chat_type="group", user_id="B",
+    )
+    session_key = build_session_key(source_a)
+    a1 = MessageEvent(text="A1", message_type=MessageType.TEXT, source=source_a)
+    b = MessageEvent(text="B", message_type=MessageType.TEXT, source=source_b)
+    a2 = MessageEvent(text="A2", message_type=MessageType.TEXT, source=source_a)
+
+    merge_pending_message_event(pending, session_key, a1, merge_text=False)
+    merge_pending_message_event(pending, session_key, b, merge_text=False)
+    merge_pending_message_event(pending, session_key, a2, merge_text=False)
+
+    assert pop_pending_message_event(pending, session_key).text == "A2"
+    assert pop_pending_message_event(pending, session_key).text == "B"
 
 
 @pytest.mark.asyncio

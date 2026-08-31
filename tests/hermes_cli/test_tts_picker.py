@@ -69,10 +69,10 @@ class TestPluginTTSProviders:
         ``display_name`` and ``name`` only."""
         tts_registry.register_provider(_FakeTTSProvider(name="minimal"))
         rows = tools_config._plugin_tts_providers()
-        assert len(rows) == 1
-        assert rows[0]["name"] == "Minimal"  # display_name default
-        assert rows[0]["tts_provider"] == "minimal"
-        assert rows[0]["env_vars"] == []
+        row = next(r for r in rows if r.get("tts_plugin_name") == "minimal")
+        assert row["name"] == "Minimal"  # display_name default
+        assert row["tts_provider"] == "minimal"
+        assert row["env_vars"] == []
 
 
 
@@ -93,9 +93,10 @@ class TestVisibleProvidersInjectsTTSPlugins:
         assert "Cartesia" in names
 
         # Plugin row has tts_provider key for write-path compat
-        plugin_rows = [r for r in visible if r.get("tts_plugin_name")]
-        assert len(plugin_rows) == 1
-        assert plugin_rows[0]["tts_provider"] == "cartesia"
+        plugin_row = next(
+            r for r in visible if r.get("tts_plugin_name") == "cartesia"
+        )
+        assert plugin_row["tts_provider"] == "cartesia"
 
     def test_other_categories_unaffected_by_tts_plugins(self):
         """Registering a TTS plugin must not leak into the Image Generation
@@ -106,4 +107,3 @@ class TestVisibleProvidersInjectsTTSPlugins:
         visible = tools_config._visible_providers(img_cat, config={})
         names = [row.get("name") for row in visible]
         assert "Cartesia" not in names
-

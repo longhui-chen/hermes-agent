@@ -41,15 +41,33 @@ from tools.environments import local as local_env_module
 from tools.environments.local import (
     LocalEnvironment,
     PROFILE_SCOPED_SUBPROCESS_ENV_KEYS,
+    RETIRED_VIDEO_EXECUTION_ENV_KEYS,
     _make_run_env,
     _sanitize_subprocess_env,
     build_connector_runtime_env,
-    build_video_edit_runtime_env,
     hermes_subprocess_env,
 )
 
 # The full set of session vars the bridge owns.
 SESSION_VARS = list(_VAR_MAP.keys())
+
+
+def test_retired_video_execution_environment_is_scrubbed_without_touching_generic_action_token():
+    assert {
+        "ZETTLAB_BUSINESS_EXECUTION_GRANT_VERSION",
+        "ZETTLAB_BUSINESS_EXECUTION_MODE",
+        "ZETTLAB_EXECUTION_REQUEST_DIGEST",
+    }.issubset(RETIRED_VIDEO_EXECUTION_ENV_KEYS)
+    env = {key: "stale" for key in RETIRED_VIDEO_EXECUTION_ENV_KEYS}
+    env["ZETTLAB_AGENT_ACTION_TOKEN"] = "unrelated-skill-token"
+    env["PATH"] = "/usr/bin"
+
+    result = local_env_module._sanitize_subprocess_env(env)
+
+    for key in RETIRED_VIDEO_EXECUTION_ENV_KEYS:
+        assert key not in result
+    assert result.get("ZETTLAB_AGENT_ACTION_TOKEN") != "unrelated-skill-token"
+    assert result["PATH"] == "/usr/bin"
 
 
 @pytest.fixture(autouse=True)
@@ -291,7 +309,7 @@ def test_make_run_env_keeps_profile_scoped_connector_runtime_out_of_popen_env(mo
         "ZETTLAB_CONNECTORS_AUTH_TOKEN": "main-token",
         "ZET_AGENT_ID": "main",
         "ZETTLAB_AGENT_ACTION_TOKEN": "main-action",
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "main-business",
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": "main-hardware",
     })
     try:
         env = _make_run_env({
@@ -355,6 +373,111 @@ def test_foreground_terminal_observes_live_profile_output(monkeypatch, tmp_path)
 
     assert result["returncode"] == 0
     assert result["output"].strip() == str(output)
+
+
+def test_terminal_child_observes_only_current_profile_catalog_token(monkeypatch, tmp_path):
+    """A model terminal child gets the narrow current-profile catalog token only."""
+    from agent import secret_scope as ss
+
+    current_catalog_token = "a" * 64
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "foreign-action-token")
+    scope_token = ss.set_secret_scope(
+        {
+            "ZETTLAB_SKILLHUB_CATALOG_TOKEN": current_catalog_token,
+            "ZETTLAB_AGENT_ACTION_TOKEN": "current-action-token",
+        }
+    )
+    environment = None
+    try:
+        environment = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        wrapped = environment._wrap_command("true", str(tmp_path))
+        result = environment.execute(
+            'printf "%s|%s" "${ZETTLAB_SKILLHUB_CATALOG_TOKEN-absent}" '
+            '"${ZETTLAB_AGENT_ACTION_TOKEN-absent}"'
+        )
+    finally:
+        if environment is not None:
+            environment.cleanup()
+        ss.reset_secret_scope(scope_token)
+
+    assert result["returncode"] == 0
+    assert result["output"].strip() == f"{current_catalog_token}|absent"
+    assert current_catalog_token not in wrapped
+
+
+@pytest.mark.parametrize(
+    "profile_value",
+    [None, "a" * 63, "A" * 64, "a" * 65, "a" * 63 + "g"],
+)
+def test_terminal_child_rejects_missing_or_invalid_catalog_token(
+    monkeypatch,
+    profile_value,
+    tmp_path,
+):
+    """A global or another profile cannot supply catalog access to this shell."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    scope = (
+        {"ZETTLAB_SKILLHUB_CATALOG_TOKEN": profile_value}
+        if profile_value is not None
+        else {}
+    )
+    scope_token = ss.set_secret_scope(scope)
+    environment = None
+    try:
+        environment = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        result = environment.execute(
+            'printf "%s|%s" "${ZETTLAB_SKILLHUB_CATALOG_TOKEN-absent}" '
+            '"${ZETTLAB_AGENT_ACTION_TOKEN-absent}"'
+        )
+    finally:
+        if environment is not None:
+            environment.cleanup()
+        ss.reset_secret_scope(scope_token)
+
+    assert result["returncode"] == 0
+    assert result["output"].strip() == "absent|absent"
+
+
+def test_single_profile_terminal_does_not_enable_catalog_token(monkeypatch):
+    """The narrow token is only a multiplex-gateway happy-path capability."""
+    from agent import secret_scope as ss
+
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    scope_token = ss.set_secret_scope(
+        {"ZETTLAB_SKILLHUB_CATALOG_TOKEN": "a" * 64}
+    )
+    try:
+        env = _make_run_env({})
+    finally:
+        ss.reset_secret_scope(scope_token)
+
+    assert "ZETTLAB_SKILLHUB_CATALOG_TOKEN" not in env
+
+
+def test_catalog_token_stays_out_of_nonterminal_subprocess_envs(monkeypatch):
+    """Only the generic terminal builder opts into the catalog bearer."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZETTLAB_SKILLHUB_CATALOG_TOKEN", "b" * 64)
+    scope_token = ss.set_secret_scope(
+        {"ZETTLAB_SKILLHUB_CATALOG_TOKEN": "a" * 64}
+    )
+    try:
+        envs = (
+            _sanitize_subprocess_env({}),
+            hermes_subprocess_env(),
+        )
+    finally:
+        ss.reset_secret_scope(scope_token)
+
+    for env in envs:
+        assert "ZETTLAB_SKILLHUB_CATALOG_TOKEN" not in env
 
 
 @pytest.mark.parametrize("value", ["relative/output", "bad\x00output", ""])
@@ -493,7 +616,7 @@ def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
     ss.set_multiplex_active(True)
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "foreign-action")
-    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "foreign-business")
+    monkeypatch.setenv("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "foreign-hardware")
     token = ss.set_secret_scope({
         "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=main",
         "ZETTLAB_CONNECTORS_AUTH_TOKEN": "main-token",
@@ -509,7 +632,7 @@ def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
     assert env["ZETTLAB_CONNECTORS_URL"].endswith("agent_id=main")
     assert env["ZET_AGENT_ID"] == "main"
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
-    assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in env
+    assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in env
 
 
 def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
@@ -522,7 +645,7 @@ def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "single-connector")
     monkeypatch.setenv("ZET_AGENT_ID", "single-agent")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "stale-action")
-    monkeypatch.setenv("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "stale-business")
+    monkeypatch.setenv("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "stale-hardware")
 
     env = build_connector_runtime_env()
 
@@ -530,199 +653,7 @@ def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
     assert env["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "single-connector"
     assert env["ZET_AGENT_ID"] == "single-agent"
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
-    assert "ZETTLAB_BUSINESS_EXECUTION_TOKEN" not in env
-
-
-def test_build_video_edit_runtime_env_scrubs_profile_keys_before_video_injection(
-    monkeypatch,
-):
-    """Video execution cannot inherit connector bearer from any sanitizer output."""
-    from agent import secret_scope as ss
-    from agent import zet_agent_response_mode as response_mode
-
-    unsafe_env = {
-        key: f"foreign-{key.lower()}"
-        for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
-    }
-    unsafe_env["ZETTLAB_AGENT_ACTION_TOKEN"] = "foreign-action"
-    monkeypatch.setattr(
-        local_env_module,
-        "_sanitize_subprocess_env",
-        lambda *_args, **_kwargs: dict(unsafe_env),
-    )
-    monkeypatch.setattr(
-        response_mode,
-        "trusted_video_edit_runtime_receipt",
-        lambda: {
-            "ZET_AGENT_ID": "video-agent",
-            "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "video-business",
-            "HERMES_TURN_ID": "turn-video",
-            "HERMES_SESSION_KEY": "session-video",
-        },
-    )
-    ss.set_multiplex_active(True)
-    scope_token = ss.set_secret_scope({
-        "ZETTLAB_CONNECTORS_URL": "http://profile.invalid/rpc",
-        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "profile-connector-token",
-        "ZET_AGENT_ID": "video-agent",
-        "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
-    })
-    turn_tokens = set_turn_vars(
-        turn_id="turn-video",
-        business_execution_token="video-business",
-    )
-    try:
-        env = build_video_edit_runtime_env()
-    finally:
-        clear_turn_vars(turn_tokens)
-        ss.reset_secret_scope(scope_token)
-
-    assert "ZETTLAB_CONNECTORS_URL" not in env
-    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
-    assert env["ZET_AGENT_ID"] == "video-agent"
-    assert env["ZETTLAB_AGENT_ACTION_TOKEN"] == "video-action"
-    assert env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] == "video-business"
-    assert env["HERMES_TURN_ID"] == "turn-video"
-
-
-def test_build_video_edit_runtime_env_requires_frozen_receipt(monkeypatch):
-    """Live profile and turn scopes cannot authorize the dedicated runner."""
-    from agent import secret_scope as ss
-    from agent import zet_agent_response_mode as response_mode
-
-    monkeypatch.setattr(
-        response_mode,
-        "trusted_video_edit_runtime_receipt",
-        lambda: {},
-    )
-    ss.set_multiplex_active(True)
-    scope_token = ss.set_secret_scope({
-        "ZET_AGENT_ID": "video-agent",
-        "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
-    })
-    turn_tokens = set_turn_vars(
-        turn_id="turn-video",
-        business_execution_token="video-business",
-    )
-    try:
-        with pytest.raises(
-            PermissionError,
-            match="trusted video-edit execution receipt unavailable",
-        ):
-            build_video_edit_runtime_env({})
-    finally:
-        clear_turn_vars(turn_tokens)
-        ss.reset_secret_scope(scope_token)
-
-
-def test_trusted_video_receipt_prefers_lineage_session_id():
-    """Receipt auth must use the turn lineage id, not the stable memory key."""
-    from agent import secret_scope as ss
-    from agent import zet_agent_response_mode as response_mode
-
-    ss.set_multiplex_active(True)
-    scope_token = ss.set_secret_scope({
-        "ZET_AGENT_ID": "video-agent",
-        "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
-    })
-    session_tokens = set_session_vars(
-        session_key="stable-session-key",
-        session_id="lineage-session-id",
-        platform="api_server",
-        chat_id="chat-1",
-    )
-    turn_tokens = set_turn_vars(
-        turn_id="turn-video",
-        business_execution_token="video-business",
-    )
-    try:
-        turn_identity = sc.current_turn_identity()
-        assert turn_identity is not None
-        receipt = response_mode._capture_trusted_execution_receipt(turn_identity)
-    finally:
-        clear_turn_vars(turn_tokens)
-        clear_session_vars(session_tokens)
-        ss.reset_secret_scope(scope_token)
-
-    assert receipt is not None
-    assert receipt.session_id == "lineage-session-id"
-
-
-def test_trusted_video_receipt_falls_back_to_stable_session_key():
-    """Legacy callers without HERMES_SESSION_ID keep the previous auth shape."""
-    from agent import secret_scope as ss
-    from agent import zet_agent_response_mode as response_mode
-
-    ss.set_multiplex_active(True)
-    scope_token = ss.set_secret_scope({
-        "ZET_AGENT_ID": "video-agent",
-        "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
-    })
-    session_tokens = set_session_vars(
-        session_key="stable-session-key",
-        platform="api_server",
-        chat_id="chat-1",
-    )
-    turn_tokens = set_turn_vars(
-        turn_id="turn-video",
-        business_execution_token="video-business",
-    )
-    try:
-        turn_identity = sc.current_turn_identity()
-        assert turn_identity is not None
-        receipt = response_mode._capture_trusted_execution_receipt(turn_identity)
-    finally:
-        clear_turn_vars(turn_tokens)
-        clear_session_vars(session_tokens)
-        ss.reset_secret_scope(scope_token)
-
-    assert receipt is not None
-    assert receipt.session_id == "stable-session-key"
-
-
-def test_build_video_edit_runtime_env_injects_lineage_receipt_session():
-    """The dedicated runner receives the frozen lineage session for auth."""
-    from agent import secret_scope as ss
-    from agent import zet_agent_response_mode as response_mode
-
-    ss.set_multiplex_active(True)
-    scope_token = ss.set_secret_scope({
-        "ZET_AGENT_ID": "video-agent",
-        "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
-    })
-    session_tokens = set_session_vars(
-        session_key="stable-session-key",
-        session_id="lineage-session-id",
-        platform="api_server",
-        chat_id="chat-1",
-    )
-    turn_tokens = set_turn_vars(
-        turn_id="turn-video",
-        business_execution_token="video-business",
-    )
-    receipt_token = None
-    try:
-        turn_identity = sc.current_turn_identity()
-        assert turn_identity is not None
-        receipt = response_mode._capture_trusted_execution_receipt(turn_identity)
-        assert receipt is not None
-        receipt_token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(
-            receipt
-        )
-        env = build_video_edit_runtime_env({})
-    finally:
-        if receipt_token is not None:
-            response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(receipt_token)
-        clear_turn_vars(turn_tokens)
-        clear_session_vars(session_tokens)
-        ss.reset_secret_scope(scope_token)
-
-    assert env["ZET_AGENT_ID"] == "video-agent"
-    assert env["ZETTLAB_AGENT_ACTION_TOKEN"] == "video-action"
-    assert env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] == "video-business"
-    assert env["HERMES_TURN_ID"] == "turn-video"
-    assert env["HERMES_SESSION_KEY"] == "lineage-session-id"
+    assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in env
 
 
 def test_connector_route_capability_replaces_only_dedicated_runner_session_key(
@@ -745,31 +676,6 @@ def test_connector_route_capability_replaces_only_dedicated_runner_session_key(
 
     assert connector_env["HERMES_SESSION_KEY"] == "c" * 43
     assert generic_env["HERMES_SESSION_KEY"] == "real-session"
-
-
-def test_build_video_edit_runtime_env_uses_frozen_trusted_receipt(monkeypatch):
-    """The dedicated worker keeps the request receipt after live scopes clear."""
-    from agent import zet_agent_response_mode as response_mode
-
-    monkeypatch.setattr(
-        response_mode,
-        "trusted_video_edit_runtime_receipt",
-        lambda: {
-            "ZET_AGENT_ID": "video-agent",
-            "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "video-business",
-            "HERMES_TURN_ID": "turn-video",
-            "HERMES_SESSION_KEY": "session-video",
-        },
-    )
-
-    env = build_video_edit_runtime_env({})
-
-    assert env["ZET_AGENT_ID"] == "video-agent"
-    assert env["ZETTLAB_AGENT_ACTION_TOKEN"] == "video-action"
-    assert env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] == "video-business"
-    assert env["HERMES_TURN_ID"] == "turn-video"
-    assert env["HERMES_SESSION_KEY"] == "session-video"
 
 
 def test_sanitize_and_nonterminal_spawn_scrub_connector_runtime_env(monkeypatch):

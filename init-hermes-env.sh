@@ -196,16 +196,21 @@ if is_termux; then
 else
     # Prefer uv sync with lockfile (hash-verified installs) when available,
     # fall back to pip install for compatibility or when lockfile is stale.
+    # Some mirrors synthesize upload timestamps for old OpenAI SDK artifacts,
+    # which can make the global exclude-newer window filter out our exact pin.
+    # The dependency is still exact-pinned and locked; this only prevents mirror
+    # metadata drift from making device installs unsatisfiable.
+    UV_OPENAI_EXCLUDE_NEWER_ARGS=(--exclude-newer-package openai=false)
     if [ -f "uv.lock" ]; then
         echo -e "${CYAN}→${NC} Using uv.lock for hash-verified installation..."
-        UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" $UV_CMD sync --all-extras --locked 2>/dev/null && \
+        UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" $UV_CMD sync --all-extras --locked "${UV_OPENAI_EXCLUDE_NEWER_ARGS[@]}" 2>/dev/null && \
             echo -e "${GREEN}✓${NC} Dependencies installed (lockfile verified)" || {
             echo -e "${YELLOW}⚠${NC} Lockfile install failed (may be outdated), falling back to pip install..."
-            $UV_CMD pip install -e ".[all]" || $UV_CMD pip install -e "."
+            $UV_CMD pip install "${UV_OPENAI_EXCLUDE_NEWER_ARGS[@]}" -e ".[all]" || $UV_CMD pip install "${UV_OPENAI_EXCLUDE_NEWER_ARGS[@]}" -e "."
             echo -e "${GREEN}✓${NC} Dependencies installed"
         }
     else
-        $UV_CMD pip install -e ".[all]" || $UV_CMD pip install -e "."
+        $UV_CMD pip install "${UV_OPENAI_EXCLUDE_NEWER_ARGS[@]}" -e ".[all]" || $UV_CMD pip install "${UV_OPENAI_EXCLUDE_NEWER_ARGS[@]}" -e "."
         echo -e "${GREEN}✓${NC} Dependencies installed"
     fi
 fi

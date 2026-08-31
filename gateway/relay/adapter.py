@@ -463,10 +463,11 @@ class RelayAdapter(BasePlatformAdapter):
                     if "/relay/media/" not in url:
                         localized.append(url)
                     continue
+                is_rehost = client.is_relay_media_url(url)
                 path = await client.download(url)
                 if path:
                     localized.append(path)
-                elif "/relay/media/" not in url:
+                elif not is_rehost:
                     # A public URL that failed to download still has value as
                     # a URL (native adapters pass URLs to vision in some
                     # lanes); a dead re-host reference does not.

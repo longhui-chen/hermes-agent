@@ -31,7 +31,7 @@ def _reset_agent_creator_runtime(monkeypatch):
     )
     monkeypatch.setattr(
         "agent.credential_broker.request_app_auto_refresh_token",
-        lambda agent_id: str(agent_id).removeprefix("test-broker:"),
+        lambda agent_id, **_kwargs: str(agent_id).removeprefix("test-broker:"),
     )
     yield
     set_zettlab_turn_id(previous_turn_id)
@@ -52,6 +52,34 @@ def _scope(values):
         yield
     finally:
         secret_scope.reset_secret_scope(token)
+
+
+@contextmanager
+def _app_operation_context():
+    """Bind the trusted user context required for an app-agent capability."""
+    from gateway.session_context import (
+        clear_session_vars,
+        clear_turn_vars,
+        pop_zettlab_auth_principal,
+        push_zettlab_auth_principal,
+        set_session_vars,
+        set_turn_vars,
+        set_zettlab_turn_id,
+        zettlab_turn_id,
+    )
+
+    previous_turn_id = zettlab_turn_id()
+    session_token = set_session_vars(session_id="session-1")
+    turn_token = set_turn_vars(turn_id="turn-1")
+    set_zettlab_turn_id("turn-1")
+    principal_token = push_zettlab_auth_principal("iam:user-1")
+    try:
+        yield
+    finally:
+        pop_zettlab_auth_principal(principal_token)
+        clear_turn_vars(turn_token)
+        clear_session_vars(session_token)
+        set_zettlab_turn_id(previous_turn_id)
 
 
 def _write_creator(
@@ -197,7 +225,7 @@ def test_application_helper_uses_optional_scoped_capability(
         },
     })
 
-    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+    with _app_operation_context(), _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
         result = json.loads(terminal_tool_module.terminal_tool(
             _application_app_agent_command(
                 f"create-app-agent --payload {shlex.quote(payload)}"
@@ -1091,7 +1119,7 @@ def test_create_app_agent_payload_passes_over_stdin(monkeypatch, tmp_path):
         + "\nJSON"
     )
 
-    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+    with _app_operation_context(), _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
         result = json.loads(
             terminal_tool_module.terminal_tool(
                 command,
@@ -1124,7 +1152,7 @@ def test_create_app_agent_inline_payload_is_canonicalized(monkeypatch, tmp_path)
         f"create-app-agent --payload {shlex.quote(payload)}"
     )
 
-    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+    with _app_operation_context(), _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
         result = json.loads(
             terminal_tool_module._run_agent_creator_command_if_allowed(
                 command,
@@ -1168,7 +1196,7 @@ def test_create_app_agent_capability_probe_reaches_the_script(
         + "\nJSON"
     )
 
-    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+    with _app_operation_context(), _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
         result = json.loads(
             terminal_tool_module.terminal_tool(
                 command,

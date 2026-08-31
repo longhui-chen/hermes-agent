@@ -34,6 +34,58 @@ _GEMINI_SCHEMA_ALLOWED_KEYS = {
 }
 
 
+def _pure_help_conditional_any_of(schema: Dict[str, Any]) -> list[Dict[str, Any]] | None:
+    """Translate Hermes' exact pure-Help conditional to Gemini's schema subset."""
+    condition = schema.get("if")
+    otherwise = schema.get("else")
+    properties = schema.get("properties")
+    if (
+        schema.get("required") != []
+        or schema.get("additionalProperties") is not False
+        or condition
+        != {
+            "properties": {"help": {"const": True}},
+            "required": ["help"],
+        }
+        or schema.get("then") != {}
+        or not isinstance(otherwise, dict)
+        or set(otherwise) != {"required"}
+        or not isinstance(properties, dict)
+    ):
+        return None
+
+    required = otherwise["required"]
+    help_schema = properties.get("help")
+    if (
+        not isinstance(required, list)
+        or not required
+        or len(required) != len(set(required))
+        or not all(isinstance(name, str) and name in properties for name in required)
+        or not isinstance(help_schema, dict)
+        or help_schema.get("type") != "boolean"
+    ):
+        return None
+
+    help_branch_property: Dict[str, Any] = {
+        "type": "boolean",
+        "enum": [True],
+    }
+    if isinstance(help_schema.get("description"), str):
+        help_branch_property["description"] = help_schema["description"]
+    return [
+        {
+            "type": "object",
+            "properties": {"help": help_branch_property},
+            "required": ["help"],
+        },
+        {
+            "type": "object",
+            "properties": {name: properties[name] for name in required},
+            "required": list(required),
+        },
+    ]
+
+
 def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
     """Return a Gemini-compatible copy of a tool parameter schema.
 
@@ -47,6 +99,7 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
     if not isinstance(schema, dict):
         return {}
 
+    pure_help_any_of = _pure_help_conditional_any_of(schema)
     cleaned: Dict[str, Any] = {}
     for key, value in schema.items():
         if key not in _GEMINI_SCHEMA_ALLOWED_KEYS:
@@ -74,6 +127,11 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
             ]
             continue
         cleaned[key] = value
+
+    if pure_help_any_of is not None:
+        cleaned["anyOf"] = [
+            sanitize_gemini_schema(branch) for branch in pure_help_any_of
+        ]
 
     # Gemini's Schema validator requires every ``enum`` entry to be a string,
     # even when the parent ``type`` is ``integer`` / ``number`` / ``boolean``.

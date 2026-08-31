@@ -4,6 +4,9 @@ Thin wrappers over the same registries the TUI /agents overlay reads —
 these tests pin auth, wiring, and found/not-found semantics.
 """
 
+import logging
+import re
+
 import pytest
 
 from gateway.config import PlatformConfig
@@ -143,6 +146,69 @@ async def test_routes_reject_bad_auth(monkeypatch):
     ):
         resp = await handler(_FakeRequest(match_info=mi, auth="Bearer wrong"))
         assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "module_name", "target_name", "match_info", "code"),
+    [
+        (
+            "_handle_delegations_status",
+            "tools.delegate_tool",
+            "list_active_subagents",
+            {},
+            "delegation_status_unavailable",
+        ),
+        (
+            "_handle_delegation_cancel",
+            "tools.async_delegation",
+            "interrupt_delegation",
+            {"delegation_id": "deleg_x"},
+            "delegation_cancel_unavailable",
+        ),
+        (
+            "_handle_subagent_interrupt",
+            "tools.delegate_tool",
+            "interrupt_subagent",
+            {"subagent_id": "sa_x"},
+            "subagent_interrupt_unavailable",
+        ),
+    ],
+)
+async def test_control_unknown_500_is_safe_and_correlated(
+    monkeypatch,
+    caplog,
+    handler_name,
+    module_name,
+    target_name,
+    match_info,
+    code,
+):
+    adapter = _adapter(monkeypatch)
+    secret_error = "/private/profile/state.db failed"
+    module = __import__(module_name, fromlist=[target_name])
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(secret_error)
+
+    monkeypatch.setattr(module, target_name, fail)
+    with caplog.at_level(logging.ERROR):
+        response = await getattr(adapter, handler_name)(
+            _FakeRequest(match_info=match_info)
+        )
+
+    assert response.status == 500
+    assert response.payload["error"]["code"] == code
+    message = response.payload["error"]["message"]
+    assert secret_error not in message
+    reference = re.search(r"reference ([0-9a-f]{12})", message)
+    assert reference is not None
+    assert any(
+        f"correlation_id={reference.group(1)}" in record.message
+        and record.exc_info
+        and secret_error in str(record.exc_info[1])
+        for record in caplog.records
+    )
 
 
 def test_interrupt_delegation_helper_contract():

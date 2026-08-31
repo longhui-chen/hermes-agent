@@ -15,6 +15,7 @@ from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
+from jsonschema import Draft7Validator
 
 
 @contextmanager
@@ -130,6 +131,46 @@ class TestConvertToolsToConverse:
         from agent.bedrock_adapter import convert_tools_to_converse
         assert convert_tools_to_converse([]) == []
         assert convert_tools_to_converse(None) == []
+
+    def test_preserves_direct_pure_help_conditional(self):
+        from agent.bedrock_adapter import convert_tools_to_converse
+
+        parameters = {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string"},
+                "help": {"type": "boolean", "default": False},
+            },
+            "required": [],
+            "if": {
+                "properties": {"help": {"const": True}},
+                "required": ["help"],
+            },
+            "then": {},
+            "else": {"required": ["document_id"]},
+            "additionalProperties": False,
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "conditional_help",
+                    "description": "Execute normally or return Help.",
+                    "parameters": parameters,
+                },
+            }
+        ]
+
+        input_schema = convert_tools_to_converse(tools)[0]["toolSpec"][
+            "inputSchema"
+        ]["json"]
+        validator = Draft7Validator(input_schema)
+
+        assert input_schema["if"] == parameters["if"]
+        assert input_schema["else"] == parameters["else"]
+        assert not validator.is_valid({})
+        assert validator.is_valid({"help": True})
+        assert validator.is_valid({"document_id": "doc-1"})
 
 
 

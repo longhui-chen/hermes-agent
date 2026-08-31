@@ -1,8 +1,9 @@
-"""Narrow adapter for App Host's dedicated-maintainer workspace surface.
+"""Narrow adapter for an app's dedicated-maintainer workspace and task surface.
 
-This is intentionally not a terminal or filesystem bridge.  App Host owns the
-checkout, validates the dedicated maintainer binding, and exposes only the
-seven fixed workspace actions plus read-only maintainer schedule status.
+This is intentionally not a terminal, generic cron, or filesystem bridge.
+App Host owns the checkout, validates the dedicated maintainer binding, and
+allows maintenance tasks only for that current app instance.  Each task is
+bound to a declared app mutation capability rather than a raw URL or database.
 """
 
 from __future__ import annotations
@@ -19,8 +20,10 @@ from tools.registry import registry
 
 
 _ACTIONS = frozenset({
-    "status", "checkout", "read", "apply_patch", "build", "publish",
-    "discard", "maintainer_schedule_status",
+    "status", "checkout", "list", "read", "apply_patch", "build", "publish",
+    "discard", "maintainer_schedule_status", "maintenance_tasks",
+    "create_maintenance_task", "update_maintenance_task",
+    "delete_maintenance_task", "maintenance_task_runs",
 })
 _MAX_RESPONSE_BYTES = 1024 * 1024
 # App Host accepts an 8 MiB patch, but a subsequent read serializes its
@@ -36,11 +39,20 @@ APP_WORKSPACE_SCHEMA = {
     "name": "app_workspace",
     "description": (
         "Edit the current version of an app only through App Host's dedicated "
-        "maintainer workspace. This is a fixed checkout/read/replace/build/"
+        "maintainer workspace. This is a fixed checkout/list/read/replace/build/"
         "publish/discard surface, not a terminal, general filesystem, URL, or "
         "environment interface. Start with status, use its app_instance_id and "
         "revision as the required compare-and-swap values, and read a file "
-        "before replacing it with apply_patch."
+        "before replacing it with apply_patch. After checkout, use list to see "
+        "which files exist and read only paths it returned — never guess a "
+        "pathname. A generated app keeps its page source at static/index.html, "
+        "its server code in main.go and any schema in migrations/, but list is "
+        "the authority; a read that comes back absent means your path was "
+        "wrong, not that the app lacks that kind of source. The one exception: "
+        "if list itself fails with error.code list_unsupported, this device's "
+        "App Host predates the list route — every other action still works, so "
+        "fall back to probing with read and do guess pathnames there; that "
+        "error is never evidence the app or its source is missing."
     ),
     "parameters": {
         "type": "object",
@@ -81,6 +93,16 @@ APP_WORKSPACE_SCHEMA = {
                 "type": "string",
                 "description": "For publish only: a concise user-facing description of this version change.",
             },
+            "name": {"type": "string", "description": "For create_maintenance_task: user-visible task name."},
+            "schedule": {"type": "string", "description": "For create_maintenance_task: recurring interval or cron expression."},
+            "timezone": {"type": "string", "description": "For create_maintenance_task: IANA timezone."},
+            "kind": {"type": "string", "enum": ["refresh", "summary"], "description": "For create_maintenance_task: the app-scoped maintenance kind."},
+            "app_operation": {"type": "string", "description": "For create_maintenance_task: declared app write operation, read from app_capabilities first."},
+            "capability_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "For create_maintenance_task: exact digest from app_capabilities for app_operation."},
+            "instruction": {"type": "string", "description": "For create_maintenance_task: concise user-approved collection or summary instruction."},
+            "task_id": {"type": "string", "description": "For update_maintenance_task, delete_maintenance_task, or maintenance_task_runs: the id returned by maintenance_tasks."},
+            "expected_schedule_revision": {"type": "integer", "minimum": 0, "description": "For update_maintenance_task: current schedule_revision returned by maintenance_tasks."},
+            "enabled": {"type": "boolean", "description": "For update_maintenance_task: whether this task should run."},
         },
         "required": ["action", "slug", "expected_instance_id"],
     },
@@ -124,6 +146,20 @@ def _required_revision(args: dict) -> int:
     return revision
 
 
+def _required_task_id(args: dict) -> str:
+    value = str(args.get("task_id", "") or "").strip()
+    if not value or len(value) > 256 or value in {".", ".."} or "/" in value or "\\" in value:
+        raise _apphost._BadRequest("task_id 必须来自当前应用的 maintenance_tasks")
+    return value
+
+
+def _required_schedule_revision(args: dict) -> int:
+    value = args.get("expected_schedule_revision")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _apphost._BadRequest("expected_schedule_revision 必须来自 maintenance_tasks")
+    return value
+
+
 def _only(args: dict, allowed: set[str]):
     unexpected = set(args) - allowed
     if unexpected:
@@ -146,11 +182,54 @@ def _build_request(args: dict):
         return "GET", f"/{quote(slug, safe='')}/maintainer_schedule?" + urlencode({
             "expected_instance_id": instance,
         }), None, _apphost._DEFAULT_TIMEOUT
+    if action == "maintenance_tasks":
+        _only(args, base_fields)
+        return "GET", f"/{quote(slug, safe='')}/maintenance_tasks?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
+    if action == "create_maintenance_task":
+        fields = base_fields | {"name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction"}
+        _only(args, fields)
+        required = ("name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction")
+        if any(not isinstance(args.get(key), str) or not str(args[key]).strip() for key in required):
+            raise _apphost._BadRequest("create_maintenance_task requires its declared task contract")
+        digest = str(args["capability_digest"]).lower()
+        if not _SHA256_RE.fullmatch(digest):
+            raise _apphost._BadRequest("capability_digest must come from app_capabilities")
+        return "POST", f"/{quote(slug, safe='')}/maintenance_tasks", {
+            "expected_instance_id": instance, "name": str(args["name"]).strip(), "schedule": str(args["schedule"]).strip(),
+            "timezone": str(args["timezone"]).strip(), "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(),
+            "capability_digest": digest, "instruction": str(args["instruction"]).strip(),
+        }, _apphost._DEFAULT_TIMEOUT
+    if action == "maintenance_task_runs":
+        _only(args, base_fields | {"task_id"})
+        return "GET", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}/runs?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
+    if action == "delete_maintenance_task":
+        _only(args, base_fields | {"task_id", "expected_schedule_revision"})
+        return "DELETE", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}?" + urlencode({
+            "expected_instance_id": instance, "expected_schedule_revision": _required_schedule_revision(args),
+        }), None, _apphost._DEFAULT_TIMEOUT
+    if action == "update_maintenance_task":
+        fields = base_fields | {"task_id", "expected_schedule_revision", "name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction", "enabled"}
+        _only(args, fields)
+        required = ("name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction")
+        if any(not isinstance(args.get(key), str) or not str(args[key]).strip() for key in required) or not isinstance(args.get("enabled"), bool):
+            raise _apphost._BadRequest("update_maintenance_task requires the complete task contract and enabled state")
+        digest = str(args["capability_digest"]).lower()
+        if not _SHA256_RE.fullmatch(digest):
+            raise _apphost._BadRequest("capability_digest must come from app_capabilities")
+        return "PATCH", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}", {
+            "expected_instance_id": instance, "expected_schedule_revision": _required_schedule_revision(args),
+            "name": str(args["name"]).strip(), "schedule": str(args["schedule"]).strip(), "timezone": str(args["timezone"]).strip(),
+            "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(), "capability_digest": digest,
+            "instruction": str(args["instruction"]).strip(), "enabled": args["enabled"],
+        }, _apphost._DEFAULT_TIMEOUT
     if action in {"checkout", "build", "discard"}:
         _only(args, base_fields)
         method = "DELETE" if action == "discard" else "POST"
         path = root if action == "discard" else f"{root}/{action}"
         return method, path, {"expected_instance_id": instance}, _apphost._LONG_TIMEOUT if action == "build" else _apphost._DEFAULT_TIMEOUT
+    if action == "list":
+        _only(args, base_fields)
+        return "POST", root + "/list", {"expected_instance_id": instance}, _apphost._DEFAULT_TIMEOUT
     if action == "read":
         _only(args, base_fields | {"path"})
         return "POST", root + "/read", {
@@ -228,6 +307,26 @@ def _schedule_response(parsed, *, expected_instance_id: str, is_status: bool):
     return parsed
 
 
+def _maintenance_task_response(parsed, *, action: str):
+    """Reject a partial success receipt before an Agent claims a task changed."""
+    if action == "maintenance_tasks":
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("tasks"), list):
+            return None
+        for task in parsed["tasks"]:
+            if not isinstance(task, dict) or not isinstance(task.get("id"), str) or not task["id"]:
+                return None
+        return parsed
+    if action in {"create_maintenance_task", "update_maintenance_task"}:
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("id"), str) or not parsed["id"]:
+            return None
+        return parsed
+    if action == "maintenance_task_runs":
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("occurrences"), list):
+            return None
+        return parsed
+    return parsed
+
+
 def app_workspace_tool(args, **_kw) -> str:
     args = args if isinstance(args, dict) else {}
     try:
@@ -235,6 +334,7 @@ def app_workspace_tool(args, **_kw) -> str:
     except _apphost._BadRequest as exc:
         return _bad_request(str(exc))
 
+    action = args.get("action")
     base = _apphost._base_url()
     token = _apphost._secret("ZETTLAB_AGENT_ACTION_TOKEN")
     if not base or not token:
@@ -256,6 +356,25 @@ def app_workspace_tool(args, **_kw) -> str:
         if upstream is not None:
             return _apphost._fail(upstream, status=exc.code)
         if exc.code == 404:
+            # list 是这一批里唯一的新路由：Hermes 先于 App Host 部署时，只有它
+            # 会撞 404，而 status / read / apply_patch / build / publish 在旧
+            # 服务端上全都照常可用。若也回「尚不支持 App Workspace」，维护者会
+            # 把一个路由缺失读成整个工作区不可用而放弃整轮维护——工具说明里还
+            # 写着「先 list 再 read」，它更没有理由继续。所以这一档单独降级，
+            # 并直接告诉它替代走法。
+            if action == "list":
+                return _apphost._local_error(
+                    "list_unsupported",
+                    "这台设备的 App Host 版本还没有列文件能力。**只有列文件这一个动作缺失**，"
+                    "status / read / apply_patch / build / publish 全都照常可用，工作区也已经检出，"
+                    "不要据此判断应用不存在、源码找不到或维护无法继续。"
+                    "改用逐个 read 探路：若这是本 skill 生成的应用，先试 static/index.html（页面）、"
+                    "main.go（后端）、migrations/ 下的 .sql（建表）——这几条只是生成应用的**候选**，"
+                    "blueprint 应用或用户自己调整过目录结构时它们可能都不在。任何一个路径 read 不到，"
+                    "只说明这个文件不存在，换一个继续试；这种情况下允许按应用类型推测路径，"
+                    "「先 list 再 read」那条要求不适用于这台设备。",
+                    status=exc.code,
+                )
             return _apphost._local_error(
                 "unsupported",
                 "设备端 App Host 尚不支持 App Workspace；没有安全的兼容路径",
@@ -266,8 +385,7 @@ def app_workspace_tool(args, **_kw) -> str:
         return _apphost._local_error("transport_error", "无法连接 App Workspace 服务", status=None)
     if len(raw) > _MAX_RESPONSE_BYTES:
         return _apphost._local_error("transport_error", "App Workspace 返回内容过大", status=status)
-    action = args.get("action")
-    if action in {"apply_patch", "discard"}:
+    if action in {"apply_patch", "discard", "delete_maintenance_task"}:
         if status == 204 and not raw:
             return _apphost._ok({})
         return _apphost._local_error("outcome_unknown", "App Workspace 返回了非合同完成状态", status=status)
@@ -289,6 +407,11 @@ def app_workspace_tool(args, **_kw) -> str:
                 "maintainer schedule 返回了缺失或不匹配的实例/修订回执",
                 status=status,
             )
+        return _apphost._ok(checked)
+    if action in {"maintenance_tasks", "create_maintenance_task", "update_maintenance_task", "maintenance_task_runs"}:
+        checked = _maintenance_task_response(parsed, action=action)
+        if checked is None:
+            return _apphost._local_error("outcome_unknown", "maintenance task 返回了不完整的回执", status=status)
         return _apphost._ok(checked)
     return _apphost._ok(_normalize_read(parsed) if action == "read" else parsed)
 

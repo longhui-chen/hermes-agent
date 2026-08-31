@@ -25,7 +25,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
-from gateway.platforms.base import _custom_unit_to_cp
+from gateway.platforms.base import (
+    _consume_feishu_quote as _consume_shared_feishu_quote,
+    _custom_unit_to_cp,
+    _flat_feishu_metadata,
+    _feishu_quote_lease,
+    _reserve_feishu_quote_metadata,
+)
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
@@ -217,6 +223,10 @@ class GatewayStreamConsumer:
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
         self._on_before_finalize = on_before_finalize
         self._initial_reply_to_id = initial_reply_to_id
+        self._feishu_quote_available = (
+            str(getattr(getattr(adapter, "platform", None), "value", getattr(adapter, "platform", ""))).lower() == "feishu"
+            and bool(initial_reply_to_id)
+        )
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
@@ -333,13 +343,49 @@ class GatewayStreamConsumer:
         final-message delivery.
         """
         meta = dict(self.metadata) if self.metadata else {}
-        if self._initial_reply_to_id:
+        if self._initial_reply_to_id and (
+            not self._is_feishu() or self._feishu_quote_available
+        ):
             meta["reply_to_message_id"] = self._initial_reply_to_id
+        elif self._is_feishu():
+            meta.pop("reply_to_message_id", None)
         if expect_edits:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
         return meta or None
+
+    async def _metadata_for_delivery(
+        self,
+        *,
+        final: bool = False,
+        expect_edits: bool = False,
+    ) -> dict | None:
+        metadata = self._metadata_for_send(
+            final=final,
+            expect_edits=expect_edits,
+        )
+        if not self._is_feishu():
+            return metadata
+        return await _reserve_feishu_quote_metadata(metadata)
+
+    def _consume_feishu_quote(self, metadata: dict | None, result: Any) -> None:
+        _consume_shared_feishu_quote(metadata, result)
+        if self._feishu_quote_available and getattr(result, "success", False):
+            self._feishu_quote_available = False
+
+    def _feishu_reply_to(
+        self, reply_to_id: Optional[str], metadata: dict | None
+    ) -> Optional[str]:
+        lease = _feishu_quote_lease(self.metadata)
+        if lease is not None:
+            return reply_to_id if metadata and metadata.get("reply_to_message_id") else None
+        return reply_to_id if self._feishu_quote_available else None
+
+    def _is_feishu(self) -> bool:
+        return str(
+            getattr(getattr(self.adapter, "platform", None), "value", getattr(self.adapter, "platform", ""))
+        ).lower() == "feishu"
 
     @property
     def already_sent(self) -> bool:
@@ -908,7 +954,7 @@ class GatewayStreamConsumer:
                                 chunks_delivered = False
                                 break
                             chunks_delivered = True
-                            reply_to = new_id
+                            reply_to = None if self._is_feishu() else new_id
 
                         if all_heads_delivered:
                             self._accumulated = chunks[-1]
@@ -1219,26 +1265,40 @@ class GatewayStreamConsumer:
         text = self._clean_for_display(text)
         if not text.strip():
             return reply_to_id
+        send_metadata = await self._metadata_for_delivery(
+            final=final,
+            expect_edits=True,
+        )
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                reply_to=reply_to_id,
-                metadata=self._metadata_for_send(final=final, expect_edits=True),
+                reply_to=(
+                    reply_to_id
+                    if not self._is_feishu()
+                    else self._feishu_reply_to(reply_to_id, send_metadata)
+                ),
+                metadata=send_metadata,
             )
-            if result.success and result.message_id:
-                self._message_id = str(result.message_id)
-                self._track_preview_ids_from_result(result)
+            self._consume_feishu_quote(send_metadata, result)
+            if result.success and (result.message_id or self._is_feishu()):
+                if result.message_id:
+                    self._message_id = str(result.message_id)
+                    self._track_preview_ids_from_result(result)
                 self._already_sent = True
                 self._last_sent_text = text
                 # Fresh content bubble — close off any stale tool bubble
                 # above so the next tool starts a new bubble below.
                 self._notify_new_message()
-                return str(result.message_id)
+                return str(result.message_id or "")
             else:
                 self._edit_supported = False
                 return reply_to_id
+        except asyncio.CancelledError:
+            self._consume_feishu_quote(send_metadata, False)
+            raise
         except Exception as e:
+            self._consume_feishu_quote(send_metadata, False)
             logger.error("Stream send chunk error: %s", e)
             return reply_to_id
 
@@ -1429,11 +1489,20 @@ class GatewayStreamConsumer:
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=chunk,
-                    metadata=self._metadata_for_send(final=True),
-                )
+                send_metadata = await self._metadata_for_delivery(final=True)
+                try:
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=chunk,
+                        metadata=send_metadata,
+                    )
+                except asyncio.CancelledError:
+                    self._consume_feishu_quote(send_metadata, False)
+                    raise
+                except Exception:
+                    self._consume_feishu_quote(send_metadata, False)
+                    raise
+                self._consume_feishu_quote(send_metadata, result)
                 if result.success:
                     break
                 retry_delay = self._fallback_flood_retry_delay(result)
@@ -1527,13 +1596,18 @@ class GatewayStreamConsumer:
 
         result = None
         for attempt in range(2):
+            send_metadata = await self._metadata_for_delivery(final=True)
             try:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=final_text,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=send_metadata,
                 )
+            except asyncio.CancelledError:
+                self._consume_feishu_quote(send_metadata, False)
+                raise
             except Exception as exc:
+                self._consume_feishu_quote(send_metadata, False)
                 logger.debug("Empty fallback final send failed: %s", exc)
                 return (
                     "ambiguous"
@@ -1541,6 +1615,7 @@ class GatewayStreamConsumer:
                     else "failed"
                 )
 
+            self._consume_feishu_quote(send_metadata, result)
             if getattr(result, "success", False):
                 break
             retry_delay = self._fallback_flood_retry_delay(result)
@@ -1678,7 +1753,11 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=(
+                    _flat_feishu_metadata(self._metadata_for_send())
+                    if self._is_feishu()
+                    else self._metadata_for_send()
+                ),
             )
         except Exception as e:
             logger.debug(
@@ -1721,15 +1800,22 @@ class GatewayStreamConsumer:
         tail = self._clean_for_display(tail)
         if not tail.strip():
             return
+        send_metadata = None
         try:
+            send_metadata = await self._metadata_for_delivery()
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=send_metadata,
             )
+            self._consume_feishu_quote(send_metadata, result)
             if result.success:
                 self._already_sent = True
+        except asyncio.CancelledError:
+            self._consume_feishu_quote(send_metadata, False)
+            raise
         except Exception as e:
+            self._consume_feishu_quote(send_metadata, False)
             logger.error("Segment-break tail flush error: %s", e)
 
     async def _try_strip_cursor(self) -> None:
@@ -1758,17 +1844,19 @@ class GatewayStreamConsumer:
         text = self._clean_for_display(text)
         if not text.strip():
             return False
+        send_metadata = await self._metadata_for_delivery()
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=send_metadata,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
             # tool..."), not the final response. Setting already_sent would cause
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
+            self._consume_feishu_quote(send_metadata, result)
             if result.success:
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
@@ -1779,7 +1867,11 @@ class GatewayStreamConsumer:
                 # unrelated commentary delivered during a session split (#14238).
                 self._delivered_commentary_texts.append(text)
             return result.success
+        except asyncio.CancelledError:
+            self._consume_feishu_quote(send_metadata, False)
+            raise
         except Exception as e:
+            self._consume_feishu_quote(send_metadata, False)
             logger.error("Commentary send error: %s", e)
             return False
 
@@ -1871,7 +1963,7 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self.metadata)
+                result = fn(text, metadata=self._metadata_for_send(final=True))
             except TypeError:
                 # Adapter / test double whose hook doesn't accept the metadata
                 # keyword — fall back to the positional-only form.
@@ -1904,15 +1996,21 @@ class GatewayStreamConsumer:
         stale_ids = set(self._preview_message_ids)
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
+        send_metadata = await self._metadata_for_delivery(final=True)
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=send_metadata,
             )
+        except asyncio.CancelledError:
+            self._consume_feishu_quote(send_metadata, False)
+            raise
         except Exception as e:
+            self._consume_feishu_quote(send_metadata, False)
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
+        self._consume_feishu_quote(send_metadata, result)
         if not getattr(result, "success", False):
             return False
         # Adopt the new message id as the current message so subsequent
@@ -2075,6 +2173,7 @@ class GatewayStreamConsumer:
             # Failure already disabled drafts for this run; fall through to
             # the regular edit/send path below.
         self._last_edit_overflowed = False
+        send_metadata = None
         try:
             if self._message_id is not None:
                 if self._edit_supported:
@@ -2302,15 +2401,23 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
+                send_metadata = await self._metadata_for_delivery(
+                    final=finalize,
+                    expect_edits=True,
+                )
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self._metadata_for_send(
-                        final=finalize,
-                        expect_edits=True,
+                    reply_to=(
+                        self._initial_reply_to_id
+                        if not self._is_feishu()
+                        else self._feishu_reply_to(
+                            self._initial_reply_to_id, send_metadata
+                        )
                     ),
+                    metadata=send_metadata,
                 )
+                self._consume_feishu_quote(send_metadata, result)
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
@@ -2342,6 +2449,10 @@ class GatewayStreamConsumer:
                     # Initial send failed — disable streaming for this session
                     self._edit_supported = False
                     return False
+        except asyncio.CancelledError:
+            self._consume_feishu_quote(send_metadata, False)
+            raise
         except Exception as e:
+            self._consume_feishu_quote(send_metadata, False)
             logger.error("Stream send/edit error: %s", e)
             return False

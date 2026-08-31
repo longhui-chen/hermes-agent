@@ -512,6 +512,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    strict_memory_isolation: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -575,6 +576,16 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+
+    strict_memory_isolation = bool(strict_memory_isolation)
+    if strict_memory_isolation:
+        if enabled_toolsets is not None:
+            enabled_toolsets = [
+                name for name in enabled_toolsets if name != "memory"
+            ]
+        disabled_toolsets = list(disabled_toolsets or [])
+        if "memory" not in disabled_toolsets:
+            disabled_toolsets.append("memory")
     _install_safe_stdio()
 
     agent.model = model
@@ -838,6 +849,7 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    agent._strict_memory_isolation = strict_memory_isolation
     agent._skip_tool_loading = bool(skip_tool_loading)
     
     # Model response configuration
@@ -918,7 +930,12 @@ def init_agent(
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
-    agent._tool_snapshot_generation = 0
+    agent._tool_snapshot_generation = (-1, -1)
+    # Exact task-local turn identity that built the initial snapshot. The
+    # between-turns prologue may consume it once to avoid rebuilding the same
+    # snapshot inside the same request. It is deliberately not a session ID:
+    # sessions span requests, while authorization and profile scopes do not.
+    agent._tool_snapshot_turn_identity = None
     # Rate limit tracking — updated from x-ratelimit-* response headers
     # after each API call.  Accessed by /usage slash command.
     agent._rate_limit_state: Optional["RateLimitState"] = None
@@ -1432,19 +1449,34 @@ def init_agent(
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
     if skip_tool_loading:
-        agent._tool_snapshot_generation = 0
+        agent._tool_snapshot_generation = (-1, -1)
         agent.tools = []
     else:
         try:
             from tools.registry import registry as _snapshot_registry
-            agent._tool_snapshot_generation = _snapshot_registry._generation
+            agent._tool_snapshot_generation = _snapshot_registry.cache_generation()
         except Exception:
-            agent._tool_snapshot_generation = 0
+            agent._tool_snapshot_generation = (-1, -1)
+        try:
+            from gateway.session_context import current_turn_identity
+
+            agent._tool_snapshot_turn_identity = current_turn_identity()
+        except Exception:
+            # Standalone/CLI callers have no trusted gateway turn binding and
+            # therefore keep the existing full-refresh behavior.
+            agent._tool_snapshot_turn_identity = None
         agent.tools = _ra().get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=agent.quiet_mode,
         )
+    if strict_memory_isolation:
+        agent.tools = [
+            tool
+            for tool in agent.tools
+            if not isinstance(tool, dict)
+            or str((tool.get("function") or {}).get("name") or "") != "memory"
+        ]
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1680,6 +1712,11 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    # A memory-skipping runtime must also reject a persisted system-prompt
+    # snapshot from an earlier memory-enabled turn. conversation_loop reads
+    # this private construction-time fact before restore/persist.
+    agent._skip_memory_context = bool(skip_memory or strict_memory_isolation)
+
     # A flush/background agent may pass skip_memory=True to avoid spinning up an
     # external memory *provider*, but if the caller also explicitly enables the
     # "memory" toolset it still needs the built-in file-backed store — otherwise
@@ -1687,7 +1724,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    if not strict_memory_isolation and (not skip_memory or _memory_toolset_requested):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1708,7 +1745,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_memory and not strict_memory_isolation:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
@@ -1725,6 +1762,10 @@ def init_agent(
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
+                        # Generic, non-secret provider context. Providers may
+                        # opt into config-driven lifecycle behaviour without
+                        # core branching on a particular plugin.
+                        "memory_config": dict(mem_config),
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
@@ -2404,6 +2445,12 @@ def init_agent(
     # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
     # 3. Check general plugin system (user-installed plugins)
     # 4. Fall back to built-in ContextCompressor
+    # Silent/strict runs are frozen, request-local executions.  Never load a
+    # user/plugin context engine for them: its selection and turn-finalizer
+    # hooks can observe or mutate the frozen transcript outside the trusted
+    # runtime boundary.  The built-in compressor remains available for the
+    # ordinary context budget path, but no external engine is admitted.
+    _context_engine_isolated = bool(strict_memory_isolation)
     _selected_engine = None
     _copy_failed = False
     _engine_name = "compressor"  # default
@@ -2413,7 +2460,7 @@ def init_agent(
     except Exception:
         pass
 
-    if _engine_name != "compressor":
+    if _engine_name != "compressor" and not _context_engine_isolated:
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
@@ -2606,6 +2653,8 @@ def init_agent(
     # same local-model latency penalty.
     agent._context_engine_tool_names: set = set()
     if (
+        not _context_engine_isolated
+        and
         hasattr(agent, "context_compressor")
         and agent.context_compressor
         and agent.tools is not None
@@ -2642,7 +2691,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not _context_engine_isolated
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,

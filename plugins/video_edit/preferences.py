@@ -1,0 +1,272 @@
+"""Hard/soft video preference memory owned by the Hermes plugin."""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+from plugins.video_edit.paths import state_path
+
+DEFAULTS = {
+    "style": "freestyle",
+    "aspect_ratio": "9:16",
+    "duration": 60,
+    "decision_mode": "auto",
+    "editing_directives": [],
+}
+VALID_FIELDS = frozenset({"style", "aspect_ratio", "duration", "decision_mode", "editing_directives", "upload_preference", "user_prompt"})
+VALID_DIRECTIVES = frozenset({
+    "energetic_pacing", "relaxed_pacing", "chronological_story", "highlights_first",
+    "keep_original_audio", "add_background_music", "no_background_music", "add_captions",
+    "no_captions", "preserve_dialogue",
+})
+MAX_EDITING_DIRECTIVES = 3
+MAX_STYLE_LENGTH = 512
+MAX_USER_PROMPT_LENGTH = 512
+
+# Preference memory is intentionally a small bounded continuity aid, not an
+# unbounded transcript or authorization ledger.  Scene order is used as a
+# deterministic LRU approximation: updates move a scene to the end, and old
+# entries are dropped when the cap is reached.
+MAX_SCENES = 64
+MAX_SCENE_NAME_BYTES = 64
+MAX_SCENE_BYTES = 8 * 1024
+MAX_PREFERENCE_BYTES = 256 * 1024
+
+
+class PreferenceError(ValueError):
+    pass
+
+
+class PreferenceValidationError(PreferenceError):
+    """Caller-supplied preference data failed the input contract."""
+
+
+def _empty() -> dict[str, Any]:
+    return {"version": 1, "global": {"hard": {}, "soft": {}}, "scenes": {}}
+
+
+def _bounded_data(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise PreferenceError("video preference memory is invalid")
+
+    global_value = value.get("global")
+    if not isinstance(global_value, dict):
+        global_value = {}
+    global_data = {
+        "hard": _clean_preferences(global_value.get("hard", {})),
+        "soft": _clean_preferences(global_value.get("soft", {})),
+    }
+
+    scenes_value = value.get("scenes")
+    if not isinstance(scenes_value, dict):
+        scenes_value = {}
+    scenes: dict[str, dict[str, dict[str, Any]]] = {}
+    for raw_name, raw_scene in scenes_value.items():
+        if not isinstance(raw_scene, dict):
+            continue
+        name = str(raw_name).strip()[:MAX_SCENE_NAME_BYTES]
+        if not name:
+            continue
+        scene = {
+            "hard": _clean_preferences(raw_scene.get("hard", {})),
+            "soft": _clean_preferences(raw_scene.get("soft", {})),
+        }
+        encoded_scene = json.dumps(
+            scene, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded_scene) > MAX_SCENE_BYTES:
+            continue
+        scenes[name] = scene
+
+    if len(scenes) > MAX_SCENES:
+        # JSON preserves insertion order.  The update path touches a scene by
+        # moving it to the end, so retaining the tail is a deterministic LRU
+        # eviction without storing an unbounded timestamp per scene.
+        scenes = dict(list(scenes.items())[-MAX_SCENES:])
+    return {"version": 1, "global": global_data, "scenes": scenes}
+
+
+def _read(path: Path) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > MAX_PREFERENCE_BYTES:
+            raise PreferenceError("video preference memory file is too large")
+    except FileNotFoundError:
+        return _empty()
+    except OSError as exc:
+        raise PreferenceError("video preference memory is unreadable") from exc
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _empty()
+    except (OSError, ValueError) as exc:
+        raise PreferenceError("video preference memory is unreadable") from exc
+    return _bounded_data(value)
+
+
+def _clean_preferences(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in VALID_FIELDS:
+            continue
+        if key == "editing_directives":
+            if not isinstance(value, list):
+                continue
+            values = [
+                str(item).strip()
+                for item in value[:MAX_EDITING_DIRECTIVES]
+                if str(item).strip() in VALID_DIRECTIVES
+            ]
+            out[key] = values
+        elif key == "duration":
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= number <= 3600:
+                out[key] = number
+        elif key == "aspect_ratio" and str(value) in {"9:16", "16:9", "1:1"}:
+            out[key] = str(value)
+        elif key == "decision_mode" and str(value) in {"auto", "balanced", "precise"}:
+            out[key] = str(value)
+        elif key == "upload_preference" and str(value) in {"raw_direct", "normalized"}:
+            out[key] = str(value)
+        elif key == "style" and isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:MAX_STYLE_LENGTH]
+        elif key == "user_prompt" and isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:MAX_USER_PROMPT_LENGTH]
+    return out
+
+
+def _write(path: Path, data: dict[str, Any]) -> None:
+    bounded = _bounded_data(data)
+    payload = json.dumps(
+        bounded, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(payload) > MAX_PREFERENCE_BYTES:
+        raise PreferenceError("video preference memory exceeds its bounded size")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+
+
+def _target(data: dict[str, Any], scope: str, scene: str) -> dict[str, Any]:
+    if scope == "global":
+        return data["global"]
+    if scope != "scene" or not scene:
+        raise PreferenceValidationError("scene scope requires a scene")
+    target = data["scenes"].setdefault(scene, {"hard": {}, "soft": {}})
+    # Touch the scene so the bounded tail behaves as an LRU on the next write.
+    data["scenes"].pop(scene, None)
+    data["scenes"][scene] = target
+    return target
+
+
+def _validated_update_preferences(action: str, raw: Any) -> dict[str, Any]:
+    """Validate update payloads before opening or mutating preference state.
+
+    The public tool schema rejects these cases first, but this second boundary
+    keeps direct/plugin callers fail-closed if they bypass schema dispatch.  A
+    cleaning pass may discard unknown or malformed fields, so compare the
+    retained keys with the original object instead of silently accepting a
+    partial write.
+    """
+
+    if raw is None:
+        if action == "set":
+            raise PreferenceValidationError("setting preferences requires at least one preference")
+        return {}
+    if not isinstance(raw, dict):
+        raise PreferenceValidationError("preferences must be an object")
+    cleaned = _clean_preferences(raw)
+    if set(cleaned) != set(raw):
+        raise PreferenceValidationError("preferences contain an unknown or invalid field")
+    if action == "set" and not cleaned:
+        raise PreferenceValidationError("setting preferences requires at least one preference")
+    return cleaned
+
+
+def resolve(agent_id: str, scene: str, explicit: Any, *, silent: bool = False) -> dict[str, Any]:
+    scene = str(scene or "general").strip()[:64] or "general"
+    path = state_path("preferences.json", agent_id)
+    lock = path.with_suffix(".lock")
+    lock.touch(mode=0o600, exist_ok=True)
+    with lock.open("r+") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        data = _read(path)
+        explicit_clean = _clean_preferences(explicit)
+        scene_data = data["scenes"].get(scene, {}) if isinstance(data.get("scenes"), dict) else {}
+        global_data = data.get("global", {})
+        result = dict(DEFAULTS)
+        sources = {key: "default" for key in result}
+        for key, value in (global_data.get("soft", {}) or {}).items():
+            if key in VALID_FIELDS:
+                result[key], sources[key] = value, "memory_soft"
+        for key, value in (scene_data.get("soft", {}) or {}).items():
+            if key in VALID_FIELDS:
+                result[key], sources[key] = value, "scene_soft"
+        for key, value in (global_data.get("hard", {}) or {}).items():
+            if key in VALID_FIELDS:
+                result[key], sources[key] = value, "global_hard"
+        for key, value in (scene_data.get("hard", {}) or {}).items():
+            if key in VALID_FIELDS:
+                result[key], sources[key] = value, "scene_hard"
+        for key, value in explicit_clean.items():
+            result[key], sources[key] = value, "explicit"
+        if not silent:
+            # The model is free to continue with defaults; this is metadata,
+            # never a gate that asks for an authorization/confirmation turn.
+            result.setdefault("decision_mode", "auto")
+        return {"scene": scene, "preferences": result, "sources": sources, "memory_hit": any(v != "default" for v in sources.values())}
+
+
+def update(agent_id: str, scope: str, scene: str, kind: str, action: str, preferences: Any) -> dict[str, Any]:
+    if scope not in {"global", "scene"} or kind not in {"hard", "soft"} or action not in {"set", "forget"}:
+        raise PreferenceValidationError("invalid preference update")
+    scene_key = str(scene or "").strip()[:64]
+    if scope == "scene" and not scene_key:
+        raise PreferenceValidationError("scene scope requires a scene")
+    cleaned = _validated_update_preferences(action, preferences)
+    path = state_path("preferences.json", agent_id)
+    lock = path.with_suffix(".lock")
+    lock.touch(mode=0o600, exist_ok=True)
+    with lock.open("r+") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        data = _read(path)
+        target = _target(data, scope, str(scene or "").strip()[:64])
+        if action == "forget":
+            for key in cleaned.keys() or VALID_FIELDS:
+                target[kind].pop(key, None)
+        else:
+            target[kind].update(cleaned)
+        data["updated_at"] = int(time.time())
+        _write(path, data)
+        return {"ok": True, "scope": scope, "kind": kind, "action": action, "scene": scene_key or "general"}
+
+
+def record_success(agent_id: str, scene: str, preferences: Any, confirmed_fields: Any) -> dict[str, Any]:
+    fields = {str(item).strip() for item in (confirmed_fields if isinstance(confirmed_fields, list) else [])}
+    values = _clean_preferences(preferences)
+    if fields:
+        values = {key: value for key, value in values.items() if key in fields}
+    values.pop("user_prompt", None)
+    if not values:
+        return {"ok": True, "recorded": []}
+    return update(agent_id, "scene", str(scene or "general"), "soft", "set", values) | {"recorded": sorted(values)}

@@ -871,7 +871,14 @@ class A2AAdapter(BasePlatformAdapter):
             env = os.environ.copy()
             home = _profile_home(profile)
             if home:
-                env["HERMES_HOME"] = home
+                # ⛔ 不许只搬 HERMES_HOME：这里把子进程指向**另一个** profile，
+                # 而子进程是完整 agent（hermes chat），会读 WECOM_CLI_CONFIG_DIR
+                # 这类兄弟 key。只搬一个键 = 子进程指着上一个 profile 的凭据目录，
+                # 找不到东西却报"未初始化"。走共享契约让所有 profile-scoped
+                # 路径一起走（见 apply_profile_scoped_env 的 docstring）。
+                from hermes_constants import apply_profile_scoped_env
+
+                apply_profile_scoped_env(env, home)
             env["HERMES_A2A_PEER"] = peer
             start = time.time()
             try:

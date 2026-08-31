@@ -529,7 +529,8 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     userProfileEnabled: 'User Profile',
     memoryCharLimit: 'Memory Budget',
     userCharLimit: 'Profile Budget',
-    provider: 'Memory Provider'
+    provider: 'Memory Provider',
+    deepMemoryMode: 'Deep Memory Mode'
   },
   context: {
     engine: 'Context Engine'
@@ -596,7 +597,8 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   },
   memory: {
     memoryEnabled: 'Save durable memories that can help future sessions.',
-    userProfileEnabled: 'Maintain a compact profile of user preferences.'
+    userProfileEnabled: 'Maintain a compact profile of user preferences.',
+    deepMemoryMode: 'Controls how Deep Memory recall participates in new chat sessions.'
   },
   context: {
     engine: 'Strategy for managing long conversations near the context limit.'
@@ -695,6 +697,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'memory.memory_char_limit',
       'memory.user_char_limit',
       'memory.provider',
+      'memory.deep_memory_mode',
       'context.engine',
       'compression.enabled',
       'compression.threshold',

@@ -9,6 +9,38 @@ from unittest.mock import patch
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
 
 
+def test_profile_generation_does_not_invalidate_sibling_profile(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    reg = ToolRegistry()
+    profile_a = str((tmp_path / "profiles" / "a").resolve())
+    profile_b = str((tmp_path / "profiles" / "b").resolve())
+    token = set_hermes_home_override(profile_b)
+    try:
+        before_b = reg.cache_generation()
+    finally:
+        reset_hermes_home_override(token)
+
+    reg.register(
+        name="mcp__demo__tool",
+        toolset="mcp-demo",
+        schema={"name": "mcp__demo__tool", "parameters": {"type": "object"}},
+        handler=lambda _args: None,
+        generation_profile=profile_a,
+    )
+
+    token = set_hermes_home_override(profile_a)
+    try:
+        assert reg.cache_generation() == (0, 1)
+    finally:
+        reset_hermes_home_override(token)
+    token = set_hermes_home_override(profile_b)
+    try:
+        assert reg.cache_generation() == before_b == (0, 0)
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _dummy_handler(args, **kwargs):
     return json.dumps({"ok": True})
 
@@ -128,6 +160,66 @@ class TestGetDefinitions:
         defs = reg.get_definitions({"first", "second"})
         assert len(defs) == 2
         assert calls["count"] == 1
+
+    def test_get_schema_and_consumers_use_dynamic_profile_schema(self, monkeypatch):
+        import model_tools
+        import tools.registry as registry_module
+        from tools.tool_search import (
+            dispatch_tool_describe,
+            validate_deferred_call_args,
+        )
+
+        reg = ToolRegistry()
+        tool_name = "mcp__shared__profile_tool"
+        active_schema = {
+            "value": {
+                "name": tool_name,
+                "description": "profile A",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"],
+                },
+            }
+        }
+        reg.register(
+            name=tool_name,
+            toolset="mcp-shared",
+            schema=_make_schema(tool_name),
+            handler=_dummy_handler,
+            dynamic_schema_overrides=lambda: active_schema["value"],
+        )
+        monkeypatch.setattr(registry_module, "registry", reg)
+        monkeypatch.setattr(model_tools, "registry", reg)
+
+        definitions = reg.get_definitions({tool_name})
+        assert definitions[0]["function"] == active_schema["value"]
+        described = json.loads(
+            dispatch_tool_describe({"name": tool_name}, current_tool_defs=definitions)
+        )
+        assert described["parameters"]["required"] == ["count"]
+        assert validate_deferred_call_args(tool_name, {}) is not None
+        assert model_tools.coerce_tool_args(tool_name, {"count": "3"}) == {
+            "count": 3
+        }
+
+        active_schema["value"] = {
+            "name": tool_name,
+            "description": "profile B",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        }
+        definitions = reg.get_definitions({tool_name})
+        assert reg.get_schema(tool_name) == active_schema["value"]
+        described = json.loads(
+            dispatch_tool_describe({"name": tool_name}, current_tool_defs=definitions)
+        )
+        assert described["parameters"]["required"] == ["query"]
+        assert validate_deferred_call_args(tool_name, {"query": "ok"}) is None
+        assert validate_deferred_call_args(tool_name, {"count": 3}) is not None
 
 
 class TestUnknownToolDispatch:

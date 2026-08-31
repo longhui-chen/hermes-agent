@@ -8,6 +8,7 @@ tool registration or provider resolution.
 import logging
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -476,6 +477,73 @@ _ExternalDirsFingerprint = Tuple[Tuple[str, str, str, bool], ...]
 _ExternalDirsCacheValue = Tuple[Tuple[str, ...], _ExternalDirsFingerprint, List[Path]]
 _EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], _ExternalDirsCacheValue] = {}
 
+# A shared/imported Agent carries its complete Skill tree in the profile.  The
+# marker is written by Local Server only after the carrier has been verified
+# and published.  Keep the name local to this generic runtime hook: Hermes
+# must not know anything about the domain Skill that happens to be installed.
+_SELF_CONTAINED_AGENT_MARKER = ".zettlab-self-contained-agent"
+
+
+def _self_contained_agent_marker_blocks_external_dirs(hermes_home: Path) -> bool:
+    """Return whether the profile must be isolated from ``external_dirs``.
+
+    A regular marker is the positive signal.  Any error while inspecting a
+    marker that appears to exist is treated conservatively as a block: a
+    malformed or swapped marker must never re-enable a shared Skill tree.  The
+    descriptor is opened with ``O_NOFOLLOW`` where the platform provides it so
+    a symlink race cannot turn the marker into an authorization signal.
+    """
+    marker = hermes_home / _SELF_CONTAINED_AGENT_MARKER
+    try:
+        initial = os.lstat(marker)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning("unable to inspect self-contained Agent marker; external skills disabled: %s", exc)
+        return True
+
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode):
+        logger.warning("invalid self-contained Agent marker; external skills disabled: %s", marker)
+        return True
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(marker, flags)
+    except OSError as exc:
+        logger.warning("unable to read self-contained Agent marker; external skills disabled: %s", exc)
+        return True
+
+    try:
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            logger.warning("unable to stat self-contained Agent marker; external skills disabled: %s", exc)
+            return True
+        if not stat.S_ISREG(opened.st_mode):
+            logger.warning("self-contained Agent marker changed type; external skills disabled: %s", marker)
+            return True
+        # On platforms without O_NOFOLLOW, compare the opened inode with a
+        # second no-follow stat to close the lstat/open race as far as possible.
+        try:
+            current = os.lstat(marker)
+        except OSError as exc:
+            logger.warning("self-contained Agent marker changed during inspection; external skills disabled: %s", exc)
+            return True
+        if (
+            current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+        ):
+            logger.warning("self-contained Agent marker changed during inspection; external skills disabled: %s", marker)
+            return True
+        return True
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
 
 def _external_dirs_cache_clear() -> None:
     """Test hook — drop the in-process cache."""
@@ -517,13 +585,18 @@ def get_external_skills_dirs() -> List[Path]:
     banner / tool-registry scans, and YAML parsing a non-trivial config
     dominates ``hermes`` cold-start time when the cache is absent.
     """
+    from hermes_constants import get_hermes_home
+
+    # This check intentionally precedes the in-process cache.  A Local Server
+    # import can publish the marker while a Hermes child is already alive; a
+    # cached external-dir result must not survive that transition.
+    hermes_home = get_hermes_home()
+    if _self_contained_agent_marker_blocks_external_dirs(hermes_home):
+        return []
+
     config_path = get_config_path()
     if not config_path.exists():
         return []
-
-    from hermes_constants import get_hermes_home
-
-    hermes_home = get_hermes_home()
 
     # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
     # the full YAML parse, so the fast path is nearly free.

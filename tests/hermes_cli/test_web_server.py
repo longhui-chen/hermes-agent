@@ -1732,6 +1732,13 @@ class TestBuildSchemaFromConfig:
         assert fields["memory.provider"]["type"] == "select"
         assert web_server.CONFIG_SCHEMA["memory.provider"] is not fields["memory.provider"]
 
+    def test_deep_memory_mode_is_a_closed_three_state_setting(self):
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        field = CONFIG_SCHEMA["memory.deep_memory_mode"]
+        assert field["type"] == "select"
+        assert field["options"] == ["off", "smart", "always"]
+
 
 
 

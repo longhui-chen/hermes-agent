@@ -4988,14 +4988,9 @@ def complete_task(
         # ``kanban_complete(artifacts=[...])`` which stashes the list in
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
-            md_artifacts = metadata.get("artifacts")
-            if isinstance(md_artifacts, (list, tuple)):
-                cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
-                ]
-                if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
+        _deliverable = _deliverable_artifacts(metadata)
+        if _deliverable:
+            completed_payload[COMPLETED_EVENT_ARTIFACTS_KEY] = _deliverable
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -5048,6 +5043,55 @@ def complete_task(
 # ---------------------------------------------------------------------------
 
 
+#: ``completed`` 事件 payload 里承载待投递产物的键。
+#
+# ⭐ 这是**单一真相源**：生产方（本模块写 payload）和消费方
+# （``gateway/kanban_watchers.py`` 读 payload）必须引用同一个常量，⛔ 不许各写
+# 各的字符串字面量。两端各自都已被测试钉住，中间这一跳唯一的漂移方式就是
+# 「一端改了 key、另一端没跟上」—— 共用常量把这种漂移变成**结构上不可能**
+# （改名必然同时影响两端），⭐ 这比加一层端到端测试更强，也不需要真实 DB 夹具。
+COMPLETED_EVENT_ARTIFACTS_KEY = "artifacts"
+
+
+def _deliverable_artifacts(metadata: Optional[dict]) -> list[str]:
+    """metadata 里哪些产物**该被推送给用户**（ZET-2473）。
+
+    ⛔ 只有 worker 通过 ``kanban_complete(artifacts=[...])`` 显式声明的那一路。
+    ``_merge_completion_prose_artifacts`` 为了防 scratch 清理误删，会把从完成
+    散文里【猜】出来的路径也并进 ``metadata["artifacts"]``；那批要保住文件、
+    但不该推给用户，否则就是刷屏。⇒ 按 ``_prose_discovered_artifacts`` 来源
+    标记减掉，⛔ 不动 ``artifacts`` 本身（防清理还要用它）。
+
+    ⚠️ 这段原本内联在 ``complete_task`` 的 event payload 构造里，无法单独驱动
+    ⇒ 「猜出来的不投递」这条承诺没有任何测试能钉住（把减法整个删掉，所有门
+    依然全绿，而刷屏原样复发）。⭐ 一个无法被驱动的分支等于一个无法被验证的
+    承诺 —— 所以把它提成纯函数，⛔ 提取时签名/行为逐字未改。
+    """
+    if not isinstance(metadata, dict):
+        return []
+    md_artifacts = metadata.get("artifacts")
+    if not isinstance(md_artifacts, (list, tuple)):
+        return []
+    prose = metadata.get("_prose_discovered_artifacts")
+    # 🔴 两侧必须**用同一种形式**比较（RH 复审 P3）。上一版比较用未 trim 的
+    # 原值、输出却是 trim 后的路径 ⇒ 只要 metadata 里那条带上空白
+    # （``" /a "`` vs 标记里的 ``"/a"``），减法就落空，猜出来的路径照样被推给
+    # 用户 —— ZET-2473 的刷屏原样复发。
+    # ⚠️ 这不是本次提取引入的（提取前后逐字等价），但 direct/legacy 两条
+    # metadata 写入路径都能构造出带空白的值。
+    # ⭐ 判据两侧不同形 = 判据无效，与「参照系不一致的门恒绿」同形。
+    prose_set = (
+        {str(p).strip() for p in prose if isinstance(p, str)}
+        if isinstance(prose, (list, tuple))
+        else set()
+    )
+    return [
+        str(p).strip()
+        for p in md_artifacts
+        if isinstance(p, str) and str(p).strip() and str(p).strip() not in prose_set
+    ]
+
+
 def _merge_completion_prose_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5087,11 +5131,28 @@ def _merge_completion_prose_artifacts(
     existing = updated.get("artifacts")
     merged = list(existing) if isinstance(existing, (list, tuple)) else []
     seen = {str(path) for path in merged}
+    promoted: list[str] = []
     for path in discovered:
         if path not in seen:
             merged.append(path)
             seen.add(path)
+            promoted.append(path)
     updated["artifacts"] = merged
+    # 🔴 这些路径是从**完成散文里猜**出来的，不是 worker 通过
+    # kanban_complete(artifacts=[...]) 显式声明的交付物。两个用途必须分开：
+    #   · 进 artifacts —— 让 _persist_scratch_completion_artifacts 把文件
+    #     复制出来，scratch 清理才不会删掉用户被承诺的东西。这是本函数的
+    #     本职，⛔ 不能取消。
+    #   · ⛔ 但【不该】被当成交付物推送给用户 —— ZET-2473 定的是「只投递
+    #     producer 显式声明的」，猜出来的一起发就是刷屏。
+    # ⇒ 单独记一份来源标记，投递侧据此减掉；⛔ 不靠"合并前后差集"反推
+    #   （persist 之后 artifacts 会被整体替换成复制后的新路径，差集会失效）。
+    if promoted:
+        prior = updated.get("_prose_discovered_artifacts")
+        prior_list = list(prior) if isinstance(prior, (list, tuple)) else []
+        updated["_prose_discovered_artifacts"] = prior_list + [
+            p for p in promoted if p not in prior_list
+        ]
     return updated
 
 
@@ -5138,6 +5199,18 @@ def _persist_scratch_completion_artifacts(
         except OSError:
             pass
 
+    # 复制会把路径整体换成 attachment_dir 下的新路径，来源标记必须跟着搬，
+    # 否则投递侧按旧路径去减就减不掉了（见 _merge_completion_prose_artifacts）。
+    _prose_src = metadata.get("_prose_discovered_artifacts")
+    _prose_src_set = {
+        str(p) for p in _prose_src if isinstance(p, str)
+    } if isinstance(_prose_src, (list, tuple)) else set()
+    _prose_after: list[str] = []
+
+    def _carry_prose_mark(original: str, final: str) -> None:
+        if original in _prose_src_set and final not in _prose_after:
+            _prose_after.append(final)
+
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
         if not artifact:
@@ -5147,10 +5220,12 @@ def _persist_scratch_completion_artifacts(
             resolved_src = src.resolve()
         except OSError:
             persisted.append(artifact)
+            _carry_prose_mark(artifact, artifact)
             continue
 
         if not resolved_src.is_relative_to(workspace_root):
             persisted.append(artifact)
+            _carry_prose_mark(artifact, artifact)
             continue
 
         if not src.is_file():
@@ -5194,7 +5269,9 @@ def _persist_scratch_completion_artifacts(
             ) from exc
 
         used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
+        _final = str(dest.resolve())
+        persisted.append(_final)
+        _carry_prose_mark(artifact, _final)
         changed = True
 
     if changed:
@@ -5202,6 +5279,12 @@ def _persist_scratch_completion_artifacts(
         metadata["_staged_artifacts"] = [
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
+        # 来源标记随之更新为复制后的路径；若这一轮没有任何猜出来的条目，
+        # 显式清掉旧值，⛔ 不留下会误伤显式交付物的陈旧标记。
+        if _prose_after:
+            metadata["_prose_discovered_artifacts"] = _prose_after
+        else:
+            metadata.pop("_prose_discovered_artifacts", None)
 
 
 def _insert_completion_attachment(
@@ -9005,9 +9088,13 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
+    # ⛔ 不许只搬 HERMES_HOME：worker 是完整 agent，会读 WECOM_CLI_CONFIG_DIR
+    # 这类兄弟 key。只搬一个键 = worker 指着上一个 profile 的凭据目录。走共享
+    # 契约让所有 profile-scoped 路径一起走（见 apply_profile_scoped_env）。
     from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import apply_profile_scoped_env
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        apply_profile_scoped_env(env, resolve_profile_env(profile_arg))
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).

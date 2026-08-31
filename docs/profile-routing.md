@@ -1,7 +1,7 @@
 # Profile-Based Routing for Inbound Messages
 
 > **Audience:** Gateway operators and contributors
-> **Source files:** `gateway/profile_routing.py`, `gateway/run.py` (`_profile_name_for_source`), `gateway/platforms/base.py` (`build_source`), `gateway/config.py`
+> **Source files:** `gateway/profile_routing.py`, `gateway/run.py` (`_profile_name_for_source`), `gateway/platforms/base.py` (`build_source`), `gateway/config.py`, `tools/mcp_tool.py`, `agent/lsp/__init__.py`
 > **Related:** [Session Lifecycle](session-lifecycle.md), `docs/design/profile-builder.md`
 
 ## Overview
@@ -120,3 +120,21 @@ Process-shared ingress such as `zet_agent` is started once by the multiplexed ga
 Its `/p/<profile>/...` routes select the profile runtime scope; secondary profiles do
 not create another listener, but their independent messaging adapters still connect
 with profile-scoped credentials.
+
+MCP 的后台事件循环也由进程共享，但 server registry、lazy schema cache、连接状态、
+退避/熔断状态和 tool provenance 均按 profile 的 `HERMES_HOME` 身份分区。同一 profile
+内的同名 MCP 继续复用长期连接；不同 profile 的同名 stdio MCP 必须各自启动，确保
+子进程始终读取对应 profile 的凭据目录。进程级 shutdown 会统一关闭并清空所有
+profile 的 MCP 生命周期状态。
+
+MCP discovery 也按 profile 身份单飞：同一 profile 的并发首次构造共享一次发现，
+不同 profile 各自读取自己的 `config.yaml` 并建立自己的长期连接。动态删除 profile
+或改变其 home 时，reconciler 使用旧 home 精确关闭该 profile 的 MCP/LSP 子进程；
+任一资源组关闭失败都会显式失败并保留可重试状态，不会伪装成已经卸载。
+进程 shutdown 会先关闭 discovery admission，再等待全部 profile 的 discovery owner，
+之后才关闭 MCP server 和 gateway executor；关闭开始后不能再启动新的 MCP 子进程。
+
+`/reload-mcp` 也只关闭并重建发起请求的 profile；同进程内其它 profile 的
+长期 MCP 连接、schema、退避状态和 agent-cache generation 保持不变。LSP service 同样按 profile 隔离：
+同一 profile 内继续按 language server 与 workspace 复用 client，不同 profile
+不会共享首次启动时捕获了凭据目录的长期子进程。

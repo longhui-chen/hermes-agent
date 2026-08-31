@@ -562,6 +562,7 @@ class TestUpdateJob:
         assert payload["code"] == "revision_conflict"
         notify.assert_not_called()
 
+
     @pytest.mark.asyncio
     async def test_update_introducing_linear_requires_live_chat_grant(self, adapter):
         app = _create_app(adapter)
@@ -695,6 +696,21 @@ class TestDeleteJob:
                 data = await resp.json()
                 assert data["ok"] is True
                 mock_remove.assert_called_once_with(VALID_JOB_ID)
+
+    @pytest.mark.asyncio
+    async def test_delete_revision_conflict_returns_409_without_notification(self, adapter):
+        from cron.jobs import JobRevisionConflict
+
+        app = _create_app(adapter)
+        notify = MagicMock()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_remove", side_effect=JobRevisionConflict("job revision changed")
+            ), patch(f"{_MOD}._notify_cron_provider_jobs_changed", notify):
+                response = await cli.delete(f"/api/jobs/{VALID_JOB_ID}?expected_revision=3")
+                assert response.status == 409
+                assert (await response.json())["code"] == "revision_conflict"
+                notify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -929,4 +945,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-

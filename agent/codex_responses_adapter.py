@@ -1278,6 +1278,30 @@ def _normalize_codex_response(
         response_status == "incomplete" and incomplete_reason == "content_filter"
     )
 
+    # 🔴 **必须排在 output 检查之前。**
+    # 失败响应的**常见形状**就是 ``status="failed"`` + ``output=[]``。顺序反了的话
+    # 它会先撞上下面那条「没有 output 项」而抛出**我们自己写的**文案,
+    # ``_format_responses_error(error_obj)`` 根本跑不到 ⇒ **provider 给的原因被丢掉**,
+    # 用户看到一句与真实原因无关的话。
+    # ⚠️ 恢复语义那一半此前已由 :1307 的出身声明覆盖(不重试不 fallback 已修好),
+    # 但**展示**那一半只有靠这个顺序才能修 —— 两个契约,两处改动。
+    # ⛔ 顺序前移只影响「failed/cancelled 且 output 为空」这一格:
+    #    · output 非空的 failed ⇒ 本来就走这里,不变
+    #    · completed + 空 output ⇒ 走下面,不变
+    #    · incomplete + content_filter ⇒ 走下面的合成分支,不变
+    #    · 空 output 但有 output_text ⇒ 走下面的合成分支,不变
+    if response_status in {"failed", "cancelled"}:
+        error_obj = getattr(response, "error", None)
+        error_msg = _format_responses_error(error_obj, response_status)
+        # ``error_msg`` 是 **provider 自己给的原因**,但包成裸 RuntimeError 会把
+        # status / body / cause 三样出身证据一起抹掉。不补声明的话,分类器第 9 步
+        # 会判「没有上游证据 ⇒ 我们自己的 bug」⇒ 既不重试也不 fallback,
+        # 而 provider 那句真正的解释还会被压成「服务内部异常」。
+        # ⇒ 抹掉出身的人负责重新写明。
+        from agent.error_classifier import declare_upstream_origin
+
+        raise declare_upstream_origin(RuntimeError(error_msg))
+
     output = getattr(response, "output", None)
     if not isinstance(output, list) or not output:
         # The Codex backend can return empty output when the answer was
@@ -1304,12 +1328,22 @@ def _normalize_codex_response(
             )]
             response.output = output
         else:
-            raise RuntimeError("Responses API returned no output items")
+            # ⭐ 与下面 status=="failed" 那条**同一个模式的第三个兄弟**:
+            # 我们构造一个裸异常去描述**provider 响应的协议异常**,而裸构造会把
+            # status / body / cause 三样出身证据一起抹掉 ⇒ 分类第 9 步判「我们的
+            # bug」⇒ 不重试、不 fallback,用户这条消息直接失败。
+            #
+            # 「响应里没有 output」是**纯粹的上游属性**:到这里时 output_text 回退
+            # 与 content_filter 都已排除;请求构造错会得到 4xx(自带 status_code,
+            # 走不到这条)。⇒ ⛔ 不存在「非上游」的成因,不需要分两类。
+            # ⚠️ 与 failed 分支的区别:那条带着 provider 的**原话**,这条的文本是
+            # 我们写的 —— 但出身声明说的是「这次失败来自上游」,⛔ 不是「这段话是
+            # 上游写的」,两者不冲突。
+            from agent.error_classifier import declare_upstream_origin
 
-    if response_status in {"failed", "cancelled"}:
-        error_obj = getattr(response, "error", None)
-        error_msg = _format_responses_error(error_obj, response_status)
-        raise RuntimeError(error_msg)
+            raise declare_upstream_origin(
+                RuntimeError("Responses API returned no output items")
+            )
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []

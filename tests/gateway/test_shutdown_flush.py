@@ -3,8 +3,10 @@
 import json
 import os
 import stat
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +16,9 @@ from gateway.shutdown_flush import (
     flush_pending_to_file,
     recover_pending_to_db,
 )
+from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import SessionSource
 
 
 def _make_flush_dir(tmp_path: Path) -> Path:
@@ -113,6 +118,65 @@ def test_serialise_object_with_text():
     assert result["session_id"] == "sid"
 
 
+def test_cross_sender_fifo_flush_and_recovery_preserve_every_event(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    session_id = "20260819_065133_fifo"
+
+    def event(index: int, kind: MessageType, media_url: str = "") -> MessageEvent:
+        item = MessageEvent(
+            text=f"message-{index}",
+            message_type=kind,
+            source=SessionSource(
+                platform=Platform("teams"),
+                chat_id="shared-room",
+                chat_type="group",
+                user_id=f"sender-{index}",
+            ),
+            media_urls=[media_url] if media_url else [],
+            media_types=["image/png"] if media_url else [],
+            message_id=f"platform-{index}",
+        )
+        return item
+
+    first = event(1, MessageType.TEXT)
+    second = event(2, MessageType.PHOTO, "/cache/two.png")
+    third = event(3, MessageType.DOCUMENT, "/cache/three.pdf")
+    first._gateway_pending_event_queue = [second, third]
+
+    session_store = SimpleNamespace(
+        _lock=threading.Lock(),
+        _entries={"shared-session": SimpleNamespace(session_id=session_id)},
+        _ensure_loaded_locked=lambda: None,
+    )
+    assert flush_pending_to_file(
+        {"shared-session": first}, session_store=session_store,
+    ) == 1
+    payload_path = next(flush_dir.glob("*.json"))
+    data = json.loads(payload_path.read_text())["data"]
+    assert [item["text"] for item in data["events"]] == [
+        "message-1", "message-2", "message-3"
+    ]
+    assert data["events"][1]["source"]["user_id"] == "sender-2"
+    assert data["events"][1]["media_urls"] == ["/cache/two.png"]
+    assert data["events"][1]["media_types"] == ["image/png"]
+
+    mock_db = MagicMock()
+    assert recover_pending_to_db(mock_db) == 3
+    assert [call.kwargs["content"] for call in mock_db.append_message.call_args_list] == [
+        "message-1", "message-2", "message-3"
+    ]
+    restored_second = mock_db.append_message.call_args_list[1].kwargs
+    assert restored_second["display_metadata"]["source"]["user_id"] == "sender-2"
+    assert restored_second["display_metadata"]["media_types"] == ["image/png"]
+    assert restored_second["display_metadata"]["media_names"] == ["two.png"]
+    assert "media_urls" not in restored_second["display_metadata"]
+    assert restored_second["api_content"].endswith("[file:/cache/two.png]")
+    assert not payload_path.exists()
+
+
 def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     """Flush dir must use get_hermes_home(), not hardcoded Path.home()."""
     import gateway.shutdown_flush as mod
@@ -130,5 +194,3 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     result = mod._get_flush_dir()
     assert captured.get("called") is True
     assert result == tmp_path / "pending_messages"
-
-

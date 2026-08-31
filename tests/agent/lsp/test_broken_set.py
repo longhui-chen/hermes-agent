@@ -14,8 +14,11 @@ This module verifies:
 """
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -92,6 +95,101 @@ def test_mark_broken_handles_no_workspace_silently(tmp_path):
         assert len(svc._broken) == 0
     finally:
         svc.shutdown()
+
+
+def test_mark_broken_shutdown_failure_keeps_exact_client_for_retry(
+    tmp_path, monkeypatch
+):
+    """半初始化 client 关闭失败时不得丢失 owner。"""
+    repo = _make_git_workspace(tmp_path)
+    monkeypatch.chdir(str(repo))
+    src = repo / "x.py"
+    src.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=2.0,
+        install_strategy="manual",
+    )
+    key = ("pyright", str(repo))
+    client = MagicMock(
+        server_id="pyright",
+        workspace_root=str(repo),
+        shutdown=AsyncMock(side_effect=RuntimeError("still alive")),
+    )
+    svc._clients[key] = client
+    svc._last_used[key] = 1.0
+    try:
+        with pytest.raises(RuntimeError, match="broken-client shutdown failed"):
+            svc._mark_broken_for_file(str(src), RuntimeError("timed out"))
+        assert svc._clients[key] is client
+        assert svc._last_used[key] == 1.0
+        assert key in svc._broken
+    finally:
+        client.shutdown.side_effect = None
+        svc.shutdown()
+
+
+def test_mark_broken_timeout_keeps_retiring_fence_until_cleanup_terminal(
+    tmp_path, monkeypatch
+):
+    """外层 1 秒超时后，后台 cleanup 未终态前不得释放 retiring owner。"""
+    repo = _make_git_workspace(tmp_path)
+    monkeypatch.chdir(str(repo))
+    src = repo / "x.py"
+    src.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=2.0,
+        install_strategy="manual",
+    )
+    key = ("pyright", str(repo))
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    cleanup_done = threading.Event()
+
+    async def blocked_shutdown():
+        cleanup_entered.set()
+        await asyncio.to_thread(release_cleanup.wait)
+        cleanup_done.set()
+
+    client = MagicMock(
+        server_id="pyright",
+        workspace_root=str(repo),
+        shutdown=AsyncMock(side_effect=blocked_shutdown),
+    )
+    svc._clients[key] = client
+    svc._last_used[key] = 1.0
+    errors = []
+
+    def mark():
+        try:
+            svc._mark_broken_for_file(str(src), RuntimeError("timed out"))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=mark)
+    worker.start()
+    assert cleanup_entered.wait(2)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert errors and "broken-client shutdown failed" in str(errors[0])
+    assert svc._retiring_clients[key] is client
+    assert key in svc._cleanup_tasks
+
+    release_cleanup.set()
+    assert cleanup_done.wait(2)
+    deadline = time.monotonic() + 2
+    while (
+        (key in svc._cleanup_tasks or key in svc._retiring_clients)
+        and time.monotonic() < deadline
+    ):
+        threading.Event().wait(0.01)
+    assert key not in svc._cleanup_tasks
+    assert key not in svc._retiring_clients
+    assert key not in svc._clients
+    svc.shutdown()
 
 
 def test_snapshot_failure_marks_broken_via_outer_timeout(tmp_path, monkeypatch):

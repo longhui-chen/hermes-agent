@@ -12,8 +12,13 @@ that the main retry loop in run_agent.py consults for every API failure.
 from __future__ import annotations
 
 import enum
+import errno
+import functools
+import json
 import logging
 import os
+import socket
+import ssl
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -69,6 +74,17 @@ class FailoverReason(enum.Enum):
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp json-schema-to-grammar rejects regex escapes in `pattern` / `format` — strip from tools and retry
 
+    # Our own code broke — NOT the provider's fault
+    # Every other member of this enum describes something that happened
+    # upstream (auth, quota, overload, transport, request shape).  Without
+    # this one an exception raised by *our* code has nowhere to go: it falls
+    # through to `unknown`, which is defined as "retry with backoff", and
+    # surfaces to the user as a `provider_*` code — i.e. "the model service
+    # had a temporary problem, please retry".  Retrying is a guaranteed
+    # no-op for a programming bug, so the user is handed an action that
+    # cannot possibly work.  Deterministic per-request: never retry.
+    internal_error = "internal_error"
+
     # Catch-all
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
@@ -123,8 +139,242 @@ def content_policy_fallback_disabled() -> bool:
     }
 
 
-def normalized_provider_error_code(classified: ClassifiedError) -> str:
-    """Return the stable Zettlab chat error code for a provider failure."""
+#: What the user is told when the failure was our own code.  The original
+#: exception text (class names, attribute names, file paths) stays in the
+#: logs; none of it means anything to the person waiting for an answer, and
+#: shipping it leaks our internals to whatever renders the message.
+INTERNAL_ERROR_USER_TEXT = "服务内部异常"
+
+
+def has_upstream_evidence(error: BaseException) -> bool:
+    """这个失败有没有**来自上游的证据**?
+
+    ⚠️ ⛔ 不要用 ``classify_api_error(...).reason is internal_error`` 代替本函数。
+    分类流水线是**按恢复策略**排序的:文本模式匹配在第 4 步,证据检查在第 8 步。
+    于是本地的 ``RuntimeError("agent step timed out: /volume1/private/…")``
+    先撞上 timeout 模式就被判成上游失败,整条路径原样出屏 —— 实测复现。
+    ⭐ 「分类器认为可以重试」和「这个错误来自上游」是**两个问题**,
+    第一个的答案证明不了第二个。
+
+    证据是闭集:HTTP 状态码、响应体、已知传输类型名、网络 errno(沿 cause
+    链 5 层)。四样都没有 ⇒ 这个异常只可能来自我们自己的代码。
+
+    ⚠️ **已知开集侧**:provider SDK 若抛出一个既无状态码、又无响应体、
+    类型名也不在传输集里的纯文本异常,这里会判成「我们的」而把它的解释
+    收成安全文案。调用方必须把原文记进日志(见 ``_internal_error_text``),
+    否则那条解释就真的丢了。
+    """
+    if not isinstance(error, Exception):
+        return False
+    return _has_upstream_evidence(
+        error, _extract_status_code(error), _extract_error_body(error)
+    )
+
+
+#: 异常类可以**自己声明**「我是有意面向用户的本地失败,原文必须原样送达」。
+#: ⭐ 这是一个**契约**,任何模块加一个类属性就能加入,⛔ 不需要在本文件维护类型名单
+#: (名单是开集,而且改一次要动两个仓)。
+USER_ACTIONABLE_ATTR = "hermes_user_actionable"
+
+#: 一个**我们构造的**异常可以声明「我手上这段文本是上游给的原话」。
+#: ⭐ 与 ``USER_ACTIONABLE_ATTR`` 严格对称,而且是同一个错误的**另一端**:
+#: 前者说「这段我们写的话必须送达」,后者说「这段上游的话必须送达」。
+#:
+#: 为什么需要它:重新包装会**抹掉出身**。``_normalize_codex_response`` 收到
+#: ``status="failed"`` 的 Responses 响应时,把 provider 在 ``error`` 里给的原因
+#: 包成一个**裸 ``RuntimeError``** —— 没有 ``status_code``、没有响应体、没有
+#: ``__cause__``。四样证据一样都没有,于是分类第 9 步判「这是我们自己的 bug」:
+#: **不重试、不 fallback**,provider 那句真正的解释还被压成「服务内部异常」。
+#: 一次上游侧的瞬时失败,就这样变成用户这条消息的永久失败。
+#:
+#: ⛔ 不用「函数名 / 模块名白名单」来救 —— 那是开集,下一个包装点又会漏。
+#: ⭐ 判据落在**包装的人自己声明**上:谁抹掉了出身,谁负责重新写明。
+#: 同形先例见 ZET-2473「只投递 producer 显式声明的交付物」。
+UPSTREAM_ORIGIN_ATTR = "hermes_upstream_origin"
+
+#: 我们自己的顶层包 —— 这些模块里定义的异常,**文本是我们写的**。
+#: ⛔ 这不是「按名字判」:判的是**类定义在谁的代码里**,即**谁写了那段文案**,
+#: 这正是「这段文本能不能给用户看」要问的事。
+_OUR_TOP_LEVEL_PACKAGES = (
+    "agent", "gateway", "tools", "hermes_cli", "plugins", "cron",
+    "tui_gateway", "acp_adapter", "run_agent", "hermes_constants",
+)
+
+
+def _is_user_actionable_local(error: BaseException) -> bool:
+    """这个异常有没有声明「我面向用户、原文必须到」。
+
+    ⚠️ 查的是**实例**,⛔ 不是 ``type(error)``。实例查找**天然回退到类**,
+    所以这是严格超集:类上声明的(``SSLConfigurationError`` / ``AuthError`` /
+    ``MoAPresetNotFoundError``)行为逐字不变,同时允许在**抛出点**给一个内建
+    异常盖戳 —— 那正是 ``bedrock_adapter._require_boto3()`` 需要的:
+    它抛的是内建 ``ImportError`` / ``RuntimeError``,消息里**只有安装/升级命令
+    是用户唯一能照做的事**,而第 ③ 问会因为「类定义在内建里」把它收成
+    「服务内部异常」。⛔ 不放宽全体内部异常,只让抛出点能显式登记。
+    ⭐ 与 ``_declares_upstream_origin`` 的查找方式一致。
+    """
+    return bool(getattr(error, USER_ACTIONABLE_ATTR, False))
+
+
+def declare_upstream_origin(error: BaseException) -> BaseException:
+    """给一个**我们构造的**异常盖上「文本来自上游」的戳,并原样返回。
+
+    只在**重新包装 provider 原话**的地方调用 —— 包装会抹掉 status / body /
+    cause 三样证据,这里把出身补回去。⛔ 不要给我们自己写的文案盖戳:
+    那等于把我们的话冒充成上游的,是本判据的反向滥用。
+    """
+    setattr(error, UPSTREAM_ORIGIN_ATTR, True)
+    return error
+
+
+def _declares_upstream_origin(error: BaseException) -> bool:
+    """包装者有没有显式声明「这段文本是上游的」。"""
+    return bool(getattr(error, UPSTREAM_ORIGIN_ATTR, False))
+
+
+def _carries_own_upstream_evidence(error: BaseException) -> bool:
+    """这个异常**自己**带上游证据 —— ⛔ 不看 cause 链。
+
+    ⭐ 与 ``has_upstream_evidence`` 的区别就是本轮缺陷的根:
+    链式取证回答的是「**这次失败能不能重试**」,而我们在展示时问的是
+    「**手上这段文本是谁写的**」。两者不是一个契约。
+    """
+    if not isinstance(error, Exception):
+        return False
+    if _declares_upstream_origin(error):
+        return True
+    if getattr(error, "status_code", None) is not None:
+        return True
+    if isinstance(_extract_error_body(error), dict) and _extract_error_body(error):
+        return True
+    if type(error).__name__ in _TRANSPORT_ERROR_TYPES:
+        return True
+    return _is_network_oserror(error)
+
+
+def _outer_class_is_ours(error: BaseException) -> bool:
+    """最外层异常的**类**是不是我们(或 Python 内建)定义的。
+
+    内建 ``RuntimeError`` / ``ValueError`` / ``AttributeError`` 由我们的代码
+    抛出 ⇒ 消息是我们写的;provider SDK 自己的异常类 ⇒ 消息是它写的。
+    """
+    module = getattr(type(error), "__module__", "") or ""
+    if module in ("builtins", "__builtin__", ""):
+        return True
+    return module.split(".", 1)[0] in _OUR_TOP_LEVEL_PACKAGES
+
+
+def is_our_own_failure(classified: ClassifiedError, error: Optional[BaseException]) -> bool:
+    """这次失败是不是**我们自己的代码**坏了。
+
+    ⭐ 单一判据,给所有面向用户的出站文本共用 —— ⛔ 不许在调用点各写一套。
+
+    ``classified.reason`` **不足以回答这个问题**:分类流水线是按**恢复策略**
+    排序的,文本模式匹配在第 4 步、证据检查在第 8 步。于是本地的
+    ``RuntimeError("agent step timed out: /volume1/private/…")`` 先撞上
+    timeout 模式,被判成 ``timeout`` / ``provider_network_error`` ——
+    界面说「网络错误,请重试」,消息里还挂着一条内部路径。
+    (同形的还有 "model not found" → ``model_not_found``、
+    "invalid api key" → ``auth``,实测三例全泄漏。)
+
+    ## 🔴 上一版只问 ``has_upstream_evidence`` —— **两个方向都错**
+
+    那个判据**沿 cause 链**取证,回答的是「这次失败能不能重试」。可展示时要问的是
+    「**手上这段文本是谁写的**」,两者不是一个契约:
+
+    · **泄漏方向**:本地异常只要是在处理传输错误时抛出的,就沿链继承到「上游证据」
+      ⇒ ``raise RuntimeError("… at /volume1/private/config.yaml") from ConnectionError``
+      整条内部路径原样出屏(实测复现)。
+    · **吞掉方向**:``MoAPresetNotFoundError("run: hermes moa list")`` 这种**有意
+      面向用户**的本地失败没有上游证据,被压成「服务内部异常」——
+      **把用户唯一能照做的那句话拿掉了**,比泄漏更该防。
+
+    ⇒ 按下面的顺序问,每一问都是闭集:
+      1. 异常类**自己声明**面向用户(``USER_ACTIONABLE_ATTR``)⇒ 原文必须到
+      2. 异常**自己**带上游证据(⛔ 不看链)⇒ 上游的文本
+      3. 异常类定义在**我们的包或内建**里 ⇒ **文本是我们写的** ⇒ 收
+      4. 其余(provider SDK 自己的异常类)⇒ 退回链式判据,
+         保住「SDK 包一层传输错误」那格 —— ⛔ 别把上一轮修对的东西弄坏
+    """
+    if error is None:
+        return classified.reason == FailoverReason.internal_error
+    # 🔴 ``classified`` **自己**可能就带着上游证据 —— 一个 HTTP 状态码只可能来自
+    # 一次真实的响应。上一版只盘问异常对象,于是
+    # ``ClassifiedError(status_code=400, reason=content_policy_blocked)`` 配一个
+    # 裸 ``Exception("boom")`` 时,第 ③ 问("类定义在内建里 ⇒ 文本是我们写的")
+    # 判成我们的 bug ⇒ **内容合规拦截被压成「服务内部异常」**,App 那边的合规
+    # 提示直接消失,换成一句用户照做也没用的「请稍后重试」。
+    # ⭐ 证据不止长在异常上,也长在分类结果上;哪一侧有都算。
+    # ⛔ 这不会放回原来的泄漏:HTTP/SSE 边界走 ``error_text_is_ours``(手上没有
+    #    ``classified``),而本地异常经 ``classify_api_error`` 得到的
+    #    ``status_code`` 本来就是 ``None``。
+    if classified.status_code is not None:
+        return False
+    return error_text_is_ours(error)
+
+
+def error_text_is_ours(error: BaseException) -> bool:
+    """手上这段异常文本**是不是我们写的** —— 四问阶梯的唯一实现。
+
+    ⭐ 抽出来是因为**有两个入口需要同一个答案**:
+    ``is_our_own_failure``(带 ``ClassifiedError``,给聊天出站用)和
+    HTTP/SSE 边界的 ``_boundary_error_text``(手上只有一个异常)。
+    ⛔ 后者原先自己问 ``has_upstream_evidence``,于是
+    ``raise RuntimeError("… /volume1/private/config.yaml") from ConnectionError``
+    沿链拿到「上游证据」,把内部路径原样发给了所有接该边界的客户端。
+    **同一个问题两处各写一套判据,必然漂移** —— 这已经是本线第二次了。
+
+    四问逐条闭集,顺序不可换:
+      ① 异常类自己声明面向用户 ⇒ 原文必须到(⛔ 不是我们的"内部错误")
+      ② 异常**自己**带上游证据(⛔ 不看 cause 链)⇒ 上游的文本
+      ③ 异常类定义在我们的包或内建里 ⇒ 文本是我们写的 ⇒ 收
+      ④ 其余(provider SDK 自己的异常类)⇒ 退回链式判据,
+         保住「SDK 包一层传输错误」那格
+    """
+    if _is_user_actionable_local(error):
+        return False
+    if _carries_own_upstream_evidence(error):
+        return False
+    if _outer_class_is_ours(error):
+        return True
+    return not has_upstream_evidence(error)
+
+
+def client_safe_error_text(
+    classified: ClassifiedError,
+    raw_text: str,
+    *,
+    error: Optional[BaseException] = None,
+) -> str:
+    """Collapse an internal failure's text before it crosses to a client.
+
+    Single source of truth: every outbound surface (``provider_message``,
+    ``final_response``, ``error``, status lines) must route its text through
+    here, otherwise the ones that don't become the leak — which is exactly
+    how the first fix missed `final_response`.
+
+    ⛔ 只有「我们自己的错」才被改写。上游失败的文本是 provider 自己的解释,
+    用户需要它逐字到达 —— 抹掉比泄漏更糟。
+    """
+    if is_our_own_failure(classified, error):
+        return INTERNAL_ERROR_USER_TEXT
+    return raw_text
+
+
+def normalized_provider_error_code(
+    classified: ClassifiedError,
+    *,
+    error: Optional[BaseException] = None,
+) -> str:
+    """Return the stable Zettlab chat error code for a provider failure.
+
+    ⭐ 传 ``error`` 时用与 ``client_safe_error_text`` **同一个** 判据
+    (``is_our_own_failure``)—— 否则码和文案会各说各话:文案已经收成
+    「服务内部异常」,码却还是 ``provider_network_error``,界面照着码劝用户
+    「检查网络后重试」。⛔ 一次失败只能有一个说法。
+    """
+    if is_our_own_failure(classified, error):
+        return "internal_error"
 
     status = classified.status_code
     reason = classified.reason
@@ -151,6 +401,22 @@ def normalized_provider_error_code(classified: ClassifiedError) -> str:
         return "provider_bad_gateway"
     if status == 507:
         return "provider_billing"
+
+    # Our own failure — must NOT wear a `provider_*` code, or the surface
+    # renders "the model service had a problem, retry later" for a bug that
+    # retrying cannot fix.  Checked before the status-code fallbacks below:
+    # an internal error carries no status, so it would otherwise land on
+    # `provider_error`.
+    if reason == FailoverReason.internal_error:
+        # ⚠️ 走到这里说明 is_our_own_failure() 已判定「不是我们的错」
+        # (有意面向用户的本地失败,如 SSLConfigurationError / MoAPresetNotFound),
+        # 而分类器出于**恢复策略**仍标了 internal_error(它确实不该重试)。
+        # ⛔ 此时不许发 internal_error 码:按交付契约,客户端见到该码而没有
+        # reference_id 就**不展示 message** ⇒ 那句可行动的原文照样被丢掉。
+        # ⭐ 码要和文案说同一件事。
+        if error is not None and not is_our_own_failure(classified, error):
+            return "agent_error"
+        return "internal_error"
 
     if reason == FailoverReason.billing:
         return "provider_billing"
@@ -689,6 +955,129 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APITimeoutError",
 })
 
+#: errno values that mean "the network failed", as opposed to "a file
+#: operation failed".  Both raise ``OSError``, so ``isinstance(error,
+#: OSError)`` cannot tell them apart — and treating the whole family as
+#: transport reported ``FileNotFoundError`` as a network timeout, which is
+#: worse than not classifying it at all: the user goes and checks their
+#: network.  The scope of the fix has to be exactly the scope of the defect,
+#: so narrow by errno rather than dropping ``OSError`` entirely (dropping it
+#: would stop retrying genuine socket failures).
+_NETWORK_ERRNOS = frozenset({
+    errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED,
+    errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH,
+    errno.ENETDOWN, errno.ENETRESET, errno.EPIPE, errno.ENOTCONN,
+    errno.EHOSTDOWN, errno.EADDRNOTAVAIL,
+})
+
+#: ``ValueError``/``OSError`` subclasses that look like our own bug but are
+#: not.  Every entry here was paid for by someone else's incident — do not
+#: drop one because a newer predicate "should" cover it:
+#:   · ``json.JSONDecodeError`` — truncated/corrupt upstream response body
+#:     (routing layer, cut stream). Retryable. (#14782)
+#:   · ``UnicodeEncodeError``   — handled by the surrogate-sanitisation path.
+#:   · ``ssl.SSLError``         — inherits OSError *and* ValueError through
+#:     the MRO, so any coarse "ValueError ⇒ local bug" test misfires on a
+#:     TLS transport failure.
+_NOT_OUR_BUG_TYPES: tuple = (
+    json.JSONDecodeError,
+    UnicodeEncodeError,
+    ssl.SSLError,
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _deliberate_local_failure_types() -> tuple:
+    """本地抛出、但**有意面向用户**的失败类型 —— ⛔ 不是我们的 bug。
+
+    ``hermes_cli.auth.AuthError`` 是 ``RuntimeError`` 的子类,既没有状态码也
+    没有响应体,按纯证据判据会被收成「服务内部异常」——**而它恰恰是最需要
+    原文的一条**:「凭据已过期,运行 `hermes auth openai`」。收掉它就等于把
+    用户唯一能照做的那句话换成一个参考编号。
+
+    ⚠️ 惰性 + 缓存导入:``hermes_cli.auth`` 会拉起 ``agent.credential_persistence``
+    等一串模块,在本模块顶层导入会拖慢启动、也可能成环。这条只在错误路径上跑。
+    """
+    out: list = []
+    try:
+        from hermes_cli.auth import AuthError
+        out.append(AuthError)
+    except Exception:  # pragma: no cover - 纯 SDK 用法下 CLI 层可能缺席
+        pass
+    return tuple(out)
+
+
+def _is_network_oserror(error: Exception) -> bool:
+    """True for socket-level ``OSError``s, False for file-level ones."""
+    if not isinstance(error, OSError):
+        return False
+    # Name-resolution failures are network problems, but they cannot be
+    # recognised by errno: `socket.gaierror` carries an `EAI_*` code
+    # (EAI_NONAME == 8), a numbering space unrelated to the `E*` errnos
+    # below — errno 8 is ENOEXEC there.  Without this branch a DNS blip
+    # during a network switch is reported as "internal error, contact
+    # support" when one retry would have fixed it.
+    if isinstance(error, (socket.gaierror, socket.herror)):
+        return True
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return True
+    return getattr(error, "errno", None) in _NETWORK_ERRNOS
+
+
+def _has_upstream_evidence(error: Exception, status_code, body) -> bool:
+    """Did this failure actually come from the provider?
+
+    ⭐ The question is *not* "do I recognise this exception's name" — that
+    predicate is open-ended, which is exactly why the existing
+    ``is_local_validation_error`` in conversation_loop enumerated
+    ``ValueError``/``TypeError`` and missed ``AttributeError``.  Adding one
+    more name would miss ``NameError`` next time.
+
+    Evidence is closed: an HTTP status, a response body, a known transport
+    type name, or a network errno.  Nothing else can have originated
+    upstream, whatever the exception happens to be called.
+    """
+    # 包装者显式声明的出身排在最前:重新包装会把 status / body / cause 三样
+    # 证据一起抹掉,而抹掉证据的正是我们自己的代码。⛔ 让它落到下面的链式
+    # 取证,结果必然是「无证据 ⇒ 我们的 bug ⇒ 不重试不 fallback」。
+    if _declares_upstream_origin(error):
+        return True
+    if status_code is not None:
+        return True
+    if isinstance(body, dict) and body:
+        return True
+    # Provider SDKs routinely re-wrap the underlying transport failure
+    # (Gemini raises GeminiAPIError from httpx.ConnectError, and it is not
+    # alone).  Looking only at the outermost exception reported those as our
+    # own bug — "internal error, contact support", no retry — for what is
+    # actually a DNS or connection failure.
+    #
+    # Walk the cause chain exactly like `_extract_status_code` /
+    # `_extract_error_body` already do in this same module: max depth 5,
+    # `__cause__` then `__context__`, stop on None or self-reference.  Only
+    # the *evidence check* differs; the traversal is theirs verbatim.
+    #
+    # NB: the mere presence of a `__cause__` proves nothing — each link is
+    # tested on its own merits, so a wrapper around our own AttributeError
+    # still classifies as internal.
+    current: Any = error
+    for _ in range(5):
+        if type(current).__name__ in _TRANSPORT_ERROR_TYPES:
+            return True
+        if _is_network_oserror(current):
+            return True
+        if isinstance(current, _NOT_OUR_BUG_TYPES):
+            return True
+        _deliberate = _deliberate_local_failure_types()
+        if _deliberate and isinstance(current, _deliberate):
+            return True
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return False
+
+
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
 # transient transport hiccup OR server-side context overflow rejection
@@ -1173,10 +1562,27 @@ def classify_api_error(
 
     # ── 8. Transport / timeout heuristics ───────────────────────────
 
-    if error_type in _TRANSPORT_ERROR_TYPES or isinstance(error, (TimeoutError, ConnectionError, OSError)):
+    # A bare ``isinstance(error, OSError)`` used to stand here.  It also
+    # swallowed FileNotFoundError / PermissionError / IsADirectoryError,
+    # which then surfaced as network timeouts — a *confident but wrong*
+    # verdict, worse than no verdict at all because it sends the user off
+    # to check their connection.  Narrowed to socket errnos;
+    # ConnectionError / TimeoutError stay whitelisted by type inside the
+    # helper, so genuine socket failures keep retrying exactly as before.
+    if error_type in _TRANSPORT_ERROR_TYPES or _is_network_oserror(error):
         return _result(FailoverReason.timeout, retryable=True)
 
-    # ── 9. Fallback: unknown ────────────────────────────────────────
+    # ── 9. No upstream evidence at all → our own bug ────────────────
+    #
+    # Deterministic per request: the same code path raises the same
+    # exception every time.  Retrying burns the budget and then tells the
+    # user "temporary problem, try again later" — an action that cannot
+    # possibly work.  Fail fast so the surface can say what actually
+    # happened and hand over a reference instead.
+    if not _has_upstream_evidence(error, status_code, body):
+        return _result(FailoverReason.internal_error, retryable=False)
+
+    # ── 10. Fallback: unknown ───────────────────────────────────────
 
     return _result(FailoverReason.unknown, retryable=True)
 

@@ -638,7 +638,7 @@ def test_invoke_uses_only_manifest_target_and_requires_matching_mode(
     assert len(seen) == 1
 
 
-def test_read_invoke_does_not_retry_outside_local_server(monkeypatch, tmp_path):
+def test_read_invoke_retries_transient_local_bridge_failure(monkeypatch, tmp_path):
     profile = _write_profile(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(profile))
     seen = []
@@ -649,7 +649,12 @@ def test_read_invoke_does_not_retry_outside_local_server(monkeypatch, tmp_path):
     }
     with _cron_scope(), mux_profile_scope(monkeypatch, _scope()), patch(
         "tools.app_data_tool._urlopen",
-        _sequence(seen, capabilities, TimeoutError("unknown read outcome")),
+        _sequence(
+            seen,
+            capabilities,
+            TimeoutError("unknown read outcome"),
+            {"items": []},
+        ),
     ):
         output = json.loads(
             skill_operation_tool(
@@ -657,9 +662,10 @@ def test_read_invoke_does_not_retry_outside_local_server(monkeypatch, tmp_path):
             )
         )
 
-    assert output["error"]["code"] == "transport_error"
+    assert output["ok"] is True
     assert [item[1] for item in seen] == [
         _CAPABILITY_TIMEOUT,
+        _READ_TIMEOUT,
         _READ_TIMEOUT,
     ]
 

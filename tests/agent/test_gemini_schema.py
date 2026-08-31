@@ -143,6 +143,38 @@ class TestSanitizeGeminiToolParameters:
         cleaned = sanitize_gemini_tool_parameters({})
         assert cleaned == {"type": "object", "properties": {}}
 
+    def test_translates_direct_pure_help_conditional_to_supported_anyof(self):
+        params = {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string"},
+                "help": {"type": "boolean", "default": False},
+            },
+            "required": [],
+            "if": {
+                "properties": {"help": {"const": True}},
+                "required": ["help"],
+            },
+            "then": {},
+            "else": {"required": ["document_id"]},
+            "additionalProperties": False,
+        }
+
+        cleaned = sanitize_gemini_tool_parameters(params)
+
+        assert "if" not in cleaned
+        assert "then" not in cleaned
+        assert "else" not in cleaned
+        assert "required" not in cleaned
+        help_branch, normal_branch = cleaned["anyOf"]
+        assert help_branch["required"] == ["help"]
+        assert help_branch["properties"]["help"] == {
+            "type": "boolean",
+            "enum": ["true"],
+        }
+        assert normal_branch["required"] == ["document_id"]
+        assert normal_branch["properties"]["document_id"] == {"type": "string"}
+
     def test_discord_create_thread_parameters_no_longer_trip_gemini(self):
         """End-to-end regression: the exact shape that was rejected in prod."""
         params = {

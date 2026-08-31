@@ -67,7 +67,7 @@ class TestRegisterMcpServersIsolation:
     """register_mcp_servers must not re-spawn a server still in cooldown."""
 
     def _run_with_mocked_connect(self, attempts):
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             attempts.append(name)
             if name == "bad":
                 raise ConnectionError("exec: bad: not found")
@@ -130,13 +130,14 @@ class TestShutdownClearsCooldownState:
         assert mcp_mod._server_connect_retry_after
         assert not mcp_mod._servers  # precondition: fast path taken
 
-        with patch("tools.mcp_tool._stop_mcp_loop"):
+        with patch("tools.mcp_tool._mcp_loop", None), \
+             patch("tools.mcp_tool._stop_mcp_loop"):
             mcp_mod.shutdown_mcp_servers()
 
         assert mcp_mod._server_connect_retry_after == {}
         assert mcp_mod._server_connect_failures == {}
 
-    def test_loop_not_running_path_clears_cooldown_state(self):
+    def test_loop_not_running_with_live_owner_keeps_state_for_retry(self):
         mcp_mod._record_connect_failure("bad")
 
         class _DeadServer:
@@ -146,10 +147,11 @@ class TestShutdownClearsCooldownState:
                 pass
 
         mcp_mod._servers["dead"] = _DeadServer()  # type: ignore[assignment]
-        # _mcp_loop is None in this test process, so the async _shutdown
-        # coroutine is never scheduled; only the final sweep can clear.
-        with patch("tools.mcp_tool._stop_mcp_loop"):
-            mcp_mod.shutdown_mcp_servers()
+        with patch("tools.mcp_tool._mcp_loop", None), \
+             patch("tools.mcp_tool._stop_mcp_loop"):
+            with pytest.raises(RuntimeError, match="loop is unavailable"):
+                mcp_mod.shutdown_mcp_servers()
 
-        assert mcp_mod._server_connect_retry_after == {}
-        assert mcp_mod._server_connect_failures == {}
+        assert mcp_mod._servers["dead"].name == "dead"
+        assert mcp_mod._server_connect_retry_after
+        assert mcp_mod._server_connect_failures

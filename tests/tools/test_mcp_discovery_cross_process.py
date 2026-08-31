@@ -60,7 +60,7 @@ def test_two_processes_each_complete_local_mcp_discovery(tmp_path):
             output = Path(output_arg)
 
             mcp_tool._MCP_AVAILABLE = True
-            mcp_tool._MCP_DISCOVERY_LOCK_PATH = None
+            mcp_tool._MCP_DISCOVERY_LOCK_PATHS.clear()
             mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES = 200
             mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S = 0.01
             mcp_tool._servers.clear()
@@ -73,7 +73,7 @@ def test_two_processes_each_complete_local_mcp_discovery(tmp_path):
             }
             mcp_tool._load_mcp_config = lambda: config
 
-            def fake_register_mcp_servers(servers):
+            def fake_register_mcp_servers(servers, **_kwargs):
                 tool_name = "mcp__test_srv__ping"
                 mcp_tool._servers["test_srv"] = SimpleNamespace(
                     _registered_tool_names=[tool_name],

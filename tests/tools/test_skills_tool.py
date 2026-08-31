@@ -936,62 +936,29 @@ class TestSkillViewCollisionDetection:
         assert any("external" in p for p in result["matches"])
         assert "hint" in result
 
-    def test_identical_profile_local_and_external_skill_prefers_profile_local(
-        self, tmp_path
-    ):
-        """A packaged Skill duplicated by the preset catalog is one logical Skill."""
+    def test_self_contained_profile_ignores_external_collision(self, tmp_path):
+        """A cloned profile resolves its local application skill unambiguously."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
         external_dir.mkdir()
-
-        local_skill = _make_skill(
-            local_dir,
-            "plaud-chief-of-staff",
-            category="profile",
-            body="IDENTICAL PACKAGED SKILL",
+        _make_skill(local_dir, "application-create", body="LOCAL APPLICATION CREATE")
+        _make_skill(external_dir, "application-create", body="PRESET APPLICATION CREATE")
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_dir}\n"
         )
-        external_skill = _make_skill(
-            external_dir,
-            "plaud-chief-of-staff",
-            body="IDENTICAL PACKAGED SKILL",
-        )
-        external_skill.joinpath("SKILL.md").write_bytes(
-            local_skill.joinpath("SKILL.md").read_bytes()
-        )
+        (tmp_path / ".zettlab-self-contained-agent").touch()
 
-        p1, p2 = self._patch_dirs(local_dir, [external_dir])
-        with p1, p2:
-            raw = skill_view("plaud-chief-of-staff")
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+        ):
+            result = json.loads(skill_view("application-create"))
 
-        result = json.loads(raw)
         assert result["success"] is True
-        assert result["path"] == "profile/plaud-chief-of-staff/SKILL.md"
-        assert "IDENTICAL PACKAGED SKILL" in result["content"]
+        assert "LOCAL APPLICATION CREATE" in result["content"]
+        assert "PRESET APPLICATION CREATE" not in result["content"]
 
-    def test_identical_external_only_skills_still_refuse(self, tmp_path):
-        """Identical third-party candidates have no owner-precedence signal."""
-        local_dir = tmp_path / "local"
-        ext_a = tmp_path / "ext_a"
-        ext_b = tmp_path / "ext_b"
-        local_dir.mkdir()
-        ext_a.mkdir()
-        ext_b.mkdir()
-
-        first = _make_skill(ext_a, "pr", body="SAME EXTERNAL VERSION")
-        second = _make_skill(ext_b, "pr", body="SAME EXTERNAL VERSION")
-        second.joinpath("SKILL.md").write_bytes(
-            first.joinpath("SKILL.md").read_bytes()
-        )
-
-        p1, p2 = self._patch_dirs(local_dir, [ext_a, ext_b])
-        with p1, p2:
-            raw = skill_view("pr")
-
-        result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous" in result["error"]
-        assert len(result["matches"]) == 2
 
     def test_support_markdown_does_not_collide_with_real_skill(self, tmp_path):
         """Supporting reference docs named <skill>.md are not skills.

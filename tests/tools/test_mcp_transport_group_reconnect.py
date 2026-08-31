@@ -50,13 +50,16 @@ class _RaisingTransportCM:
     """Fake streamable-HTTP transport whose __aexit__ raises a group, mimicking
     the SDK's anyio TaskGroup tearing down on a stream drop."""
 
-    def __init__(self, exc):
+    def __init__(self, exc, before_raise=None):
         self._exc = exc
+        self._before_raise = before_raise
 
     async def __aenter__(self):
         return (object(), object(), lambda: "session-id")
 
     async def __aexit__(self, *exc_info):
+        if self._before_raise is not None:
+            self._before_raise()
         raise self._exc
 
 
@@ -110,6 +113,12 @@ def test_run_http_transport_group_returns_reconnect(monkeypatch):
 
 def test_run_http_transport_group_reraises_on_shutdown(monkeypatch):
     task = _make_http_task(monkeypatch, _group(ConnectionError("stream dropped")))
-    task._shutdown_event.set()
+    monkeypatch.setattr(
+        "tools.mcp_tool.streamable_http_client",
+        lambda url, http_client=None: _RaisingTransportCM(
+            _group(ConnectionError("stream dropped")),
+            before_raise=task._shutdown_event.set,
+        ),
+    )
     with pytest.raises(BaseExceptionGroup):
         asyncio.run(task._run_http({"url": "http://127.0.0.1:9/mcp"}))

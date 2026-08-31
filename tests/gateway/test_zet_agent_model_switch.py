@@ -1,20 +1,26 @@
+import asyncio
 import os
+import queue
 import types
 from collections import OrderedDict
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
-import queue
 
 from gateway.config import PlatformConfig
 import gateway.platforms.zet_agent as zet_agent
 from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.session_context import zettlab_auth_principal
 
 
 class _FakeRequest:
-    def __init__(self, body, match_info=None):
+    def __init__(self, body, match_info=None, headers=None):
         self._body = body
-        self.headers = {"Authorization": "Bearer test-key"}
+        self.headers = {
+            "Authorization": "Bearer test-key",
+            **(headers or {}),
+        }
         self.match_info = match_info or {}
 
     async def json(self):
@@ -153,6 +159,233 @@ async def test_session_model_switch_persists_override_no_note(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_session_model_switch_schedules_prewarm_only_with_complete_trusted_identity(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides={},
+        _evict_cached_agent=lambda _sid: None,
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_runtime_shell_prewarm",
+        lambda session_id: scheduled.append(
+            {
+                "session_id": session_id,
+                "account_id": zet_agent._zettlab_request_account_id.get(),
+                "principal": zettlab_auth_principal(),
+                "deep_principal": zet_agent._deep_memory_principal.get(),
+                "deep_subject": zet_agent._deep_memory_subject.get(),
+            }
+        )
+        or True,
+    )
+
+    session_id = "zettlab:account-a:agent-1:42"
+    response = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": session_id},
+            headers={
+                "X-Hermes-Session-Key": session_id,
+                "X-Zettlab-Account-Id": "account-a",
+                "X-Zettlab-Auth-Principal-Id": "iam:cn:user:account-a",
+                "X-Zettlab-User-Id": "account-a",
+            },
+        )
+    )
+
+    assert response.status == 200
+    assert scheduled == [{
+        "session_id": session_id,
+        "account_id": "account-a",
+        "principal": "iam:cn:user:account-a",
+        "deep_principal": "iam:cn:user:account-a",
+        "deep_subject": "account-a",
+    }]
+    assert zet_agent._zettlab_request_account_id.get() == ""
+    assert zet_agent._deep_memory_principal.get() == ""
+    assert zet_agent._deep_memory_subject.get() == ""
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_without_identity_keeps_legacy_success_and_skips_prewarm(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides={},
+        _evict_cached_agent=lambda _sid: None,
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_runtime_shell_prewarm",
+        lambda session_id: scheduled.append(session_id) or True,
+    )
+
+    response = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": "zettlab:account-a:agent-1:legacy"},
+        )
+    )
+
+    assert response.status == 200
+    assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_prewarm_is_ephemeral_and_real_switch_wins_flow(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    evicted = []
+    overrides = {}
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides=overrides,
+        _evict_cached_agent=lambda sid: evicted.append(sid),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_prewarm():
+        started.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(
+        adapter,
+        "_start_runtime_shell_prewarm",
+        lambda _session_id: asyncio.create_task(run_prewarm()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_runtime_shell_prewarm",
+        lambda _session_id: False,
+    )
+
+    session_id = "zettlab:account-a:agent-1:prewarm"
+    headers = {
+        "X-Hermes-Session-Key": session_id,
+        "X-Zettlab-Account-Id": "account-a",
+        "X-Zettlab-Auth-Principal-Id": "iam:cn:user:account-a",
+        "X-Zettlab-User-Id": "account-a",
+    }
+    prewarm = asyncio.create_task(
+        adapter._handle_session_runtime_prewarm(
+            _FakeRequest(
+                {"model": "deepseek-v4", "provider": "custom"},
+                match_info={"session_id": session_id},
+                headers=headers,
+            )
+        )
+    )
+    await started.wait()
+
+    state_key = f"agent:main:zet_agent:dm:{session_id}"
+    ephemeral_override = overrides[state_key]
+    assert ephemeral_override["model"] == "deepseek-v4"
+    assert evicted == []
+
+    switched = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {
+                "model": "deepseek-v4",
+                "provider": "custom",
+                "supports_vision": False,
+            },
+            match_info={"session_id": session_id},
+            headers=headers,
+        )
+    )
+    assert switched.status == 200
+    durable_override = overrides[state_key]
+    assert durable_override is not ephemeral_override
+    assert durable_override["supports_vision"] is False
+
+    release.set()
+    response = await prewarm
+    await asyncio.sleep(0)
+
+    assert response.status == 200
+    assert response.payload["prewarmed"] is True
+    assert overrides[state_key] is durable_override
+    assert evicted == [adapter._interaction_queue_key(session_id)]
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_prewarm_without_identity_is_a_stateless_noop(
+    monkeypatch,
+):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    overrides = {}
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides=overrides,
+        _evict_cached_agent=lambda _sid: None,
+    )
+    started = []
+    monkeypatch.setattr(
+        adapter,
+        "_start_runtime_shell_prewarm",
+        lambda session_id: started.append(session_id),
+        raising=False,
+    )
+
+    response = await adapter._handle_session_runtime_prewarm(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": "zettlab:account-a:agent-1:no-identity"},
+        )
+    )
+
+    assert response.status == 200
+    assert response.payload["prewarmed"] is False
+    assert response.payload["reason"] == "identity_unavailable"
+    assert overrides == {}
+    assert started == []
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_prewarm_rejects_oversized_session_id(monkeypatch):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = types.SimpleNamespace(_session_model_overrides={})
+
+    response = await adapter._handle_session_runtime_prewarm(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": "s" * 513},
+            headers={
+                "X-Zettlab-Account-Id": "account-a",
+                "X-Zettlab-Auth-Principal-Id": "iam:cn:user:account-a",
+                "X-Zettlab-User-Id": "account-a",
+            },
+        )
+    )
+
+    assert response.status == 400
+    assert adapter.gateway_runner._session_model_overrides == {}
+
+
+@pytest.mark.asyncio
 async def test_agent_model_switch_writes_config_only(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
@@ -282,6 +515,35 @@ async def test_run_agent_no_note_when_model_unchanged(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_silent_run_skips_model_identity_note_and_seen_state(monkeypatch):
+    adapter = _seen_adapter(
+        monkeypatch,
+        config_model="glm-5.1",
+        seen={"sess-1": "deepseek-v4"},
+    )
+    effective_model = MagicMock(side_effect=AssertionError("must not resolve"))
+    ensure_seen = MagicMock(side_effect=AssertionError("must not load seen state"))
+    save_seen = MagicMock(side_effect=AssertionError("must not persist seen state"))
+    monkeypatch.setattr(adapter, "_effective_model", effective_model)
+    monkeypatch.setattr(adapter, "_ensure_seen_models", ensure_seen)
+    monkeypatch.setattr(adapter, "_save_seen_models", save_seen)
+
+    captured = await _capture_run_agent(
+        monkeypatch,
+        adapter,
+        user_message="run the frozen task",
+        session_id="sess-1",
+        execution_policy="silent_automation",
+    )
+
+    assert captured["user_message"] == "run the frozen task"
+    assert adapter._seen_models == {"sess-1": "deepseek-v4"}
+    effective_model.assert_not_called()
+    ensure_seen.assert_not_called()
+    save_seen.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_run_agent_forwards_structured_plan_ack(monkeypatch):
     adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
     plan_ack = {
@@ -299,275 +561,6 @@ async def test_run_agent_forwards_structured_plan_ack(monkeypatch):
     )
 
     assert captured["plan_ack"] == plan_ack
-
-
-@pytest.mark.asyncio
-async def test_run_agent_legacy_unbound_plan_ack_flow_has_no_execution_capability(
-    monkeypatch,
-):
-    from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_token, current_turn_identity
-    from tools.environments.local import build_video_edit_runtime_env
-
-    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    captured = {}
-    boundary_checks = []
-    monkeypatch.setattr(
-        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
-        lambda: boundary_checks.append(True) or True,
-    )
-
-    async def fake_super(self, **kwargs):
-        with pytest.raises(
-            PermissionError,
-            match="trusted video-edit execution receipt unavailable",
-        ):
-            build_video_edit_runtime_env({})
-        captured["runtime_rejected"] = True
-        captured["turn_identity"] = current_turn_identity()
-        captured["scoped_token"] = business_execution_token()
-        captured["forwarded_token"] = kwargs["business_execution_token"]
-        return ({}, {})
-
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-    await adapter._run_agent(
-        user_message="确认执行",
-        conversation_history=[],
-        session_id="legacy-plan-session",
-        turn_id="",
-        business_execution_token="a" * 64,
-        plan_ack={
-            "status": "confirmed",
-            "revision_requested": False,
-        },
-    )
-
-    assert captured == {
-        "runtime_rejected": True,
-        "turn_identity": None,
-        "scoped_token": "",
-        "forwarded_token": "",
-    }
-    assert boundary_checks == [True]
-
-
-@pytest.mark.asyncio
-async def test_run_agent_direct_unbound_flow_preserves_business_capability(
-    monkeypatch,
-):
-    from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_token
-    from tools.environments.local import build_video_edit_runtime_env
-
-    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    captured = {}
-    monkeypatch.setattr(
-        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
-        lambda: True,
-    )
-
-    async def fake_super(self, **kwargs):
-        with pytest.raises(
-            PermissionError,
-            match="trusted video-edit execution receipt unavailable",
-        ):
-            build_video_edit_runtime_env({})
-        captured["video_runtime_rejected"] = True
-        captured["scoped_token"] = business_execution_token()
-        captured["forwarded_token"] = kwargs["business_execution_token"]
-        return ({}, {})
-
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-    await adapter._run_agent(
-        user_message="直接执行",
-        conversation_history=[],
-        session_id="direct-session",
-        turn_id="",
-        business_execution_token="a" * 64,
-        plan_ack={},
-    )
-
-    assert captured == {
-        "video_runtime_rejected": True,
-        "scoped_token": "a" * 64,
-        "forwarded_token": "a" * 64,
-    }
-
-
-@pytest.mark.asyncio
-async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
-    monkeypatch,
-):
-    from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_token
-
-    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    captured = {}
-    monkeypatch.setattr(
-        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
-        lambda: True,
-    )
-
-    async def fake_super(self, **kwargs):
-        captured["scoped_token"] = business_execution_token()
-        captured["forwarded_token"] = kwargs["business_execution_token"]
-        return ({}, {})
-
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-    await adapter._run_agent(
-        user_message="取消计划",
-        conversation_history=[],
-        session_id="plan-session",
-        turn_id="confirmation-turn-2",
-        business_execution_token="a" * 64,
-        plan_ack={
-            "turn_id": "plan-turn-1",
-            "status": "cancelled",
-            "revision_requested": False,
-        },
-    )
-
-    assert captured == {"scoped_token": "", "forwarded_token": ""}
-
-
-@pytest.mark.asyncio
-async def test_run_agent_binds_structured_plan_receipt_only_for_current_turn(
-    monkeypatch,
-):
-    from gateway.platforms.api_server import APIServerAdapter
-    from tools.environments.local import LocalEnvironment
-
-    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    monkeypatch.setattr(
-        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
-        lambda: True,
-    )
-    captured = []
-    scoped_tokens = []
-    env = LocalEnvironment()
-
-    async def fake_super(self, **kw):
-        from gateway.session_context import business_execution_token
-
-        result = env.execute(
-            "printf '%s|%s|%s|%s|%s' \"$HERMES_TURN_ID\" "
-            "\"$HERMES_PLAN_ACK_STATUS\" \"$HERMES_PLAN_ACK_TURN_ID\" "
-            "\"$HERMES_PLAN_ACK_REVISION_REQUESTED\" "
-            "\"$ZETTLAB_BUSINESS_EXECUTION_TOKEN\""
-        )
-        captured.append(result["output"].split("|"))
-        scoped_tokens.append(business_execution_token())
-        return ({}, {})
-
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-    await adapter._run_agent(
-        user_message="plan",
-        conversation_history=[],
-        session_id="plan-session",
-        turn_id="plan-turn-1",
-    )
-    await adapter._run_agent(
-        user_message="确认执行",
-        conversation_history=[],
-        session_id="plan-session",
-        turn_id="confirmation-turn-2",
-        business_execution_token="a" * 64,
-        plan_ack={
-            "turn_id": "plan-turn-1",
-            "status": "cancelled",
-            "revision_requested": True,
-        },
-    )
-
-    assert captured == [
-        ["plan-turn-1", "", "", "", ""],
-        ["confirmation-turn-2", "cancelled", "plan-turn-1", "1", ""],
-    ]
-    assert scoped_tokens == ["", ""]
-    assert os.environ.get("HERMES_TURN_ID") is None
-    assert os.environ.get("HERMES_PLAN_ACK_STATUS") is None
-    assert os.environ.get("HERMES_PLAN_ACK_TURN_ID") is None
-    assert os.environ.get("HERMES_PLAN_ACK_REVISION_REQUESTED") is None
-    assert os.environ.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN") is None
-
-
-@pytest.mark.asyncio
-async def test_run_agent_requires_process_boundary_before_binding_business_token(
-    monkeypatch,
-):
-    from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_token
-
-    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    events = []
-
-    def boundary_ready():
-        events.append(("boundary", business_execution_token()))
-        return True
-
-    async def fake_super(self, **_kwargs):
-        events.append(("model", business_execution_token()))
-        return ({}, {})
-
-    monkeypatch.setattr(
-        zet_agent,
-        "gateway_sensitive_process_boundary_ready",
-        boundary_ready,
-        raising=False,
-    )
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-
-    await adapter._run_agent(
-        user_message="确认执行",
-        conversation_history=[],
-        session_id="plan-session",
-        turn_id="confirmation-turn-2",
-        business_execution_token="a" * 64,
-    )
-
-    assert events == [
-        ("boundary", ""),
-        ("model", "a" * 64),
-    ]
-    assert business_execution_token() == ""
-
-
-@pytest.mark.asyncio
-async def test_run_agent_boundary_failure_keeps_business_token_out_of_context(
-    monkeypatch,
-):
-    from gateway.platforms.api_server import APIServerAdapter
-    from gateway.session_context import business_execution_token
-
-    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    model_started = []
-
-    async def fake_super(self, **_kwargs):
-        model_started.append(True)
-        return ({}, {})
-
-    monkeypatch.setattr(
-        zet_agent,
-        "gateway_sensitive_process_boundary_ready",
-        lambda: False,
-        raising=False,
-    )
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-
-    with pytest.raises(
-        PermissionError,
-        match="gateway process memory boundary is unavailable",
-    ):
-        await adapter._run_agent(
-            user_message="确认执行",
-            conversation_history=[],
-            session_id="plan-session",
-            turn_id="confirmation-turn-2",
-            business_execution_token="a" * 64,
-        )
-
-    assert business_execution_token() == ""
-    assert model_started == []
 
 
 @pytest.mark.asyncio

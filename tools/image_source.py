@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import os
 import re
 from dataclasses import dataclass
@@ -75,6 +76,42 @@ class NotAnImage(ImageResolutionError):
     pass
 
 
+class NotAMediaReference(ImageResolutionError):
+    """调用方递来的不是媒体引用,而是**我们自己插进正文的占位标记**。
+
+    现场(2026-08-16 云机实测,用户在测时撞到两次):正文里是适配器为「无
+    说明文字的媒体」插入的 ``[图片]``,模型把它当成图片引用喂给了
+    ``vision_analyze``,于是报 ``media file not found: '[图片]'`` —— 模型据此
+    告诉用户「图片分析失败」,而真相是**这一轮压根没有可用的图片**。
+    两条提示指向完全不同的动作。
+
+    ⛔ 判据**不是**「这个字符串像不像路径」—— 本函数下方那条注释记着:
+    在这里加形状门曾经把 ``pic.png`` 这类合法的裸相对名一起挡掉。
+    ⭐ 判据是**闭集且我们说了算**:这个标记是不是**我们自己产出的**那几个。
+    """
+
+
+@functools.lru_cache(maxsize=1)
+def _adapter_placeholder_predicate():
+    """复用适配器侧**已有**的判定,⛔ 不在这里新开第三份清单。
+
+    仓里已经有两份占位符清单且**互相不一致**
+    (``agent.conversation_loop`` 3 条 / ``gateway.platforms.yuanbao`` 8 条)——
+    再写一份只会让漂移变成三向。这里引用 ``conversation_loop`` 那份:它的
+    docstring 明说是「adapter-generated placeholders for captionless media」,
+    正是本判据要问的那件事。
+
+    ⚠️ 惰性 + 缓存导入:``conversation_loop`` 很大,顶层导入会拖慢媒体路径也
+    可能成环。取不到就返回 ``None`` ⇒ **退回今天的行为**(fail-open):
+    少一层解释,⛔ 不会新增拦截。
+    """
+    try:
+        from agent.conversation_loop import _is_trusted_image_media_placeholder
+        return _is_trusted_image_media_placeholder
+    except Exception:  # pragma: no cover - 独立工具进程里可能没有 agent 层
+        return None
+
+
 @dataclass
 class ResolveContext:
     task_id: Optional[str] = None
@@ -101,6 +138,18 @@ async def resolve_image_source(
     if not isinstance(src, str) or not src.strip():
         raise SourceNotFound("image_url is required", src=str(src))
     s = src.strip()
+    # ⭐ 收口处判一次,三个调用点(vision_analyze ×2、flux3 video)一并覆盖。
+    # 放在最前面:占位标记既不是 data:/http(s)、也不该被当路径去开。
+    _is_placeholder = _adapter_placeholder_predicate()
+    if _is_placeholder is not None and _is_placeholder(s):
+        raise NotAMediaReference(
+            f"{s!r} is a placeholder this adapter inserts for media that has no "
+            "caption — it is not an image reference, and no image is available "
+            "in this turn. Do not retry with this value; tell the user the image "
+            "did not reach you and ask them to resend it.",
+            src=s,
+            origin="placeholder",
+        )
     if s.startswith("data:"):
         data, mime = _resolve_data_url(s)
         return _finalize(data, mime, "data", s, permitted)

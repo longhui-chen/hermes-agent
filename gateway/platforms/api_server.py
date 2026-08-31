@@ -65,6 +65,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT, PrestreamTiming
+
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
 # (no prefix / multiplexing off → handle as the default profile).
@@ -75,6 +77,7 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+_prestream_timing_context = PRESTREAM_TIMING_CONTEXT
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -92,6 +95,11 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from agent.browser_content_evidence import project_browser_content_evidence
 from agent.browser_state_preview import project_browser_state_preview
+from agent.error_classifier import (
+    INTERNAL_ERROR_USER_TEXT,
+    error_text_is_ours,
+)
+from agent.response_format import ResponseFormatValidationError
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
 from gateway.platforms.base import (
@@ -99,6 +107,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     is_network_accessible,
+    safe_exc,
     validate_media_delivery_path,
 )
 from gateway.readiness import collect_runtime_readiness
@@ -158,6 +167,12 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
+# 100 条 LRU 之外再加总字节硬顶；否则 previous_response_id 链会在每条记录
+# 重复整段历史，带 data URI 时按三角形速度占满磁盘。
+MAX_RESPONSE_STORE_BYTES = 512 * 1024 * 1024
+RESPONSE_STORE_FAILURE_MESSAGE = (
+    "Response could not be stored. Retry with store=false or start a new conversation."
+)
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
@@ -296,11 +311,28 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
     explicit provider/model so an API caller can use the same authenticated
     provider catalog as the TUI without mutating config.yaml.
     """
-    from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error, _get_model_config
+    from hermes_cli.runtime_provider import (
+        AuthError,
+        resolve_runtime_provider,
+        format_runtime_provider_error,
+        _get_model_config,
+    )
 
     try:
         runtime = resolve_runtime_provider(requested=provider, target_model=target_model)
-    except Exception as exc:
+    except (AuthError, ValueError) as exc:
+        # ⛔ 只包这两类 —— 它们是 runtime_provider **有意**抛出的、面向用户的
+        # 失败(凭据 / 未知 provider),``format_runtime_provider_error`` 也只
+        # 认得 ``AuthError``,其余一律 ``str(error)`` 原样返回。
+        #
+        # 🔴 上一版这里是 ``except Exception``。于是一个内部 ``AttributeError``
+        # 被格式化成字符串、包成 ``RuntimeError``、再被上层包成
+        # ``_ProviderAuthResolutionError``,最后以 **HTTP 200** 作为 assistant
+        # 的回答送到用户面前:「⚠️ Provider authentication failed: 'X' object
+        # has no attribute 'y' … /volume1/private/config.yaml」。
+        # ⭐ 我先前判定「代码在此之前已认定是 auth 失败,不属于本缺陷」——
+        #    那个前提是错的:是**这个 catch 自己**把一切都变成了 auth 失败。
+        # 其余异常照原样往上抛,由 HTTP 边界的 _boundary_error_text 收口。
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()
@@ -525,6 +557,12 @@ def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
     return False
 
 
+# MAX_CANONICAL_FINAL_TURN_ID_LEN 限住会被 governor 当作 pending receipt 键、
+# 并驻留到 TTL 到期的那个 turn_id。正常值是 local-server 的 UUID 类关联令牌，
+# 200 已经很宽松；不设上限则少量请求就能长期占住设备内存。
+MAX_CANONICAL_FINAL_TURN_ID_LEN = 200
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -559,6 +597,134 @@ def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
     if re.fullmatch(r"[A-Za-z0-9_-]{43}", capability) is None:
         return ""
     return capability
+
+
+def _extract_creation_action_receipt_transport(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("creation_action_receipt_transport")
+    if raw == "canonical_final_v1":
+        return "canonical_final_v1"
+    return ""
+
+
+# 与 _handle_chat_completions 收进 conversation_messages 的那组 role 保持同源。
+# 两处不一致就会出现「门禁看的那条」和「Agent 收到的那条」不是同一条。
+_AGENT_INPUT_MESSAGE_ROLES = frozenset({"user", "assistant"})
+
+
+def _has_creation_recommendation_wrapper(body: Dict[str, Any]) -> bool:
+    """正文里是否出现了创建建议动作信封——不看内容是否合法。
+
+    降级边界要用这个宽判据，不能复用下面那个严格解析器：严格解析要求 action
+    小写、creation_type 属于固定三项，而 creation-governor 会先做规范化
+    （`CREATE` → `create`、`scheduled-task` → `task` 之类）再接受动作。两边判据
+    不一致时，一个「严格解析不认、governor 认」的 payload 打到普通端点上，
+    transport 不会被清除，于是普通端点也能改 proposal、拉起原生创建流程并产出
+    可信回执——版本化端点这道门就白设了。
+
+    判据放宽到「有没有这个 wrapper」之后，governor 将来新增多少种规范化写法都
+    不会开出新口子：可信回执只可能从版本化 handler 显式放行的请求里出来。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    # 看的是**实际送进 Agent 的那条消息**，不按 role 过滤也不向前搜索：
+    # _handle_chat_completions 无条件取 conversation_messages[-1] 当 user_message，
+    # governor 解析的就是它。若这里只看最后一条 user 消息，一个「末条是 assistant
+    # 且正文带 wrapper」的普通请求就会漏判——transport 不被清除，governor 照样
+    # 解析那个 wrapper、消费 proposal 并产出可信回执，版本化端点的门禁被绕过。
+    # 判据必须跟 _handle_chat_completions 真正喂给 Agent 的那条消息是同一条：
+    # 它只把 role 为 user / assistant 的收进 conversation_messages，其余（tool、
+    # 以及任何将来新增的 role）整条忽略。这里若按「最后一条非 system」来选，
+    # 在正文带 wrapper 的 user 消息后面追加一条 tool 消息就能骗过门禁——门禁看
+    # 到的是那条 tool、判定没有 wrapper 而保留 transport，而 Agent 实际收到的
+    # 仍是前面那条 user，governor 照样消费 proposal 并产出可信回执。
+    last_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict)
+            and message.get("role") in _AGENT_INPUT_MESSAGE_ROLES
+        ),
+        None,
+    )
+    last_content = last_message.get("content") if isinstance(last_message, dict) else None
+    # 多模态 content 是 API 正式接受的形态：wrapper 藏在 parts 数组的某个 text
+    # part 里时，只看标量字符串就会漏判。_normalize_multimodal_content() 会保留
+    # 这些文本 part，governor 对整个列表做 str() 之后照样能解析出 JSON wrapper。
+    for _text in _iter_message_text_parts(last_content):
+        if "[creation_recommendation_response]" in _text:
+            return True
+    return False
+
+
+def _iter_message_text_parts(content: Any):
+    """Yield every text fragment a message content field can carry."""
+    if isinstance(content, str):
+        yield content
+        return
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if isinstance(part, str):
+            yield part
+        elif isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                yield text
+
+
+def _is_canonical_final_creation_action(body: Dict[str, Any]) -> bool:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    # 必须是**最后一条**对话消息本身携带动作，不能向前搜索：
+    # _handle_chat_completions 取 conversation_messages[-1] 当 user_message，
+    # 如果动作后面还跟着一条 assistant 消息，向前搜索会放行准入，但 governor
+    # 拿到的是那条 assistant——它看不到动作，既不接管也不产回执，请求却以普通
+    # 模型结果收尾，Web 因此把创建永久标成「不确定且不可重试」。准入判据必须
+    # 和后续真正喂给 Agent 的那条消息是同一条。
+    last_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") != "system"
+        ),
+        None,
+    )
+    if not isinstance(last_message, dict) or last_message.get("role") != "user":
+        return False
+    last_user_content = last_message.get("content")
+    if not isinstance(last_user_content, str):
+        return False
+    match = re.search(
+        r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+        r"\[/creation_recommendation_response\]\s*$",
+        last_user_content,
+        re.DOTALL,
+    )
+    if match is None:
+        return False
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("version") == 1
+        and payload.get("type") == "creation_recommendation_response"
+        and payload.get("action")
+        in {"create", "dismiss", "mute_session", "unmute_session"}
+        and payload.get("creation_type") in {"agent", "skill", "task"}
+        and isinstance(payload.get("proposal_id"), str)
+        and payload["proposal_id"].strip()
+        and isinstance(payload.get("title"), str)
+        and payload["title"].strip()
+        and isinstance(payload.get("dedup_key"), str)
+        and payload["dedup_key"].strip()
+    )
 
 
 def _extract_skill_slug(body: Dict[str, Any]) -> str:
@@ -601,19 +767,44 @@ def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
     return _strip_skill_display_token(user_message, skill_slug)
 
 
-def _extract_business_execution_token(raw: Any) -> str:
-    """Accept only local-server's fixed-width opaque capability format."""
-    token = str(raw or "").strip()
-    return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
+def _is_video_edit_skill_slug(skill_slug: str) -> bool:
+    """Identify the ordinary video orchestration Skill for silent turns.
+
+    Silent automation normally skips Skill expansion because it has no
+    interactive user-facing command flow. Weekly video still needs the
+    Skill's business sequencing instructions; this prompt-only expansion does
+    not restore ``skill_view`` or any capability/attestation protocol.
+    """
+    normalized = str(skill_slug or "").strip().lower().strip("/")
+    return normalized in {
+        "video-edit-workflow-mini",
+        "video-edit-workflow",
+        "video-edit",
+        "video_edit",
+    }
 
 
-def _business_execution_scope_digest(token: str) -> str:
-    """Derive a non-secret cache scope from a validated capability token."""
-    if not token:
+_HARDWARE_EXECUTION_TOKEN_HEADER = "X-Zettlab-Hardware-Execution-Token"
+
+
+def _extract_hardware_execution_token(request: Any) -> str:
+    """Relay the dedicated capability only to trusted hardware helpers."""
+    if request is None:
         return ""
-    return hashlib.sha256(
-        b"zettlab-business-execution-scope-v1\0" + token.encode("ascii")
-    ).hexdigest()
+    token = str(
+        request.headers.get(_HARDWARE_EXECUTION_TOKEN_HEADER, "") or ""
+    ).strip()
+    return token if re.fullmatch(r"[0-9a-f]{64}", token) is not None else ""
+
+
+def _extract_requested_execution_policy(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("execution_policy", metadata.get("executionPolicy", ""))
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip().lower()
 
 
 def _normalize_chat_content(
@@ -689,6 +880,179 @@ _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 _CURRENT_TURN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 _CURRENT_TURN_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_API_MEDIA_PROBE_MAX_DATA_HEADER = 128
+_API_MEDIA_PROBE_MAX_IMAGE_SAMPLES = 8
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 入站媒体观测点 —— **真正的入口**在这里,⛔ 不在 platform adapter
+# ═══════════════════════════════════════════════════════════════════════
+#
+# 🔴 实测推翻的前提(2026-08-17 21:32–21:36,cloud-gt002):
+#    我把探针挂在 ``BasePlatformAdapter.handle_message``,理由是
+#    ``RelayAdapter`` 继承了它。代码在、进程是新槽、门全绿、逆改全红 ——
+#    **真实流量里一次都没执行**。
+#    ⭐ 板端根本不走 Python platform adapter,走的是**这条 HTTP 端点**
+#      (同窗口 access log 有 ``POST /p/main/v1/chat/completions 200``)。
+#    ⇒ **「继承了」推不出「会被执行」**。判据必须是「它实际被谁调用」,
+#      ⛔ 不是「结构上它在调用链里」。
+#
+# ⭐ 本探针**每个请求都出声**(哪怕没有任何媒体、哪怕 JSON 都没解开)。
+#    为什么:上一版对纯文本**保持沉默**,于是「没有那行」有两种成因 ——
+#    「没有媒体」和「根本没被执行」—— 混在一起就什么都判不了。
+#    ⇒ 判据从「有没有那行」换成「``seq`` 有没有前进」:
+#      seq 停着不动 = 没被执行;seq 前进而 media=0 = 执行了、请求里真没媒体。
+#    ⭐ 这是**唯一**能把「量具没跑」和「被测对象是空的」分开的形状。
+_API_MEDIA_PROBE = "[API-MEDIA-INGRESS]"
+_API_MEDIA_PROBE_SEQ = itertools.count(1)
+
+
+def _probe_describe_image_ref(url_value: Any) -> str:
+    """把一条图片引用压成**不含内容**的形状描述。
+
+    ⛔ 一个字符的 URL / base64 都不出;只出:固定 scheme、已知 data MIME 或
+       ``other``、payload **字节数**(数字不是内容)。
+    ⭐ 这正是 LS 侧 ``model input data url missing`` 的镜像判据:
+       它说「我没送出去」,这里能证明「我确实一个都没收到 / 收到了但形状不对」。
+    """
+    if not isinstance(url_value, str) or not url_value:
+        return "empty"
+    if url_value[:5].lower() == "data:":
+        comma = url_value.find(",", 5, 5 + _API_MEDIA_PROBE_MAX_DATA_HEADER)
+        if comma < 0:
+            return "data:malformed"
+        header = url_value[5:comma]
+        pieces = header.split(";")
+        mime = pieces[0].lower()
+        label = mime if mime in _CURRENT_TURN_IMAGE_MIMES else "other"
+        b64 = any(piece.lower() == "base64" for piece in pieces[1:])
+        return f"data:{label};{'b64' if b64 else 'raw'};{len(url_value) - comma - 1}b"
+    if url_value[:8].lower() == "https://":
+        return "https"
+    if url_value[:7].lower() == "http://":
+        return "http"
+    return "other"
+
+
+def _probe_profile_id(profile: Any) -> str:
+    """Keep the route profile correlatable without writing client path text."""
+    if not isinstance(profile, str) or not profile:
+        return "-"
+    return hashlib.sha256(profile.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _log_api_media_ingress(
+    request: Any, body: Any, *, outcome: str = "", profile: str = "",
+) -> None:
+    """记录**每一次** chat/completions 请求里到底带了什么媒体。
+
+    ⛔ 不出:URL 值、base64 内容、鉴权头、消息正文。
+    ✅ 出:条数、part 类型分布、图片引用的**形状**、固定的不支持类型类别。
+
+    ⚠️ ``file`` / ``input_file`` / ``input_audio`` 这三类在本端点是**直接 400**
+       的(见 ``_normalize_multimodal_content``:file 抛
+       ``unsupported_content_type``,audio 落到最后那条 unknown 分支)。
+       ⇒ 它们出现在 ``unsupported=[…]`` 里就等于**当场定位**了
+       「文件/音频发不进来」的归属:⛔ 不是链路丢了,是这个端点不收。
+
+    ⛔ 本函数永不向调用方抛异常(把请求处理弄挂不可接受),也⛔ 不静默:
+       自己坏了打 ``[API-MEDIA-INGRESS-ERR]``。
+    """
+    seq = next(_API_MEDIA_PROBE_SEQ)
+    try:
+        counts = {"text": 0, "image": 0, "file": 0, "other": 0}
+        unsupported: List[str] = []
+        img_shapes: List[str] = []
+        img_more = 0
+        n_msgs = 0
+        parts_more = 0
+        # 🔴 探针盲区补丁(2026-08-17 实证):**文件根本不是 part**。
+        #    LS 的 `internal/backend/hermes/chat.go` 逐字写着:
+        #      "{type:image_url,...}; non-image media (files) are appended to the
+        #       user text as a line \"[file: <url>]\" since hermes' Chat
+        #       Completions endpoint does not (today) expose a file content part"
+        #    ⇒ 只按 part 类型枚举,文件消息在探针眼里和纯文本**长得一模一样**,
+        #      正好落在最要紧的那一格上。⇒ 数 `[file: ` 出现次数。
+        #    ⛔ 只出**计数**,⛔ 一个字符的路径都不出(路径会泄漏 HERMES_HOME 布局)。
+        file_notes = 0
+        content_shapes: List[str] = []
+
+        def _count_file_notes(text: Any) -> None:
+            nonlocal file_notes
+            if isinstance(text, str):
+                file_notes += text.count("[file: ")
+
+        messages = (body or {}).get("messages") if isinstance(body, dict) else None
+        if isinstance(messages, list):
+            n_msgs = len(messages)
+            current = next(
+                (msg for msg in reversed(messages)
+                 if isinstance(msg, dict) and msg.get("role") == "user"),
+                None,
+            )
+            if current is not None:
+                content = current.get("content")
+                if not isinstance(content, list):
+                    # ⭐ 非图片消息 LS 送的是**纯字符串** content(不是 parts 数组)——
+                    #    这一支以前整个不统计,文件行就是在这里被漏掉的。
+                    content_shapes.append("str" if isinstance(content, str) else "?")
+                    _count_file_notes(content)
+                else:
+                    content_shapes.append("list")
+                    parts = content[:MAX_CONTENT_LIST_SIZE]
+                    parts_more = len(content) - len(parts)
+                    for part in parts:
+                        if isinstance(part, str):
+                            counts["text"] += 1
+                            continue
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = str(part.get("type") or "").strip().lower()
+                        if ptype in _TEXT_PART_TYPES:
+                            counts["text"] += 1
+                            _count_file_notes(part.get("text"))
+                        elif ptype in _IMAGE_PART_TYPES:
+                            counts["image"] += 1
+                            ref = part.get("image_url")
+                            if isinstance(ref, dict):
+                                ref = ref.get("url")
+                            if len(img_shapes) < _API_MEDIA_PROBE_MAX_IMAGE_SAMPLES:
+                                img_shapes.append(_probe_describe_image_ref(ref))
+                            else:
+                                img_more += 1
+                        elif ptype in _FILE_PART_TYPES:
+                            counts["file"] += 1
+                            unsupported.append(ptype)
+                        else:
+                            counts["other"] += 1
+                            unsupported.append("input_audio" if ptype == "input_audio" else "other")
+
+        if outcome:
+            verdict = outcome
+        elif unsupported:
+            verdict = "has_unsupported"
+        elif counts["image"] and file_notes:
+            verdict = "image_and_filenote"
+        elif counts["image"]:
+            verdict = "image_only"
+        elif file_notes:
+            # ⭐ 文件走的是文本行,⛔ 不是 part —— 这一格以前会被误判成 no_media。
+            verdict = "filenote_only"
+        else:
+            verdict = "no_media"
+
+        logger.info(
+            "%s seq=%d id=%x-%04x profile=%s msgs=%d shapes=[%s] parts_more=%d text=%d image=%d "
+            "filepart=%d other=%d filenote=%d img=[%s] img_more=%d unsupported=[%s] verdict=%s",
+            _API_MEDIA_PROBE, seq, os.getpid(), seq & 0xFFFF,
+            _probe_profile_id(profile), n_msgs, ",".join(content_shapes), parts_more,
+            counts["text"], counts["image"], counts["file"], counts["other"],
+            file_notes,
+            ",".join(img_shapes), img_more, ",".join(sorted(set(unsupported))), verdict,
+        )
+    except Exception as exc:
+        # ⛔ 不裸 `%s` 异常 —— 请求体里可能带 data URL / 令牌,异常消息会回显。
+        logger.warning("[API-MEDIA-INGRESS-ERR] seq=%d %s", seq, safe_exc(exc))
 
 
 def _normalize_multimodal_content(content: Any) -> Any:
@@ -824,12 +1188,20 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
-def _content_has_image(content: Any) -> bool:
-    return isinstance(content, list) and any(
+def _content_has_image_payload(content: Any) -> bool:
+    """Return whether normalized content carries an image attachment."""
+    if not isinstance(content, list):
+        return False
+    return any(
         isinstance(part, dict)
         and str(part.get("type") or "").strip().lower() in _IMAGE_PART_TYPES
         for part in content
     )
+
+
+def _content_has_image(content: Any) -> bool:
+    """Compatibility name used by provider image fallback paths."""
+    return _content_has_image_payload(content)
 
 
 def _extract_current_turn_reference_image(content: Any) -> str:
@@ -1361,8 +1733,14 @@ class ResponseStore:
     if the on-disk path is unavailable.
     """
 
-    def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
+    def __init__(
+        self,
+        max_size: int = MAX_STORED_RESPONSES,
+        db_path: str = None,
+        max_bytes: int = MAX_RESPONSE_STORE_BYTES,
+    ):
         self._max_size = max_size
+        self._max_bytes = max(1, int(max_bytes))
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -1447,36 +1825,83 @@ class ResponseStore:
             self._conn.commit()
             return None
 
-    def put(self, response_id: str, data: Dict[str, Any]) -> None:
-        """Store a response, evicting the oldest if at capacity."""
+    @staticmethod
+    def _json_upper_bound(value: Any, *, stop_after: int) -> int:
+        """Conservative JSON byte bound without allocating the serialized copy."""
+        def string_bytes(text: str) -> int:
+            size = 2
+            for char in text:
+                code = ord(char)
+                if char in {'"', "\\"} or code < 0x20:
+                    size += 6
+                elif code <= 0x7F:
+                    size += 1
+                elif code <= 0xFFFF:
+                    size += 6
+                else:
+                    size += 12
+            return size
+
+        total = 0
+        stack = [value]
+        while stack and total <= stop_after:
+            item = stack.pop()
+            if item is None or isinstance(item, (bool, int, float)):
+                total += 24
+            elif isinstance(item, str):
+                total += string_bytes(item)
+            elif isinstance(item, dict):
+                total += 2 + 2 * len(item)
+                for key, child in item.items():
+                    total += string_bytes(str(key))
+                    stack.append(child)
+            elif isinstance(item, (list, tuple, set)):
+                total += 2 + len(item)
+                stack.extend(item)
+            else:
+                total += string_bytes(str(item))
+        return total
+
+    def put(self, response_id: str, data: Dict[str, Any]) -> bool:
+        """Store a response within count/byte caps; False means not persisted."""
+        if self._json_upper_bound(data, stop_after=self._max_bytes) > self._max_bytes:
+            logger.warning("Response %s exceeds response-store byte cap", response_id)
+            return False
+        # ensure_ascii=True guarantees one UTF-8 byte per output character, so
+        # measuring the string is exact and does not allocate a second
+        # response-sized bytes object.
+        payload = json.dumps(data, default=str, ensure_ascii=True)
+        if len(payload) > self._max_bytes:
+            logger.warning("Response %s exceeds response-store byte cap", response_id)
+            return False
         self._conn.execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
+            (response_id, payload, time.time()),
         )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
-        if count > self._max_size:
-            # Collect IDs that will be evicted
-            evict_ids = [
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
-                    (count - self._max_size,),
-                ).fetchall()
-            ]
-            if evict_ids:
-                placeholders = ",".join("?" for _ in evict_ids)
-                # Clear conversation mappings pointing to evicted responses
-                self._conn.execute(
-                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-                # Delete evicted responses
-                self._conn.execute(
-                    f"DELETE FROM responses WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
+        rows = self._conn.execute(
+            "SELECT response_id, length(CAST(data AS BLOB)) "
+            "FROM responses ORDER BY accessed_at ASC"
+        ).fetchall()
+        total_bytes = sum(int(row[1] or 0) for row in rows)
+        evict_ids = []
+        while rows and (
+            len(rows) > self._max_size or total_bytes > self._max_bytes
+        ):
+            response_id_oldest, size_oldest = rows.pop(0)
+            evict_ids.append(response_id_oldest)
+            total_bytes -= int(size_oldest or 0)
+        if evict_ids:
+            placeholders = ",".join("?" for _ in evict_ids)
+            self._conn.execute(
+                f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+                evict_ids,
+            )
+            self._conn.execute(
+                f"DELETE FROM responses WHERE response_id IN ({placeholders})",
+                evict_ids,
+            )
         self._conn.commit()
+        return True
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
@@ -1521,12 +1946,14 @@ class ResponseStore:
 # CORS middleware
 # ---------------------------------------------------------------------------
 
+# HardwareExecutionToken and X-Zettlab-Agent-Action-Token headers are
+# intentionally absent. They are loopback hardware transport, not a
+# browser/App contract; omission makes browser preflight fail closed even for
+# an allowed origin.
+
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": (
-        "Authorization, Content-Type, Idempotency-Key, "
-        "X-Zettlab-Business-Execution-Token"
-    ),
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
 }
 
 
@@ -1565,6 +1992,14 @@ _MEDIA_MIME = {
     ".bmp": "image/bmp",
 }
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
+_ANY_MEDIA_TAG_RE = re.compile(
+    r"media:\s*(?:"
+    r"`(?:~/|/|[A-Za-z]:[/\\])[^`\r\n]+`|"
+    r"\"(?:~/|/|[A-Za-z]:[/\\])[^\"\r\n]+\"|"
+    r"'(?:~/|/|[A-Za-z]:[/\\])[^'\r\n]+'|"
+    r"(?:~/|/|[A-Za-z]:[/\\])[^\s\r\n]+)",
+    re.IGNORECASE,
+)
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -1586,7 +2021,7 @@ def _resolve_media_to_data_urls(text: str) -> str:
     process could see was base64-exfiltrated to the API caller if its path
     merely appeared in the model's own final reply text.
     """
-    if not text or "MEDIA:" not in text:
+    if not text or "media:" not in text.lower():
         return text
     import base64
 
@@ -1610,20 +2045,170 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return f"![image](data:{_MEDIA_MIME[suffix]};base64,{b64})"
 
     def _repl(m: "re.Match[str]") -> str:
-        return _to_data_url(m.group("path")) or m.group(0)
+        data_url = _to_data_url(m.group("path"))
+        if data_url:
+            return data_url
+        if validate_media_delivery_path(m.group("path")):
+            return "⚠️ Attachment is available only through native messaging delivery."
+        return "⚠️ Couldn't deliver the attachment."
 
     try:
-        return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+        resolved = MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+        return _ANY_MEDIA_TAG_RE.sub("⚠️ Couldn't deliver the attachment.", resolved)
     except Exception:
-        return text
+        return _ANY_MEDIA_TAG_RE.sub("⚠️ Couldn't deliver the attachment.", text)
+
+
+class _StreamingMediaDeltaFilter:
+    """流式保留最多 5 字符前瞻，绝不把宿主 ``MEDIA:`` 路径发到线外。"""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    @staticmethod
+    def _resolve_segment(segment: str) -> str:
+        resolved = _resolve_media_to_data_urls(segment)
+        if resolved != segment:
+            return resolved
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media, cleaned = BasePlatformAdapter.extract_media(segment)
+        if media:
+            safe_media = BasePlatformAdapter.filter_media_delivery_paths(media)
+            notice = (
+                "⚠️ Attachment is available only in the completed response."
+                if safe_media
+                else "⚠️ Couldn't deliver the attachment."
+            )
+            return f"{cleaned}\n{notice}".strip()
+        return cleaned
+
+    def feed(self, delta: str) -> List[str]:
+        self._buffer += delta
+        return self._drain(final=False)
+
+    def finish(self) -> List[str]:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> List[str]:
+        out: List[str] = []
+        while self._buffer:
+            lower_buffer = self._buffer.lower()
+            marker = lower_buffer.find("media:")
+            if marker < 0:
+                if final:
+                    out.append(self._buffer)
+                    self._buffer = ""
+                else:
+                    keep = 0
+                    for size in range(1, min(5, len(self._buffer)) + 1):
+                        if lower_buffer.endswith("media:"[:size]):
+                            keep = size
+                    if len(self._buffer) > keep:
+                        out.append(self._buffer[:-keep] if keep else self._buffer)
+                        self._buffer = self._buffer[-keep:] if keep else ""
+                break
+            if marker > 0:
+                out.append(self._buffer[:marker])
+                self._buffer = self._buffer[marker:]
+            newline = self._buffer.find("\n")
+            if newline < 0 and not final:
+                break
+            end = len(self._buffer) if newline < 0 else newline
+            segment = self._buffer[:end]
+            out.append(self._resolve_segment(segment))
+            self._buffer = self._buffer[end:]
+            if self._buffer.startswith("\n"):
+                out.append("\n")
+                self._buffer = self._buffer[1:]
+        return [part for part in out if part]
 
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
-    """Redact API-bound error text before it crosses the HTTP boundary."""
+    """Redact API-bound error text before it crosses the HTTP boundary.
+
+    ⛔ 这一层只做凭据脱敏,**不猜文本来源**。上一版在这里额外抹掉「绝对路径」
+    和「Python 属性错误措辞」,两个判据都挑错了维度:
+
+    · 措辞是开集 —— 认得 ``'X' object has no attribute 'y'``,就认不得
+      ``KeyError`` / ``NameError`` / ``module 'x' has no attribute 'y'``,
+      补一个漏下一个。
+    · 「以 ``/`` 开头、两段以上」分不开**主机文件系统路径**和**上游 URL /
+      HTTP 路由**:实测把
+      ``... at https://api.example.com/v1/chat/completions``
+      改成了 ``... at https:/<path>``,把 provider 自己的解释改坏了。
+
+    ⇒ 真正的判据在**捕获点**(``_boundary_error_text``):有没有上游证据。
+    """
     redacted = redact_sensitive_text(str(value), force=True)
     if limit is not None:
         return redacted[:limit]
     return redacted
+
+
+def _internal_error_text(operation: str, exc: BaseException) -> str:
+    """Log the original, return only a stable, traceable, safe line.
+
+    照抄仓内先例 ``zet_agent._correlated_error_response``:完整异常 + 关联 ID 进
+    日志,响应只给用户能拿去问支持的编号。⛔ 抹掉而不记录 = 把可诊断性也砍掉。
+    """
+    correlation_id = uuid.uuid4().hex[:12]
+    # ``exc_info=exc`` 而不是 ``True``:后者取的是「当前正在处理的异常」,
+    # 在 except 块之外调用会记成 ``NoneType: None`` —— 文案照样安全,但
+    # traceback 没了,而这份 traceback 是编号唯一能兑现的东西。
+    logger.error(
+        "[api_server] %s failed (correlation_id=%s)", operation, correlation_id,
+        exc_info=exc,
+    )
+    return f"{INTERNAL_ERROR_USER_TEXT}。如果问题持续,请提供参考编号 {correlation_id}。"
+
+
+def _boundary_error_text(
+    operation: str,
+    exc: BaseException,
+    *,
+    message: Any = None,
+    limit: int | None = None,
+) -> str:
+    """给客户端的文本:先判「这个失败到底是谁的」,再决定说什么。
+
+    ⭐ 判据是**有没有上游证据**(HTTP 状态码 / 响应体 / 已知传输类型名 /
+    网络 errno),⛔ 不是「这个异常叫什么名字」—— 后者是开集,枚举了
+    ``ValueError``/``TypeError`` 就会漏 ``AttributeError``,补上又漏
+    ``NameError``。四样证据一样都没有 ⇒ 它只可能来自我们自己的代码。
+
+    · 我们自己的 bug → 原始异常带 traceback + 关联 ID 进日志,客户端只拿到
+      安全文案和编号。用户照着「上游模型服务错误 · 请稍后重试」重试一百次
+      也不会好,那条提示本身就是缺陷。
+    · 上游失败 → provider 的解释**逐字透传**(只做凭据脱敏)。告诉用户等
+      30 秒 / 换个模型 / 去充值的正是它,抹掉比泄漏更糟。
+
+    ⚠️ ⛔ **这里问的是 ``error_text_is_ours``,⛔ 不是
+    ``classify_api_error(...).reason``,也⛔ 不是 ``has_upstream_evidence``**。
+
+    · 用 ``.reason``(第一版):分类流水线**按恢复策略**排序,文本模式匹配在
+      第 4 步、证据检查在第 8 步。本地的
+      ``RuntimeError("agent step timed out: /volume1/private/…")`` 先撞上
+      timeout 模式就被当成上游失败原样出屏。
+    · 用 ``has_upstream_evidence``(第二版):它**沿 cause 链**取证,回答的是
+      「这次失败能不能重试」。于是
+      ``raise RuntimeError("… /volume1/private/config.yaml") from ConnectionError``
+      继承到「上游证据」,内部路径照样推给了每一个接本边界的 HTTP/SSE 客户端。
+
+    ⭐ 两版栽在同一句话上:**「可不可以重试」证明不了「这段文本是谁写的」。**
+    展示只认后者 ⇒ 复用 ``error_text_is_ours``,与聊天出站路径**同一个实现**
+    (⛔ 同一个问题不许两处各写一套判据 —— 漂移就是这么来的)。
+    """
+    try:
+        internal = error_text_is_ours(exc)
+    except Exception:  # noqa: BLE001 — 判据自身失败时站保守侧:当作我们的 bug
+        logger.debug(
+            "[api_server] evidence check raised on %s", type(exc).__name__, exc_info=True
+        )
+        internal = True
+    if internal:
+        return _internal_error_text(operation, exc)
+    return _redact_api_error_text(exc if message is None else message, limit=limit)
 
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
@@ -1871,16 +2456,71 @@ def _make_request_fingerprint(
     body: Dict[str, Any],
     keys: List[str],
     *,
-    execution_scope_digest: str = "",
+    hardware_execution_token: str = "",
+    admission_scope: str = "",
+    identity_scope: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
-    material = repr(subset).encode("utf-8")
-    if execution_scope_digest:
-        material += (
-            b"\0zettlab-business-execution-scope-v1:"
-            + execution_scope_digest.encode("ascii")
+    body_fingerprint = hashlib.sha256(repr(subset).encode("utf-8")).hexdigest()
+    hardware_token = str(hardware_execution_token or "").strip()
+    capability_digests: List[bytes] = []
+    if re.fullmatch(r"[0-9a-f]{64}", hardware_token) is not None:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-hardware-execution-token-v1\0"
+                + hardware_token.encode("ascii")
+            ).hexdigest().encode("ascii")
         )
-    return hashlib.sha256(material).hexdigest()
+    # admission_scope 把「这份 body 是从哪条路由、以什么准入模式进来的」并进
+    # 指纹。少了它，同一个 Idempotency-Key + 同一份 body 会在普通端点和
+    # canonical-final-v1 之间共用缓存：普通端点先缓存的无回执结果会让版本化
+    # 重试直接命中缓存、跳过 governor 和动作接管。
+    if admission_scope:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-admission-scope-v1\0" + admission_scope.encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    # identity_scope 把「这份 body 属于谁、属于哪个会话」并进指纹。_idem_cache
+    # 是进程全局的，少了它，两个不同 profile / owner / session key 的请求只要
+    # Idempotency-Key 和 body 相同就会互相命中——后到的那个直接复用前一个会话的
+    # agent 结果，跳过 governor 的 owner / proposal 校验，甚至拿到别人会话的
+    # accepted 回执和正文。只并进摘要，不并原值。
+    if identity_scope:
+        capability_digests.append(
+            hashlib.sha256(
+                b"zettlab-identity-scope-v1\0"
+                + hashlib.sha256(identity_scope.encode("utf-8")).hexdigest().encode("ascii")
+            ).hexdigest().encode("ascii")
+        )
+    if not capability_digests:
+        return body_fingerprint
+    return hashlib.sha256(
+        b"zettlab-request-idempotency-v4\0"
+        + body_fingerprint.encode("ascii")
+        + b"\0"
+        + b"\0".join(capability_digests)
+    ).hexdigest()
+
+
+def _make_silent_automation_fingerprint(
+    body: Dict[str, Any], *, identity_scope: str = ""
+) -> str:
+    """Bind silent retries to the durable task and request identity.
+
+    Silent automation is an execution mode, not a second capability protocol.
+    Idempotency still needs a stable fingerprint so a retry can resume the same
+    task without relying on a per-turn business token.
+    """
+    subset = {
+        key: body.get(key)
+        for key in ("messages", "metadata", "tools", "model", "stream")
+    }
+    encoded = json.dumps(subset, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    scope = hashlib.sha256(str(identity_scope or "").encode()).hexdigest()
+    return hashlib.sha256(
+        b"zettlab-silent-automation-v2\0" + encoded + b"\0" + scope.encode()
+    ).hexdigest()
 
 
 def _derive_chat_session_id(
@@ -1913,6 +2553,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        defer_job as _cron_defer,
         job_occurrence_projection as _cron_occurrence_projection,
     )
     _CRON_AVAILABLE = True
@@ -1926,6 +2567,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_defer = None
     _cron_occurrence_projection = None
 
 
@@ -2016,6 +2658,17 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # ⭐ 与上面那把 key **同源**地记下属主:``_get_scoped_secret`` 是在属主
+        # profile 的 scope 里跑的,此刻的 ``get_hermes_home()`` 就是属主的 home。
+        # 不带 ``/p/<profile>/`` 前缀的请求由这个 listener 的 key 鉴权,就必须在
+        # **同一个** profile 的 scope 里执行 —— 见 ``_profile_scope``。
+        # ⛔ 绝不从 ``os.environ`` 猜(``ZET_AGENT_ID`` 与这把 key 毫无关系)。
+        try:
+            from hermes_constants import get_hermes_home as _get_owner_home
+
+            self._owner_home = _get_owner_home()
+        except Exception:  # noqa: BLE001 — 取不到就退回旧行为,⛔ 不因此拒服务
+            self._owner_home = None
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -2602,8 +3255,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return _PROFILE_REJECTED
         return profile
 
-    @staticmethod
-    def _profile_scope(profile: Optional[str]):
+    # ⚠️ 从 ``@staticmethod`` 改成实例方法:属主(``_owner_home``)是**构造期**
+    # 捕获在实例上的,静态方法里拿不到 self。四个调用点全是
+    # ``self._profile_scope(...)``,⛔ 无外部直调。
+    def _profile_scope(self, profile: Optional[str]):
         """Enter the multiplex profile runtime scope, or a no-op when unset.
 
         When no ``/p/<profile>/`` prefix was given AND multiplexing is active,
@@ -2619,10 +3274,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 from agent.secret_scope import is_multiplex_active
 
                 if is_multiplex_active():
+                    import os as _os
+
                     from gateway.run import _profile_runtime_scope
                     from hermes_constants import get_hermes_home
 
-                    return _profile_runtime_scope(get_hermes_home())
+                    # 🔴 上面写的是「进 DEFAULT profile 的 scope」，但 get_hermes_home()
+                    # 返回的是**网关目录**，不是 profiles/<default>。二者不同，后果不对称：
+                    # 子进程 HOME 由 hermes_constants._profile_home_path 派生成 {pin}/home
+                    # 且**要求该目录存在**；网关目录下没有 home/ ⇒ 派生失败 ⇒ HOME 根本不注入
+                    # ⇒ lark-cli 回落 ~ 找不到 config.json ⇒ 报「未绑定」⇒ 助手转去 config bind
+                    # ⇒ 那条只认 .env 明文 ⇒ exit 3。整条症状由这一处的目录取错引出。
+                    # ⇒ 按 docstring 的原意取**默认档案目录**；取不到才退回原值（⛔ 不 fail closed：
+                    #    不带前缀的单档案部署是合法的，不能被这条改动搞挂）。
+                    # 🔴🔴 **信任边界。上一版从进程环境猜归属,是跨 profile 越权口子。**
+                    # ``_expected_api_key()`` 把 ``None`` 和 ``"default"`` 当同一档、
+                    # 校验 **default listener 的 key**,而这里却按进程级
+                    # ``ZET_AGENT_ID``(缺省 ``main``)选运行时目录 ⇒ 只要
+                    # ``profiles/main/home`` 存在,**持 default key 的普通请求就在
+                    # ``main`` 的 secret / session / MCP scope 里执行**。凭据与数据双向越界。
+                    # ⭐ 判据换成与 key **同源**的那一面:构造期捕获的属主 home。
+                    # ⛔ 不用 ``get_profile_dir("default")`` —— 那是按名字再猜一次。
+                    pin = get_hermes_home()
+                    recovered = False
+                    owner = getattr(self, "_owner_home", None)
+                    if owner and _os.path.isdir(_os.path.join(str(owner), "home")):
+                        pin = owner
+                        recovered = True
+                    # ⭐ 无条件留痕：这条分支此前完全不可观测，"是不是走了这里"只能靠推断。
+                    # 字段选择服务于定位：pin 是什么、它的 home/ 在不在（HOME 能否被派生）。
+                    try:
+                        logger.warning(
+                            "[profile-scope] unscoped request under multiplex: profile=%r "
+                            "recovered_from_default=%s pin=%s pin_home_exists=%s",
+                            profile,
+                            recovered,
+                            pin,
+                            _os.path.isdir(_os.path.join(str(pin), "home")),
+                        )
+                    except Exception:
+                        pass
+                    return _profile_runtime_scope(pin)
             except Exception:
                 pass
             return nullcontext()
@@ -2677,6 +3369,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            (
+                "POST",
+                "/v1/chat/completions/canonical-final-v1",
+                self._handle_canonical_final_chat_completions,
+            ),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -2692,6 +3389,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
+            ("POST", "/api/jobs/{job_id}/defer", self._handle_defer_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
@@ -3456,6 +4154,10 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
         router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
         router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+        router.add_post(
+            "/p/{profile}/v1/chat/completions/canonical-final-v1",
+            self._profile_handler(self._handle_canonical_final_chat_completions),
+        )
 
         router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
         router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
@@ -3476,6 +4178,7 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_delete("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_delete_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/pause", self._profile_handler(self._handle_pause_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/resume", self._profile_handler(self._handle_resume_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/defer", self._profile_handler(self._handle_defer_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
         if _CRON_AVAILABLE:
             router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
@@ -3897,6 +4600,14 @@ class APIServerAdapter(BasePlatformAdapter):
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
         """
+        if str(
+            (request_overrides or {}).get("_zet_execution_policy", "") or ""
+        ).strip().lower() == "silent_automation":
+            # Reject before resolving provider credentials or touching SessionDB;
+            # this path is not authorized to construct a silent agent.
+            raise PermissionError(
+                "silent_automation requires the zet_agent adapter"
+            )
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs,
@@ -3972,7 +4683,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Surface as the typed provider-auth failure so
                     # _run_agent()/_handle_runs() return the controlled
                     # response shape instead of a raw 500.
-                    raise _ProviderAuthResolutionError(str(exc)) from exc
+                    #
+                    # ⛔ 只有**真的**是凭据 / 配置类失败才配这个标签。其余的
+                    # (我们自己的 bug)照原样抛,交给 HTTP 边界收口 ——
+                    # 否则内部异常文本会以 HTTP 200 当作 assistant 的回答出现。
+                    if isinstance(exc, RuntimeError):
+                        raise _ProviderAuthResolutionError(str(exc)) from exc
+                    raise
                 logger.debug(
                     "api_server provider-runtime refresh failed for provider=%s model=%s",
                     provider_name,
@@ -4156,6 +4873,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Consumed only by the ZetAgent subclass; never forward this private
         # plan policy hint into AIAgent or an LLM request body.
         agent_request_overrides.pop("_zet_plan_auto_execute", None)
+        agent_request_overrides.pop("_zet_execution_policy", None)
 
         agent_kwargs = {
             "model": model,
@@ -4980,19 +5698,33 @@ class APIServerAdapter(BasePlatformAdapter):
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
         history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-            route=route,
-            session_model=session_model,
-            requested_runtime=runtime_request.get("requested") or {},
-            route_source=runtime_request.get("route_source") or "global",
-            confirmed_runtime_lock=lock_active,
-            **agent_overrides,
-        )
+        # ⛔ 这里原来**一个 catch 都没有**:``_run_agent`` 抛错时 aiohttp 直接
+        # 回一个纯文本 ``500 Server got itself in trouble`` —— 没有 JSON、
+        # 没有可行动提示、没有参考编号,客户端连解析都解析不了。
+        # 流式的兄弟路径(``…/chat/stream``)一直是接住的,这条没跟上。
+        try:
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                route=route,
+                session_model=session_model,
+                requested_runtime=runtime_request.get("requested") or {},
+                route_source=runtime_request.get("route_source") or "global",
+                confirmed_runtime_lock=lock_active,
+                **agent_overrides,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[api_server] session chat failed for %s", session_id)
+            return web.json_response(
+                _openai_error(
+                    _boundary_error_text("session chat", exc),
+                    err_type="server_error",
+                ),
+                status=500,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -5100,6 +5832,7 @@ class APIServerAdapter(BasePlatformAdapter):
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
         seq = 0
+        media_delta_filter = _StreamingMediaDeltaFilter()
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
@@ -5126,7 +5859,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _delta(delta: str) -> None:
             if delta:
-                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+                for safe_delta in media_delta_filter.feed(delta):
+                    _enqueue(
+                        "assistant.delta",
+                        {"message_id": message_id, "delta": safe_delta},
+                    )
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -5158,6 +5895,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
+                for safe_delta in media_delta_filter.finish():
+                    _enqueue(
+                        "assistant.delta",
+                        {"message_id": message_id, "delta": safe_delta},
+                    )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
@@ -5197,7 +5939,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
-                await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+                await queue.put(_event_payload("error", {
+                    "message": _boundary_error_text("session chat stream", exc),
+                }))
             finally:
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
@@ -5313,19 +6057,99 @@ class APIServerAdapter(BasePlatformAdapter):
             on_settled()
         return user_message
 
+    async def _handle_canonical_final_chat_completions(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                _openai_error("Invalid JSON in request body"), status=400
+            )
+        if not isinstance(body, dict) or (
+            _extract_creation_action_receipt_transport(body)
+            != "canonical_final_v1"
+        ) or not _extract_turn_id(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires exact receipt metadata and turn id"
+                ),
+                status=400,
+            )
+        if not _is_canonical_final_creation_action(body):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 requires a valid creation recommendation action"
+                ),
+                status=400,
+            )
+        # 结构化输出与可信回执互斥：governor 的 _on_pre_llm_call() 遇到
+        # structured_output 会直接进入 suppression，既不消费动作也不生成回执，
+        # 而 HTTP 请求照常以普通模型结果收尾。放行这类请求等于让 Web 收到一个
+        # 「没接管、也没法重试」的死状态。宁可在进 Agent 前明确拒绝。
+        from agent.response_format import response_format_requires_structured_output
+
+        if response_format_requires_structured_output(body.get("response_format")):
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot be combined with a structured "
+                    "response_format: the receipt would never be produced"
+                ),
+                status=400,
+            )
+        # turn_id 会成为 pending_action_results 的键并驻留到 TTL 到期。不设上限
+        # 的话，少量携带超长 turn_id 的请求就能把设备上的 Hermes 撑爆（端侧
+        # 2 GB 硬预算）。正常的 turn_id 是 local-server 的 UUID 类关联令牌。
+        if len(_extract_turn_id(body)) > MAX_CANONICAL_FINAL_TURN_ID_LEN:
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 turn_id exceeds "
+                    f"{MAX_CANONICAL_FINAL_TURN_ID_LEN} characters"
+                ),
+                status=400,
+            )
+        # 禁用了工具的 create 动作永远走不到原生创建流程（skill_manage / cronjob
+        # 都是工具），但 governor 会照常消费 proposal 并回 accepted——Web 结算成
+        # 「已接管」，资源却根本不会被创建。宁可在进 Agent 前拒掉。
+        if str(body.get("tool_choice") or "").strip().lower() == "none":
+            return web.json_response(
+                _openai_error(
+                    "canonical-final-v1 cannot run with tool_choice=none: the "
+                    "native creation flow would never execute"
+                ),
+                status=400,
+            )
+        request["canonical_final_creation_action_admitted"] = True
+        return await self._handle_chat_completions(request)
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        prestream_ingress_at = time.monotonic()
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
             return limited
 
         # Parse request body
+        _probe_profile = ""
+        try:
+            _probe_profile = str(request.match_info.get("profile", "") or "")
+        except Exception:
+            _probe_profile = ""
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
+            # ⭐ 解不开也要出声 —— 否则「没有那行」又会有两种成因。
+            _log_api_media_ingress(request, None, outcome="bad_json", profile=_probe_profile)
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        # ⭐ 入站媒体观测点:**每个请求都记一行**,seq 单调递增。
+        #    这是本端点真正的入口 —— 板端走的就是它,⛔ 不是 platform adapter。
+        _log_api_media_ingress(request, body, profile=_probe_profile)
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -5340,10 +6164,19 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
         connector_route_capability = _extract_connector_route_capability(body)
-        business_execution_token = _extract_business_execution_token(
-            request.headers.get("X-Zettlab-Business-Execution-Token", "")
+        creation_action_receipt_transport = (
+            _extract_creation_action_receipt_transport(body)
         )
-
+        if _has_creation_recommendation_wrapper(body) and not request.get(
+            "canonical_final_creation_action_admitted", False
+        ):
+            creation_action_receipt_transport = ""
+        hardware_execution_token = _extract_hardware_execution_token(request)
+        requested_execution_policy = _extract_requested_execution_policy(body)
+        requested_silent_automation = (
+            requested_execution_policy == "silent_automation"
+        )
+        execution_policy = ""
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -5359,11 +6192,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
-            elif role in {"user", "assistant"}:
+            elif role in _AGENT_INPUT_MESSAGE_ROLES:
                 try:
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
+                if requested_silent_automation and _content_has_image_payload(content):
+                    return web.json_response(
+                        _openai_error(
+                            "silent_automation does not accept multimodal input",
+                            param=f"messages[{idx}].content",
+                            code="silent_automation_multimodal_unsupported",
+                        ),
+                        status=400,
+                    )
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
@@ -5390,7 +6232,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return key_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
+        # Validate the lineage before authorization; history is loaded only after
+        # the execution policy is known so trusted silent turns never read request
+        # or SessionDB conversation history.
         #
         # Security: session continuation exposes conversation history, so it is
         # only allowed when the API key is configured and the request is
@@ -5428,13 +6272,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -5448,8 +6285,71 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
-        # Explicit skill invocation (zet_agent hook; base no-op): triggered
-        # ONLY by metadata.skill_slug — never by sniffing the message text.
+        skill_slug = _extract_skill_slug(body)
+        trusted_task_message = _trusted_skill_task_message(user_message, skill_slug)
+
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if requested_silent_automation and stream:
+            return web.json_response(
+                _openai_error(
+                    "silent_automation requires stream=false so retries remain idempotent",
+                    param="stream",
+                ),
+                status=400,
+            )
+        if requested_silent_automation and not str(
+            idempotency_key or ""
+        ).strip():
+            return web.json_response(
+                _openai_error(
+                    "silent_automation requires a non-empty Idempotency-Key",
+                    param="Idempotency-Key",
+                    code="silent_automation_idempotency_required",
+                ),
+                status=400,
+            )
+
+        if requested_silent_automation:
+            # Silent execution is a task mode, not a second business-capability
+            # protocol. Idempotency and the normal loopback caller identity
+            # keep retries attached to the same workflow.
+            execution_policy = "silent_automation"
+
+        history_source = "request"
+        history_outcome = "request"
+        if execution_policy == "silent_automation":
+            # Silent automation owns one server-selected task configuration.
+            # Interactive Plan controls are not part of that task.
+            response_mode = ""
+            plan_ack = {}
+            plan_auto_execute = False
+
+        if execution_policy == "silent_automation":
+            # Silent automation is a self-contained internal task, not part of
+            # the user's canonical chat history.
+            history = []
+            system_prompt = None
+            current_turn_reference_image = ""
+        elif provided_session_id:
+            try:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                    history_source = "session_db"
+                    history_outcome = "session_db_success"
+            except Exception as e:
+                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                history = []
+                history_source = "session_db"
+                history_outcome = "session_db_error"
+        history_ready_at = time.monotonic()
+
+        # Explicit skill selection is triggered ONLY by metadata.skill_slug —
+        # never by sniffing the message text. Ordinary turns and silent video
+        # turns expand the selected Skill as prompt-level business guidance.
+        # Silent video still skips every interactive skill_view/
+        # capability/attestation hop; plugin tools remain the only side-effect
+        # boundary.
         # The expansion runs LATE on purpose; the placement is load-bearing:
         #   - AFTER session_id is final, so skill templates resolve
         #     ${HERMES_SESSION_ID} against the real session (session_id is
@@ -5462,12 +6362,23 @@ class APIServerAdapter(BasePlatformAdapter):
         #     tools this turn" boundary (request_overrides strips every agent
         #     tool) and expansion injects tool-driving instructions — the
         #     message passes through unexpanded instead.
-        skill_slug = _extract_skill_slug(body)
         skill_selection_enabled = bool(
-            skill_slug and body.get("tool_choice") != "none"
+            skill_slug
+            and (
+                body.get("tool_choice") != "none"
+                or requested_silent_automation
+            )
+            and (not requested_silent_automation or execution_policy == "silent_automation")
+        )
+        skill_expansion_enabled = bool(
+            skill_selection_enabled
+            and (
+                execution_policy != "silent_automation"
+                or _is_video_edit_skill_slug(skill_slug)
+            )
         )
         trusted_user_message = (
-            _trusted_skill_task_message(user_message, skill_slug)
+            trusted_task_message
             if skill_selection_enabled
             else user_message
         )
@@ -5477,24 +6388,51 @@ class APIServerAdapter(BasePlatformAdapter):
             else ""
         )
 
+        prestream_timing: Optional[PrestreamTiming] = None
+        if stream and self.platform == Platform.ZET_AGENT:
+            prestream_timing = PrestreamTiming(
+                session_id=session_id,
+                turn_id=turn_id,
+                explicit_skill=skill_selection_enabled,
+                ingress_at=prestream_ingress_at,
+            )
+            if history_outcome == "session_db_error":
+                prestream_timing.history_failed(
+                    source="session_db",
+                    outcome="session_db_error",
+                )
+            else:
+                prestream_timing.history_ready(
+                    source=history_source,
+                    count=len(history),
+                    observed_at=history_ready_at,
+                )
+
         async def _expanded_user_message(on_settled=None):
-            if not skill_slug or body.get("tool_choice") == "none":
+            if not skill_expansion_enabled:
                 if on_settled is not None:
                     on_settled()
-                return user_message
+                return trusted_user_message
             return await self._expand_inbound_skill_invocation(
-                user_message, skill_slug, session_id=session_id,
+                user_message, trusted_skill_slug, session_id=session_id,
                 on_settled=on_settled,
             )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", self._model_name)
+        # Silent tasks run on the server-selected runtime. Request-level
+        # model/provider/options must not become an unbound exfiltration or
+        # cost-control switch.
+        model_name = (
+            self._model_name
+            if execution_policy == "silent_automation"
+            else body.get("model", self._model_name)
+        )
         created = int(time.time())
         request_overrides: Dict[str, Any] = {}
-        if body.get("tool_choice") == "none":
+        if execution_policy != "silent_automation" and body.get("tool_choice") == "none":
             request_overrides["tool_choice"] = "none"
         response_format = body.get("response_format")
-        if response_format is not None:
+        if execution_policy != "silent_automation" and response_format is not None:
             response_format_error = _validate_chat_response_format(response_format)
             if response_format_error:
                 return web.json_response(
@@ -5509,11 +6447,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # Per-client model routing: if the requested model matches a
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
-        route = self._resolve_route(model_name)
-        agent_overrides = _request_agent_overrides(
-            body,
-            virtual_model=self._model_name,
-            allow_bare_model=self._direct_model_requests,
+        route = (
+            None
+            if execution_policy == "silent_automation"
+            else self._resolve_route(model_name)
+        )
+        agent_overrides = (
+            {}
+            if execution_policy == "silent_automation"
+            else _request_agent_overrides(
+                body,
+                virtual_model=self._model_name,
+                allow_bare_model=self._direct_model_requests,
+            )
         )
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
@@ -5539,6 +6485,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            media_delta_filter = _StreamingMediaDeltaFilter()
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -5549,7 +6496,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the final answer after tool calls.  The SSE loop detects
                 # completion via agent_task.done() instead.
                 if delta is not None:
-                    _stream_q.put(delta)
+                    for safe_delta in media_delta_filter.feed(delta):
+                        if prestream_timing is not None:
+                            prestream_timing.observe_queued_semantic("content")
+                        _stream_q.put(safe_delta)
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
@@ -5575,13 +6525,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                wire_item = ("__tool_progress__", {
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
-                }))
+                })
+                if prestream_timing is not None:
+                    prestream_timing.observe_queued_semantic("tool_start")
+                _stream_q.put(wire_item)
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -5618,50 +6571,101 @@ class APIServerAdapter(BasePlatformAdapter):
                 request.get("hermes_profile_home")
             )
             try:
-                user_message = await _expanded_user_message(
-                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                if prestream_timing is not None and skill_expansion_enabled:
+                    prestream_timing.skill_expand_started()
+                def _expansion_settled() -> None:
+                    if prestream_timing is not None and skill_expansion_enabled:
+                        prestream_timing.skill_expand_settled()
+                    self._end_profile_chat_run(expansion_run_key)
+
+                expansion_timing_token = _prestream_timing_context.set(
+                    prestream_timing
                 )
+                try:
+                    try:
+                        user_message = await _expanded_user_message(
+                            on_settled=_expansion_settled
+                        )
+                    except asyncio.CancelledError:
+                        if prestream_timing is not None and skill_expansion_enabled:
+                            prestream_timing.skill_expand_completed("cancelled")
+                        raise
+                    except BaseException:
+                        if prestream_timing is not None and skill_expansion_enabled:
+                            prestream_timing.skill_expand_completed("error")
+                        raise
+                    else:
+                        if prestream_timing is not None and skill_expansion_enabled:
+                            prestream_timing.skill_expand_completed("success")
+                finally:
+                    _prestream_timing_context.reset(expansion_timing_token)
             except BaseException:
                 # The stream path ends the run in the agent task's
                 # done-callback; a failure before that task exists must not
                 # leak the active-run count (unload would then hang/refuse).
                 self._end_profile_chat_run(profile_run_key)
+                if prestream_timing is not None:
+                    prestream_timing.terminal_write_completed()
                 raise
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                **agent_overrides,
-                route=route,
-                response_mode=response_mode,
-                plan_ack=plan_ack,
-                plan_auto_execute=plan_auto_execute,
-                turn_id=turn_id,
-                connector_route_capability=connector_route_capability,
-                business_execution_token=business_execution_token,
-                current_turn_reference_image=current_turn_reference_image,
-                request_overrides=request_overrides or None,
-                trusted_user_message=trusted_user_message,
-                trusted_skill_slug=trusted_skill_slug,
-            ))
+            if prestream_timing is not None:
+                prestream_timing.executor_queued()
+            timing_token = _prestream_timing_context.set(prestream_timing)
+            try:
+                try:
+                    agent_task = asyncio.ensure_future(self._run_agent(
+                        user_message=user_message,
+                        conversation_history=history,
+                        ephemeral_system_prompt=system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_on_delta,
+                        tool_start_callback=_on_tool_start,
+                        tool_complete_callback=_on_tool_complete,
+                        agent_ref=agent_ref,
+                        gateway_session_key=gateway_session_key,
+                        **agent_overrides,
+                        route=route,
+                        response_mode=response_mode,
+                        plan_ack=plan_ack,
+                        plan_auto_execute=plan_auto_execute,
+                        turn_id=turn_id,
+                        connector_route_capability=connector_route_capability,
+                        creation_action_receipt_transport=creation_action_receipt_transport,
+                        hardware_execution_token=hardware_execution_token,
+                        execution_policy=execution_policy,
+                        current_turn_reference_image=current_turn_reference_image,
+                        request_overrides=request_overrides or None,
+                        trusted_user_message=trusted_user_message,
+                        trusted_skill_slug=trusted_skill_slug,
+                        prestream_timing=prestream_timing,
+                    ))
+                except BaseException:
+                    if prestream_timing is not None:
+                        prestream_timing.terminal_write_completed()
+                    raise
+            finally:
+                _prestream_timing_context.reset(timing_token)
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            def _finish_chat_stream(_fut):
+                for safe_delta in media_delta_filter.finish():
+                    _stream_q.put(safe_delta)
+                _stream_q.put(None)
+
+            agent_task.add_done_callback(_finish_chat_stream)
             agent_task.add_done_callback(
                 lambda _fut, key=profile_run_key: self._end_profile_chat_run(key)
             )
 
-            return await self._write_sse_chat_completion(
-                request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
-                gateway_session_key=gateway_session_key,
-            )
+            writer_timing_token = _prestream_timing_context.set(prestream_timing)
+            try:
+                return await self._write_sse_chat_completion(
+                    request, completion_id, model_name, created, _stream_q,
+                    agent_task, agent_ref, session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    prestream_timing=prestream_timing,
+                )
+            finally:
+                _prestream_timing_context.reset(writer_timing_token)
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
@@ -5700,7 +6704,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
-                    business_execution_token=business_execution_token,
+                    creation_action_receipt_transport=creation_action_receipt_transport,
+                    hardware_execution_token=hardware_execution_token,
+                    execution_policy=execution_policy,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
@@ -5709,62 +6715,110 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 self._end_profile_chat_run(profile_run_key)
 
-        idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(
-                body,
-                keys=[
-                    "model",
-                    "provider",
-                    "model_options",
-                    "messages",
-                    "tools",
-                    "tool_choice",
-                    "response_format",
-                    "stream",
-                    "metadata",
-                ],
-                execution_scope_digest=_business_execution_scope_digest(
-                    business_execution_token
-                ),
+            fp = (
+                _make_silent_automation_fingerprint(
+                    body,
+                    identity_scope="\0".join(
+                        (
+                            str(request.get("hermes_profile_home") or ""),
+                            str(gateway_session_key or ""),
+                            str(session_id or ""),
+                        )
+                    ),
+                )
+                if execution_policy == "silent_automation"
+                else _make_request_fingerprint(
+                    body,
+                    keys=[
+                        "model",
+                        "provider",
+                        "model_options",
+                        "messages",
+                        "tools",
+                        "tool_choice",
+                        "response_format",
+                        "stream",
+                        "metadata",
+                    ],
+                    hardware_execution_token=hardware_execution_token,
+                    admission_scope=(
+                        "canonical_final_v1"
+                        if request.get("canonical_final_creation_action_admitted", False)
+                        else "plain"
+                    ),
+                    identity_scope="\0".join(
+                        (
+                            str(request.get("hermes_profile_home") or ""),
+                            str(gateway_session_key or ""),
+                            str(session_id or ""),
+                        )
+                    ),
+                )
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except ValueError as e:
-                if "response_format" in str(e):
+                # ⭐ 判据是**类型**,⛔ 不是文本形状。
+                # 前两版分别用过「文本里含 response_format」和「以它开头」——
+                # 都挡不住 `_run_agent` 内部一条恰好提到该词的 ValueError
+                # (RH 实测:"response_format resolver crashed at /volume1/…"
+                #  被当成 400 请求校验错误、内部路径原样回显)。
+                # 现在只认 agent.response_format 有意抛出的那个子类;它仍继承
+                # ValueError,所以其余调用点行为不变。
+                if isinstance(e, ResponseFormatValidationError):
                     return web.json_response(
                         _openai_error(str(e), param="response_format"),
                         status=400,
                     )
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
         else:
             try:
                 result, usage = await _compute_completion()
             except ValueError as e:
-                if "response_format" in str(e):
+                # ⭐ 判据是**类型**,⛔ 不是文本形状。
+                # 前两版分别用过「文本里含 response_format」和「以它开头」——
+                # 都挡不住 `_run_agent` 内部一条恰好提到该词的 ValueError
+                # (RH 实测:"response_format resolver crashed at /volume1/…"
+                #  被当成 400 请求校验错误、内部路径原样回显)。
+                # 现在只认 agent.response_format 有意抛出的那个子类;它仍继承
+                # ValueError,所以其余调用点行为不变。
+                if isinstance(e, ResponseFormatValidationError):
                     return web.json_response(
                         _openai_error(str(e), param="response_format"),
                         status=400,
                     )
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("chat completions", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
 
@@ -5847,6 +6901,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        prestream_timing: Optional[PrestreamTiming] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -5855,6 +6910,21 @@ class APIServerAdapter(BasePlatformAdapter):
         LLM API calls, and the asyncio task wrapper is cancelled.
         """
         import queue as _q
+
+        if prestream_timing is None:
+            prestream_timing = _prestream_timing_context.get()
+        timing_terminal_completed = False
+
+        def _complete_timing_terminal_once() -> None:
+            nonlocal timing_terminal_completed
+            if timing_terminal_completed:
+                return
+            timing_terminal_completed = True
+            if prestream_timing is not None:
+                try:
+                    prestream_timing.terminal_write_completed()
+                except Exception:
+                    pass
 
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -5872,7 +6942,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
+        try:
+            await response.prepare(request)
+        except BaseException:
+            _complete_timing_terminal_once()
+            raise
 
         try:
             last_activity = time.monotonic()
@@ -5898,6 +6972,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                semantic_event = None
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     # Keep browserState's wire representation identical to its
                     # UTF-8 byte-budget calculation.  ASCII escaping can triple
@@ -5913,6 +6988,22 @@ class APIServerAdapter(BasePlatformAdapter):
                             "utf-8", errors="backslashreplace"
                         )
                     )
+                    if semantic_event is None and prestream_timing is not None:
+                        if item[1].get("type") == "reasoning.delta":
+                            semantic_event = prestream_timing.semantic_classified(
+                                "reasoning"
+                            )
+                        elif item[1].get("type") == "hermes.attachment":
+                            semantic_event = prestream_timing.semantic_classified(
+                                "attachment"
+                            )
+                        elif (
+                            item[1].get("status") == "running"
+                            and item[1].get("toolCallId")
+                        ):
+                            semantic_event = prestream_timing.semantic_classified(
+                                "tool_start"
+                            )
                 elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
                     event_data = json.dumps(item[1])
                     await response.write(
@@ -5921,12 +7012,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 else:
                     if isinstance(item, str):
                         streamed_text_parts.append(item)
+                        if semantic_event is None:
+                            if prestream_timing is not None:
+                                prestream_timing.observe_queued_semantic("content")
+                            semantic_event = (
+                                prestream_timing.semantic_classified("content")
+                                if prestream_timing is not None
+                                else None
+                            )
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
                         "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
                     }
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                if prestream_timing is not None:
+                    try:
+                        prestream_timing.public_write_completed(semantic_event)
+                    except Exception:
+                        pass
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -5974,7 +7078,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 result = {
                     "completed": False,
                     "failed": True,
-                    "error": str(exc),
+                    "error": _boundary_error_text("chat completions stream", exc),
                 }
             result_dict = result if isinstance(result, dict) else {}
             completed = bool(result_dict.get("completed", True))
@@ -5995,8 +7099,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # creation-recommendation envelope), emit that suffix before the
             # terminal chunk so API consumers persist and render the actual
             # final response rather than the pre-transform draft.
+            final_response = result_dict.get("final_response") or ""
+            has_streamed_response = any(streamed_text_parts)
             if result_dict.get("response_transformed"):
-                final_response = result_dict.get("final_response") or ""
                 transform_suffix = result_dict.get("response_transform_suffix")
                 streamed_response = "".join(streamed_text_parts)
                 if isinstance(transform_suffix, str) and transform_suffix:
@@ -6016,6 +7121,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         "final output is not an append-only transform",
                         completion_id,
                     )
+            elif not has_streamed_response and final_response:
+                # Some trusted preflight and other early-return paths produce a
+                # complete final response without entering the provider loop,
+                # so stream_delta_callback never receives a token. Preserve the
+                # OpenAI streaming contract by emitting that response exactly
+                # once before the terminal chunk.
+                await _emit(final_response)
 
             # Finish chunk
             finish_chunk = {
@@ -6028,6 +7140,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            hermes_terminal: Dict[str, Any] = {}
+            if result_dict.get("response_transformed") or result_dict.get(
+                "canonical_response_required"
+            ):
+                hermes_terminal["canonical_final_response"] = str(
+                    result_dict.get("final_response") or ""
+                )
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
                 _wire_code = _hermes_error_code(result_dict, finish_reason)
@@ -6036,14 +7155,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": err_msg,
                         "type": _wire_code,
                     }
-                finish_chunk["hermes"] = {
+                hermes_terminal.update({
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": _wire_code,
-                }
+                })
+            if hermes_terminal:
+                finish_chunk["hermes"] = hermes_terminal
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            _complete_timing_terminal_once()
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
@@ -6079,6 +7201,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(b"data: [DONE]\n\n")
             except Exception:
                 pass
+
+        finally:
+            _complete_timing_terminal_once()
 
         return response
 
@@ -6196,20 +7321,21 @@ class APIServerAdapter(BasePlatformAdapter):
             *,
             conversation_history_snapshot: Optional[List[Dict[str, Any]]] = None,
             session_id_snapshot: Optional[str] = None,
-        ) -> None:
+        ) -> bool:
             if not store:
-                return
+                return True
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
-            self._response_store.put(response_id, {
+            stored = self._response_store.put(response_id, {
                 "response": response_env,
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id_snapshot or session_id,
             })
-            if conversation:
+            if conversation and stored:
                 self._response_store.set_conversation(conversation, response_id)
+            return stored
 
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
@@ -6497,14 +7623,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 # delta so Responses clients still receive a live text part.
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
                 if agent_final and not final_text_parts:
-                    await _emit_text_delta(agent_final)
+                    await _emit_text_delta(_resolve_media_to_data_urls(agent_final))
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
-                agent_error = _redact_api_error_text(e)
+                agent_error = _boundary_error_text("streaming responses", e)
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -6586,11 +7712,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "role": "assistant",
                         "content": final_response_text or _redact_api_error_text(agent_error),
                     })
-                _persist_response_snapshot(
+                stored = _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
                 )
-                terminal_snapshot_persisted = True
+                terminal_snapshot_persisted = stored
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -6614,16 +7740,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 # here we only propagate a compression-rotated session_id so
                 # previous_response_id chaining resumes the child session.
                 _result_sid = result.get("session_id") if isinstance(result, dict) else None
-                _persist_response_snapshot(
+                stored = _persist_response_snapshot(
                     completed_env,
                     conversation_history_snapshot=full_history,
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
-                terminal_snapshot_persisted = True
-                await _write_event("response.completed", {
-                    "type": "response.completed",
-                    "response": completed_env,
-                })
+                terminal_snapshot_persisted = stored
+                if store and not stored:
+                    failed_env = _envelope("failed")
+                    failed_env["output"] = final_items
+                    failed_env["error"] = {
+                        "message": RESPONSE_STORE_FAILURE_MESSAGE,
+                        "type": "server_error",
+                    }
+                    failed_env["usage"] = completed_env["usage"]
+                    await _write_event("response.failed", {
+                        "type": "response.failed",
+                        "response": failed_env,
+                    })
+                else:
+                    await _write_event("response.completed", {
+                        "type": "response.completed",
+                        "response": completed_env,
+                    })
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
@@ -6671,13 +7810,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # BadRequestError, AuthenticationError).  Emit a response.failed
             # event and properly terminate the SSE stream so the client doesn't
             # get a TransferEncodingError from incomplete chunked encoding.
-            import traceback as _tb
             _persist_incomplete_if_needed()
-            agent_error = _redact_api_error_text(_tb.format_exc())
+            # ⛔ 这里原来送的是 `traceback.format_exc()` —— 整条堆栈直接进客户端。
+            # 上游失败时 provider 的解释仍然逐字送达,自己的 bug 只送编号。
+            agent_error = _boundary_error_text("responses stream", _exc, limit=500)
             try:
                 failed_env = _envelope("failed")
                 failed_env["output"] = list(emitted_items)
-                failed_env["error"] = {"message": _redact_api_error_text(_exc, limit=500), "type": "server_error"}
+                failed_env["error"] = {"message": agent_error, "type": "server_error"}
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -6827,13 +7967,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # calls in real time.  See _write_sse_responses for details.
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            media_delta_filter = _StreamingMediaDeltaFilter()
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
                 # Forwarding would kill the SSE stream prematurely; the
                 # SSE writer detects completion via agent_task.done().
                 if delta is not None:
-                    _stream_q.put(delta)
+                    for safe_delta in media_delta_filter.feed(delta):
+                        _stream_q.put(safe_delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Queue non-start tool progress events if needed in future.
@@ -6878,7 +8020,12 @@ class APIServerAdapter(BasePlatformAdapter):
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            def _finish_responses_stream(_fut):
+                for safe_delta in media_delta_filter.finish():
+                    _stream_q.put(safe_delta)
+                _stream_q.put(None)
+
+            agent_task.add_done_callback(_finish_responses_stream)
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)
@@ -6932,7 +8079,10 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("responses", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
         else:
@@ -6941,7 +8091,10 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        _boundary_error_text("responses", e),
+                        err_type="server_error",
+                    ),
                     status=500,
                 )
 
@@ -6997,7 +8150,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
-            self._response_store.put(response_id, {
+            stored = self._response_store.put(response_id, {
                 "response": response_data,
                 "conversation_history": full_history,
                 "instructions": instructions,
@@ -7005,8 +8158,17 @@ class APIServerAdapter(BasePlatformAdapter):
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
-            if conversation:
+            if conversation and stored:
                 self._response_store.set_conversation(conversation, response_id)
+            if not stored:
+                return web.json_response(
+                    _openai_error(
+                        RESPONSE_STORE_FAILURE_MESSAGE,
+                        err_type="server_error",
+                    ),
+                    status=500,
+                    headers={"X-Hermes-Session-Id": _effective_session_id},
+                )
 
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:
@@ -7056,7 +8218,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
-        "repeat", "enabled", "timezone", "output_language",
+        "repeat", "enabled", "timezone", "output_language", "source",
         # A server-owned optimistic-concurrency fence. Its only current
         # caller is local-server's dedicated-maintainer schedule bridge; it
         # is not persisted as a mutable job field.
@@ -7209,7 +8371,9 @@ class APIServerAdapter(BasePlatformAdapter):
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_list_job_occurrences(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/occurrences — real runs plus bounded future previews."""
@@ -7265,7 +8429,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_create_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs — create a new cron job."""
@@ -7286,6 +8452,14 @@ class APIServerAdapter(BasePlatformAdapter):
             timezone = body.get("timezone")
             output_language = body.get("output_language")
             origin = body.get("origin")
+            source = body.get("source")
+            # ADIC v1 (interface-freeze doc §7): server-stamped ONLY. Never
+            # add these to _UPDATE_ALLOWED_FIELDS — local-server's dedicated-
+            # maintainer bridge sets them once at provision time, and
+            # cron.jobs.create_job / update_job (_IMMUTABLE_JOB_FIELDS) are the
+            # actual enforcement point, not this handler.
+            app_slug = body.get("app_slug")
+            import_operation = body.get("import_operation")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -7327,8 +8501,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["timezone"] = timezone
             if output_language is not None:
                 kwargs["output_language"] = output_language
+            if source is not None:
+                kwargs["source"] = source
             if origin is not None:
                 kwargs["origin"] = origin
+            if app_slug is not None:
+                kwargs["app_slug"] = app_slug
+            if import_operation is not None:
+                kwargs["import_operation"] = import_operation
 
             if _cron_job_requires_live_chat_authorization(skills):
                 return web.json_response(
@@ -7341,7 +8521,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_get_job(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/{job_id} — get a single cron job."""
@@ -7360,7 +8542,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} — update a cron job."""
@@ -7417,7 +8601,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_delete_job(self, request: "web.Request") -> "web.Response":
         """DELETE /api/jobs/{job_id} — delete a cron job."""
@@ -7431,13 +8617,29 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            success = _cron_remove(job_id)
+            expected_revision = request.query.get("expected_revision")
+            if expected_revision is not None:
+                expected_revision = int(expected_revision)
+                if expected_revision < 0:
+                    raise ValueError("expected_revision must be a non-negative integer")
+            if expected_revision is None:
+                success = _cron_remove(job_id)
+            else:
+                success = _cron_remove(job_id, expected_revision=expected_revision)
             if not success:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"ok": True})
+        except _CronJobRevisionConflict as e:
+            return web.json_response(
+                {"error": str(e), "code": "revision_conflict"}, status=409
+            )
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_pause_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/pause — pause a cron job."""
@@ -7457,7 +8659,9 @@ class APIServerAdapter(BasePlatformAdapter):
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_resume_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/resume — resume a paused cron job."""
@@ -7476,6 +8680,54 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except Exception as e:
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
+
+    async def _handle_defer_job(self, request: "web.Request") -> "web.Response":
+        """POST /api/jobs/{job_id}/defer — postpone a job's next run.
+
+        Body: {"seconds": 300} or {"until": "<ISO-8601>"}, optional "reason".
+        Unlike pause, the job stays enabled and keeps its cadence: the next
+        slot moves out to the later of its current slot and the retry point,
+        and the deferral is recorded (deferred_at / defer_reason /
+        defer_count). Used by the app-refresh governor so deferred maintainer
+        refreshes resume on their own instead of staying paused.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
+        seconds = body.get("seconds")
+        until = body.get("until")
+        reason = body.get("reason")
+        if seconds is None and until is None:
+            return web.json_response({"error": "provide seconds or until"}, status=400)
+        try:
+            job = _cron_defer(
+                job_id,
+                seconds=float(seconds) if seconds is not None else None,
+                until=str(until) if until is not None else None,
+                reason=str(reason) if reason else None,
+            )
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+            _notify_cron_provider_jobs_changed()
+            return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -7499,7 +8751,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+            return web.json_response(
+                {"error": _boundary_error_text("cron api", e)}, status=500
+            )
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
         """POST /api/cron/fire — Chronos managed-cron fire webhook (NAS → agent).
@@ -8036,11 +9290,14 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
-        business_execution_token: Optional[str] = None,
+        creation_action_receipt_transport: str = "",
+        hardware_execution_token: Optional[str] = None,
+        execution_policy: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
+        prestream_timing: Optional[PrestreamTiming] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -8082,18 +9339,38 @@ class APIServerAdapter(BasePlatformAdapter):
             (request_overrides or {}).get("_zettlab_session_context_account_id")
             or session_user_id
         ).strip()
+        if prestream_timing is None:
+            prestream_timing = _prestream_timing_context.get()
+        turn_plan_ack_status = str(
+            (plan_ack or {}).get("status", "") or ""
+        ).strip().lower()
+        turn_plan_ack_turn_id = str(
+            (plan_ack or {}).get("turn_id", "") or ""
+        ).strip()
+        turn_plan_ack_revision_requested = ""
+        if turn_plan_ack_status not in {"confirmed", "cancelled"}:
+            turn_plan_ack_status = ""
+            turn_plan_ack_turn_id = ""
+        else:
+            turn_plan_ack_revision_requested = (
+                "1" if bool((plan_ack or {}).get("revision_requested")) else "0"
+            )
 
         def _run():
             from gateway.session_context import (
                 clear_turn_vars,
                 clear_session_vars,
+                pop_zettlab_auth_principal,
                 pop_current_turn_reference_image,
+                push_zettlab_auth_principal,
                 push_current_turn_reference_image,
                 set_turn_vars,
                 set_zettlab_connector_route_capability,
                 set_zettlab_turn_id,
             )
 
+            if prestream_timing is not None:
+                prestream_timing.executor_started()
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
@@ -8103,7 +9380,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 turn_tokens = set_turn_vars(
                     turn_id=str(turn_id or ""),
-                    business_execution_token=str(business_execution_token or ""),
+                    plan_ack_status=turn_plan_ack_status,
+                    plan_ack_turn_id=turn_plan_ack_turn_id,
+                    plan_ack_revision_requested=turn_plan_ack_revision_requested,
+                    hardware_execution_token=str(hardware_execution_token or ""),
+                    execution_policy=str(execution_policy or ""),
+                )
+                principal_token = (
+                    push_zettlab_auth_principal(session_user_id)
+                    if session_user_id
+                    else None
                 )
                 agent = None
                 # turn_id is request-scoped correlation for NAS fallback and
@@ -8122,22 +9408,33 @@ class APIServerAdapter(BasePlatformAdapter):
                     resolved_plan_auto_execute = _resolve_plan_auto_execute(plan_auto_execute)
                     create_overrides = dict(request_overrides or {})
                     create_overrides["_zet_plan_auto_execute"] = resolved_plan_auto_execute
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=stream_delta_callback,
-                        tool_progress_callback=tool_progress_callback,
-                        tool_start_callback=tool_start_callback,
-                        tool_complete_callback=tool_complete_callback,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=requested_model,
-                        requested_provider=requested_provider,
-                        model_options=model_options,
-                        route=route,
-                        session_model=session_model,
-                        confirmed_runtime_lock=confirmed_runtime_lock,
-                        request_overrides=create_overrides,
-                    )
+                    create_overrides["_zet_execution_policy"] = execution_policy or ""
+                    if prestream_timing is not None:
+                        prestream_timing.agent_init_started()
+                    try:
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=stream_delta_callback,
+                            tool_progress_callback=tool_progress_callback,
+                            tool_start_callback=tool_start_callback,
+                            tool_complete_callback=tool_complete_callback,
+                            gateway_session_key=gateway_session_key,
+                            requested_model=requested_model,
+                            requested_provider=requested_provider,
+                            model_options=model_options,
+                            route=route,
+                            session_model=session_model,
+                            confirmed_runtime_lock=confirmed_runtime_lock,
+                            request_overrides=create_overrides,
+                        )
+                    except BaseException:
+                        if prestream_timing is not None:
+                            prestream_timing.agent_init_finished("error")
+                        raise
+                    else:
+                        if prestream_timing is not None:
+                            prestream_timing.agent_init_finished("success")
                     agent._tools_disabled_for_request = (
                         create_overrides.get("tool_choice") == "none"
                     )
@@ -8146,6 +9443,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent._zet_agent_response_mode = response_mode or ""
                     agent._zet_agent_plan_ack = dict(plan_ack or {})
                     agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
+                    agent._creation_action_receipt_transport = (
+                        creation_action_receipt_transport
+                    )
                     if trusted_user_message is not None:
                         agent._zet_agent_trusted_user_message = trusted_user_message
                     agent._zet_agent_trusted_skill_slug = trusted_skill_slug
@@ -8298,6 +9598,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                     pop_current_turn_reference_image(reference_token)
+                    if principal_token is not None:
+                        pop_zettlab_auth_principal(principal_token)
                     clear_turn_vars(turn_tokens)
                     clear_session_vars(tokens)
                     set_zettlab_turn_id("")
@@ -8308,6 +9610,8 @@ class APIServerAdapter(BasePlatformAdapter):
         from contextvars import copy_context
 
         ctx = copy_context()
+        if prestream_timing is not None:
+            ctx.run(_prestream_timing_context.set, prestream_timing)
         self._inflight_agent_runs += 1
         try:
             return await _run_in_executor_with_completion_barrier(
@@ -8848,10 +10152,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
+                run_error = _boundary_error_text("run", exc)
                 self._set_run_status(
                     run_id,
                     "failed",
-                    error=_redact_api_error_text(exc),
+                    error=run_error,
                     last_event="run.failed",
                 )
                 try:
@@ -8859,7 +10164,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
+                        "error": run_error,
                     })
                 except Exception:
                     pass
@@ -9031,7 +10336,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
-            return web.json_response(_openai_error(str(exc)), status=500)
+            return web.json_response(
+                _openai_error(_boundary_error_text("approval resolution", exc)),
+                status=500,
+            )
 
         if resolved <= 0:
             return web.json_response(

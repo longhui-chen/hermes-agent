@@ -42,7 +42,7 @@ class TestProbeMcpServerTools:
         mock_server._tools = [mock_tool]
         mock_server.shutdown = AsyncMock()
 
-        async def fake_connect(name, cfg):
+        async def fake_connect(name, cfg, **_kwargs):
             if name == "broken":
                 raise ConnectionError("Server not found")
             return mock_server
@@ -54,7 +54,7 @@ class TestProbeMcpServerTools:
              patch("tools.mcp_tool._run_on_mcp_loop") as mock_run, \
              patch("tools.mcp_tool._stop_mcp_loop"):
 
-            def run_coro(coro_or_factory, timeout=120):
+            def run_coro(coro_or_factory, timeout=120, **_kwargs):
                 coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
                 loop = asyncio.new_event_loop()
                 try:
@@ -84,7 +84,7 @@ class TestProbeMcpServerTools:
 
         connect_calls = []
 
-        async def fake_connect(name, cfg):
+        async def fake_connect(name, cfg, **_kwargs):
             connect_calls.append(name)
             return mock_server
 
@@ -95,7 +95,7 @@ class TestProbeMcpServerTools:
              patch("tools.mcp_tool._run_on_mcp_loop") as mock_run, \
              patch("tools.mcp_tool._stop_mcp_loop"):
 
-            def run_coro(coro_or_factory, timeout=120):
+            def run_coro(coro_or_factory, timeout=120, **_kwargs):
                 coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
                 loop = asyncio.new_event_loop()
                 try:

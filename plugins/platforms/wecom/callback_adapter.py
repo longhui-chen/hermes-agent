@@ -46,7 +46,7 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult, safe_exc
 from plugins.platforms.wecom.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
 
 logger = logging.getLogger(__name__)
@@ -172,7 +172,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.warning(
                         "[WecomCallback] Initial token refresh failed for app '%s': %s",
-                        app.get("name", "default"), exc,
+                        app.get("name", "default"), safe_exc(exc),
                     )
             return True
         except Exception:

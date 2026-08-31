@@ -975,20 +975,50 @@ def judge_goal(
     return verdict, reason, parse_failed, wait_directive, False
 
 
-def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def gather_background_processes(
+    task_id: Optional[str] = None,
+    session_key: Optional[str] = None,
+    extra_session_keys: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """Return the live background-process snapshot for the goal judge.
 
-    Thin, fail-safe wrapper over ``process_registry.list_sessions(task_id)``.
+    Thin, fail-safe wrapper over ``process_registry.list_sessions``.
     Returns only RUNNING processes (an exited one is nothing to wait on) and
     never raises — any import/registry failure yields ``[]`` so the goal loop
     degrades to its pre-wait-barrier behavior (judge just won't see processes).
     The drivers (CLI + gateway) call this and pass the result into
     ``GoalManager.evaluate_after_turn(background_processes=...)``.
+
+    ``session_key`` (plus optional ``extra_session_keys``) scopes the snapshot
+    to one conversation. Without a key the registry returns the whole profile
+    — a concurrent cron job's terminal/browser processes would then look like
+    the Goal's own wait targets and park the loop. Zettlab's goal driver
+    passes the profile-scoped process key plus raw/compaction aliases.
     """
     try:
         from tools.process_registry import process_registry
 
-        sessions = process_registry.list_sessions(task_id=task_id) or []
+        keys: List[str] = []
+        for raw in (session_key, *(extra_session_keys or [])):
+            key = str(raw or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+        if keys:
+            sessions: List[Dict[str, Any]] = []
+            seen: set = set()
+            for key in keys:
+                for row in process_registry.list_sessions(
+                    task_id=task_id, session_key=key,
+                ) or []:
+                    if not isinstance(row, dict):
+                        continue
+                    marker = row.get("session_id") or row.get("pid") or id(row)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    sessions.append(row)
+        else:
+            sessions = process_registry.list_sessions(task_id=task_id) or []
     except Exception as exc:
         logger.debug("gather_background_processes failed: %s", exc)
         return []

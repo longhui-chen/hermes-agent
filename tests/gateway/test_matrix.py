@@ -320,6 +320,16 @@ def _make_adapter():
     return adapter
 
 
+@pytest.mark.parametrize("configured", ["0", "-1"])
+def test_matrix_nonpositive_media_limit_uses_bounded_default(monkeypatch, configured):
+    """非正配置不能把 Matrix 入站媒体的累计字节门关掉。"""
+    monkeypatch.setenv("MATRIX_MAX_MEDIA_BYTES", configured)
+    adapter = _make_adapter()
+
+    assert adapter._max_media_bytes == 100 * 1024 * 1024
+    assert adapter._max_media_bytes > 0
+
+
 # ---------------------------------------------------------------------------
 # Typing indicator
 # ---------------------------------------------------------------------------
@@ -1958,32 +1968,76 @@ class TestMatrixImageOnlyMediaNormalization:
             captured_event = msg_event
 
         self.adapter.handle_message = capture
-
-        await self.adapter._handle_media_message(
-            room_id="!room:example.org",
-            sender="@alice:example.org",
-            event_id="$image1",
-            event_ts=0.0,
-            source_content={
-                "msgtype": "m.image",
-                "body": "30.png",
-                "url": "mxc://example/30.png",
-                "info": {"mimetype": "image/png"},
-            },
-            relates_to={},
-            msgtype="m.image",
+        self.adapter._download_mxc_media_with_cap = AsyncMock(
+            return_value=b"\xff\xd8\xffimage"
         )
+
+        with patch(
+            "gateway.platforms.base.cache_image_from_bytes",
+            return_value="/cache/30.png",
+        ):
+            await self.adapter._handle_media_message(
+                room_id="!room:example.org",
+                sender="@alice:example.org",
+                event_id="$image1",
+                event_ts=0.0,
+                source_content={
+                    "msgtype": "m.image",
+                    "body": "30.png",
+                    "url": "mxc://example/30.png",
+                    "info": {"mimetype": "image/png"},
+                },
+                relates_to={},
+                msgtype="m.image",
+            )
 
         assert captured_event is not None
         assert captured_event.text == ""
         assert captured_event.media_urls == [
-            "https://matrix.example.org/_matrix/media/v3/download/example/30.png"
+            "/cache/30.png"
         ]
         assert captured_event.message_type == MessageType.PHOTO
 
+    @pytest.mark.asyncio
+    async def test_image_caption_and_media_stay_in_one_gateway_event(self):
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter.handle_message = capture
+        self.adapter._download_mxc_media_with_cap = AsyncMock(
+            return_value=b"\xff\xd8\xffimage"
+        )
+
+        with patch(
+            "gateway.platforms.base.cache_image_from_bytes",
+            return_value="/cache/caption.png",
+        ):
+            await self.adapter._handle_media_message(
+                room_id="!room:example.org",
+                sender="@alice:example.org",
+                event_id="$image-caption",
+                event_ts=0.0,
+                source_content={
+                    "msgtype": "m.image",
+                    "body": "请看这张图",
+                    "url": "mxc://example/caption.png",
+                    "info": {"mimetype": "image/png"},
+                },
+                relates_to={},
+                msgtype="m.image",
+            )
+
+        assert captured_event is not None
+        assert captured_event.text == "请看这张图"
+        assert len(captured_event.media_urls) == 1
+        assert captured_event.media_types == ["image/png"]
+
 
     @pytest.mark.asyncio
-    async def test_inbound_oversized_media_is_rejected(self):
+    async def test_declared_oversize_keeps_caption_and_reports_actionable_failure(self):
         captured_event = None
 
         async def capture(msg_event):
@@ -2000,7 +2054,7 @@ class TestMatrixImageOnlyMediaNormalization:
             event_ts=0.0,
             source_content={
                 "msgtype": "m.image",
-                "body": "huge.png",
+                "body": "请分析这张图",
                 "url": "mxc://example/huge.png",
                 "info": {"mimetype": "image/png", "size": 11},
             },
@@ -2008,66 +2062,330 @@ class TestMatrixImageOnlyMediaNormalization:
             msgtype="m.image",
         )
 
-        assert captured_event is None
+        assert captured_event is not None, "超限附件不能把整条用户消息静默丢掉"
+        assert not captured_event.media_urls
+        assert "请分析这张图" in captured_event.text
+        assert "size limit" in captured_event.text and "smaller" in captured_event.text
         self.adapter._client.download_media.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inbound_actual_bytes_over_cap_are_not_forwarded(self):
+        """Matrix 事件可省略/谎报 size；实际流必须在缓冲完成前受限。"""
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"\xff\xd8\xff" + b"x" * 8
+
+        class Response:
+            headers = {}
+            content = Content()
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+        class Session:
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        self.adapter._max_media_bytes = 10
+        self.adapter._client.download_media = AsyncMock(
+            return_value=b"\xff\xd8\xff" + b"x" * 8
+        )
+        self.adapter._client.api = types.SimpleNamespace(
+            session=Session(),
+            token="test-token",
+            as_user_id=None,
+            get_download_url=MagicMock(
+                return_value=(
+                    "https://matrix.example.org/_matrix/media/v3/download/"
+                    "example/oversize.png"
+                )
+            ),
+            log_download_request=MagicMock(return_value=18),
+            log_download_request_done=MagicMock(),
+        )
+        self.adapter._client.versions = AsyncMock(
+            return_value=types.SimpleNamespace(supports=lambda _version: False)
+        )
+        self.adapter.handle_message = capture
+
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$image-actual-big",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "oversize.png",
+                "url": "mxc://example/oversize.png",
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={},
+            msgtype="m.image",
+        )
+
+        assert captured_event is not None
+        assert not captured_event.media_urls, (
+            "实际超限的 Matrix 媒体不能落盘或作为远程 URL 继续送进模型"
+        )
+        assert "size limit" in captured_event.text and "smaller" in captured_event.text
+
+    @pytest.mark.asyncio
+    async def test_actual_oversize_preserves_user_caption(self):
+        from plugins.platforms.matrix.adapter import _MatrixInboundMediaRejected
+
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter._download_mxc_media_with_cap = AsyncMock(
+            side_effect=_MatrixInboundMediaRejected("too large")
+        )
+        self.adapter.handle_message = capture
+
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$caption-big",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "原始说明不能丢",
+                "url": "mxc://example/oversize.png",
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={},
+            msgtype="m.image",
+        )
+
+        assert captured_event is not None and not captured_event.media_urls
+        assert "原始说明不能丢" in captured_event.text
+        assert "size limit" in captured_event.text
+
+    @pytest.mark.asyncio
+    async def test_encrypted_media_missing_metadata_is_not_silent(self, monkeypatch):
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter._download_mxc_media_with_cap = AsyncMock(return_value=b"ciphertext")
+        self.adapter.handle_message = capture
+        crypto_module = types.ModuleType("mautrix.crypto.attachments")
+        crypto_module.decrypt_attachment = MagicMock(
+            side_effect=AssertionError("缺元数据时不应尝试解密")
+        )
+        monkeypatch.setitem(sys.modules, "mautrix.crypto.attachments", crypto_module)
+
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$encrypted-missing",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "加密图片说明",
+                "file": {"url": "mxc://example/encrypted"},
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={},
+            msgtype="m.image",
+        )
+
+        assert captured_event is not None and not captured_event.media_urls
+        crypto_module.decrypt_attachment.assert_not_called()
+        assert "加密图片说明" in captured_event.text
+        assert "attachment unavailable" in captured_event.text
+        assert "send" in captured_event.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_sender_reaches_pairing_without_downloading_media(self):
+        self.adapter.set_authorization_check(lambda *_args: False)
+        self.adapter._download_mxc_media_with_cap = AsyncMock(return_value=b"image")
+        self.adapter.handle_message = AsyncMock()
+
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@unpaired:example.org",
+            event_id="$unpaired-media",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "image.png",
+                "url": "mxc://example/image.png",
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={},
+            msgtype="m.image",
+        )
+
+        self.adapter._download_mxc_media_with_cap.assert_not_awaited()
+        self.adapter.handle_message.assert_awaited_once(), (
+            "未授权 Matrix 消息仍要交给共享鉴权/配对链"
+        )
+
+    @pytest.mark.asyncio
+    async def test_authenticated_download_failure_does_not_emit_unusable_bare_url(self):
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter._download_mxc_media_with_cap = AsyncMock(
+            side_effect=RuntimeError("homeserver unavailable")
+        )
+        self.adapter.handle_message = capture
+
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$download-failed",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "图片说明",
+                "url": "mxc://example/image.png",
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={},
+            msgtype="m.image",
+        )
+
+        assert captured_event is not None and not captured_event.media_urls
+        assert "图片说明" in captured_event.text
+        assert "attachment unavailable" in captured_event.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("authenticated", [False, True])
+    async def test_bounded_download_reuses_sdk_endpoint_and_live_api_token(
+        self, authenticated
+    ):
+        """流式上限不能破坏 SDK 的 v3/v1.11 协商或密码登录 token。"""
+        requested = {}
+
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"matrix-media"
+
+        class Response:
+            headers = {}
+            content = Content()
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+        class Session:
+            def get(self, url, **kwargs):
+                requested["url"] = str(url)
+                requested.update(kwargs)
+                return Response()
+
+        negotiated_url = (
+            "https://matrix.example.org/_matrix/client/v1/media/download/server/id"
+            if authenticated
+            else "https://matrix.example.org/_matrix/media/v3/download/server/id"
+        )
+        api = types.SimpleNamespace(
+            session=Session(),
+            token="password-login-token",
+            as_user_id="@bridge:test" if authenticated else None,
+            get_download_url=MagicMock(return_value=negotiated_url),
+            log_download_request=MagicMock(return_value=17),
+            log_download_request_done=MagicMock(),
+        )
+        self.adapter._access_token = ""
+        self.adapter._client = types.SimpleNamespace(
+            api=api,
+            versions=AsyncMock(
+                return_value=types.SimpleNamespace(
+                    supports=lambda _version: authenticated
+                )
+            ),
+        )
+
+        assert not self.adapter._access_token and api.token, (
+            "夹具必须模拟密码登录只把新 token 写入 client.api.token"
+        )
+        body = await self.adapter._download_mxc_media_with_cap("mxc://server/id")
+
+        assert body == b"matrix-media"
+        api.get_download_url.assert_called_once()
+        assert api.get_download_url.call_args.kwargs["authenticated"] is authenticated
+        assert requested["url"] == negotiated_url
+        assert requested["headers"] == (
+            {"Authorization": "Bearer password-login-token"}
+            if authenticated else {}
+        )
+        assert requested["params"] == (
+            {"allow_redirect": "false", "user_id": "@bridge:test"}
+            if authenticated else {"allow_redirect": "false"}
+        )
+        assert requested["allow_redirects"] is False
 
 
     @pytest.mark.asyncio
     async def test_external_media_download_follows_safe_redirect(self, monkeypatch):
-        """A redirect to another allowed URL is followed and its body returned."""
-        import aiohttp
+        """外部图片必须走 connect-time SSRF client，redirect hook 检查每一跳。"""
         import tools.url_safety as url_safety
 
-        class _Content:
-            async def iter_chunked(self, _size):
+        captured = {}
+
+        class _Response:
+            headers = {"content-type": "image/png"}
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
                 yield b"imgbytes"
 
-        class _RedirectResponse:
-            status = 302
-            headers = {"Location": "https://cdn.example.com/final.png"}
-            content_type = "image/png"
+        class _Stream:
+            async def __aenter__(self):
+                return _Response()
 
+            async def __aexit__(self, *_args):
+                return False
+
+        class _Client:
             async def __aenter__(self):
                 return self
 
             async def __aexit__(self, *_args):
-                return None
+                return False
 
-            def raise_for_status(self):
-                return None
+            def stream(self, method, url, **kwargs):
+                captured["request"] = (method, url, kwargs)
+                return _Stream()
 
-        class _OkResponse:
-            status = 200
-            headers = {}
-            content_type = "image/png"
-            content = _Content()
+        def make_client(**kwargs):
+            captured["client_kwargs"] = kwargs
+            return _Client()
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return None
-
-            def raise_for_status(self):
-                return None
-
-        class _Session:
-            def __init__(self):
-                self.requested = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return None
-
-            def get(self, url, *_args, **_kwargs):
-                self.requested.append(url)
-                return _RedirectResponse() if len(self.requested) == 1 else _OkResponse()
-
-        session = _Session()
-        monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: session)
         monkeypatch.setattr(url_safety, "is_safe_url", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", make_client)
 
         data, ct, _fname = await self.adapter._download_external_media_with_cap(
             "https://example.com/image.png"
@@ -2075,10 +2393,11 @@ class TestMatrixImageOnlyMediaNormalization:
 
         assert data == b"imgbytes"
         assert ct == "image/png"
-        assert session.requested == [
-            "https://example.com/image.png",
-            "https://cdn.example.com/final.png",
-        ]
+        assert captured["request"][:2] == ("GET", "https://example.com/image.png")
+        assert captured["client_kwargs"]["follow_redirects"] is True
+        assert captured["client_kwargs"]["event_hooks"]["response"], (
+            "connect-time 安全 client 之外仍要有 redirect-target hook"
+        )
 
 
     @pytest.mark.asyncio
@@ -2088,7 +2407,7 @@ class TestMatrixImageOnlyMediaNormalization:
 
         signed_url = "https://example.com/image.png?signature=secret-token#frag"
         self.adapter._download_external_media_with_cap = AsyncMock(
-            side_effect=ValueError("download failed")
+            side_effect=ValueError(f"download failed for {signed_url}")
         )
         self.adapter.send = AsyncMock(return_value=SendResult(success=True))
         monkeypatch.setattr(url_safety, "is_safe_url", lambda *_args, **_kwargs: True)

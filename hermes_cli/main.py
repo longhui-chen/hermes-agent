@@ -766,18 +766,6 @@ try:
 except Exception:
     pass  # best-effort — redaction stays at default (enabled) on config errors
 
-# The centralized logging setup below starts a QueueListener thread. Production
-# gateway processes must fork the trusted video-edit supervisor before that
-# thread exists; ordinary CLI commands must not pay this resident-process cost.
-try:
-    from hermes_cli.trusted_video_edit_startup import (
-        prepare_trusted_video_edit_runtime_before_cli_logging,
-    )
-
-    prepare_trusted_video_edit_runtime_before_cli_logging(sys.argv)
-except Exception:
-    pass  # best-effort — the gateway startup guard remains fail-closed
-
 # Initialize centralized file logging early — all `hermes` subcommands
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
@@ -12239,6 +12227,14 @@ def main():
     )
     sessions_delete.add_argument("session_id", help="Session ID to delete")
     sessions_delete.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation"
+    )
+
+    sessions_delete_agent = sessions_subparsers.add_parser(
+        "delete-agent", help="Delete every chat session belonging to a local agent"
+    )
+    sessions_delete_agent.add_argument("agent_id", help="Local agent ID")
+    sessions_delete_agent.add_argument(
         "--yes", "-y", action="store_true", help="Skip confirmation"
     )
 

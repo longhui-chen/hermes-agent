@@ -90,6 +90,8 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["user_id"] == "open-id"
     assert provider.init_kwargs["user_id_alt"] == "union-id"
     assert provider.init_kwargs["platform"] == "feishu"
+    assert provider.init_kwargs["memory_config"] == cfg["memory"]
+    assert provider.init_kwargs["memory_config"] is not cfg["memory"]
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
 
@@ -178,4 +180,3 @@ def test_core_tool_names_rejected_from_memory_routing_table():
     assert "clarify" not in schema_names
     assert "delegate_task" not in schema_names
     assert "honcho_search" in schema_names
-

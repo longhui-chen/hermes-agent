@@ -35,6 +35,7 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
+from agent.prestream_timing import observe_provider_dispatch
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -491,6 +492,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
+        observe_provider_dispatch()
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
@@ -507,6 +509,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
+            observe_provider_dispatch()
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
@@ -519,8 +522,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # MoA is a virtual chat-completions provider backed by the
         # in-process MoAClient facade. Do not rebuild a request-local
         # OpenAI client from the virtual runtime metadata.
+        observe_provider_dispatch(scope="composite")
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    observe_provider_dispatch()
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1142,7 +1147,15 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         from agent.response_format import response_format_requires_structured_output
 
         if response_format_requires_structured_output((agent.request_overrides or {}).get("response_format")):
-            raise ValueError("response_format is not supported by the Anthropic Messages transport.")
+            # 🔴 **必须是专用类型。** HTTP 边界已改成 ``isinstance(e,
+            # ResponseFormatValidationError)`` 才回 400;普通 ``ValueError`` 会掉进
+            # 内部错误分支 ⇒ 原本**可操作的 400**退化成「服务内部异常」的 500。
+            # ⭐ 上一轮我收窄了 catch,却**没把所有 raise 点跟上** —— 兄弟调用点。
+            from agent.response_format import ResponseFormatValidationError
+
+            raise ResponseFormatValidationError(
+                "response_format is not supported by the Anthropic Messages transport."
+            )
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)
@@ -2595,6 +2608,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
+                        observe_provider_dispatch()
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
@@ -2613,6 +2627,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
+                            observe_provider_dispatch()
                             return normalize_converse_response(
                                 client.converse(**final_kwargs)
                             )
@@ -3078,6 +3093,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            observe_provider_dispatch(
+                scope="composite" if agent.provider == "moa" else "physical"
+            )
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
@@ -3578,6 +3596,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            observe_provider_dispatch()
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

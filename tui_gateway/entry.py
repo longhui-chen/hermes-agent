@@ -403,12 +403,11 @@ def ensure_mcp_discovery_started() -> None:
     SELECTED profile's ``mcp_servers``, not the launch profile's (#67605).
 
     Delegating to the shared owner (instead of a hand-rolled thread) keeps
-    the process-wide start lock, the retry-after-zero-connected allowance,
+    the profile-scoped single-flight lock, the retry-after-zero-connected allowance,
     and interactive-OAuth suppression.
 
-    Known limitation: MCP tool registration is process-global, so in a
-    multi-profile process the FIRST profile that builds an agent wins the
-    discovery slot. Full per-profile MCP registries are tracked in #67605.
+    Discovery 与 MCP registry 都按 profile 身份分区：同 profile 复用单飞，
+    不同 profile 可并发发现自己的配置与长期连接。
     """
     global _mcp_discovery_enabled
 

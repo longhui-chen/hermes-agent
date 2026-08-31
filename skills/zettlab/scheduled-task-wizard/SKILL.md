@@ -1,6 +1,6 @@
 ---
 name: scheduled-task-wizard
-description: 定时任务（Hermes cron）的对话向导。用户表达"到点让 Agent 做事"时可加载：把自然语言提炼成自包含的 cron prompt，创建/修改直接调 cronjob 落盘、不做二次确认，只有删除输出 mode=delete 的 cron-action-preview JSON 围栏让 APP 渲染确认卡。schedule / deliver / repeat / output_language 的字段规则以 cronjob 工具描述为准，本 skill 只补充：删除确认流程、巡检类任务的 [SILENT] 约定、prompt 里相对时间词写死。出货内置，每个 ZettClaw Agent 默认装载。
+description: "处理定时、提醒、schedule/reminder 和周期任务。"
 version: 2.0.0
 author: zettlab
 license: proprietary

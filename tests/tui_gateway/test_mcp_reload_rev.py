@@ -19,12 +19,15 @@ fixtures still restore the module globals they touch.
 
 from __future__ import annotations
 
+import sys
 import threading
+import types
 
 import pytest
 
 import tools.mcp_tool as mcp_tool
 import tui_gateway.server as srv
+from hermes_constants import get_hermes_home
 
 
 @pytest.fixture()
@@ -33,15 +36,25 @@ def reload_env(monkeypatch):
     calls = {"discover": 0, "shutdown": 0}
     rev_box = {"rev": "rev-a"}
 
-    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: calls.__setitem__("shutdown", calls["shutdown"] + 1))
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: calls.__setitem__("discover", calls["discover"] + 1))
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_profile", lambda: calls.__setitem__("shutdown", calls["shutdown"] + 1))
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda **_kwargs: calls.__setitem__("discover", calls["discover"] + 1))
     monkeypatch.setattr(srv, "_compute_mcp_rev", lambda: rev_box["rev"])
 
-    saved = (srv._mcp_reload_gen, srv._mcp_reload_loaded_rev)
-    srv._mcp_reload_gen = 0
-    srv._mcp_reload_loaded_rev = ""
+    saved = (
+        dict(srv._mcp_reload_gen_by_profile),
+        dict(srv._mcp_reload_loaded_rev_by_profile),
+    )
+    srv._mcp_reload_gen_by_profile.clear()
+    srv._mcp_reload_loaded_rev_by_profile.clear()
     yield calls, rev_box
-    srv._mcp_reload_gen, srv._mcp_reload_loaded_rev = saved
+    srv._mcp_reload_gen_by_profile.clear()
+    srv._mcp_reload_gen_by_profile.update(saved[0])
+    srv._mcp_reload_loaded_rev_by_profile.clear()
+    srv._mcp_reload_loaded_rev_by_profile.update(saved[1])
+
+
+def _profile_key() -> str:
+    return str(get_hermes_home().resolve())
 
 
 def _reload(rev: str | None = None, rid: int = 1) -> dict:
@@ -60,10 +73,59 @@ def test_success_reports_loaded_rev(reload_env):
     assert envelope["result"]["status"] == "reloaded"
     assert envelope["result"]["loaded_rev"] == "rev-a"
     assert calls["discover"] == 1
-    assert srv._mcp_reload_gen == 1
+    assert srv._mcp_reload_gen_by_profile[_profile_key()] == 1
 
 
-def test_failed_reload_is_an_error_and_no_generation_advance(reload_env, monkeypatch):
+def test_reload_uses_session_profile_when_request_omits_profile(
+    reload_env, tmp_path, monkeypatch
+):
+    calls, _ = reload_env
+    session_id = "profile-b-session"
+    profile_home = tmp_path / "profiles" / "b"
+    profile_home.mkdir(parents=True)
+    launch_profile = _profile_key()
+    srv._mcp_reload_gen_by_profile[launch_profile] = 7
+    srv._mcp_reload_loaded_rev_by_profile[launch_profile] = "launch-rev"
+    seen_homes = []
+    monkeypatch.setitem(
+        srv._sessions,
+        session_id,
+        {"profile_home": str(profile_home), "agent": object()},
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "shutdown_mcp_profile",
+        lambda: seen_homes.append(("shutdown", get_hermes_home())),
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "discover_mcp_tools",
+        lambda: seen_homes.append(("discover", get_hermes_home())) or [],
+    )
+    monkeypatch.setattr(mcp_tool, "refresh_agent_mcp_tools", lambda *args, **kwargs: None)
+    monkeypatch.setattr(srv, "_session_info", lambda *args, **kwargs: {})
+    monkeypatch.setattr(srv, "_emit", lambda *args, **kwargs: None)
+
+    envelope = srv._methods["reload.mcp"](
+        1,
+        {"session_id": session_id, "confirm": True, "rev": "rev-a"},
+    )
+
+    assert envelope["result"]["status"] == "reloaded"
+    assert seen_homes == [
+        ("shutdown", profile_home),
+        ("discover", profile_home),
+    ]
+    assert srv._mcp_reload_gen_by_profile[str(profile_home.resolve())] == 1
+    assert srv._mcp_reload_gen_by_profile[launch_profile] == 7
+    assert srv._mcp_reload_loaded_rev_by_profile[launch_profile] == "launch-rev"
+    assert calls["shutdown"] == 0
+
+
+@pytest.mark.parametrize("failure_target", ["shutdown_mcp_profile", "discover_mcp_tools"])
+def test_failed_reload_is_an_error_and_no_generation_advance(
+    reload_env, monkeypatch, caplog, failure_target
+):
     """The exact client-facing contract: a failure must NOT look like an ack.
     quietRpc on the TUI side collapses this error to null and keeps the
     revision un-accepted, so the next poll retries."""
@@ -72,13 +134,75 @@ def test_failed_reload_is_an_error_and_no_generation_advance(reload_env, monkeyp
     def _boom():
         raise RuntimeError("flapping server")
 
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", _boom)
+    monkeypatch.setattr(mcp_tool, failure_target, _boom)
 
     envelope = _reload(rev="rev-b")
 
     assert "error" in envelope
-    assert srv._mcp_reload_gen == 0
-    assert srv._mcp_reload_loaded_rev == ""
+    assert "flapping server" not in envelope["error"]["message"]
+    assert "reference 1" in envelope["error"]["message"]
+    assert "request_id=1" in caplog.text
+    assert srv._mcp_reload_gen_by_profile.get(_profile_key(), 0) == 0
+    assert srv._mcp_reload_loaded_rev_by_profile.get(_profile_key(), "") == ""
+
+
+def test_agent_refresh_failure_log_keeps_request_reference(
+    reload_env, monkeypatch, caplog
+):
+    session_id = "refresh-failure-session"
+    monkeypatch.setitem(
+        srv._sessions,
+        session_id,
+        {"profile_home": str(get_hermes_home()), "agent": object()},
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("refresh callback detail")
+
+    monkeypatch.setattr(mcp_tool, "refresh_agent_mcp_tools", _boom)
+    monkeypatch.setattr(srv, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(srv, "_emit", lambda *_args, **_kwargs: None)
+
+    envelope = srv._methods["reload.mcp"](
+        73,
+        {"session_id": session_id, "confirm": True, "rev": "rev-a"},
+    )
+
+    assert envelope["result"]["status"] == "reloaded"
+    assert "request_id=73" in caplog.text
+    assert "refresh callback detail" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("failure", "business_code", "action"),
+    [
+        (FileNotFoundError("/secret/profile/.env"), "ENV_RELOAD_FILE_NOT_FOUND", "Create them"),
+        (PermissionError("/secret/profile/.env"), "ENV_RELOAD_PERMISSION_DENIED", "Fix their permissions"),
+        (KeyError("MISSING_API_KEY"), "ENV_RELOAD_CONFIG_MISSING", "Add them"),
+        (ValueError("parser line 7"), "ENV_RELOAD_INVALID_CONFIG", "Fix them"),
+        (OSError("disk path unavailable"), "ENV_RELOAD_IO_ERROR", "Check storage availability"),
+        (RuntimeError("internal loader detail"), "ENV_RELOAD_FAILED", "Retry the operation"),
+    ],
+)
+def test_reload_env_classifies_errors_without_leaking_details(
+    monkeypatch, caplog, failure, business_code, action
+):
+    def _boom():
+        raise failure
+
+    fake = types.SimpleNamespace(reload_env=_boom)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake)
+
+    envelope = srv._methods["reload.env"]("env-42", {})
+    message = envelope["error"]["message"]
+
+    assert envelope["error"]["code"] == 5015
+    assert business_code in message
+    assert action in message
+    assert "reference env-42" in message
+    assert str(failure) not in message
+    assert "request_id=env-42" in caplog.text
+    assert str(failure) in caplog.text
 
 
 def test_leader_rehashes_until_stable_when_config_changes_mid_reload(reload_env, monkeypatch):
@@ -97,7 +221,7 @@ def test_leader_rehashes_until_stable_when_config_changes_mid_reload(reload_env,
 
     assert envelope["result"]["loaded_rev"] == "rev-b"
     assert calls["discover"] == 2  # pass 1 read stale config, pass 2 converged
-    assert srv._mcp_reload_gen == 1
+    assert srv._mcp_reload_gen_by_profile[_profile_key()] == 1
 
 
 class _WaiterLock:
@@ -140,7 +264,7 @@ def _run_leader_follower(reload_env, monkeypatch, follower_rev):
     leader_in_discovery = threading.Event()
     release_leader = threading.Event()
 
-    def _slow_discover():
+    def _slow_discover(**_kwargs):
         calls["discover"] += 1
         if calls["discover"] == 1:
             leader_in_discovery.set()

@@ -36,7 +36,6 @@ from agent.display import (
 from agent.zet_agent_response_mode import (
     apply_trusted_skill_execution,
     dispatch_trusted_skill_operation,
-    trusted_skill_operation_execution_block_message,
     trusted_skill_operation_block_message,
 )
 from agent.tool_dispatch_helpers import (
@@ -89,30 +88,9 @@ def _tool_error_log_preview(
     *,
     max_chars: int = 200,
 ) -> str:
-    """Keep generic errors bounded while preserving trusted worker root causes."""
+    """Keep tool errors bounded before writing them to logs."""
     text = _multimodal_text_summary(function_result)
-    head = text[:max_chars] if len(text) > max_chars else text
-    if function_name != "terminal":
-        return head
-
-    try:
-        payload = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        return head
-    if (
-        not isinstance(payload, dict)
-        or payload.get("video_edit_runtime_direct") is not True
-        or not isinstance(payload.get("output"), str)
-    ):
-        return head
-
-    tail = next(
-        (line.strip() for line in reversed(payload["output"].splitlines()) if line.strip()),
-        "",
-    )
-    if not tail or tail in head:
-        return head
-    return f"{head} | tail: {tail[:max_chars]}"
+    return text[:max_chars] if len(text) > max_chars else text
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -274,8 +252,7 @@ def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args:
             f"Do not call `{function_name}` or perform side effects."
         )
 
-    # Trusted video-edit authority constrains executable helpers only. Plan
-    # presentation is independently governed by the App plan capability.
+    # Hardware helper scoping is independent from the App plan capability.
     if function_name != "present_plan":
         skill_scope_block = trusted_skill_operation_block_message(
             agent,
@@ -367,7 +344,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
     cache_key = (
-        getattr(_registry, "_generation", 0),
+        _registry.cache_generation(),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
     )
@@ -778,6 +755,11 @@ def _handle_registry_function_call(
         "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
         "tool_request_middleware_trace": list(middleware_trace),
     }
+    if function_name == "search_memory":
+        # search_memory is registry-dispatched on the production gateway path.
+        # Thread the live, session-scoped manager through that boundary so a
+        # smart-mode provider can supplement native curated memory.
+        call_kwargs["search_memory_manager"] = agent._memory_manager
     if trusted_boundary_enabled:
         call_kwargs["dispatch_wrapper"] = _dispatch_wrapper
 
@@ -1710,13 +1692,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "memory":
             def _execute(next_args: dict) -> Any:
                 final_args = copy.deepcopy(next_args)
-                trusted_block = trusted_skill_operation_execution_block_message(
-                    agent,
-                    function_name=function_name,
-                    function_args=final_args,
-                )
-                if trusted_block is not None:
-                    return json.dumps({"error": trusted_block}, ensure_ascii=False)
                 target = final_args.get("target", "memory")
                 operations = final_args.get("operations")
                 from tools.memory_tool import memory_tool as _memory_tool
@@ -2266,6 +2241,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
+        if (
+            agent._tool_guardrail_halt_decision is not None
+            and i < len(assistant_message.tool_calls)
+        ):
+            _append_cancelled_tool_results(
+                messages,
+                assistant_message.tool_calls[i:],
+                reason="guardrail halt",
+            )
+            _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage="guardrail halt cancelled tool results",
+            )
+            break
+
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -2329,9 +2320,27 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if agent._tool_guardrail_halt_decision is not None:
+            remaining_calls = [
+                call
+                for _, later_calls in segments[segment_index:]
+                for call in later_calls
+            ]
+            if remaining_calls:
+                _append_cancelled_tool_results(
+                    messages,
+                    remaining_calls,
+                    reason="guardrail halt",
+                )
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage="guardrail halt cancelled tool segments",
+                )
+            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(

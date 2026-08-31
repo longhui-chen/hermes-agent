@@ -748,6 +748,29 @@ class ZetGoalDriver:
             if at is not None and at > self._cancel_marks.get(new_key, 0.0):
                 self._cancel_marks[new_key] = at
 
+    def _background_process_session_keys(self, *sids: str) -> List[str]:
+        """Keys process_registry uses for Goal-owned terminal/browser jobs.
+
+        Live zet_agent turns register ``ProcessSession.session_key`` as
+        ``_interaction_queue_key(session_id)`` (``<HERMES_HOME>|<sid>``),
+        not the public chat id. Include both the scoped key and the raw
+        sid, plus compaction origin aliases, so WAIT still sees in-flight
+        CI/build/watch after a lineage rotation.
+        """
+        keys: List[str] = []
+        for sid in sids:
+            raw = str(sid or "").strip()
+            if not raw:
+                continue
+            try:
+                scoped = str(self.adapter._interaction_queue_key(raw) or "").strip()
+            except Exception:
+                scoped = raw
+            for key in (scoped, raw):
+                if key and key not in keys:
+                    keys.append(key)
+        return keys
+
     def _after_turn_sync(
         self,
         session_id: str,
@@ -758,6 +781,7 @@ class ZetGoalDriver:
     ) -> None:
         from hermes_cli.goals import GoalManager
 
+        origin_session_id = session_id
         rotated = bool(effective_session_id and effective_session_id != session_id)
         if rotated:
             self._migrate_sidecar(session_id, effective_session_id)
@@ -821,12 +845,18 @@ class ZetGoalDriver:
                 # Judge visibility into live background processes (CI/build/
                 # watch launched by this turn): the WAIT verdict keys off the
                 # snapshot — omitting it makes the judge continue immediately
-                # and re-launch long tasks (codex P1). Same no-arg gather as
-                # gateway/run.py's goal driver.
+                # and re-launch long tasks (codex P1). Scoped to this session
+                # so a concurrent cron job's processes cannot park the Goal.
                 try:
                     from hermes_cli.goals import gather_background_processes
 
-                    bg_procs = gather_background_processes()
+                    keys = self._background_process_session_keys(
+                        session_id, origin_session_id,
+                    )
+                    bg_procs = gather_background_processes(
+                        session_key=keys[0] if keys else session_id,
+                        extra_session_keys=keys[1:] or None,
+                    )
                 except Exception:
                     bg_procs = None
                 try:

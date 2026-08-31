@@ -316,7 +316,7 @@ class TestMcpTest:
             async def shutdown(self):
                 captured["shutdown"] = True
 
-        async def fake_connect(name, config):
+        async def fake_connect(name, config, **_kwargs):
             return FakeServer()
 
         def fake_run_on_mcp_loop(coro, timeout):
@@ -421,7 +421,7 @@ class TestProbeEnvResolution:
             async def shutdown(self):
                 return None
 
-        async def _fake_connect(name, config):
+        async def _fake_connect(name, config, **_kwargs):
             seen["config"] = config
             return _FakeServer()
 
@@ -495,7 +495,7 @@ class TestProbeCapabilityGating:
 
         called: list[str] = []
 
-        async def _fake_connect(name, cfg):
+        async def _fake_connect(name, cfg, **_kwargs):
             return self._make_server(called, caps)
 
         monkeypatch.setattr("tools.mcp_tool._connect_server", _fake_connect)

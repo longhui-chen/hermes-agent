@@ -829,7 +829,16 @@ CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
 
 
 class AuthError(RuntimeError):
-    """Structured auth error with UX mapping hints."""
+    """Structured auth error with UX mapping hints.
+
+    ⭐ 面向用户:消息里是「凭据过期,运行 `hermes auth <provider>`」这类可照做的
+    指令。⛔ 不许被出站层压成「服务内部异常」——它恰恰是最需要原文的一条。
+    契约见 ``agent.error_classifier.USER_ACTIONABLE_ATTR``。
+    ⚠️ 它定义在**我们自己的包**里,所以「类定义在谁的模块」那一问会判成「我们的」;
+    必须靠这个显式声明把它捞回来。
+    """
+
+    hermes_user_actionable = True
 
     def __init__(
         self,

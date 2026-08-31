@@ -52,7 +52,9 @@ from gateway.platforms.base import (
     SUPPORTED_VIDEO_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     is_host_excluded_by_no_proxy,
+    log_media_intake_failure,
     resolve_proxy_url,
+    safe_exc,
     safe_url_for_log,
     _ssrf_redirect_guard,
     cache_document_from_bytes,
@@ -5025,7 +5027,12 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:
             response = getattr(exc, "response", None)
             detail = self._describe_slack_api_error(response, file_obj={"id": file_id})
-            logger.warning("[Slack] files.info error for file_shared %s: %s", file_id, detail or exc)
+            # `detail` 已是清洗过的用户可读诊断;兜底那一侧⛔ 不许裸 `%s` 异常
+            # (SlackApiError.__str__ 会带出整条响应体)。
+            logger.warning(
+                "[Slack] files.info error for file_shared %s: %s",
+                file_id, detail or safe_exc(exc),
+            )
             return
 
         if not info_resp.get("ok"):
@@ -5980,11 +5987,17 @@ class SlackAdapter(BasePlatformAdapter):
                         attachment_notices.append(detail)
                         logger.warning("[Slack] %s", detail)
                     else:
-                        logger.warning(
-                            "[Slack] Failed to cache image from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
+                        # 🔴 ⛔ 不再 `%s` 原始 url / 原始异常 / `exc_info=True`:
+                        # `url_private_download` 是**凭据面**(公开分享文件带
+                        # `?pub_secret=`),而 `httpx.HTTPStatusError.__str__`
+                        # 本身就含整条 URL。同文件的 `_download_slack_file`
+                        # 抛错时已经走 `safe_url_for_log` —— 这里是**兄弟调用点
+                        # 没跟上**。照抄 weixin `_note_media_failure` 的机制:
+                        # 只记 kind/reason/url_host/异常类型名。
+                        # ⭐ 用户侧提示**另走一条**(`attachment_notices`),已存在,⛔ 不动。
+                        log_media_intake_failure(
+                            logger, "slack", "image", "download_failed",
+                            url=url, exc=e,
                         )
             elif mimetype.startswith("audio/") and url:
                 try:
@@ -6000,11 +6013,9 @@ class SlackAdapter(BasePlatformAdapter):
                         attachment_notices.append(detail)
                         logger.warning("[Slack] %s", detail)
                     else:
-                        logger.warning(
-                            "[Slack] Failed to cache audio from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
+                        log_media_intake_failure(
+                            logger, "slack", "audio", "download_failed",
+                            url=url, exc=e,
                         )
             elif mimetype.startswith("video/") and url and _is_slack_voice_clip(f):
                 # Slack in-app voice clips are audio-only MP4 containers that
@@ -6035,11 +6046,9 @@ class SlackAdapter(BasePlatformAdapter):
                         attachment_notices.append(detail)
                         logger.warning("[Slack] %s", detail)
                     else:
-                        logger.warning(
-                            "[Slack] Failed to cache voice clip from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
+                        log_media_intake_failure(
+                            logger, "slack", "voice", "download_failed",
+                            url=url, exc=e,
                         )
             elif mimetype.startswith("video/") and url:
                 try:
@@ -6067,11 +6076,9 @@ class SlackAdapter(BasePlatformAdapter):
                         attachment_notices.append(detail)
                         logger.warning("[Slack] %s", detail)
                     else:
-                        logger.warning(
-                            "[Slack] Failed to cache video from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
+                        log_media_intake_failure(
+                            logger, "slack", "video", "download_failed",
+                            url=url, exc=e,
                         )
             elif url:
                 # Try to handle as a document attachment
@@ -6147,11 +6154,9 @@ class SlackAdapter(BasePlatformAdapter):
                         attachment_notices.append(detail)
                         logger.warning("[Slack] %s", detail)
                     else:
-                        logger.warning(
-                            "[Slack] Failed to cache document from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
+                        log_media_intake_failure(
+                            logger, "slack", "file", "download_failed",
+                            url=url, exc=e,
                         )
 
         if attachment_notices:
@@ -7617,14 +7622,19 @@ class SlackAdapter(BasePlatformAdapter):
                     media_urls.append(cached_path)
                     media_types.append(mimetype)
                 except Exception as exc:
-                    logger.warning(
-                        "[Slack] Failed to cache thread-root image %s: %s",
-                        f.get("id") or f.get("name") or "unknown",
-                        exc,
+                    # 兄弟调用点:与上面 5 个入站出口同形,同样不许 `%s` 原始异常
+                    # (`httpx.HTTPStatusError.__str__` 含整条签名 URL)。
+                    log_media_intake_failure(
+                        logger, "slack", "image", "thread_root_download_failed",
+                        url=url, exc=exc,
+                        file_id=f.get("id") or f.get("name") or "unknown",
                     )
         except Exception as exc:  # pragma: no cover - defensive
+            # ⭐ 这一条是**整段恢复流程**的兜底,不对应某一个附件 ⇒ ⛔ 不套
+            # `log_media_intake_failure`(它的语义是「某个 kind 没取到」)。
+            # 只把渲染换成 `safe_exc`,级别与措辞保持不变 —— 作用域刚好等于缺陷。
             logger.debug(
-                "[Slack] Thread-root image recovery failed: %s", exc
+                "[Slack] Thread-root image recovery failed: %s", safe_exc(exc)
             )
         return media_urls, media_types
 
@@ -8149,11 +8159,13 @@ class SlackAdapter(BasePlatformAdapter):
                     ):
                         raise
                     if attempt < 2:
+                        # ⛔ 不许 `url[:80]` + 裸异常:`httpx.HTTPStatusError`
+                        # 的 __str__ 本身就含整条 URL,截断前 80 字符挡不住它。
                         logger.debug(
                             "Slack file download retry %d/2 for %s: %s",
                             attempt + 1,
-                            url[:80],
-                            exc,
+                            safe_url_for_log(url),
+                            safe_exc(exc),
                         )
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
@@ -8218,11 +8230,13 @@ class SlackAdapter(BasePlatformAdapter):
                     if isinstance(exc, ValueError):
                         raise
                     if attempt < 2:
+                        # ⛔ 不许 `url[:80]` + 裸异常:`httpx.HTTPStatusError`
+                        # 的 __str__ 本身就含整条 URL,截断前 80 字符挡不住它。
                         logger.debug(
                             "Slack file download retry %d/2 for %s: %s",
                             attempt + 1,
-                            url[:80],
-                            exc,
+                            safe_url_for_log(url),
+                            safe_exc(exc),
                         )
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue

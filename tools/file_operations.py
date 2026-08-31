@@ -26,6 +26,7 @@ Usage:
 """
 
 import os
+import posixpath
 import re
 import json
 import urllib.request
@@ -35,7 +36,7 @@ import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from agent.secret_scope import get_secret
 from tools.loopback_transport import is_trusted_loopback_http, urlopen_hardened
 from tools.binary_extensions import BINARY_EXTENSIONS
@@ -2180,15 +2181,21 @@ class ShellFileOperations(FileOperations):
         return result
 
     def nas_search(self, pattern: str, limit: int = 60,
-                   semantic: bool = False, path_prefix: str = "") -> SearchResult:
+                   semantic: bool = False, video_semantic: bool = False,
+                   path_prefix: str = "",
+                   return_references: bool = False) -> SearchResult:
         """First-class NAS library search (search_files target='nas').
 
         Same wire path as the empty-workspace fallback, but callable directly
         so the model can search the user's NAS files/photos without first
-        running a doomed workspace search, can opt into the semantic
-        (image-embedding) leg for photo/visual queries, and can scope hits to
-        one folder via path_prefix (server validates it against SearchRoots;
-        older local-server builds ignore the field — unscoped results).
+        running a doomed workspace search, can opt into either the semantic
+        (image-embedding) leg for photo/visual queries or the video-semantic
+        leg for actions/objects inside videos, and can scope hits to one folder
+        via path_prefix (server validates it against SearchRoots; older
+        local-server builds ignore the field — unscoped results).
+        ``return_references`` adds a bounded path list from this same
+        authenticated request for same-turn native-tool handoff; it does not
+        alter card rendering or authorize the downstream operation.
         Unlike the fallback, unavailability and zero hits return a
         SearchResult the model can act on instead of a silent None.
         """
@@ -2202,14 +2209,16 @@ class ShellFileOperations(FileOperations):
                 "credential (not running on a Zettlab device?)."
             ))
         result = self._zettlab_nas_fallback(
-            query, limit, semantic=semantic, path_prefix=path_prefix,
-            explicit=True)
+            query, limit, semantic=semantic, video_semantic=video_semantic,
+            path_prefix=path_prefix, explicit=True,
+            return_references=return_references)
         if result is not None:
             return result
         return SearchResult(total_count=0, note=(
             "No NAS files matched this query (or the device search service "
             "did not respond). Try different keywords"
-            + ("" if semantic else ", or semantic=true for photo/visual queries")
+            + ("" if semantic or video_semantic
+               else ", or semantic=true for photo/visual queries")
             + "."
         ))
 
@@ -2252,8 +2261,10 @@ class ShellFileOperations(FileOperations):
 
     def _zettlab_nas_fallback(self, pattern: str, limit: int,
                               semantic: bool = False,
+                              video_semantic: bool = False,
                               path_prefix: str = "",
-                              explicit: bool = False) -> Optional[SearchResult]:
+                              explicit: bool = False,
+                              return_references: bool = False) -> Optional[SearchResult]:
         """Query local-server NAS agent-search; returns None on any error.
 
         On a hit, local-server injects the matches as preview cards into this
@@ -2268,6 +2279,10 @@ class ShellFileOperations(FileOperations):
         turn already ended) — then the paths ARE returned (capped) with a note
         telling the model to list them briefly itself, because claiming "shown
         above" would be a lie the user can see.
+
+        An explicit NAS call may also request the same bounded path references
+        while cards render normally. Implicit workspace fallback never returns
+        those references, even if the flag is supplied accidentally.
         """
         token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "")
         query = (pattern or "").strip()
@@ -2275,11 +2290,13 @@ class ShellFileOperations(FileOperations):
         if not token or not query or not url:
             return None
         # Default to name+content only (matches local-server's own default).
-        # Semantic is opt-in: forcing it here would drag every empty-workspace
-        # search behind the c-engine cold start (~30s) instead of returning the
-        # fast FTS hits. nas_search passes semantic=True for photo/visual
-        # queries, which also needs the longer timeout for that cold start.
-        modes = ["name", "content"] + (["semantic"] if semantic else [])
+        # Semantic legs are opt-in: forcing one here would drag every
+        # empty-workspace search behind the c-engine cold start (~30s) instead
+        # of returning the fast FTS hits. Video semantic is intentionally a
+        # video-only query: filename/document hits would dilute content-based
+        # video retrieval and do not carry a matching timestamp.
+        modes = (["video_semantic"] if video_semantic else
+                 ["name", "content"] + (["semantic"] if semantic else []))
         payload_req = {
             "q": query,
             "modes": modes,
@@ -2291,6 +2308,13 @@ class ShellFileOperations(FileOperations):
         prefix = str(path_prefix or "").strip()
         if prefix:
             payload_req["path_prefix"] = prefix
+        normalized_prefix = posixpath.normpath(prefix) if prefix else ""
+        prefix_is_valid = bool(
+            normalized_prefix
+            and posixpath.isabs(normalized_prefix)
+            and "\x00" not in normalized_prefix
+            and ".." not in PurePosixPath(prefix).parts
+        )
         body = json.dumps(payload_req).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -2311,7 +2335,8 @@ class ShellFileOperations(FileOperations):
             headers=headers,
         )
         try:
-            with urlopen_hardened(req, timeout=45 if semantic else 10) as resp:
+            with urlopen_hardened(
+                    req, timeout=45 if semantic or video_semantic else 10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             # Parse inside the try so any malformed reply (non-dict payload,
             # non-dict items, non-numeric total_count) degrades to None rather
@@ -2326,11 +2351,77 @@ class ShellFileOperations(FileOperations):
                 for it in (data.get("items") or [])
                 if isinstance(it, dict) and (it.get("path") or it.get("filename"))
             ]
+            raw_reference_paths = [
+                str(it.get("path"))
+                for it in (data.get("items") or [])
+                if isinstance(it, dict) and it.get("path")
+            ]
             hits = len(item_paths)
             if not hits:
                 return None
             total = int(data.get("total_count") or hits)
             carded = data.get("carded")
+            reference_paths = []
+            rejected_references = 0
+            seen_references = set()
+            for raw_path in raw_reference_paths:
+                if not prefix:
+                    reference_paths.append(raw_path)
+                    continue
+                normalized_path = posixpath.normpath(raw_path)
+                valid_path = bool(
+                    raw_path == raw_path.strip()
+                    and "\x00" not in raw_path
+                    and posixpath.isabs(normalized_path)
+                    and raw_path == normalized_path
+                    and ".." not in PurePosixPath(raw_path).parts
+                )
+                if valid_path:
+                    try:
+                        valid_path = bool(
+                            prefix_is_valid
+                            and normalized_path != normalized_prefix
+                            and posixpath.commonpath(
+                                (normalized_path, normalized_prefix)
+                            ) == normalized_prefix
+                        )
+                    except (OSError, ValueError):
+                        valid_path = False
+                # A missing ``carded`` field identifies the compatibility
+                # server that ignores path_prefix. Keep its cards/count, but
+                # never turn its unscoped paths into downstream references.
+                if valid_path and carded is None:
+                    valid_path = False
+                if not valid_path:
+                    rejected_references += 1
+                    continue
+                if normalized_path not in seen_references:
+                    seen_references.add(normalized_path)
+                    reference_paths.append(normalized_path)
+            references_truncated = bool(
+                explicit
+                and return_references
+                and (
+                    data.get("truncated") is True
+                    or rejected_references > 0
+                    or len(reference_paths) > self._NAS_UNCARDED_LIST_CAP
+                    or total > len(reference_paths)
+                )
+            )
+            if references_truncated and prefix and carded is None:
+                reference_limit_reason = (
+                    "NAS reference list is unavailable because this device "
+                    "could not verify the requested path scope; do not use "
+                    "the unscoped matches as downstream references."
+                )
+            elif references_truncated:
+                reference_limit_reason = (
+                    "NAS reference list is incomplete; narrow the search "
+                    "before treating the returned paths as the full "
+                    "candidate set."
+                )
+            else:
+                reference_limit_reason = None
         except Exception:
             return None
         if carded is False:
@@ -2351,7 +2442,11 @@ class ShellFileOperations(FileOperations):
                 )
             return SearchResult(
                 total_count=total,
-                files=item_paths[:self._NAS_UNCARDED_LIST_CAP],
+                files=(reference_paths if return_references else item_paths)[
+                    :self._NAS_UNCARDED_LIST_CAP
+                ],
+                truncated=references_truncated,
+                limit_reason=reference_limit_reason,
                 carded=False,
                 note=(
                     f"{hits} NAS file(s) matched but NO preview cards were shown "
@@ -2375,6 +2470,10 @@ class ShellFileOperations(FileOperations):
             )
         return SearchResult(
             total_count=total,
+            files=(reference_paths[:self._NAS_UNCARDED_LIST_CAP]
+                   if explicit and return_references else []),
+            truncated=references_truncated,
+            limit_reason=reference_limit_reason,
             # True = server confirmed; None (old server) = omitted, so the
             # chat-side collector keeps its legacy derived-card compensation.
             carded=(True if carded is True else None),

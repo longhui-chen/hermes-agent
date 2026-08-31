@@ -22,6 +22,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.prestream_timing import observe_provider_dispatch
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -1237,9 +1238,18 @@ def _consume_codex_event_stream(
     # signal the SDK's high-level helper used to raise as
     # ``RuntimeError("Didn't receive a `response.completed` event.")``.
     if not saw_terminal and not output:
-        raise RuntimeError(
+        # ⭐ 出身声明模式的**第四个**兄弟(前三:codex_responses_adapter 的
+        # failed 分支与空 output 分支、auxiliary_client 的流无终止帧)。
+        # ⚠️ 我上一轮只修了 auxiliary_client 那条("did not return a final
+        # response"),**这一条函数不同、文案也不同**,漏掉了 —— 又是兄弟调用点
+        # 没跟上。⛔ 「同一个模式修了三个实例」不等于修完了。
+        # SSE 在没产出任何 item/text 时提前断开是**上游断流**,裸构造会抹掉出身
+        # ⇒ 判成我们的 bug、既不重试也不 fallback,一次瞬时断流变永久失败。
+        from agent.error_classifier import declare_upstream_origin
+
+        raise declare_upstream_origin(RuntimeError(
             "Codex Responses stream did not emit a terminal response"
-        )
+        ))
 
     assembled_text = "".join(collected_text_deltas)
 
@@ -1299,6 +1309,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
+            observe_provider_dispatch()
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:

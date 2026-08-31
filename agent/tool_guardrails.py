@@ -65,8 +65,8 @@ class ToolCallGuardrailConfig:
     """Thresholds for per-turn tool-call loop detection.
 
     Warnings are enabled by default and never prevent tool execution. Hard stops
-    are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
-    the user enables circuit-breaker behavior in config.yaml.
+    remain configurable for ordinary tools; trusted runtime operations can still
+    declare a non-retryable failure and terminate their turn immediately.
     """
 
     warnings_enabled: bool = True
@@ -534,14 +534,14 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
     """Action-oriented guidance for recovering from repeated tool failures."""
     common = (
         f"{tool_name} has failed {count} times this turn. This looks like a loop. "
-        "Do not switch to text-only replies; keep using tools, but diagnose before retrying. "
-        "First inspect the latest error/output and verify your assumptions. "
+        "Respect the active workflow and the latest tool result. If either marks "
+        "the failure as terminal or fail-closed, stop using tools and report the blocker "
+        "concisely. Otherwise verify your assumptions before one targeted recovery attempt. "
     )
     if tool_name == "terminal":
         return common + (
-            "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
-            "in the same tool, then try an absolute path, a simpler command, a different "
-            "working directory, or a different tool such as read_file/write_file/patch."
+            "Use only diagnostics permitted by the active workflow; do not replace a "
+            "trusted helper's terminal failure with generic filesystem discovery."
         )
     return common + (
         "Try different arguments, a narrower query/path, an absolute path when relevant, "

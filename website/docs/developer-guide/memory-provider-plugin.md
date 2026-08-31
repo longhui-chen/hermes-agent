@@ -81,7 +81,15 @@ class MyMemoryProvider(MemoryProvider):
 | `on_session_end(messages)` | Conversation ends | Final extraction/flush |
 | `on_pre_compress(messages)` | Before context compression | Save insights before discard |
 | `on_memory_write(action, target, content)` | Built-in memory writes | Mirror to your backend |
+| `search_memory_mode()` + `search(query, top_k)` | Explicit `search_memory` calls | Replace native search, supplement it, or stay disabled |
 | `shutdown()` | Process exit | Clean up connections |
+
+Providers that expose a callable `search(query, top_k)` default to the legacy
+`replace` policy. Override `search_memory_mode()` to return `supplement` when
+Hermes should always search `MEMORY.md` / `USER.md` too, or `disabled` when the
+provider's recall is controlled by another lifecycle hook. External search is
+bounded and fails open; native curated results remain available on timeout or
+provider failure.
 
 ## Config Schema
 

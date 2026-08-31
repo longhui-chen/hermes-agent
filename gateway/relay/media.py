@@ -34,6 +34,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 import urllib.error
 import urllib.parse
@@ -78,8 +79,23 @@ class RelayMediaClient:
         secret: Optional[str],
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._base_origin = self._origin(self._base_url)
+        base_path = urllib.parse.urlsplit(self._base_url).path.rstrip("/")
+        self._media_path_prefix = f"{base_path}/relay/media/"
         self._gateway_id = gateway_id or ""
         self._secret = secret or ""
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int] | None:
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            scheme = parsed.scheme.lower()
+            if scheme not in {"http", "https"} or not parsed.hostname:
+                return None
+            port = parsed.port or (443 if scheme == "https" else 80)
+            return scheme, parsed.hostname.lower(), port
+        except (TypeError, ValueError):
+            return None
 
     @property
     def enabled(self) -> bool:
@@ -91,7 +107,15 @@ class RelayMediaClient:
 
     def is_relay_media_url(self, url: str) -> bool:
         """Is ``url`` a connector re-host reference (needs our bearer to GET)?"""
-        return "/relay/media/" in (url or "")
+        try:
+            parsed = urllib.parse.urlsplit(url or "")
+        except (TypeError, ValueError):
+            return False
+        return (
+            self._base_origin is not None
+            and self._origin(url) == self._base_origin
+            and parsed.path.startswith(self._media_path_prefix)
+        )
 
     async def upload(
         self,
@@ -110,7 +134,8 @@ class RelayMediaClient:
             return None
         path = Path(file_path)
         try:
-            data = path.read_bytes()
+            with path.open("rb") as handle:
+                data = handle.read(MEDIA_MAX_BYTES + 1)
         except OSError:
             logger.warning("relay media upload: cannot read %s", file_path)
             return None
@@ -130,7 +155,9 @@ class RelayMediaClient:
         headers = {
             "Authorization": f"Bearer {self._bearer()}",
             "Content-Type": content_type,
-            "X-Media-Filename": (filename or path.name)[:255],
+            "X-Media-Filename": re.sub(
+                r"[\x00-\x1f\x7f]", "", filename or path.name
+            )[:255],
         }
         url = f"{self._base_url}/relay/media"
 
@@ -140,13 +167,18 @@ class RelayMediaClient:
                 with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as resp:
                     import json
 
-                    body = json.loads(resp.read().decode("utf-8"))
+                    raw = resp.read(65537)
+                    if len(raw) > 65536:
+                        raise ValueError("relay media upload response too large")
+                    body = json.loads(raw.decode("utf-8"))
                     media_id = body.get("id")
                     if not media_id:
                         return None
                     return f"{self._base_url}/relay/media/{media_id}"
             except (urllib.error.URLError, ValueError, OSError) as exc:
-                logger.warning("relay media upload failed: %s", exc)
+                from gateway.platforms.base import safe_exc
+
+                logger.warning("relay media upload failed: %s", safe_exc(exc))
                 return None
 
         return await asyncio.get_running_loop().run_in_executor(None, _post)
@@ -168,38 +200,71 @@ class RelayMediaClient:
         if needs_auth:
             headers["Authorization"] = f"Bearer {self._bearer()}"
 
-        def _get() -> Optional[str]:
-            req = urllib.request.Request(url, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as resp:
-                    length = int(resp.headers.get("Content-Length") or 0)
-                    if length > MEDIA_MAX_BYTES:
-                        logger.warning("relay media download too large: %s", url)
+        from gateway.platforms.base import (
+            _read_httpx_body_with_limit,
+            _ssrf_redirect_guard,
+            inbound_media_download_permit,
+            safe_exc,
+            safe_url_for_log,
+        )
+        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+
+        if not needs_auth and not is_safe_url(url):
+            logger.warning(
+                "relay media download blocked unsafe URL: %s", safe_url_for_log(url)
+            )
+            return None
+
+        try:
+            if needs_auth:
+                import httpx
+
+                client_cm = httpx.AsyncClient(
+                    timeout=_REQUEST_TIMEOUT_S,
+                    follow_redirects=False,
+                )
+            else:
+                client_cm = create_ssrf_safe_async_client(
+                    timeout=_REQUEST_TIMEOUT_S,
+                    follow_redirects=True,
+                    event_hooks={"response": [_ssrf_redirect_guard]},
+                )
+            async with client_cm as client:
+                async with inbound_media_download_permit():
+                    async with client.stream("GET", url, headers=headers) as resp:
+                        if needs_auth and getattr(resp, "is_redirect", False):
+                            raise ValueError("authenticated relay media redirect refused")
+                        resp.raise_for_status()
+                        data = await _read_httpx_body_with_limit(
+                            resp,
+                            media_type="relay inbound media",
+                            max_bytes=MEDIA_MAX_BYTES,
+                            permit_acquired=True,
+                        )
+                    if not data:
                         return None
-                    data = resp.read(MEDIA_MAX_BYTES + 1)
-                    if not data or len(data) > MEDIA_MAX_BYTES:
-                        return None
-                    # Extension: prefer the response's content-disposition /
-                    # suggested name, fall back to the mime type, then .bin —
-                    # vision/file tools sniff by extension.
                     name = suggested_name or ""
                     if not name:
-                        cd = resp.headers.get("Content-Disposition") or ""
+                        cd = resp.headers.get("content-disposition") or ""
                         if "filename=" in cd:
                             name = cd.split("filename=", 1)[1].strip().strip('"')
                     ext = Path(name).suffix if name else ""
                     if not ext:
-                        mime = (resp.headers.get("Content-Type") or "").split(";")[0]
+                        mime = (resp.headers.get("content-type") or "").split(";")[0]
                         ext = mimetypes.guess_extension(mime) or ".bin"
-                    fd, tmp_path = tempfile.mkstemp(prefix="relay_media_", suffix=ext)
+                    fd, tmp_path = tempfile.mkstemp(
+                        prefix="relay_media_", suffix=ext,
+                    )
                     with os.fdopen(fd, "wb") as fh:
                         fh.write(data)
                     return tmp_path
-            except (urllib.error.URLError, ValueError, OSError) as exc:
-                logger.warning("relay media download failed for %s: %s", url, exc)
-                return None
-
-        return await asyncio.get_running_loop().run_in_executor(None, _get)
+        except Exception as exc:
+            logger.warning(
+                "relay media download failed for %s: %s",
+                safe_url_for_log(url),
+                safe_exc(exc),
+            )
+            return None
 
 
 __all__ = ["RelayMediaClient", "media_base_url", "MEDIA_MAX_BYTES"]

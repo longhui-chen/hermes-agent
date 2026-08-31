@@ -1275,21 +1275,34 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._warn_once_no_ffmpeg()
             return None
 
+        # 🔴 兄弟调用点:feishu `_transcode_to_opus` 的 docstring 声称照抄本函数,
+        # 而本函数**自己**带着同一组缺陷(无超时 / stderr 无界 / CancelledError
+        # 不进 except Exception)。两处一起收进同一个 helper,⛔ 不留一处旧写法
+        # ——否则下一次改动又会从这里被抄走。
+        from tools.bounded_media_exec import (
+            TranscodeTimeout,
+            run_media_subprocess,
+        )
+
         out_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
         try:
-            proc = await asyncio.create_subprocess_exec(
-                _FFMPEG_PATH, "-y", "-i", mp3_path,
-                "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
-                "-application", "voip", out_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0 or not Path(out_path).exists():
+            try:
+                rc, stderr = await run_media_subprocess([
+                    _FFMPEG_PATH, "-y", "-i", mp3_path,
+                    "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+                    "-application", "voip", out_path,
+                ])
+            except TranscodeTimeout as exc:
+                logger.error(
+                    "[whatsapp_cloud] ffmpeg opus conversion timed out; "
+                    "killed the whole process group: %s", exc,
+                )
+                return None
+            if rc != 0 or not Path(out_path).exists():
                 logger.error(
                     "[whatsapp_cloud] ffmpeg opus conversion failed "
                     "(returncode=%s): %s",
-                    proc.returncode,
+                    rc,
                     (stderr or b"").decode("utf-8", errors="replace")[:500],
                 )
                 return None

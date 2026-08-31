@@ -14,11 +14,12 @@ If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, 
 
 ## Text-to-Speech
 
-Convert text to speech with eleven providers:
+Convert text to speech with twelve providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
 | **Edge TTS** (default) | Good | Free | None needed |
+| **Zettlab managed TTS** (Zettlab devices) | Good | Included | None needed |
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
 | **MiniMax TTS** | Excellent | Paid | `MINIMAX_API_KEY` or `MINIMAX_CN_API_KEY` |
@@ -44,7 +45,7 @@ Convert text to speech with eleven providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper"
+  provider: "edge"              # "edge" | "zettlab" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper"
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -104,6 +105,13 @@ tts:
     # volume: 1.0                               # 0.5 = half as loud
     # normalize_audio: true
 ```
+
+On a managed Zettlab device, an explicitly configured provider still wins. If
+no provider is configured, an existing direct OpenAI TTS key keeps precedence;
+otherwise Hermes selects the bundled `zettlab` provider. Its public model,
+default voice, supported formats, and speed support come from the device's
+generation capability response. Hermes does not select or store the underlying
+cloud vendor credential.
 
 MiniMax TTS selects its region, endpoint, and credential together:
 

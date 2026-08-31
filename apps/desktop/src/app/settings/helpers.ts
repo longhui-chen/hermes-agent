@@ -131,6 +131,14 @@ export function sectionFieldEntries(
   )
 }
 
+export function memoryFieldVisible(key: string, config: HermesConfigRecord): boolean {
+  if (key !== 'memory.deep_memory_mode') {
+    return true
+  }
+
+  return String(getNested(config, 'memory.provider') ?? '') === 'zettlab_deep_memory'
+}
+
 export function setNested(obj: HermesConfigRecord, path: string, value: unknown): HermesConfigRecord {
   const clone = structuredClone(obj)
   const parts = configPathParts(path)

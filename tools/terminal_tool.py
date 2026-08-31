@@ -65,6 +65,9 @@ from utils import env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+
+
+
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
 # The terminal tool polls this during command execution so it can kill
@@ -1078,23 +1081,65 @@ import sys
 
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
+_CONNECTOR_RUNTIME_SCRIPTS = frozenset({
+    _CONNECTOR_RUNTIME_SCRIPT,
+    "action_runtime.py",
+})
 _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES = 1024 * 1024
 _CONNECTOR_RUNTIME_TRUST_MAX_PATHS = 8192
 _CONNECTOR_RUNTIME_TRUST_MAX_BYTES = 64 * 1024 * 1024
-_VIDEO_EDIT_RUNTIME_SCRIPTS = frozenset({
-    "preference_resolver.py",
-    "workflow_state.py",
-    "cloud_render_business.py",
-    "normalize.py",
-})
 _CAMERA_RUNTIME_SCRIPT = "camera_connector.py"
 _CAMERA_RUNTIME_RELATIVE_PATH = Path(
     "skills/camsnap/scripts/camera_connector.py"
 )
 _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH = Path("skills/camsnap/manifest.yaml")
 _CAMERA_RUNTIME_CAPABILITY = "zettlab.camera.actions.v1"
+_PRINTER3D_RUNTIME_SCRIPTS = frozenset({
+    "printer3d_connector.py",
+    "printer3d_control.py",
+})
+_PRINTER3D_RUNTIME_PATHS = {
+    "printer3d_connector.py": Path("skills/printer3d/scripts/printer3d_connector.py"),
+    "printer3d_control.py": Path("skills/printer3d-control/scripts/printer3d_control.py"),
+}
+_PRINTER3D_RUNTIME_MANIFEST_PATHS = {
+    "printer3d_connector.py": Path("skills/printer3d/manifest.yaml"),
+    "printer3d_control.py": Path("skills/printer3d-control/manifest.yaml"),
+}
+_PRINTER3D_RUNTIME_MANIFEST_IDS = {
+    "printer3d_connector.py": "printer3d",
+    "printer3d_control.py": "printer3d-control",
+}
+_PRINTER3D_RUNTIME_SCOPES = {
+    "printer3d_connector.py": ["hardware.printer3d:read"],
+    "printer3d_control.py": ["hardware.printer3d:control", "hardware.printer3d:job"],
+}
+_PRINTER3D_RUNTIME_CAPABILITIES = {
+    "printer3d_connector.py": "zettlab.printer3d.actions.v1",
+    "printer3d_control.py": "hardware.printer3d.control.v1",
+}
+_PLAUD_RUNTIME_SCRIPT = "plaud_connector.py"
+_PLAUD_RUNTIME_RELATIVE_PATH = Path(
+    "skills/plaud-recordings/scripts/plaud_connector.py"
+)
+_PLAUD_RUNTIME_MANIFEST_RELATIVE_PATH = Path(
+    "skills/plaud-recordings/manifest.yaml"
+)
+_PLAUD_RUNTIME_CAPABILITY = "zettlab.plaud.actions.v1"
+_SMART_HOME_RUNTIME_SCRIPT = "smart_home_light.py"
+_SMART_HOME_RUNTIME_RELATIVE_PATH = Path(
+    "skills/smart-home-light-control/scripts/smart_home_light.py"
+)
+_SMART_HOME_RUNTIME_MANIFEST_RELATIVE_PATH = Path(
+    "skills/smart-home-light-control/manifest.yaml"
+)
+_SMART_HOME_RUNTIME_CAPABILITY = "zettlab.smart_home.light.actions.v1"
+_SMART_HOME_RUNTIME_SCOPE = "hardware.smart_home:control"
+_SMART_HOME_RUNTIME_MAX_TIMEOUT_SECONDS = 90
+_PLAUD_FILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _CAMERA_RUNTIME_MAX_MANIFEST_BYTES = 64 * 1024
 _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS = 80
+_PLAUD_RUNTIME_MAX_TIMEOUT_SECONDS = 45
 _CAMERA_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
@@ -1133,6 +1178,7 @@ _CONNECTOR_RUNTIME_SHELL_OPTIONS_WITH_ARG = {
 _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH = 8
 _CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _CONNECTOR_RUNTIME_TIMEOUT_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?")
+_CONNECTOR_RUNTIME_SKILL_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
 _LARK_CLI_COMMAND = "lark-cli"
 _LARK_CLI_MAX_TIMEOUT_SECONDS = 600
 @dataclass(frozen=True)
@@ -1156,611 +1202,7 @@ class _LarkCLICommand:
     args: list[str]
 
 
-@dataclass(frozen=True)
-class _TrustedWorkerModuleSnapshot:
-    name: str
-    path: str
-    source: str
-
-
-@dataclass(frozen=True)
-class _TrustedRuntimeDirectorySnapshot:
-    modules: tuple[_TrustedWorkerModuleSnapshot, ...]
-    total_bytes: int
-
-
-@dataclass(frozen=True)
-class _TrustedWorkerSourceSnapshot:
-    modules: tuple[_TrustedWorkerModuleSnapshot, ...]
-    python_executable: str
-    python_fingerprint: tuple[int, ...]
-    worker_path: str
-
-
-@dataclass(frozen=True)
-class _TrustedWorkerFactoryImage:
-    """Final in-process recovery root; service supervision owns gateway loss."""
-
-    snapshot: _TrustedWorkerSourceSnapshot
-    bootstrap_code: types.CodeType
-    module_names: frozenset[str]
-    owner_pid: int
-
-
-@dataclass(frozen=True)
-class _VideoEditWorkerProcessIdentity:
-    """Kernel-backed identity for one process outside the gateway's child set."""
-
-    pid: int
-    start_time: Optional[int]
-    pidfd: Optional[int]
-
-
-@dataclass(frozen=True)
-class _TrustedWorkerFactorySupervisor:
-    """Disposable gateway child that owns and rebuilds the worker factory."""
-
-    snapshot: _TrustedWorkerSourceSnapshot
-    process: "_ForkedVideoEditWorkerSeed"
-    channel: socket.socket
-    owner_pid: int
-
-
-@dataclass(frozen=True)
-class _ForkedVideoEditWorkerSeed:
-    """Popen-like identity handle for a process forked by the trusted tree."""
-
-    pid: int
-    identity: _VideoEditWorkerProcessIdentity
-    direct_child: bool = False
-    parent_control: Optional[str] = None
-
-    def poll(self) -> Optional[int]:
-        if self.direct_child:
-            try:
-                waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
-            except ChildProcessError:
-                return -getattr(signal, "SIGKILL", 9)
-            if waited_pid == self.pid:
-                return os.waitstatus_to_exitcode(status)
-            return None
-        if _video_edit_worker_process_identity_is_current(self.identity):
-            return None
-        return -getattr(signal, "SIGKILL", 9)
-
-    def kill(self) -> bool:
-        if self.direct_child:
-            if self.poll() is not None:
-                return False
-            try:
-                os.kill(self.pid, getattr(signal, "SIGKILL", 9))
-                return True
-            except ProcessLookupError:
-                return True
-            except PermissionError:
-                return False
-        if _signal_video_edit_worker_process_identity(
-            self.identity,
-            getattr(signal, "SIGKILL", 9),
-        ):
-            return True
-        return _request_video_edit_worker_parent_reap(
-            self,
-            parent_control=self.parent_control,
-        )
-
-    def wait(self, timeout: Optional[float] = None) -> int:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            returncode = self.poll()
-            if returncode is not None:
-                return returncode
-            if deadline is not None and time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired(
-                    "trusted video-edit worker seed",
-                    float(timeout if timeout is not None else 0.0),
-                )
-            time.sleep(0.01)
-
-    def close(self) -> None:
-        _close_video_edit_worker_process_identity(self.identity)
-
-
 _CONNECTOR_RUNTIME_ROOT_ANCHOR: Optional[_ConnectorRuntimeRootAnchor] = None
-_VIDEO_EDIT_WORKER_BROKER_PID: Optional[int] = None
-_VIDEO_EDIT_WORKER_BROKER_IDENTITY: Optional[_VideoEditWorkerProcessIdentity] = None
-_VIDEO_EDIT_WORKER_CHANNEL: Optional[socket.socket] = None
-_VIDEO_EDIT_WORKER_FACTORY_PROCESS: Optional[_ForkedVideoEditWorkerSeed] = None
-_VIDEO_EDIT_WORKER_FACTORY_CHANNEL: Optional[socket.socket] = None
-_VIDEO_EDIT_WORKER_SEED_PROCESS: Optional[_ForkedVideoEditWorkerSeed] = None
-_VIDEO_EDIT_WORKER_SEED_CHANNEL: Optional[socket.socket] = None
-_VIDEO_EDIT_WORKER_SOURCE_SNAPSHOT: Optional[_TrustedWorkerSourceSnapshot] = None
-_VIDEO_EDIT_WORKER_FACTORY_IMAGE: Optional[_TrustedWorkerFactoryImage] = None
-_VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR: Optional[
-    _TrustedWorkerFactorySupervisor
-] = None
-_VIDEO_EDIT_WORKER_LOCK = threading.RLock()
-_VIDEO_EDIT_WORKER_IDLE_TIMER: Optional[threading.Timer] = None
-_VIDEO_EDIT_WORKER_IDLE_GENERATION = 0
-_VIDEO_EDIT_WORKER_IDLE_TIMEOUT_SECONDS = 30.0
-_VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED = False
-_VIDEO_EDIT_WORKER_MAX_FRAME_BYTES = 8 * 1024 * 1024
-_VIDEO_EDIT_WORKER_START_TIMEOUT_SECONDS = 10
-_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS = 3
-_VIDEO_EDIT_WORKER_FACTORY_SEED_START_MAX_ATTEMPTS = 2
-_VIDEO_EDIT_WORKER_BROKER_START_MAX_ATTEMPTS = 2
-_VIDEO_EDIT_WORKER_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
-_VIDEO_EDIT_UPLOAD_TIMEOUT_SECONDS = 3700
-_VIDEO_EDIT_WORKER_SOURCE_LIMIT_BYTES = 512 * 1024
-_VIDEO_EDIT_WORKER_INTERPRETER_LIMIT_BYTES = 32 * 1024 * 1024
-_TRUSTED_RUNTIME_SOURCE_CACHE_MAX_BYTES = 8 * 1024 * 1024
-_TRUSTED_RUNTIME_SOURCE_CACHE_MAX_DIRECTORIES = 128
-# Leave two MiB of the worker's eight MiB IPC frame for JSON structure, argv,
-# scoped env, and secrets. The encoded bundle check below handles escaping too.
-_TRUSTED_RUNTIME_DIRECTORY_MAX_ENCODED_BYTES = 6 * 1024 * 1024
-_TRUSTED_RUNTIME_SOURCE_CACHE: dict[
-    tuple[str, tuple[int, int]],
-    _TrustedRuntimeDirectorySnapshot,
-] = {}
-_TRUSTED_RUNTIME_SOURCE_CACHE_BYTES = 0
-_VIDEO_EDIT_WORKER_MEMORY_BOOTSTRAP = r"""
-import array
-import json
-import os
-import select
-import signal
-import socket
-import struct
-import sys
-import types
-
-def _recv_exact(channel, size):
-    chunks = []
-    remaining = size
-    while remaining:
-        chunk = channel.recv(remaining)
-        if not chunk:
-            raise EOFError("trusted worker source channel closed")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-source_channel = socket.socket(fileno=int(sys.argv[1]))
-supervisor_channel = socket.socket(fileno=int(sys.argv[2]))
-interpreter_fd = int(sys.argv[3])
-gateway_pid = int(sys.argv[4])
-if (
-    source_channel.fileno() <= 2
-    or supervisor_channel.fileno() <= 2
-    or source_channel.fileno() == supervisor_channel.fileno()
-    or gateway_pid <= 1
-):
-    raise PermissionError("resident supervisor descriptor identity is invalid")
-if interpreter_fd >= 0:
-    os.close(interpreter_fd)
-if os.getppid() != gateway_pid:
-    raise PermissionError("resident supervisor parent identity changed during startup")
-if sys.platform.startswith("linux") and hasattr(socket, "SO_PEERCRED"):
-    peer_credentials = supervisor_channel.getsockopt(
-        socket.SOL_SOCKET,
-        socket.SO_PEERCRED,
-        struct.calcsize("3i"),
-    )
-    peer_pid, _, _ = struct.unpack("3i", peer_credentials)
-    if peer_pid != gateway_pid:
-        raise PermissionError("resident supervisor control peer changed")
-try:
-    size = struct.unpack("!I", _recv_exact(source_channel, 4))[0]
-    if size <= 0 or size > 1024 * 1024:
-        raise ValueError("invalid trusted worker source frame")
-    payload = json.loads(_recv_exact(source_channel, size).decode("utf-8"))
-finally:
-    source_channel.close()
-
-modules = payload["modules"]
-for item in modules:
-    name = item["name"]
-    if name not in {"process_security", "video_edit_runtime_worker"}:
-        raise ValueError("unexpected trusted worker module")
-    module = types.ModuleType(name)
-    module.__file__ = item["path"]
-    module.__package__ = ""
-    sys.modules[name] = module
-    exec(compile(item["source"], item["path"], "exec"), module.__dict__)
-
-worker = sys.modules["video_edit_runtime_worker"]
-worker_path = payload["worker_path"]
-if not worker.harden_sensitive_process(no_new_privs=True, drop_ptrace=True):
-    raise PermissionError("resident supervisor memory boundary is unavailable")
-if not worker.enable_child_subreaper():
-    raise PermissionError("resident supervisor subreaper boundary is unavailable")
-memory_limit = worker.apply_worker_memory_limit(worker._MEMORY_LIMIT_BYTES)
-if sys.platform.startswith("linux") and memory_limit.get("applied") is not True:
-    raise PermissionError("resident supervisor memory limit is unavailable")
-worker._preload_optional_runtime_modules()
-for item in modules:
-    item.clear()
-modules.clear()
-payload.clear()
-sys.path[:] = []
-sys.path_importer_cache.clear()
-sys.meta_path[:] = [
-    worker.importlib.machinery.BuiltinImporter,
-    worker.importlib.machinery.FrozenImporter,
-]
-
-def _factory_loop(factory_channel, parent_guard, ready_channel, supervisor_pid):
-    active_seed_pid = 0
-    last_reaped_seed_pid = 0
-    factory_pid = os.getpid()
-
-    if not worker.bind_process_to_parent(
-        supervisor_pid, death_signal=signal.SIGTERM
-    ):
-        raise PermissionError("factory parent-death boundary is unavailable")
-    os.setsid()
-    if not worker.harden_sensitive_process(no_new_privs=True, drop_ptrace=True):
-        raise PermissionError("factory process memory boundary is unavailable")
-    if not worker.enable_child_subreaper():
-        raise PermissionError("factory child-subreaper boundary is unavailable")
-
-    def _cleanup_seed(pid):
-        nonlocal active_seed_pid, last_reaped_seed_pid
-        if pid and active_seed_pid == pid:
-            cleaned = worker._kill_and_reap_executor(pid)
-            if cleaned:
-                last_reaped_seed_pid = pid
-                active_seed_pid = 0
-            return cleaned
-        if pid == last_reaped_seed_pid:
-            return True
-        if sys.platform.startswith("linux"):
-            return worker._cleanup_linux_owned_processes(os.getpid(), None)
-        return not pid
-
-    def _refresh_seed_state():
-        nonlocal active_seed_pid, last_reaped_seed_pid
-        if active_seed_pid and worker._reap_exited_broker_leader(active_seed_pid):
-            exited_pid = active_seed_pid
-            cleaned = (
-                not sys.platform.startswith("linux")
-                or worker._cleanup_linux_owned_processes(os.getpid(), None)
-            )
-            if cleaned:
-                active_seed_pid = 0
-                last_reaped_seed_pid = exited_pid
-
-    def _spawn_seed():
-        nonlocal active_seed_pid
-        _refresh_seed_state()
-        if active_seed_pid:
-            worker._send_seed_broker_response(
-                factory_channel,
-                {"seed_ready": False, "error": "factory already owns an active seed"},
-                broker_fd=None,
-            )
-            return
-        if sys.platform.startswith("linux") and not worker._cleanup_linux_owned_processes(
-            os.getpid(), None
-        ):
-            worker._send_seed_broker_response(
-                factory_channel,
-                {"seed_ready": False, "error": "factory child invariant failed"},
-                broker_fd=None,
-            )
-            return
-
-        gateway_channel, seed_channel = socket.socketpair()
-        try:
-            seed_pid = os.fork()
-        except OSError as exc:
-            gateway_channel.close()
-            seed_channel.close()
-            worker._send_seed_broker_response(
-                factory_channel,
-                {"seed_ready": False, "error": f"{type(exc).__name__}: {exc}"},
-                broker_fd=None,
-            )
-            return
-        if seed_pid == 0:
-            factory_channel.close()
-            parent_guard.close()
-            gateway_channel.close()
-            try:
-                if not worker.bind_process_to_parent(
-                    factory_pid, death_signal=signal.SIGTERM
-                ):
-                    raise PermissionError("seed parent-death boundary is unavailable")
-                os.setsid()
-                sys.argv = [worker_path, str(seed_channel.fileno())]
-                returncode = worker.main()
-            except BaseException:
-                returncode = 1
-            finally:
-                seed_channel.close()
-            os._exit(returncode)
-
-        seed_channel.close()
-        try:
-            gateway_channel.settimeout(10)
-            ready = worker._recv_frame(gateway_channel)
-            if ready.get("ready") is not True or ready.get("fork_seed") is not True:
-                raise RuntimeError("trusted video-edit worker seed failed to initialize")
-            gateway_channel.settimeout(None)
-            active_seed_pid = seed_pid
-            worker._send_seed_broker_response(
-                factory_channel,
-                {"seed_ready": True, "seed_pid": seed_pid, "ready": ready},
-                broker_fd=gateway_channel.fileno(),
-            )
-        except Exception as exc:
-            worker._kill_and_reap_executor(seed_pid)
-            worker._send_seed_broker_response(
-                factory_channel,
-                {"seed_ready": False, "error": f"{type(exc).__name__}: {exc}"},
-                broker_fd=None,
-            )
-        finally:
-            gateway_channel.close()
-
-    worker._send_frame(ready_channel, {
-        "ready": True,
-        "factory_ready": True,
-        "fork_factory": True,
-        "resident_image": True,
-        "dumpable": 0 if sys.platform.startswith("linux") else None,
-        "memory_limit": memory_limit,
-        "accepts_secrets": False,
-        "child_subreaper": True,
-    })
-    ready_channel.close()
-    try:
-        while True:
-            readable, _, _ = select.select(
-                [factory_channel, parent_guard],
-                [],
-                [],
-                0.05 if active_seed_pid else None,
-            )
-            if parent_guard in readable:
-                if not parent_guard.recv(1):
-                    break
-                raise PermissionError("factory parent guard received data")
-            if factory_channel not in readable:
-                _refresh_seed_state()
-                continue
-            operation = factory_channel.recv(1)
-            if not operation:
-                break
-            if operation == b"N":
-                _spawn_seed()
-                continue
-            if operation == b"T":
-                requested_pid = struct.unpack(
-                    "!Q", worker._recv_exact(factory_channel, 8)
-                )[0]
-                cleaned = _cleanup_seed(requested_pid)
-                worker._send_frame(factory_channel, {
-                    "cleanup": "stopped" if cleaned else "unknown",
-                    "pid": requested_pid,
-                    "reaped": cleaned,
-                })
-                continue
-            if operation == b"Q":
-                cleaned = _cleanup_seed(active_seed_pid)
-                worker._send_frame(factory_channel, {"shutdown": cleaned})
-                if cleaned:
-                    break
-                continue
-            break
-    finally:
-        if active_seed_pid:
-            _cleanup_seed(active_seed_pid)
-        factory_channel.close()
-        parent_guard.close()
-    return 0
-
-active_factory_pid = 0
-last_reaped_factory_pid = 0
-active_factory_guard = None
-supervisor_pid = os.getpid()
-
-def _close_factory_guard():
-    global active_factory_guard
-    guard = active_factory_guard
-    active_factory_guard = None
-    if guard is not None:
-        guard.close()
-
-def _cleanup_factory(pid):
-    global active_factory_pid, last_reaped_factory_pid
-    if pid and active_factory_pid == pid:
-        cleaned = worker._kill_and_reap_executor(pid)
-        if cleaned:
-            last_reaped_factory_pid = pid
-            active_factory_pid = 0
-            _close_factory_guard()
-        return cleaned
-    if pid == last_reaped_factory_pid:
-        return True
-    if sys.platform.startswith("linux"):
-        return worker._cleanup_linux_owned_processes(os.getpid(), None)
-    return not pid
-
-def _refresh_factory_state():
-    global active_factory_pid, last_reaped_factory_pid
-    if active_factory_pid and worker._reap_exited_broker_leader(active_factory_pid):
-        exited_pid = active_factory_pid
-        cleaned = (
-            not sys.platform.startswith("linux")
-            or worker._cleanup_linux_owned_processes(os.getpid(), None)
-        )
-        if cleaned:
-            active_factory_pid = 0
-            last_reaped_factory_pid = exited_pid
-            _close_factory_guard()
-
-def _spawn_factory():
-    global active_factory_pid, active_factory_guard
-    _refresh_factory_state()
-    if active_factory_pid:
-        worker._send_seed_broker_response(
-            supervisor_channel,
-            {"factory_spawned": False, "error": "supervisor already owns a factory"},
-            broker_fd=None,
-        )
-        return
-    if sys.platform.startswith("linux") and not worker._cleanup_linux_owned_processes(
-        os.getpid(), None
-    ):
-        worker._send_seed_broker_response(
-            supervisor_channel,
-            {"factory_spawned": False, "error": "supervisor child invariant failed"},
-            broker_fd=None,
-        )
-        return
-
-    gateway_factory, factory_channel = socket.socketpair()
-    supervisor_guard, factory_guard = socket.socketpair()
-    ready_parent, ready_child = socket.socketpair()
-    try:
-        factory_pid = os.fork()
-    except OSError as exc:
-        for channel in (
-            gateway_factory,
-            factory_channel,
-            supervisor_guard,
-            factory_guard,
-            ready_parent,
-            ready_child,
-        ):
-            channel.close()
-        worker._send_seed_broker_response(
-            supervisor_channel,
-            {"factory_spawned": False, "error": f"{type(exc).__name__}: {exc}"},
-            broker_fd=None,
-        )
-        return
-    if factory_pid == 0:
-        supervisor_channel.close()
-        gateway_factory.close()
-        supervisor_guard.close()
-        ready_parent.close()
-        try:
-            returncode = _factory_loop(
-                factory_channel,
-                factory_guard,
-                ready_child,
-                supervisor_pid,
-            )
-        except BaseException:
-            returncode = 1
-        finally:
-            for channel in (factory_channel, factory_guard, ready_child):
-                try:
-                    channel.close()
-                except OSError:
-                    pass
-        os._exit(returncode)
-
-    factory_channel.close()
-    factory_guard.close()
-    ready_child.close()
-    try:
-        ready_parent.settimeout(10)
-        ready = worker._recv_frame(ready_parent)
-        if (
-            ready.get("ready") is not True
-            or ready.get("factory_ready") is not True
-            or ready.get("resident_image") is not True
-        ):
-            raise RuntimeError("trusted video-edit worker factory failed to initialize")
-        active_factory_pid = factory_pid
-        active_factory_guard = supervisor_guard
-        worker._send_seed_broker_response(
-            supervisor_channel,
-            {
-                "factory_spawned": True,
-                "factory_pid": factory_pid,
-                "ready": ready,
-            },
-            broker_fd=gateway_factory.fileno(),
-        )
-    except Exception as exc:
-        supervisor_guard.close()
-        worker._kill_and_reap_executor(factory_pid)
-        worker._send_seed_broker_response(
-            supervisor_channel,
-            {"factory_spawned": False, "error": f"{type(exc).__name__}: {exc}"},
-            broker_fd=None,
-        )
-    finally:
-        ready_parent.close()
-        gateway_factory.close()
-
-worker._send_frame(supervisor_channel, {
-    "ready": True,
-    "supervisor_ready": True,
-    "resident_supervisor": True,
-    "dumpable": 0 if sys.platform.startswith("linux") else None,
-    "memory_limit": memory_limit,
-    "accepts_secrets": False,
-    "child_subreaper": True,
-})
-try:
-    while True:
-        readable, _, _ = select.select(
-            [supervisor_channel], [], [], 0.05 if active_factory_pid else 0.25
-        )
-        if os.getppid() != gateway_pid:
-            break
-        if not readable:
-            _refresh_factory_state()
-            continue
-        operation = supervisor_channel.recv(1)
-        if not operation:
-            break
-        if operation == b"N":
-            _spawn_factory()
-            continue
-        if operation == b"T":
-            requested_pid = struct.unpack(
-                "!Q", worker._recv_exact(supervisor_channel, 8)
-            )[0]
-            cleaned = _cleanup_factory(requested_pid)
-            worker._send_frame(supervisor_channel, {
-                "cleanup": "stopped" if cleaned else "unknown",
-                "pid": requested_pid,
-                "reaped": cleaned,
-            })
-            continue
-        if operation == b"Q":
-            cleaned = _cleanup_factory(active_factory_pid)
-            worker._send_frame(supervisor_channel, {"shutdown": cleaned})
-            if cleaned:
-                break
-            continue
-        break
-finally:
-    if active_factory_pid:
-        _cleanup_factory(active_factory_pid)
-    _close_factory_guard()
-    supervisor_channel.close()
-"""
-_MANAGED_TRUSTED_RUNTIME = bool(os.environ.get("ZETTLAB_PRESETS_DIR"))
-_SENSITIVE_PROCESS_OS_BOUNDARY = (
-    not sys.platform.startswith("linux")
-    or (
-        _MANAGED_TRUSTED_RUNTIME
-        and harden_sensitive_process(no_new_privs=False, drop_ptrace=True)
-    )
-)
-_MODEL_DESCENDANT_PTRACE_BOUNDARY = (
-    not sys.platform.startswith("linux")
-    or (_MANAGED_TRUSTED_RUNTIME and _SENSITIVE_PROCESS_OS_BOUNDARY)
-)
-
-
 def _is_python_executable_token(token: str) -> bool:
     name = Path(token).name.lower()
     return (
@@ -2121,14 +1563,18 @@ def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
         )
         return None
 
-    parts = path.parts
-    if len(parts) < 4:
+    parts = relative.parts
+    if len(parts) != 4:
         _log_connector_runtime_rejection("invalid_layout", str(relative))
         return None
-    if parts[-1] != _CONNECTOR_RUNTIME_SCRIPT:
+    if parts[-1] not in _CONNECTOR_RUNTIME_SCRIPTS:
         _log_connector_runtime_rejection("invalid_script_name", str(relative))
         return None
-    if parts[-2] != "scripts" or parts[-4] != "skills":
+    if (
+        parts[0] != "skills"
+        or _CONNECTOR_RUNTIME_SKILL_ID_RE.fullmatch(parts[1]) is None
+        or parts[2] != "scripts"
+    ):
         _log_connector_runtime_rejection("invalid_layout", str(relative))
         return None
     if not path.is_file():
@@ -2147,6 +1593,27 @@ def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
         _log_connector_runtime_rejection(reason or "trust_check_failed", str(relative))
         return None
     return path
+
+
+def _connector_action_runtime_identity(
+    script: Path,
+    anchor: _ConnectorRuntimeRootAnchor,
+) -> Optional[str]:
+    """Return the canonical identity for one already-trusted direct runner."""
+    try:
+        relative = script.relative_to(anchor.resolved_root)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if (
+        len(parts) != 4
+        or parts[0] != "skills"
+        or _CONNECTOR_RUNTIME_SKILL_ID_RE.fullmatch(parts[1]) is None
+        or parts[2] != "scripts"
+        or parts[3] not in _CONNECTOR_RUNTIME_SCRIPTS
+    ):
+        return None
+    return relative.as_posix()
 
 
 def _managed_lark_cli_broker_enabled() -> bool:
@@ -2362,7 +1829,7 @@ def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntime
         if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
             return None
 
-    if Path(tokens[1]).name != _CONNECTOR_RUNTIME_SCRIPT:
+    if Path(tokens[1]).name not in _CONNECTOR_RUNTIME_SCRIPTS:
         return None
 
     script = _resolve_connector_runtime_script(tokens[1])
@@ -2523,7 +1990,7 @@ def _connector_runtime_python_script_index(
     segment: list[str],
     python_index: int,
     *,
-    script_name: str = _CONNECTOR_RUNTIME_SCRIPT,
+    script_name: str | None = None,
 ) -> Optional[int]:
     """Find a script after Python flags without interpreting ``-c``/``-m``."""
     position = python_index + 1
@@ -2542,10 +2009,13 @@ def _connector_runtime_python_script_index(
             if position >= len(segment):
                 return None
             position += 1
-    if (
-        position >= len(segment)
-        or Path(segment[position]).name != script_name
-    ):
+    if position >= len(segment):
+        return None
+    candidate_name = Path(segment[position]).name
+    allowed_names = (
+        _CONNECTOR_RUNTIME_SCRIPTS if script_name is None else {script_name}
+    )
+    if candidate_name not in allowed_names:
         return None
     return position
 
@@ -2712,1845 +2182,17 @@ def _read_connector_runtime_script_bytes(
         os.close(descriptor)
 
 
-def _trusted_video_edit_source_bundle(
-    *,
-    script: Path,
-    presets_root: Path,
-    expected_root_identity: tuple[int, int],
-) -> dict[str, dict[str, str]]:
-    """Return a pre-trust source snapshot; never reread scripts post-terminal."""
-    global _TRUSTED_RUNTIME_SOURCE_CACHE_BYTES
 
-    video_edit_scripts_root = (
-        presets_root / "skills" / "video-edit-workflow-mini" / "scripts"
-    )
-    require_signed_video_edit_sources = script.parent == video_edit_scripts_root
 
-    cache_key = (str(script.parent), expected_root_identity)
-    with _VIDEO_EDIT_WORKER_LOCK:
-        snapshot = _TRUSTED_RUNTIME_SOURCE_CACHE.get(cache_key)
-        if snapshot is None:
-            if _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED:
-                raise PermissionError(
-                    "trusted runtime source was not captured before terminal access"
-                )
-            if len(_TRUSTED_RUNTIME_SOURCE_CACHE) >= (
-                _TRUSTED_RUNTIME_SOURCE_CACHE_MAX_DIRECTORIES
-            ):
-                raise MemoryError("trusted runtime source cache directory limit reached")
-
-            signed_digests = (
-                _trusted_video_edit_release_digests()
-                if require_signed_video_edit_sources
-                else {}
-            )
-            if require_signed_video_edit_sources and not signed_digests:
-                raise PermissionError(
-                    "signed video-edit helper manifest is unavailable"
-                )
-
-            modules: list[_TrustedWorkerModuleSnapshot] = []
-            total_bytes = 0
-            for dependency in sorted(script.parent.glob("*.py")):
-                if not dependency.is_file() or not _connector_runtime_path_is_trusted(
-                    dependency,
-                    presets_root,
-                    expected_root_identity=expected_root_identity,
-                ):
-                    raise PermissionError(
-                        f"untrusted video-edit dependency: {dependency.name}"
-                    )
-                source_bytes = _read_stable_trusted_worker_source(dependency)
-                if require_signed_video_edit_sources:
-                    relative_dependency = dependency.relative_to(
-                        presets_root
-                    ).as_posix()
-                    expected_digest = signed_digests.get(relative_dependency)
-                    if (
-                        expected_digest is None
-                        or hashlib.sha256(source_bytes).hexdigest()
-                        != expected_digest
-                    ):
-                        raise PermissionError(
-                            "video-edit dependency does not match signed manifest: "
-                            f"{dependency.name}"
-                        )
-                total_bytes += len(source_bytes)
-                if (
-                    _TRUSTED_RUNTIME_SOURCE_CACHE_BYTES + total_bytes
-                    > _TRUSTED_RUNTIME_SOURCE_CACHE_MAX_BYTES
-                ):
-                    raise MemoryError("trusted runtime source cache byte limit reached")
-                try:
-                    source = source_bytes.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise PermissionError(
-                        f"trusted runtime source is not UTF-8: {dependency.name}"
-                    ) from exc
-                if not _connector_runtime_path_is_trusted(
-                    dependency,
-                    presets_root,
-                    expected_root_identity=expected_root_identity,
-                ):
-                    raise PermissionError(
-                        f"video-edit dependency changed: {dependency.name}"
-                    )
-                modules.append(
-                    _TrustedWorkerModuleSnapshot(
-                        dependency.stem,
-                        str(dependency),
-                        source,
-                    )
-                )
-            snapshot = _TrustedRuntimeDirectorySnapshot(
-                modules=tuple(modules),
-                total_bytes=total_bytes,
-            )
-            if not any(module.path == str(script) for module in snapshot.modules):
-                raise PermissionError(
-                    "video-edit entrypoint missing from trusted snapshot"
-                )
-            encoded_bundle_bytes = len(json.dumps(
-                {
-                    module.name: {
-                        "path": module.path,
-                        "source": module.source,
-                    }
-                    for module in snapshot.modules
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8"))
-            if encoded_bundle_bytes > _TRUSTED_RUNTIME_DIRECTORY_MAX_ENCODED_BYTES:
-                raise MemoryError("trusted runtime source directory exceeds IPC budget")
-            _TRUSTED_RUNTIME_SOURCE_CACHE[cache_key] = snapshot
-            _TRUSTED_RUNTIME_SOURCE_CACHE_BYTES += total_bytes
-
-        bundle = {
-            ("__main__" if module.path == str(script) else module.name): {
-                "path": module.path,
-                "source": module.source,
-            }
-            for module in snapshot.modules
-        }
-        if "__main__" not in bundle:
-            raise PermissionError("runtime entrypoint was not captured before terminal access")
-        return bundle
-
-
-def _trusted_video_edit_release_digests() -> dict[str, str]:
-    """Load only the digests from the already verified presets manifest."""
-    try:
-        from agent.zet_agent_response_mode import (
-            trusted_video_edit_manifest_digests,
-        )
-
-        return dict(trusted_video_edit_manifest_digests())
-    except Exception:
-        return {}
-
-
-def _preload_trusted_runtime_source_bundles() -> None:
-    """Eagerly snapshot every allowlisted installed runtime before terminal use."""
-    anchor = _capture_connector_runtime_root()
-    if anchor is None:
-        raise PermissionError("trusted presets root is unavailable")
-    candidates = set(
-        anchor.resolved_root.glob("skills/*/scripts/connector_runtime.py")
-    )
-    video_scripts = (
-        anchor.resolved_root / "skills" / "video-edit-workflow-mini" / "scripts"
-    )
-    candidates.update(
-        video_scripts / name
-        for name in _VIDEO_EDIT_RUNTIME_SCRIPTS
-        if (video_scripts / name).is_file()
-    )
-    if len(candidates) > _TRUSTED_RUNTIME_SOURCE_CACHE_MAX_DIRECTORIES:
-        raise MemoryError("trusted runtime source preload count exceeded")
-    for script in sorted(candidates):
-        if not _connector_runtime_path_is_trusted(
-            script,
-            anchor.resolved_root,
-            expected_root_identity=anchor.identity,
-        ):
-            raise PermissionError(f"untrusted runtime preload: {script}")
-        _trusted_video_edit_source_bundle(
-            script=script,
-            presets_root=anchor.resolved_root,
-            expected_root_identity=anchor.identity,
-        )
-
-
-def _video_edit_worker_recv_exact(channel: socket.socket, size: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining:
-        chunk = channel.recv(remaining)
-        if not chunk:
-            raise EOFError("trusted video-edit worker channel closed")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def _video_edit_worker_recv_frame(
-    channel: socket.socket,
-    *,
-    timeout: float,
-) -> dict[str, Any]:
-    previous_timeout = channel.gettimeout()
-    channel.settimeout(timeout)
-    try:
-        size = struct.unpack(
-            "!I",
-            _video_edit_worker_recv_exact(channel, 4),
-        )[0]
-        if size <= 0 or size > _VIDEO_EDIT_WORKER_MAX_FRAME_BYTES:
-            raise ValueError("invalid trusted video-edit worker frame size")
-        payload = json.loads(
-            _video_edit_worker_recv_exact(channel, size).decode("utf-8")
-        )
-    finally:
-        channel.settimeout(previous_timeout)
-    if not isinstance(payload, dict):
-        raise ValueError("invalid trusted video-edit worker frame")
-    return payload
-
-
-def _video_edit_worker_send_frame(
-    channel: socket.socket,
-    payload: dict[str, Any],
-) -> None:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    if len(encoded) > _VIDEO_EDIT_WORKER_MAX_FRAME_BYTES:
-        raise ValueError("trusted video-edit worker request too large")
-    channel.sendall(struct.pack("!I", len(encoded)) + encoded)
-
-
-def _video_edit_worker_recv_fd_frame(
-    channel: socket.socket,
-    *,
-    timeout: float,
-) -> tuple[dict[str, Any], Optional[socket.socket]]:
-    previous_timeout = channel.gettimeout()
-    channel.settimeout(timeout)
-    received_fds = array.array("i")
-    try:
-        try:
-            marker, ancillary, message_flags, _address = channel.recvmsg(
-                1,
-                socket.CMSG_SPACE(received_fds.itemsize),
-                getattr(socket, "MSG_CMSG_CLOEXEC", 0),
-            )
-            if message_flags & getattr(socket, "MSG_CTRUNC", 0):
-                raise RuntimeError("trusted worker seed truncated broker fd metadata")
-            for level, kind, data in ancillary:
-                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                    usable = len(data) - (len(data) % received_fds.itemsize)
-                    received_fds.frombytes(data[:usable])
-            payload = _video_edit_worker_recv_frame(channel, timeout=timeout)
-        except Exception:
-            for fd in received_fds:
-                os.close(fd)
-            raise
-    finally:
-        channel.settimeout(previous_timeout)
-
-    if marker == b"E":
-        for fd in received_fds:
-            os.close(fd)
-        return payload, None
-    if marker != b"F" or len(received_fds) != 1:
-        for fd in received_fds:
-            os.close(fd)
-        raise RuntimeError("trusted worker seed returned an invalid broker fd")
-    fd = received_fds[0]
-    try:
-        os.set_inheritable(fd, False)
-        return payload, socket.socket(fileno=fd)
-    except Exception:
-        os.close(fd)
-        raise
-
-
-def _read_video_edit_worker_process_start_time(pid: int) -> Optional[int]:
-    """Read Linux's non-reusable process birth identity from procfs."""
-    if not sys.platform.startswith("linux"):
-        return None
-    with Path(f"/proc/{pid}/stat").open("r", encoding="ascii") as handle:
-        raw = handle.read(4096)
-    closing_paren = raw.rfind(")")
-    if closing_paren < 0:
-        raise ValueError("invalid /proc stat comm field")
-    fields = raw[closing_paren + 2 :].split()
-    if len(fields) < 20:
-        raise ValueError("incomplete /proc stat record")
-    return int(fields[19])
-
-
-def _capture_video_edit_worker_process_identity(
-    pid: int,
-) -> _VideoEditWorkerProcessIdentity:
-    if not isinstance(pid, int) or pid <= 0:
-        raise ValueError("invalid trusted worker process id")
-    start_before = _read_video_edit_worker_process_start_time(pid)
-    if sys.platform.startswith("linux") and start_before is None:
-        raise PermissionError("trusted worker process identity is unavailable")
-
-    descriptor: Optional[int] = None
-    pidfd_open = getattr(os, "pidfd_open", None)
-    if pidfd_open is not None:
-        try:
-            descriptor = pidfd_open(pid, 0)
-        except OSError as exc:
-            if exc.errno not in {
-                errno.EINVAL,
-                errno.ENOSYS,
-                errno.EPERM,
-                errno.EACCES,
-            }:
-                raise
-    try:
-        start_after = _read_video_edit_worker_process_start_time(pid)
-        if start_after != start_before:
-            raise PermissionError("trusted worker process identity changed")
-        return _VideoEditWorkerProcessIdentity(
-            pid=pid,
-            start_time=start_before,
-            pidfd=descriptor,
-        )
-    except Exception:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise
-
-
-def _close_video_edit_worker_process_identity(
-    identity: _VideoEditWorkerProcessIdentity,
-) -> None:
-    if identity.pidfd is None:
-        return
-    try:
-        os.close(identity.pidfd)
-    except OSError:
-        pass
-
-
-def _video_edit_worker_process_identity_is_current(
-    identity: _VideoEditWorkerProcessIdentity,
-) -> bool:
-    try:
-        current_start_time = _read_video_edit_worker_process_start_time(identity.pid)
-    except (OSError, ValueError):
-        return False
-    if identity.start_time is not None:
-        if current_start_time != identity.start_time:
-            return False
-    elif sys.platform.startswith("linux"):
-        return False
-
-    if identity.pidfd is not None:
-        try:
-            readable, _, _ = select.select([identity.pidfd], [], [], 0)
-        except (OSError, ValueError):
-            return False
-        return not readable
-
-    try:
-        os.kill(identity.pid, 0)  # windows-footgun: ok -- POSIX worker only
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _video_edit_worker_process_identity_can_signal(
-    identity: _VideoEditWorkerProcessIdentity,
-) -> bool:
-    """Require a non-reusable kernel identity before gateway-side signaling."""
-    return identity.pidfd is not None or identity.start_time is not None
-
-
-def _signal_video_edit_worker_process_identity(
-    identity: _VideoEditWorkerProcessIdentity,
-    signum: int,
-) -> bool:
-    """Signal only the process captured by this identity, never a reused PID."""
-    if not _video_edit_worker_process_identity_can_signal(identity):
-        return False
-    if not _video_edit_worker_process_identity_is_current(identity):
-        return False
-
-    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
-    if identity.pidfd is not None and pidfd_send_signal is not None:
-        try:
-            if not _video_edit_worker_process_identity_is_current(identity):
-                return False
-            pidfd_send_signal(identity.pidfd, signum, None, 0)
-            return True
-        except ProcessLookupError:
-            return True
-        except OSError:
-            return False
-
-    try:
-        if not _video_edit_worker_process_identity_is_current(identity):
-            return False
-        os.kill(identity.pid, signum)
-        return True
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-
-
-def _trusted_worker_stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        value.st_mode,
-        value.st_nlink,
-        value.st_uid,
-        value.st_gid,
-        value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
-    )
-
-
-def _video_edit_worker_source_paths() -> tuple[tuple[str, Path], ...]:
-    module_dir = Path(__file__).resolve().parent
-    return (
-        ("process_security", module_dir / "process_security.py"),
-        ("video_edit_runtime_worker", module_dir / "video_edit_runtime_worker.py"),
-    )
-
-
-def _read_stable_trusted_worker_source(path: Path) -> bytes:
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    path_before = os.stat(path, follow_symlinks=False)
-    if not stat.S_ISREG(path_before.st_mode):
-        raise PermissionError(f"trusted worker source is not a regular file: {path.name}")
-
-    fd = os.open(path, flags)
-    try:
-        opened_before = os.fstat(fd)
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            remaining = _VIDEO_EDIT_WORKER_SOURCE_LIMIT_BYTES + 1 - total
-            chunk = os.read(fd, min(64 * 1024, remaining))
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > _VIDEO_EDIT_WORKER_SOURCE_LIMIT_BYTES:
-                raise ValueError(f"trusted worker source is too large: {path.name}")
-            chunks.append(chunk)
-        opened_after = os.fstat(fd)
-    finally:
-        os.close(fd)
-
-    path_after = os.stat(path, follow_symlinks=False)
-    fingerprints = {
-        _trusted_worker_stat_fingerprint(path_before),
-        _trusted_worker_stat_fingerprint(opened_before),
-        _trusted_worker_stat_fingerprint(opened_after),
-        _trusted_worker_stat_fingerprint(path_after),
-    }
-    if len(fingerprints) != 1 or not stat.S_ISREG(opened_after.st_mode):
-        raise PermissionError(f"trusted worker source changed while loading: {path.name}")
-    return b"".join(chunks)
-
-
-def _stable_trusted_worker_file_fingerprint(path: Path) -> tuple[int, ...]:
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    path_before = os.stat(path, follow_symlinks=False)
-    fd = os.open(path, flags)
-    try:
-        opened = os.fstat(fd)
-    finally:
-        os.close(fd)
-    path_after = os.stat(path, follow_symlinks=False)
-    fingerprints = {
-        _trusted_worker_stat_fingerprint(path_before),
-        _trusted_worker_stat_fingerprint(opened),
-        _trusted_worker_stat_fingerprint(path_after),
-    }
-    if len(fingerprints) != 1 or not stat.S_ISREG(opened.st_mode):
-        raise PermissionError(f"trusted executable changed while loading: {path.name}")
-    return _trusted_worker_stat_fingerprint(opened)
-
-
-def _capture_trusted_video_edit_worker_snapshot() -> _TrustedWorkerSourceSnapshot:
-    modules: list[_TrustedWorkerModuleSnapshot] = []
-    total_bytes = 0
-    worker_path = ""
-    for name, path in _video_edit_worker_source_paths():
-        source_bytes = _read_stable_trusted_worker_source(path)
-        total_bytes += len(source_bytes)
-        if total_bytes > _VIDEO_EDIT_WORKER_SOURCE_LIMIT_BYTES:
-            raise ValueError("trusted worker source snapshot is too large")
-        try:
-            source = source_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"trusted worker source is not UTF-8: {path.name}") from exc
-        modules.append(_TrustedWorkerModuleSnapshot(name, str(path), source))
-        if name == "video_edit_runtime_worker":
-            worker_path = str(path)
-    if not worker_path:
-        raise FileNotFoundError("trusted video-edit worker entrypoint missing")
-
-    python_executable = Path(sys.executable).resolve(strict=True)
-    return _TrustedWorkerSourceSnapshot(
-        modules=tuple(modules),
-        python_executable=str(python_executable),
-        python_fingerprint=_stable_trusted_worker_file_fingerprint(python_executable),
-        worker_path=worker_path,
-    )
-
-
-def _trusted_video_edit_worker_snapshot_payload(
-    snapshot: _TrustedWorkerSourceSnapshot,
-) -> dict[str, Any]:
-    return {
-        "modules": [
-            {"name": module.name, "path": module.path, "source": module.source}
-            for module in snapshot.modules
-        ],
-        "worker_path": snapshot.worker_path,
-    }
-
-
-def _trusted_video_edit_worker_factory_image(
-    snapshot: _TrustedWorkerSourceSnapshot,
-) -> _TrustedWorkerFactoryImage:
-    """Preload every bootstrap dependency into the gateway before trust closes."""
-    global _VIDEO_EDIT_WORKER_FACTORY_IMAGE
-
-    image = _VIDEO_EDIT_WORKER_FACTORY_IMAGE
-    if (
-        image is not None
-        and image.owner_pid == os.getpid()
-        and image.snapshot is snapshot
-    ):
-        return image
-    if _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED:
-        raise PermissionError(
-            "trusted video-edit worker gateway image was not prepared before terminal access"
-        )
-
-    expected_names = ("process_security", "video_edit_runtime_worker")
-    if tuple(module.name for module in snapshot.modules) != expected_names:
-        raise PermissionError("trusted video-edit worker source identity changed")
-
-    missing = object()
-    previous_modules: dict[str, object] = {}
-    loaded_modules: dict[str, types.ModuleType] = {}
-    modules_before = set(sys.modules)
-    imported_names: set[str] = set()
-    real_import = builtins.__import__
-
-    def tracked_import(
-        name: str,
-        globals: Optional[dict[str, Any]] = None,
-        locals: Optional[dict[str, Any]] = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ) -> Any:
-        imported = real_import(name, globals, locals, fromlist, level)
-        if level == 0:
-            imported_names.add(name)
-            for item in fromlist or ():
-                qualified = f"{name}.{item}"
-                if qualified in sys.modules:
-                    imported_names.add(qualified)
-        return imported
-
-    tracked_builtins = dict(vars(builtins))
-    tracked_builtins["__import__"] = tracked_import
-    try:
-        for module_snapshot in snapshot.modules:
-            name = module_snapshot.name
-            previous_modules[name] = sys.modules.get(name, missing)
-            module = types.ModuleType(name)
-            module.__file__ = module_snapshot.path
-            module.__package__ = ""
-            module.__dict__["__builtins__"] = tracked_builtins
-            sys.modules[name] = module
-            exec(
-                compile(
-                    module_snapshot.source,
-                    module_snapshot.path,
-                    "exec",
-                ),
-                module.__dict__,
-            )
-            loaded_modules[name] = module
-
-        worker = loaded_modules["video_edit_runtime_worker"]
-        real_import_module = worker.importlib.import_module
-
-        def tracked_import_module(name: str, package: Optional[str] = None) -> Any:
-            imported = real_import_module(name, package)
-            imported_names.add(name)
-            return imported
-
-        worker.importlib = types.SimpleNamespace(import_module=tracked_import_module)
-        worker._preload_optional_runtime_modules()
-        bootstrap_code = compile(
-            _VIDEO_EDIT_WORKER_MEMORY_BOOTSTRAP,
-            "<trusted-video-edit-worker-supervisor>",
-            "exec",
-        )
-        module_names = {
-            "array",
-            "builtins",
-            "json",
-            "os",
-            "select",
-            "signal",
-            "socket",
-            "struct",
-            "sys",
-            "types",
-            *expected_names,
-            *imported_names,
-            *(set(sys.modules) - modules_before),
-        }
-        pending = list(module_names)
-        while pending:
-            name = pending.pop()
-            module = sys.modules.get(name)
-            if not isinstance(module, types.ModuleType):
-                continue
-            for value in vars(module).values():
-                if not isinstance(value, types.ModuleType):
-                    continue
-                dependency = value.__name__
-                if dependency in sys.modules and dependency not in module_names:
-                    module_names.add(dependency)
-                    pending.append(dependency)
-            parts = name.split(".")
-            for index in range(1, len(parts)):
-                parent = ".".join(parts[:index])
-                if parent in sys.modules and parent not in module_names:
-                    module_names.add(parent)
-                    pending.append(parent)
-        for name, module in tuple(sys.modules.items()):
-            spec = getattr(module, "__spec__", None)
-            if getattr(spec, "origin", None) in {"built-in", "frozen"}:
-                module_names.add(name)
-        if _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED:
-            raise PermissionError(
-                "terminal access began while trusted worker image was loading"
-            )
-        image = _TrustedWorkerFactoryImage(
-            snapshot=snapshot,
-            bootstrap_code=bootstrap_code,
-            module_names=frozenset(module_names),
-            owner_pid=os.getpid(),
-        )
-        _VIDEO_EDIT_WORKER_FACTORY_IMAGE = image
-        return image
-    finally:
-        for name in reversed(tuple(previous_modules)):
-            previous = previous_modules[name]
-            if previous is missing:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous
-
-
-def _validate_trusted_video_edit_worker_interpreter(
-    snapshot: _TrustedWorkerSourceSnapshot,
-) -> None:
-    current = _stable_trusted_worker_file_fingerprint(Path(snapshot.python_executable))
-    if current != snapshot.python_fingerprint:
-        raise PermissionError("trusted video-edit worker interpreter changed")
-
-
-def _sealed_trusted_video_edit_worker_interpreter(
-    snapshot: _TrustedWorkerSourceSnapshot,
-) -> tuple[str, Optional[int]]:
-    """Return an immutable Linux executable image, closing the pathname race."""
-    _validate_trusted_video_edit_worker_interpreter(snapshot)
-    if not sys.platform.startswith("linux"):
-        return snapshot.python_executable, None
-    if not hasattr(os, "memfd_create"):
-        raise PermissionError("sealed trusted interpreter is unavailable")
-    try:
-        import fcntl as sealed_fcntl
-    except ImportError as exc:
-        raise PermissionError("sealed trusted interpreter is unavailable") from exc
-
-    path = Path(snapshot.python_executable)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    path_before = os.stat(path, follow_symlinks=False)
-    source_fd = os.open(path, flags)
-    sealed_fd: Optional[int] = None
-    try:
-        opened_before = os.fstat(source_fd)
-        if (
-            not stat.S_ISREG(opened_before.st_mode)
-            or opened_before.st_size <= 0
-            or opened_before.st_size > _VIDEO_EDIT_WORKER_INTERPRETER_LIMIT_BYTES
-        ):
-            raise PermissionError("trusted video-edit worker interpreter is invalid")
-        sealed_fd = os.memfd_create(
-            "hermes-video-worker-python",
-            getattr(os, "MFD_CLOEXEC", 0) | getattr(os, "MFD_ALLOW_SEALING", 0),
-        )
-        copied = 0
-        while True:
-            chunk = os.read(source_fd, min(1024 * 1024, opened_before.st_size - copied))
-            if not chunk:
-                break
-            copied += len(chunk)
-            if copied > _VIDEO_EDIT_WORKER_INTERPRETER_LIMIT_BYTES:
-                raise PermissionError("trusted video-edit worker interpreter is too large")
-            view = memoryview(chunk)
-            while view:
-                written = os.write(sealed_fd, view)
-                if written <= 0:
-                    raise OSError("sealed interpreter copy made no progress")
-                view = view[written:]
-        opened_after = os.fstat(source_fd)
-        path_after = os.stat(path, follow_symlinks=False)
-        fingerprints = {
-            _trusted_worker_stat_fingerprint(path_before),
-            _trusted_worker_stat_fingerprint(opened_before),
-            _trusted_worker_stat_fingerprint(opened_after),
-            _trusted_worker_stat_fingerprint(path_after),
-            snapshot.python_fingerprint,
-        }
-        if len(fingerprints) != 1 or copied != opened_after.st_size:
-            raise PermissionError("trusted video-edit worker interpreter changed while sealing")
-        os.fchmod(sealed_fd, 0o500)
-        required_seals = (
-            getattr(sealed_fcntl, "F_SEAL_WRITE", 0)
-            | getattr(sealed_fcntl, "F_SEAL_GROW", 0)
-            | getattr(sealed_fcntl, "F_SEAL_SHRINK", 0)
-            | getattr(sealed_fcntl, "F_SEAL_SEAL", 0)
-        )
-        if not required_seals or not hasattr(sealed_fcntl, "F_ADD_SEALS"):
-            raise PermissionError("sealed trusted interpreter is unavailable")
-        sealed_fcntl.fcntl(sealed_fd, sealed_fcntl.F_ADD_SEALS, required_seals)
-        applied_seals = sealed_fcntl.fcntl(sealed_fd, sealed_fcntl.F_GET_SEALS)
-        if applied_seals & required_seals != required_seals:
-            raise PermissionError("trusted interpreter seals were not applied")
-        os.lseek(sealed_fd, 0, os.SEEK_SET)
-        return f"/proc/self/fd/{sealed_fd}", sealed_fd
-    except Exception:
-        if sealed_fd is not None:
-            os.close(sealed_fd)
-        raise
-    finally:
-        os.close(source_fd)
-
-
-def _validate_trusted_video_edit_worker_factory_supervisor(
-    supervisor: _TrustedWorkerFactorySupervisor,
-    snapshot: _TrustedWorkerSourceSnapshot,
-) -> None:
-    if supervisor.owner_pid != os.getpid() or supervisor.snapshot is not snapshot:
-        raise PermissionError("trusted video-edit worker supervisor identity changed")
-    if supervisor.process.poll() is not None:
-        raise PermissionError("trusted video-edit worker resident supervisor was lost")
-    if not _video_edit_worker_socket_peer_open(supervisor.channel):
-        raise PermissionError("trusted video-edit worker supervisor channel was lost")
-
-
-def _close_inherited_video_edit_worker_fds(*, keep: set[int]) -> None:
-    """Close gateway descriptors in the fork child before it starts serving."""
-    try:
-        max_fd = int(os.sysconf("SC_OPEN_MAX"))
-    except (OSError, TypeError, ValueError):
-        max_fd = 65536
-    start = 3
-    for descriptor in sorted(fd for fd in keep if 3 <= fd < max_fd):
-        if start < descriptor:
-            os.closerange(start, descriptor)
-        start = descriptor + 1
-    if start < max_fd:
-        os.closerange(start, max_fd)
-
-
-def _run_trusted_video_edit_worker_supervisor_child(
-    *,
-    image: _TrustedWorkerFactoryImage,
-    gateway_pid: int,
-    parent_channel: socket.socket,
-    child_channel: socket.socket,
-    source_parent: socket.socket,
-    source_child: socket.socket,
-    worker_env: dict[str, str],
-) -> None:
-    """Enter the already-compiled supervisor image without an OS exec."""
-    parent_channel.close()
-    source_parent.close()
-    child_fd = child_channel.fileno()
-    source_fd = source_child.fileno()
-    bootstrap_code = image.bootstrap_code
-    module_names = image.module_names
-    del image
-    try:
-        gc.disable()
-        for name in tuple(sys.modules):
-            if name not in module_names:
-                sys.modules.pop(name, None)
-        os.environ.clear()
-        os.environ.update(worker_env)
-        _close_inherited_video_edit_worker_fds(keep={child_fd, source_fd})
-        os.setsid()  # windows-footgun: ok -- forked POSIX supervisor child
-        sys.argv = [
-            "hermes-resident-worker-supervisor",
-            str(source_fd),
-            str(child_fd),
-            "-1",
-            str(gateway_pid),
-        ]
-        exec(
-            bootstrap_code,
-            {
-                "__builtins__": __builtins__,
-                "__name__": "__main__",
-            },
-        )
-        returncode = 0
-    except BaseException:
-        returncode = 1
-    finally:
-        for channel in (source_child, child_channel):
-            try:
-                channel.close()
-            except OSError:
-                pass
-    os._exit(returncode)
-
-
-def _trusted_video_edit_worker_factory_bootstrap(
-    snapshot: _TrustedWorkerSourceSnapshot,
-) -> _TrustedWorkerFactorySupervisor:
-    """Fork the resident supervisor before the gateway becomes multithreaded."""
-    global _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-
-    image = _trusted_video_edit_worker_factory_image(snapshot)
-    supervisor = _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-    if supervisor is not None:
-        try:
-            _validate_trusted_video_edit_worker_factory_supervisor(supervisor, snapshot)
-            return supervisor
-        except Exception:
-            _discard_trusted_video_edit_worker_factory_supervisor()
-
-    if _video_edit_worker_process_thread_count() != 1:
-        raise PermissionError(
-            "trusted video-edit worker supervisor must be prepared "
-            "before gateway threads start"
-        )
-
-    parent_channel, child_channel = socket.socketpair()
-    source_parent, source_child = socket.socketpair()
-    gateway_pid = os.getpid()
-    worker_env = _trusted_video_edit_worker_env()
-    child_pid: Optional[int] = None
-    process: Optional[_ForkedVideoEditWorkerSeed] = None
-    try:
-        child_pid = os.fork()  # windows-footgun: ok -- POSIX-gated worker path
-        if child_pid == 0:
-            _run_trusted_video_edit_worker_supervisor_child(
-                image=image,
-                gateway_pid=gateway_pid,
-                parent_channel=parent_channel,
-                child_channel=child_channel,
-                source_parent=source_parent,
-                source_child=source_child,
-                worker_env=worker_env,
-            )
-            os._exit(1)
-
-        identity = _capture_video_edit_worker_process_identity(child_pid)
-        process = _ForkedVideoEditWorkerSeed(
-            pid=child_pid,
-            identity=identity,
-            direct_child=True,
-        )
-        child_channel.close()
-        source_child.close()
-        _video_edit_worker_send_frame(
-            source_parent,
-            _trusted_video_edit_worker_snapshot_payload(snapshot),
-        )
-        source_parent.close()
-        ready = _video_edit_worker_recv_frame(
-            parent_channel,
-            timeout=_VIDEO_EDIT_WORKER_START_TIMEOUT_SECONDS,
-        )
-        memory_limit = ready.get("memory_limit") or {}
-        if (
-            ready.get("ready") is not True
-            or ready.get("supervisor_ready") is not True
-            or ready.get("resident_supervisor") is not True
-            or ready.get("accepts_secrets") is not False
-            or ready.get("child_subreaper") is not True
-            or (
-                sys.platform.startswith("linux")
-                and (
-                    ready.get("dumpable") != 0
-                    or memory_limit.get("applied") is not True
-                    or int(memory_limit.get("limit_bytes") or 0)
-                    > _VIDEO_EDIT_WORKER_MEMORY_LIMIT_BYTES
-                )
-            )
-            or process.poll() is not None
-        ):
-            raise RuntimeError("trusted worker resident supervisor failed to initialize")
-        supervisor = _TrustedWorkerFactorySupervisor(
-            snapshot=snapshot,
-            process=process,
-            channel=parent_channel,
-            owner_pid=os.getpid(),
-        )
-        _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR = supervisor
-        return supervisor
-    except Exception:
-        for pending_channel in (
-            child_channel,
-            source_child,
-            source_parent,
-            parent_channel,
-        ):
-            try:
-                pending_channel.close()
-            except OSError:
-                pass
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=2)
-        elif process is None and child_pid is not None and child_pid > 0:
-            try:
-                os.kill(child_pid, getattr(signal, "SIGKILL", 9))
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(child_pid, 0)
-            except ChildProcessError:
-                pass
-        raise
-    finally:
-        if process is not None and _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR is None:
-            process.close()
-
-
-def _discard_trusted_video_edit_worker_factory_supervisor() -> None:
-    """Stop the resident supervisor from its owning gateway process."""
-    global _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-
-    supervisor = _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-    _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR = None
-    if supervisor is None:
-        return
-    try:
-        if supervisor.owner_pid != os.getpid():
-            return
-        if supervisor.process.poll() is None:
-            try:
-                supervisor.channel.sendall(b"Q")
-                _video_edit_worker_recv_frame(
-                    supervisor.channel,
-                    timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-                )
-            except (EOFError, OSError, socket.timeout, ValueError):
-                pass
-        if supervisor.process.poll() is not None:
-            return
-        try:
-            supervisor.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            supervisor.process.kill()
-            supervisor.process.wait(timeout=2)
-    finally:
-        try:
-            supervisor.channel.close()
-        except OSError:
-            pass
-        supervisor.process.close()
-
-
-def _discard_inherited_video_edit_worker_state() -> None:
-    """Close inherited handles in a fork child without controlling parent jobs."""
-    global _VIDEO_EDIT_WORKER_BROKER_IDENTITY
-    global _VIDEO_EDIT_WORKER_BROKER_PID
-    global _VIDEO_EDIT_WORKER_CHANNEL
-    global _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-    global _VIDEO_EDIT_WORKER_FACTORY_IMAGE
-    global _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-    global _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-    global _VIDEO_EDIT_WORKER_IDLE_GENERATION
-    global _VIDEO_EDIT_WORKER_IDLE_TIMER
-    global _VIDEO_EDIT_WORKER_LOCK
-    global _VIDEO_EDIT_WORKER_SEED_CHANNEL
-    global _VIDEO_EDIT_WORKER_SEED_PROCESS
-
-    channels = (
-        _VIDEO_EDIT_WORKER_CHANNEL,
-        _VIDEO_EDIT_WORKER_FACTORY_CHANNEL,
-        _VIDEO_EDIT_WORKER_SEED_CHANNEL,
-    )
-    broker_identity = _VIDEO_EDIT_WORKER_BROKER_IDENTITY
-    factory_process = _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-    seed_process = _VIDEO_EDIT_WORKER_SEED_PROCESS
-    supervisor = _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-
-    _VIDEO_EDIT_WORKER_BROKER_IDENTITY = None
-    _VIDEO_EDIT_WORKER_BROKER_PID = None
-    _VIDEO_EDIT_WORKER_CHANNEL = None
-    _VIDEO_EDIT_WORKER_FACTORY_CHANNEL = None
-    _VIDEO_EDIT_WORKER_FACTORY_IMAGE = None
-    _VIDEO_EDIT_WORKER_FACTORY_PROCESS = None
-    _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR = None
-    _VIDEO_EDIT_WORKER_IDLE_GENERATION += 1
-    _VIDEO_EDIT_WORKER_IDLE_TIMER = None
-    _VIDEO_EDIT_WORKER_SEED_CHANNEL = None
-    _VIDEO_EDIT_WORKER_SEED_PROCESS = None
-    _VIDEO_EDIT_WORKER_LOCK = threading.RLock()
-
-    for channel in channels:
-        if channel is not None:
-            try:
-                channel.close()
-            except OSError:
-                pass
-    if supervisor is not None:
-        try:
-            supervisor.channel.close()
-        except OSError:
-            pass
-        supervisor.process.close()
-    if broker_identity is not None:
-        _close_video_edit_worker_process_identity(broker_identity)
-    if factory_process is not None:
-        factory_process.close()
-    if seed_process is not None:
-        seed_process.close()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(
-        after_in_child=_discard_inherited_video_edit_worker_state
-    )
-
-
-def _trusted_video_edit_worker_snapshot_for_seed_start(
-) -> _TrustedWorkerSourceSnapshot:
-    """Return only the startup snapshot captured before terminal trust closed."""
-    global _VIDEO_EDIT_WORKER_SOURCE_SNAPSHOT
-
-    snapshot = _VIDEO_EDIT_WORKER_SOURCE_SNAPSHOT
-    if snapshot is not None:
-        return snapshot
-    if _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED:
-        raise PermissionError(
-            "trusted video-edit worker source snapshot was not captured "
-            "before terminal access"
-        )
-
-    snapshot = _capture_trusted_video_edit_worker_snapshot()
-    if _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED:
-        raise PermissionError(
-            "terminal access began while trusted worker source was loading"
-        )
-    _VIDEO_EDIT_WORKER_SOURCE_SNAPSHOT = snapshot
-    return snapshot
-
-
-def _trusted_video_edit_worker_env() -> dict[str, str]:
-    # The persistent seed never needs profile, provider, cloud, or user env.
-    # Keep a fixed locale/path only; the one-shot receives its explicit env over
-    # the private broker socket after the seed has forked it.
-    return {
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "PATH": os.defpath,
-        "TZ": "UTC",
-    }
-
-
-def _force_kill_video_edit_worker_group(
-    identity: _VideoEditWorkerProcessIdentity,
-) -> bool:
-    """Contain an identity-stable group without signaling a reused PID/PGID."""
-    if not _video_edit_worker_process_identity_can_signal(identity):
-        return False
-    if not _signal_video_edit_worker_process_identity(identity, signal.SIGSTOP):
-        return False
-    if not _video_edit_worker_process_identity_is_current(identity):
-        return False
-    group_signaled = True
-    try:
-        os.killpg(identity.pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX worker
-    except (PermissionError, ProcessLookupError):
-        group_signaled = False
-    leader_signaled = _signal_video_edit_worker_process_identity(
-        identity,
-        signal.SIGKILL,  # windows-footgun: ok -- POSIX worker
-    )
-    return group_signaled or leader_signaled
-
-
-def _video_edit_worker_socket_peer_open(channel: socket.socket) -> bool:
-    try:
-        marker = channel.recv(
-            1,
-            getattr(socket, "MSG_PEEK", 0) | getattr(socket, "MSG_DONTWAIT", 0),
-        )
-    except (BlockingIOError, socket.timeout):
-        return True
-    except (AttributeError, OSError):
-        return False
-    return bool(marker)
-
-
-def _request_video_edit_worker_parent_reap(
-    process: _ForkedVideoEditWorkerSeed,
-    *,
-    parent_control: Optional[str],
-) -> bool:
-    """Use the real parent when this platform has no non-reusable PID handle."""
-    if parent_control == "supervisor":
-        if _VIDEO_EDIT_WORKER_FACTORY_PROCESS is not process:
-            return False
-        supervisor = _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-        if supervisor is None:
-            return False
-        try:
-            _validate_trusted_video_edit_worker_factory_supervisor(
-                supervisor,
-                supervisor.snapshot,
-            )
-        except PermissionError:
-            return False
-        channel = supervisor.channel
-    elif parent_control == "factory":
-        if _VIDEO_EDIT_WORKER_SEED_PROCESS is not process:
-            return False
-        if not _video_edit_worker_factory_is_ready():
-            return False
-        channel = _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-        if channel is None:
-            return False
-    else:
-        return False
-
-    try:
-        channel.sendall(b"T" + struct.pack("!Q", process.pid))
-        stopped = _video_edit_worker_recv_frame(
-            channel,
-            timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-        )
-    except (EOFError, OSError, socket.timeout, ValueError):
-        return False
-    return stopped.get("pid") == process.pid and stopped.get("reaped") is True
-
-
-def _video_edit_worker_factory_is_ready() -> bool:
-    process = _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-    channel = _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-    supervisor = _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-    return (
-        supervisor is not None
-        and supervisor.owner_pid == os.getpid()
-        and supervisor.process.poll() is None
-        and _video_edit_worker_socket_peer_open(supervisor.channel)
-        and process is not None
-        and process.poll() is None
-        and channel is not None
-        and _video_edit_worker_socket_peer_open(channel)
-    )
-
-
-def _discard_video_edit_worker_seed() -> bool:
-    """Drop the active seed and ask its factory to reap the whole subtree."""
-    global _VIDEO_EDIT_WORKER_SEED_CHANNEL
-    global _VIDEO_EDIT_WORKER_SEED_PROCESS
-
-    channel = _VIDEO_EDIT_WORKER_SEED_CHANNEL
-    process = _VIDEO_EDIT_WORKER_SEED_PROCESS
-    _VIDEO_EDIT_WORKER_SEED_CHANNEL = None
-    _VIDEO_EDIT_WORKER_SEED_PROCESS = None
-    if channel is not None:
-        try:
-            channel.close()
-        except OSError:
-            pass
-    if process is None:
-        return True
-
-    try:
-        reaped = False
-        factory_channel = _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-        if _video_edit_worker_factory_is_ready() and factory_channel is not None:
-            try:
-                factory_channel.sendall(b"T" + struct.pack("!Q", process.pid))
-                stopped = _video_edit_worker_recv_frame(
-                    factory_channel,
-                    timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-                )
-                reaped = (
-                    stopped.get("pid") == process.pid
-                    and stopped.get("reaped") is True
-                )
-            except (EOFError, OSError, socket.timeout, ValueError):
-                reaped = False
-        if not reaped and process.poll() is None:
-            _force_kill_video_edit_worker_group(process.identity)
-        return reaped
-    finally:
-        process.close()
-
-
-def _terminate_video_edit_worker(*, close_disk_trust: bool) -> bool:
-    """Stop the active one-shot and return only seed-verified reap status."""
-    global _VIDEO_EDIT_WORKER_BROKER_IDENTITY
-    global _VIDEO_EDIT_WORKER_BROKER_PID
-    global _VIDEO_EDIT_WORKER_CHANNEL
-    global _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED
-
-    broker_pid = _VIDEO_EDIT_WORKER_BROKER_PID
-    broker_identity = _VIDEO_EDIT_WORKER_BROKER_IDENTITY
-    channel = _VIDEO_EDIT_WORKER_CHANNEL
-    _VIDEO_EDIT_WORKER_BROKER_IDENTITY = None
-    _VIDEO_EDIT_WORKER_BROKER_PID = None
-    _VIDEO_EDIT_WORKER_CHANNEL = None
-    if close_disk_trust:
-        _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED = True
-    if channel is not None:
-        try:
-            channel.close()
-        except OSError:
-            pass
-
-    if broker_pid is None:
-        if broker_identity is not None:
-            _close_video_edit_worker_process_identity(broker_identity)
-        return True
-
-    seed_channel = _VIDEO_EDIT_WORKER_SEED_CHANNEL
-    if (
-        broker_pid is not None
-        and seed_channel is not None
-        and _video_edit_worker_socket_peer_open(seed_channel)
-    ):
-        try:
-            seed_channel.sendall(b"T" + struct.pack("!Q", broker_pid))
-            stopped = _video_edit_worker_recv_frame(
-                seed_channel,
-                timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-            )
-            if (
-                stopped.get("pid") == broker_pid
-                and stopped.get("cleanup") in {"stopped", "already_clean"}
-                and stopped.get("reaped") is True
-            ):
-                if broker_identity is not None:
-                    _close_video_edit_worker_process_identity(broker_identity)
-                return True
-            raise RuntimeError("trusted worker seed did not confirm broker reaping")
-        except (EOFError, OSError, RuntimeError, socket.timeout, ValueError):
-            pass
-
-    # A gateway-side signal closes the immediate containment gap, but only the
-    # seed is the broker's parent and can prove waitpid completed. Lose the seed
-    # and disk trust so callers cannot mistake best-effort killing for reaping.
-    if broker_identity is not None:
-        _force_kill_video_edit_worker_group(broker_identity)
-        _close_video_edit_worker_process_identity(broker_identity)
-    _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED = True
-    _discard_video_edit_worker_seed()
-    return False
-
-
-def _shutdown_video_edit_worker_seed() -> None:
-    """Shut down both the active seed and its pre-terminal factory."""
-    global _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-    global _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-    global _VIDEO_EDIT_WORKER_SEED_CHANNEL
-    global _VIDEO_EDIT_WORKER_SEED_PROCESS
-
-    _discard_video_edit_worker_seed()
-    channel = _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-    process = _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-    _VIDEO_EDIT_WORKER_FACTORY_CHANNEL = None
-    _VIDEO_EDIT_WORKER_FACTORY_PROCESS = None
-    _VIDEO_EDIT_WORKER_SEED_CHANNEL = None
-    _VIDEO_EDIT_WORKER_SEED_PROCESS = None
-    if channel is not None and process is not None and process.poll() is None:
-        try:
-            channel.sendall(b"Q")
-            _video_edit_worker_recv_frame(
-                channel,
-                timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-            )
-        except (EOFError, OSError, socket.timeout, ValueError):
-            pass
-    if channel is not None:
-        try:
-            channel.close()
-        except OSError:
-            pass
-    if process is None:
-        return
-    try:
-        if process.poll() is None:
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                supervisor = _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-                if supervisor is not None:
-                    try:
-                        _validate_trusted_video_edit_worker_factory_supervisor(
-                            supervisor,
-                            supervisor.snapshot,
-                        )
-                        supervisor.channel.sendall(
-                            b"T" + struct.pack("!Q", process.pid)
-                        )
-                        _video_edit_worker_recv_frame(
-                            supervisor.channel,
-                            timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-                        )
-                    except (EOFError, OSError, PermissionError, socket.timeout, ValueError):
-                        pass
-                if process.poll() is None:
-                    _force_kill_video_edit_worker_group(process.identity)
-                process.wait(timeout=2)
-    finally:
-        process.close()
-
-
-def _ensure_video_edit_worker_factory_started() -> None:
-    global _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-    global _VIDEO_EDIT_WORKER_FACTORY_PROCESS
-
-    if _video_edit_worker_factory_is_ready():
-        return
-    if (
-        _VIDEO_EDIT_WORKER_FACTORY_PROCESS is not None
-        or _VIDEO_EDIT_WORKER_FACTORY_CHANNEL is not None
-    ):
-        _shutdown_video_edit_worker_seed()
-    if not _ensure_sensitive_runtime_boundary():
-        raise PermissionError("Hermes process memory boundary is unavailable")
-    if os.name != "posix" or not hasattr(socket.socket, "sendmsg"):
-        raise PermissionError("trusted video-edit worker requires POSIX fd isolation")
-
-    snapshot = _trusted_video_edit_worker_snapshot_for_seed_start()
-    supervisor = _trusted_video_edit_worker_factory_bootstrap(snapshot)
-    _validate_trusted_video_edit_worker_factory_supervisor(supervisor, snapshot)
-    supervisor.channel.sendall(b"N")
-    response, factory_channel = _video_edit_worker_recv_fd_frame(
-        supervisor.channel,
-        timeout=_VIDEO_EDIT_WORKER_START_TIMEOUT_SECONDS,
-    )
-    factory_pid = response.get("factory_pid")
-    ready = response.get("ready") or {}
-    memory_limit = ready.get("memory_limit") or {}
-    if (
-        factory_channel is None
-        or response.get("factory_spawned") is not True
-        or not isinstance(factory_pid, int)
-        or factory_pid <= 0
-        or ready.get("ready") is not True
-        or ready.get("factory_ready") is not True
-        or ready.get("fork_factory") is not True
-        or ready.get("resident_image") is not True
-        or ready.get("accepts_secrets") is not False
-        or ready.get("child_subreaper") is not True
-        or (
-            sys.platform.startswith("linux")
-            and (
-                ready.get("dumpable") != 0
-                or memory_limit.get("applied") is not True
-                or int(memory_limit.get("limit_bytes") or 0)
-                > _VIDEO_EDIT_WORKER_MEMORY_LIMIT_BYTES
-            )
-        )
-    ):
-        if factory_channel is not None:
-            factory_channel.close()
-        raise RuntimeError(
-            str(response.get("error") or "resident supervisor could not spawn factory")
-        )
-    try:
-        identity = _capture_video_edit_worker_process_identity(factory_pid)
-    except Exception:
-        try:
-            supervisor.channel.sendall(b"T" + struct.pack("!Q", factory_pid))
-            _video_edit_worker_recv_frame(
-                supervisor.channel,
-                timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-            )
-        except (EOFError, OSError, socket.timeout, ValueError):
-            pass
-        factory_channel.close()
-        raise
-    _VIDEO_EDIT_WORKER_FACTORY_PROCESS = _ForkedVideoEditWorkerSeed(
-        factory_pid,
-        identity,
-        parent_control="supervisor",
-    )
-    _VIDEO_EDIT_WORKER_FACTORY_CHANNEL = factory_channel
-
-
-def _spawn_video_edit_worker_seed_from_factory() -> None:
-    global _VIDEO_EDIT_WORKER_SEED_CHANNEL
-    global _VIDEO_EDIT_WORKER_SEED_PROCESS
-
-    factory_channel = _VIDEO_EDIT_WORKER_FACTORY_CHANNEL
-    if not _video_edit_worker_factory_is_ready() or factory_channel is None:
-        raise PermissionError("trusted video-edit worker factory unavailable")
-    factory_channel.sendall(b"N")
-    response, seed_channel = _video_edit_worker_recv_fd_frame(
-        factory_channel,
-        timeout=_VIDEO_EDIT_WORKER_START_TIMEOUT_SECONDS,
-    )
-    seed_pid = response.get("seed_pid")
-    ready = response.get("ready") or {}
-    memory_limit = ready.get("memory_limit") or {}
-    if (
-        seed_channel is None
-        or response.get("seed_ready") is not True
-        or not isinstance(seed_pid, int)
-        or seed_pid <= 0
-        or ready.get("ready") is not True
-        or ready.get("fork_seed") is not True
-        or ready.get("accepts_secrets") is not False
-        or ready.get("child_subreaper") is not True
-        or (
-            sys.platform.startswith("linux")
-            and (
-                ready.get("dumpable") != 0
-                or memory_limit.get("applied") is not True
-                or int(memory_limit.get("limit_bytes") or 0)
-                > _VIDEO_EDIT_WORKER_MEMORY_LIMIT_BYTES
-            )
-        )
-    ):
-        if seed_channel is not None:
-            seed_channel.close()
-        if isinstance(seed_pid, int) and seed_pid > 0:
-            try:
-                factory_channel.sendall(b"T" + struct.pack("!Q", seed_pid))
-                _video_edit_worker_recv_frame(
-                    factory_channel,
-                    timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-                )
-            except (EOFError, OSError, socket.timeout, ValueError):
-                pass
-        raise RuntimeError(
-            str(response.get("error") or "trusted worker factory could not spawn seed")
-        )
-    try:
-        identity = _capture_video_edit_worker_process_identity(seed_pid)
-    except Exception:
-        seed_channel.close()
-        try:
-            factory_channel.sendall(b"T" + struct.pack("!Q", seed_pid))
-            _video_edit_worker_recv_frame(
-                factory_channel,
-                timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-            )
-        except (EOFError, OSError, socket.timeout, ValueError):
-            pass
-        raise
-    _VIDEO_EDIT_WORKER_SEED_PROCESS = _ForkedVideoEditWorkerSeed(
-        seed_pid,
-        identity,
-        parent_control="factory",
-    )
-    _VIDEO_EDIT_WORKER_SEED_CHANNEL = seed_channel
-
-
-def _ensure_video_edit_worker_seed_started() -> None:
-    for attempt in range(_VIDEO_EDIT_WORKER_FACTORY_SEED_START_MAX_ATTEMPTS):
-        process = _VIDEO_EDIT_WORKER_SEED_PROCESS
-        channel = _VIDEO_EDIT_WORKER_SEED_CHANNEL
-        try:
-            if not _video_edit_worker_factory_is_ready():
-                if process is not None or channel is not None:
-                    _terminate_video_edit_worker(close_disk_trust=False)
-                    _discard_video_edit_worker_seed()
-                _ensure_video_edit_worker_factory_started()
-                process = _VIDEO_EDIT_WORKER_SEED_PROCESS
-                channel = _VIDEO_EDIT_WORKER_SEED_CHANNEL
-            if (
-                process is not None
-                and process.poll() is None
-                and channel is not None
-                and _video_edit_worker_socket_peer_open(channel)
-            ):
-                return
-            if process is not None or channel is not None:
-                _terminate_video_edit_worker(close_disk_trust=False)
-                _discard_video_edit_worker_seed()
-            _spawn_video_edit_worker_seed_from_factory()
-            return
-        except (
-            AttributeError,
-            EOFError,
-            OSError,
-            PermissionError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ):
-            supervisor = _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR
-            snapshot = _VIDEO_EDIT_WORKER_SOURCE_SNAPSHOT
-            if (
-                supervisor is None
-                or snapshot is None
-                or (
-                    _VIDEO_EDIT_WORKER_FACTORY_PROCESS is None
-                    and _VIDEO_EDIT_WORKER_FACTORY_CHANNEL is None
-                )
-            ):
-                raise
-            _validate_trusted_video_edit_worker_factory_supervisor(
-                supervisor,
-                snapshot,
-            )
-            _shutdown_video_edit_worker_seed()
-            if attempt + 1 >= _VIDEO_EDIT_WORKER_FACTORY_SEED_START_MAX_ATTEMPTS:
-                raise
-
-
-def _spawn_video_edit_worker_broker() -> None:
-    global _VIDEO_EDIT_WORKER_BROKER_IDENTITY
-    global _VIDEO_EDIT_WORKER_BROKER_PID
-    global _VIDEO_EDIT_WORKER_CHANNEL
-
-    for attempt in range(_VIDEO_EDIT_WORKER_BROKER_START_MAX_ATTEMPTS):
-        seed_channel = _VIDEO_EDIT_WORKER_SEED_CHANNEL
-        seed_process = _VIDEO_EDIT_WORKER_SEED_PROCESS
-        if (
-            seed_channel is None
-            or seed_process is None
-            or seed_process.poll() is not None
-        ):
-            raise PermissionError("trusted video-edit worker seed unavailable")
-
-        broker_channel: Optional[socket.socket] = None
-        try:
-            seed_channel.sendall(b"S")
-            response, broker_channel = _video_edit_worker_recv_fd_frame(
-                seed_channel,
-                timeout=_VIDEO_EDIT_WORKER_START_TIMEOUT_SECONDS,
-            )
-            broker_pid = response.get("broker_pid")
-            if (
-                broker_channel is None
-                or response.get("broker_ready") is not True
-                or not isinstance(broker_pid, int)
-                or broker_pid <= 0
-            ):
-                raise RuntimeError(
-                    str(
-                        response.get("error")
-                        or "trusted worker seed could not spawn broker"
-                    )
-                )
-            try:
-                identity = _capture_video_edit_worker_process_identity(broker_pid)
-            except (OSError, ValueError):
-                try:
-                    seed_channel.sendall(b"T" + struct.pack("!Q", broker_pid))
-                    _video_edit_worker_recv_frame(
-                        seed_channel,
-                        timeout=_VIDEO_EDIT_WORKER_CLEANUP_ACK_TIMEOUT_SECONDS,
-                    )
-                except (EOFError, OSError, socket.timeout, ValueError):
-                    pass
-                raise
-            _VIDEO_EDIT_WORKER_BROKER_IDENTITY = identity
-            _VIDEO_EDIT_WORKER_BROKER_PID = broker_pid
-            _VIDEO_EDIT_WORKER_CHANNEL = broker_channel
-            return
-        except (AttributeError, EOFError, OSError, RuntimeError, TypeError, ValueError):
-            if broker_channel is not None:
-                try:
-                    broker_channel.close()
-                except OSError:
-                    pass
-            _discard_video_edit_worker_seed()
-            if attempt + 1 >= _VIDEO_EDIT_WORKER_BROKER_START_MAX_ATTEMPTS:
-                raise
-            try:
-                _ensure_video_edit_worker_seed_started()
-            except Exception as recovery_error:
-                raise RuntimeError(
-                    "trusted video-edit worker seed recovery unavailable"
-                ) from recovery_error
-
-
-def _ensure_video_edit_worker_started() -> None:
-    with _VIDEO_EDIT_WORKER_LOCK:
-        _ensure_video_edit_worker_seed_started()
-        if _VIDEO_EDIT_WORKER_BROKER_PID is not None or _VIDEO_EDIT_WORKER_CHANNEL is not None:
-            _terminate_video_edit_worker(close_disk_trust=False)
-
-
-def _cancel_video_edit_worker_idle_recycle() -> None:
-    """Cancel the current idle deadline while the lifecycle lock is held."""
-    global _VIDEO_EDIT_WORKER_IDLE_GENERATION
-    global _VIDEO_EDIT_WORKER_IDLE_TIMER
-
-    timer = _VIDEO_EDIT_WORKER_IDLE_TIMER
-    _VIDEO_EDIT_WORKER_IDLE_TIMER = None
-    _VIDEO_EDIT_WORKER_IDLE_GENERATION += 1
-    if timer is not None:
-        timer.cancel()
-
-
-def _video_edit_worker_process_thread_count() -> int:
-    """Return the native thread count used to guard the supervisor fork."""
-    if sys.platform.startswith("linux"):
-        try:
-            return len(os.listdir("/proc/self/task"))
-        except OSError:
-            pass
-    return threading.active_count()
-
-
-def _reap_video_edit_worker_resident_tree(*, stop_supervisor: bool) -> None:
-    """Reap transient workers; stop the clean supervisor only at process exit."""
-    cleanup_steps = [
-        (
-            "broker",
-            lambda: _terminate_video_edit_worker(close_disk_trust=False),
-        ),
-        ("seed_factory", _shutdown_video_edit_worker_seed),
-    ]
-    if stop_supervisor:
-        cleanup_steps.append(
-            ("supervisor", _discard_trusted_video_edit_worker_factory_supervisor)
-        )
-    for layer, cleanup in cleanup_steps:
-        try:
-            cleanup()
-        except Exception as exc:
-            logger.warning(
-                "Trusted video-edit %s cleanup failed: %s",
-                layer,
-                type(exc).__name__,
-            )
-
-
-def _recycle_video_edit_worker_after_idle(generation: int) -> None:
-    """Reap transient worker layers after a bounded inactive interval."""
-    global _VIDEO_EDIT_WORKER_IDLE_GENERATION
-    global _VIDEO_EDIT_WORKER_IDLE_TIMER
-
-    with _VIDEO_EDIT_WORKER_LOCK:
-        if (
-            generation != _VIDEO_EDIT_WORKER_IDLE_GENERATION
-            or _VIDEO_EDIT_WORKER_IDLE_TIMER is None
-        ):
-            return
-        _VIDEO_EDIT_WORKER_IDLE_TIMER = None
-        _VIDEO_EDIT_WORKER_IDLE_GENERATION += 1
-        _reap_video_edit_worker_resident_tree(stop_supervisor=False)
-
-
-def _schedule_video_edit_worker_idle_recycle() -> None:
-    """Keep the trusted tree warm briefly, then release its bounded RSS."""
-    global _VIDEO_EDIT_WORKER_IDLE_GENERATION
-    global _VIDEO_EDIT_WORKER_IDLE_TIMER
-
-    _cancel_video_edit_worker_idle_recycle()
-    if all(
-        value is None
-        for value in (
-            _VIDEO_EDIT_WORKER_FACTORY_SUPERVISOR,
-            _VIDEO_EDIT_WORKER_FACTORY_PROCESS,
-            _VIDEO_EDIT_WORKER_SEED_PROCESS,
-            _VIDEO_EDIT_WORKER_BROKER_PID,
-            _VIDEO_EDIT_WORKER_CHANNEL,
-        )
-    ):
-        return
-    generation = _VIDEO_EDIT_WORKER_IDLE_GENERATION
-    timer = threading.Timer(
-        max(float(_VIDEO_EDIT_WORKER_IDLE_TIMEOUT_SECONDS), 0.0),
-        _recycle_video_edit_worker_after_idle,
-        args=(generation,),
-    )
-    timer.daemon = True
-    _VIDEO_EDIT_WORKER_IDLE_TIMER = timer
-    try:
-        timer.start()
-    except Exception as exc:
-        _VIDEO_EDIT_WORKER_IDLE_TIMER = None
-        _VIDEO_EDIT_WORKER_IDLE_GENERATION += 1
-        timer.cancel()
-        logger.warning(
-            "Trusted video-edit idle recycle timer failed: %s",
-            type(exc).__name__,
-        )
-        _reap_video_edit_worker_resident_tree(stop_supervisor=False)
-
-
-def _run_video_edit_worker(
-    payload: dict[str, Any],
-    *,
-    timeout: int,
-) -> dict[str, Any]:
-    with _VIDEO_EDIT_WORKER_LOCK:
-        _cancel_video_edit_worker_idle_recycle()
-        try:
-            _ensure_video_edit_worker_started()
-            _spawn_video_edit_worker_broker()
-            channel = _VIDEO_EDIT_WORKER_CHANNEL
-            broker_pid = _VIDEO_EDIT_WORKER_BROKER_PID
-            if channel is None or _VIDEO_EDIT_WORKER_BROKER_PID is None:
-                _terminate_video_edit_worker(close_disk_trust=True)
-                raise RuntimeError("trusted video-edit worker unavailable")
-            try:
-                _video_edit_worker_send_frame(
-                    channel,
-                    {
-                        "operation": "run",
-                        "executor_timeout_seconds": max(float(timeout), 0.1),
-                        **payload,
-                    },
-                )
-                response = _video_edit_worker_recv_frame(
-                    channel,
-                    timeout=max(float(timeout) + 1.0, 1.1),
-                )
-            except socket.timeout:
-                reaped = _terminate_video_edit_worker(close_disk_trust=False)
-                return {
-                    "stdout": "",
-                    "stderr": "trusted video-edit executor timed out",
-                    "returncode": 124,
-                    "worker": {
-                        "one_shot": True,
-                        "pid": broker_pid,
-                        "call_index": 1,
-                        "reaped": reaped,
-                    },
-                }
-            except (EOFError, OSError, ValueError):
-                reaped = _terminate_video_edit_worker(close_disk_trust=False)
-                return {
-                    "stdout": "",
-                    "stderr": "trusted video-edit executor terminated by memory/security limit",
-                    "returncode": 1,
-                    "worker": {
-                        "one_shot": True,
-                        "pid": broker_pid,
-                        "call_index": 1,
-                        "reaped": reaped,
-                    },
-                }
-            reaped = _terminate_video_edit_worker(close_disk_trust=False)
-            if not reaped:
-                return {
-                    "stdout": "",
-                    "stderr": "trusted video-edit executor cleanup could not be verified",
-                    "returncode": 1,
-                    "worker": {
-                        "one_shot": True,
-                        "pid": broker_pid,
-                        "call_index": 1,
-                        "reaped": False,
-                    },
-                }
-            if not all(key in response for key in ("stdout", "stderr", "returncode")):
-                _close_video_edit_worker_disk_trust()
-                raise RuntimeError("invalid trusted video-edit worker response")
-            worker = response.get("worker")
-            if (
-                not isinstance(worker, dict)
-                or worker.get("one_shot") is not True
-                or worker.get("pid") != broker_pid
-            ):
-                _close_video_edit_worker_disk_trust()
-                raise RuntimeError("invalid trusted video-edit worker identity")
-            worker["reaped"] = True
-            return response
-        finally:
-            _schedule_video_edit_worker_idle_recycle()
-
-
-def _stop_video_edit_worker() -> None:
-    with _VIDEO_EDIT_WORKER_LOCK:
-        _cancel_video_edit_worker_idle_recycle()
-        _reap_video_edit_worker_resident_tree(stop_supervisor=True)
-
-
-def _close_video_edit_worker_disk_trust() -> None:
-    global _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED
-
-    with _VIDEO_EDIT_WORKER_LOCK:
-        _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED = True
 
 
 def _ensure_sensitive_runtime_boundary() -> bool:
-    """Close process inspection before trusted tokens can enter memory.
-
-    Disk trust controls future source reads, not this already-imported OS
-    primitive. A frozen worker image may establish the process boundary after
-    an ordinary terminal command has closed all filesystem trust.
-    """
-    global _MODEL_DESCENDANT_PTRACE_BOUNDARY
-    global _SENSITIVE_PROCESS_OS_BOUNDARY
-
-    if _SENSITIVE_PROCESS_OS_BOUNDARY and _MODEL_DESCENDANT_PTRACE_BOUNDARY:
-        return True
-    boundary = harden_sensitive_process(no_new_privs=False, drop_ptrace=True)
-    _SENSITIVE_PROCESS_OS_BOUNDARY = boundary
-    _MODEL_DESCENDANT_PTRACE_BOUNDARY = boundary
-    return boundary
-
-
-def _late_prepare_video_edit_worker_before_terminal() -> None:
-    """Freeze trusted code and fork its supervisor before gateway threads start."""
-    if not os.environ.get("ZETTLAB_PRESETS_DIR"):
-        return
-    with _VIDEO_EDIT_WORKER_LOCK:
-        if _VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED:
-            return
-        snapshot = _trusted_video_edit_worker_snapshot_for_seed_start()
-        _trusted_video_edit_worker_factory_image(snapshot)
-        _preload_trusted_runtime_source_bundles()
-        _trusted_video_edit_worker_factory_bootstrap(snapshot)
-
-
-atexit.register(_stop_video_edit_worker)
-
-# Production gateways set the pinned presets root before tool discovery. Freeze
-# the trusted image and create its single-threaded supervisor before gateway
-# adapters start threads. Transient factory/seed/broker processes remain lazy.
-if os.environ.get("ZETTLAB_PRESETS_DIR"):
+    """Harden the current process before connector subprocess execution."""
     try:
-        _late_prepare_video_edit_worker_before_terminal()
-    except Exception as exc:
-        logger.warning(
-            "Trusted video-edit image failed during tool initialization: %s",
-            type(exc).__name__,
-        )
+        return bool(harden_sensitive_process(no_new_privs=False, drop_ptrace=True))
+    except Exception:
+        logger.warning("terminal: process hardening unavailable", exc_info=True)
+        return False
 
 
 def _run_connector_runtime_command_if_allowed(
@@ -4612,13 +2254,29 @@ def _run_connector_runtime_command_if_allowed(
 
     secret_values: list[str] = []
     try:
-        from tools.environments.local import build_connector_runtime_env
+        from tools.environments.local import (
+            CONNECTOR_ACTION_RUNTIME_ENV_KEY,
+            build_connector_runtime_env,
+        )
 
         connector_env = build_connector_runtime_env()
-        from tools.environments.local import _sanitize_subprocess_env
+        runtime_identity = _connector_action_runtime_identity(script, anchor)
+        if runtime_identity is None:
+            _log_connector_runtime_rejection("runtime_identity_unavailable")
+            return None
+        connector_env[CONNECTOR_ACTION_RUNTIME_ENV_KEY] = runtime_identity
 
-        run_env = _sanitize_subprocess_env(os.environ)
-        run_env.pop("PYTHONPATH", None)
+        # ⭐ 受信 runner **不继承进程环境**,照抄同文件 _run_camera_runtime_command_if_allowed
+        # 的做法(base_env={})。⛔ 别改回 _sanitize_subprocess_env(os.environ):那是**黑名单**
+        # ——只剥 Hermes 自己的密钥,其余一律放行,于是:
+        #   ① HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 会跟着进去。脚本随后拿 action token 和
+        #      ZETTLAB_LOCAL_SERVER_URL 访问 loopback,而 Python 的 requests/urllib **不会**
+        #      自动豁免 loopback —— 没配 NO_PROXY 时,带 X-Zettlab-Agent-Action-Token 的请求
+        #      会被发到外部代理。这不是假想:本线的设备上就跑着 mihomo,代理变量确实配着。
+        #   ② ZET_CHAT_APPEND_URL 这类**跨 profile 的陈旧回调地址**也会跟着进去,卡片/状态
+        #      可能回写到错误的会话或 profile。
+        # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
+        # 显式给,⛔ 不从进程环境里捡。
         secret_values = [
             connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
@@ -4630,7 +2288,7 @@ def _run_connector_runtime_command_if_allowed(
             script=script,
             argv=argv[1:],
             cwd=Path(run_cwd),
-            base_env=run_env,
+            base_env={},
             injected_env=connector_env,
             timeout=timeout,
             secret_values=secret_values,
@@ -4668,6 +2326,47 @@ _APP_AGENT_HELPER_MANIFEST_RELATIVE_PATH = Path(
 _AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY = (
     "zettlab.agent_action_token_fd.v1"
 )
+_OVERSEAS_CONNECT_SCRIPT = "connect.py"
+_OVERSEAS_CONNECT_RELATIVE_PATH = Path(
+    "skills/overseas-connect/scripts/connect.py"
+)
+_OVERSEAS_CONNECT_MANIFEST_RELATIVE_PATH = Path(
+    "skills/overseas-connect/manifest.yaml"
+)
+_OVERSEAS_CONNECT_ACTION_TOKEN_FD_CAPABILITY = (
+    "zettlab.agent_action_token_fd.v1"
+)
+# 带 --platform 的 5-token 子命令(capability / connect-card / disconnect)曾经在这里,
+# 受信通道一直放行它们 —— ⛔ 已于本次整组摘除,判据是**模型能不能到达**。
+#
+# 🔴 为什么必须摘:2026-08-07 拍板的设计是「不再弹单平台卡 → 弹一张海外渠道列表卡 →
+# 用户在卡内自己选平台」,即**AI 只剩弹卡**。改版当时加了 status-card 与 SKILL.md 的
+# 文字契约,却**没拆掉旧入口**;而模型不受自然语言契约约束,直接发 terminal 命令就能调:
+#   - `capability --platform X` 把「是否已配置 / 状态 / 是否已配对 / 是否 chat-created」
+#     写进 terminal 输出 ⇒ **绑定状态进了聊天记录**,这是产品明令禁止的;
+#   - `connect-card` / `disconnect` 让模型**替用户选定平台**,绕开总列表卡。
+# 影响面是全设备所有带 terminal 的 Agent,不限 Memo。
+#
+# ⛔ 别因为「SKILL.md 里已经写了不要用」就以为够了 —— 那是文档,不是闸门。这里才是。
+_OVERSEAS_CONNECT_PLATFORM_COMMANDS: frozenset[str] = frozenset()
+# 无参子命令(3 token)。改版后 AI 面前只剩这一条:它弹出海外渠道列表卡,平台由
+# 用户在卡里自己点,模型不再需要认平台。
+_OVERSEAS_CONNECT_CARD_ONLY_COMMANDS = frozenset({
+    "status-card",
+})
+# 三方镜像的一环:这份集合必须与 presets 的 connect.py SUPPORTED_PLATFORMS、板端
+# via_skill_channels.go 的 imConnectPlatforms 同集。三处跨三个仓、互相 import 不到,
+# 只能各自钉住自己那份字面量(见 test_overseas_connect_platform_allowlist_is_the_
+# agreed_set)。
+#
+# whatsapp 2026-08-07 从三处一起摘掉:产品线已彻底停掉(Meta 全球禁第三方 AI 助手
+# 接入),driver 不会再有。⛔ 别单独加回来 —— 受信通道是最外层的门,它松着就意味着
+# 放行一个内层三方都不支持的形态。
+_OVERSEAS_CONNECT_PLATFORMS = frozenset({
+    "telegram",
+    "slack",
+    "discord",
+})
 _AGENT_CREATOR_MAX_PAYLOAD_BYTES = 1024 * 1024
 _AGENTCOMPUTER_MAX_STDIN_BYTES = 4 * 1024 * 1024
 _AGENT_CREATOR_MAX_SCRIPT_BYTES = 1024 * 1024
@@ -4774,6 +2473,13 @@ class _AgentCreatorCommand:
     approval_operation: Optional[str]
 
 
+@dataclass(frozen=True)
+class _OverseasConnectCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+
+
 def _agent_creator_blocked_result(
     code: str,
     message: str,
@@ -4788,6 +2494,18 @@ def _agent_creator_blocked_result(
         "status": "error",
         "agent_creator_direct": direct,
         "agent_creator_blocked": True,
+    }, ensure_ascii=False)
+
+
+def _overseas_connect_blocked_result(code: str, message: str) -> str:
+    return json.dumps({
+        "output": "",
+        "exit_code": 2,
+        "error": message,
+        "errorCode": code,
+        "status": "error",
+        "overseas_connect_direct": True,
+        "overseas_connect_blocked": True,
     }, ensure_ascii=False)
 
 
@@ -4838,176 +2556,33 @@ def _agent_creator_shell_guard_result(command: str) -> Optional[str]:
 
 
 @dataclass(frozen=True)
-class _VideoEditRuntimeCommand:
-    argv: list[str]
-    root_identity: tuple[int, int]
-    script_identity: tuple[int, int]
-
-
-@dataclass(frozen=True)
 class _CameraRuntimeCommand:
     argv: list[str]
     root_identity: tuple[int, int]
     script_identity: tuple[int, int]
 
 
-def _video_edit_runtime_timeout(
-    parsed: _VideoEditRuntimeCommand,
-    requested_timeout: int,
-) -> int:
-    if (
-        Path(parsed.argv[1]).name == "cloud_render_business.py"
-        and _cloud_render_business_subcommand(parsed.argv[2:]) == "upload"
-    ):
-        return max(requested_timeout, _VIDEO_EDIT_UPLOAD_TIMEOUT_SECONDS)
-    return requested_timeout
+@dataclass(frozen=True)
+class _Printer3DRuntimeCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
 
 
-def _cloud_render_business_subcommand(arguments: list[str]) -> Optional[str]:
-    """Return the argparse subcommand after supported global options."""
-    position = 0
-    options_with_value = {"--agent-id", "--base-url", "--timeout"}
-    while position < len(arguments):
-        token = arguments[position]
-        if token == "--":
-            position += 1
-            break
-        option_name = token.split("=", 1)[0]
-        if option_name not in options_with_value:
-            break
-        position += 1
-        if "=" not in token:
-            if position >= len(arguments):
-                return None
-            position += 1
-    if position >= len(arguments) or arguments[position].startswith("-"):
-        return None
-    return arguments[position]
+@dataclass(frozen=True)
+class _PlaudRuntimeCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
 
 
-def _video_edit_runtime_claims_match_receipt(
-    parsed: _VideoEditRuntimeCommand,
-    trusted_env: Mapping[str, str],
-) -> bool:
-    """Bind model-supplied business routing claims to the frozen receipt."""
-    if Path(parsed.argv[1]).name != "cloud_render_business.py":
-        return True
-
-    expected_agent_id = str(trusted_env.get("ZET_AGENT_ID", "") or "").strip()
-    if not expected_agent_id:
-        return False
-
-    agent_ids: list[str] = []
-    arguments = parsed.argv[2:]
-    position = 0
-    while position < len(arguments):
-        token = arguments[position]
-        option_name = token.split("=", 1)[0]
-        if option_name.startswith("--") and "--base-url".startswith(option_name):
-            # argparse accepts unambiguous long-option abbreviations by
-            # default, so --base and --base=<url> are equivalent to the
-            # forbidden --base-url override inside the signed helper.
-            return False
-        if (
-            option_name != "--agent-id"
-            and option_name.startswith("--")
-            and "--agent-id".startswith(option_name)
-        ):
-            # An abbreviated second declaration (for example --agent) would
-            # be accepted by argparse and could override the exact bound ID.
-            return False
-        if token == "--agent-id":
-            position += 1
-            if position >= len(arguments):
-                return False
-            agent_ids.append(arguments[position])
-        elif token.startswith("--agent-id="):
-            agent_ids.append(token.split("=", 1)[1])
-        position += 1
-
-    # The signed workflow always names its profile explicitly. The base URL is
-    # deliberately not model-configurable; the signed helper owns the loopback
-    # business endpoint default.
-    return (
-        len(agent_ids) == 1
-        and agent_ids[0] == expected_agent_id
-    )
+@dataclass(frozen=True)
+class _SmartHomeRuntimeCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
 
 
-def _resolve_video_edit_runtime_script(raw_path: str) -> Optional[Path]:
-    anchor = _capture_connector_runtime_root()
-    if anchor is None:
-        return None
-    relative_text: Optional[str] = None
-    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
-        if raw_path.startswith(prefix):
-            relative_text = raw_path[len(prefix):]
-            break
-    if relative_text is None:
-        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).absolute()
-        for allowed_root in (anchor.configured_root, anchor.resolved_root):
-            try:
-                relative_text = str(expanded.relative_to(allowed_root))
-                break
-            except ValueError:
-                continue
-    if relative_text is None:
-        return None
-
-    expected_prefix = Path("skills/video-edit-workflow-mini/scripts")
-    relative = Path(relative_text)
-    if relative.parent != expected_prefix or relative.name not in _VIDEO_EDIT_RUNTIME_SCRIPTS:
-        return None
-    candidate = anchor.resolved_root / relative
-    try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(anchor.resolved_root)
-    except (OSError, ValueError):
-        return None
-    if not resolved.is_file() or not _connector_runtime_path_is_trusted(
-        candidate,
-        anchor.resolved_root,
-        expected_root_identity=anchor.identity,
-    ):
-        return None
-    return resolved
-
-
-def _parse_video_edit_runtime_command(command: str) -> Optional[_VideoEditRuntimeCommand]:
-    lexer = shlex.shlex(
-        command.strip(),
-        posix=True,
-        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
-    )
-    lexer.whitespace = " \t\r"
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    try:
-        tokens = list(lexer)
-    except ValueError:
-        return None
-    if len(tokens) < 2 or not _is_python_executable_token(tokens[0]):
-        return None
-    if any(
-        token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
-        for token in tokens
-    ):
-        return None
-    if Path(tokens[1]).name not in _VIDEO_EDIT_RUNTIME_SCRIPTS:
-        return None
-    script = _resolve_video_edit_runtime_script(tokens[1])
-    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
-    if script is None or anchor is None:
-        return None
-    try:
-        script_identity = _path_identity(script)
-    except OSError:
-        return None
-    return _VideoEditRuntimeCommand(
-        argv=[sys.executable, str(script), *tokens[2:]],
-        root_identity=anchor.identity,
-        script_identity=script_identity,
-    )
 
 
 def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
@@ -5158,6 +2733,447 @@ def _camera_runtime_shell_guard_result(command: str) -> Optional[str]:
     }, ensure_ascii=False)
 
 
+def _resolve_printer3d_runtime_script(raw_path: str) -> Optional[Path]:
+    script_name = Path(raw_path).name
+    relative_path = _PRINTER3D_RUNTIME_PATHS.get(script_name)
+    anchor = _capture_connector_runtime_root()
+    if relative_path is None or anchor is None:
+        return None
+    relative_text: Optional[str] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative_text = raw_path[len(prefix):]
+            break
+    if relative_text is None:
+        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).absolute()
+        for allowed_root in (anchor.configured_root, anchor.resolved_root):
+            try:
+                relative_text = str(expanded.relative_to(allowed_root))
+                break
+            except ValueError:
+                continue
+    if relative_text is None or Path(relative_text) != relative_path:
+        return None
+    candidate = anchor.resolved_root / relative_path
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(anchor.resolved_root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file() or not _connector_runtime_path_is_trusted(
+        candidate,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        return None
+    return resolved
+
+
+def _printer3d_runtime_arguments_allowed(script_name: str, arguments: list[str]) -> bool:
+    if script_name == "printer3d_connector.py":
+        return arguments == ["list"] or bool(
+            len(arguments) == 3
+            and arguments[0] == "status"
+            and arguments[1] == "--printer-id"
+            and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
+        )
+    if script_name != "printer3d_control.py":
+        return False
+    return bool(
+        len(arguments) == 5
+        and arguments[0] in {"pause", "resume", "cancel"}
+        and arguments[1] == "--printer-id"
+        and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
+        and arguments[3] == "--idempotency-key"
+        and _CAMERA_ID_RE.fullmatch(arguments[4]) is not None
+    )
+
+
+def _parse_printer3d_runtime_command(command: str) -> Optional[_Printer3DRuntimeCommand]:
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    script_name = Path(tokens[1]).name if len(tokens) > 1 else ""
+    if (
+        len(tokens) < 3
+        or not _is_python_executable_token(tokens[0])
+        or script_name not in _PRINTER3D_RUNTIME_SCRIPTS
+        or any(token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION for token in tokens)
+        or not _printer3d_runtime_arguments_allowed(script_name, tokens[2:])
+    ):
+        return None
+    script = _resolve_printer3d_runtime_script(tokens[1])
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if script is None or anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _Printer3DRuntimeCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _printer3d_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor, script_name: str) -> bool:
+    manifest_relative = _PRINTER3D_RUNTIME_MANIFEST_PATHS.get(script_name)
+    if manifest_relative is None:
+        return False
+    manifest = anchor.resolved_root / manifest_relative
+    try:
+        digest = anchor.file_digests.get(manifest_relative.as_posix())
+        if digest is None or not _connector_runtime_path_is_trusted(
+            manifest,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        ):
+            return False
+        raw = _read_connector_runtime_script_bytes(
+            manifest,
+            expected_identity=_path_identity(manifest),
+            expected_digest=digest,
+        )
+        if len(raw) > _CAMERA_RUNTIME_MAX_MANIFEST_BYTES:
+            return False
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        return bool(
+            isinstance(loaded, dict)
+            and loaded.get("id") == _PRINTER3D_RUNTIME_MANIFEST_IDS[script_name]
+            and loaded.get("required_scopes") == _PRINTER3D_RUNTIME_SCOPES[script_name]
+            and _PRINTER3D_RUNTIME_CAPABILITIES[script_name]
+            in (loaded.get("runtime_capabilities") or [])
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def _printer3d_runtime_shell_guard_result(command: str) -> Optional[str]:
+    if not any(script in command for script in _PRINTER3D_RUNTIME_SCRIPTS):
+        return None
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": (
+            "3D-printer actions require one exact foreground signed helper "
+            "command with fixed arguments and no shell operators, wrappers, "
+            "host, credential, URL, path, or discovery input."
+        ),
+        "printer3d_runtime_direct": False,
+        "printer3d_runtime_blocked": True,
+    }, ensure_ascii=False)
+
+
+def _resolve_smart_home_runtime_script(raw_path: str) -> Optional[Path]:
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
+        return None
+    relative_text: Optional[str] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative_text = raw_path[len(prefix):]
+            break
+    if relative_text is None:
+        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).absolute()
+        for allowed_root in (anchor.configured_root, anchor.resolved_root):
+            try:
+                relative_text = str(expanded.relative_to(allowed_root))
+                break
+            except ValueError:
+                continue
+    if relative_text is None or Path(relative_text) != _SMART_HOME_RUNTIME_RELATIVE_PATH:
+        return None
+    candidate = anchor.resolved_root / _SMART_HOME_RUNTIME_RELATIVE_PATH
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(anchor.resolved_root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file() or not _connector_runtime_path_is_trusted(
+        candidate, anchor.resolved_root, expected_root_identity=anchor.identity
+    ):
+        return None
+    return resolved
+
+
+def _smart_home_runtime_arguments_allowed(arguments: list[str]) -> bool:
+    if arguments == ["list"]:
+        return True
+    if len(arguments) < 5 or arguments[0] not in {"power", "brightness", "color", "color-temperature"}:
+        return False
+    if arguments[1] != "--target-id" or _CAMERA_ID_RE.fullmatch(arguments[2]) is None:
+        return False
+    if "--idempotency-key" not in arguments:
+        return False
+    key_index = arguments.index("--idempotency-key")
+    if key_index != len(arguments) - 2 or _CAMERA_ID_RE.fullmatch(arguments[-1]) is None:
+        return False
+    if arguments[0] == "power":
+        return len(arguments) == 6 and arguments[3] in {"--on", "--off"} and arguments[4] == "--idempotency-key"
+    if arguments[0] == "brightness":
+        return len(arguments) == 6 and arguments[3] == "--percent" and arguments[4].isdigit() and 0 <= int(arguments[4]) <= 100
+    if arguments[0] == "color":
+        return (
+            len(arguments) == 10
+            and arguments[3] == "--red" and arguments[5] == "--green" and arguments[7] == "--blue"
+            and all(arguments[index].isdigit() and 0 <= int(arguments[index]) <= 255 for index in (4, 6, 8))
+        )
+    return len(arguments) == 6 and arguments[3] == "--kelvin" and arguments[4].isdigit() and 1 <= int(arguments[4]) <= 100000
+
+
+def _parse_smart_home_runtime_command(command: str) -> Optional[_SmartHomeRuntimeCommand]:
+    lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if (
+        len(tokens) < 3
+        or not _is_python_executable_token(tokens[0])
+        or Path(tokens[1]).name != _SMART_HOME_RUNTIME_SCRIPT
+        or any(token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION for token in tokens)
+        or not _smart_home_runtime_arguments_allowed(tokens[2:])
+    ):
+        return None
+    script = _resolve_smart_home_runtime_script(tokens[1])
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if script is None or anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _SmartHomeRuntimeCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _smart_home_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool:
+    manifest = anchor.resolved_root / _SMART_HOME_RUNTIME_MANIFEST_RELATIVE_PATH
+    try:
+        digest = anchor.file_digests.get(_SMART_HOME_RUNTIME_MANIFEST_RELATIVE_PATH.as_posix())
+        if digest is None or not _connector_runtime_path_is_trusted(manifest, anchor.resolved_root, expected_root_identity=anchor.identity):
+            return False
+        raw = _read_connector_runtime_script_bytes(manifest, expected_identity=_path_identity(manifest), expected_digest=digest)
+        if len(raw) > _CAMERA_RUNTIME_MAX_MANIFEST_BYTES:
+            return False
+        import yaml
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        return bool(
+            isinstance(loaded, dict)
+            and loaded.get("id") == "smart-home-light-control"
+            and loaded.get("required_scopes") == [_SMART_HOME_RUNTIME_SCOPE]
+            and _SMART_HOME_RUNTIME_CAPABILITY in (loaded.get("runtime_capabilities") or [])
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def _smart_home_runtime_shell_guard_result(command: str) -> Optional[str]:
+    if _SMART_HOME_RUNTIME_SCRIPT not in command:
+        return None
+    return json.dumps({
+        "output": "", "exit_code": -1,
+        "error": "Smart-home actions require one exact foreground signed helper command with fixed light arguments.",
+        "smart_home_runtime_direct": False, "smart_home_runtime_blocked": True,
+    }, ensure_ascii=False)
+
+
+def _resolve_plaud_runtime_script(raw_path: str) -> Optional[Path]:
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
+        return None
+    relative_text: Optional[str] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative_text = raw_path[len(prefix):]
+            break
+    if relative_text is None:
+        expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).absolute()
+        for allowed_root in (anchor.configured_root, anchor.resolved_root):
+            try:
+                relative_text = str(expanded.relative_to(allowed_root))
+                break
+            except ValueError:
+                continue
+    if relative_text is None or Path(relative_text) != _PLAUD_RUNTIME_RELATIVE_PATH:
+        return None
+    candidate = anchor.resolved_root / _PLAUD_RUNTIME_RELATIVE_PATH
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(anchor.resolved_root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file() or not _connector_runtime_path_is_trusted(
+        candidate,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        return None
+    return resolved
+
+
+def _plaud_runtime_date_allowed(value: str) -> bool:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        return False
+    try:
+        time.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _plaud_runtime_arguments_allowed(arguments: list[str]) -> bool:
+    if not arguments:
+        return False
+    action = arguments[0]
+    if action in {"transcript", "note"}:
+        return bool(
+            len(arguments) == 3
+            and arguments[1] == "--file-id"
+            and _PLAUD_FILE_ID_RE.fullmatch(arguments[2]) is not None
+        )
+    if action == "list":
+        values = arguments[1:]
+        allowed = {"--page": (1, 1000), "--page-size": (10, 100)}
+    elif action == "search":
+        if len(arguments) < 2:
+            return False
+        keyword = arguments[1]
+        if (
+            not keyword.strip()
+            or len(keyword.encode("utf-8")) > 200
+            or any(ord(character) < 0x20 for character in keyword)
+        ):
+            return False
+        values = arguments[2:]
+        allowed = {"--max": (1, 100), "--from": None, "--to": None}
+    else:
+        return False
+    if len(values) % 2 != 0:
+        return False
+    seen: set[str] = set()
+    for index in range(0, len(values), 2):
+        flag, value = values[index:index + 2]
+        bounds = allowed.get(flag)
+        if flag not in allowed or flag in seen:
+            return False
+        seen.add(flag)
+        if bounds is None:
+            if not _plaud_runtime_date_allowed(value):
+                return False
+            continue
+        if not value.isdigit() or not bounds[0] <= int(value) <= bounds[1]:
+            return False
+    return True
+
+
+def _parse_plaud_runtime_command(command: str) -> Optional[_PlaudRuntimeCommand]:
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if (
+        len(tokens) < 3
+        or not _is_python_executable_token(tokens[0])
+        or Path(tokens[1]).name != _PLAUD_RUNTIME_SCRIPT
+        or any(
+            token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+            for token in tokens
+        )
+        or not _plaud_runtime_arguments_allowed(tokens[2:])
+    ):
+        return None
+    script = _resolve_plaud_runtime_script(tokens[1])
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if script is None or anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _PlaudRuntimeCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _plaud_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool:
+    manifest = anchor.resolved_root / _PLAUD_RUNTIME_MANIFEST_RELATIVE_PATH
+    try:
+        digest = anchor.file_digests.get(
+            _PLAUD_RUNTIME_MANIFEST_RELATIVE_PATH.as_posix()
+        )
+        if digest is None or not _connector_runtime_path_is_trusted(
+            manifest,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        ):
+            return False
+        raw = _read_connector_runtime_script_bytes(
+            manifest,
+            expected_identity=_path_identity(manifest),
+            expected_digest=digest,
+        )
+        if len(raw) > _CAMERA_RUNTIME_MAX_MANIFEST_BYTES:
+            return False
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        return bool(
+            isinstance(loaded, dict)
+            and loaded.get("id") == "plaud-recordings"
+            and loaded.get("required_scopes") == ["hardware.plaud:read"]
+            and _PLAUD_RUNTIME_CAPABILITY
+            in (loaded.get("runtime_capabilities") or [])
+        )
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def _plaud_runtime_shell_guard_result(command: str) -> Optional[str]:
+    if _PLAUD_RUNTIME_SCRIPT not in command:
+        return None
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": (
+            "PLAUD actions require one exact foreground signed helper command "
+            "with fixed read-only arguments and no shell operators, wrappers, "
+            "account identifier, credential, URL, path, audio, write, or control "
+            "input. For list, --page-size must be between 10 and 100."
+        ),
+        "plaud_runtime_direct": False,
+        "plaud_runtime_blocked": True,
+    }, ensure_ascii=False)
+
+
 def _agent_creator_segment_contains_invocation(segment: list[str]) -> bool:
     """Recognize creator scripts only where the shell would execute them."""
 
@@ -5250,17 +3266,18 @@ def _log_agent_creator_rejection(reason: str) -> None:
     )
 
 
-def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
-    """Resolve one fixed creator helper below the pinned presets root."""
+def _resolve_fixed_preset_script(
+    raw_path: str,
+    expected_paths: frozenset[Path],
+    *,
+    log_agent_creator_trust_rejection: bool = False,
+) -> Optional[Path]:
+    """Resolve one fixed script below the pinned presets root."""
 
     anchor = _capture_connector_runtime_root()
     if anchor is None:
         return None
 
-    expected_paths = {
-        _AGENT_CREATOR_RELATIVE_PATH,
-        _APP_AGENT_HELPER_RELATIVE_PATH,
-    }
     relative: Optional[Path] = None
     for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
         if raw_path.startswith(prefix):
@@ -5300,14 +3317,27 @@ def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
         anchor.resolved_root,
         expected_root_identity=anchor.identity,
     ):
-        reason = _connector_runtime_trust_rejection_reason(
-            candidate,
-            anchor.resolved_root,
-            expected_root_identity=anchor.identity,
-        )
-        _log_agent_creator_rejection(reason or "trust_check_failed")
+        if log_agent_creator_trust_rejection:
+            reason = _connector_runtime_trust_rejection_reason(
+                candidate,
+                anchor.resolved_root,
+                expected_root_identity=anchor.identity,
+            )
+            _log_agent_creator_rejection(reason or "trust_check_failed")
         return None
     return resolved
+
+
+def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
+    return _resolve_fixed_preset_script(
+        raw_path,
+        frozenset({_AGENT_CREATOR_RELATIVE_PATH, _APP_AGENT_HELPER_RELATIVE_PATH}),
+        log_agent_creator_trust_rejection=True,
+    )
+
+
+def _resolve_overseas_connect_script(raw_path: str) -> Optional[Path]:
+    return _resolve_fixed_preset_script(raw_path, frozenset({_OVERSEAS_CONNECT_RELATIVE_PATH}))
 
 
 def _split_agent_creator_heredoc(
@@ -5543,6 +3573,81 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
     )
 
 
+def _parse_overseas_connect_command(
+    command: str,
+) -> Optional[_OverseasConnectCommand]:
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if (
+        len(tokens) < 3
+        or not _is_python_executable_token(tokens[0])
+        or Path(tokens[1]).name != _OVERSEAS_CONNECT_SCRIPT
+        or any(
+            token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+            for token in tokens
+        )
+    ):
+        return None
+
+    # 现在**只有一种**合法形态,token 数精确 —— 多一个参数就拒,不做前缀匹配:
+    #   status-card   → 3 token,⛔ 不接受 --platform
+    # 无参形态不能接受 --platform:脚本那边 status-card 根本不读它,静默放行会让
+    # 「我指定了平台」变成一个不报错的错觉。
+    # ⚠️ 5-token 的 `<子命令> --platform <平台>` 形态曾经也合法,已整组摘除
+    # (见 _OVERSEAS_CONNECT_PLATFORM_COMMANDS 现为空集及其说明)。下面那条 elif 分支
+    # 留着只是为了「有人往集合里加东西时形状校验仍然成立」,⛔ 别把它读成「还有 5-token
+    # 命令可用」。
+    subcommand = tokens[2]
+    if subcommand in _OVERSEAS_CONNECT_CARD_ONLY_COMMANDS:
+        if len(tokens) != 3:
+            return None
+    elif subcommand in _OVERSEAS_CONNECT_PLATFORM_COMMANDS:
+        # ⚠️ 该集合现在是**空的**(见其定义处的说明):带 --platform 的子命令整组不再被
+        # 受信通道接管。这条分支留着是为了在有人重新往集合里加东西时,校验形状仍然成立;
+        # ⛔ 别把它当成「还有 5-token 命令可用」的证据。
+        if (
+            len(tokens) != 5
+            or tokens[3] != "--platform"
+            or tokens[4] not in _OVERSEAS_CONNECT_PLATFORMS
+        ):
+            return None
+    else:
+        return None
+
+    script = _resolve_overseas_connect_script(tokens[1])
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if script is None or anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _OverseasConnectCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _overseas_connect_shell_guard_result(command: str) -> Optional[str]:
+    if "overseas-connect" not in command or _OVERSEAS_CONNECT_SCRIPT not in command:
+        return None
+    return _overseas_connect_blocked_result(
+        "overseas_connect_command_blocked",
+        "Overseas Connect must run as one direct canonical Python command.",
+    )
+
+
 def _request_agentcomputer_mutation_approval(
     parsed: _AgentCreatorCommand,
 ) -> Optional[str]:
@@ -5635,6 +3740,32 @@ def _request_agentcomputer_mutation_approval(
         "allow_permanent": False,
         "agent_creator_direct": True,
     }, ensure_ascii=False)
+
+
+def _agent_creator_operation_payload(
+    parsed: _AgentCreatorCommand,
+) -> Optional[dict]:
+    """Return the app-agent object that the pinned script will POST.
+
+    Hermes deliberately does not canonicalize or digest this value. The
+    local-server broker is the sole authority for operation binding; this
+    helper only decodes the already validated command payload so the same
+    object can be forwarded to that broker before the script runs. The probe
+    sentinel is translated to the empty object because the preset sends
+    ``{}`` on the wire for its read-only capability probe.
+    """
+    if len(parsed.argv) < 5 or parsed.argv[2] != "create-app-agent":
+        return None
+    raw = parsed.stdin_text if parsed.argv[4] == "-" else parsed.argv[4]
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value == {"probe": True}:
+        return {}
+    return value
 
 
 def _read_verified_agent_creator_file(
@@ -5783,6 +3914,57 @@ def _agent_creator_manifest_supports_action_token_fd(
     return True
 
 
+def _overseas_connect_manifest_supports_action_token_fd(
+    anchor: _ConnectorRuntimeRootAnchor,
+) -> bool:
+    manifest = anchor.resolved_root / _OVERSEAS_CONNECT_MANIFEST_RELATIVE_PATH
+    if not _connector_runtime_path_is_trusted(
+        manifest,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        return False
+    try:
+        manifest_identity = _path_identity(manifest)
+        manifest_digest = anchor.file_digests.get(
+            manifest.relative_to(anchor.resolved_root).as_posix()
+        )
+        if manifest_digest is None:
+            raise OSError("manifest absent from startup trust snapshot")
+        raw = _read_verified_agent_creator_file(
+            manifest,
+            expected_identity=manifest_identity,
+            max_bytes=_AGENT_CREATOR_MAX_MANIFEST_BYTES,
+            expected_digest=manifest_digest,
+        )
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        capabilities = loaded.get("runtime_capabilities") if isinstance(loaded, dict) else None
+        if (
+            not isinstance(capabilities, list)
+            or len(capabilities) > _AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES
+            or not all(
+                isinstance(capability, str) and 0 < len(capability) <= 128
+                for capability in capabilities
+            )
+            or loaded.get("id") != "overseas-connect"
+            or _OVERSEAS_CONNECT_ACTION_TOKEN_FD_CAPABILITY not in capabilities
+        ):
+            raise ValueError("overseas-connect runtime capability unavailable")
+        return (
+            _path_identity(anchor.resolved_root) == anchor.identity
+            and _path_identity(manifest) == manifest_identity
+            and _connector_runtime_path_is_trusted(
+                manifest,
+                anchor.resolved_root,
+                expected_root_identity=anchor.identity,
+            )
+        )
+    except Exception:
+        return False
+
+
 _VIDEO_EDIT_PLAN_PREPARATION_ACTIONS = frozenset({
     "resolve",
     "finalize",
@@ -5792,30 +3974,8 @@ _VIDEO_EDIT_PLAN_PREPARATION_ACTIONS = frozenset({
 })
 
 
-def _is_video_edit_plan_preparation_command(command: str) -> bool:
-    """Allow only bounded preference preparation while App Plan mode is active."""
-    parsed = _parse_video_edit_runtime_command(command)
-    return bool(
-        parsed is not None
-        and Path(parsed.argv[1]).name == "preference_resolver.py"
-        and len(parsed.argv) >= 3
-        and parsed.argv[2] in _VIDEO_EDIT_PLAN_PREPARATION_ACTIONS
-    )
 
 
-def _video_edit_runtime_shell_guard_result(command: str) -> Optional[str]:
-    if not any(name in command for name in _VIDEO_EDIT_RUNTIME_SCRIPTS):
-        return None
-    return json.dumps({
-        "output": "",
-        "exit_code": -1,
-        "error": (
-            "Trusted video-edit scripts must run as one direct foreground "
-            "python command without shell operators, wrappers, PTY, or background execution."
-        ),
-        "video_edit_runtime_direct": False,
-        "video_edit_runtime_blocked": True,
-    }, ensure_ascii=False)
 
 
 def _run_agent_creator_command_if_allowed(
@@ -5897,13 +4057,31 @@ def _run_agent_creator_command_if_allowed(
             direct=True,
         )
 
+    app_auto_refresh = (
+        len(parsed.argv) >= 3 and parsed.argv[2] == "create-app-agent"
+    )
+    app_operation = (
+        _agent_creator_operation_payload(parsed)
+        if app_auto_refresh
+        else None
+    )
+    if app_auto_refresh and app_operation is None:
+        return _agent_creator_blocked_result(
+            "agent_creator_operation_binding_unavailable",
+            "Agent Creator operation payload could not be forwarded to local-server.",
+            direct=True,
+        )
+
     try:
         from tools.environments.local import build_agent_creator_runtime_env
 
         creator_env = build_agent_creator_runtime_env(
-            app_auto_refresh=(
-                len(parsed.argv) >= 3 and parsed.argv[2] == "create-app-agent"
-            )
+            app_auto_refresh=app_auto_refresh,
+            **(
+                {"app_auto_refresh_operation": app_operation}
+                if app_auto_refresh
+                else {}
+            ),
         )
     except Exception:
         return _agent_creator_blocked_result(
@@ -5915,16 +4093,24 @@ def _run_agent_creator_command_if_allowed(
     token = creator_env.pop("ZETTLAB_AGENT_ACTION_TOKEN", "")
     turn_id = creator_env.get("ZETTLAB_TURN_ID", "")
     try:
-        from tools.environments.local import _sanitize_subprocess_env
         from tools.trusted_direct_runner import run_trusted_python_script
 
-        run_env = _sanitize_subprocess_env(os.environ)
-        run_env.pop("ZETTLAB_TURN_ID", None)
+        # ⭐ 受信 runner **不继承进程环境**,照抄同文件 _run_camera_runtime_command_if_allowed
+        # 的做法(base_env={})。⛔ 别改回 _sanitize_subprocess_env(os.environ):那是**黑名单**
+        # ——只剥 Hermes 自己的密钥,其余一律放行,于是:
+        #   ① HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 会跟着进去。脚本随后拿 action token 和
+        #      ZETTLAB_LOCAL_SERVER_URL 访问 loopback,而 Python 的 requests/urllib **不会**
+        #      自动豁免 loopback —— 没配 NO_PROXY 时,带 X-Zettlab-Agent-Action-Token 的请求
+        #      会被发到外部代理。这不是假想:本线的设备上就跑着 mihomo,代理变量确实配着。
+        #   ② ZET_CHAT_APPEND_URL 这类**跨 profile 的陈旧回调地址**也会跟着进去,卡片/状态
+        #      可能回写到错误的会话或 profile。
+        # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
+        # 显式给,⛔ 不从进程环境里捡。
         completed = run_trusted_python_script(
             script=script,
             argv=parsed.argv[1:],
             cwd=anchor.resolved_root,
-            base_env=run_env,
+            base_env={},
             injected_env=creator_env,
             injected_secrets={"ZETTLAB_AGENT_ACTION_TOKEN": token},
             timeout=timeout,
@@ -5954,21 +4140,30 @@ def _run_agent_creator_command_if_allowed(
     }, ensure_ascii=False)
 
 
-def _run_video_edit_runtime_command_if_allowed(
+def _run_overseas_connect_command_if_allowed(
     command: str,
     *,
     cwd: str,
     timeout: int,
 ) -> Optional[str]:
-    parsed = _parse_video_edit_runtime_command(command)
+    del cwd
+    parsed = _parse_overseas_connect_command(command)
     if parsed is None:
-        return _video_edit_runtime_shell_guard_result(command)
+        return _overseas_connect_shell_guard_result(command)
 
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_identity_changed",
+            "Overseas Connect trust identity changed before execution.",
+        )
     script = Path(parsed.argv[1])
     try:
+        script_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
         identities_match = (
-            anchor is not None
+            script_digest is not None
             and _path_identity(anchor.resolved_root) == parsed.root_identity
             and _path_identity(script) == parsed.script_identity
             and _connector_runtime_path_is_trusted(
@@ -5977,86 +4172,91 @@ def _run_video_edit_runtime_command_if_allowed(
                 expected_root_identity=parsed.root_identity,
             )
         )
-    except OSError:
-        identities_match = False
-    if not identities_match:
-        return _video_edit_runtime_shell_guard_result(command)
-
-    secret_values: list[str] = []
-    try:
-        from tools.environments.local import build_video_edit_runtime_env
-
-        trusted_env = build_video_edit_runtime_env()
-        if not _video_edit_runtime_claims_match_receipt(parsed, trusted_env):
-            return _video_edit_runtime_shell_guard_result(command)
-        secret_values = [
-            trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
-            trusted_env.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
-        ]
-        trusted_secrets = {
-            key: trusted_env.pop(key)
-            for key in (
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
-                "ZETTLAB_AGENT_ACTION_TOKEN",
-            )
-            if trusted_env.get(key)
-        }
-        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-        payload = {
-            "script": parsed.argv[1],
-            "argv": parsed.argv[1:],
-            "env": trusted_env,
-            "secrets": trusted_secrets,
-            "cwd": run_cwd,
-            "source_bundle": _trusted_video_edit_source_bundle(
-                script=script,
-                presets_root=anchor.resolved_root,
-                expected_root_identity=parsed.root_identity,
-            ),
-        }
-        # The upload helper permits one 1800s transfer plus one retry. Keep the
-        # generic terminal cap unchanged while allowing this bounded operation
-        # to finish both attempts.
-        worker_timeout = _video_edit_runtime_timeout(parsed, timeout)
-        completed = _run_video_edit_worker(
-            payload,
-            timeout=worker_timeout,
+        if not identities_match:
+            raise OSError("overseas-connect trust identity changed")
+        script_bytes = _read_verified_agent_creator_script(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=script_digest,
         )
-        returncode = int(completed["returncode"])
-        result = json.loads(_connector_runtime_result_json(
-            command=command,
-            output=(completed["stdout"] or "") + (completed["stderr"] or ""),
-            returncode=returncode,
-            secret_values=secret_values,
-            timed_out=returncode == 124,
-        ))
-        result.pop("connector_runtime_direct", None)
-        result["video_edit_runtime_direct"] = True
-        return json.dumps(result, ensure_ascii=False)
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        result = json.loads(_connector_runtime_result_json(
-            command=command,
-            output=stdout + stderr,
-            returncode=124,
-            secret_values=secret_values,
-            timed_out=True,
-        ))
-        result.pop("connector_runtime_direct", None)
-        result["video_edit_runtime_direct"] = True
-        return json.dumps(result, ensure_ascii=False)
-    except Exception as exc:
-        return json.dumps({
-            "output": "",
-            "exit_code": -1,
-            "error": f"Trusted video-edit execution failed: {type(exc).__name__}: {exc}",
-            "video_edit_runtime_direct": True,
-        }, ensure_ascii=False)
+    except OSError:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_identity_changed",
+            "Overseas Connect trust identity changed before execution.",
+        )
+
+    if not _overseas_connect_manifest_supports_action_token_fd(anchor):
+        return _overseas_connect_blocked_result(
+            "overseas_connect_runtime_capability_unavailable",
+            "Overseas Connect is unavailable because its scoped authorization channel is missing.",
+        )
+    try:
+        from tools.environments.local import (
+            build_overseas_connect_runtime_env,
+        )
+        # ⭐ 先建立进程边界,再取 action token。照抄同文件 connector / camera 两个受信
+        # runner 的做法(_run_connector_runtime_command_if_allowed 与
+        # _run_camera_runtime_command_if_allowed 都在取凭据前调它),⛔ 没另发明一套。
+        # 边界建不起来就**直接阻断**这个 runner:模型启动的本地子进程若能 ptrace 父进程,
+        # 会在 token 进入内存的那一刻拿到连接授权。fail closed,⛔ 不降级放行。
+        if not _ensure_sensitive_runtime_boundary():
+            return _overseas_connect_blocked_result(
+                "overseas_connect_boundary_unavailable",
+                "Overseas Connect is unavailable because this process cannot establish a "
+                "trusted execution boundary.",
+            )
+        runtime_env, token = build_overseas_connect_runtime_env()
+    except Exception:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_scope_unavailable",
+            "Overseas Connect is unavailable because this turn has no scoped authorization.",
+        )
+
+    try:
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        turn_id = runtime_env.get("ZETTLAB_TURN_ID", "")
+        # ⭐ 受信 runner **不继承进程环境**,照抄同文件 _run_camera_runtime_command_if_allowed
+        # 的做法(base_env={})。⛔ 别改回 _sanitize_subprocess_env(os.environ):那是**黑名单**
+        # ——只剥 Hermes 自己的密钥,其余一律放行,于是:
+        #   ① HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 会跟着进去。脚本随后拿 action token 和
+        #      ZETTLAB_LOCAL_SERVER_URL 访问 loopback,而 Python 的 requests/urllib **不会**
+        #      自动豁免 loopback —— 没配 NO_PROXY 时,带 X-Zettlab-Agent-Action-Token 的请求
+        #      会被发到外部代理。这不是假想:本线的设备上就跑着 mihomo,代理变量确实配着。
+        #   ② ZET_CHAT_APPEND_URL 这类**跨 profile 的陈旧回调地址**也会跟着进去,卡片/状态
+        #      可能回写到错误的会话或 profile。
+        # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
+        # 显式给,⛔ 不从进程环境里捡。
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=anchor.resolved_root,
+            base_env={},
+            injected_env=runtime_env,
+            injected_secrets={"ZETTLAB_AGENT_ACTION_TOKEN": token},
+            timeout=timeout,
+            secret_values=(token, turn_id),
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+    except Exception:
+        return _overseas_connect_blocked_result(
+            "overseas_connect_execution_unavailable",
+            "Overseas Connect could not start its secure device action.",
+        )
+
+    error = None
+    if completed.timed_out:
+        error = "Command timed out while running Overseas Connect."
+    elif completed.interrupted:
+        error = "Overseas Connect was interrupted."
+    return json.dumps({
+        "output": completed.output,
+        "exit_code": completed.returncode,
+        "error": error,
+        "overseas_connect_direct": True,
+    }, ensure_ascii=False)
+
 
 
 def _run_camera_runtime_command_if_allowed(
@@ -6119,7 +4319,7 @@ def _run_camera_runtime_command_if_allowed(
             key: trusted_env.pop(key)
             for key in (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
-                "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
             )
         }
         secret_values = list(trusted_secrets.values())
@@ -6152,6 +4352,246 @@ def _run_camera_runtime_command_if_allowed(
             "exit_code": -1,
             "error": f"Camera runtime execution failed: {type(exc).__name__}",
             "camera_runtime_direct": True,
+        }, ensure_ascii=False)
+
+
+def _run_printer3d_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_printer3d_runtime_command(command)
+    if parsed is None:
+        return _printer3d_runtime_shell_guard_result(command)
+    if not _ensure_sensitive_runtime_boundary():
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "3D-printer runtime process memory boundary is unavailable",
+            "printer3d_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(parsed.argv[1])
+    expected_digest: Optional[str] = None
+    try:
+        expected_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
+        identities_match = (
+            anchor is not None
+            and expected_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+            and _printer3d_runtime_manifest_allows(anchor, script.name)
+        )
+    except (OSError, AttributeError):
+        identities_match = False
+    if not identities_match:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "3D-printer runtime package identity or capability is unavailable",
+            "printer3d_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=expected_digest,
+        )
+        from tools.environments.local import build_printer3d_runtime_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        trusted_env = build_printer3d_runtime_env()
+        trusted_secrets = {
+            key: trusted_env.pop(key)
+            for key in (
+                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+            )
+        }
+        secret_values = list(trusted_secrets.values())
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=Path(run_cwd),
+            base_env={},
+            injected_env=trusted_env,
+            injected_secrets=trusted_secrets,
+            timeout=max(1, min(timeout, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            secret_values=secret_values,
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+        payload = json.loads(_connector_runtime_result_json(
+            command=command,
+            output=completed.output,
+            returncode=completed.returncode,
+            secret_values=secret_values,
+            timed_out=completed.timed_out,
+        ))
+        payload.pop("connector_runtime_direct", None)
+        payload["printer3d_runtime_direct"] = True
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"3D-printer runtime execution failed: {type(exc).__name__}",
+            "printer3d_runtime_direct": True,
+        }, ensure_ascii=False)
+
+
+def _run_smart_home_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_smart_home_runtime_command(command)
+    if parsed is None:
+        return _smart_home_runtime_shell_guard_result(command)
+    if not _ensure_sensitive_runtime_boundary():
+        return json.dumps({"output": "", "exit_code": -1, "error": "Smart-home runtime process memory boundary is unavailable", "smart_home_runtime_direct": True}, ensure_ascii=False)
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(parsed.argv[1])
+    try:
+        expected_digest = anchor.file_digests.get(script.relative_to(anchor.resolved_root).as_posix())
+        identities_match = (
+            anchor is not None and expected_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(script, anchor.resolved_root, expected_root_identity=parsed.root_identity)
+            and _smart_home_runtime_manifest_allows(anchor)
+        )
+    except (OSError, AttributeError):
+        identities_match = False
+        expected_digest = None
+    if not identities_match:
+        return json.dumps({"output": "", "exit_code": -1, "error": "Smart-home runtime package identity or capability is unavailable", "smart_home_runtime_direct": True}, ensure_ascii=False)
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(script, expected_identity=parsed.script_identity, expected_digest=expected_digest)
+        from tools.environments.local import build_smart_home_runtime_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+        trusted_env = build_smart_home_runtime_env()
+        trusted_secrets = {key: trusted_env.pop(key) for key in ("ZETTLAB_AGENT_ACTION_TOKEN", "ZETTLAB_HARDWARE_EXECUTION_TOKEN")}
+        secret_values = list(trusted_secrets.values())
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        completed = run_trusted_python_script(
+            script=script, argv=parsed.argv[1:], cwd=Path(run_cwd), base_env={}, injected_env=trusted_env,
+            injected_secrets=trusted_secrets, timeout=max(1, min(timeout, _SMART_HOME_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            secret_values=secret_values, script_bytes=script_bytes, stdlib_only=True,
+        )
+        payload = json.loads(_connector_runtime_result_json(command=command, output=completed.output, returncode=completed.returncode, secret_values=secret_values, timed_out=completed.timed_out))
+        payload.pop("connector_runtime_direct", None)
+        payload["smart_home_runtime_direct"] = True
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"output": "", "exit_code": -1, "error": f"Smart-home runtime execution failed: {type(exc).__name__}", "smart_home_runtime_direct": True}, ensure_ascii=False)
+
+
+def _run_plaud_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_plaud_runtime_command(command)
+    if parsed is None:
+        return _plaud_runtime_shell_guard_result(command)
+    if not _ensure_sensitive_runtime_boundary():
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "PLAUD runtime process memory boundary is unavailable",
+            "plaud_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(parsed.argv[1])
+    expected_digest: Optional[str] = None
+    try:
+        expected_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
+        identities_match = (
+            anchor is not None
+            and expected_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+            and _plaud_runtime_manifest_allows(anchor)
+        )
+    except (OSError, AttributeError):
+        identities_match = False
+    if not identities_match:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "PLAUD runtime package identity or capability is unavailable",
+            "plaud_runtime_direct": True,
+        }, ensure_ascii=False)
+
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=expected_digest,
+        )
+        from tools.environments.local import build_plaud_runtime_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        trusted_env = build_plaud_runtime_env()
+        trusted_secrets = {
+            key: trusted_env.pop(key)
+            for key in (
+                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+            )
+        }
+        secret_values = list(trusted_secrets.values())
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=Path(run_cwd),
+            base_env={},
+            injected_env=trusted_env,
+            injected_secrets=trusted_secrets,
+            timeout=max(1, min(timeout, _PLAUD_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            secret_values=secret_values,
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+        payload = json.loads(_connector_runtime_result_json(
+            command=command,
+            output=completed.output,
+            returncode=completed.returncode,
+            secret_values=secret_values,
+            timed_out=completed.timed_out,
+        ))
+        payload.pop("connector_runtime_direct", None)
+        payload["plaud_runtime_direct"] = True
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"PLAUD runtime execution failed: {type(exc).__name__}",
+            "plaud_runtime_direct": True,
         }, ensure_ascii=False)
 
 
@@ -7612,6 +6052,27 @@ def terminal_tool(
                 }, ensure_ascii=False)
 
         if not background and not pty:
+            smart_home_runtime_result = _run_smart_home_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if smart_home_runtime_result is not None:
+                return smart_home_runtime_result
+            plaud_runtime_result = _run_plaud_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if plaud_runtime_result is not None:
+                return plaud_runtime_result
+            printer3d_runtime_result = _run_printer3d_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if printer3d_runtime_result is not None:
+                return printer3d_runtime_result
             camera_runtime_result = _run_camera_runtime_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -7619,13 +6080,6 @@ def terminal_tool(
             )
             if camera_runtime_result is not None:
                 return camera_runtime_result
-            video_edit_runtime_result = _run_video_edit_runtime_command_if_allowed(
-                command,
-                cwd=workdir or cwd,
-                timeout=effective_timeout,
-            )
-            if video_edit_runtime_result is not None:
-                return video_edit_runtime_result
             agent_creator_result = _run_agent_creator_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -7633,6 +6087,13 @@ def terminal_tool(
             )
             if agent_creator_result is not None:
                 return agent_creator_result
+            overseas_connect_result = _run_overseas_connect_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if overseas_connect_result is not None:
+                return overseas_connect_result
             connector_runtime_result = _run_connector_runtime_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -7644,27 +6105,24 @@ def terminal_tool(
             lark_cli_result = _lark_cli_shell_guard_result(command)
             if lark_cli_result is not None:
                 return lark_cli_result
+            smart_home_runtime_result = _smart_home_runtime_shell_guard_result(command)
+            if smart_home_runtime_result is not None:
+                return smart_home_runtime_result
+            plaud_runtime_result = _plaud_runtime_shell_guard_result(command)
+            if plaud_runtime_result is not None:
+                return plaud_runtime_result
             camera_runtime_result = _camera_runtime_shell_guard_result(command)
             if camera_runtime_result is not None:
                 return camera_runtime_result
-            video_edit_runtime_result = _video_edit_runtime_shell_guard_result(command)
-            if video_edit_runtime_result is not None:
-                return video_edit_runtime_result
             agent_creator_result = _agent_creator_shell_guard_result(command)
             if agent_creator_result is not None:
                 return agent_creator_result
+            overseas_connect_result = _overseas_connect_shell_guard_result(command)
+            if overseas_connect_result is not None:
+                return overseas_connect_result
             connector_runtime_result = _connector_runtime_shell_guard_result(command)
             if connector_runtime_result is not None:
                 return connector_runtime_result
-
-        try:
-            _late_prepare_video_edit_worker_before_terminal()
-        except Exception as exc:
-            logger.warning(
-                "Trusted video-edit worker late preload failed before terminal: %s",
-                type(exc).__name__,
-            )
-        _close_video_edit_worker_disk_trust()
 
         # Start cleanup thread
         _start_cleanup_thread()

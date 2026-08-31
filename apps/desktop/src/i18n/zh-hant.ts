@@ -520,7 +520,8 @@ export const zhHant = defineLocale({
         userProfileEnabled: '使用者設定檔',
         memoryCharLimit: '記憶預算',
         userCharLimit: '設定檔預算',
-        provider: '記憶提供方'
+        provider: '記憶提供方',
+        deepMemoryMode: 'Deep Memory 模式'
       },
       context: {
         engine: '上下文引擎'
@@ -582,7 +583,8 @@ export const zhHant = defineLocale({
       },
       memory: {
         memoryEnabled: '儲存有助於未來工作階段的持久記憶。',
-        userProfileEnabled: '維護一份精簡的使用者偏好設定檔。'
+        userProfileEnabled: '維護一份精簡的使用者偏好設定檔。',
+        deepMemoryMode: '控制 Deep Memory 如何參與新的聊天工作階段。'
       },
       context: {
         engine: '長對話接近上下文上限時的管理策略。'
@@ -648,7 +650,16 @@ export const zhHant = defineLocale({
       imported: '設定已匯入',
       invalidJson: '設定 JSON 無效',
       keepAwakeTitle: '保持電腦喚醒',
-      keepAwakeDesc: '阻止本機睡眠，讓長時間或整夜執行持續進行。螢幕仍可變暗。'
+      keepAwakeDesc: '阻止本機睡眠，讓長時間或整夜執行持續進行。螢幕仍可變暗。',
+      deepMemoryModeTitle: 'Deep Memory 召回',
+      deepMemoryModeOff: '關閉',
+      deepMemoryModeSmart: '智慧',
+      deepMemoryModeAlways: '開啟',
+      deepMemoryModeOffDesc:
+        '聊天僅使用 Hermes 原生記憶。關閉 Deep 召回與 Deep 工具，但原生記憶寫入仍會在背景鏡像。新聊天工作階段生效。',
+      deepMemoryModeSmartDesc:
+        '呼叫 search_memory 時，同時執行 memo_recall，並合併原生與 Deep 結果。新聊天工作階段生效。',
+      deepMemoryModeAlwaysDesc: '每輪開始時自動召回 Deep Memory，與目前行為一致。新聊天工作階段生效。'
     },
     quickEntry: {
       enabledTitle: '快速輸入',

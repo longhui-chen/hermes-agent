@@ -644,7 +644,8 @@ export const zh: Translations = {
         userProfileEnabled: '用户画像',
         memoryCharLimit: '记忆预算',
         userCharLimit: '画像预算',
-        provider: '记忆提供方'
+        provider: '记忆提供方',
+        deepMemoryMode: 'Deep Memory 模式'
       },
       context: {
         engine: '上下文引擎'
@@ -706,7 +707,8 @@ export const zh: Translations = {
       },
       memory: {
         memoryEnabled: '保存有助于未来会话的持久记忆。',
-        userProfileEnabled: '维护一份精简的用户偏好画像。'
+        userProfileEnabled: '维护一份精简的用户偏好画像。',
+        deepMemoryMode: '控制 Deep Memory 如何参与新的聊天会话。'
       },
       context: {
         engine: '在接近上下文上限时管理长对话的策略。'
@@ -777,7 +779,15 @@ export const zh: Translations = {
       attachmentSizeDesc:
         '桌面端为预览和图片附件加载本地文件的大小上限（MB）。默认为 16。远程非图片附件使用单独的 256 MB 上限。设置过大会将整个文件读入内存，可能导致应用卡死或崩溃。',
       attachmentSizeUnit: 'MB',
-      attachmentSizeLabel: '预览 / 图片加载大小上限（MB）'
+      attachmentSizeLabel: '预览 / 图片加载大小上限（MB）',
+      deepMemoryModeTitle: 'Deep Memory 召回',
+      deepMemoryModeOff: '关闭',
+      deepMemoryModeSmart: '智能',
+      deepMemoryModeAlways: '开启',
+      deepMemoryModeOffDesc:
+        '聊天仅使用 Hermes 原生记忆。关闭 Deep 召回与 Deep 工具，但原生记忆写入仍会在后台镜像。新聊天会话生效。',
+      deepMemoryModeSmartDesc: '调用 search_memory 时，同时执行 memo_recall，并合并原生与 Deep 结果。新聊天会话生效。',
+      deepMemoryModeAlwaysDesc: '每轮开始时自动召回 Deep Memory，与当前行为一致。新聊天会话生效。'
     },
     quickEntry: {
       enabledTitle: '快速输入',

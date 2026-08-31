@@ -65,6 +65,24 @@ def _install(monkeypatch, *replies):
     return rec
 
 
+def _scope_denied_error():
+    body = json.dumps(
+        {
+            "error": {
+                "code": "SNAPSHOT_AGENT_PATH_OUT_OF_SCOPE",
+                "message": "path out of scope",
+            }
+        }
+    ).encode("utf-8")
+    return urllib.error.HTTPError(
+        "http://127.0.0.1:19090/api/v1/internal/snapshot/agent-protection/ensure",
+        403,
+        "Forbidden",
+        None,
+        io.BytesIO(body),
+    )
+
+
 def test_dispatch_writes_through_when_snapshot_unavailable_flow(monkeypatch, tmp_path):
     """本特性完全不可用时，行为与 2026-07-29 引入它之前完全一致（PRD 附录 B #18，
     验收 §19 #1b）。

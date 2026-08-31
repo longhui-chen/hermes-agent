@@ -4428,27 +4428,56 @@ class TestRetryExhaustion:
         assert agent.client.chat.completions.create.call_count == 1
 
 
-    def test_build_api_kwargs_error_no_unbound_local(self, agent):
+    def test_build_api_kwargs_error_no_unbound_local(self, agent, caplog):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
 
         Regression: _dump_api_request_debug(api_kwargs, ...) in the except block
         referenced api_kwargs before it was assigned when _build_api_kwargs threw.
+
+        ## 🔴 本用例的第三条断言改过一次,理由要留着
+
+        原来断言 ``"bad messages" in result["error"]``。⭐ 它钉的是**当时的实现
+        行为**,不是需求 —— 而 ``result["error"]`` **是面向用户的**:
+        ``gateway/run.py`` 里 ``final_response = f"⚠️ {result['error']}"`` 直接把它
+        当回复发出去。``_build_api_kwargs`` 抛的是**我们自己代码**的异常,原文里
+        可能带内部路径 / 属性名 / 堆栈碎片,原样出屏正是本 PR 要消除的那件事。
+
+        ⇒ 按 [[gate-can-pin-the-bug-as-contract]]:**换驱动方式,契约不动**。
+        本用例真正的契约是「``except`` 块自己不许崩」,那条一字未改;
+        新增的两条把「原文进日志、⛔ 不进用户文案」也一起钉住 ——
+        ⛔ 这不是放宽,是把断言挪到正确的那一侧。
         """
+        import logging
+
         self._setup_agent(agent)
-        with (
-            patch.object(agent, "_build_api_kwargs", side_effect=ValueError("bad messages")),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-            patch("run_agent.time", self._make_fast_time_mock()),
-        ):
-            result = agent.run_conversation("hello")
-        # Must surface the real error, not UnboundLocalError
+        with caplog.at_level(logging.WARNING):
+            with (
+                patch.object(agent, "_build_api_kwargs", side_effect=ValueError("bad messages")),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+                patch("run_agent.time", self._make_fast_time_mock()),
+            ):
+                result = agent.run_conversation("hello")
+
+        # 原契约,一字未改:except 块自己不许崩
         assert result.get("completed") is False
         assert result.get("failed") is True
         assert "error" in result
         assert "UnboundLocalError" not in result.get("error", "")
-        assert "bad messages" in result["error"]
+
+        # 新契约(同一次失败的两侧,⛔ 缺一不可)
+        from agent.error_classifier import INTERNAL_ERROR_USER_TEXT
+
+        assert INTERNAL_ERROR_USER_TEXT in result["error"], (
+            "我们自己代码的异常没有被收成安全文案"
+        )
+        assert "bad messages" not in result["error"], (
+            "内部异常原文出现在面向用户的字段里(gateway 会把它当回复发出去)"
+        )
+        assert "bad messages" in caplog.text, (
+            "⛔ 抹掉而不记录 = 把可诊断性也砍掉了 —— 原文必须进日志"
+        )
 
 
 # ---------------------------------------------------------------------------

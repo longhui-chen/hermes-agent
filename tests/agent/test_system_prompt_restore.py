@@ -36,6 +36,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    agent._skip_memory_context = False
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -112,6 +113,28 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_skip_memory_context_never_reuses_or_overwrites_stored_prompt(self):
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "MEMORY.md and USER.md from an ordinary turn"
+        }
+        agent = _make_agent(
+            session_db=db,
+            prebuilt_prompt="FRESH PROMPT WITHOUT MEMORY",
+        )
+        agent._skip_memory_context = True
+
+        _restore_or_build_system_prompt(
+            agent,
+            None,
+            [{"role": "user", "content": "continuation"}],
+        )
+
+        db.get_session.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+        agent._build_system_prompt.assert_called_once_with(None)
+        assert agent._cached_system_prompt == "FRESH PROMPT WITHOUT MEMORY"
 
 
 # ---------------------------------------------------------------------------

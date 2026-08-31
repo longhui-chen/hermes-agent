@@ -148,7 +148,19 @@ def _lookup_scoped_tool_defs_cache(
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
-            registry._generation,
+            # 🔴 **必须用 ``cache_generation()``,⛔ 不是裸 ``_generation``。**
+            # ``_bump_generation(profile)`` 在**具名 profile** 上只递增
+            # ``_profile_generations[profile]`` 就 return,**根本不动全局
+            # ``_generation``**(见 tools/registry.py)。single-profile 进程里
+            # MCP 注册/注销/schema 刷新全走那条分支 ⇒ 这个 key 一动不动
+            # ⇒ ``tools/list_changed`` 或用户显式 ``/reload-mcp`` 之后
+            # ``refresh_agent_mcp_tools()`` **再次命中旧缓存**,新增/删除/变更的
+            # 工具**不会出现在当前 Agent 上**,得等一次无关的全局注册、配置文件
+            # 变化或**进程重启**才恢复。
+            # ⭐ 半条链:本 PR 加了 ``_profile_generations`` + ``cache_generation()``,
+            #   却漏了这个消费者 —— 兄弟调用点(其余三处已经在用了:
+            #   agent/tool_executor.py · gateway/run.py · tools/mcp_tool.py)。
+            registry.cache_generation(),
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
@@ -1276,6 +1288,7 @@ def handle_function_call(
     dispatch_wrapper: Optional[
         Callable[[str, Dict[str, Any], Callable[[], Any]], Any]
     ] = None,
+    search_memory_manager: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1300,6 +1313,9 @@ def handle_function_call(
         dispatch_wrapper: Internal boundary around the raw registry handler.
                        It runs inside tool-execution middleware and before
                        post/transform hooks, with the final dispatched args.
+        search_memory_manager: Internal per-agent memory manager threaded only
+                       to the search_memory registry handler. This keeps
+                       provider-backed supplemental recall session-scoped.
 
     Returns:
         Function result as a JSON string.
@@ -1352,7 +1368,10 @@ def handle_function_call(
         if function_name == _ts_mod.TOOL_CALL_NAME:
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
-                return tool_error(err or "tool_call could not be resolved")
+                return _ts_mod.render_tool_call_resolution_error(
+                    function_args or {},
+                    err or "tool_call could not be resolved",
+                )
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
@@ -1391,6 +1410,7 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 dispatch_wrapper=dispatch_wrapper,
+                search_memory_manager=search_memory_manager,
             )
 
     _tool_original_args = dict(function_args)
@@ -1542,14 +1562,20 @@ def handle_function_call(
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     def _registry_dispatch() -> Any:
+                        dispatch_kwargs = {
+                            "task_id": task_id,
+                            "session_id": session_id,
+                            "user_task": user_task,
+                            "previous_assistant_message": previous_assistant_message,
+                            "turn_id": turn_id,
+                            "tool_call_id": tool_call_id,
+                        }
+                        if function_name == "search_memory":
+                            dispatch_kwargs["memory_manager"] = search_memory_manager
                         return registry.dispatch(
-                            function_name, next_args,
-                            task_id=task_id,
-                            session_id=session_id,
-                            user_task=user_task,
-                            previous_assistant_message=previous_assistant_message,
-                            turn_id=turn_id,
-                            tool_call_id=tool_call_id,
+                            function_name,
+                            next_args,
+                            **dispatch_kwargs,
                         )
 
                     if dispatch_wrapper is not None:

@@ -149,7 +149,14 @@ def _encoded_auth_value_looks_real(raw: str) -> bool:
         return False
     if _ENCODED_AUTH_VALUE_RE.fullmatch(value) is None:
         return False
-    return re.search(r"[0-9+/=]|[A-Z]", value) is not None
+    if re.search(r"[0-9+/=]|[A-Z]", value) is not None:
+        return True
+    # An all-lowercase-letter value can still be a real secret (a joined
+    # passphrase, a letters-only slice of lowercase hex). Prose after a bare
+    # "auth" key is a short config word; 20+ unbroken lowercase letters is
+    # not. Hyphenated/underscored lowercase values stay exempt — those are
+    # the kebab-case config enums this gate exists to keep clean.
+    return len(value) >= 20 and value.isalpha()
 
 
 def portable_credential_finding(value: str) -> Optional[str]:

@@ -22,6 +22,8 @@ def _run_handle_function_call(
     tool_args=None,
     dispatch_result='{"output": "original"}',
     invoke_hook=_UNSET,
+    turn_id="",
+    api_request_id="",
 ):
     """Drive ``handle_function_call`` with a mocked registry dispatch."""
     from tools.registry import registry
@@ -47,6 +49,8 @@ def _run_handle_function_call(
         task_id="t1",
         session_id="s1",
         tool_call_id="tc1",
+        turn_id=turn_id,
+        api_request_id=api_request_id,
         skip_pre_tool_call_hook=True,
     )
 

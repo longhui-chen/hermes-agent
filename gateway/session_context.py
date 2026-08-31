@@ -83,6 +83,10 @@ _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNS
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+_SESSION_ID_ENV_MIRROR_SUPPRESSED: ContextVar[bool] = ContextVar(
+    "HERMES_SESSION_ID_ENV_MIRROR_SUPPRESSED",
+    default=False,
+)
 # In-process UI session/window id for multi-session desktop/TUI hosts. This is
 # intentionally separate from HERMES_SESSION_ID: the latter is the durable
 # conversation/session-db id, while the UI id is the live frontend tab/window
@@ -140,6 +144,67 @@ def cron_attached_skills() -> tuple[str, ...]:
     """Return the immutable Skill names authorized for this Cron task."""
     return _CRON_ATTACHED_SKILLS.get()
 
+# ADIC v1 (App Data Import Contract): a bounded, task-local ledger of this
+# turn's app_host `app_operation(...)` outcomes, tagged with the operation
+# name. cron/scheduler.py pushes a scope around one job's run_conversation
+# call and reads the ledger right before mark_job_run, filtering by
+# job.get("import_operation") (the app's OWN declared write-operation name —
+# e.g. "records.refresh" for a blueprint app, not necessarily the literal
+# "data.import"), so a cron verdict can tell "the app confirmed the write
+# operation this job exists to run" apart from "the agent produced a
+# plausible reply". Every app_operation call is recorded here regardless of
+# name — read operations like data.import_schema included — because the
+# name-based filter at verdict time is what excludes them; pre-filtering by a
+# fixed name here would make every app whose write operation isn't literally
+# named "data.import" fail every single round (the mirror-image bug this
+# ledger exists to prevent: false failure instead of false success). Not part
+# of _VAR_MAP: like _HARDWARE_EXECUTION_TOKEN, this must never mirror into
+# os.environ or forward to generic terminal/plugin/model-driving subprocesses,
+# and it must stay absent (not merely empty) for interactive turns that never
+# push a scope, so app_host's call() two-layer status is completely untouched.
+_IMPORT_ATTEMPTS: ContextVar = ContextVar("HERMES_IMPORT_ATTEMPTS", default=_UNSET)
+_IMPORT_ATTEMPTS_MAX = 64
+
+
+def push_import_attempts_scope() -> object:
+    """Open this turn's bounded app_operation ledger and return its token."""
+    return _IMPORT_ATTEMPTS.set([])
+
+
+def pop_import_attempts_scope(token: object) -> None:
+    """Close the ledger opened by :func:`push_import_attempts_scope`."""
+    _IMPORT_ATTEMPTS.reset(token)
+
+
+def record_import_attempt(
+    *, operation: str, ok: bool, error_code: str = "", error_message: str = ""
+) -> None:
+    """Append one app_operation outcome to the active ledger.
+
+    ``operation`` is the exact operation name the call was made with (e.g.
+    "data.import", "records.refresh", "data.import_schema") — cron's verdict
+    filters on it, it is not a hint. No-op when no scope is open (every
+    interactive turn, and any cron path that never calls
+    :func:`push_import_attempts_scope`) and once the ledger hits its cap, so
+    a runaway retry loop within one turn cannot grow this unbounded on a
+    memory-constrained device.
+    """
+    ledger = _IMPORT_ATTEMPTS.get()
+    if ledger is _UNSET or ledger is None or len(ledger) >= _IMPORT_ATTEMPTS_MAX:
+        return
+    ledger.append({
+        "operation": str(operation or "").strip()[:128],
+        "ok": bool(ok),
+        "error_code": str(error_code or ""),
+        "error_message": str(error_message or "")[:512],
+    })
+
+
+def import_attempts_snapshot() -> list:
+    """Return this turn's recorded app_operation outcomes (oldest first)."""
+    ledger = _IMPORT_ATTEMPTS.get()
+    return list(ledger) if isinstance(ledger, list) else []
+
 # Current chat turn and its structured plan-review receipt. These values are
 # consumed by skill subprocesses, so they must follow the same task-local
 # ContextVar -> child-process bridge as HERMES_SESSION_* rather than using the
@@ -156,14 +221,28 @@ _PLAN_ACK_REVISION_REQUESTED: ContextVar = ContextVar(
     "HERMES_PLAN_ACK_REVISION_REQUESTED",
     default=_UNSET,
 )
-_BUSINESS_EXECUTION_TOKEN: ContextVar = ContextVar(
-    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+# Dedicated capability retained only for hardware skills such as camsnap.
+# It stays outside _VAR_MAP so generic subprocesses cannot inherit it.
+_HARDWARE_EXECUTION_TOKEN: ContextVar = ContextVar(
+    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
     default=_UNSET,
 )
+# Stable caller session identity for long-running turns. It stays outside
+# _VAR_MAP so generic subprocesses cannot inherit host routing metadata.
+_EXECUTION_SESSION_KEY: ContextVar = ContextVar(
+    "ZETTLAB_EXECUTION_SESSION_KEY",
+    default=_UNSET,
+)
+# The per-turn execution policy is kept separate from the legacy session
+# environment map. Generic model-authored subprocesses must not inherit it.
+_EXECUTION_POLICY: ContextVar = ContextVar(
+    "HERMES_EXECUTION_POLICY",
+    default=_UNSET,
+)
+SILENT_AUTOMATION_POLICY = "silent_automation"
 _ZETTLAB_AUTH_PRINCIPAL: ContextVar = ContextVar(
     "ZETTLAB_AUTH_PRINCIPAL", default=_UNSET
 )
-
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -225,6 +304,24 @@ def set_zettlab_turn_id(turn_id: str) -> None:
 
 def zettlab_turn_id() -> str:
     return _ZETTLAB_TURN_ID.get().strip()
+
+
+def push_execution_session_key(value: str):
+    """Bind the stable session identity for one long-running turn."""
+    return _EXECUTION_SESSION_KEY.set(str(value or "").strip())
+
+
+def pop_execution_session_key(token) -> None:
+    """Restore the long-running session identity preceding this turn."""
+    _EXECUTION_SESSION_KEY.reset(token)
+
+
+def execution_session_key() -> str:
+    """Return the stable session key frozen at the execution boundary."""
+    value = _EXECUTION_SESSION_KEY.get()
+    if value is _UNSET or value is None:
+        return ""
+    return str(value).strip()
 
 
 def push_zettlab_turn_title(title: str):
@@ -323,7 +420,8 @@ def set_turn_vars(
     plan_ack_status: str = "",
     plan_ack_turn_id: str = "",
     plan_ack_revision_requested: str = "",
-    business_execution_token: str = "",
+    hardware_execution_token: str = "",
+    execution_policy: str = "",
 ) -> list:
     """Bind one request's turn identity and plan receipt task-locally."""
     global _session_context_engaged
@@ -334,7 +432,8 @@ def set_turn_vars(
         _PLAN_ACK_STATUS.set(plan_ack_status),
         _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
         _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
-        _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
+        _HARDWARE_EXECUTION_TOKEN.set(hardware_execution_token),
+        _EXECUTION_POLICY.set(execution_policy),
     ]
 
 
@@ -347,7 +446,8 @@ def clear_turn_vars(tokens: list) -> None:
             _PLAN_ACK_STATUS,
             _PLAN_ACK_TURN_ID,
             _PLAN_ACK_REVISION_REQUESTED,
-            _BUSINESS_EXECUTION_TOKEN,
+            _HARDWARE_EXECUTION_TOKEN,
+            _EXECUTION_POLICY,
         ),
         tokens,
     ):
@@ -372,16 +472,31 @@ def current_turn_identity() -> tuple[str, object] | None:
     return normalized_turn_id, binding
 
 
-def business_execution_token() -> str:
-    """Return the task-local capability for the trusted video executor only.
-
-    This value intentionally lives outside ``_VAR_MAP`` so generic terminal,
-    execute-code, plugin, and model-driving subprocesses cannot inherit it.
-    """
-    value = _BUSINESS_EXECUTION_TOKEN.get()
+def hardware_execution_token() -> str:
+    """Return the task-local opaque capability for trusted hardware helpers."""
+    value = _HARDWARE_EXECUTION_TOKEN.get()
     if value is _UNSET or value is None:
         return ""
-    return str(value).strip()
+    normalized = str(value).strip()
+    return normalized if re.fullmatch(r"[0-9a-f]{64}", normalized) else ""
+
+
+def execution_policy() -> str:
+    """Return the verified policy for the current turn, if one is bound.
+
+    This stays outside ``_VAR_MAP`` so ordinary model-authored subprocesses do
+    not receive policy metadata through the generic session environment bridge.
+    Hardware/plugin dispatch may use it to select the correct lifecycle.
+    """
+    value = _EXECUTION_POLICY.get()
+    if value is _UNSET or value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def generic_lifecycle_hooks_allowed() -> bool:
+    """Keep unbound/plugin lifecycle code outside trusted silent turns."""
+    return execution_policy() != SILENT_AUTOMATION_POLICY
 
 
 def push_zettlab_auth_principal(value: str):
@@ -421,6 +536,13 @@ def set_current_session_id(session_id: str) -> None:
 
     _SESSION_ID.set(session_id)
 
+    # Background constructors (for example an exact-session runtime-shell
+    # prewarm) need the task-local identity but must never replace the process
+    # compatibility mirror while another root turn may be using it.  Default
+    # false preserves every CLI/gateway/compression call site unchanged.
+    if _SESSION_ID_ENV_MIRROR_SUPPRESSED.get():
+        return
+
     # Skip the process-global os.environ write for delegated children. The
     # child's own tools and subprocesses still resolve their id through the
     # ContextVar (task-local), while the parent's process-wide env keeps the
@@ -451,6 +573,17 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         yield
     finally:
         _SESSION_ID.set(previous)
+
+
+@contextmanager
+def suppress_current_session_id_env_mirror() -> Iterator[None]:
+    """Keep constructor session changes task-local for this lexical scope."""
+    token = _SESSION_ID_ENV_MIRROR_SUPPRESSED.set(True)
+    try:
+        with scoped_current_session_id():
+            yield
+    finally:
+        _SESSION_ID_ENV_MIRROR_SUPPRESSED.reset(token)
 
 
 def set_session_vars(
@@ -605,7 +738,9 @@ def reset_session_vars() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
-    _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
+    _HARDWARE_EXECUTION_TOKEN.set(_UNSET)
+    _EXECUTION_SESSION_KEY.set(_UNSET)
+    _EXECUTION_POLICY.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.

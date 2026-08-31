@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import ipaddress
 import logging
 import ntpath
 import os
@@ -18,6 +19,7 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -2024,7 +2026,7 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
 
 def _inject_context_hermes_home(env: dict) -> None:
-    """把 context-local 的 Hermes home 覆盖桥接进子进程环境。
+    """把 context-local 的 profile-scoped 环境桥接进子进程环境。
 
     ⚠️ 这里**曾经**是一个 ``except Exception: pass``。它把三件性质完全不同的事
     压成了同一个"静默通过",其中最毒的一件是:连 ``from hermes_constants import``
@@ -2045,22 +2047,18 @@ def _inject_context_hermes_home(env: dict) -> None:
        ⭐ 爆炸半径很窄:只有 pin 存在(多 profile 会话)才可能触发,单 profile 走 ①。
     """
     try:
-        from hermes_constants import get_hermes_home_override
+        from hermes_constants import apply_context_profile_scoped_env
     except ImportError:
         # ② 机制不可用:先留下能定位的日志,再上抛 —— ⛔ 不许静默继续。
         logger.error(
-            "profile pin unavailable: cannot import get_hermes_home_override; "
+            "profile pin unavailable: cannot import apply_context_profile_scoped_env; "
             "a child process may be pointed at another profile's credential store",
             exc_info=True,
         )
         raise
 
     # ③ 取 pin 若抛异常,**不接住** —— fail closed 好过指向别人的凭据库。
-    value = get_hermes_home_override()
-    if not value:
-        # ① 无 pin:静默返回。
-        return
-    env["HERMES_HOME"] = value
+    apply_context_profile_scoped_env(env)
 
 
 def _inject_session_context_env(env: dict) -> None:
@@ -2133,36 +2131,63 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_ID",
 })
 
+CONNECTOR_ACTION_RUNTIME_ENV_KEY = "ZETTLAB_CONNECTOR_ACTION_RUNTIME"
+
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
-VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    # Turn-scoped side-effect capability. Generic subprocesses must not
-    # inherit either a live ContextVar or a stale process-global fallback.
-    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+})
+# These names belonged to the removed video BusinessExecution transport.  Keep
+# them in the scrub set (built from fragments so the retirement guard cannot
+# mistake a defensive cleanup list for a reintroduced wire protocol), but
+# never inject them into a child process.  The generic Agent action token above
+# remains available to unrelated creator/connector skills.
+_RETIRED_VIDEO_EXECUTION_PREFIX = "ZETTLAB_BUSINESS_EXECUTION_"
+RETIRED_VIDEO_EXECUTION_ENV_KEYS: frozenset[str] = frozenset({
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "TOKEN",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION_VERSION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "ACTION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "SCOPE_DIGEST",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "CAPABILITY",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "GRANT_VERSION",
+    _RETIRED_VIDEO_EXECUTION_PREFIX + "MODE",
+    "ZETTLAB_EXECUTION_SCOPE_DIGEST",
+    "ZETTLAB_EXECUTION_REQUEST_DIGEST",
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
 })
 PROFILE_PUBLIC_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
-    # Platform-owned, profile-scoped filesystem capability. Unlike connector
-    # and action tokens this value is safe for model-authored shell commands,
-    # and skills use it as the conventional location for mutable state.
+    # 平台拥有的、按 profile 隔离的路径能力。它们不是 bearer token，终端和
+    # skills 需要随当前 profile 重注入，绝不能从上一个 shell snapshot 继承。
     "ZET_AGENT_OUTPUT_DIR",
+    "WECOM_CLI_CONFIG_DIR",
 })
+SKILLHUB_CATALOG_TOKEN_ENV_KEY = "ZETTLAB_SKILLHUB_CATALOG_TOKEN"
+_SKILLHUB_CATALOG_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
 _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
 _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
+    | {CONNECTOR_ACTION_RUNTIME_ENV_KEY}
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
-    | VIDEO_EDIT_RUNTIME_ENV_KEYS
+    | HARDWARE_RUNTIME_ENV_KEYS
+    | RETIRED_VIDEO_EXECUTION_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
     | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
+    | {SKILLHUB_CATALOG_TOKEN_ENV_KEY}
 )
 
 
-def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
+def _apply_profile_secret_scope_env(
+    env: dict,
+    *,
+    inject: bool,
+    inject_skillhub_catalog_token: bool = False,
+) -> None:
     """Scrub profile values and optionally inject safe terminal runtime data.
 
     The multiplex gateway intentionally avoids merging every profile's .env into
@@ -2170,12 +2195,28 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
     are not a trusted runner, so they must never inherit connector or Agent
     action bearer material from globals, extra env, or a shell snapshot. Skills
     that need secret values receive them through a dedicated allowlisted path.
-    The one public terminal value is re-read from the active profile scope only;
-    a stale process-global or shell-snapshot value is never trusted in multiplex
-    mode.
+    Public terminal values are re-read from the active profile scope only; a
+    stale process-global or shell-snapshot value is never trusted in multiplex
+    mode. The catalog bearer remains opt-in for the generic terminal builder,
+    so helper/background subprocesses continue to receive no profile bearer.
     """
     for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
         env.pop(key, None)
+
+    # WECOM_CLI_CONFIG_DIR 不是 profile .env 里的 bearer 值，而是已经由
+    # _inject_context_hermes_home 钉住的当前 HERMES_HOME 派生出的路径。无论
+    # 前台、背景还是 PTY spawn，都必须先丢掉 snapshot 的旧值再从当前 profile
+    # 重建；没有当前 profile 时宁可不注入，不能复用别人的凭据目录。
+    try:
+        from hermes_constants import apply_context_profile_scoped_env
+    except ImportError:
+        logger.error(
+            "profile-scoped WECOM_CLI_CONFIG_DIR injection is unavailable",
+            exc_info=True,
+        )
+        raise
+    apply_context_profile_scoped_env(env)
+
     if not inject:
         return
 
@@ -2188,7 +2229,7 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
         scope = None
         multiplex_active = True
 
-    for key in PROFILE_PUBLIC_RUNTIME_ENV_KEYS:
+    for key in PROFILE_PUBLIC_RUNTIME_ENV_KEYS - {"WECOM_CLI_CONFIG_DIR"}:
         if scope is not None:
             raw_value = scope.get(key)
         elif not multiplex_active:
@@ -2206,6 +2247,14 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
             continue
         env[key] = os.path.normpath(value)
 
+    if inject_skillhub_catalog_token and multiplex_active and scope is not None:
+        catalog_token = scope.get(SKILLHUB_CATALOG_TOKEN_ENV_KEY)
+        if (
+            isinstance(catalog_token, str)
+            and _SKILLHUB_CATALOG_TOKEN_RE.fullmatch(catalog_token)
+        ):
+            env[SKILLHUB_CATALOG_TOKEN_ENV_KEY] = catalog_token
+
 
 def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     """Build env for the dedicated connector_runtime.py runner.
@@ -2214,7 +2263,21 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     runtime bearer may be supplied to the allowlisted runner subprocess, but it
     must not be inherited by arbitrary model-authored shell commands.
     """
-    env = _sanitize_subprocess_env(os.environ, base_env)
+    # ⛔ 起手底座**不继承进程环境**。这里原先是
+    # `_sanitize_subprocess_env(os.environ, base_env)` —— 那是**黑名单**,只剥 Hermes
+    # 自己的密钥,HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / ZET_CHAT_APPEND_URL 一律放行。
+    #
+    # ⚠️ 把 run_trusted_python_script 的 base_env 收成 {} 并**不够**:这个函数的返回值
+    # 是走 injected_env 进去的,同一个泄漏换个参数照样到子进程。判据必须贴**最终进入
+    # 子进程的环境全集**,⛔ 不是「某个参数是不是空的」。
+    #
+    # 底座换空是安全的:下面本来就按 CONNECTOR_RUNTIME_ENV_KEYS 这份**白名单**逐键
+    # 填/删,底座里的其它东西一个都用不到。仓内另外三个 build_*_runtime_env
+    # (agent_creator / overseas_connect / camera)本来就是白名单构造 —— 照抄它们。
+    env = dict(base_env or {})
+    # The pinned script identity is minted by terminal_tool only after exact
+    # direct-runner path verification. Never accept an inherited/profile value.
+    env.pop(CONNECTOR_ACTION_RUNTIME_ENV_KEY, None)
 
     scope = None
     multiplex_active = False
@@ -2250,13 +2313,19 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     return env
 
 
-def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[str, str]:
+def build_agent_creator_runtime_env(
+    *,
+    app_auto_refresh: bool = False,
+    app_auto_refresh_operation: object | None = None,
+) -> dict[str, str]:
     """Build the minimal env for the trusted agent-creator preset runner.
 
     The action token is never read from process env or a profile ``.env``.
     After command validation and mutation approval, the trusted gateway process
     obtains a short-lived AgentComputer-only token from local-server's Unix
-    broker. The direct runner then gives it to the CLI over a one-shot FD.
+    broker. For an app-agent request it forwards the already parsed operation
+    object; local-server alone derives the binding and issues the capability. The direct
+    runner then gives the resulting token to the CLI over a one-shot FD.
     """
 
     from agent.credential_broker import (
@@ -2274,12 +2343,34 @@ def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[s
     ).strip()
     if not agent_id:
         raise RuntimeError("agent creator profile identity unavailable")
-    request_token = (
-        request_app_auto_refresh_token
-        if app_auto_refresh
-        else request_agentcomputer_token
-    )
-    token = request_token(agent_id)
+    if app_auto_refresh:
+        if app_auto_refresh_operation is None:
+            raise RuntimeError("agent creator operation binding unavailable")
+        try:
+            from gateway.session_context import (
+                get_session_env,
+                zettlab_auth_principal,
+                zettlab_turn_id,
+            )
+
+            turn_id = str(zettlab_turn_id() or "").strip()
+            session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+            owner_principal = str(zettlab_auth_principal() or "").strip()
+        except Exception as exc:
+            raise RuntimeError("agent creator operation context unavailable") from exc
+        if not turn_id or not session_id or not owner_principal:
+            raise RuntimeError("agent creator operation context unavailable")
+        token = request_app_auto_refresh_token(
+            agent_id,
+            operation_kind="app_dedicated_create_v1",
+            operation=app_auto_refresh_operation,
+            owner_principal=owner_principal,
+            owner_agent_id=agent_id,
+            turn_id=turn_id,
+            session_id=session_id,
+        )
+    else:
+        token = request_agentcomputer_token(agent_id)
     if (
         "\x00" in token
         or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
@@ -2287,6 +2378,84 @@ def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[s
         raise RuntimeError("agent creator action token invalid")
 
     env = {"ZETTLAB_AGENT_ACTION_TOKEN": token}
+    if not app_auto_refresh:
+        try:
+            from gateway.session_context import zettlab_turn_id
+
+            turn_id = zettlab_turn_id()
+        except Exception:
+            turn_id = ""
+    if turn_id:
+        turn_id = str(turn_id)
+        if (
+            "\x00" in turn_id
+            or len(turn_id.encode("utf-8")) > _AGENT_CREATOR_TURN_ID_MAX_BYTES
+        ):
+            raise RuntimeError("agent creator turn id invalid")
+        env["ZETTLAB_TURN_ID"] = turn_id
+    return env
+
+
+def build_overseas_connect_runtime_env() -> tuple[dict[str, str], str]:
+    """Return public turn metadata and the profile action token for one trusted runner."""
+
+    from agent.secret_scope import get_secret
+
+    token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
+    # ⛔ 这里**不重新实现** action token 的格式规则。原先写的是
+    # `re.fullmatch(r"[0-9a-f]{64}", token)` —— 比签发方还严:local-server 的权威判据
+    # (internal/agent/actiontoken/store.go 的 looksLikeIssuedToken)是「长度 64 + 能被
+    # hex.DecodeString 解析」,而 hex.DecodeString **接受大写**。于是 profile .env 里
+    # 已存的大写 hex token,local-server 认、我们这里拒,用户点连接卡只看到
+    # "secure flow 不可用",而毛病不在他那边。
+    #
+    # 格式是签发方的事,兄弟调用点也都不管格式:同文件的 agent creator 只查
+    # 「无 NUL + 长度上界」,camera runtime 只查「非空 + 无 NUL + ≤128 字节」。
+    # 这里对齐它们 —— 我们只需要保证这个值能安全地经 FD 交给子进程。
+    if (
+        not token
+        or "\x00" in token
+        or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
+    ):
+        raise RuntimeError("overseas-connect action token unavailable")
+
+    env: dict[str, str] = {}
+    append_url = str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
+    parsed = None
+    loopback = False
+    try:
+        parsed = urlsplit(append_url)
+        host = parsed.hostname
+        loopback = host == "localhost" or ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        pass
+    if not (
+        parsed is not None
+        and loopback
+        and parsed.scheme in {"http", "https"}
+        and parsed.netloc
+        and not parsed.username
+        and not parsed.password
+    ):
+        raise RuntimeError("overseas-connect local server callback unavailable")
+    # ⚠️ ⛔ 别在这里注入 ZET_CHAT_APPEND_URL。
+    #
+    # 2026-08-11 我试过(c9cc64540),理由是 connect.py 的第三条兜底
+    # local_server_from_chat_url() 读它。但那推翻了 afebbf011(Turing, 2026-08-06)
+    # 刻意钉死的契约:**回调 URL 不进子进程,只从它派生出 base**
+    # (tests/tools/test_terminal_overseas_connect_runner.py::
+    #  test_direct_runner_uses_loopback_base_from_profile_scope 断言 append == "")。
+    #
+    # 而且那个归因本身也是错的:scope 里的值本来就不进 os.environ,所以在受信 runner
+    # 路径下,那条兜底从 afebbf011 起就是死代码 —— 不是被 base_env={} 掐掉的。
+    # 受信路径靠的是这里注入的 ZETTLAB_LOCAL_SERVER_URL,它才是唯一约定来源。
+    env["ZETTLAB_LOCAL_SERVER_URL"] = urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        "",
+        "",
+        "",
+    ))
     try:
         from gateway.session_context import zettlab_turn_id
 
@@ -2299,38 +2468,18 @@ def build_agent_creator_runtime_env(*, app_auto_refresh: bool = False) -> dict[s
             "\x00" in turn_id
             or len(turn_id.encode("utf-8")) > _AGENT_CREATOR_TURN_ID_MAX_BYTES
         ):
-            raise RuntimeError("agent creator turn id invalid")
+            raise RuntimeError("overseas-connect turn id invalid")
         env["ZETTLAB_TURN_ID"] = turn_id
-    return env
-
-
-def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]:
-    """Build the minimal env for the trusted video-edit script runner."""
-    env = _sanitize_subprocess_env(os.environ, base_env)
-    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
-        env.pop(key, None)
-    _inject_session_context_env(env)
-
-    try:
-        from agent.zet_agent_response_mode import trusted_video_edit_runtime_receipt
-
-        frozen_receipt = trusted_video_edit_runtime_receipt()
-    except Exception:
-        frozen_receipt = {}
-    if not frozen_receipt:
-        raise PermissionError("trusted video-edit execution receipt unavailable")
-    env.update(frozen_receipt)
-    return env
+    return env, token
 
 
 def build_camera_runtime_env() -> dict[str, str]:
     """Build the exact request-scoped env for the trusted camera helper.
 
-    Camera credentials never enter Hermes. The helper receives only the
-    profile action token and the current request's business capability so the
-    device-local CameraService can bind the call to one Agent, user, turn, and
-    session. Generic subprocesses continue to have all of these values
-    stripped by :func:`_apply_profile_secret_scope_env`.
+    The helper receives the profile action token and the independently scoped
+    hardware capability plus turn/session correlation. Generic subprocesses
+    continue to have all of these values stripped by
+    :func:`_apply_profile_secret_scope_env`.
     """
     try:
         from agent.zet_agent_response_mode import trusted_camera_runtime_receipt
@@ -2344,8 +2493,8 @@ def build_camera_runtime_env() -> dict[str, str]:
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
             frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
         ).strip(),
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": str(
-            frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "") or ""
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(
+            frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or ""
         ).strip(),
         "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
@@ -2355,7 +2504,7 @@ def build_camera_runtime_env() -> dict[str, str]:
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
         "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
@@ -2368,6 +2517,104 @@ def build_camera_runtime_env() -> dict[str, str]:
     ):
         raise PermissionError("trusted camera execution receipt unavailable")
     return env
+
+
+def build_printer3d_runtime_env() -> dict[str, str]:
+    """Reuse the request-scoped receipt without exposing it to terminal."""
+    try:
+        from agent.zet_agent_response_mode import trusted_printer3d_runtime_receipt
+
+        frozen_receipt = dict(trusted_printer3d_runtime_receipt())
+    except Exception:
+        frozen_receipt = {}
+    session_id = str(frozen_receipt.get("HERMES_SESSION_KEY", "") or "").strip()
+    env = {
+        "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
+        "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
+        "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
+        "HERMES_SESSION_ID": session_id,
+        "HERMES_SESSION_KEY": session_id,
+    }
+    limits = {
+        "ZET_AGENT_ID": 128,
+        "ZETTLAB_AGENT_ACTION_TOKEN": 128,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
+        "HERMES_TURN_ID": 256,
+        "HERMES_SESSION_ID": 1024,
+        "HERMES_SESSION_KEY": 1024,
+    }
+    if any(not value or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
+        raise PermissionError("trusted printer3d execution receipt unavailable")
+    return env
+
+
+def build_smart_home_runtime_env() -> dict[str, str]:
+    """Build the request-scoped receipt for the smart-home light helper."""
+    try:
+        from agent.zet_agent_response_mode import trusted_smart_home_runtime_receipt
+
+        frozen_receipt = dict(trusted_smart_home_runtime_receipt())
+    except Exception:
+        frozen_receipt = {}
+    session_id = str(frozen_receipt.get("HERMES_SESSION_KEY", "") or "").strip()
+    env = {
+        "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
+        "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
+        "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
+        "HERMES_SESSION_ID": session_id,
+        "HERMES_SESSION_KEY": session_id,
+    }
+    limits = {"ZET_AGENT_ID": 128, "ZETTLAB_AGENT_ACTION_TOKEN": 128, "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128, "HERMES_TURN_ID": 256, "HERMES_SESSION_ID": 1024, "HERMES_SESSION_KEY": 1024}
+    if any(not value or "\x00" in value or len(value.encode("utf-8")) > limits[key] for key, value in env.items()):
+        raise PermissionError("trusted smart-home execution receipt unavailable")
+    return env
+
+
+def build_plaud_runtime_env() -> dict[str, str]:
+    """Build the exact request-scoped env for the trusted PLAUD helper."""
+    try:
+        from agent.zet_agent_response_mode import trusted_plaud_runtime_receipt
+
+        frozen_receipt = dict(trusted_plaud_runtime_receipt())
+    except Exception:
+        frozen_receipt = {}
+    session_id = str(frozen_receipt.get("HERMES_SESSION_KEY", "") or "").strip()
+    env = {
+        "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
+        "ZETTLAB_AGENT_ACTION_TOKEN": str(frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip(),
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": str(frozen_receipt.get("ZETTLAB_HARDWARE_EXECUTION_TOKEN", "") or "").strip(),
+        "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
+        "HERMES_SESSION_ID": session_id,
+        "HERMES_SESSION_KEY": session_id,
+    }
+    limits = {
+        "ZET_AGENT_ID": 128,
+        "ZETTLAB_AGENT_ACTION_TOKEN": 128,
+        "ZETTLAB_HARDWARE_EXECUTION_TOKEN": 128,
+        "HERMES_TURN_ID": 256,
+        "HERMES_SESSION_ID": 1024,
+        "HERMES_SESSION_KEY": 1024,
+    }
+    if any(
+        not value
+        or "\x00" in value
+        or len(value.encode("utf-8")) > limits[key]
+        for key, value in env.items()
+    ):
+        raise PermissionError("trusted PLAUD execution receipt unavailable")
+    return env
+
+
+def _strip_managed_bootstrap_identity(env: dict[str, str]) -> None:
+    """Remove the root gateway's ExecStart identity from child processes.
+
+    The parent consumes these markers when it places model-controlled commands
+    in their profile UID/cgroup boundary. Children must not re-enter bootstrap.
+    """
+    for marker in _MANAGED_BOOTSTRAP_ENV_KEYS:
+        env.pop(marker, None)
 
 
 def _sanitize_subprocess_env(
@@ -2426,11 +2673,7 @@ def _sanitize_subprocess_env(
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
-    # These values authorize only the root gateway's ExecStart bootstrap.
-    # Model-controlled terminal/background/PTY children are already placed in
-    # their profile UID+cgroup boundary and must never re-enter that bootstrap.
-    for _marker in _MANAGED_BOOTSTRAP_ENV_KEYS:
-        sanitized.pop(_marker, None)
+    _strip_managed_bootstrap_identity(sanitized)
 
     _apply_windows_msys_bash_env_defaults(sanitized)
 
@@ -3248,10 +3491,15 @@ def _make_run_env(env: dict) -> dict:
     # The generic terminal path is model-controlled shell. Connector bearer
     # must only flow through a dedicated allowlisted connector runner, not via
     # Popen env or the shared shell snapshot.
-    _apply_profile_secret_scope_env(run_env, inject=True)
+    _apply_profile_secret_scope_env(
+        run_env,
+        inject=True,
+        inject_skillhub_catalog_token=True,
+    )
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
+    _strip_managed_bootstrap_identity(run_env)
 
     _apply_windows_msys_bash_env_defaults(run_env)
 
@@ -3358,6 +3606,15 @@ class LocalEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         self.init_session()
 
+    def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
+        """Keep the catalog bearer out of shared snapshots.
+
+        BaseEnvironment restores these names from the current Popen environment
+        after sourcing a snapshot, so the bearer never needs to appear in the
+        shell command string or persist for another profile.
+        """
+        return (SKILLHUB_CATALOG_TOKEN_ENV_KEY,)
+
     def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
         return tuple(
             sorted(
@@ -3376,6 +3633,23 @@ class LocalEnvironment(BaseEnvironment):
         """
         exports = super()._snapshot_ephemeral_env_exports()
         public_env: dict[str, str] = {}
+        _inject_context_hermes_home(public_env)
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            multiplex_active = is_multiplex_active()
+        except ImportError:
+            logger.error(
+                "profile-scoped WECOM_CLI_CONFIG_DIR snapshot injection is unavailable",
+                exc_info=True,
+            )
+            raise
+        if "HERMES_HOME" not in public_env and not multiplex_active:
+            profile_home = str(self.env.get("HERMES_HOME") or "").strip()
+            if profile_home:
+                from hermes_constants import apply_profile_scoped_env
+
+                apply_profile_scoped_env(public_env, profile_home)
         _apply_profile_secret_scope_env(public_env, inject=True)
         for key in sorted(PROFILE_PUBLIC_RUNTIME_ENV_KEYS):
             value = public_env.get(key)

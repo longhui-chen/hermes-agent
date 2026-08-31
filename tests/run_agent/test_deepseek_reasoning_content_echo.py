@@ -14,9 +14,11 @@ Fix covers three paths:
    persisted poisoned.
 2. ``_copy_reasoning_content_for_api`` — already-poisoned history replays
    with ``reasoning_content=" "`` injected defensively.
-3. Detection covers three signals: ``provider == "deepseek"``,
+3. Detection covers three static signals: ``provider == "deepseek"``,
    ``"deepseek" in model``, and ``api.deepseek.com`` host match. The third
    catches custom-provider setups pointing at DeepSeek.
+4. Opaque model aliases learn the same requirement from one explicit upstream
+   validation error and retry exactly once, without hard-coding the alias.
 
 The placeholder is a single space (not empty string) because DeepSeek V4 Pro
 tightened validation and rejects empty-string reasoning_content with a
@@ -29,7 +31,9 @@ Refs #15250 / #15353 / #17341.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -77,6 +81,189 @@ class TestNeedsDeepSeekToolReasoning:
     def test_provider_deepseek(self) -> None:
         agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
         assert agent._needs_deepseek_tool_reasoning() is True
+
+
+class TestReactiveReasoningEchoCapability:
+    """Opaque public model packages learn echo-back from one explicit 400."""
+
+    def test_current_route_can_learn_reasoning_echo_without_model_hardcode(self) -> None:
+        agent = _make_agent(
+            provider="custom",
+            model="lite",
+            base_url="http://127.0.0.1:19090/api/v1/ai-proxy/v1",
+        )
+
+        assert agent._needs_thinking_reasoning_pad() is False
+        assert hasattr(agent, "_learn_reasoning_echo_for_current_route")
+        assert agent._learn_reasoning_echo_for_current_route() is True
+        assert agent._needs_thinking_reasoning_pad() is True
+
+        agent.model = "pro"
+        assert agent._needs_thinking_reasoning_pad() is False
+        agent.model = "lite"
+        assert agent._needs_thinking_reasoning_pad() is True
+
+    def test_explicit_required_error_is_distinct_from_strict_field_rejection(self) -> None:
+        from agent import conversation_loop
+
+        detector = getattr(
+            conversation_loop,
+            "_is_reasoning_echo_required_error",
+            None,
+        )
+        assert callable(detector)
+
+        required = RuntimeError(
+            "The `reasoning_content` in the thinking mode must be passed back to the API."
+        )
+        required.status_code = 400
+        required.body = {
+            "error": {
+                "message": (
+                    "The `reasoning_content` in the thinking mode must be passed "
+                    "back to the API."
+                )
+            }
+        }
+        strict = RuntimeError(
+            "messages.2.assistant.reasoning_content: Extra inputs are not permitted"
+        )
+        strict.status_code = 422
+
+        assert detector(required) is True
+        assert detector(strict) is False
+
+
+def _make_loop_agent() -> AIAgent:
+    tool_defs = [{
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Run an allowed command.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    with (
+        patch("run_agent.get_tool_definitions", return_value=tool_defs),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="http://127.0.0.1:19090/api/v1/ai-proxy/v1",
+            provider="custom",
+            model="lite",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    return agent
+
+
+def _successful_text_response(text: str = "done") -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=text, tool_calls=None),
+            finish_reason="stop",
+        )],
+        model="lite",
+        usage=None,
+    )
+
+
+def _reasoning_echo_rejection() -> RuntimeError:
+    rejection = RuntimeError(
+        "Error code: 400 - {'error': {'message': "
+        "'The `reasoning_content` in the thinking mode must be passed back to the API.'}}"
+    )
+    rejection.status_code = 400
+    rejection.body = {
+        "error": {
+            "message": (
+                "The `reasoning_content` in the thinking mode must be passed "
+                "back to the API."
+            )
+        }
+    }
+    rejection.response = None
+    return rejection
+
+
+def _history_without_reasoning_echo() -> list[dict]:
+    return [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+
+
+class TestReactiveReasoningEchoFlow:
+    def test_first_explicit_400_repairs_replay_and_retries_once(self) -> None:
+        agent = _make_loop_agent()
+        sent_messages: list[list[dict]] = []
+        responses = iter([_reasoning_echo_rejection(), _successful_text_response()])
+
+        def _create(**kwargs):
+            sent_messages.append(deepcopy(kwargs["messages"]))
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        agent.client.chat.completions.create.side_effect = _create
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=_history_without_reasoning_echo(),
+            )
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 2
+        first_tool_call = next(
+            message
+            for message in sent_messages[0]
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        )
+        second_tool_call = next(
+            message
+            for message in sent_messages[1]
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        )
+        assert "reasoning_content" not in first_tool_call
+        assert second_tool_call["reasoning_content"] == " "
+
+    def test_repeated_required_error_stops_after_single_repair_retry(self) -> None:
+        agent = _make_loop_agent()
+        agent.client.chat.completions.create.side_effect = [
+            _reasoning_echo_rejection(),
+            _reasoning_echo_rejection(),
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=_history_without_reasoning_echo(),
+            )
+
+        assert result["completed"] is False
+        assert agent.client.chat.completions.create.call_count == 2
 
 
 
