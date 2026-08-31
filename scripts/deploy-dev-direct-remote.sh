@@ -20,7 +20,7 @@ stage=$(mktemp -d "${hermes_src}.new.XXXXXX")
 # metadata operation. /tmp is tmpfs on the 2 GB boards and must never receive it.
 keep=$(mktemp -d "${hermes_src}.runtime.XXXXXX")
 cleanup() {
-  rm -rf "$stage" "$keep" "$archive" /tmp/hermes-src.XXXXXX.tgz /tmp/deploy-dev-direct-remote.sh
+  rm -rf "$stage" "$keep" "$archive" "${plugin_output:-}" /tmp/hermes-src.XXXXXX.tgz /tmp/deploy-dev-direct-remote.sh
   systemctl is-active --quiet zettlab-local-server || systemctl start zettlab-local-server || true
 }
 trap cleanup EXIT
@@ -60,7 +60,10 @@ venv/bin/python -c 'import langfuse'
 
 ln -sfn "$wrapper" /usr/local/bin/hermes
 echo "=== bundled plugins ==="
-/usr/local/bin/hermes plugins list | head -25
+plugin_output=$(mktemp /tmp/hermes-plugins.XXXXXX)
+/usr/local/bin/hermes plugins list >"$plugin_output" 2>&1
+head -25 "$plugin_output"
+grep -q 'bundled' "$plugin_output" || { echo "no bundled plugins found" >&2; exit 1; }
 
 systemctl start zettlab-local-server
 for attempt in $(seq 1 30); do
