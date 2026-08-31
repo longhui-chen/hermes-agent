@@ -155,10 +155,11 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
         in command_log
     ), result.stdout + result.stderr
     assert (
-        "--frozen --no-dev --no-editable --no-build-isolation "
+        "--frozen --no-dev --no-build-isolation "
         "--reinstall-package hermes-agent"
         in command_log
     )
+    assert 'grep -IlR -F "$stage"' in REMOTE_DEPLOY.read_text(encoding="utf-8")
     assert "--extra zpk-runtime" in command_log
     assert "uv pip install" not in command_log
     assert "systemctl daemon-reload" in command_log

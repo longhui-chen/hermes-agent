@@ -138,11 +138,11 @@ else
   echo "dependency metadata unchanged; copied existing dependencies"
 fi
 
-# Always reinstall the project itself. The packaged runtime intentionally uses
-# a non-editable wheel, so skipping this phase would leave the previous source
-# running whenever pyproject.toml and uv.lock are unchanged.
+# Always reinstall the project itself as editable. Hermes deliberately blocks
+# ad-hoc device wheel builds, and skipping this phase would leave the previous
+# source running whenever pyproject.toml and uv.lock are unchanged.
 if ! UV_PROJECT_ENVIRONMENT="$stage/venv" "$uv_bin" sync \
-  --project "$stage" --frozen --no-dev --no-editable --no-build-isolation \
+  --project "$stage" --frozen --no-dev --no-build-isolation \
   --reinstall-package hermes-agent \
   --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
   >>"$sync_output" 2>&1; then
@@ -156,6 +156,13 @@ tail -20 "$sync_output"
 while IFS= read -r entry; do
   sed -i "1 s|$stage/venv|$hermes_src/venv|" "$entry"
 done < <(grep -Il "^#!$stage/venv/" "$stage/venv/bin/"* 2>/dev/null || true)
+
+# Editable installs also persist the checkout path in .pth/finder metadata.
+# Rewrite only text files containing the exact staging path so the activated
+# environment follows the stable ZPK source directory after the rename.
+while IFS= read -r metadata_file; do
+  sed -i "s|$stage|$hermes_src|g" "$metadata_file"
+done < <(grep -IlR -F "$stage" "$stage/venv/lib/"python*/site-packages 2>/dev/null || true)
 
 "$stage/venv/bin/python" -c 'import langfuse'
 plugin_output=$(mktemp /tmp/hermes-plugins.XXXXXX)
