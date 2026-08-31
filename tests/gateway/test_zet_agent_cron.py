@@ -2508,3 +2508,350 @@ def test_job_store_agent_id_only_matches_profile_store_shape(tmp_path, monkeypat
     (root / "profiles").mkdir(parents=True)
     _mux_env(monkeypatch, root, root, root / "state.db")
     assert zc._job_store_agent_id() == ""
+
+
+# ── 失败补跑（catch-up）: mark_job_run 覆写顺序验证 ─────────────────────
+# mark_job_run 是 run_one_job 里对 next_run_at 的最后一次写；补跑必须写在
+# _orig_mark 之后，写早了会被冲掉。
+
+
+def _save_catchup_fixture_job(cron_jobs, jid="jobCatchup"):
+    job = {
+        "id": jid, "name": "会议转录待办与日程同步", "prompt": "同步转录待办",
+        "skills": [], "skill": None,
+        "schedule": {"kind": "cron", "expr": "0 13,20 * * *", "display": "每天13:00和20:00"},
+        "schedule_display": "每天13:00和20:00",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True, "state": "scheduled", "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": "zettlab:u:main:s1", "chat_name": "对话"},
+        "timezone": "UTC", "last_status": None, "last_error": None,
+        "last_delivery_error": None,
+    }
+    cron_jobs.save_jobs([job])
+    return job
+
+
+def _point_job_store_at(tmp_path, monkeypatch):
+    import cron.jobs as cron_jobs
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    return cron_jobs
+
+
+def test_catchup_next_run_written_before_mark_is_clobbered(tmp_path, monkeypatch):
+    """反面：run_job 期间（mark 之前）写的补跑时间会被 mark_job_run 覆写。"""
+    from datetime import timedelta
+    from hermes_time import now as hermes_now
+
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    job = _save_catchup_fixture_job(cron_jobs)
+    jid = job["id"]
+
+    catchup_at = (hermes_now() + timedelta(seconds=900)).isoformat()
+    # 模拟"在 run_job / retry wrapper 里写补跑"（错误的挂载点）
+    cron_jobs.update_job(jid, {"next_run_at": catchup_at})
+    assert cron_jobs.get_job(jid)["next_run_at"] == catchup_at
+
+    natural_before = cron_jobs.compute_next_run(
+        job["schedule"], hermes_now().isoformat(), tz_name="UTC"
+    )
+    cron_jobs.mark_job_run(jid, False, "connection refused")
+    natural_after = cron_jobs.compute_next_run(
+        job["schedule"], hermes_now().isoformat(), tz_name="UTC"
+    )
+
+    stored = cron_jobs.get_job(jid)["next_run_at"]
+    # 补跑时间被冲掉，回到自然 slot（次日 13:00/20:00 边界）
+    assert stored != catchup_at
+    assert stored in {natural_before, natural_after}
+
+
+def test_catchup_next_run_written_after_mark_survives(tmp_path, monkeypatch):
+    """正面：_orig_mark 返回后写的补跑时间留得住，且不破坏 mark 落下的状态。"""
+    from datetime import timedelta
+    from hermes_time import now as hermes_now
+
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    job = _save_catchup_fixture_job(cron_jobs)
+    jid = job["id"]
+
+    cron_jobs.mark_job_run(jid, False, "connection refused")
+    after_mark = cron_jobs.get_job(jid)
+    assert after_mark["last_status"] == "error"
+    assert after_mark["last_error"] == "connection refused"
+    assert after_mark["state"] == "scheduled"
+
+    catchup_at = (hermes_now() + timedelta(seconds=900)).isoformat()
+    cron_jobs.update_job(jid, {"next_run_at": catchup_at})
+
+    stored = cron_jobs.get_job(jid)
+    # 补跑时间生效（这是 run_one_job 流程里 next_run_at 的最后一次写）
+    assert stored["next_run_at"] == catchup_at
+    # mark 落下的失败状态原样保留，update_job 没有触发意外重算/重置
+    assert stored["last_status"] == "error"
+    assert stored["last_error"] == "connection refused"
+    assert stored["state"] == "scheduled"
+    assert stored["schedule"]["expr"] == "0 13,20 * * *"
+    assert stored["enabled"] is True
+    # mark 已清掉 claim；update_job(next_run_at) 不得复活它
+    assert stored.get("fire_claim") is None
+    assert stored.get("in_flight_occurrence") is None
+
+
+# ── 失败补跑（catch-up）: 功能行为 ───────────────────────────────────────
+# 用 interval 做确定性距离（1440m 恒远 / 5m 恒近），避免 cron 表达式在墙钟
+# 贴近 slot 时测试闪烁。
+
+
+def _save_interval_job(cron_jobs, jid, minutes):
+    job = {
+        "id": jid, "name": "会议转录待办与日程同步", "prompt": "同步转录待办",
+        "skills": [], "skill": None,
+        "schedule": {"kind": "interval", "minutes": minutes, "display": f"every {minutes}m"},
+        "schedule_display": f"every {minutes}m",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True, "state": "scheduled", "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": "zettlab:u:main:s1", "chat_name": "对话"},
+        "timezone": "UTC", "last_status": None, "last_error": None,
+        "last_delivery_error": None,
+    }
+    cron_jobs.save_jobs([job])
+    return job
+
+
+def _catchup_env(monkeypatch, retry_state=None):
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_LAST_RETRY_STATE", dict(retry_state or {}))
+    return zc
+
+
+def _seconds_until(iso_ts):
+    from datetime import datetime
+    from hermes_time import now as hermes_now
+
+    dt = datetime.fromisoformat(iso_ts)
+    now = hermes_now()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=now.tzinfo)
+    return (dt - now).total_seconds()
+
+
+def test_catchup_scheduled_after_transient_retry_exhausted(tmp_path, monkeypatch):
+    """transient 失败 + 重试耗尽 + 零工具活动 → next_run_at 拉近到补跑窗。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    job = _save_interval_job(cron_jobs, "jobCU1", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobCU1": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+    )
+
+    cron_jobs.mark_job_run("jobCU1", False, "connection refused")
+    assert _seconds_until(cron_jobs.get_job("jobCU1")["next_run_at"]) > 3600  # 自然 slot ~24h
+
+    zc._maybe_schedule_failure_catchup("jobCU1")
+
+    delta = _seconds_until(cron_jobs.get_job("jobCU1")["next_run_at"])
+    # 900s ± 20% jitter
+    assert 700 < delta < 1100
+
+
+def test_catchup_skipped_for_non_transient_failure(tmp_path, monkeypatch):
+    """401/agent_error 没进重试循环（无 retry_exhausted）→ 不补跑。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobCU2", 1440)
+    zc = _catchup_env(monkeypatch)  # 空 retry state = 非 transient 失败
+
+    cron_jobs.mark_job_run("jobCU2", False, "401 Unauthorized")
+    natural = cron_jobs.get_job("jobCU2")["next_run_at"]
+    zc._maybe_schedule_failure_catchup("jobCU2")
+
+    assert cron_jobs.get_job("jobCU2")["next_run_at"] == natural
+
+
+def test_catchup_skipped_when_run_had_tool_activity(tmp_path, monkeypatch):
+    """有工具活动（可能已写日程）→ skipped_reason=tool_activity → 不补跑。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobCU3", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobCU3": {"retryable": True, "skipped_reason": "tool_activity", "tool_activity": 5}},
+    )
+
+    cron_jobs.mark_job_run("jobCU3", False, "connection refused")
+    natural = cron_jobs.get_job("jobCU3")["next_run_at"]
+    zc._maybe_schedule_failure_catchup("jobCU3")
+
+    assert cron_jobs.get_job("jobCU3")["next_run_at"] == natural
+
+
+def test_catchup_budget_derived_from_persisted_streak(tmp_path, monkeypatch):
+    """预算 = occurrence journal 连续失败尾串：1、2 次补，第 3 次回自然 slot；
+    成功打断后新失败链重新可补。持久化 → 跨重启/共享 store 的 replica 一致。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobBD", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobBD": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+    )
+
+    def fail_and_catchup():
+        cron_jobs.mark_job_run("jobBD", False, "connection refused")
+        zc._maybe_schedule_failure_catchup("jobBD")
+        return _seconds_until(cron_jobs.get_job("jobBD")["next_run_at"])
+
+    assert 700 < fail_and_catchup() < 1100   # streak=1 → 补
+    assert 700 < fail_and_catchup() < 1100   # streak=2 → 补
+    assert fail_and_catchup() > 3600         # streak=3 → 预算耗尽，回自然 slot
+
+    cron_jobs.mark_job_run("jobBD", True, None)  # 成功打断失败链
+    assert 700 < fail_and_catchup() < 1100   # 新链 streak=1 → 重新可补
+
+def test_catchup_skipped_when_natural_slot_sooner(tmp_path, monkeypatch):
+    """高频任务（every 5m）自然 slot 比补跑窗更近 → 不补跑。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobCU5", 5)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobCU5": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+    )
+
+    cron_jobs.mark_job_run("jobCU5", False, "connection refused")
+    natural = cron_jobs.get_job("jobCU5")["next_run_at"]
+    assert _seconds_until(natural) < 700  # 前置：自然 slot 确实在补跑窗之内
+    zc._maybe_schedule_failure_catchup("jobCU5")
+
+    assert cron_jobs.get_job("jobCU5")["next_run_at"] == natural
+
+
+def test_catchup_wired_through_installed_mark_and_success_clears_rounds(tmp_path, monkeypatch):
+    """走真实 patched mark_job_run 链：失败触发补跑；成功清空补跑计数。"""
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobCU6", 1440)
+    zc.install()
+    monkeypatch.setattr(zc, "_try_persist_to_session", lambda *a, **k: None)
+    monkeypatch.setattr(zc, "_detect_fake_success", lambda job_id: None)
+    monkeypatch.setattr(
+        zc, "_LAST_RETRY_STATE",
+        {"jobCU6": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+    )
+
+    scheduler.mark_job_run("jobCU6", False, "connection refused")
+    delta = _seconds_until(cron_jobs.get_job("jobCU6")["next_run_at"])
+    assert 700 < delta < 1100  # 补跑写入在 _orig_mark 之后，没被冲掉
+
+    # 成功打断持久化失败链；再失败 → 新链 streak=1 → 仍可补跑
+    scheduler.mark_job_run("jobCU6", True, None)
+    scheduler.mark_job_run("jobCU6", False, "connection refused")
+    delta = _seconds_until(cron_jobs.get_job("jobCU6")["next_run_at"])
+    assert 700 < delta < 1100
+
+
+def test_shutdown_interrupt_mark_does_not_schedule_catchup(tmp_path, monkeypatch):
+    """shutdown 强杀的 mark_job_run(False) 不触发补跑：被杀的 run 没有 retry
+    state → skipped_reason 缺失；重启场景归 cron/jobs.py 的 gateway-down 补跑。"""
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobCU7", 1440)
+    zc.install()
+    monkeypatch.setattr(zc, "_try_persist_to_session", lambda *a, **k: None)
+    monkeypatch.setattr(zc, "_LAST_RETRY_STATE", {})
+    monkeypatch.setattr(scheduler, "_running_job_ids", {"jobCU7"})
+    monkeypatch.setattr(scheduler, "_interrupted_job_ids", set())
+
+    marked = scheduler.mark_running_jobs_interrupted("gateway shutdown")
+    assert marked == ["jobCU7"]
+
+    stored = cron_jobs.get_job("jobCU7")
+    assert stored["last_status"] == "error"
+    assert _seconds_until(stored["next_run_at"]) > 3600  # 自然 slot，未被拉近
+
+
+def test_catchup_abandoned_on_concurrent_user_edit(tmp_path, monkeypatch):
+    """helper 读 job 后用户并发编辑（revision 前进）→ CAS 冲突 → 放弃补跑。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobCAS", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobCAS": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+    )
+
+    cron_jobs.mark_job_run("jobCAS", False, "connection refused")
+    natural = cron_jobs.get_job("jobCAS")["next_run_at"]
+
+    real_update = cron_jobs.update_job
+
+    def racing_update(job_id, updates, **kw):
+        if "expected_revision" in updates:
+            real_update(job_id, {"name": "edited-by-user"})  # 模拟并发编辑，revision +1
+        return real_update(job_id, updates, **kw)
+
+    monkeypatch.setattr(cron_jobs, "update_job", racing_update)
+    zc._maybe_schedule_failure_catchup("jobCAS")  # 不得抛异常
+
+    stored = cron_jobs.get_job("jobCAS")
+    assert stored["next_run_at"] == natural  # 补跑放弃，用户编辑赢
+    assert stored["name"] == "edited-by-user"
+
+
+def test_final_attempt_tool_activity_blocks_catchup(tmp_path, monkeypatch):
+    """末次重试有工具活动 → retry_exhausted 仍记录 activity → 补跑跳过。
+    重试循环只在每次重试前查活动，末次尝试的活动此前从未被检查。"""
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobFA", 1440)
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_LAST_RETRY_STATE", {})
+    monkeypatch.setattr(zc, "_MAX_RUN_RETRIES", 2)
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda jid: set())
+    activity_seq = iter([0, 0, 5])  # 重试前两查=0，循环退出后末次检查=5
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda jid, base: next(activity_seq))
+
+    result = zc._run_job_with_retry(
+        lambda j: (False, None, None, "connection refused"), {"id": "jobFA"}
+    )
+    assert result[0] is False
+    st = zc._LAST_RETRY_STATE["jobFA"]
+    assert st["skipped_reason"] == "retry_exhausted"
+    assert st["tool_activity"] == 5
+
+    cron_jobs.mark_job_run("jobFA", False, "connection refused")
+    natural = cron_jobs.get_job("jobFA")["next_run_at"]
+    zc._maybe_schedule_failure_catchup("jobFA")
+    assert cron_jobs.get_job("jobFA")["next_run_at"] == natural  # 不补跑
+
+
+def test_catchup_does_not_cross_deferred_until(tmp_path, monkeypatch):
+    """deferred_until 水位在场 → 补跑不得把 next_run_at 拉到水位之前。"""
+    from datetime import timedelta
+    from hermes_time import now as hermes_now
+
+    cron_jobs = _point_job_store_at(tmp_path, monkeypatch)
+    _save_interval_job(cron_jobs, "jobDF", 1440)
+    zc = _catchup_env(
+        monkeypatch,
+        retry_state={"jobDF": {"retryable": True, "skipped_reason": "retry_exhausted", "attempts": 2, "tool_activity": 0}},
+    )
+
+    cron_jobs.mark_job_run("jobDF", False, "connection refused")
+    # 模拟 mark_job_run 尊重 deferral 后的状态：next_run_at = deferred_until，字段保留
+    deferred = (hermes_now() + timedelta(hours=6)).isoformat()
+    jobs = cron_jobs.load_jobs()
+    for j in jobs:
+        if j["id"] == "jobDF":
+            j["deferred_until"] = deferred
+            j["next_run_at"] = deferred
+    cron_jobs.save_jobs(jobs)
+
+    zc._maybe_schedule_failure_catchup("jobDF")
+    stored = cron_jobs.get_job("jobDF")
+    assert stored["next_run_at"] == deferred  # 水位未被越过

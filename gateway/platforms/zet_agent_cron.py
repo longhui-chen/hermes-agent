@@ -981,6 +981,13 @@ def install() -> None:
                         job_id, e,
                     )
 
+            # Catch-up must run after _orig_mark's next_run_at overwrite.
+            if not success:
+                try:
+                    _maybe_schedule_failure_catchup(job_id)
+                except Exception as e:
+                    _dbg(f"_wrapped_mark catchup FAILED: {e!r}")
+
             return result
         finally:
             _LATEST_OUTPUT.pop(job_id, None)
@@ -1555,6 +1562,12 @@ def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
 _MAX_RUN_RETRIES = _env_int("ZET_CRON_RETRY_MAX", 2, lo=0, hi=10)
 _RETRY_BACKOFF_S = _env_int("ZET_CRON_RETRY_BACKOFF_S", 45, lo=0, hi=600)
 
+# Failure catch-up: after in-run retries are exhausted on a clean transient
+# failure, pull next_run_at near-term instead of waiting for the next natural
+# slot. ZET_CRON_CATCHUP_MAX=0 disables.
+_CATCHUP_DELAY_S = _env_int("ZET_CRON_CATCHUP_DELAY_S", 900, lo=60, hi=7200)
+_CATCHUP_MAX = _env_int("ZET_CRON_CATCHUP_MAX", 2, lo=0, hi=10)
+
 # Set at exit so a backoff wait aborts instead of stalling the pool's wait=True drain.
 _shutdown = threading.Event()
 atexit.register(_shutdown.set)
@@ -1798,8 +1811,89 @@ def _run_job_with_retry(orig_run_job, job, *, before_retry=None):
         state["retryable"] = True
         if not state.get("skipped_reason") and attempts >= _MAX_RUN_RETRIES:
             state["skipped_reason"] = "retry_exhausted"
+            # 循环只在重试前查活动，末次尝试的没查过；补上，供补跑判定
+            state["tool_activity"] = _attempt_tool_activity(job_id, baseline)
         _remember_retry_state(job_id, state)
     return result
+
+
+def _maybe_schedule_failure_catchup(job_id: str) -> None:
+    """Pull next_run_at to a near-term re-run after a clean transient failure.
+
+    Must run AFTER _orig_mark, which overwrites next_run_at with the natural
+    slot. Fires only on the retry wrapper's retry_exhausted (transient error +
+    zero tool activity), for recurring jobs, never later than the natural
+    slot, and only while the persisted trailing-failure streak is within
+    _CATCHUP_MAX — the streak comes from the occurrence journal, so the
+    budget holds across restarts and store-sharing replicas, and a success
+    is what resets it.
+    """
+    if _CATCHUP_MAX <= 0:
+        return
+    state = _LAST_RETRY_STATE.get(job_id) or {}
+    if state.get("skipped_reason") != "retry_exhausted":
+        return
+    if state.get("tool_activity") != 0:
+        return  # 末次尝试有工具活动（或无法确认）→ 不重复副作用
+    from cron.jobs import (
+        JobRevisionConflict,
+        _read_occurrence_journal,
+        get_job,
+        update_job,
+    )
+
+    job = get_job(job_id)
+    if not job:
+        return
+    if job.get("schedule", {}).get("kind") not in {"cron", "interval"}:
+        return
+    if not job.get("enabled", True) or job.get("state") != "scheduled":
+        return
+    if job.get("deferred_until"):
+        return  # 显式延期水位在场，补跑不得早于它
+    # 预算 = journal 里的连续 failed 尾串（本次失败已由 _orig_mark 记入）。
+    # 读不到（streak=0）按不可验证处理，不补。
+    records, _truncated = _read_occurrence_journal(job)
+    streak = 0
+    for rec in reversed(records or []):
+        if rec.get("status") != "failed":
+            break
+        streak += 1
+    if not (1 <= streak <= _CATCHUP_MAX):
+        _dbg(f"catchup: streak={streak} outside budget job={job_id}")
+        return
+
+    import random
+    from datetime import datetime, timedelta
+    from hermes_time import now as _hermes_now
+
+    # ±20% jitter 防上游恢复后被同 tick 失败的一批任务集体打爆
+    delay = _CATCHUP_DELAY_S * (0.8 + 0.4 * random.random())
+    catchup_at = _hermes_now() + timedelta(seconds=delay)
+    natural = job.get("next_run_at")
+    if natural:
+        try:
+            natural_dt = datetime.fromisoformat(natural)
+        except ValueError:
+            return
+        if natural_dt.tzinfo is None:
+            natural_dt = natural_dt.replace(tzinfo=catchup_at.tzinfo)
+        if catchup_at >= natural_dt:
+            _dbg(f"catchup: natural slot sooner job={job_id}")
+            return
+    try:
+        # CAS 栅栏：用户在上面 get_job 之后改了 schedule/timezone 的话放弃补跑
+        update_job(job_id, {
+            "next_run_at": catchup_at.isoformat(),
+            "expected_revision": int(job.get("revision") or 0),
+        })
+    except JobRevisionConflict:
+        _dbg(f"catchup: revision conflict, user edit wins job={job_id}")
+        return
+    _dbg(
+        f"catchup: scheduled job={job_id} round={streak}/{_CATCHUP_MAX} "
+        f"at={catchup_at.isoformat()}"
+    )
 
 
 # ── Persist to hermes SessionDB ─────────────────────────────────────
