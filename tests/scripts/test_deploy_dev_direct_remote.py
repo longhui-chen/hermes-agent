@@ -16,6 +16,17 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def test_uv_bootstrap_is_pinned_and_precedes_runtime_activation() -> None:
+    source = REMOTE_DEPLOY.read_text(encoding="utf-8")
+
+    assert "HERMES_DEPLOY_UV_VERSION:-0.12.5" in source
+    assert "https://astral.sh/uv/install.sh" in source
+    assert "--proto '=https' --tlsv1.2" in source
+    assert source.index("    bootstrap_uv\n") < source.index(
+        'systemctl stop "$service_name"\nrm -rf "$rollback"'
+    )
+
+
 def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> None:
     app_root = tmp_path / "apps" / "com.zettlab.claw" / "test-version"
     hermes_src = app_root / "lib" / "hermes-agent"
@@ -55,10 +66,11 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
     _write_executable(
         fake_bin / "systemctl",
         f"#!/bin/sh\nprintf 'systemctl %s\\n' \"$*\" >> '{calls}'\n"
-        "[ \"${1:-}\" = is-active ] && exit 1\n"
+        "[ \"${1:-}\" = is-active ] && exit 0\n"
         "exit 0\n",
     )
     _write_executable(fake_bin / "journalctl", "#!/bin/sh\nexit 0\n")
+    _write_executable(fake_bin / "flock", "#!/bin/sh\nexit 0\n")
 
     fake_home = tmp_path / "home"
     uv = fake_home / ".local" / "bin" / "uv"
@@ -71,6 +83,7 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
         "count=$((count + 1))\n"
         f"printf '%s' \"$count\" > '{uv_count}'\n"
         '[ "$count" -lt 2 ] && exit 0\n'
+        'rm -f "$UV_PROJECT_ENVIRONMENT/bin/python"\n'
         "exit 23\n",
     )
 
@@ -83,6 +96,9 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
             "HERMES_DEPLOY_HERMES_BIN": str(hermes_bin),
             "HERMES_DEPLOY_SERVICE": "test-local-server",
             "HERMES_DEPLOY_HEALTH_URL": "http://127.0.0.1:1/health",
+            "HERMES_DEPLOY_RECOVERY_HELPER": str(tmp_path / "recover-hermes"),
+            "HERMES_DEPLOY_SYSTEMD_DIR": str(tmp_path / "systemd"),
+            "HERMES_DEPLOY_LOCK_FILE": str(tmp_path / "deploy.lock"),
         }
     )
 
@@ -98,13 +114,24 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
     assert (hermes_src / "old-source-marker").read_text(encoding="utf-8") == "old"
     assert not (hermes_src / "new-source-marker").exists()
     assert (hermes_src / "venv" / "bin" / "python").is_file()
-    assert "deployment failed; restored previous Hermes source" in result.stderr
+    assert not (app_root / "lib" / "hermes-agent.new").exists()
+
+    recovery_helper = tmp_path / "recover-hermes"
+    assert recovery_helper.is_file(), result.stdout + result.stderr
+    dropin = tmp_path / "systemd" / "95-hermes-direct-deploy-recover.conf"
+    assert f"ExecStartPre={recovery_helper}" in dropin.read_text(encoding="utf-8")
+
+    rollback = app_root / "lib" / "hermes-agent.rollback"
+    hermes_src.rename(rollback)
+    subprocess.run([str(recovery_helper)], check=True)
+    assert (hermes_src / "old-source-marker").is_file()
+    assert not rollback.exists()
 
     command_log = calls.read_text(encoding="utf-8")
     assert (
         "uv sync --frozen --no-dev --no-editable --no-install-project --no-build"
         in command_log
-    )
+    ), result.stdout + result.stderr
     assert (
         "uv sync --frozen --no-dev --no-editable --no-build-isolation "
         "--reinstall-package hermes-agent"
@@ -112,4 +139,5 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
     )
     assert "--extra zpk-runtime" in command_log
     assert "uv pip install" not in command_log
-    assert "systemctl start test-local-server" in command_log
+    assert "systemctl daemon-reload" in command_log
+    assert "systemctl stop test-local-server" not in command_log
