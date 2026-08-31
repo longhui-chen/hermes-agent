@@ -62,9 +62,16 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
 
     fake_home = tmp_path / "home"
     uv = fake_home / ".local" / "bin" / "uv"
+    uv_count = tmp_path / "uv-count"
     _write_executable(
         uv,
-        f"#!/bin/sh\nprintf 'uv %s\\n' \"$*\" >> '{calls}'\nexit 23\n",
+        "#!/bin/sh\n"
+        f"printf 'uv %s\\n' \"$*\" >> '{calls}'\n"
+        f"count=$(cat '{uv_count}' 2>/dev/null || printf 0)\n"
+        "count=$((count + 1))\n"
+        f"printf '%s' \"$count\" > '{uv_count}'\n"
+        '[ "$count" -lt 2 ] && exit 0\n'
+        "exit 23\n",
     )
 
     env = os.environ.copy()
@@ -94,7 +101,15 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
     assert "deployment failed; restored previous Hermes source" in result.stderr
 
     command_log = calls.read_text(encoding="utf-8")
-    assert "uv sync --locked --no-dev" in command_log
+    assert (
+        "uv sync --frozen --no-dev --no-editable --no-install-project --no-build"
+        in command_log
+    )
+    assert (
+        "uv sync --frozen --no-dev --no-editable --no-build-isolation "
+        "--reinstall-package hermes-agent"
+        in command_log
+    )
     assert "--extra zpk-runtime" in command_log
     assert "uv pip install" not in command_log
     assert "systemctl start test-local-server" in command_log

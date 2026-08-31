@@ -70,9 +70,17 @@ if [[ "$deps_changed" == "1" ]]; then
   [[ -x venv/bin/python ]] || { echo "existing Hermes venv is unavailable" >&2; exit 1; }
   sync_output=$(mktemp /tmp/hermes-sync.XXXXXX)
   if ! UV_PROJECT_ENVIRONMENT="$hermes_src/venv" "$uv_bin" sync \
-    --locked --no-dev \
+    --frozen --no-dev --no-editable --no-install-project --no-build \
     --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
     >"$sync_output" 2>&1; then
+    tail -40 "$sync_output" >&2
+    exit 1
+  fi
+  if ! UV_PROJECT_ENVIRONMENT="$hermes_src/venv" "$uv_bin" sync \
+    --frozen --no-dev --no-editable --no-build-isolation \
+    --reinstall-package hermes-agent \
+    --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
+    >>"$sync_output" 2>&1; then
     tail -40 "$sync_output" >&2
     exit 1
   fi
