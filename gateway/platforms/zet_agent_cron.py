@@ -981,6 +981,15 @@ def install() -> None:
                         job_id, e,
                     )
 
+            # Catch-up must run after _orig_mark's next_run_at overwrite.
+            if success:
+                _CATCHUP_ROUNDS.pop(job_id, None)
+            else:
+                try:
+                    _maybe_schedule_failure_catchup(job_id)
+                except Exception as e:
+                    _dbg(f"_wrapped_mark catchup FAILED: {e!r}")
+
             return result
         finally:
             _LATEST_OUTPUT.pop(job_id, None)
@@ -1555,6 +1564,14 @@ def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
 _MAX_RUN_RETRIES = _env_int("ZET_CRON_RETRY_MAX", 2, lo=0, hi=10)
 _RETRY_BACKOFF_S = _env_int("ZET_CRON_RETRY_BACKOFF_S", 45, lo=0, hi=600)
 
+# Failure catch-up: after in-run retries are exhausted on a clean transient
+# failure, pull next_run_at near-term instead of waiting for the next natural
+# slot. ZET_CRON_CATCHUP_MAX=0 disables.
+_CATCHUP_DELAY_S = _env_int("ZET_CRON_CATCHUP_DELAY_S", 900, lo=60, hi=7200)
+_CATCHUP_MAX = _env_int("ZET_CRON_CATCHUP_MAX", 2, lo=0, hi=10)
+# Consecutive catch-up rounds per job; in-memory, cleared on success.
+_CATCHUP_ROUNDS: Dict[str, int] = {}
+
 # Set at exit so a backoff wait aborts instead of stalling the pool's wait=True drain.
 _shutdown = threading.Event()
 atexit.register(_shutdown.set)
@@ -1800,6 +1817,60 @@ def _run_job_with_retry(orig_run_job, job, *, before_retry=None):
             state["skipped_reason"] = "retry_exhausted"
         _remember_retry_state(job_id, state)
     return result
+
+
+def _maybe_schedule_failure_catchup(job_id: str) -> None:
+    """Pull next_run_at to a near-term re-run after a clean transient failure.
+
+    Must run AFTER _orig_mark, which overwrites next_run_at with the natural
+    slot. Fires only on the retry wrapper's retry_exhausted (transient error +
+    zero tool activity), for recurring jobs, never later than the natural
+    slot, at most _CATCHUP_MAX consecutive rounds.
+    """
+    if _CATCHUP_MAX <= 0:
+        return
+    state = _LAST_RETRY_STATE.get(job_id) or {}
+    if state.get("skipped_reason") != "retry_exhausted":
+        return
+    rounds = _CATCHUP_ROUNDS.get(job_id, 0)
+    if rounds >= _CATCHUP_MAX:
+        _CATCHUP_ROUNDS.pop(job_id, None)  # 预算用尽；下一轮失败流重新开
+        _dbg(f"catchup: budget exhausted job={job_id}")
+        return
+    from cron.jobs import get_job, update_job
+
+    job = get_job(job_id)
+    if not job:
+        return
+    if job.get("schedule", {}).get("kind") not in {"cron", "interval"}:
+        return
+    if not job.get("enabled", True) or job.get("state") != "scheduled":
+        return
+
+    import random
+    from datetime import datetime, timedelta
+    from hermes_time import now as _hermes_now
+
+    # ±20% jitter 防上游恢复后被同 tick 失败的一批任务集体打爆
+    delay = _CATCHUP_DELAY_S * (0.8 + 0.4 * random.random())
+    catchup_at = _hermes_now() + timedelta(seconds=delay)
+    natural = job.get("next_run_at")
+    if natural:
+        try:
+            natural_dt = datetime.fromisoformat(natural)
+        except ValueError:
+            return
+        if natural_dt.tzinfo is None:
+            natural_dt = natural_dt.replace(tzinfo=catchup_at.tzinfo)
+        if catchup_at >= natural_dt:
+            _dbg(f"catchup: natural slot sooner job={job_id}")
+            return
+    update_job(job_id, {"next_run_at": catchup_at.isoformat()})
+    _CATCHUP_ROUNDS[job_id] = rounds + 1
+    _dbg(
+        f"catchup: scheduled job={job_id} round={rounds + 1}/{_CATCHUP_MAX} "
+        f"at={catchup_at.isoformat()}"
+    )
 
 
 # ── Persist to hermes SessionDB ─────────────────────────────────────
