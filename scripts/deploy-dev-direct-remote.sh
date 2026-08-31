@@ -128,7 +128,7 @@ fi
 sync_output=$(mktemp /tmp/hermes-sync.XXXXXX)
 if [[ "$deps_changed" == "1" ]]; then
   if ! UV_PROJECT_ENVIRONMENT="$stage/venv" "$uv_bin" sync \
-    --project "$stage" --frozen --no-dev --no-editable --no-install-project --no-build \
+    --project "$stage" --frozen --inexact --no-dev --no-editable --no-install-project --no-build \
     --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
     >"$sync_output" 2>&1; then
     tail -40 "$sync_output" >&2
@@ -142,7 +142,7 @@ fi
 # ad-hoc device wheel builds, and skipping this phase would leave the previous
 # source running whenever pyproject.toml and uv.lock are unchanged.
 if ! UV_PROJECT_ENVIRONMENT="$stage/venv" "$uv_bin" sync \
-  --project "$stage" --frozen --no-dev --no-build-isolation \
+  --project "$stage" --frozen --inexact --no-dev --no-build-isolation \
   --reinstall-package hermes-agent \
   --extra all --extra langfuse --extra anthropic --extra zpk-runtime \
   >>"$sync_output" 2>&1; then

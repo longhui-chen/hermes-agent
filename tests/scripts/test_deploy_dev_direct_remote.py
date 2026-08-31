@@ -151,11 +151,11 @@ def test_dependency_sync_failure_restores_previous_source(tmp_path: Path) -> Non
     assert (
         "uv sync --project "
         in command_log
-        and "--frozen --no-dev --no-editable --no-install-project --no-build"
+        and "--frozen --inexact --no-dev --no-editable --no-install-project --no-build"
         in command_log
     ), result.stdout + result.stderr
     assert (
-        "--frozen --no-dev --no-build-isolation "
+        "--frozen --inexact --no-dev --no-build-isolation "
         "--reinstall-package hermes-agent"
         in command_log
     )
