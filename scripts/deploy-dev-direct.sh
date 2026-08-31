@@ -41,24 +41,25 @@ fi
 
 repo_root=$(git rev-parse --show-toplevel)
 git -C "$repo_root" rev-parse --verify "${ref}^{commit}" >/dev/null
-archive=$(mktemp "${TMPDIR:-/tmp}/hermes-src.XXXXXX.tgz")
+archive=$(mktemp "${TMPDIR:-/tmp}/hermes-src.XXXXXX")
 trap 'rm -f "$archive"' EXIT
 git -C "$repo_root" archive --format=tar.gz -o "$archive" "$ref"
 remote_helper="$repo_root/scripts/deploy-dev-direct-remote.sh"
 [[ -x "$remote_helper" ]] || { echo "missing remote helper: $remote_helper" >&2; exit 1; }
 
-if [[ "$transport" == "sshpass" ]]; then
-  export SSHPASS="$BOARD_SSH_PASSWORD"
-  sshpass -e scp -P "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "$archive" "$remote_helper" "root@$host:/tmp/"
-  sshpass -e ssh -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "root@$host" bash /tmp/deploy-dev-direct-remote.sh
-else
-  export DEPLOY_HOST="$host" DEPLOY_PORT="$port" DEPLOY_ARCHIVE="$archive" DEPLOY_HELPER="$remote_helper"
+copy_file() {
+  local source=$1 target=$2
+  if [[ "$transport" == "sshpass" ]]; then
+    export SSHPASS="$BOARD_SSH_PASSWORD"
+    sshpass -e scp -P "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "$source" "root@$host:$target"
+    return
+  fi
+  export DEPLOY_HOST="$host" DEPLOY_PORT="$port" DEPLOY_SOURCE="$source" DEPLOY_TARGET="$target"
   expect <<'EXPECT_SCP'
-set timeout 120
+set timeout 180
 spawn scp -P $env(DEPLOY_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  $env(DEPLOY_ARCHIVE) $env(DEPLOY_HELPER) root@$env(DEPLOY_HOST):/tmp/
+  $env(DEPLOY_SOURCE) root@$env(DEPLOY_HOST):$env(DEPLOY_TARGET)
 expect {
   -re "(?i)password:" { send -- "$env(BOARD_SSH_PASSWORD)\r"; exp_continue }
   eof
@@ -66,6 +67,16 @@ expect {
 catch wait result
 exit [lindex $result 3]
 EXPECT_SCP
+}
+
+copy_file "$archive" /tmp/hermes-src.new.tgz
+copy_file "$remote_helper" /tmp/deploy-dev-direct-remote.sh
+
+if [[ "$transport" == "sshpass" ]]; then
+  export SSHPASS="$BOARD_SSH_PASSWORD"
+  sshpass -e ssh -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "root@$host" bash /tmp/deploy-dev-direct-remote.sh
+else
   expect <<'EXPECT_SSH'
 set timeout 900
 spawn ssh -p $env(DEPLOY_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
