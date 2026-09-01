@@ -313,6 +313,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "zettlab_createpipeline": {
+        "description": "Trigger the platform application-creation pipeline: start from a one-line intent, poll status (zettlab)",
+        "tools": ["create_pipeline"],
+        "includes": []
+    },
+
     "zettlab_app_workspace": {
         "description": "Edit a dedicated maintainer's bounded App Host workspace (zettlab)",
         "tools": ["app_workspace"],
@@ -578,7 +584,7 @@ TOOLSETS = {
         # tools are scoped to the active generated-app profile and must not be
         # advertised by messaging or Cron platforms.
         "tools": _HERMES_CORE_TOOLS + [
-            "call_agent", "app_host", "app_data", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "coding_agent_host", "ssh_control"
+            "call_agent", "app_host", "app_data", "create_pipeline", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "coding_agent_host", "ssh_control"
         ],
         "includes": []
     },
