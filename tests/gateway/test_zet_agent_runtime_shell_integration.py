@@ -1,11 +1,15 @@
 """Zet adapter integration contracts for ordinary runtime-shell reuse."""
 
 import asyncio
+import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from agent.prestream_timing import PRESTREAM_TIMING_CONTEXT
 from gateway.config import PlatformConfig
@@ -20,7 +24,10 @@ from gateway.platforms.zet_agent import (
 from gateway.session_context import (
     pop_zettlab_auth_principal,
     push_zettlab_auth_principal,
+    set_zettlab_connector_route_capability,
+    zettlab_connector_route_capability,
 )
+from tools import terminal_tool as terminal_tool_module
 
 
 class _SessionDB:
@@ -174,6 +181,137 @@ def _interactive_create(adapter, **kwargs):
         return _create(adapter, **kwargs)
     finally:
         _zet_runtime_shell_cache_allowed.reset(token)
+
+
+def _http_app(adapter: ZetAgentAdapter) -> web.Application:
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    return app
+
+
+def _write_connector_runtime(tmp_path: Path) -> None:
+    script = (
+        tmp_path
+        / "presets"
+        / "skills"
+        / "github"
+        / "scripts"
+        / "connector_runtime.py"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        "import json, os\n"
+        "print(json.dumps({'route': os.environ.get('HERMES_SESSION_KEY', '')}))\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_zet_http_connector_turn_recovers_lost_tool_context_without_cross_turn_leak(
+    runtime_adapter,
+    monkeypatch,
+    tmp_path,
+):
+    """Exercise HTTP -> ZetAgent -> real dispatch -> trusted runner.
+
+    The test intentionally clears the ContextVar immediately before the real
+    tool-dispatch middleware runs.  A regression in either ZetAgent's private
+    per-turn binding or tool_executor's short-lived recovery therefore makes
+    the connector runner miss ``HERMES_SESSION_KEY``.  A second request proves
+    the cached runtime shell is rebound rather than borrowing the first turn.
+    """
+    from agent import relay_tools
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+    from hermes_cli import middleware as hermes_middleware
+
+    adapter, _db, _runtime, _retired, _home = runtime_adapter
+    _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setattr(terminal_tool_module, "_CONNECTOR_RUNTIME_ROOT_ANCHOR", None)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_ensure_sensitive_runtime_boundary",
+        lambda: True,
+    )
+    # Keep the test at the production dispatch boundary while making plugin
+    # policy/relay dependencies deterministic; the runner itself is real.
+    monkeypatch.setattr(
+        relay_tools,
+        "execute",
+        lambda _name, args, dispatch, **_kwargs: (dispatch(args), args),
+    )
+    monkeypatch.setattr(
+        hermes_middleware,
+        "apply_tool_request_middleware",
+        lambda _name, args, **_kwargs: SimpleNamespace(payload=args, trace=[]),
+    )
+    monkeypatch.setattr(
+        hermes_middleware,
+        "run_tool_execution_middleware",
+        lambda _name, args, dispatch, **_kwargs: dispatch(args),
+    )
+
+    def _connector_turn(self, **_kwargs):
+        self._tool_guardrails = SimpleNamespace(
+            before_call=lambda *_args, **_kwargs: SimpleNamespace(
+                allows_execution=True
+            )
+        )
+        self._turns_since_memory = 0
+        self._iters_since_skill = 0
+        # Model the observed defect: a real runtime boundary reaches dispatch
+        # after the request ContextVar was dropped.
+        set_zettlab_connector_route_capability("")
+        outcome = _run_agent_tool_execution_middleware(
+            self,
+            function_name="terminal",
+            function_args={},
+            effective_task_id="connector-route-flow",
+            tool_call_id="connector-route-call",
+            execute=lambda _args: terminal_tool_module.terminal_tool(
+                'python3 "$ZETTLAB_PRESETS_DIR/skills/github/scripts/'
+                'connector_runtime.py" list-tools',
+                task_id="connector-route-flow",
+            ),
+        )
+        self.session_prompt_tokens = 1
+        self.session_completion_tokens = 1
+        self.session_total_tokens = 2
+        return {"final_response": outcome.result, "completed": True, "failed": False}
+
+    monkeypatch.setattr(_FakeAgent, "run_conversation", _connector_turn)
+
+    async with TestClient(TestServer(_http_app(adapter))) as client:
+        async def _post(capability: str) -> dict:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "test/model",
+                    "messages": [{"role": "user", "content": "list repos"}],
+                    "metadata": {"connector_route_capability": capability},
+                },
+            )
+            assert response.status == 200
+            body = await response.json()
+            result = json.loads(body["choices"][0]["message"]["content"])
+            assert result["connector_runtime_direct"] is True
+            assert result["exit_code"] == 0
+            return json.loads(result["output"])
+
+        route_a = "A" * 43
+        route_b = "B" * 43
+        assert await _post(route_a) == {"route": route_a}
+        assert await _post(route_b) == {"route": route_b}
+
+    assert zettlab_connector_route_capability() == ""
 
 
 def test_second_interactive_turn_reuses_shell_and_rebinds_request_state(

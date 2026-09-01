@@ -1373,6 +1373,7 @@ class ZetAgentAdapter(APIServerAdapter):
             ("_zet_agent_trusted_user_message", None),
             ("_zet_agent_trusted_skill_slug", ""),
             ("_creation_action_receipt_transport", ""),
+            ("_zettlab_connector_route_capability", ""),
             ("_zettlab_active_turn_id", ""),
             ("_zet_runtime_shell_force_tool_refresh", False),
             ("runtime_auxiliary_task_configs", None),
@@ -4027,6 +4028,17 @@ class ZetAgentAdapter(APIServerAdapter):
         agent_request_overrides = dict(request_overrides or {})
         from gateway.session_context import zettlab_auth_principal
 
+        # This is transport authority minted by local-server for exactly one
+        # chat turn.  It must not reach AIAgent.request_overrides or a model
+        # provider.  Keep it only on the Agent instance so tool execution can
+        # recover if an intermediate runtime wrapper drops ContextVars.
+        connector_route_capability = str(
+            agent_request_overrides.pop("_zettlab_connector_route_capability", "")
+            or ""
+        ).strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{43}", connector_route_capability) is None:
+            connector_route_capability = ""
+
         account_id = str(
             agent_request_overrides.pop("_zettlab_session_context_account_id", "")
             or _zettlab_request_account_id.get()
@@ -4669,6 +4681,7 @@ class ZetAgentAdapter(APIServerAdapter):
         }
         agent.runtime_auxiliary_task_configs = runtime_auxiliary_task_configs
         agent.runtime_supports_vision = runtime_supports_vision
+        agent._zettlab_connector_route_capability = connector_route_capability
         from gateway.session_context import get_session_env
 
         extension_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
@@ -4893,6 +4906,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # _create_agent. It selects the ordinary video plugin toolset for a
         # silent task and never reaches AIAgent or a provider request.
         request_overrides["_zet_trusted_skill_slug"] = trusted_skill_slug
+        if connector_route_capability:
+            request_overrides["_zettlab_connector_route_capability"] = (
+                connector_route_capability
+            )
         # Capture before base _run_agent hops to its executor. The principal
         # remains private request metadata, never a model argument.
         principal = zettlab_auth_principal()
