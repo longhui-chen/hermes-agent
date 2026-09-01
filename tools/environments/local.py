@@ -2128,6 +2128,7 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # of whatever os.environ/shell snapshot happened to contain.
     "ZETTLAB_CONNECTORS_URL",
     "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+    "ZETTLAB_CONNECTOR_SESSION_INVOKE_V1",
     "ZET_AGENT_ID",
 })
 
