@@ -1,25 +1,34 @@
-"""Cron-only Connector execution lease client.
+"""Cron-only Connector direct-execution route client.
 
-The durable grant is scoped to one job and can only be exchanged by the
-device-authenticated local bridge. A cron run receives only a local route
-capability; neither a user JWT nor the short cloud lease reaches Hermes tools.
+Cron is a background caller, not a suspended Chat turn. It obtains a one-run
+opaque route handle from its local-server parent; the handle never leaves the
+device. The Server call is separately device-authenticated and re-checks owner,
+Agent policy, provider connection, and reauth state for every MCP request.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-_CREATE_METHOD = "zettlab/cron/create-connector-grant"
-_LEASE_METHOD = "zettlab/cron/acquire-connector-lease"
+_PREPARE_METHOD = "zettlab/cron/prepare-connector-execution"
 _TIMEOUT_SECONDS = 10
+_MAX_PRESET_MANIFESTS = 256
+_PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class ConnectorExecutionLeaseError(RuntimeError):
+    """Compatibility name for the existing scheduler error boundary.
+
+    The implementation no longer requests a Connector grant or lease token.
+    """
+
     def __init__(self, code: str, retryable: bool = False):
         super().__init__(code)
         self.code = code or "task_connector_temporarily_unavailable"
@@ -27,70 +36,79 @@ class ConnectorExecutionLeaseError(RuntimeError):
 
 
 def enabled() -> bool:
-    return _secret("ZETTLAB_CRON_CONNECTOR_EXECUTION_LEASES_ENABLED") == "1"
+    return _secret("ZETTLAB_CRON_CONNECTOR_DIRECT_ENABLED") == "1"
 
 
-def wants_linear_execution(skills: Any) -> bool:
-    # Legacy jobs can retain the singular ``skill: "Linear"`` shape.  Treat
-    # it as one value instead of iterating its characters and accidentally
-    # bypassing the task-authorization requirement.
+def connector_provider_for_skills(skills: Any) -> Optional[str]:
+    """Return the sole Connector provider declared by trusted preset manifests.
+
+    A Cron job may include ordinary skills alongside one Connector provider.
+    More than one Connector provider is rejected because one direct route is
+    deliberately bound to one Server-side connection and policy snapshot.
+    """
     if isinstance(skills, str):
         skills = [skills]
-    return any(str(skill).strip().lower() == "linear" for skill in (skills or []))
+    skill_ids = {str(skill).strip().lower() for skill in (skills or []) if str(skill).strip()}
+    if not skill_ids:
+        return None
+    providers = {_preset_connector_providers().get(skill_id, "") for skill_id in skill_ids}
+    providers.discard("")
+    if len(providers) > 1:
+        raise ConnectorExecutionLeaseError("task_connector_mixed_skills_unsupported")
+    return next(iter(providers), None)
 
 
-def supports_exclusive_linear_execution(skills: Any) -> bool:
-    """Whether one task can safely use the single-connection Linear lease."""
-    if isinstance(skills, str):
-        skills = [skills]
-    normalized = [str(skill).strip().lower() for skill in (skills or []) if str(skill).strip()]
-    return bool(normalized) and all(skill == "linear" for skill in normalized)
-
-
-def requires_live_chat_grant(skills: Any) -> bool:
-    """Whether creating this job needs the live Chat-only grant exchange."""
-    return enabled() and wants_linear_execution(skills)
-
-
-def create_grant(job_id: str, provider_id: str = "linear") -> Dict[str, str]:
-    if not enabled() or provider_id.strip().lower() != "linear":
+def _preset_connector_providers() -> Dict[str, str]:
+    """Read bounded, bundled manifest metadata; never infer from a path name."""
+    raw_root = os.environ.get("ZETTLAB_PRESETS_DIR", "").strip()
+    if not raw_root:
         return {}
-    try:
-        from gateway.session_context import zettlab_connector_route_capability
-        route_capability = zettlab_connector_route_capability()
-    except Exception:
-        route_capability = ""
-    if not route_capability:
-        raise ConnectorExecutionLeaseError("task_connector_not_authorized")
-    result = _bridge_call(
-        _CREATE_METHOD,
-        {"job_id": str(job_id), "provider_id": "linear"},
-        route_capability=route_capability,
-        retry_transient=False,
-    )
-    grant_id = str(result.get("grant_id") or "").strip()
-    grant_token = str(result.get("grant_token") or "").strip()
-    if not grant_id or not grant_token:
-        raise ConnectorExecutionLeaseError("task_connector_not_authorized")
-    return {
-        "provider_id": "linear",
-        "grant_id": grant_id,
-        "grant_token": grant_token,
-        "expires_at": str(result.get("expires_at") or "").strip(),
-    }
+    root = Path(raw_root).expanduser()
+    skills_root = root / "skills"
+    if not skills_root.is_dir():
+        return {}
+    result: Dict[str, str] = {}
+    for index, manifest in enumerate(skills_root.glob("**/manifest.yaml")):
+        if index >= _MAX_PRESET_MANIFESTS:
+            break
+        try:
+            skill_id, provider_id = _connector_provider_from_manifest(manifest)
+        except (OSError, UnicodeError):
+            continue
+        if skill_id and provider_id:
+            result[skill_id] = provider_id
+    return result
 
 
-def acquire_route_capability(execution: Any, execution_id: str) -> str:
-    if not isinstance(execution, dict):
-        raise ConnectorExecutionLeaseError("task_connector_not_authorized")
-    if str(execution.get("provider_id") or "").strip().lower() != "linear":
-        raise ConnectorExecutionLeaseError("task_connector_not_authorized")
-    grant_token = str(execution.get("grant_token") or "").strip()
-    if not grant_token:
+def _connector_provider_from_manifest(path: Path) -> tuple[str, str]:
+    skill_id = ""
+    provider_id = ""
+    in_action_manifest = False
+    for raw_line in path.read_text(encoding="utf-8", errors="strict").splitlines():
+        if raw_line and not raw_line[0].isspace():
+            in_action_manifest = raw_line.strip() == "connector_action_manifest:"
+        line = raw_line.strip()
+        if line.startswith("id:") and not skill_id:
+            skill_id = line.partition(":")[2].strip().strip('"\'').lower()
+        elif in_action_manifest and line.startswith("provider_id:"):
+            candidate = line.partition(":")[2].strip().strip('"\'').lower()
+            if _PROVIDER_ID_RE.fullmatch(candidate):
+                provider_id = candidate
+    return skill_id, provider_id
+
+
+def requires_live_chat_grant(_skills: Any) -> bool:
+    """Cron creation never needs a live Chat route in the direct model."""
+    return False
+
+
+def prepare_route_capability(job_id: str, execution_id: str, provider_id: str) -> str:
+    provider_id = provider_id.strip().lower()
+    if not enabled() or not _PROVIDER_ID_RE.fullmatch(provider_id):
         raise ConnectorExecutionLeaseError("task_connector_not_authorized")
     result = _bridge_call(
-        _LEASE_METHOD,
-        {"grant_token": grant_token, "execution_id": str(execution_id)},
+        _PREPARE_METHOD,
+        {"job_id": str(job_id), "execution_id": str(execution_id), "provider_id": provider_id},
         retry_transient=True,
     )
     capability = str(result.get("route_capability") or "").strip()
@@ -102,6 +120,7 @@ def acquire_route_capability(execution: Any, execution_id: str) -> str:
 def _secret(name: str) -> str:
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
+
         scope = current_secret_scope()
         if scope is not None:
             value = scope.get(name)
@@ -113,9 +132,12 @@ def _secret(name: str) -> str:
     return os.environ.get(name, "")
 
 
-def _bridge_call(method: str, params: Dict[str, Any], *, route_capability: str = "", retry_transient: bool) -> Dict[str, Any]:
+def _bridge_call(method: str, params: Dict[str, Any], *, retry_transient: bool) -> Dict[str, Any]:
     url = _secret("ZETTLAB_CONNECTORS_URL").strip()
-    action_token = _secret("ZETTLAB_CONNECTORS_AUTH_TOKEN").strip()
+    # This is the generic local Agent-process identity already required by the
+    # gateway. It is not a Connector credential, is never relayed to Server,
+    # and cannot authorize a provider call by itself.
+    action_token = (_secret("ZETTLAB_AGENT_ACTION_TOKEN") or _secret("ZET_AGENT_KEY")).strip()
     if not url or not action_token:
         raise ConnectorExecutionLeaseError("task_connector_not_authorized")
     headers = {
@@ -123,8 +145,6 @@ def _bridge_call(method: str, params: Dict[str, Any], *, route_capability: str =
         "X-Zettlab-Agent-Action-Token": action_token,
         "X-Zettlab-Connector-Consumer": "skill-runtime",
     }
-    if route_capability:
-        headers["X-Zettlab-Session-Key"] = route_capability
     body = json.dumps({"jsonrpc": "2.0", "id": "cron-connector-execution", "method": method, "params": params}).encode()
     attempts = 2 if retry_transient else 1
     last_error: Optional[ConnectorExecutionLeaseError] = None
