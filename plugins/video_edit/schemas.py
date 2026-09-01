@@ -7,11 +7,11 @@ import math
 import re
 from typing import Any
 
-from plugins.video_edit import preferences
+from plugins.video_edit import client, preferences, state
 from plugins.video_edit.paths import MAX_TASK_ID_LENGTH
 
 
-HELP_SCHEMA_VERSION = "1.8"
+HELP_SCHEMA_VERSION = "1.9"
 HELP_TOPICS = ("overview", "inputs", "outputs", "errors", "recovery", "examples")
 HELP_CONTROL_FIELDS = frozenset({"help", "help_topic"})
 _SELF_TOOL = "$self"
@@ -206,7 +206,11 @@ def _tool(
 
 _PREFERENCES = {
     "type": "object",
-    "description": "Creative choices. Omitted fields are selected from remembered preferences or sensible defaults.",
+    "description": (
+        "Creative choices only; scene is a top-level task category, not a "
+        "preference. Omitted fields are selected from remembered preferences "
+        "or sensible defaults."
+    ),
     "properties": {
         "style": {"type": "string", "maxLength": preferences.MAX_STYLE_LENGTH},
         "aspect_ratio": {"type": "string", "enum": ["9:16", "16:9", "1:1"]},
@@ -241,7 +245,15 @@ TOOL_DEFINITIONS = [
                 "maxLength": MAX_TASK_ID_LENGTH,
                 "description": "Optional fallback key for direct or CLI calls; a trusted turn_id supplied by the dispatcher is authoritative when present.",
             },
-            "scene": {"type": "string", "maxLength": 64, "default": "general"},
+            "scene": {
+                "type": "string",
+                "maxLength": 64,
+                "default": "general",
+                "description": (
+                    "Top-level semantic task category used for preference "
+                    "resolution; never place scene inside preferences."
+                ),
+            },
             "preferences": _PREFERENCES,
             "silent": {
                 "type": "boolean",
@@ -256,6 +268,7 @@ TOOL_DEFINITIONS = [
                 "Without trusted turn context, reuse task_id for resume or retry; use a new task_id only for an explicit re-edit.",
                 "Explicit preferences override remembered values and defaults.",
                 "Preserve the complete current user request in preferences.user_prompt; user_prompt is not a top-level input.",
+                "scene is a top-level task category and must never be nested inside preferences.",
             ],
             reusable_business_ids=["task_id"],
             success_outputs=["ok", "workflow_id", "scene", "preferences", "sources", "memory_hit", "next"],
@@ -382,14 +395,18 @@ TOOL_DEFINITIONS = [
     ),
     _tool(
         "video_edit_upload_assets",
-        "Upload bounded video assets for a workflow. Interactive edits pass files; proactive edits omit files and reuse the plugin-owned manifest checkpoint. Paths are validated locally.",
+        "Upload one bounded, complete video selection for a workflow. The plugin validates paths and splits provider requests into batches internally.",
         {
             "workflow_id": {"type": "string"},
             "files": {
                 "type": "array",
                 "items": {"type": "string"},
                 "minItems": 1,
-                "maxItems": 8,
+                "maxItems": state.MAX_FILES,
+                "description": (
+                    "The complete ordered source selection for this workflow; "
+                    "do not send a later subset as another tool call."
+                ),
             },
             "normalize": {
                 "type": "boolean",
@@ -399,13 +416,14 @@ TOOL_DEFINITIONS = [
         _help(
             when_to_use="Upload the selected interactive media or continue a proactive workflow after preferences are resolved.",
             cross_field_invariants=[
-                "Interactive workflows supply one to eight trusted media references; proactive workflows reuse their stored manifest selection.",
+                f"Interactive workflows supply the full ordered selection once, up to {state.MAX_FILES} trusted media references; proactive workflows reuse their stored manifest selection.",
+                f"Provider upload requests are split internally into batches of at most {client.MAX_UPLOAD_FILES}; never call this tool with only the next subset.",
                 "Reuse workflow_id and the exact source selection for retry; a changed selection is a new edit.",
             ],
             reusable_business_ids=["workflow_id"],
             success_outputs=["ok", "workflow_id", "uploaded", "reused", "strategy", "next"],
             failure_code="upload_assets_failed",
-            failure_recovery="Retry with the same workflow_id and exact media selection so accepted uploads are reused.",
+            failure_recovery="Retry with the same workflow_id and complete exact media selection so accepted internal batches are reused.",
             recoverable_errors=[
                 {
                     "reason_code": "media_preparation_failed",
@@ -426,7 +444,7 @@ TOOL_DEFINITIONS = [
                     "files": ["MEDIA_REFERENCE_FROM_USER"],
                 },
             ),
-            bad_recovery="Do not change workflow_id, replace the source selection, or repeat already accepted uploads.",
+            bad_recovery="Do not change workflow_id, replace the source selection, or submit a later subset as a second upload call.",
         ),
         ["workflow_id"],
     ),

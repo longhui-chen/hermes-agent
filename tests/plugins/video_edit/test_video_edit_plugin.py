@@ -977,6 +977,68 @@ def test_workflow_rejects_source_selection_changes_instead_of_reusing_old_projec
     assert tools.state.get(workflow, "agent-a")["object_keys"] == ["old-object"]
 
 
+def test_upload_accepts_one_full_selection_and_batches_provider_requests(
+    isolated_video_home,
+    monkeypatch,
+):
+    sources = [
+        isolated_video_home[1] / "agent-a" / f"clip-{index:02d}.mov"
+        for index in range(14)
+    ]
+    sources[0].parent.mkdir(parents=True)
+    for index, source in enumerate(sources):
+        _write_video(source, f"clip-{index}".encode())
+
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {
+                "task_id": "batched-provider-upload",
+                "preferences": {"upload_preference": "raw_direct"},
+            },
+            agent_id="agent-a",
+        )
+    )["workflow_id"]
+    upload_batches: list[list[str]] = []
+    replay_scopes: list[str] = []
+
+    def upload(files, **kwargs):
+        names = [path.name for path in files]
+        upload_batches.append(names)
+        replay_scopes.append(kwargs["replay_scope"])
+        assert len(files) <= client.MAX_UPLOAD_FILES
+        return {
+            "data": {
+                "uploads": [
+                    {"object_key": f"object/{name}"}
+                    for name in names
+                ]
+            }
+        }
+
+    monkeypatch.setattr(client, "upload", upload)
+
+    result = json.loads(
+        tools.handle_upload_assets(
+            {
+                "workflow_id": workflow,
+                "files": [str(source) for source in sources],
+            },
+            agent_id="agent-a",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["uploaded"] == 14
+    assert [len(batch) for batch in upload_batches] == [10, 4]
+    checkpoint = tools.state.get(workflow, "agent-a")
+    fingerprint = checkpoint["source_fingerprint"]
+    assert replay_scopes == [f"{fingerprint}:0", f"{fingerprint}:10"]
+    assert checkpoint["source_paths"] == [str(source) for source in sources]
+    assert checkpoint["object_keys"] == [
+        f"object/{source.name}" for source in sources
+    ]
+
+
 def test_source_fingerprint_ignores_ctime_only_but_detects_inode_replacement():
     info = SimpleNamespace(
         st_dev=7,
@@ -2308,7 +2370,7 @@ def test_partial_normalized_upload_retry_keeps_normalized_strategy(
 ):
     sources = [
         isolated_video_home[1] / "agent-a" / f"normalized-retry-{index}.mov"
-        for index in range(4)
+        for index in range(11)
     ]
     sources[0].parent.mkdir(parents=True)
     for index, source in enumerate(sources):
@@ -2370,7 +2432,7 @@ def test_partial_normalized_upload_retry_keeps_normalized_strategy(
     checkpoint = tools.state.get(workflow, "agent-a")
     assert checkpoint["normalize"] is True
     assert checkpoint["normalizer_generation"] == normalizer.generation()
-    assert len(checkpoint["object_keys"]) == 3
+    assert len(checkpoint["object_keys"]) == 10
 
     retried = json.loads(
         tools.handle_upload_assets(
@@ -2385,12 +2447,12 @@ def test_partial_normalized_upload_retry_keeps_normalized_strategy(
 
     assert retried["ok"] is True
     assert retried["strategy"] == "normalized"
-    assert retried["uploaded"] == 4
-    assert normalize_calls == 2
+    assert retried["uploaded"] == 11
+    assert normalize_calls == 3
     assert uploaded_batches == [
-        ["vewm_0.mp4", "vewm_1.mp4", "vewm_2.mp4"],
-        ["vewm_3.mp4"],
-        ["vewm_3.mp4"],
+        [f"vewm_{index}.mp4" for index in range(10)],
+        ["vewm_0.mp4"],
+        ["vewm_0.mp4"],
     ]
     assert tools.state.get(workflow, "agent-a")["normalize"] is True
 
@@ -2401,7 +2463,7 @@ def test_partial_raw_fallback_retry_keeps_raw_strategy(
 ):
     sources = [
         isolated_video_home[1] / "agent-a" / f"raw-retry-{index}.mov"
-        for index in range(4)
+        for index in range(11)
     ]
     sources[0].parent.mkdir(parents=True)
     for index, source in enumerate(sources):
@@ -2453,7 +2515,7 @@ def test_partial_raw_fallback_retry_keeps_raw_strategy(
     checkpoint = tools.state.get(workflow, "agent-a")
     assert checkpoint["normalize"] is False
     assert checkpoint["normalizer_generation"] == ""
-    assert len(checkpoint["object_keys"]) == 3
+    assert len(checkpoint["object_keys"]) == 10
 
     retried = json.loads(
         tools.handle_upload_assets(
@@ -2468,12 +2530,12 @@ def test_partial_raw_fallback_retry_keeps_raw_strategy(
 
     assert retried["ok"] is True
     assert retried["strategy"] == "raw_direct"
-    assert retried["uploaded"] == 4
+    assert retried["uploaded"] == 11
     assert normalize_calls == 1
     assert uploaded_batches == [
-        ["raw-retry-0.mov", "raw-retry-1.mov", "raw-retry-2.mov"],
-        ["raw-retry-3.mov"],
-        ["raw-retry-3.mov"],
+        [f"raw-retry-{index}.mov" for index in range(10)],
+        ["raw-retry-10.mov"],
+        ["raw-retry-10.mov"],
     ]
     assert tools.state.get(workflow, "agent-a")["normalize"] is False
 
@@ -2484,7 +2546,7 @@ def test_partial_normalized_upload_rejects_a_new_runtime_generation(
 ):
     sources = [
         isolated_video_home[1] / "agent-a" / f"generation-retry-{index}.mov"
-        for index in range(4)
+        for index in range(11)
     ]
     sources[0].parent.mkdir(parents=True)
     for index, source in enumerate(sources):
@@ -2597,7 +2659,9 @@ def test_accepted_normalized_upload_without_checkpoint_rejects_new_generation(
     assert checkpoint["normalize"] is True
     assert checkpoint["normalizer_generation"] == "generation-before-restart"
     assert checkpoint.get("object_keys", []) == []
-    assert accepted_batches == [([source.resolve()], checkpoint["source_fingerprint"])]
+    assert accepted_batches == [
+        ([source.resolve()], f'{checkpoint["source_fingerprint"]}:0')
+    ]
 
     runtime_generation = "generation-after-restart"
     retried = json.loads(
@@ -3198,7 +3262,10 @@ def test_proactive_download_uses_server_trigger_output_bucket(
     "files",
     [
         [{"path": "/volume1/subvol/data/only-one.mov"}],
-        [{"path": f"/volume1/subvol/data/{index}.mov"} for index in range(tools.state.MAX_FILES + 1)],
+        [
+            {"path": f"/volume1/subvol/data/{index}.mov"}
+            for index in range(tools.state.MAX_PROACTIVE_FILES + 1)
+        ],
         [{"path": "/volume1/subvol/data/one.mov"}, {"path": ""}],
     ],
 )
