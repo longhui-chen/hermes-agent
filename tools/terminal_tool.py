@@ -2278,7 +2278,7 @@ def _run_connector_runtime_command_if_allowed(
         # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
         # 显式给,⛔ 不从进程环境里捡。
         secret_values = [
-            connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
+            connector_env.get("HERMES_SESSION_KEY", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()

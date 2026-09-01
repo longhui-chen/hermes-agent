@@ -4,6 +4,7 @@ import textwrap
 import pytest
 
 from agent import secret_scope
+from gateway.session_context import set_zettlab_connector_route_capability
 from tools import terminal_tool as terminal_tool_module
 
 
@@ -35,14 +36,13 @@ def test_terminal_flow_keeps_direct_runner_after_shared_ancestor_changes(
         """
         import os
 
-        if os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "flow-secret":
+        if os.environ.get("HERMES_SESSION_KEY") == "flow-session":
             print("connector-call-succeeded")
         """
     ).lstrip())
 
     monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "shared" / "presets-v1"))
-    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "flow-secret")
     monkeypatch.setattr(terminal_tool_module, "_CONNECTOR_RUNTIME_ROOT_ANCHOR", None)
     monkeypatch.setattr(terminal_tool_module.os, "geteuid", lambda: 424242, raising=False)
     monkeypatch.setattr(terminal_tool_module.os, "getegid", lambda: 424242, raising=False)
@@ -69,12 +69,16 @@ def test_terminal_flow_keeps_direct_runner_after_shared_ancestor_changes(
     terminal_tool_module._capture_connector_runtime_root()
     (tmp_path / "shared" / ".recycle").mkdir()
 
-    result = json.loads(terminal_tool_module.terminal_tool(
-        f"python3 {runtime_path} list-tools",
-        task_id="connector-runtime-shared-ancestor-flow",
-    ))
+    set_zettlab_connector_route_capability("flow-session")
+    try:
+        result = json.loads(terminal_tool_module.terminal_tool(
+            f"python3 {runtime_path} list-tools",
+            task_id="connector-runtime-shared-ancestor-flow",
+        ))
+    finally:
+        set_zettlab_connector_route_capability("")
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
     assert "connector-call-succeeded" in result["output"]
-    assert "flow-secret" not in result["output"]
+    assert "flow-session" not in result["output"]

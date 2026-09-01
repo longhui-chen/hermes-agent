@@ -39,6 +39,11 @@ def test_connector_session_invoke_flag_only_reaches_dedicated_runner(monkeypatch
     assert connector_env["HERMES_SESSION_KEY"] == "C" * 43
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in connector_env
 
+    forged_base = build_connector_runtime_env(
+        {"ZETTLAB_CONNECTORS_AUTH_TOKEN": "legacy-bearer"}
+    )
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in forged_base
+
     generic_env = hermes_subprocess_env()
     assert "ZETTLAB_CONNECTOR_SESSION_INVOKE_V1" not in generic_env
     assert "HERMES_SESSION_KEY" not in generic_env

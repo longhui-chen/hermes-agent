@@ -450,14 +450,15 @@ def test_connector_runtime_keys_actually_reach_the_subprocess(monkeypatch, tmp_p
 
     seen = set(json.loads(completed.output.strip().splitlines()[-1]))
 
-    # ① connector 脚本真正消费的三个键必须到达(skills/intl/monday/scripts/
+    # ① connector 脚本真正消费的 session 路由键必须到达(skills/intl/monday/scripts/
     #    connector_runtime.py 读的正是它们)。⭐ 逐个分别钉,⛔ 不用一个代表 ——
     #    本轮已经栽过一次「镜像断言只钉一个键、漏掉的那个逆改照样全绿」。
-    for key in ("ZETTLAB_CONNECTORS_URL", "ZETTLAB_CONNECTORS_AUTH_TOKEN", "ZET_AGENT_ID"):
+    for key in ("ZETTLAB_CONNECTORS_URL", "ZET_AGENT_ID"):
         assert key in seen, (
             f"{key} 没有到达 connector runtime 的子进程 —— "
             "该 skill 的执行路径被 base_env={} 打断了"
         )
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in seen
     # ② 同时证明 base_env={} 仍在生效:父进程的代理变量与诱饵一个都不许过去。
     leaked = sorted(
         k for k in seen

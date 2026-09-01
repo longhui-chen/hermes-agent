@@ -628,7 +628,7 @@ def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
         ss.reset_secret_scope(token)
         ss.set_multiplex_active(False)
 
-    assert env["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "main-token"
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
     assert env["ZETTLAB_CONNECTORS_URL"].endswith("agent_id=main")
     assert env["ZET_AGENT_ID"] == "main"
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
@@ -650,7 +650,7 @@ def test_build_connector_runtime_env_single_profile_strips_stale_capabilities(
     env = build_connector_runtime_env()
 
     assert env["ZETTLAB_CONNECTORS_URL"] == "http://single.invalid/rpc"
-    assert env["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "single-connector"
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
     assert env["ZET_AGENT_ID"] == "single-agent"
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in env
     assert "ZETTLAB_HARDWARE_EXECUTION_TOKEN" not in env
