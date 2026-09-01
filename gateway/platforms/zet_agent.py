@@ -4050,6 +4050,8 @@ class ZetAgentAdapter(APIServerAdapter):
         trusted_skill_slug = str(
             agent_request_overrides.pop("_zet_trusted_skill_slug", "") or ""
         ).strip()
+        # 受限单步的私有配置：只在本方法内消费（收窄工具/轮数），绝不进 AIAgent / LLM 请求体。
+        agent_request_overrides.pop("_bounded_step", None)
         silent_execution = execution_policy == "silent_automation"
         disable_tools = (
             not silent_execution
@@ -4321,7 +4323,16 @@ class ZetAgentAdapter(APIServerAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
+        # 受限单步（bounded-step 原语）的按步配置，随 request_overrides 穿进来。
+        # 与 api_server._create_agent 同源；zet_agent 复制 body 不调 super，故在此重复。
+        _bounded_step = (request_overrides or {}).get("_bounded_step") or {}
+        bounded_tool_allowlist = _bounded_step.get("tool_face")
+        bounded_max_iterations = _bounded_step.get("max_iterations")
+
         max_iterations = _current_max_iterations()
+        if bounded_max_iterations is not None:
+            # 受限单步：平台按步指定轮数上限，夹到 [1, 配置上限]（HR#1 端侧预算）。
+            max_iterations = max(1, min(int(bounded_max_iterations), max_iterations))
         fallback_model = (
             None
             if silent_execution or confirmed_runtime_lock
@@ -4645,6 +4656,18 @@ class ZetAgentAdapter(APIServerAdapter):
                 execution_policy,
                 trusted_skill_slug,
             )
+        if bounded_tool_allowlist is not None and not disable_tools:
+            # 受限单步（bounded-step 原语）：只放行平台指定的工具白名单（HR#3 显式
+            # allowlist）。放在 execution policy 之后作最终工具面收敛；同滤 agent.tools
+            # （模型看不到白名单外 schema）与 valid_tool_names（conversation_loop gate
+            # 调用）。空白名单=全关。disable_tools（全关）优先。
+            _allow = {str(t).strip() for t in bounded_tool_allowlist if str(t).strip()}
+            agent.tools = [
+                t for t in getattr(agent, "tools", [])
+                if isinstance(t, dict) and (t.get("function") or {}).get("name") in _allow
+            ]
+            agent.valid_tool_names = {t["function"]["name"] for t in agent.tools}
+            agent._skip_mcp_refresh = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider")
             or getattr(agent, "provider", "")
