@@ -576,7 +576,9 @@ def _files_for_upload(entry: dict[str, Any], args: dict[str, Any]) -> list[Path]
                 )
         raw_files = persisted_files
     if not isinstance(raw_files, list) or not raw_files or len(raw_files) > state.MAX_FILES:
-        raise VideoPathError("video file count must be between 1 and 8")
+        raise VideoPathError(
+            f"video file count must be between 1 and {state.MAX_FILES}"
+        )
     agent_id = str(entry.get("agent_id") or "")
     try:
         return [validate_input_file(str(value), agent_id) for value in raw_files]
@@ -616,7 +618,10 @@ def _upload_batches(files: list[Path]) -> list[list[Path]]:
     current_bytes = 0
     for path in files:
         size = path.stat().st_size
-        if current and (len(current) >= 3 or current_bytes + size > 512 * 1024 * 1024):
+        if current and (
+            len(current) >= client.MAX_UPLOAD_FILES
+            or current_bytes + size > 512 * 1024 * 1024
+        ):
             batches.append(current)
             current = []
             current_bytes = 0
@@ -795,46 +800,57 @@ def _handle_upload_assets_locked(
         })
         if len(existing) != len(raw_existing) or len(existing) > len(files):
             raise _WorkflowUnavailable("video upload checkpoint is invalid")
-        upload_files = files
-        if normalize:
-            try:
-                normalized = normalizer.normalize_files(files, workflow_id)
-                upload_files = [output.path for output in normalized]
-                # Read the helper identity after the output has been produced.
-                # This keeps an unavailable optional helper from blocking the
-                # first attempt before the raw-direct fallback can run.
-                normalizer_generation = normalizer.generation()
-                state.update(workflow_id, agent_id, {
-                    "normalizer_generation": normalizer_generation,
-                })
-            except normalizer.NormalizeError:
-                if existing or any(
-                    path.stat().st_size > client.MAX_UPLOAD_BYTES for path in files
-                ):
-                    raise
-                # Hardware normalization is an optimization. When direct
-                # upload remains inside the provider contract, fall back
-                # without asking the user or creating a second workflow.
-                normalize = False
-                upload_files = files
-                state.update(workflow_id, agent_id, {
-                    "normalize": False,
-                    "normalizer_generation": "",
-                    "normalization_fallback": "raw_direct",
-                    "status": "uploading",
-                })
         uploaded = list(existing)
-        normalized_by_path = {output.path: output for output in normalized}
-        for batch in _upload_batches(upload_files[len(existing):]):
-            batch_outputs = (
-                [normalized_by_path[path] for path in batch]
-                if normalize
-                else None
-            )
+        for source_batch in _upload_batches(files[len(existing):]):
+            batch = source_batch
+            batch_outputs: list[normalizer.NormalizedOutput] | None = None
+            if normalize:
+                try:
+                    normalized = normalizer.normalize_files(source_batch, workflow_id)
+                    batch = [output.path for output in normalized]
+                    batch_outputs = normalized
+                    # Pin one helper generation across every accepted batch so
+                    # a rollout cannot mix differently prepared media inside a
+                    # single project.
+                    current_generation = normalizer.generation()
+                    if (
+                        normalizer_generation
+                        and normalizer_generation != current_generation
+                    ):
+                        raise _WorkflowUnavailable(
+                            "video media preparation changed; start a new edit"
+                        )
+                    normalizer_generation = current_generation
+                    state.update(
+                        workflow_id,
+                        agent_id,
+                        {"normalizer_generation": normalizer_generation},
+                    )
+                except normalizer.NormalizeError:
+                    if uploaded or any(
+                        path.stat().st_size > client.MAX_UPLOAD_BYTES
+                        for path in files
+                    ):
+                        raise
+                    # Preparation is an optimization until the first provider
+                    # batch is accepted. If it is unavailable, the whole
+                    # workflow deterministically falls back to raw upload.
+                    if normalized:
+                        normalizer.cleanup(normalized, workflow_id)
+                    normalize = False
+                    normalized = []
+                    batch = source_batch
+                    batch_outputs = None
+                    state.update(workflow_id, agent_id, {
+                        "normalize": False,
+                        "normalizer_generation": "",
+                        "normalization_fallback": "raw_direct",
+                        "status": "uploading",
+                    })
             body = client.upload(
                 batch,
                 agent_id=agent_id,
-                replay_scope=source_fingerprint,
+                replay_scope=f"{source_fingerprint}:{len(uploaded)}",
                 normalized_outputs=batch_outputs,
             )
             batch_keys = client.extract_upload_keys(body)
@@ -849,7 +865,7 @@ def _handle_upload_assets_locked(
                     "uploaded_count": len(uploaded),
                     "status": (
                         "assets_uploaded"
-                        if len(uploaded) >= len(upload_files)
+                        if len(uploaded) >= len(files)
                         else "uploading"
                     ),
                 },
@@ -858,9 +874,7 @@ def _handle_upload_assets_locked(
             # batch has been accepted; the durable workflow keeps only keys.
             if batch_outputs is not None:
                 normalizer.cleanup(batch_outputs, workflow_id)
-                normalized = [
-                    output for output in normalized if output not in batch_outputs
-                ]
+                normalized = []
         return _ok({"ok": True, "workflow_id": workflow_id, "uploaded": len(uploaded), "strategy": "normalized" if normalize else "raw_direct", "next": "video_edit_create_project"})
     except Exception as exc:
         return _business_fail(
@@ -1242,7 +1256,7 @@ def handle_proactive_resolve(args: dict, **kwargs: Any) -> str:
         scene = str(payload.get("scene") or "general")
         resolved = preferences.resolve(agent_id, scene, {}, silent=True)
         files = payload["files"]
-        if not 2 <= len(files) <= state.MAX_FILES:
+        if not 2 <= len(files) <= state.MAX_PROACTIVE_FILES:
             raise _WorkflowUnavailable("proactive workflow manifest is unavailable")
         if any(
             not isinstance(item, dict)

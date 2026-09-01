@@ -47,6 +47,7 @@ HELP_SCHEMA_DIGEST_BY_VERSION = {
     "1.6": "e8fa7a6778e0f60d8690db7a6ae4ebf0a7dfb3f7f8b1b8c77271644cdcf62709",
     "1.7": "baccd822ed985b1b0b69008be51083bc1009d86060fc12a76d792d19dcd1ff08",
     "1.8": "b9ecbee9306e6cd0213d59e22bee78cb824a537ac55057148fc55685685725a2",
+    "1.9": "fec69dde221b47e6618388062d94035ed39fae83fe356df7feb6a638d452107b",
 }
 
 OVERVIEW_FIELDS = {
@@ -407,6 +408,47 @@ def test_preference_update_help_preserves_unrepresentable_qualifiers():
     assert "do not call this tool" in invariants
 
 
+def test_resolve_schema_keeps_scene_outside_creative_preferences():
+    definition = next(
+        item
+        for item in schemas.TOOL_DEFINITIONS
+        if item["name"] == "video_edit_preferences_resolve"
+    )
+    properties = definition["parameters"]["properties"]
+    overview = _parsed(
+        tools.HANDLERS["video_edit_preferences_resolve"],
+        {"help": True},
+    )
+
+    assert "top-level" in properties["scene"]["description"].lower()
+    assert "scene" not in properties["preferences"]["properties"]
+    assert any(
+        "scene" in invariant.lower() and "top-level" in invariant.lower()
+        for invariant in overview["cross_field_invariants"]
+    )
+
+
+def test_upload_schema_exposes_full_selection_while_provider_batches_stay_bounded():
+    definition = next(
+        item
+        for item in schemas.TOOL_DEFINITIONS
+        if item["name"] == "video_edit_upload_assets"
+    )
+    files = definition["parameters"]["properties"]["files"]
+    overview = _parsed(
+        tools.HANDLERS["video_edit_upload_assets"],
+        {"help": True},
+    )
+
+    assert client.MAX_UPLOAD_FILES == 10
+    assert files["maxItems"] == state.MAX_FILES
+    assert state.MAX_FILES > client.MAX_UPLOAD_FILES
+    invariants = " ".join(overview["cross_field_invariants"]).lower()
+    assert "full ordered selection" in invariants
+    assert "internally" in invariants
+    assert "10" in invariants
+
+
 def test_sanitized_model_schemas_keep_all_normal_required_inputs_visible():
     from tools.schema_sanitizer import sanitize_tool_schemas
 
@@ -594,7 +636,10 @@ def test_terminal_help_recovery_wording_is_business_neutral():
         ("video_edit_preferences_record_success", {"preferences": []}, "type"),
         (
             "video_edit_upload_assets",
-            {"workflow_id": "WORKFLOW_ID", "files": ["MEDIA_REFERENCE"] * 9},
+            {
+                "workflow_id": "WORKFLOW_ID",
+                "files": ["MEDIA_REFERENCE"] * (state.MAX_FILES + 1),
+            },
             "maxItems",
         ),
         (
@@ -657,7 +702,10 @@ def test_schema_validator_accepts_boundaries_and_rejects_every_constraint_family
         ),
         (
             "video_edit_upload_assets",
-            {"workflow_id": "WORKFLOW_ID", "files": ["MEDIA_REFERENCE"] * 8},
+            {
+                "workflow_id": "WORKFLOW_ID",
+                "files": ["MEDIA_REFERENCE"] * state.MAX_FILES,
+            },
         ),
         (
             "video_edit_preferences_resolve",
