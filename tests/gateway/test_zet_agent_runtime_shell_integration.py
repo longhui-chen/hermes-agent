@@ -57,6 +57,7 @@ class _FakeAgent:
         self._end_session_on_close = True
         self._cached_system_prompt = None
         self._cached_system_prompt_static = None
+        self._checkpoint_mgr = SimpleNamespace(enabled=False)
         self.prompt_invalidations = 0
         self.end_session_calls = 0
         self.released = 0
@@ -77,6 +78,10 @@ class _FakeAgent:
         self.prompt_invalidations += 1
         self._cached_system_prompt = None
         self._cached_system_prompt_static = None
+
+    def _touch_activity(self, _reason):
+        """Match the production activity hook used by tool dispatch."""
+        return None
 
     def _create_request_openai_client(self, *, reason, api_kwargs=None):
         self.request_clients_created += 1
