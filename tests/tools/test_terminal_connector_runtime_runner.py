@@ -677,6 +677,67 @@ def test_nested_shell_guard_ignores_runtime_path_used_as_command_data(monkeypatc
     assert result is None
 
 
+def test_connector_runtime_shell_guard_blocks_python_subprocess_wrapper():
+    source = (
+        "import os, subprocess; "
+        'subprocess.run(["python3", '
+        'os.path.join(os.environ["ZETTLAB_PRESETS_DIR"], '
+        '"skills/github/scripts/connector_runtime.py"), '
+        '"list-tools", "--prefix", "github."])'
+    )
+
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        f"python3 -c {shlex.quote(source)}"
+    )
+
+    assert result is not None
+    payload = json.loads(result)
+    assert payload["connector_runtime_blocked"] is True
+    assert payload["errorCode"] == "connector_runtime_compound_command"
+
+
+def test_python_subprocess_connector_runtime_flow_is_blocked_before_generic_terminal(
+    monkeypatch,
+    tmp_path,
+):
+    _write_connector_runtime(tmp_path, "github")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    source = (
+        "import os, subprocess; "
+        'subprocess.run(["python3", '
+        'os.path.join(os.environ["ZETTLAB_PRESETS_DIR"], '
+        '"skills/github/scripts/connector_runtime.py"), '
+        '"list-tools", "--prefix", "github."])'
+    )
+
+    result = json.loads(
+        terminal_tool_module.terminal_tool(
+            f"python3 -c {shlex.quote(source)}",
+            task_id="connector-runtime-python-wrapper",
+        )
+    )
+
+    assert result["connector_runtime_blocked"] is True
+    assert result["errorCode"] == "connector_runtime_compound_command"
+    assert result["connector_error"]["nextAction"] == {"type": "retry_single_command"}
+    assert "runner-token" not in json.dumps(result)
+
+
+def test_connector_runtime_shell_guard_allows_unrelated_python_command():
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        "python3 -c 'print(\"connector runtime diagnostics\")'"
+    )
+
+    assert result is None
+
+
 def test_nested_shell_guard_stops_parsing_options_after_double_dash(monkeypatch):
     monkeypatch.setattr(
         terminal_tool_module,
