@@ -24,6 +24,7 @@ _ACTIONS = frozenset({
     "discard", "maintainer_schedule_status", "maintenance_tasks",
     "create_maintenance_task", "update_maintenance_task",
     "delete_maintenance_task", "maintenance_task_runs",
+    "maintenance_task_events",
 })
 _MAX_RESPONSE_BYTES = 1024 * 1024
 # App Host accepts an 8 MiB patch, but a subsequent read serializes its
@@ -100,7 +101,9 @@ APP_WORKSPACE_SCHEMA = {
             "app_operation": {"type": "string", "description": "For create_maintenance_task: declared app write operation, read from app_capabilities first."},
             "capability_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "For create_maintenance_task: exact digest from app_capabilities for app_operation."},
             "instruction": {"type": "string", "description": "For create_maintenance_task: concise user-approved collection or summary instruction."},
-            "task_id": {"type": "string", "description": "For update_maintenance_task, delete_maintenance_task, or maintenance_task_runs: the id returned by maintenance_tasks."},
+            "task_id": {"type": "string", "description": "For update_maintenance_task, delete_maintenance_task, maintenance_task_runs, or maintenance_task_events: the id returned by maintenance_tasks."},
+            "spec_id": {"type": "string", "description": "For maintenance_task_events: the task's spec id (as named in the run prompt) when task_id is unknown."},
+            "ack": {"type": "boolean", "description": "For maintenance_task_events: acknowledge (remove) the returned events; default true. Pass false to peek."},
             "expected_schedule_revision": {"type": "integer", "minimum": 0, "description": "For update_maintenance_task: current schedule_revision returned by maintenance_tasks."},
             "enabled": {"type": "boolean", "description": "For update_maintenance_task: whether this task should run."},
         },
@@ -199,6 +202,24 @@ def _build_request(args: dict):
             "timezone": str(args["timezone"]).strip(), "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(),
             "capability_digest": digest, "instruction": str(args["instruction"]).strip(),
         }, _apphost._DEFAULT_TIMEOUT
+    if action == "maintenance_task_events":
+        _only(args, base_fields | {"task_id", "spec_id", "ack"})
+        query = {"expected_instance_id": instance}
+        task_id = str(args.get("task_id", "") or "").strip()
+        spec_id = str(args.get("spec_id", "") or "").strip()
+        if task_id:
+            query["task_id"] = _required_task_id(args)
+        elif spec_id:
+            if len(spec_id) > 64 or "/" in spec_id or "\\" in spec_id:
+                raise _apphost._BadRequest("spec_id 必须是任务的 spec id")
+            query["spec_id"] = spec_id
+        else:
+            raise _apphost._BadRequest("maintenance_task_events 需要 task_id 或 spec_id")
+        ack = args.get("ack", True)
+        if not isinstance(ack, bool):
+            raise _apphost._BadRequest("ack 必须是布尔值")
+        query["ack"] = "true" if ack else "false"
+        return "GET", f"/{quote(slug, safe='')}/maintenance_task_events?" + urlencode(query), None, _apphost._DEFAULT_TIMEOUT
     if action == "maintenance_task_runs":
         _only(args, base_fields | {"task_id"})
         return "GET", f"/{quote(slug, safe='')}/maintenance_tasks/{quote(_required_task_id(args), safe='')}/runs?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
@@ -322,6 +343,10 @@ def _maintenance_task_response(parsed, *, action: str):
         return parsed
     if action == "maintenance_task_runs":
         if not isinstance(parsed, dict) or not isinstance(parsed.get("occurrences"), list):
+            return None
+        return parsed
+    if action == "maintenance_task_events":
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("events"), list):
             return None
         return parsed
     return parsed
