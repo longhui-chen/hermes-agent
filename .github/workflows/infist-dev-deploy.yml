@@ -207,7 +207,18 @@ jobs:
           #     缺 SDK 时 langfuse 插件惰性空转、设备静默不出 trace（ZET-1188）。
           if ! venv/bin/python -c "import langfuse" >/dev/null 2>&1; then
             echo "::warning::langfuse SDK 缺失（疑 fallback 重建漏装 opt-in extra），补装 langfuse==4.7.1"
-            venv/bin/python -m pip install "langfuse==4.7.1" 2>&1 | tail -8 || true
+            # uv-created environments intentionally do not contain pip.  This
+            # is common on boards that have no pre-existing venv (for example
+            # a freshly provisioned ZPK board), so prefer uv's interpreter-
+            # targeted installer and only use python -m pip after bootstrapping
+            # pip with ensurepip.  The old unconditional `python -m pip` made
+            # deployment fail after init-hermes-env.sh had actually succeeded.
+            if command -v uv >/dev/null 2>&1; then
+              uv pip install --python venv/bin/python "langfuse==4.7.1"
+            else
+              venv/bin/python -m ensurepip --upgrade
+              venv/bin/python -m pip install "langfuse==4.7.1"
+            fi
           fi
           if ! venv/bin/python -c "import langfuse" >/dev/null 2>&1; then
             echo "::error::langfuse SDK 仍 import 失败 —— 设备将不出 trace，fail job"
