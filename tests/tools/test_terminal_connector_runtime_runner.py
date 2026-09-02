@@ -26,7 +26,8 @@ def _write_connector_runtime(tmp_path, skill_id="linear"):
         """
         import os
 
-        print("connector token ok: " + str(os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "runner-token"))
+        print("connector session ok: " + str(os.environ.get("HERMES_SESSION_KEY") == "turn-capability"))
+        print("legacy bearer absent: " + str("ZETTLAB_CONNECTORS_AUTH_TOKEN" not in os.environ))
         print("connector_agent=" + str(os.environ.get("ZET_AGENT_ID")))
         """
     ).lstrip())
@@ -40,7 +41,8 @@ def _write_action_runtime(tmp_path, skill_id="software-quality-connector-actions
         """
         import os
 
-        print("action token ok: " + str(os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "runner-token"))
+        print("action session ok: " + str(os.environ.get("HERMES_SESSION_KEY") == "turn-capability"))
+        print("legacy bearer absent: " + str("ZETTLAB_CONNECTORS_AUTH_TOKEN" not in os.environ))
         print("action_route=" + os.environ.get("HERMES_SESSION_KEY", ""))
         print("action_runtime=" + os.environ.get("ZETTLAB_CONNECTOR_ACTION_RUNTIME", ""))
         """
@@ -71,10 +73,11 @@ def _write_connector_runtime_with_global_mutation(tmp_path):
         import os
         import sys
 
-        os.environ["PARENT_SHOULD_NOT_SEE"] = os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", "")
+        os.environ["PARENT_SHOULD_NOT_SEE"] = os.environ.get("HERMES_SESSION_KEY", "")
         sys.path[:] = ["connector-only-path"]
         os.chdir("/")
-        print("worker token ok: " + str(os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "runner-token"))
+        print("worker session ok: " + str(os.environ.get("HERMES_SESSION_KEY") == "turn-capability"))
+        print("legacy bearer absent: " + str("ZETTLAB_CONNECTORS_AUTH_TOKEN" not in os.environ))
         """
     ).lstrip())
     return script
@@ -97,6 +100,7 @@ def _write_connector_runtime_sleep(tmp_path):
 def test_connector_runtime_direct_runner_flow_receives_profile_scoped_env(monkeypatch, tmp_path):
     """Official presets keep working through the dedicated connector runner."""
     from agent import secret_scope as ss
+    from gateway.session_context import set_zettlab_connector_route_capability
 
     _write_connector_runtime(tmp_path)
     monkeypatch.setenv("TERMINAL_ENV", "local")
@@ -109,15 +113,19 @@ def test_connector_runtime_direct_runner_flow_receives_profile_scoped_env(monkey
         lambda path, presets_root, **kwargs: True,
     )
     ss.set_multiplex_active(False)
-
-    result = json.loads(terminal_tool_module.terminal_tool(
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
-        task_id="connector-runtime-direct-test",
-    ))
+    set_zettlab_connector_route_capability("turn-capability")
+    try:
+        result = json.loads(terminal_tool_module.terminal_tool(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
+            task_id="connector-runtime-direct-test",
+        ))
+    finally:
+        set_zettlab_connector_route_capability("")
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
-    assert "connector token ok: True" in result["output"]
+    assert "connector session ok: True" in result["output"]
+    assert "legacy bearer absent: True" in result["output"]
     assert "connector_agent=agent-1" in result["output"]
 
 
@@ -153,8 +161,10 @@ def test_action_runtime_direct_runner_flow_receives_turn_capability(monkeypatch,
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
-    assert "action token ok: True" in result["output"]
-    assert "action_route=turn-capability" in result["output"]
+    assert "action session ok: True" in result["output"]
+    assert "legacy bearer absent: True" in result["output"]
+    assert "action_route=[REDACTED]" in result["output"]
+    assert "turn-capability" not in result["output"]
     assert (
         "action_runtime=skills/software-quality-connector-actions/scripts/action_runtime.py"
         in result["output"]
@@ -182,8 +192,9 @@ def test_connector_action_runtime_identity_is_not_inherited_by_generic_or_env_bu
     )
 
 
-def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatch, tmp_path):
-    """Connector bearer is delivered over stdin to the allowlisted runner."""
+def test_connector_runtime_direct_runner_injects_session_without_retired_bearer(monkeypatch, tmp_path):
+    """The allowlisted runner gets only the session route, never the retired CRT."""
+    from gateway.session_context import set_zettlab_connector_route_capability
     from tools import trusted_direct_runner
 
     script = _write_connector_runtime(tmp_path)
@@ -213,17 +224,22 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
         fake_run,
     )
 
-    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
-        cwd=str(tmp_path),
-        timeout=5,
-    ))
+    set_zettlab_connector_route_capability("turn-capability")
+    try:
+        result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
+            cwd=str(tmp_path),
+            timeout=5,
+        ))
+    finally:
+        set_zettlab_connector_route_capability("")
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["base_env"]
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["injected_env"]
     assert "ZETTLAB_CONNECTORS_URL" not in captured["base_env"]
-    assert captured["injected_env"]["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "runner-token"
+    assert captured["injected_env"]["HERMES_SESSION_KEY"] == "turn-capability"
     assert captured["injected_env"]["ZETTLAB_CONNECTORS_URL"] == "http://127.0.0.1/rpc"
     assert captured["injected_env"]["ZETTLAB_CONNECTOR_ACTION_RUNTIME"] == (
         "skills/linear/scripts/connector_runtime.py"
@@ -303,6 +319,8 @@ def test_shared_linear_connector_runtime_receives_action_runtime_identity(
 
 def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkeypatch, tmp_path):
     """Worker env/path/cwd/stdout mutations cannot bleed into the gateway process."""
+    from gateway.session_context import set_zettlab_connector_route_capability
+
     _write_connector_runtime_with_global_mutation(tmp_path)
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
@@ -315,6 +333,7 @@ def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkey
     original_path = list(sys.path)
     original_stdout = sys.stdout
     sys.stdout = StringIO()
+    set_zettlab_connector_route_capability("turn-capability")
     try:
         result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
             'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
@@ -322,12 +341,14 @@ def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkey
             timeout=5,
         ))
     finally:
+        set_zettlab_connector_route_capability("")
         captured_parent_stdout = sys.stdout.getvalue()
         sys.stdout = original_stdout
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
-    assert "worker token ok: True" in result["output"]
+    assert "worker session ok: True" in result["output"]
+    assert "legacy bearer absent: True" in result["output"]
     assert "PARENT_SHOULD_NOT_SEE" not in os.environ
     assert os.getcwd() == original_cwd
     assert sys.path == original_path
@@ -409,6 +430,8 @@ def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_pa
 
 
 def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, tmp_path):
+    from gateway.session_context import set_zettlab_connector_route_capability
+
     secret = "SECRET-" + ("x" * 64) + "-END"
     script = tmp_path / "presets" / "skills" / "linear" / "scripts" / "connector_runtime.py"
     script.parent.mkdir(parents=True)
@@ -416,7 +439,7 @@ def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, 
         f"""
         import os
 
-        print("prefix-" + os.environ["ZETTLAB_CONNECTORS_AUTH_TOKEN"] + "-suffix")
+        print("prefix-" + os.environ["HERMES_SESSION_KEY"] + "-suffix")
         """
     ).lstrip())
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
@@ -430,11 +453,15 @@ def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, 
 
     monkeypatch.setattr(tool_output_limits, "get_max_bytes", lambda: 45)
 
-    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
-        cwd=str(tmp_path),
-        timeout=5,
-    ))
+    set_zettlab_connector_route_capability(secret)
+    try:
+        result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
+            cwd=str(tmp_path),
+            timeout=5,
+        ))
+    finally:
+        set_zettlab_connector_route_capability("")
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0

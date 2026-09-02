@@ -75,7 +75,15 @@ def test_create_does_not_persist_a_connector_grant(monkeypatch):
 
     def create_job(**kwargs):
         saved.update(kwargs)
-        return {"id": "job-1", **kwargs}
+        job = dict(kwargs)
+        job.update(
+            id="job-1",
+            name=kwargs.get("name") or "Linear",
+            schedule_display="every 1 hour",
+            next_run_at="2026-09-02T00:00:00Z",
+            repeat={"times": kwargs.get("repeat"), "completed": 0},
+        )
+        return job
 
     monkeypatch.setattr(cronjob_tools, "create_job", create_job)
     monkeypatch.setattr(cronjob_tools, "_notify_provider_jobs_changed_safe", lambda: None)
