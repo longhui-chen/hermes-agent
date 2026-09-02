@@ -309,13 +309,7 @@ TOOLSETS = {
     # the model's schema (found on a real device).
     "zettlab_apphost": {
         "description": "Manage device-hosted generated applications and their owner-scoped data (zettlab)",
-        "tools": ["app_host", "app_data"],
-        "includes": []
-    },
-
-    "zettlab_createpipeline": {
-        "description": "Trigger the platform application-creation pipeline: start from a one-line intent, poll status (zettlab)",
-        "tools": ["create_pipeline"],
+        "tools": ["app_host", "app_data", "create_pipeline"],
         "includes": []
     },
 

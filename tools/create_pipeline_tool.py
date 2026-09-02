@@ -4,9 +4,12 @@ app-dispatch routes a NEW-app request here instead of the main Chat Agent
 free-lancing skills (product-prototyping, app-coding, …): the platform pipeline
 runs guide→assemble→coding→compile→selftest→publish with the order welded in, so
 no stray skill can intercept creation and no step is skipped. Loopback-only, same
-trust model as app_host (the createpipeline face ignores the action token but we
-send it for parity). The run executes in the background — `create` returns a
+trust model as app_host. The run executes in the background — `create` returns a
 run_id immediately; poll `status` until done/failed.
+
+Registered under the zettlab_apphost toolset (verified on-device: a separate
+toolset's tool was silently dropped by the platform reverse-mapping; app_host's
+toolset resolves + carries the same App Host secret scope).
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ _SCHEMA = {
         "Start the platform's application-creation pipeline from a one-line intent, "
         "or poll a run. Use this for a NEW app request INSTEAD of writing code or "
         "opening prototyping skills yourself — the platform drives "
-        "guide→assemble→coding→compile→selftest→publish deterministically, in order. "
+        "guide->assemble->coding->compile->selftest->publish deterministically, in order. "
         "action='create' needs `intent` (the user's one-line request) and returns a "
         "run_id; action='status' needs `run_id` and returns step/done/failed/entry_url."
     ),
@@ -46,7 +49,7 @@ def _secret(name: str) -> str:
 
 def _base_url() -> str:
     """Derive the create-pipeline loopback base from the app_host base
-    (…/api/v1/internal/apphost → …/api/v1/internal/createpipeline). Reuses the
+    (…/api/v1/internal/apphost -> …/api/v1/internal/createpipeline). Reuses the
     already-injected ZET_APPHOST_BASE_URL so no new registry env is needed."""
     raw = _secret("ZET_APPHOST_BASE_URL")
     try:
@@ -57,20 +60,33 @@ def _base_url() -> str:
     except (ValueError, TypeError):
         return ""
     path = parsed.path.rstrip("/")
-    if not path.endswith("/apphost"):
-        return ""
-    path = path[: -len("/apphost")] + "/createpipeline"
+    if path.endswith("/apphost"):
+        path = path[: -len("/apphost")] + "/createpipeline"
+    elif "/internal" in path:
+        path = path.rsplit("/internal", 1)[0] + "/internal/createpipeline"
+    else:
+        path = path + "/createpipeline"
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
-def _enabled() -> bool:
-    return bool(_base_url() and _secret("ZETTLAB_AGENT_ACTION_TOKEN"))
+def _cp_enabled() -> bool:
+    # Gate on the App Host base secret + the action token (same session condition
+    # as app_host). The /createpipeline sibling is always reachable when /apphost
+    # is; do NOT gate on the derived URL (call-time concern). A unique name avoids
+    # any registry check_fn keying collision with other tools' `_enabled`.
+    return bool(_secret("ZET_APPHOST_BASE_URL") and _secret("ZETTLAB_AGENT_ACTION_TOKEN"))
 
 
-_enabled._profile_scope_sensitive = True  # type: ignore[attr-defined]
+_cp_enabled._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 
-def create_pipeline(action: str = "status", intent: str = "", run_id: str = "", **_: Any) -> str:
+def create_pipeline(args: Any = None, **_: Any) -> str:
+    # hermes dispatch calls handler(args, **kwargs): the first positional `args`
+    # is the parsed argument dict (see app_host_tool's args.get(...) pattern —
+    # the unpacked-kwargs signature crashes with "unhashable type: 'dict'").
+    if not isinstance(args, dict):
+        args = {}
+    action = str(args.get("action", "") or "").strip()
     if action not in _ACTIONS:
         return json.dumps({"success": False, "code": "invalid_action"}, ensure_ascii=False)
     base = _base_url()
@@ -79,16 +95,16 @@ def create_pipeline(action: str = "status", intent: str = "", run_id: str = "", 
     headers = {"X-Zettlab-Agent-Action-Token": _secret("ZETTLAB_AGENT_ACTION_TOKEN")}
     try:
         if action == "create":
-            intent = str(intent or "").strip()
+            intent = str(args.get("intent", "") or "").strip()
             if not intent:
                 return json.dumps({"success": False, "code": "intent_required"}, ensure_ascii=False)
-            body: dict[str, str] = {"intent": intent}
+            body = {"intent": intent}
             owner = _secret("ZET_AGENT_ID")
             if owner:
                 body["owner_agent"] = owner
             response = requests.post(base + "/create", headers=headers, json=body, timeout=15)
         else:  # status
-            run_id = str(run_id or "").strip()
+            run_id = str(args.get("run_id", "") or "").strip()
             if not run_id:
                 return json.dumps({"success": False, "code": "run_id_required"}, ensure_ascii=False)
             response = requests.get(base + "/status/" + quote(run_id, safe=""), headers=headers, timeout=10)
@@ -98,4 +114,4 @@ def create_pipeline(action: str = "status", intent: str = "", run_id: str = "", 
         return json.dumps({"success": False, "code": "create_pipeline_unavailable", "error": str(exc)[:256]}, ensure_ascii=False)
 
 
-registry.register(name="create_pipeline", toolset="zettlab_createpipeline", schema=_SCHEMA, handler=create_pipeline, check_fn=_enabled, defer_to_tool_search=False)
+registry.register(name="create_pipeline", toolset="zettlab_apphost", schema=_SCHEMA, handler=create_pipeline, check_fn=_cp_enabled, defer_to_tool_search=False)
