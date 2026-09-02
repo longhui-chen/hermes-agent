@@ -2,12 +2,12 @@
 
 A user who attaches a PDF / DOCX in chat used to see the agent treat it as
 "unreadable" because the context note told the model to "Ask the user what
-they'd like you to do with it" — steering it away from extracting the text it
-is perfectly capable of reading. These tests pin the contract:
+they'd like you to do with it" — steering it away from reading the runtime's
+canonical document artifact. These tests pin the contract:
 
 - text documents: note confirms the (adapter-)inlined content + records path.
-- binary documents (PDF/DOCX/…): note tells the agent to extract the text
-  itself and never tells it to punt back to the user.
+- binary documents (PDF/DOCX/…): note tells the agent to use `read_file` and
+  never starts a second parser or punts back to the user.
 """
 
 import importlib
@@ -38,12 +38,13 @@ class TestBinaryDocumentNote:
             "application/octet-stream",
         ],
     )
-    def test_binary_note_guides_extraction(self, mtype):
+    def test_binary_note_guides_canonical_read(self, mtype):
         note = _build_document_context_note("contract.pdf", "/cache/doc_contract.pdf", mtype)
         # Records the path so the agent can open it.
         assert "/cache/doc_contract.pdf" in note
-        # Tells the agent to read it by extracting the text...
-        assert "extract" in note.lower()
+        assert "read_file" in note
+        assert "canonical parsed content" in note
+        assert "do not run another parser or ocr tool" in note.lower()
         # ...and does NOT steer it into punting back to the user (the bug).
         assert "ask the user" not in note.lower()
         assert "paste" in note.lower()

@@ -16,9 +16,10 @@ BINARY_EXTENSIONS = frozenset({
     # Executables/binaries
     ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".obj", ".lib",
     ".app", ".msi", ".deb", ".rpm",
-    # Documents (exclude .pdf — text-based, agents may want to inspect)
-    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".odt", ".ods", ".odp",
+    # Documents. Their canonical text is runtime-owned; Hermes never decodes
+    # these binary source formats itself.
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".odt", ".ods", ".odp", ".epub", ".mobi", ".rtf", ".msg",
     # Fonts
     ".ttf", ".otf", ".woff", ".woff2", ".eot",
     # Bytecode / VM artifacts

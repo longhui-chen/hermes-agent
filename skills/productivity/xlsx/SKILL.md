@@ -1,6 +1,6 @@
 ---
 name: xlsx
-description: "Create, read, edit Excel .xlsx spreadsheets and CSVs."
+description: "Create and edit Excel .xlsx spreadsheets and CSVs."
 version: 1.0.0
 author: Anthropic (adapted by Nous Research)
 license: Proprietary. LICENSE.txt has complete terms
@@ -14,7 +14,7 @@ metadata:
 
 # XLSX Skill
 
-Create, read, and edit Excel workbooks — formulas, formatting, charts, data cleaning, and format conversion. Every formula-bearing output must be recalculated and error-free before delivery.
+Create and edit Excel workbooks — formulas, formatting, charts, data cleaning, and format conversion. Runtime-owned document parsing supplies canonical Markdown for reading. Every formula-bearing output must be recalculated and error-free before delivery.
 
 ## When to Use
 
@@ -23,7 +23,7 @@ Use this skill any time a spreadsheet file is the primary input or output: openi
 ## Prerequisites
 
 ```bash
-pip install openpyxl pandas "markitdown[xlsx]"
+pip install openpyxl pandas
 which soffice || sudo apt install -y libreoffice   # formula recalculation (scripts/recalc.py)
 ```
 
@@ -35,7 +35,7 @@ macOS: `brew install libreoffice`.
 |---|---|
 | **Create** or **edit** with formulas/formatting | `openpyxl` — see gotchas below |
 | **Bulk data** in or out | `pandas` (`read_excel`, `to_excel`) |
-| **Quick look** at a sheet | `markitdown file.xlsx` — `## SheetName` per sheet; reads `.xlsm` too. No cell coordinates, so don't plan edits from it. (`read_file` also auto-extracts .xlsx) |
+| **Read workbook content** | `read_file` (runtime canonical Markdown; no local parsing) |
 | **Read** a model (formulas *and* values) | two `load_workbook` passes — see gotchas |
 
 > Script paths below are relative to this skill's directory.
