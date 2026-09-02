@@ -205,8 +205,9 @@ def _write_connector_runtime(tmp_path: Path) -> None:
     )
     script.parent.mkdir(parents=True)
     script.write_text(
-        "import json, os\n"
-        "print(json.dumps({'route': os.environ.get('HERMES_SESSION_KEY', '')}))\n",
+        "import hashlib, json, os\n"
+        "route = os.environ.get('HERMES_SESSION_KEY', '')\n"
+        "print(json.dumps({'route_sha256': hashlib.sha256(route.encode()).hexdigest()}))\n",
         encoding="utf-8",
     )
 
@@ -313,8 +314,14 @@ async def test_zet_http_connector_turn_recovers_lost_tool_context_without_cross_
 
         route_a = "A" * 43
         route_b = "B" * 43
-        assert await _post(route_a) == {"route": route_a}
-        assert await _post(route_b) == {"route": route_b}
+        import hashlib
+
+        assert await _post(route_a) == {
+            "route_sha256": hashlib.sha256(route_a.encode()).hexdigest()
+        }
+        assert await _post(route_b) == {
+            "route_sha256": hashlib.sha256(route_b.encode()).hexdigest()
+        }
 
     assert zettlab_connector_route_capability() == ""
 
