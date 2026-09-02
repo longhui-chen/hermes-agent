@@ -4434,6 +4434,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 _zet_runtime_shell_cache_allowed.get()
                 and execution_policy == ""
                 and not disable_tools
+                # 平台按轮笼子（tool_face）作用在新建的 agent 上：命中缓存壳会跳过
+                # 收窄、收窄后的壳被缓存又会漏到下一轮——受限轮一律不走缓存。
+                and bounded_tool_allowlist is None
                 and not confirmed_runtime_lock
                 and bool(gateway_session_key)
                 and bool(session_id)
@@ -4527,6 +4530,8 @@ class ZetAgentAdapter(APIServerAdapter):
                     runtime_cache_reason = "confirmed_runtime_lock"
                 elif disable_tools:
                     runtime_cache_reason = "tools_disabled"
+                elif bounded_tool_allowlist is not None:
+                    runtime_cache_reason = "bounded_tool_face"
                 elif execution_policy:
                     runtime_cache_reason = "special_execution_policy"
                 elif not gateway_session_key or not session_id:

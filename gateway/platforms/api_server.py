@@ -747,6 +747,30 @@ def _extract_skill_slug(body: Dict[str, Any]) -> str:
     return slug
 
 
+def _extract_turn_cage(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Platform turn cage: ``metadata.tool_face`` (list of tool names) and
+    ``metadata.max_iterations`` (int) narrow ONE chat turn to the platform's
+    whitelist — local-server sets them for a session bound to a create-pipeline
+    run in its guide stage. They ride the same ``_bounded_step`` override the
+    bounded-step endpoint uses, so the narrowing is allowlist-only (it can never
+    widen the agent's tools). Absent / malformed → empty dict (uncaged turn)."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    cage: Dict[str, Any] = {}
+    raw_face = metadata.get("tool_face", metadata.get("toolFace"))
+    if isinstance(raw_face, list):
+        face = [str(t).strip() for t in raw_face if isinstance(t, str) and str(t).strip()]
+        if face:
+            cage["tool_face"] = face
+    if "tool_face" not in cage:
+        return {}
+    raw_max = metadata.get("max_iterations", metadata.get("maxIterations"))
+    if isinstance(raw_max, int) and not isinstance(raw_max, bool) and raw_max >= 1:
+        cage["max_iterations"] = raw_max
+    return cage
+
+
 def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
     """Remove only the App quick-pick token from a string user task."""
     if not isinstance(user_message, str) or not skill_slug:
@@ -6617,6 +6641,13 @@ class APIServerAdapter(BasePlatformAdapter):
         request_overrides: Dict[str, Any] = {}
         if execution_policy != "silent_automation" and body.get("tool_choice") == "none":
             request_overrides["tool_choice"] = "none"
+        # Platform turn cage (local-server create-pipeline conversational guide):
+        # narrow THIS turn's tools to the platform whitelist via the bounded-step
+        # override. Silent automation already carries its own policy; skip there.
+        if execution_policy != "silent_automation":
+            turn_cage = _extract_turn_cage(body)
+            if turn_cage:
+                request_overrides["_bounded_step"] = turn_cage
         response_format = body.get("response_format")
         if execution_policy != "silent_automation" and response_format is not None:
             response_format_error = _validate_chat_response_format(response_format)
