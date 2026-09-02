@@ -373,6 +373,22 @@ def set_zettlab_connector_route_capability(capability: str) -> None:
     _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.set(capability or "")
 
 
+def push_zettlab_connector_route_capability(capability: str) -> object:
+    """Temporarily bind one trusted Connector route capability.
+
+    Tool workers use this only to restore the current Agent turn's private
+    capability after an execution boundary lost its ContextVars.  Returning a
+    reset token keeps the restoration strictly task-scoped instead of leaking
+    onto a recycled worker thread.
+    """
+    return _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.set(capability or "")
+
+
+def pop_zettlab_connector_route_capability(token: object) -> None:
+    """Restore the Connector route capability that preceded a temporary bind."""
+    _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.reset(token)
+
+
 def zettlab_connector_route_capability() -> str:
     return _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.get().strip()
 

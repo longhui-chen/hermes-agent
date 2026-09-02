@@ -21,6 +21,7 @@ import os
 import random
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -58,6 +59,43 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _restore_agent_connector_route_capability(agent):
+    """Recover a lost per-turn Connector route capability for one tool call.
+
+    The API adapter binds the capability in a ContextVar, which normally
+    crosses the tool-worker boundary through ``copy_context``.  A runtime
+    wrapper may nevertheless enter tool execution with that ContextVar empty.
+    ZetAgent stores the already-validated value privately on the active Agent
+    instance, never in model-visible request overrides.  Restore it only for
+    this dispatch and reset it unconditionally so a reused worker cannot
+    borrow another user's route.
+    """
+    from gateway.session_context import (
+        pop_zettlab_connector_route_capability,
+        push_zettlab_connector_route_capability,
+        zettlab_connector_route_capability,
+    )
+
+    current = zettlab_connector_route_capability()
+    fallback = str(
+        getattr(agent, "_zettlab_connector_route_capability", "") or ""
+    ).strip()
+    if current or not fallback:
+        yield
+        return
+
+    token = push_zettlab_connector_route_capability(fallback)
+    logger.warning(
+        "restored missing Connector route capability for tool dispatch "
+        "(source=agent_turn capability_present=true)"
+    )
+    try:
+        yield
+    finally:
+        pop_zettlab_connector_route_capability(token)
 
 
 def _ensure_file_checkpoint(
@@ -562,7 +600,12 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        return execute(final_args)
+        # The dispatch is the narrowest common boundary for sequential and
+        # concurrent tool execution.  Keep the fallback private to this call:
+        # the trusted connector runner may read it, but middleware, the model,
+        # and later worker tasks cannot retain it.
+        with _restore_agent_connector_route_capability(agent):
+            return execute(final_args)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(

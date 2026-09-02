@@ -652,6 +652,13 @@ _ZET_WORKDIR_SECTION = """\
 - 相对路径没有稳定含义：文件工具在你还没跑过终端命令时把它解析到你自己的产出目录，一旦终端 `cd` 过或带 `workdir` 跑过命令，就改成跟着那个目录走。所以要落临时产物，写绝对路径，别靠相对路径。
 - 终端命令的锚点也不与文件工具共用：命令里的脚本、输入、输出参数都写绝对路径。刚用 write_file 写出的文件，交给命令时也要给绝对路径。"""
 
+_ZET_CODING_AGENT_SECTION = """\
+## Coding Agent 会话
+
+- 用户询问当前 Chat 可读取的 Codex 或 Claude Code 会话、会话数量、标题、状态或历史时，使用 `coding_agent_host`，先调用 `action=providers`，再用 `action=threads_list`；必须传 `provider_id=codex` 或 `provider_id=claude_code`，可按需传 `workspace_alias`、`workspace_scope=recent`、`limit`。
+- 这是 Coding Agent Host 的会话读取链路，不需要 `pc_node_status`、`pc_ui` 或电脑桌面控制能力；不要因为 `computer_use=false` 就把关联会话报告为不可用。
+- 只有用户要求操作桌面应用或读取授权电脑文件时，才使用 `pc_node_status` / `pc_ui` / `pc_file`。读取 Coding Agent 会话仍受当前 Chat 与 Host 的会话授权约束；工具返回未授权或 Host 不可用时如实报告。"""
+
 # 只有终端工具真的能解析 `agent_output` 时才教这个姿势。别名尚未落地的运行时
 # 会把它当普通路径原样 `cd`，命令直接失败——教一个用不了的姿势比不教更糟。
 _ZET_WORKDIR_ALIAS_LINE = (
@@ -681,9 +688,9 @@ def _agent_output_alias_available() -> bool:
 
 def _zet_workdir_section() -> str:
     if not _agent_output_alias_available():
-        return _ZET_WORKDIR_SECTION
+        return f"{_ZET_WORKDIR_SECTION}\n{_ZET_CODING_AGENT_SECTION}"
     # 别名行放最后：它是上一条「终端参数写绝对路径」的例外，紧跟着读才不歧义。
-    return f"{_ZET_WORKDIR_SECTION}\n{_ZET_WORKDIR_ALIAS_LINE}"
+    return f"{_ZET_WORKDIR_SECTION}\n{_ZET_CODING_AGENT_SECTION}\n{_ZET_WORKDIR_ALIAS_LINE}"
 
 _ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言
@@ -1366,6 +1373,7 @@ class ZetAgentAdapter(APIServerAdapter):
             ("_zet_agent_trusted_user_message", None),
             ("_zet_agent_trusted_skill_slug", ""),
             ("_creation_action_receipt_transport", ""),
+            ("_zettlab_connector_route_capability", ""),
             ("_zettlab_active_turn_id", ""),
             ("_zet_runtime_shell_force_tool_refresh", False),
             ("runtime_auxiliary_task_configs", None),
@@ -4020,6 +4028,17 @@ class ZetAgentAdapter(APIServerAdapter):
         agent_request_overrides = dict(request_overrides or {})
         from gateway.session_context import zettlab_auth_principal
 
+        # This is transport authority minted by local-server for exactly one
+        # chat turn.  It must not reach AIAgent.request_overrides or a model
+        # provider.  Keep it only on the Agent instance so tool execution can
+        # recover if an intermediate runtime wrapper drops ContextVars.
+        connector_route_capability = str(
+            agent_request_overrides.pop("_zettlab_connector_route_capability", "")
+            or ""
+        ).strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{43}", connector_route_capability) is None:
+            connector_route_capability = ""
+
         account_id = str(
             agent_request_overrides.pop("_zettlab_session_context_account_id", "")
             or _zettlab_request_account_id.get()
@@ -4662,6 +4681,7 @@ class ZetAgentAdapter(APIServerAdapter):
         }
         agent.runtime_auxiliary_task_configs = runtime_auxiliary_task_configs
         agent.runtime_supports_vision = runtime_supports_vision
+        agent._zettlab_connector_route_capability = connector_route_capability
         from gateway.session_context import get_session_env
 
         extension_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
@@ -4886,6 +4906,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # _create_agent. It selects the ordinary video plugin toolset for a
         # silent task and never reaches AIAgent or a provider request.
         request_overrides["_zet_trusted_skill_slug"] = trusted_skill_slug
+        if connector_route_capability:
+            request_overrides["_zettlab_connector_route_capability"] = (
+                connector_route_capability
+            )
         # Capture before base _run_agent hops to its executor. The principal
         # remains private request metadata, never a model argument.
         principal = zettlab_auth_principal()
