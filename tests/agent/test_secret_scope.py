@@ -39,6 +39,20 @@ class TestMultiplexActiveFailClosed:
         with pytest.raises(ss.UnscopedSecretError):
             ss.get_secret("ANTHROPIC_API_KEY")
 
+    def test_presets_dir_is_process_global(self, monkeypatch):
+        """The shared preset root remains readable in a profile scope."""
+        presets_dir = "/opt/zettlab/presets"
+        monkeypatch.setenv("ZETTLAB_PRESETS_DIR", presets_dir)
+        ss.set_multiplex_active(True)
+        assert ss.get_secret("ZETTLAB_PRESETS_DIR") == presets_dir
+
+    def test_api_server_key_is_still_fail_closed(self, monkeypatch):
+        """Adding the preset path must not widen the credential allowlist."""
+        monkeypatch.setenv("API_SERVER_KEY", "cross-profile-key")
+        ss.set_multiplex_active(True)
+        with pytest.raises(ss.UnscopedSecretError):
+            ss.get_secret("API_SERVER_KEY")
+
 
     def test_scoped_missing_key_returns_default_not_environ(self, monkeypatch):
         # Even though the value exists in os.environ, a scope is authoritative:

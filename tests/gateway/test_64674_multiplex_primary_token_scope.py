@@ -214,6 +214,40 @@ class TestPrimaryMessageRuntimeScope:
             secret_scope.get_secret("DISCORD_BOT_TOKEN")
 
 
+class TestPrimaryAdapterConstructionScope:
+    def test_primary_adapter_factory_binds_listener_owner(self, tmp_path, monkeypatch):
+        """Primary adapter construction carries the active profile scope."""
+        from agent import secret_scope
+        from gateway import run as run_mod
+        from gateway.run import GatewayRunner
+
+        owner = tmp_path / "listener-owner"
+        owner.mkdir()
+        monkeypatch.setattr(run_mod, "get_hermes_home", lambda: owner)
+        secret_scope.set_multiplex_active(True)
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        observed = {}
+
+        def _create(platform, config):
+            observed["home"] = run_mod.get_hermes_home()
+            observed["scope"] = secret_scope.current_secret_scope()
+            return object()
+
+        runner._create_adapter = _create  # type: ignore[method-assign]
+        result = runner._create_primary_adapter(
+            Platform.API_SERVER,
+            PlatformConfig(enabled=True),
+            profile_home=owner,
+        )
+
+        assert result is not None
+        assert observed["home"] == owner
+        assert observed["scope"] is not None
+        assert secret_scope.current_secret_scope() is None
+
+
 class TestReconnectDropsEmptyToken:
     @pytest.mark.asyncio
     async def test_empty_token_removed_from_queue(self):
