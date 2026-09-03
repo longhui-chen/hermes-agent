@@ -17,7 +17,11 @@ from plugins.video_edit.paths import safe_id, state_path
 
 MAX_WORKFLOWS = 64
 WORKFLOW_TTL_SECONDS = 90 * 24 * 60 * 60
-MAX_FILES = 8
+# Keep one workflow bounded while allowing the plugin to hide provider-sized
+# upload batches from the model. Fifty references bound the durable manifest;
+# provider count and byte limits split it further without increasing peak prep.
+MAX_FILES = 50
+MAX_PROACTIVE_FILES = 8
 MAX_WORKFLOW_BYTES = 2 * 1024 * 1024
 REPORT_LOCK_BUCKETS = 16
 UPLOAD_LOCK_BUCKETS = 16

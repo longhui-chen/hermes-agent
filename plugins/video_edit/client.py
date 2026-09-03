@@ -29,7 +29,7 @@ from plugins.video_edit.paths import (
 DEFAULT_BASE = "http://127.0.0.1:19090/api/v1/ai-proxy/business"
 DEFAULT_INTERNAL_BASE = "http://127.0.0.1:19090/api/v1/internal/proactive-video"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-MAX_UPLOAD_FILES = 8
+MAX_UPLOAD_FILES = 10
 MAX_UPLOAD_BYTES = 3 * 1024 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
 RESULT_URL_UNAVAILABLE_STATUSES = frozenset(

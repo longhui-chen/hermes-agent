@@ -21,7 +21,6 @@ Search arXiv papers by keyword, author, category, or ID.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `Research`, `Arxiv`, `Papers`, `Academic`, `Science`, `API` |
-| Related skills | `ocr-and-documents` |
 
 ## Reference: full SKILL.md
 
@@ -173,7 +172,7 @@ web_extract(urls=["https://arxiv.org/abs/2402.03300"])
 web_extract(urls=["https://arxiv.org/pdf/2402.03300"])
 ```
 
-For local PDF processing, see the `ocr-and-documents` skill.
+For local PDFs, use `read_file`; it consumes the runtime's canonical Markdown.
 
 ## Common Categories
 
@@ -195,12 +194,12 @@ Full list: https://arxiv.org/category_taxonomy
 The `scripts/search_arxiv.py` script handles XML parsing and provides clean output:
 
 ```bash
-python scripts/search_arxiv.py "GRPO reinforcement learning"
-python scripts/search_arxiv.py "transformer attention" --max 10 --sort date
-python scripts/search_arxiv.py --author "Yann LeCun" --max 5
-python scripts/search_arxiv.py --category cs.AI --sort date
-python scripts/search_arxiv.py --id 2402.03300
-python scripts/search_arxiv.py --id 2402.03300,2401.12345
+python3 "${HERMES_SKILL_DIR}/scripts/search_arxiv.py" "GRPO reinforcement learning"
+python3 "${HERMES_SKILL_DIR}/scripts/search_arxiv.py" "transformer attention" --max 10 --sort date
+python3 "${HERMES_SKILL_DIR}/scripts/search_arxiv.py" --author "Yann LeCun" --max 5
+python3 "${HERMES_SKILL_DIR}/scripts/search_arxiv.py" --category cs.AI --sort date
+python3 "${HERMES_SKILL_DIR}/scripts/search_arxiv.py" --id 2402.03300
+python3 "${HERMES_SKILL_DIR}/scripts/search_arxiv.py" --id 2402.03300,2401.12345
 ```
 
 No dependencies — uses only Python stdlib.
@@ -261,7 +260,7 @@ curl -s "https://api.semanticscholar.org/graph/v1/author/search?query=Yann+LeCun
 
 ## Complete Research Workflow
 
-1. **Discover**: `python scripts/search_arxiv.py "your topic" --sort date --max 10`
+1. **Discover**: `python3 "${HERMES_SKILL_DIR}/scripts/search_arxiv.py" "your topic" --sort date --max 10`
 2. **Assess impact**: `curl -s "https://api.semanticscholar.org/graph/v1/paper/arXiv:ID?fields=citationCount,influentialCitationCount"`
 3. **Read abstract**: `web_extract(urls=["https://arxiv.org/abs/ID"])`
 4. **Read full paper**: `web_extract(urls=["https://arxiv.org/pdf/ID"])`
@@ -283,7 +282,7 @@ curl -s "https://api.semanticscholar.org/graph/v1/author/search?query=Yann+LeCun
 - arXiv IDs: old format (`hep-th/0601001`) vs new (`2402.03300`)
 - PDF: `https://arxiv.org/pdf/{id}` — Abstract: `https://arxiv.org/abs/{id}`
 - HTML (when available): `https://arxiv.org/html/{id}`
-- For local PDF processing, see the `ocr-and-documents` skill
+- For local PDFs, use `read_file`; do not run a second parser or OCR path
 
 ## ID Versioning
 

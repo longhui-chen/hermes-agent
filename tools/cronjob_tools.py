@@ -311,9 +311,9 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
 
 def _cron_connector_execution_required(skills: List[str]) -> bool:
     try:
-        from cron.connector_execution import enabled, supports_exclusive_linear_execution
+        from cron.connector_execution import connector_provider_for_skills, enabled
 
-        return enabled() and supports_exclusive_linear_execution(skills)
+        return enabled() and bool(connector_provider_for_skills(skills))
     except Exception:
         return False
 
@@ -321,20 +321,17 @@ def _cron_connector_execution_required(skills: List[str]) -> bool:
 def _cron_connector_execution_mixed_skills_blocked(skills: List[str]) -> bool:
     """Do not migrate a multi-Connector task to a one-Connector lease."""
     try:
-        from cron.connector_execution import (
-            enabled,
-            supports_exclusive_linear_execution,
-            wants_linear_execution,
-        )
+        from cron.connector_execution import connector_provider_for_skills, enabled
 
-        return enabled() and wants_linear_execution(skills) and not supports_exclusive_linear_execution(skills)
-    except Exception:
+        connector_provider_for_skills(skills)
         return False
+    except Exception as exc:
+        return enabled() and str(getattr(exc, "code", "")) == "task_connector_mixed_skills_unsupported"
 
 
 _MIXED_LINEAR_CONNECTOR_EXECUTION_ERROR = (
-    "当前定时任务同时使用 Linear 和其他技能/连接器。为避免单一 Linear 授权导致部分执行，"
-    "请拆分为独立的 Linear 定时任务后再创建或更新。"
+    "当前定时任务同时使用多个连接器。为避免单一连接器路由导致部分执行，"
+    "请拆分为每个连接器独立的定时任务后再创建或更新。"
 )
 
 
@@ -816,23 +813,6 @@ def cronjob(
                 output_language=output_language,
             )
 
-            # Grant a connector-backed job while this exact Chat route still
-            # exists. If that proof is unavailable, remove the new record so a
-            # later tick cannot run partially and fabricate an empty report.
-            if _cron_connector_execution_required(canonical_skills):
-                try:
-                    from cron.connector_execution import create_grant
-
-                    execution = create_grant(job["id"], "linear")
-                    if execution:
-                        job = update_job(job["id"], {"connector_execution": execution})
-                except Exception:
-                    remove_job(job["id"])
-                    _notify_provider_jobs_changed_safe()
-                    return tool_error(
-                        "定时任务连接未授权/已过期；请先在当前会话重新授权 Linear 后再创建任务。",
-                        success=False,
-                    )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
@@ -1059,23 +1039,9 @@ def cronjob(
             )
             if _cron_connector_execution_mixed_skills_blocked(effective_skills):
                 return tool_error(_MIXED_LINEAR_CONNECTOR_EXECUTION_ERROR, success=False)
-            if _cron_connector_execution_required(effective_skills):
-                try:
-                    from cron.connector_execution import create_grant
-
-                    # Updating a Linear task is the deliberate one-time
-                    # migration path for jobs created before this feature.
-                    # The grant is refreshed while this exact Chat route is
-                    # live; Cron itself never reconstructs that route later.
-                    updates["connector_execution"] = create_grant(job_id, "linear")
-                except Exception:
-                    return tool_error(
-                        "定时任务连接未授权/已过期；请先在当前会话重新授权 Linear 后再更新任务。",
-                        success=False,
-                    )
-            elif "skills" in updates or "skill" in updates:
-                # Removing Linear from a task makes any old grant inert and
-                # prevents a stale secret from staying in its job record.
+            if "skills" in updates or "skill" in updates:
+                # Direct execution has no durable grant. Clearing this legacy
+                # field also removes any old task token from existing jobs.
                 updates["connector_execution"] = None
             updated = update_job(job_id, updates)
             _notify_provider_jobs_changed_safe()

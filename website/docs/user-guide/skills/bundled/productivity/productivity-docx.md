@@ -1,14 +1,14 @@
 ---
-title: "Docx — Create, read, edit Word .docx documents and templates"
+title: "Docx — Create and edit Word .docx documents and templates"
 sidebar_label: "Docx"
-description: "Create, read, edit Word .docx documents and templates"
+description: "Create and edit Word .docx documents and templates"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Docx
 
-Create, read, edit Word .docx documents and templates.
+Create and edit Word .docx documents and templates.
 
 ## Skill metadata
 
@@ -21,7 +21,7 @@ Create, read, edit Word .docx documents and templates.
 | License | Proprietary. LICENSE.txt has complete terms |
 | Platforms | linux, macos, windows |
 | Tags | `Word`, `DOCX`, `Documents`, `Office`, `Productivity` |
-| Related skills | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf), [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx), [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint), [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) |
+| Related skills | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf), [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx), [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) |
 
 ## Reference: full SKILL.md
 
@@ -31,17 +31,16 @@ The following is the complete skill definition that Hermes loads when this skill
 
 # DOCX Skill
 
-Create, read, and edit Word documents — reports, memos, letters, letterheads, tables of contents, tracked changes (redlining), and comments. A `.docx` is a ZIP archive of XML files; this skill covers both the high-level creation path and surgical XML editing.
+Create and edit Word documents — reports, memos, letters, letterheads, tables of contents, tracked changes (redlining), and comments. Runtime-owned document parsing supplies canonical Markdown for reading; this skill covers authoring and surgical XML editing only.
 
 ## When to Use
 
-Use this skill whenever the user wants to create, read, edit, or manipulate Word documents (.docx) or Word templates (.dotx). Triggers include: any mention of "Word doc", ".docx", ".dotx", or requests for a "report", "memo", "letter", or similar deliverable as a Word file; extracting or reorganizing content from .docx files; find-and-replace in Word files; inserting images; tracked changes or comments. Do NOT use for PDFs (see the `pdf` skill), spreadsheets (`xlsx`), or presentations (`powerpoint`).
+Use this skill whenever the user wants to create, edit, or manipulate Word documents (.docx) or Word templates (.dotx). Use `read_file` for content reading; it resolves the runtime canonical artifact. Do not run a second parser just to read document content.
 
 ## Prerequisites
 
 ```bash
 npm ls docx --depth=0 2>/dev/null | grep -q docx || npm install docx   # creation (docx-js)
-pip show pandoc >/dev/null 2>&1 || true; which pandoc || sudo apt install -y pandoc   # reading
 which soffice || sudo apt install -y libreoffice     # rendering/verification
 which pdftoppm || sudo apt install -y poppler-utils  # PDF → images
 pip install defusedxml lxml   # validation scripts
@@ -55,7 +54,7 @@ macOS: `brew install pandoc libreoffice poppler`.
 |---|---|
 | **Create** a new document | Write a `docx` (npm) script — see gotchas below |
 | **Edit** an existing document | `unzip` → edit `word/document.xml` → `zip` (docx-js cannot open existing files) |
-| **Read** content | `pandoc -t markdown file.docx` (or `read_file`, which auto-extracts .docx text) |
+| **Read** content | `read_file` (runtime canonical Markdown; no local parsing) |
 
 > Script paths below are relative to this skill's directory.
 
@@ -141,4 +140,4 @@ The script writes `comments.xml`, `commentsExtended.xml`, `commentsIds.xml`, `co
 
 ## Related skills
 
-`pdf` (PDF work), `xlsx` (spreadsheets), `powerpoint` (decks), `ocr-and-documents` (scanned input extraction).
+`pdf` (PDF work), `xlsx` (spreadsheets), `powerpoint` (decks).

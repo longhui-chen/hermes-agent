@@ -1895,6 +1895,11 @@ def _connector_runtime_shell_guard_result(
             for segment in segments
         )
     if not contains_trusted_runtime:
+        contains_trusted_runtime = any(
+            _connector_runtime_segment_contains_nested_python_invocation(segment)
+            for segment in segments
+        )
+    if not contains_trusted_runtime:
         return None
 
     code = "connector_runtime_compound_command"
@@ -1956,6 +1961,57 @@ def _connector_runtime_segment_contains_nested_shell_invocation(
         ) is not None:
             return True
     return False
+
+
+def _connector_runtime_segment_contains_nested_python_invocation(
+    segment: list[str],
+) -> bool:
+    """Recognize ``python -c`` wrappers around an official runtime script."""
+    for index, token in enumerate(segment):
+        if not _is_python_executable_token(token):
+            continue
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(
+            segment[:index]
+        ):
+            continue
+        source = _connector_runtime_python_command_argument(segment[index + 1 :])
+        if source is None:
+            continue
+        normalized = source.replace("\\", "/")
+        mentions_runtime = any(
+            script_name in normalized for script_name in _CONNECTOR_RUNTIME_SCRIPTS
+        )
+        mentions_presets_path = (
+            "ZETTLAB_PRESETS_DIR" in source
+            or "/skills/" in normalized
+            or "skills/" in normalized
+        )
+        if mentions_runtime and mentions_presets_path:
+            return True
+    return False
+
+
+def _connector_runtime_python_command_argument(arguments: list[str]) -> Optional[str]:
+    """Return the source string passed to Python's ``-c`` option."""
+    position = 0
+    while position < len(arguments):
+        token = arguments[position]
+        if token == "--" or token == "-m" or token.startswith("-m"):
+            return None
+        if token == "-c":
+            command_index = position + 1
+            return arguments[command_index] if command_index < len(arguments) else None
+        if token.startswith("-c"):
+            return token[2:] or None
+        if not token.startswith("-"):
+            return None
+        option_name = token.split("=", 1)[0]
+        position += 1
+        if "=" not in token and option_name in {"-W", "-X", "--check-hash-based-pycs"}:
+            if position >= len(arguments):
+                return None
+            position += 1
+    return None
 
 
 def _connector_runtime_shell_command_argument(arguments: list[str]) -> Optional[str]:
@@ -2278,7 +2334,7 @@ def _run_connector_runtime_command_if_allowed(
         # 黑名单是开集(下一个键还得再补一次),白名单是闭集:脚本需要什么,由 injected_env
         # 显式给,⛔ 不从进程环境里捡。
         secret_values = [
-            connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
+            connector_env.get("HERMES_SESSION_KEY", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()

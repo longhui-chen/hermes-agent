@@ -21,7 +21,7 @@ Edit text in existing PDFs via natural-language prompts.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `PDF`, `Documents`, `Editing`, `NLP`, `Productivity` |
-| Related skills | `pdf`, `ocr-and-documents` |
+| Related skills | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) |
 
 ## Reference: full SKILL.md
 
@@ -31,7 +31,7 @@ The following is the complete skill definition that Hermes loads when this skill
 
 # nano-pdf
 
-Edit PDFs using natural-language instructions. Point it at a page and describe what to change. For structural PDF work (merge, split, forms, watermarks, creation), see the `pdf` skill; for text extraction from scans, see `ocr-and-documents`.
+Edit PDFs using natural-language instructions. Point it at a page and describe what to change. For structural PDF work (merge, split, forms, watermarks, creation), see the `pdf` skill. Read content through `read_file`, which consumes runtime canonical Markdown.
 
 ## Prerequisites
 

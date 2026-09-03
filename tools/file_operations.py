@@ -263,6 +263,10 @@ class SearchResult:
     files: List[str] = field(default_factory=list)
     counts: Dict[str, int] = field(default_factory=dict)
     total_count: int = 0
+    # Number of result items actually returned by the backend.  NAS responses
+    # may report a larger total_count together with truncated=true; keeping the
+    # two counts distinct prevents a partial result from looking complete.
+    returned_count: Optional[int] = None
     truncated: bool = False
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
@@ -309,6 +313,8 @@ class SearchResult:
 
     def to_dict(self, densify: bool = False) -> dict:
         result: dict[str, object] = {"total_count": self.total_count}
+        if self.returned_count is not None:
+            result["returned_count"] = self.returned_count
         if self.matches:
             dense = self._densify_matches() if densify else None
             if dense is not None:
@@ -2360,6 +2366,21 @@ class ShellFileOperations(FileOperations):
             if not hits:
                 return None
             total = int(data.get("total_count") or hits)
+            raw_returned = data.get("returned_count")
+            if raw_returned is None:
+                returned = hits
+            else:
+                try:
+                    returned = int(raw_returned)
+                except (TypeError, ValueError):
+                    return None
+                if returned < 0:
+                    return None
+            raw_limit_reason = data.get("limit_reason")
+            if raw_limit_reason is not None and not isinstance(raw_limit_reason, str):
+                return None
+            server_limit_reason = (raw_limit_reason or "").strip() or None
+            server_truncated = data.get("truncated") is True
             carded = data.get("carded")
             reference_paths = []
             rejected_references = 0
@@ -2422,6 +2443,8 @@ class ShellFileOperations(FileOperations):
                 )
             else:
                 reference_limit_reason = None
+            effective_truncated = server_truncated or references_truncated
+            effective_limit_reason = server_limit_reason or reference_limit_reason
         except Exception:
             return None
         if carded is False:
@@ -2432,6 +2455,9 @@ class ShellFileOperations(FileOperations):
             if not explicit:
                 return SearchResult(
                     total_count=total,
+                    returned_count=returned,
+                    truncated=effective_truncated,
+                    limit_reason=effective_limit_reason,
                     carded=False,
                     note=(
                         f"{hits} NAS file(s) matched but NO preview cards were "
@@ -2442,11 +2468,12 @@ class ShellFileOperations(FileOperations):
                 )
             return SearchResult(
                 total_count=total,
+                returned_count=returned,
                 files=(reference_paths if return_references else item_paths)[
                     :self._NAS_UNCARDED_LIST_CAP
                 ],
-                truncated=references_truncated,
-                limit_reason=reference_limit_reason,
+                truncated=effective_truncated,
+                limit_reason=effective_limit_reason,
                 carded=False,
                 note=(
                     f"{hits} NAS file(s) matched but NO preview cards were shown "
@@ -2470,10 +2497,11 @@ class ShellFileOperations(FileOperations):
             )
         return SearchResult(
             total_count=total,
+            returned_count=returned,
             files=(reference_paths[:self._NAS_UNCARDED_LIST_CAP]
                    if explicit and return_references else []),
-            truncated=references_truncated,
-            limit_reason=reference_limit_reason,
+            truncated=effective_truncated,
+            limit_reason=effective_limit_reason,
             # True = server confirmed; None (old server) = omitted, so the
             # chat-side collector keeps its legacy derived-card compensation.
             carded=(True if carded is True else None),

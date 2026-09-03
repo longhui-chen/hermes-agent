@@ -116,6 +116,10 @@ _GLOBAL_ENV_EXACT = frozenset({
     # profile-scoped.
     "API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT",
     "API_SERVER_CORS_ORIGINS",
+    # Shared preset/skill installation root. This is a deployment path, not
+    # a profile credential; config expansion must keep resolving it while a
+    # multiplexed profile scope is active.
+    "ZETTLAB_PRESETS_DIR",
 })
 _GLOBAL_ENV_PREFIXES = (
     "HERMES_KANBAN_",

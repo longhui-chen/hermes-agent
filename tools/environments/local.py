@@ -2127,9 +2127,14 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # gateway, so subprocesses must receive the current profile's scope instead
     # of whatever os.environ/shell snapshot happened to contain.
     "ZETTLAB_CONNECTORS_URL",
-    "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+    "ZETTLAB_CONNECTOR_SESSION_INVOKE_V1",
     "ZET_AGENT_ID",
 })
+
+# CRT is retired from every child-process contract. Keep the name exclusively
+# in the scrub set so an older profile or caller cannot reintroduce it through
+# a shell snapshot or an explicit base_env.
+_RETIRED_CONNECTOR_RUNTIME_BEARER_ENV_KEY = "ZETTLAB_CONNECTORS_AUTH_TOKEN"
 
 CONNECTOR_ACTION_RUNTIME_ENV_KEY = "ZETTLAB_CONNECTOR_ACTION_RUNTIME"
 
@@ -2172,7 +2177,7 @@ _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
-    | {CONNECTOR_ACTION_RUNTIME_ENV_KEY}
+    | {CONNECTOR_ACTION_RUNTIME_ENV_KEY, _RETIRED_CONNECTOR_RUNTIME_BEARER_ENV_KEY}
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
     | HARDWARE_RUNTIME_ENV_KEYS
     | RETIRED_VIDEO_EXECUTION_ENV_KEYS
@@ -2259,9 +2264,9 @@ def _apply_profile_secret_scope_env(
 def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     """Build env for the dedicated connector_runtime.py runner.
 
-    This is intentionally separate from the generic terminal env. Connector
-    runtime bearer may be supplied to the allowlisted runner subprocess, but it
-    must not be inherited by arbitrary model-authored shell commands.
+    This is intentionally separate from the generic terminal env. The
+    allowlisted runner receives only the current session route capability;
+    provider credentials remain Server-side and never enter a subprocess.
     """
     # ⛔ 起手底座**不继承进程环境**。这里原先是
     # `_sanitize_subprocess_env(os.environ, base_env)` —— 那是**黑名单**,只剥 Hermes
@@ -2275,6 +2280,7 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     # 填/删,底座里的其它东西一个都用不到。仓内另外三个 build_*_runtime_env
     # (agent_creator / overseas_connect / camera)本来就是白名单构造 —— 照抄它们。
     env = dict(base_env or {})
+    env.pop(_RETIRED_CONNECTOR_RUNTIME_BEARER_ENV_KEY, None)
     # The pinned script identity is minted by terminal_tool only after exact
     # direct-runner path verification. Never accept an inherited/profile value.
     env.pop(CONNECTOR_ACTION_RUNTIME_ENV_KEY, None)

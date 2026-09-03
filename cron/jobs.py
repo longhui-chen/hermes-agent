@@ -1211,24 +1211,10 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     # GET; the first successful mutation persists revision 1 atomically.
     normalized["revision"] = _job_revision(normalized)
 
-    # A task grant is durable scheduler-private material.  Its opaque token
-    # must never leave jobs.json via any list/get/update API; only the raw
-    # scheduler record may exchange it for a short local route capability.
-    execution = normalized.get("connector_execution")
-    if isinstance(execution, dict):
-        provider_id = str(execution.get("provider_id") or "").strip().lower()
-        grant_id = str(execution.get("grant_id") or "").strip()
-        expires_at = str(execution.get("expires_at") or "").strip()
-        if provider_id == "linear" and grant_id:
-            normalized["connector_execution"] = {
-                "provider_id": provider_id,
-                "grant_id": grant_id,
-                "authorization_state": "authorized",
-            }
-            if expires_at:
-                normalized["connector_execution"]["expires_at"] = expires_at
-        else:
-            normalized.pop("connector_execution", None)
+    # Connector direct execution has no job-persisted grant or lease. Hide any
+    # pre-cutover material immediately; the scheduler also erases it atomically
+    # from raw jobs.json on its next tick.
+    normalized.pop("connector_execution", None)
 
     raw_output_language = normalized.get("output_language")
     output_language = normalize_output_language_tag(raw_output_language)
@@ -2612,24 +2598,11 @@ def update_job(job_id: str, updates: Dict[str, Any], *, preserve_claim: bool = F
 
             updated = _apply_skill_fields({**job, **updates})
             if "connector_execution" in updates:
-                execution = updates.get("connector_execution")
-                if execution is None:
-                    updated.pop("connector_execution", None)
-                elif isinstance(execution, dict):
-                    provider_id = str(execution.get("provider_id") or "").strip().lower()
-                    grant_id = str(execution.get("grant_id") or "").strip()
-                    grant_token = str(execution.get("grant_token") or "").strip()
-                    expires_at = str(execution.get("expires_at") or "").strip()
-                    if provider_id != "linear" or not grant_id or not grant_token:
-                        raise ValueError("invalid connector execution grant")
-                    updated["connector_execution"] = {
-                        "provider_id": provider_id,
-                        "grant_id": grant_id,
-                        "grant_token": grant_token,
-                        "expires_at": expires_at,
-                    }
-                else:
-                    raise ValueError("invalid connector execution grant")
+                # The old grant/lease record is retired. Accept only an
+                # explicit clear so old callers can remove it safely.
+                if updates.get("connector_execution") is not None:
+                    raise ValueError("connector execution grants are retired")
+                updated.pop("connector_execution", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -3539,6 +3512,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     now = _hermes_now()
     raw_jobs = load_jobs()
     needs_save = False
+
+    # Strong-cutover migration: old Connector grants/lease material is no
+    # longer executable and must not remain in jobs.json. This stays inside the
+    # existing jobs lock and uses the normal atomic save at the end of the tick.
+    for raw_job in raw_jobs:
+        if isinstance(raw_job, dict) and raw_job.pop("connector_execution", None) is not None:
+            needs_save = True
 
     # Repair id-less records BEFORE anything keys off ``job["id"]``. A direct
     # jobs.json edit that bypassed add_job() can leave a record without an "id"

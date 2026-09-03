@@ -336,9 +336,9 @@ def _inject_execute_code_session_context_env(env: dict) -> None:
     _inject_session_context_env(env)
     logger.debug(
         "execute_code: session routing env injected "
-        "(session_key_present=%s, connector_auth_present=%s)",
+        "(session_key_present=%s, connector_session_invoke=%s)",
         bool(env.get("HERMES_SESSION_KEY")),
-        bool(env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN")),
+        bool(env.get("ZETTLAB_CONNECTOR_SESSION_INVOKE_V1")),
     )
 
 

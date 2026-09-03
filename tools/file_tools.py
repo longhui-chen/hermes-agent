@@ -13,6 +13,11 @@ from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
+from tools.document_sidecar import (
+    CanonicalDocumentUnavailable,
+    is_parsed_document,
+    resolve_canonical_document,
+)
 from tools.file_operations import (
     ShellFileOperations,
     normalize_read_pagination,
@@ -1619,64 +1624,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         if sibling_error:
             return json.dumps({"error": sibling_error}, ensure_ascii=False)
 
-        # ── Structured-document extraction ────────────────────────────
-        # Try before the binary-extension guard so .docx/.xlsx can render as text.
-        # Malformed documents fall through to the normal path/binary guard.
-        from tools.read_extract import ExtractionError, extract_document_text, is_extractable_document
-
-        if is_extractable_document(str(_resolved)):
+        # ── Canonical document artifact ──
+        # Parsing belongs to the runtime pipeline. read_file only follows its
+        # artifact pointer and then uses the normal paginated text path below.
+        if is_parsed_document(str(_resolved)):
             try:
-                extracted_text = extract_document_text(str(_resolved))
-            except ExtractionError:
-                logger.debug("document extraction failed for %s", path, exc_info=True)
-            else:
-                file_ops = _get_file_ops(task_id)
-                lines = extracted_text.splitlines()
-                total_lines = len(lines)
-                end_line = offset + limit - 1
-                page_text = "\n".join(lines[offset - 1:end_line])
-                result_dict = {
-                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
-                    "total_lines": total_lines,
-                    "file_size": os.path.getsize(_resolved),
-                    "truncated": total_lines > end_line,
-                    "extracted_document": True,
-                }
-                if result_dict["truncated"]:
-                    result_dict["hint"] = (
-                        f"Use offset={end_line + 1} to continue reading "
-                        f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)"
-                    )
-                content_len = len(result_dict["content"])
-                max_chars = _get_max_read_chars()
-                if content_len > max_chars:
-                    # Graceful char-budget truncation (nearai/ironclaw#5029):
-                    # trim to the last complete line that fits and offer a
-                    # next_offset rather than rejecting the whole extraction.
-                    trimmed, lines_kept, _ = _truncate_to_char_budget(
-                        result_dict["content"], max_chars
-                    )
-                    next_offset = offset + lines_kept
-                    shown_end = offset + lines_kept - 1
-                    result_dict["content"] = trimmed
-                    result_dict["truncated"] = True
-                    result_dict["truncated_by"] = "bytes"
-                    result_dict["next_offset"] = next_offset
-                    result_dict["hint"] = (
-                        f"Output truncated at the {max_chars:,}-char read budget "
-                        f"after {lines_kept} line(s) (showing lines {offset}-"
-                        f"{shown_end} of {total_lines}). Use offset={next_offset} "
-                        "to continue."
-                    )
-                    if len(trimmed.split("\n", 1)[0]) >= max_chars:
-                        result_dict["hint"] += (
-                            " Note: the first line alone exceeded the budget and "
-                            "was clamped mid-line; its remainder is not "
-                            "retrievable via offset."
-                        )
-                if result_dict["content"]:
-                    result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
-                return json.dumps(result_dict, ensure_ascii=False)
+                _resolved = resolve_canonical_document(str(_resolved))
+            except CanonicalDocumentUnavailable:
+                return tool_error(
+                    f"Canonical document content is not available yet for '{path}'. "
+                    "Wait for runtime document processing and retry; do not parse the source with another tool."
+                )
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).

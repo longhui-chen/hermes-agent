@@ -3322,7 +3322,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     pin = get_hermes_home()
                     recovered = False
                     owner = getattr(self, "_owner_home", None)
-                    if owner and _os.path.isdir(_os.path.join(str(owner), "home")):
+                    # The listener owner itself is the trust anchor. Do not
+                    # require the optional ``<HERMES_HOME>/home`` subprocess
+                    # directory: legacy/default installs may not have it,
+                    # and falling back to process-global HERMES_HOME would
+                    # route an authenticated request into another profile.
+                    if owner and _os.path.isdir(str(owner)):
                         pin = owner
                         recovered = True
                     # ⭐ 无条件留痕：这条分支此前完全不可观测，"是不是走了这里"只能靠推断。

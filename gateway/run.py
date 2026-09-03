@@ -2995,7 +2995,7 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     platform adapter, so the note just confirms that and records the path.
 
     Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
-    must tell the agent to *extract* the text itself before answering — earlier
+    must tell the agent to read the runtime's canonical artifact before answering — earlier
     wording ("Ask the user what they'd like you to do with it") steered the
     model into punting back to the user, which is why attached PDFs/DOCX looked
     "unreadable" to the agent even though it has the tools to read them.
@@ -3009,8 +3009,8 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
         f"Its text is not inlined here (it's a binary format such as PDF or DOCX). "
-        f"To read it, extract the document's text yourself — for example with the "
-        f"terminal tool or the ocr-and-documents skill — before answering, instead "
+        f"To read it, use read_file on the saved path; the runtime resolves its "
+        f"canonical parsed content. Do not run another parser or OCR tool. Answer instead "
         f"of asking the user to paste the contents.]"
     )
 
@@ -12003,6 +12003,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Initialize and connect each configured platform
         _multiplex_on = bool(getattr(self.config, "multiplex_profiles", False))
         _multiplex_skipped_platforms: list[Platform] = []
+        # The active profile owns the process-shared listener. Capture its
+        # home once and construct the primary adapter under that exact scope
+        # so APIServerAdapter can bind unprefixed requests to the same owner.
+        _primary_profile_home = Path(get_hermes_home())
         for platform, platform_config in self.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True
@@ -12026,7 +12030,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _multiplex_skipped_platforms.append(platform)
                 continue
             enabled_platform_count += 1
-            adapter = self._create_adapter(platform, platform_config)
+            adapter = self._create_primary_adapter(
+                platform, platform_config, profile_home=_primary_profile_home
+            )
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 _pval = platform.value
@@ -13454,7 +13460,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         self.delivery_router.adapters = self.adapters
                     await self._retry_unpublished_adapter_cleanup("", platform)
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = self._create_primary_adapter(platform, platform_config)
                     if not adapter:
                         logger.warning(
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
@@ -15026,6 +15032,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         import hashlib
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
+
+    def _create_primary_adapter(
+        self,
+        platform: Platform,
+        config: Any,
+        *,
+        profile_home: Optional[Path] = None,
+    ) -> Optional[BasePlatformAdapter]:
+        """Create a primary adapter inside its listener owner's profile scope.
+
+        The process-shared API/Zet listener authenticates both unprefixed and
+        ``/p/<profile>/`` requests. Capturing the active profile's home while
+        constructing the adapter keeps its listener key and owner home from
+        diverging when multiplex fail-closed secret resolution is enabled.
+        """
+        if not getattr(self.config, "multiplex_profiles", False):
+            return self._create_adapter(platform, config)
+        home = Path(profile_home) if profile_home is not None else Path(get_hermes_home())
+        with _profile_runtime_scope(home):
+            return self._create_adapter(platform, config)
 
     def _create_adapter(
         self, 

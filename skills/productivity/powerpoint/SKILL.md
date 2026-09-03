@@ -1,6 +1,6 @@
 ---
 name: powerpoint
-description: "Create, read, edit .pptx decks, slides, notes, templates."
+description: "Create and edit .pptx decks, slides, notes, templates."
 version: 2.0.0
 author: Anthropic (adapted by Nous Research)
 license: Proprietary. LICENSE.txt has complete terms
@@ -14,7 +14,7 @@ metadata:
 
 # Powerpoint Skill
 
-Create, read, and edit PowerPoint decks — from-scratch generation with pptxgenjs, template-based editing via direct XML manipulation, speaker notes, charts, and design QA. A `.pptx` is a ZIP archive of XML files.
+Create and edit PowerPoint decks — from-scratch generation with pptxgenjs, template-based editing via direct XML manipulation, speaker notes, charts, and design QA. Runtime-owned document parsing supplies canonical Markdown for reading.
 
 ## When to Use
 
@@ -24,7 +24,7 @@ Use this skill any time a .pptx or .potx file is involved in any way — as inpu
 
 ```bash
 npm ls pptxgenjs --depth=0 2>/dev/null | grep -q pptxgenjs || npm install pptxgenjs
-pip install "markitdown[pptx]" Pillow defusedxml lxml
+pip install Pillow defusedxml lxml
 which soffice || sudo apt install -y libreoffice     # rendering/QA
 which pdftoppm || sudo apt install -y poppler-utils  # PDF → images
 ```
@@ -37,7 +37,7 @@ macOS: `brew install libreoffice poppler`. Icons in generated decks additionally
 |---|---|
 | **Create** a new deck | Write a `pptxgenjs` script — see gotchas below |
 | **Edit** an existing deck, or build from a template | unzip → edit `ppt/slides/slideN.xml` → zip |
-| **Read** content | `markitdown deck.pptx` (one block per slide under `<!-- Slide number: N -->` markers); visual grid: `python scripts/thumbnail.py deck.pptx` |
+| **Read textual content** | `read_file` (runtime canonical Markdown; no local parser) |
 
 ## Scripts
 

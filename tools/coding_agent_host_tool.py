@@ -13,7 +13,15 @@ from agent.secret_scope import get_secret
 from gateway.session_context import get_session_env, zettlab_browser_session_token
 from tools.registry import registry
 
-_ACTIONS = {"providers", "session_create", "session_send", "timeline_read", "session_cancel", "permission_respond"}
+_ACTIONS = {
+    "providers",
+    "threads_list",
+    "session_create",
+    "session_send",
+    "timeline_read",
+    "session_cancel",
+    "permission_respond",
+}
 _SCHEMA = {
     "name": "coding_agent_host",
     "description": "Use a verified Coding Agent provider on the authorized computer Host. Workspace is always a Host-owned alias.",
@@ -21,6 +29,7 @@ _SCHEMA = {
         "action": {"type": "string", "enum": sorted(_ACTIONS)},
         "provider_id": {"type": "string", "enum": ["codex", "claude_code", "paseo"]},
         "workspace_alias": {"type": "string", "maxLength": 64},
+        "workspace_scope": {"type": "string", "enum": ["recent"]},
         "session_id": {"type": "string", "maxLength": 128},
         "text": {"type": "string", "maxLength": 65536},
         "permission_id": {"type": "string", "maxLength": 128},
@@ -50,7 +59,7 @@ def _enabled() -> bool:
 _enabled._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 
-def coding_agent_host(action: str = "providers", provider_id: str = "", workspace_alias: str = "", session_id: str = "", text: str = "", permission_id: str = "", decision: str = "", cursor: str = "", limit: int = 50, **_: Any) -> str:
+def coding_agent_host(action: str = "providers", provider_id: str = "", workspace_alias: str = "", workspace_scope: str = "", session_id: str = "", text: str = "", permission_id: str = "", decision: str = "", cursor: str = "", limit: int = 50, **_: Any) -> str:
     if action not in _ACTIONS:
         return json.dumps({"success": False, "code": "invalid_action"})
     target_session_id = session_id
@@ -61,6 +70,7 @@ def coding_agent_host(action: str = "providers", provider_id: str = "", workspac
     try:
         wire_action = {
             "providers": "coding-agent.providers",
+            "threads_list": "coding-agent.threads.list",
             "session_create": "coding-agent.session.create",
             "session_send": "coding-agent.session.send",
             "timeline_read": "coding-agent.timeline.read",
@@ -68,7 +78,7 @@ def coding_agent_host(action: str = "providers", provider_id: str = "", workspac
             "permission_respond": "coding-agent.permission.respond",
         }[action]
         params = {
-            "provider_id": provider_id, "workspace_alias": workspace_alias, "session_id": session_id,
+            "provider_id": provider_id, "workspace_alias": workspace_alias, "workspace_scope": workspace_scope, "session_id": session_id,
             "text": text, "permission_id": permission_id, "decision": decision, "cursor": cursor, "limit": limit,
         }
         params = {key: value for key, value in params.items() if value not in ("", None)}
