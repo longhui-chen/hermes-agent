@@ -931,9 +931,20 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # One exception: the sample is produced by a byte-bounded
+            # ``head -c``, so a multi-byte UTF-8 character sitting on the cut
+            # boundary decodes into a single *trailing* U+FFFD. That is an
+            # artefact of the sampling, not of the file \u2014 a Go/HTML source
+            # with Chinese comments hit it on every read and was reported as
+            # "binary" (the coding agent then re-implemented helpers it could
+            # not see and broke the build). Ignore replacement chars only when
+            # they sit at the very end of the sample; anywhere else they still
+            # mean undecodable bytes.
+            sample = content_sample[:1000]
+            if "\ufffd" in sample.rstrip("\ufffd"):
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
         
@@ -3050,7 +3061,14 @@ class ShellFileOperations(FileOperations):
         # A truncating head makes grep exit 141 (SIGPIPE) on an otherwise
         # successful search; the strict `== 2` guard below ignores that, so
         # pipefail does not turn truncated results into false errors.
-        cmd = "set -o pipefail; " + " ".join(cmd_parts)
+        #
+        # Pin a UTF-8 locale for grep: under the C/POSIX locale GNU grep
+        # (>= 2.21) treats any file with bytes that are not valid in the
+        # current encoding as *binary* and silently drops its matches — a
+        # plain Go/HTML source with Chinese comments then reports "0 matches".
+        # C.UTF-8 exists on glibc/musl hosts; where it does not, setlocale
+        # falls back to C and behaves exactly as before.
+        cmd = "set -o pipefail; LC_ALL=C.UTF-8 " + " ".join(cmd_parts)
         result = self._exec(cmd, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
