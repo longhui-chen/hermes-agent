@@ -349,6 +349,58 @@ def test_nas_search_default_keeps_fast_modes(monkeypatch, file_ops):
     assert captured["timeout"] == 10
 
 
+def test_nas_search_preserves_partial_result_metadata_without_references(
+        monkeypatch, file_ops):
+    """The ordinary card-only NAS path must not hide an incomplete search."""
+    _zettlab_env(monkeypatch)
+    payload = {"data": {
+        "items": [{"path": "/nas/a.pdf"}],
+        "total_count": 137,
+        "returned_count": 1,
+        "truncated": True,
+        "limit_reason": "result_cap",
+        "carded": True,
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search("report")
+
+    assert result.total_count == 137
+    assert result.returned_count == 1
+    assert result.truncated is True
+    assert result.limit_reason == "result_cap"
+    output = result.to_dict()
+    assert output["returned_count"] == 1
+    assert output["truncated"] is True
+    assert output["limit_reason"] == "result_cap"
+
+
+def test_nas_search_derives_returned_count_for_legacy_server(monkeypatch, file_ops):
+    """Older local-server builds lack returned_count; item count is still explicit."""
+    _zettlab_env(monkeypatch)
+    payload = {"data": {
+        "items": [{"path": "/nas/a.pdf"}, {"path": "/nas/b.pdf"}],
+        "total_count": 2,
+        "carded": True,
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        result = file_ops.nas_search("report")
+
+    assert result.returned_count == 2
+    assert result.to_dict()["returned_count"] == 2
+
+
+def test_nas_search_rejects_invalid_returned_count(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    payload = {"data": {
+        "items": [{"path": "/nas/a.pdf"}],
+        "total_count": 1,
+        "returned_count": "NaN",
+    }}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
+        assert file_ops.nas_search("report").error is None
+        assert file_ops._zettlab_nas_fallback("report", 50) is None
+
+
 def test_nas_search_unavailable_without_token(monkeypatch, file_ops):
     """Unlike the fallback's silent None, the first-class entry must tell the
     model WHY there are no results, without ever sending a request."""
