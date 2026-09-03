@@ -41,6 +41,39 @@ class TestProfileScopeDefaultFallback:
             assert ss.get_secret("OPENROUTER_BASE_URL") == "https://from-environ.example/v1"
         assert ss.current_secret_scope() is None
 
+    def test_unprefixed_request_keeps_listener_owner_without_subprocess_home(
+        self, tmp_path, monkeypatch
+    ):
+        """An owner directory is authoritative even without ``<home>/home``."""
+        from contextlib import nullcontext
+
+        import hermes_constants
+        import gateway.run as run_mod
+
+        owner = tmp_path / "listener-owner"
+        owner.mkdir()
+        process_home = tmp_path / "other-profile"
+        process_home.mkdir()
+
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: owner)
+        with run_mod._profile_runtime_scope(owner):
+            scoped_adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+        # Simulate the process-level home changing before the request arrives.
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: process_home)
+        seen = {}
+
+        def _capture(pin):
+            seen["pin"] = pin
+            return nullcontext()
+
+        monkeypatch.setattr(run_mod, "_profile_runtime_scope", _capture)
+        ss.set_multiplex_active(True)
+        with scoped_adapter._profile_scope(None):
+            pass
+
+        assert seen["pin"] == owner
+
 
 # Regression coverage for #72041: profile-bound API authentication
 class TestProfileScopedApiAuthentication:
