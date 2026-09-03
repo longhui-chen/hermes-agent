@@ -145,22 +145,31 @@ def create_pipeline(args: Any = None, **_: Any) -> str:
         args = {}
     action = str(args.get("action", "") or "").strip()
     if action not in _ACTIONS:
-        return json.dumps({"ok": False, "success": False, "code": "invalid_action"}, ensure_ascii=False)
+        return json.dumps({"ok": False, "success": False, "code": "invalid_action",
+                           "next": "action 只能是 start / set_pace / submit_spec / status / cancel。"}, ensure_ascii=False)
     if action == "create":
         action = "start"
     base = _base_url()
     if not base:
-        return json.dumps({"ok": False, "success": False, "code": "create_pipeline_unavailable"}, ensure_ascii=False)
+        return json.dumps({"ok": False, "success": False, "code": "create_pipeline_unavailable",
+                           "next": "设备的应用创建服务不可用，如实告诉用户稍后再试；不要自己写代码替代。"}, ensure_ascii=False)
     headers = {"X-Zettlab-Agent-Action-Token": _secret("ZETTLAB_AGENT_ACTION_TOKEN")}
     session_id = _session_id()
     if session_id:
         headers[_SESSION_HEADER] = session_id
     run_id = str(args.get("run_id", "") or "").strip()
     try:
-        if action == "start":
+        if action == "start" and not str(args.get("intent", "") or "").strip() and run_id:
+            # 模型在用户确认那一轮常常习惯性再调一次 create/start(run_id)（09-03 药箱 #2 就是
+            # 这样拿到裸错误后编出"已开始建造"）。带 run_id 不带 intent = 它其实想知道现状：
+            # 直接当 status 查，把真实状态和 next 给回去，而不是一句没有指引的 intent_required。
+            response = requests.get(base + "/status/" + quote(run_id, safe=""), headers=headers, timeout=10)
+        elif action == "start":
             intent = str(args.get("intent", "") or "").strip()
             if not intent:
-                return json.dumps({"ok": False, "success": False, "code": "intent_required"}, ensure_ascii=False)
+                return json.dumps({"ok": False, "success": False, "code": "intent_required",
+                                   "next": "start 只在还没有 run 时用，必须带 intent（用户的一句话诉求）；已有 run 请用 status / set_pace / submit_spec / cancel 并带 run_id。你没有确认动作：用户的「确认」由平台处理。"},
+                                  ensure_ascii=False)
             body: Dict[str, Any] = {"intent": intent}
             owner = _secret("ZET_AGENT_ID")
             if owner:
@@ -170,11 +179,13 @@ def create_pipeline(args: Any = None, **_: Any) -> str:
             response = requests.post(base + "/start", headers=headers, json=body, timeout=15)
         elif action == "status":
             if not run_id:
-                return json.dumps({"ok": False, "success": False, "code": "run_id_required"}, ensure_ascii=False)
+                return json.dumps({"ok": False, "success": False, "code": "run_id_required",
+                                   "next": "status 需要 run_id（start 返回的 run_id）。"}, ensure_ascii=False)
             response = requests.get(base + "/status/" + quote(run_id, safe=""), headers=headers, timeout=10)
         else:
             if not run_id:
-                return json.dumps({"ok": False, "success": False, "code": "run_id_required"}, ensure_ascii=False)
+                return json.dumps({"ok": False, "success": False, "code": "run_id_required",
+                                   "next": action + " 需要 run_id（start 返回的 run_id）。"}, ensure_ascii=False)
             if action == "set_pace":
                 pace = str(args.get("pace", "") or "").strip().lower()
                 if pace not in {"direct", "ask"}:

@@ -1340,6 +1340,22 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         err = data.get("error") or data.get("message")
         if err and (data.get("success") is False or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
+        # An explicit verdict wins: tools returning {"ok": bool} / {"success": bool}
+        # already say whether they failed. Never fall through to the substring
+        # heuristic for a JSON object — a healthy status payload that merely
+        # carries "failed": false (create_pipeline) was counted as a failure on
+        # every call and tripped the same-tool loop guard after three calls,
+        # while the real terminal failure (a long "problems" list pushing the
+        # word past the 500-char window) was counted as a success (09-03).
+        verdict = data.get("ok")
+        if not isinstance(verdict, bool):
+            verdict = data.get("success")
+        if isinstance(verdict, bool):
+            if verdict:
+                return False, ""
+            code = data.get("code") or data.get("error") or data.get("message")
+            return True, f" [{_trim_error(str(code))}]" if code else " [error]"
+        return False, ""
 
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
