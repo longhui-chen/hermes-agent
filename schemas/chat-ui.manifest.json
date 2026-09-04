@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "repo": "hermes-agent",
   "generated_by": "CHAT_UI_MANIFEST_UPDATE=1 python -m pytest -q tests/gateway/test_zet_agent_contract_manifest.py",
-  "snapshot_sha256": "3d5dfc0e24e1836d928e09fb5f0f19412db5e35eb3de6642da8ee760ac2b9eb5",
+  "snapshot_sha256": "1ae834c339fe1c5b67e32a141fb04869bec30ff700513acf43d5623946130670",
   "attachment_schema_sha256": "d4da6e3b73d51b22d72051f965f6ae35244bdf579c93e0c74069bc6231201b84",
   "hermes": {
     "payload_types": [

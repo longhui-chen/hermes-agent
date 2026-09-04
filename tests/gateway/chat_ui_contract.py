@@ -39,7 +39,7 @@ MANIFEST_GENERATED_BY = (
 # Pinned sha256 of the mirrored contract snapshot payload
 # (zettlab-product-dev: node scripts/chat-ui-contract/snapshot.mjs --print-sha).
 # Bump together with schemas/chat-ui-golden.snapshot.json on a reviewed contract change.
-CHAT_UI_GOLDEN_SNAPSHOT_SHA256 = "3d5dfc0e24e1836d928e09fb5f0f19412db5e35eb3de6642da8ee760ac2b9eb5"
+CHAT_UI_GOLDEN_SNAPSHOT_SHA256 = "1ae834c339fe1c5b67e32a141fb04869bec30ff700513acf43d5623946130670"
 
 # Golden files under golden/hermes that are not keyed by payload.type.
 NON_TYPE_GOLDENS = ("tool-frame.running", "tool-frame.completed", "tool-frame.error", "hermes-error", "finish-chunk")

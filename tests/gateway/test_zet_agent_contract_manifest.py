@@ -49,6 +49,12 @@ def test_payload_types_match_golden_and_doc():
     emitted = set(scan["payload_types"]) - ignore
     assert emitted - golden_types == set(), f"emitted without golden: {sorted(emitted - golden_types)}"
     assert golden_types - emitted == set(), f"golden without producer: {sorted(golden_types - emitted)}"
+    allow = set(snap["payload"].get("known", {}).get("hermes", {}).get("ignore_type_literals", []))
+    unlisted = set(scan["ignored_type_literals"]) - allow
+    assert unlisted == set(), (
+        f"undotted type literals not on the audited allowlist (known-differences hermes.ignore_type_literals): {sorted(unlisted)}; "
+        "a new frame needs golden + doc, a non-frame literal needs the allowlist"
+    )
     documented = set(cuc.documented_types())
     assert emitted - documented == set(), f"undocumented in {cuc.CONTRACT_DOC.name}: {sorted(emitted - documented)}"
     # static shape: a literal frame never writes a key the golden does not document

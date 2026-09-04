@@ -1,7 +1,7 @@
 {
   "snapshot_version": 1,
   "root_commit": null,
-  "sha256": "3d5dfc0e24e1836d928e09fb5f0f19412db5e35eb3de6642da8ee760ac2b9eb5",
+  "sha256": "1ae834c339fe1c5b67e32a141fb04869bec30ff700513acf43d5623946130670",
   "payload": {
     "golden": {
       "events": {
@@ -115,7 +115,6 @@
                   "connected": true
                 }
               },
-              "expires_at": 1756973400000,
               "dedup_key": "connector:notion",
               "fallback_text": "连接 Notion 以继续"
             }
@@ -1129,6 +1128,52 @@
           "type": "string"
         }
       },
+      "attachment_wire": {
+        "actions": {
+          "required": false,
+          "type": "array"
+        },
+        "category": {
+          "required": false,
+          "type": "string"
+        },
+        "dedup_key": {
+          "required": false,
+          "type": "string"
+        },
+        "expires_at": {
+          "required": false,
+          "type": "number"
+        },
+        "fallback_text": {
+          "required": false,
+          "type": "string"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "kind": {
+          "required": true,
+          "type": "string"
+        },
+        "payload": {
+          "required": true,
+          "type": "any"
+        },
+        "resolution": {
+          "required": false,
+          "type": "object"
+        },
+        "state": {
+          "required": true,
+          "type": "string"
+        },
+        "v": {
+          "required": true,
+          "type": "number"
+        }
+      },
       "events": {
         "agent.created": {
           "struct": "AgentLifecycleData",
@@ -2109,7 +2154,12 @@
     "known": {
       "$comment": "Explicitly declared differences the guard downgrades to warnings. Every entry names the closing batch. Fields the wire carries but a client lacks are NOT listed here: they are fixed by adding optional fields to the client types (B0 task 4.1). Only client-side phantoms (declared in TS, never emitted by local-server) live here until the batch that removes them.",
       "hermes": {
-        "ignore_type_literals": []
+        "ignore_type_literals": [
+          "disabled",
+          "invalid_request_error",
+          "text"
+        ],
+        "reason": "Non-frame dict literals in zet_agent.py that also carry a \"type\" key: reasoning-config `disabled`, the OpenAI-style error body `invalid_request_error`, and `text` content blocks. Any other undotted type literal is a new frame until registered here."
       },
       "registry": {
         "web": {
