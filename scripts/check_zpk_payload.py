@@ -347,7 +347,7 @@ def main() -> int:
     print(f"hermes --version ok: {version_output}")
 
     # ZET-1399: devices have no system uv and Debian ships ensurepip in the
-    # absent python3.11-venv package, so the venv-seeded pip is the ONLY
+    # absent matching python-venv package, so the venv-seeded pip is the ONLY
     # working tier of the tools/lazy_deps.py install ladder on a ZPK device.
     # A payload without it silently bricks every lazy-installable backend.
     pip_output = _check_command([sys.executable, "-m", "pip", "--version"])
