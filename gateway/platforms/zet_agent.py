@@ -4883,6 +4883,7 @@ class ZetAgentAdapter(APIServerAdapter):
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
+        connector_policy_disabled_skills: Optional[tuple[str, ...]] = None,
         prestream_timing: Optional[PrestreamTiming] = None,
     ):
         """Wrap base ``_run_agent`` to bind the App and interaction scopes.
@@ -5147,6 +5148,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
                 trusted_skill_slug=trusted_skill_slug,
+                connector_policy_disabled_skills=connector_policy_disabled_skills,
                 prestream_timing=prestream_timing,
             )
             # Early-return steer salvage: many conversation_loop retry/error

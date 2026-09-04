@@ -510,6 +510,16 @@ def get_workload_attached_skill_names() -> Set[str]:
         return set()
 
 
+def get_chat_connector_disabled_skill_names() -> Set[str]:
+    """Return the exact task-local deny set projected from Chat overrides."""
+    try:
+        from gateway.session_context import chat_connector_disabled_skills
+
+        return set(chat_connector_disabled_skills())
+    except Exception:
+        return set()
+
+
 def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     """Return the effective disabled set for this profile and workload.
 
@@ -520,7 +530,7 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     policy_disabled = get_connector_policy_disabled_skill_names()
     if policy_disabled:
         policy_disabled -= get_workload_attached_skill_names()
-    return user_disabled | policy_disabled
+    return user_disabled | policy_disabled | get_chat_connector_disabled_skill_names()
 
 
 def _normalize_string_set(values) -> Set[str]:

@@ -6,7 +6,9 @@ import json
 
 from agent import prompt_builder, skill_commands, skill_utils
 from gateway.session_context import (
+    pop_chat_connector_disabled_skills,
     pop_workload_attached_skills,
+    push_chat_connector_disabled_skills,
     push_workload_attached_skills,
     workload_skill_scope,
 )
@@ -127,3 +129,27 @@ def test_workload_scope_is_bounded_and_rejects_unknown_sources() -> None:
         assert "application or cron" in str(exc)
     else:
         raise AssertionError("unknown workload source must fail closed")
+
+
+def test_chat_override_deny_set_cannot_be_bypassed_by_skill_view(
+    tmp_path, monkeypatch
+) -> None:
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    _write_skill(skills_dir, "github")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [])
+    skill_utils._raw_config_cache_clear()
+    skills_tool._SKILLS_CACHE.clear()
+
+    token = push_chat_connector_disabled_skills(["github"])
+    try:
+        assert "github" in skill_utils.get_disabled_skill_names()
+        assert "github" not in _visible_names()
+        assert json.loads(skills_tool.skill_view("github"))["success"] is False
+    finally:
+        pop_chat_connector_disabled_skills(token)
+
+    assert "github" in _visible_names()

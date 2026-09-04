@@ -124,6 +124,14 @@ _WORKLOAD_SKILL_SCOPE: ContextVar[tuple[str, tuple[str, ...]]] = ContextVar(
 )
 _WORKLOAD_SKILL_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,127}$")
 
+# Exact connector Skill names disabled for one Chat turn after applying the
+# server-authoritative Agent snapshot and the session override. This is kept
+# separate from the profile-wide machine policy because concurrent chats may
+# carry different overrides.
+_CHAT_CONNECTOR_DISABLED_SKILLS: ContextVar[tuple[str, ...]] = ContextVar(
+    "hermes_chat_connector_disabled_skills", default=()
+)
+
 
 def push_workload_attached_skills(source_kind: str, skills) -> object:
     """Bind a normalized, immutable Application/Cron Skill set."""
@@ -154,6 +162,29 @@ def workload_skill_scope() -> tuple[str, tuple[str, ...]]:
 def workload_attached_skills() -> tuple[str, ...]:
     """Return exact Skill names attached to the current workload."""
     return workload_skill_scope()[1]
+
+
+def push_chat_connector_disabled_skills(skills) -> object:
+    """Bind a bounded, normalized Chat-only Connector Skill deny set."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    values = skills if isinstance(skills, (list, tuple)) else []
+    for raw in values[:2048]:
+        value = str(raw or "").strip()
+        if _WORKLOAD_SKILL_ID_RE.fullmatch(value) and value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return _CHAT_CONNECTOR_DISABLED_SKILLS.set(tuple(normalized))
+
+
+def pop_chat_connector_disabled_skills(token: object) -> None:
+    """Restore the Chat Connector deny set preceding this task."""
+    _CHAT_CONNECTOR_DISABLED_SKILLS.reset(token)
+
+
+def chat_connector_disabled_skills() -> tuple[str, ...]:
+    """Return the current Chat-only Connector Skill deny set."""
+    return _CHAT_CONNECTOR_DISABLED_SKILLS.get()
 
 
 def push_cron_attached_skills(skills) -> object:

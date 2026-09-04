@@ -747,6 +747,24 @@ def _extract_skill_slug(body: Dict[str, Any]) -> str:
     return slug
 
 
+def _extract_connector_policy_disabled_skills(body: Dict[str, Any]) -> tuple[str, ...]:
+    """Read the machine-authored Chat visibility overlay from metadata."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ()
+    raw = metadata.get("connector_policy_disabled_skills")
+    if not isinstance(raw, list) or len(raw) > 2048:
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        skill = str(value or "").strip()
+        if re.fullmatch(r"[a-z][a-z0-9_-]{1,127}", skill) and skill not in seen:
+            seen.add(skill)
+            out.append(skill)
+    return tuple(out)
+
+
 def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
     """Remove only the App quick-pick token from a string user task."""
     if not isinstance(user_message, str) or not skill_slug:
@@ -6293,7 +6311,13 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        connector_policy_disabled_skills = _extract_connector_policy_disabled_skills(body)
         skill_slug = _extract_skill_slug(body)
+        if skill_slug in connector_policy_disabled_skills:
+            # Quick-pick is not a visibility bypass. Treat a stale selection as
+            # ordinary text; the per-turn deny set below also blocks skill_view
+            # and direct slash expansion inside the agent.
+            skill_slug = ""
         trusted_task_message = _trusted_skill_task_message(user_message, skill_slug)
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -6644,6 +6668,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         request_overrides=request_overrides or None,
                         trusted_user_message=trusted_user_message,
                         trusted_skill_slug=trusted_skill_slug,
+                        connector_policy_disabled_skills=connector_policy_disabled_skills,
                         prestream_timing=prestream_timing,
                     ))
                 except BaseException:
@@ -6719,6 +6744,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
                     trusted_skill_slug=trusted_skill_slug,
+                    connector_policy_disabled_skills=connector_policy_disabled_skills,
                 )
             finally:
                 self._end_profile_chat_run(profile_run_key)
@@ -9305,6 +9331,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
+        connector_policy_disabled_skills: Optional[tuple[str, ...]] = None,
         prestream_timing: Optional[PrestreamTiming] = None,
     ) -> tuple:
         """
@@ -9370,7 +9397,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 clear_session_vars,
                 pop_zettlab_auth_principal,
                 pop_current_turn_reference_image,
+                pop_chat_connector_disabled_skills,
                 push_zettlab_auth_principal,
+                push_chat_connector_disabled_skills,
                 push_current_turn_reference_image,
                 set_turn_vars,
                 set_zettlab_connector_route_capability,
@@ -9409,6 +9438,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 reference_token = push_current_turn_reference_image(
                     current_turn_reference_image
+                )
+                chat_skill_visibility_token = push_chat_connector_disabled_skills(
+                    connector_policy_disabled_skills or ()
                 )
                 try:
                     # Resolve the auto-execute flag once so the Plan-First
@@ -9605,6 +9637,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # in gateway/run.py's _run_sync_with_timeout_lifecycle.
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
+                    pop_chat_connector_disabled_skills(chat_skill_visibility_token)
                     pop_current_turn_reference_image(reference_token)
                     if principal_token is not None:
                         pop_zettlab_auth_principal(principal_token)
