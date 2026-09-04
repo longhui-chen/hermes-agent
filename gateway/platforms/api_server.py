@@ -563,6 +563,12 @@ def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
 MAX_CANONICAL_FINAL_TURN_ID_LEN = 200
 
 
+# Upper bound for metadata.turn_id (bytes). local-server ids are UUID-sized;
+# 128 leaves room for prefixed / composite ids without letting a client push
+# kilobytes into every SSE frame.
+MAX_TURN_ID_BYTES = 128
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -576,6 +582,13 @@ def _extract_turn_id(body: Dict[str, Any]) -> str:
     raw = metadata.get("turn_id", metadata.get("turnId", ""))
     tid = str(raw or "").strip()
     if not tid or any(c.isspace() or ord(c) < 0x20 for c in tid):
+        return ""
+    # The id is echoed onto every extension frame of the turn (HERMES_TURN_ID →
+    # zet_agent `_stamp_extension_turn_id`), so an oversized value would be
+    # re-serialised hundreds of times per streamed turn. Real ids are UUID-ish;
+    # anything past the cap is dropped rather than truncated (a truncated id
+    # would silently mis-correlate).
+    if len(tid.encode("utf-8")) > MAX_TURN_ID_BYTES:
         return ""
     return tid
 

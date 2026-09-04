@@ -83,7 +83,7 @@ Producer: `_push_title`. local-server adds `session_id` while translating.
 
 | Field | Type | Req | Meaning |
 |---|---|---|---|
-| `state` | string | yes | `start` / `running` / `done` / `error` |
+| `state` | string | yes | `started` / `succeeded` / `failed` (exactly what `agent/conversation_compression.py` emits; the adapter forwards the payload unchanged) |
 | `message` | string | no | human-readable note |
 | `old_session_id` | string | no | rotation source |
 | `new_session_id` | string | no | rotation target |
@@ -204,7 +204,11 @@ Built by upstream `api_server.py` (`_on_tool_start` / `_on_tool_complete`
 | `ui_hint` | object | no | `takeover_browser` hint `{type, agent_id, browser_session_id, tab_id}`; translated into `tool.result.output.ui_hint` (on the **do-not-touch** list of the chat-ui contract) |
 | `browserState` | object | no | bounded page-state projection |
 | `browserContentEvidence` | object | no | bounded content projection |
-| `error`, `connectorError` | mixed | no | promoted tool errors |
+| `error` | string | no | short error text; present together with `outcome: "error"` |
+| `errorCode` | string | no | promoted from the tool result (`errorCode`, or `connector_error.code` / `.errorCode`) |
+| `statusCode` | number | no | promoted from `connector_error.status` |
+| `provider` | string | no | promoted from `connector_error.provider` |
+| `connector_error` | object | no | the connector's structured error verbatim (`provider`, `status`, `code`, `message`, `nextAction`, …); local-server / clients read this snake_case key — there is no `connectorError` on the wire. Golden: `tool-frame.error.json` |
 
 ---
 
