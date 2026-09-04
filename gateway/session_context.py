@@ -113,36 +113,94 @@ _EXEC_ASK: ContextVar = ContextVar("HERMES_EXEC_ASK", default=_UNSET)
 # masks any leaked process env value.
 _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
-# Exact profile-local Skills attached to the current scheduled job. This is a
-# task-local host capability, not an environment variable or model argument.
-# Cron-only tools use it to prevent a prompt from borrowing an operation
-# manifest from another installed Skill in the same profile.
-_CRON_ATTACHED_SKILLS: ContextVar[tuple[str, ...]] = ContextVar(
-    "hermes_cron_attached_skills", default=()
+# Exact profile-local Skills attached to the current Application or Cron
+# execution. This is a task-local host capability, not an environment variable
+# or model argument. It may bypass only the machine-owned Connector visibility
+# filter; user-disabled and platform/environment-incompatible Skills remain
+# unavailable. The tuple is bounded so one workload cannot create unbounded
+# cache cardinality in the long-running multiplex process.
+_WORKLOAD_SKILL_SCOPE: ContextVar[tuple[str, tuple[str, ...]]] = ContextVar(
+    "hermes_workload_skill_scope", default=("", ())
+)
+_WORKLOAD_SKILL_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,127}$")
+
+# Exact connector Skill names disabled for one Chat turn after applying the
+# server-authoritative Agent snapshot and the session override. This is kept
+# separate from the profile-wide machine policy because concurrent chats may
+# carry different overrides.
+_CHAT_CONNECTOR_DISABLED_SKILLS: ContextVar[tuple[str, ...]] = ContextVar(
+    "hermes_chat_connector_disabled_skills", default=()
 )
 
 
-def push_cron_attached_skills(skills) -> object:
-    """Bind a normalized, immutable scheduled-job Skill set."""
+def push_workload_attached_skills(source_kind: str, skills) -> object:
+    """Bind a normalized, immutable Application/Cron Skill set."""
+    source = str(source_kind or "").strip().lower()
+    if source not in {"application", "cron"}:
+        raise ValueError("workload Skill source must be application or cron")
     normalized: list[str] = []
     seen: set[str] = set()
     values = skills if isinstance(skills, (list, tuple)) else []
     for raw in values[:32]:
         value = str(raw or "").strip()
-        if value and value not in seen:
+        if _WORKLOAD_SKILL_ID_RE.fullmatch(value) and value not in seen:
             seen.add(value)
             normalized.append(value)
-    return _CRON_ATTACHED_SKILLS.set(tuple(normalized))
+    return _WORKLOAD_SKILL_SCOPE.set((source, tuple(normalized)))
+
+
+def pop_workload_attached_skills(token: object) -> None:
+    """Restore the workload Skill binding preceding this task."""
+    _WORKLOAD_SKILL_SCOPE.reset(token)
+
+
+def workload_skill_scope() -> tuple[str, tuple[str, ...]]:
+    """Return the source kind and Skill names for the current execution."""
+    return _WORKLOAD_SKILL_SCOPE.get()
+
+
+def workload_attached_skills() -> tuple[str, ...]:
+    """Return exact Skill names attached to the current workload."""
+    return workload_skill_scope()[1]
+
+
+def push_chat_connector_disabled_skills(skills) -> object:
+    """Bind a bounded, normalized Chat-only Connector Skill deny set."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    values = skills if isinstance(skills, (list, tuple)) else []
+    for raw in values[:2048]:
+        value = str(raw or "").strip()
+        if _WORKLOAD_SKILL_ID_RE.fullmatch(value) and value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return _CHAT_CONNECTOR_DISABLED_SKILLS.set(tuple(normalized))
+
+
+def pop_chat_connector_disabled_skills(token: object) -> None:
+    """Restore the Chat Connector deny set preceding this task."""
+    _CHAT_CONNECTOR_DISABLED_SKILLS.reset(token)
+
+
+def chat_connector_disabled_skills() -> tuple[str, ...]:
+    """Return the current Chat-only Connector Skill deny set."""
+    return _CHAT_CONNECTOR_DISABLED_SKILLS.get()
+
+
+def push_cron_attached_skills(skills) -> object:
+    """Backward-compatible Cron wrapper for the workload Skill scope."""
+    return push_workload_attached_skills("cron", skills)
 
 
 def pop_cron_attached_skills(token: object) -> None:
-    """Restore the scheduled-job Skill binding preceding this task."""
-    _CRON_ATTACHED_SKILLS.reset(token)
+    """Backward-compatible Cron wrapper restoring the preceding scope."""
+    pop_workload_attached_skills(token)
 
 
 def cron_attached_skills() -> tuple[str, ...]:
-    """Return the immutable Skill names authorized for this Cron task."""
-    return _CRON_ATTACHED_SKILLS.get()
+    """Return immutable Skill names only for the current Cron source."""
+    source, skills = workload_skill_scope()
+    return skills if source == "cron" else ()
 
 # ADIC v1 (App Data Import Contract): a bounded, task-local ledger of this
 # turn's app_host `app_operation(...)` outcomes, tagged with the operation

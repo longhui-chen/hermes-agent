@@ -79,7 +79,6 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
@@ -620,44 +619,12 @@ def _get_disabled_skill_names() -> Set[str]:
     return get_disabled_skill_names()
 
 
-def _get_session_platform() -> str:
-    """Resolve the current platform from gateway session context.
-
-    Mirrors the platform-resolution logic in
-    ``agent.skill_utils.get_disabled_skill_names`` so that
-    ``_is_skill_disabled`` respects ``HERMES_SESSION_PLATFORM``.
-    """
-    try:
-        from gateway.session_context import get_session_env
-        return get_session_env("HERMES_SESSION_PLATFORM") or ""
-    except Exception:
-        return ""
-
-
 def _is_skill_disabled(name: str, platform: str = None) -> bool:
-    """Check if a skill is disabled in config.
-
-    Resolves the active platform from (in order of precedence):
-    1. Explicit ``platform`` argument
-    2. ``HERMES_PLATFORM`` environment variable
-    3. ``HERMES_SESSION_PLATFORM`` from gateway session context
-    """
+    """Check the unified user + Connector-policy visibility predicate."""
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        skills_cfg = config.get("skills", {})
-        # ZET fork: session ContextVar outranks the process env (see
-        # skill_commands._resolve_skill_commands_platform for the rationale).
-        resolved_platform = platform or _get_session_platform() or os.getenv("HERMES_PLATFORM")
-        global_disabled = skills_cfg.get("disabled", [])
-        if resolved_platform:
-            platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
-            if platform_disabled is not None:
-                # A globally-disabled skill stays disabled on every platform;
-                # the platform list adds to it rather than replacing it. Keep
-                # in sync with agent.skill_utils.get_disabled_skill_names.
-                return name in platform_disabled or name in global_disabled
-        return name in global_disabled
+        from agent.skill_utils import get_disabled_skill_names
+
+        return name in get_disabled_skill_names(platform)
     except Exception:
         return False
 
@@ -801,6 +768,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                     "success": True,
                     "skills": [],
                     "categories": [],
+                    "visibility_generation": _connector_visibility_generation(),
                     "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
                 },
                 ensure_ascii=False,
@@ -815,6 +783,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                     "success": True,
                     "skills": [],
                     "categories": [],
+                    "visibility_generation": _connector_visibility_generation(),
                     "message": "No skills found in skills/ directory.",
                 },
                 ensure_ascii=False,
@@ -838,6 +807,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
+                "visibility_generation": _connector_visibility_generation(),
                 "hint": "Use skill_view(name) to see full content, tags, and linked files",
             },
             ensure_ascii=False,
@@ -845,6 +815,16 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
     except Exception as e:
         return tool_error(str(e), success=False)
+
+
+def _connector_visibility_generation() -> int:
+    """Return the additive Connector visibility generation for API callers."""
+    try:
+        from agent.skill_utils import get_connector_policy_generation
+
+        return get_connector_policy_generation()
+    except Exception:
+        return 0
 
 
 # ── Plugin skill serving ──────────────────────────────────────────────────

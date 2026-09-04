@@ -56,6 +56,14 @@ from gateway.platforms.api_server import (
 # ---------------------------------------------------------------------------
 
 
+def test_extract_connector_policy_disabled_skills_is_bounded_and_normalized():
+    extract = api_server_module._extract_connector_policy_disabled_skills
+    assert extract({"metadata": {"connector_policy_disabled_skills": [
+        "github", "github", "bad/name", " jira ", 42,
+    ]}}) == ("github", "jira")
+    assert extract({"metadata": {"connector_policy_disabled_skills": ["x"] * 2049}}) == ()
+
+
 class TestCheckRequirements:
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
@@ -1713,9 +1721,15 @@ class TestSkillsEndpoint:
             {"name": "github", "description": "GitHub workflow skill", "category": "github"},
             {"name": "ascii-art", "description": "ASCII art generation", "category": "creative"},
         ]
-        with patch(
-            "tools.skills_tool._find_all_skills",
-            return_value=list(fake_skills),
+        with (
+            patch(
+                "tools.skills_tool._find_all_skills",
+                return_value=list(fake_skills),
+            ),
+            patch(
+                "agent.skill_utils.get_connector_policy_generation",
+                return_value=23,
+            ),
         ):
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
@@ -1723,6 +1737,7 @@ class TestSkillsEndpoint:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["object"] == "list"
+                assert data["visibility_generation"] == 23
                 names = sorted(s["name"] for s in data["data"])
                 assert names == ["ascii-art", "github"]
                 for entry in data["data"]:
@@ -2282,6 +2297,33 @@ class TestChatCompletionsEndpoint:
                     mock_expand.await_args.kwargs["session_id"]
                     == mock_run.await_args.kwargs["session_id"]
                 )
+
+    @pytest.mark.asyncio
+    async def test_chat_connector_visibility_blocks_stale_quick_pick(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/github list issues"}],
+                        "stream": False,
+                        "metadata": {
+                            "skill_slug": "github",
+                            "connector_policy_disabled_skills": ["github"],
+                        },
+                    },
+                )
+                assert resp.status == 200
+                mock_expand.assert_not_awaited()
+                assert mock_run.await_args.kwargs["trusted_skill_slug"] == ""
+                assert mock_run.await_args.kwargs["connector_policy_disabled_skills"] == ("github",)
 
     @pytest.mark.asyncio
     async def test_video_edit_skill_selection_preserves_routing_signal(
