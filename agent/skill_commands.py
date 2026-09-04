@@ -25,6 +25,7 @@ _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_skills_dir_key: Optional[str] = None
 _skill_commands_visibility_key: tuple[str, ...] = ()
+_SKILL_COMMANDS_CACHE_MAX_ENTRIES = 32
 _skill_commands_cache: Dict[
     tuple[Optional[str], Optional[str], tuple[str, ...]], Dict[str, Dict[str, Any]]
 ] = {}
@@ -569,6 +570,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         _skill_commands_visibility_key = visibility_key
         _skill_commands = commands
         _skill_commands_cache[scope_key] = commands
+        if hasattr(_skill_commands_cache, "move_to_end"):
+            _skill_commands_cache.move_to_end(scope_key)
+        while len(_skill_commands_cache) > _SKILL_COMMANDS_CACHE_MAX_ENTRIES:
+            _skill_commands_cache.pop(next(iter(_skill_commands_cache)))
     return commands
 
 
@@ -594,6 +599,8 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         cached = _skill_commands_cache.get(scope_key)
         if cached:
+            if hasattr(_skill_commands_cache, "move_to_end"):
+                _skill_commands_cache.move_to_end(scope_key)
             _skill_commands_platform = platform_key
             _skill_commands_skills_dir_key = skills_dir_key
             _skill_commands_visibility_key = visibility_key
@@ -613,7 +620,11 @@ def _cached_skill_commands_for_current_scope() -> Dict[str, Dict[str, Any]]:
             and _skill_commands_visibility_key == visibility_key
         ):
             return _skill_commands
-        return _skill_commands_cache.get(scope_key, {})
+        cached = _skill_commands_cache.get(scope_key, {})
+        if cached:
+            if hasattr(_skill_commands_cache, "move_to_end"):
+                _skill_commands_cache.move_to_end(scope_key)
+        return cached
 
 
 def _invalidate_other_skill_command_scopes(

@@ -153,3 +153,30 @@ def test_chat_override_deny_set_cannot_be_bypassed_by_skill_view(
         pop_chat_connector_disabled_skills(token)
 
     assert "github" in _visible_names()
+
+
+def test_chat_visibility_command_cache_is_bounded(tmp_path, monkeypatch) -> None:
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    for name in ("alpha", "beta", "gamma"):
+        _write_skill(skills_dir, name)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [])
+    monkeypatch.setattr(skill_commands, "_SKILL_COMMANDS_CACHE_MAX_ENTRIES", 2)
+    skill_utils._raw_config_cache_clear()
+    skill_commands._skill_commands_cache.clear()
+    monkeypatch.setattr(skill_commands, "_skill_commands", {})
+    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+    monkeypatch.setattr(skill_commands, "_skill_commands_skills_dir_key", None)
+    monkeypatch.setattr(skill_commands, "_skill_commands_visibility_key", ())
+
+    for disabled in (["alpha"], ["beta"], ["gamma"]):
+        token = push_chat_connector_disabled_skills(disabled)
+        try:
+            skill_commands.get_skill_commands()
+        finally:
+            pop_chat_connector_disabled_skills(token)
+
+    assert len(skill_commands._skill_commands_cache) == 2
