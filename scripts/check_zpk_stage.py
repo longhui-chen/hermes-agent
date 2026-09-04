@@ -42,6 +42,11 @@ MAX_REPORTED_PATHS = 50
 PYTHON_RELATIVE_PATH = Path("venv/bin/python")
 PYTHON_CONFIG_RELATIVE_PATH = Path("venv/pyvenv.cfg")
 ELF_MACHINE_AARCH64 = 183
+ELF_MACHINE_RISCV = 243
+ELF_MACHINE_BY_ARCH = {
+    "arm64": ELF_MACHINE_AARCH64,
+    "riscv64": ELF_MACHINE_RISCV,
+}
 
 
 def _is_intentionally_excluded(relative_path: Path) -> bool:
@@ -185,10 +190,13 @@ def check_staged_python(
         )
 
     machine = _elf_machine(interpreter)
-    if target_arch == "arm64":
-        if machine != ELF_MACHINE_AARCH64:
+    if target_arch:
+        expected_machine = ELF_MACHINE_BY_ARCH[target_arch]
+        if machine != expected_machine:
             actual = "non-ELF" if machine is None else f"machine {machine}"
-            raise RuntimeError(f"staged Python is not Linux arm64 ELF ({actual})")
+            raise RuntimeError(
+                f"staged Python is not Linux {target_arch} ELF ({actual})"
+            )
         needed = _needed_libraries(interpreter)
         unbundled_python = tuple(
             name for name in needed if re.fullmatch(r"libpython[^/]*", name)
@@ -218,9 +226,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target-arch",
-        choices=("arm64",),
+        choices=tuple(ELF_MACHINE_BY_ARCH),
         default=None,
-        help="require a Linux arm64 staged interpreter (used by device packaging)",
+        help="require a staged interpreter for the selected Linux device architecture",
     )
     parser.add_argument(
         "--python-version",

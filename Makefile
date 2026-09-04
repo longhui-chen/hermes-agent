@@ -3,13 +3,19 @@
 UV ?= uv
 ZPK_OUTPUT ?= build/zettlab-claw.zpk
 ZPK_SRC_DIR := zpk/lib/hermes-agent
+TARGET_ARCH ?= arm64
 # The device image provides Debian's system Python, not a self-contained
 # interpreter from the uv builder image.  Keep this explicit so a builder
 # cannot silently copy a /usr/local launcher that needs an unavailable
 # libpython shared object at runtime.  Release builders may override this
 # with another reviewed, target-compatible absolute path.
+ifeq ($(TARGET_ARCH),riscv64)
+ZPK_PYTHON ?= /usr/bin/python3.12
+ZPK_PYTHON_VERSION ?= 3.12
+else
 ZPK_PYTHON ?= /usr/bin/python3.11
 ZPK_PYTHON_VERSION ?= 3.11
+endif
 # ZET-1399: `anthropic` left `[all]` on 2026-05-12 in favour of lazy install,
 # but on ZPK devices the lazy-install ladder (uv -> pip -> ensurepip) is fully
 # broken: no system uv, uv-created venvs ship without pip, and Debian splits
@@ -222,14 +228,14 @@ zpk-stage: zpk-venv
 	@tar $(ZPK_EXCLUDES) -cf - . | tar -xf - -C "$(ZPK_SRC_DIR)"
 	@rm -f "$(ZPK_SRC_DIR)/venv/lib64"
 	@python_bin=$$(readlink -f venv/bin/python); \
-	rm -f "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"; \
+	rm -f "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python$(ZPK_PYTHON_VERSION)"; \
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python"; \
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3"; \
-	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
-	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
+	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python$(ZPK_PYTHON_VERSION)"
+	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python$(ZPK_PYTHON_VERSION)"
 	@find "$(ZPK_SRC_DIR)" -type l -delete
 	@python3 scripts/check_zpk_stage.py "$(ZPK_SRC_DIR)" \
-		--target-arch arm64 --python-version "$(ZPK_PYTHON_VERSION)" \
+		--target-arch "$(TARGET_ARCH)" --python-version "$(ZPK_PYTHON_VERSION)" \
 		--python-home "$$(dirname "$$(readlink -f "$(ZPK_PYTHON)")")"
 	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes \
 		zpk/libexec/hermes-secure-launcher.py zpk/zpk-systemd.sh \
