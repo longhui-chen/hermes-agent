@@ -90,11 +90,20 @@ def _own_session_id() -> str:
 
     Empty for CLI/unknown contexts (the endpoint then rejects: no owner).
     """
+    key = ""
     try:
         from tools.approval import get_current_session_key
 
         key = str(get_current_session_key("") or "")
     except Exception:
+        key = ""
+    if not key:
+        # contextvar 在某些执行路径（线程池里跑的工具调用等）拿不到，退回进程环境。
+        # 真机上主 Agent 想把「改这个应用」转交给应用的专属 Agent，就是卡在这里：
+        # caller_session_id 空 → local-server 400 → 用户被告知「维护者调用未成功」，
+        # 只能自己换到应用侧边栏重说一遍。
+        key = str(_scoped_env("HERMES_SESSION_KEY", "") or "").strip()
+    if not key:
         return ""
     marker = ":zet_agent:"
     idx = key.find(marker)
