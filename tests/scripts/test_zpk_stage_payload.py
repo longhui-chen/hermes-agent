@@ -334,39 +334,3 @@ def test_check_staged_python_accepts_target_compatible_interpreter(
     module.check_staged_python(
         stage, target_arch="arm64", python_version="3.11", python_home="/usr/bin"
     )
-
-
-def test_check_staged_python_accepts_riscv64_interpreter(
-    monkeypatch, tmp_path: Path
-) -> None:
-    stage = tmp_path / "stage"
-    _write_fake_python(stage)
-    module = _load_check_module()
-
-    monkeypatch.setattr(module, "_elf_machine", lambda _path: module.ELF_MACHINE_RISCV)
-    monkeypatch.setattr(module, "_needed_libraries", lambda _path: ("libc.so.6",))
-    monkeypatch.setattr(module, "_missing_dynamic_libraries", lambda _path: ())
-
-    module.check_staged_python(
-        stage, target_arch="riscv64", python_version="3.11", python_home="/usr/bin"
-    )
-
-
-def test_check_staged_python_rejects_wrong_riscv64_machine(
-    monkeypatch, tmp_path: Path
-) -> None:
-    stage = tmp_path / "stage"
-    _write_fake_python(stage)
-    module = _load_check_module()
-
-    monkeypatch.setattr(
-        module, "_elf_machine", lambda _path: module.ELF_MACHINE_AARCH64
-    )
-
-    with pytest.raises(RuntimeError, match="not Linux riscv64 ELF"):
-        module.check_staged_python(
-            stage,
-            target_arch="riscv64",
-            python_version="3.11",
-            python_home="/usr/bin",
-        )

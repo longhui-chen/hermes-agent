@@ -9,10 +9,6 @@ HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 HERMES_LINK="/usr/local/bin/hermes"
 DATA_DIR="/volume1/system/zettos-main-data/com.zettlab.claw"
 
-# Keep the version probe and every install-time Python helper from mutating the
-# immutable package slot after .check-app has been generated.
-export PYTHONDONTWRITEBYTECODE=1
-
 source "$APP_ROOT/zpk-systemd.sh"
 
 # PyPI 镜像是辅助提速功能：其脚本缺失/损坏不应阻断 hermes 核心安装（HR2），
