@@ -193,6 +193,7 @@ def test_zpk_install_does_not_write_python_bytecode_into_package_slot() -> None:
     )
     assert "export PYTHONDONTWRITEBYTECODE=1" in install_script
     assert "export PYTHONDONTWRITEBYTECODE=1" in launcher_script
+    assert 'exec "$HERMES_PYTHON" -I -B ' in launcher_script
 
 
 def test_zpk_uv_config_matches_locked_resolver_policy() -> None:
