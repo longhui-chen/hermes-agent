@@ -112,6 +112,11 @@ Fields from `contracts/chat-ui/v1/golden/hermes/context.compaction.json` (do not
 | `message` | string | `"上下文已压缩"` |
 | `old_session_id` | string | `"sess_demo_0001"` |
 | `new_session_id` | string | `"sess_demo_0002"` |
+| `before_messages` | number | `42` |
+| `before_tokens` | number | `18000` |
+| `after_messages` | number | `12` |
+| `after_tokens` | number | `6000` |
+| `error` | string | `""` |
 <!-- generated:end context.compaction -->
 
 | Field | Type | Req | Meaning |

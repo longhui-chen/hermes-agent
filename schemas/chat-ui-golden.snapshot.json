@@ -1,7 +1,7 @@
 {
   "snapshot_version": 1,
   "root_commit": null,
-  "sha256": "1ae834c339fe1c5b67e32a141fb04869bec30ff700513acf43d5623946130670",
+  "sha256": "d87d0f7f092e14ee687274f7c25977a523c0dbb19c8d34d7b87db763446ccdd2",
   "payload": {
     "golden": {
       "events": {
@@ -885,7 +885,12 @@
           "state": "succeeded",
           "message": "上下文已压缩",
           "old_session_id": "sess_demo_0001",
-          "new_session_id": "sess_demo_0002"
+          "new_session_id": "sess_demo_0002",
+          "before_messages": 42,
+          "before_tokens": 18000,
+          "after_messages": 12,
+          "after_tokens": 6000,
+          "error": ""
         },
         "conversation.title": {
           "type": "conversation.title",

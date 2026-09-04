@@ -62,9 +62,14 @@ def test_compaction_status_callback_forwards_producer_states(golden, state):
     adapter = _adapter()
     q: "queue.Queue" = queue.Queue()
     status = adapter._make_status_cb(q)
-    payload = {"state": state, "message": "compacting"}
-    if state == "succeeded":
-        payload.update({"old_session_id": "sess_old", "new_session_id": "sess_new"})
+    # The exact shapes agent/conversation_compression.py emits (started / failed / succeeded).
+    payload = {"state": state, "message": "compacting", "old_session_id": "sess_old"}
+    if state == "started":
+        payload.update({"before_messages": 42, "before_tokens": 18000})
+    elif state == "failed":
+        payload.update({"error": "boom"})
+    else:
+        payload.update({"new_session_id": "sess_new", "before_messages": 42, "after_messages": 12, "before_tokens": 18000, "after_tokens": 6000})
     tokens = set_turn_vars(turn_id="turn-1")
     try:
         status("context.compaction", payload)
