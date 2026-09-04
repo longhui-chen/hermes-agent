@@ -20,7 +20,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from agent.credential_broker import request_app_auto_refresh_token
 from agent.secret_scope import get_secret
@@ -100,6 +100,10 @@ _HTTP_ACTIONS = (
     # operation journal: the former invokes a declared app capability, the
     # latter only reads the state of an already accepted workflow.
     "app_capabilities", "app_operation", "workflow_operation_status", "workflow_operation_resume",
+    # The platform-event inbox of one maintenance task (规范 3.2 事件触发). A
+    # read, scoped by the maintainer binding — so it lives on the app_host
+    # face that cron turns keep, not on the interactive-only app_workspace.
+    "maintenance_task_events",
 )
 _ACTIONS = _HTTP_ACTIONS + ("build_env",)
 
@@ -304,6 +308,22 @@ APP_HOST_SCHEMA = {
             "operation_id": {
                 "type": "string",
                 "description": "Required for workflow_operation_status: App Host operation journal receipt id.",
+            },
+            "spec_id": {
+                "type": "string",
+                "description": "For maintenance_task_events: the maintenance task's spec id (as named in the run prompt). Either spec_id or task_id is required.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "For maintenance_task_events: the maintenance task's job id, when known instead of spec_id.",
+            },
+            "ack": {
+                "type": "boolean",
+                "description": "For maintenance_task_events: acknowledge (remove) the returned events; default true. Pass false to peek without draining.",
+            },
+            "expected_instance_id": {
+                "type": "string",
+                "description": "For maintenance_task_events: optional current app_instance_id (from list); omit to read the current instance.",
             },
         },
         "required": ["action"],
@@ -781,6 +801,31 @@ def _build_request(action, args):
         if lifecycle_action not in _LIFECYCLE_ACTIONS:
             raise _BadRequest("lifecycle 需要 lifecycle_action 参数（start/stop/restart）")
         return "POST", f"/{slug}/lifecycle", {"action": lifecycle_action}, timeout
+    if action == "maintenance_task_events":
+        slug = _require_slug(args)
+        query = {}
+        task_id = str(args.get("task_id", "") or "").strip()
+        spec_id = str(args.get("spec_id", "") or "").strip()
+        if task_id:
+            if len(task_id) > 64 or not re.fullmatch(r"[A-Za-z0-9_.-]+", task_id):
+                raise _BadRequest("task_id 必须是任务的 job id")
+            query["task_id"] = task_id
+        elif spec_id:
+            if len(spec_id) > 64 or "/" in spec_id or "\\" in spec_id or any(ord(ch) < 0x20 for ch in spec_id):
+                raise _BadRequest("spec_id 必须是任务的 spec id")
+            query["spec_id"] = spec_id
+        else:
+            raise _BadRequest("maintenance_task_events 需要 spec_id 或 task_id")
+        ack = args.get("ack", True)
+        if not isinstance(ack, bool):
+            raise _BadRequest("ack 必须是布尔值")
+        query["ack"] = "true" if ack else "false"
+        instance = str(args.get("expected_instance_id", "") or "").strip()
+        if instance:
+            if len(instance) > 256 or any(ord(ch) < 0x20 for ch in instance):
+                raise _BadRequest("expected_instance_id 必须是合法的当前 app_instance_id")
+            query["expected_instance_id"] = instance
+        return "GET", f"/{slug}/maintenance_task_events?" + urlencode(query), None, timeout
     if action == "logs":
         slug = _require_slug(args)
         tail = args.get("tail", _DEFAULT_LOG_TAIL)
@@ -845,11 +890,40 @@ def _build_env_result():
     return _ok({"vendor_dir": vendor_dir, "ready": ready})
 
 
+def _resolve_current_instance(slug):
+    """Return the current app_instance_id of ``slug`` from its capability
+    contract (the one read a bound maintainer may always make — the
+    owner-scoped list is closed to it), or "" when it cannot be determined
+    (the caller then sends the request without it and lets App Host answer)."""
+    if not slug or not _SLUG_RE.match(slug):
+        return ""
+    base = _base_url()
+    token = _secret("ZETTLAB_AGENT_ACTION_TOKEN")
+    if not base or not token:
+        return ""
+    headers = {_ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
+    try:
+        headers.update(_execution_headers())
+    except Exception:
+        pass
+    req = urllib.request.Request(base + f"/{quote(slug, safe='')}/capabilities", headers=headers, method="GET")
+    try:
+        with _urlopen(req, timeout=_DEFAULT_TIMEOUT) as resp:
+            raw = resp.read(_MAX_RESPONSE_BYTES + 1)
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return ""
+    if isinstance(parsed, dict):
+        return str(parsed.get("app_instance_id", "") or "").strip()
+    return ""
+
+
 _COMPLETION_STATUS = {
     "probe": {200}, "list": {200}, "app_capabilities": {200},
     "app_operation": {200}, "acquire_slot": {200}, "release_slot": {204},
     "publish": {200, 202}, "install": {200, 202}, "reload": {200, 202}, "rollback": {200},
     "delete": {204}, "lifecycle": {200}, "logs": {200}, "call": {200},
+    "maintenance_task_events": {200},
     "workflow_operation_status": {200, 202}, "workflow_operation_resume": {200, 202},
 }
 
@@ -973,6 +1047,15 @@ def _app_host_tool_dispatch(args, **_kw):
     if action == "build_env":
         # Pure local check — no HTTP request, no credentials leave the tool.
         return _build_env_result()
+
+    if action == "maintenance_task_events" and not str(args.get("expected_instance_id", "") or "").strip():
+        # The wake-up prompt names the app by slug only; local-servers before
+        # the inbox relaxation refuse the read without the current instance id
+        # (404), so resolve it from the owner-scoped list before asking.
+        resolved = _resolve_current_instance(str(args.get("slug", "") or "").strip())
+        if resolved:
+            args = dict(args)
+            args["expected_instance_id"] = resolved
 
     try:
         method, path, body, timeout = _build_request(action, args)
