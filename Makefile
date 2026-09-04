@@ -9,17 +9,20 @@ TARGET_ARCH ?= arm64
 # cannot silently copy a /usr/local launcher that needs an unavailable
 # libpython shared object at runtime.  Release builders may override this
 # with another reviewed, target-compatible absolute path.
-ifeq ($(TARGET_ARCH),riscv64)
-ZPK_PYTHON ?= /usr/bin/python3.12
-ZPK_PYTHON_VERSION ?= 3.12
-else
-ZPK_PYTHON ?= /usr/bin/python3.11
-ZPK_PYTHON_VERSION ?= 3.11
-endif
+ZPK_PYTHON_arm64 := /usr/bin/python3.11
+ZPK_PYTHON_riscv64 := /usr/bin/python3.12
+ZPK_PYTHON_VERSION_arm64 := 3.11
+ZPK_PYTHON_VERSION_riscv64 := 3.12
+ZPK_PYTHON ?= $(ZPK_PYTHON_$(TARGET_ARCH))
+ZPK_PYTHON_VERSION ?= $(ZPK_PYTHON_VERSION_$(TARGET_ARCH))
+ZPK_UV_DEPENDENCY_BUILD_POLICY_arm64 := --no-build
+ZPK_UV_DEPENDENCY_BUILD_POLICY_riscv64 :=
+ZPK_UV_DEPENDENCY_BUILD_POLICY := $(ZPK_UV_DEPENDENCY_BUILD_POLICY_$(TARGET_ARCH))
+ZPK_UV_PYTHON_ARGS := --python "$(ZPK_PYTHON)" --no-managed-python --no-python-downloads
 # ZET-1399: `anthropic` left `[all]` on 2026-05-12 in favour of lazy install,
 # but on ZPK devices the lazy-install ladder (uv -> pip -> ensurepip) is fully
 # broken: no system uv, uv-created venvs ship without pip, and Debian splits
-# ensurepip into the (absent) python3.11-venv package. Anything a device needs
+# ensurepip into a separate pythonX.Y-venv package. Anything a device needs
 # at runtime must therefore be baked into the ZPK venv here.
 override ZPK_INSTALL_SPEC := .[all,langfuse,anthropic,zpk-runtime]
 override ZPK_UV_SYNC_EXTRAS := \
@@ -180,9 +183,9 @@ zpk-venv: check-zpk-python
 	@rm -rf venv python-runtime
 	@mkdir -p "$(ZPK_LOG_DIR)"
 	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
-		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv --python "$(ZPK_PYTHON)" --no-managed-python --no-python-downloads; \
+		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv $(ZPK_UV_PYTHON_ARGS); \
 	else \
-		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv --python "$(ZPK_PYTHON)" --no-managed-python --no-python-downloads >"$(ZPK_UV_VENV_LOG)" 2>&1 || { \
+		$(ZPK_UV_ENV) "$(UV)" --no-progress venv venv $(ZPK_UV_PYTHON_ARGS) >"$(ZPK_UV_VENV_LOG)" 2>&1 || { \
 			echo "uv venv failed; showing last 120 log lines from $(ZPK_UV_VENV_LOG)"; \
 			tail -n 120 "$(ZPK_UV_VENV_LOG)" 2>/dev/null || true; \
 			exit 1; \
@@ -197,22 +200,22 @@ zpk-venv: check-zpk-python
 	@echo "Installing locked zettlab-claw dependencies ($(ZPK_INSTALL_SPEC))..."
 	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build \
-				$(ZPK_UV_SYNC_EXTRAS) && \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project $(ZPK_UV_DEPENDENCY_BUILD_POLICY) \
+				$(ZPK_UV_PYTHON_ARGS) $(ZPK_UV_SYNC_EXTRAS) && \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
 			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation \
-				--reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS); \
+				$(ZPK_UV_PYTHON_ARGS) --reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS); \
 	else \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build \
-				$(ZPK_UV_SYNC_EXTRAS) >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project $(ZPK_UV_DEPENDENCY_BUILD_POLICY) \
+				$(ZPK_UV_PYTHON_ARGS) $(ZPK_UV_SYNC_EXTRAS) >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
 			echo "uv locked dependency sync failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
 			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
 			exit 1; \
 		}; \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
 			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation \
-				--reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS) >>"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+				$(ZPK_UV_PYTHON_ARGS) --reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS) >>"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
 			echo "uv locked project sync failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
 			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
 			exit 1; \

@@ -180,9 +180,9 @@ def test_zpk_payload_checker_rejects_cached_project_wheel(
 
 def test_zpk_python_is_explicit_target_compatible_path() -> None:
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
-    match = re.search(r"^ZPK_PYTHON\s*\?=\s*(\S+)", makefile, re.MULTILINE)
-    assert match, "ZPK_PYTHON must have a reviewed default"
-    assert match.group(1) == "/usr/bin/python3.11"
+    assert "ZPK_PYTHON_arm64 := /usr/bin/python3.11" in makefile
+    assert "ZPK_PYTHON_riscv64 := /usr/bin/python3.12" in makefile
+    assert "ZPK_PYTHON ?= $(ZPK_PYTHON_$(TARGET_ARCH))" in makefile
     assert "--python 3.11" not in makefile
 
 
@@ -212,8 +212,14 @@ def test_zpk_payload_checker_covers_deep_memory_runtime() -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="ZPK Makefile is POSIX-only")
+@pytest.mark.parametrize(
+    ("target_arch", "expect_dependency_no_build"),
+    (("arm64", True), ("riscv64", False)),
+)
 def test_zpk_make_flow_uses_locked_sync_and_reviewed_uv_path(
     tmp_path: Path,
+    target_arch: str,
+    expect_dependency_no_build: bool,
 ) -> None:
     make = shutil.which("make")
     if make is None:
@@ -304,6 +310,7 @@ if (
             "--no-print-directory",
             "ZPK_VERBOSE=1",
             f"UV={fake_uv}",
+            f"TARGET_ARCH={target_arch}",
             f"ZPK_PYTHON={target_python}",
             "zpk-venv",
         ],
@@ -336,13 +343,17 @@ if (
         assert "install" not in sync_argv
         assert "--exclude-newer" not in sync_argv
         assert "--exclude-newer-package" not in sync_argv
+        python_index = sync_argv.index("--python")
+        assert sync_argv[python_index + 1] == str(target_python)
+        assert "--no-managed-python" in sync_argv
+        assert "--no-python-downloads" in sync_argv
         assert {
             sync_argv[index + 1]
             for index, argument in enumerate(sync_argv[:-1])
             if argument == "--extra"
         } == {"all", "langfuse", "anthropic", "zpk-runtime"}
     assert "--no-install-project" in dependency_sync
-    assert "--no-build" in dependency_sync
+    assert ("--no-build" in dependency_sync) is expect_dependency_no_build
     assert "--no-build-isolation" not in dependency_sync
     assert "--no-install-project" not in project_sync
     assert "--no-build" not in project_sync
@@ -369,6 +380,7 @@ if (
             "--no-print-directory",
             "ZPK_VERBOSE=1",
             f"UV={fake_uv}",
+            f"TARGET_ARCH={target_arch}",
             f"ZPK_PYTHON={target_python}",
             "zpk-venv",
         ],
@@ -386,7 +398,7 @@ if (
     assert len(failed_calls) == 2
     assert "venv" in failed_calls[0]["argv"]
     assert "--no-install-project" in failed_calls[1]["argv"]
-    assert "--no-build" in failed_calls[1]["argv"]
+    assert ("--no-build" in failed_calls[1]["argv"]) is expect_dependency_no_build
     assert all("--no-build-isolation" not in call["argv"] for call in failed_calls)
 
 
