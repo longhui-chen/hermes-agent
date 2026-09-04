@@ -1,7 +1,7 @@
 {
   "snapshot_version": 1,
   "root_commit": null,
-  "sha256": "d87d0f7f092e14ee687274f7c25977a523c0dbb19c8d34d7b87db763446ccdd2",
+  "sha256": "0e00f702b5fa8fddd71cefa2a5fd435e98e7804cade212394c2482982325915e",
   "payload": {
     "golden": {
       "events": {
@@ -1835,7 +1835,7 @@
           }
         },
         "text.reset": {
-          "struct": "",
+          "struct": "struct {}",
           "fields": {}
         },
         "todo.update": {
