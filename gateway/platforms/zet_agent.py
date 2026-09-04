@@ -1,8 +1,21 @@
 """
 Zet Agent platform — APIServerAdapter subclass that extends the
 ``/v1/chat/completions`` SSE channel with Zettlab-specific events
-(reasoning, approval, clarify, conversation title) without forking
-the upstream platform file.
+without forking the upstream platform file.
+
+Wire contract
+-------------
+Every extension frame rides ``event: hermes.tool.progress`` and is keyed by
+``payload.type``: ``reasoning.delta``, ``conversation.title``,
+``context.compaction``, ``steer_dropped``, ``hermes.approval``,
+``hermes.clarify``, ``hermes.todo``, ``hermes.plan``, ``hermes.attachment``,
+``hermes.delegation.progress``; tool lifecycle frames carry no ``type`` and
+are keyed by ``toolCallId``. Field tables, the optional ``turn_id`` every
+adapter-built frame carries, and the error frame / finish chunk rules live
+in ``docs/zet-agent-sse-extension-contract.md`` (source of truth; golden
+samples in zettlab-product-dev ``contracts/chat-ui/v1/golden/hermes``).
+Every adapter-built frame in this module goes through :func:`_put_progress`
+(upstream ``api_server.py`` still pushes the tool lifecycle frames itself).
 
 Strategy
 --------
@@ -798,6 +811,39 @@ class _ClarifyEntry:
         self.prepared_delivery_id: Optional[str] = None
         self.prepared_until = 0.0
         self.deferred_wake_at = 0.0
+
+
+def _stamp_extension_turn_id(payload):
+    """Attach the current turn id to an extension frame (chat-ui contract §1.1).
+
+    Every ``hermes.tool.progress`` frame the adapter builds carries an optional
+    ``turn_id`` = the ``metadata.turn_id`` local-server sent with the request
+    (session env ``HERMES_TURN_ID``). Frames that already carry one (clarify /
+    approval) are left alone; frames built outside a bound turn stay without
+    it. Never raises: a missing turn is a correlation gap, not an error.
+    """
+    if not isinstance(payload, dict) or payload.get("turn_id"):
+        return payload
+    try:
+        from gateway.session_context import get_session_env
+
+        turn_id = get_session_env("HERMES_TURN_ID", "").strip()
+    except Exception:
+        return payload
+    if turn_id:
+        payload["turn_id"] = turn_id
+    return payload
+
+
+def _put_progress(stream_q, payload) -> None:
+    """Push one extension frame onto the request stream (single emit point).
+
+    Stamps a shallow copy: callers keep caching / replaying their own dict
+    (approval projection cache, pending interaction mirrors) and must never
+    observe the wire-only ``turn_id`` being written into it.
+    """
+    frame = dict(payload) if isinstance(payload, dict) else payload
+    stream_q.put(("__tool_progress__", _stamp_extension_turn_id(frame)))
 
 
 class ZetAgentAdapter(APIServerAdapter):
@@ -2356,10 +2402,7 @@ class ZetAgentAdapter(APIServerAdapter):
         try:
             # Hermes keeps the upstream payload minimal; local-server adds
             # the canonical session_id while translating the SSE event.
-            stream_q.put((
-                "__tool_progress__",
-                {"type": "conversation.title", "title": title},
-            ))
+            _put_progress(stream_q, {"type": "conversation.title", "title": title})
         except Exception:
             logger.debug("[zet_agent] title push failed", exc_info=True)
 
@@ -2854,10 +2897,7 @@ class ZetAgentAdapter(APIServerAdapter):
             leftover = result_dict.get("pending_steer")
             if not leftover or not str(leftover).strip():
                 return
-            stream_q.put((
-                "__tool_progress__",
-                {"type": "steer_dropped", "text": str(leftover)},
-            ))
+            _put_progress(stream_q, {"type": "steer_dropped", "text": str(leftover)})
         except Exception:
             logger.debug("[zet_agent] steer_dropped push failed", exc_info=True)
 
@@ -2906,7 +2946,7 @@ class ZetAgentAdapter(APIServerAdapter):
             event = dict(payload)
             event["type"] = "context.compaction"
             try:
-                stream_q.put(("__tool_progress__", event))
+                _put_progress(stream_q, event)
             except Exception:
                 logger.debug("[zet_agent] status push failed", exc_info=True)
 
@@ -3048,7 +3088,7 @@ class ZetAgentAdapter(APIServerAdapter):
             stream_queues[scoped_session_key] = stream_q
         if should_emit:
             try:
-                stream_q.put(("__tool_progress__", payload))
+                _put_progress(stream_q, payload)
             except Exception:
                 self._remove_approval_projection(
                     scoped_session_key, str(payload.get("approval_id") or "")
@@ -3102,7 +3142,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
         if next_payload is not None and stream_q is not None:
             try:
-                stream_q.put(("__tool_progress__", next_payload))
+                _put_progress(stream_q, next_payload)
             except Exception:
                 logger.debug("[zet_agent] approval projection push failed", exc_info=True)
         return bool(queue)
@@ -3226,6 +3266,21 @@ class ZetAgentAdapter(APIServerAdapter):
                     ),
                     "expires_at_ms": expires_at_ms,
                 }
+                if turn_id:
+                    # Same source as the durable path below: the captured owner
+                    # turn wins over the caller's ambient HERMES_TURN_ID, so the
+                    # generic wire stamp never re-attributes a legacy prompt.
+                    legacy_payload["turn_id"] = turn_id
+                # Keep the source-owned interaction identity on the legacy
+                # mirror too: /pending matches mirrors by ``interaction_id`` and
+                # local-server keys the approval card by it, so a legacy frame
+                # without it can neither be replayed after a reconnect nor be
+                # correlated with the id the source queue holds.
+                interaction_id = str(
+                    approval_data.get("interaction_id", "") or ""
+                ).strip()
+                if interaction_id:
+                    legacy_payload["interaction_id"] = interaction_id
                 if approval_data.get("validation_target"):
                     legacy_payload["validation_target"] = approval_data[
                         "validation_target"
@@ -3289,7 +3344,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     raise RuntimeError("approval notify push failed") from push_error
             else:
                 try:
-                    stream_q.put(("__tool_progress__", payload))
+                    _put_progress(stream_q, payload)
                 except Exception as exc:
                     self._remove_pending_interaction(
                         "approval", internal_key, interaction_id
@@ -3436,7 +3491,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     return ""
             else:
                 try:
-                    stream_q.put(("__tool_progress__", payload))
+                    _put_progress(stream_q, payload)
                 except Exception:
                     logger.debug("[zet_agent] clarify push failed", exc_info=True)
                     self._discard_clarify_entry(internal_key, entry)
@@ -3498,7 +3553,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 "summary": summary,
             }
             try:
-                stream_q.put(("__tool_progress__", payload))
+                _put_progress(stream_q, payload)
             except Exception:
                 logger.debug("[zet_agent] todo emit push failed", exc_info=True)
 
@@ -3573,9 +3628,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 uuid.NAMESPACE_OID, f"mc:{session_id}"
             ).hex[:12]
             _observe_queued_attachment()
-            stream_q.put((
-                "__tool_progress__",
-                {
+            _put_progress(stream_q, {
                     "type": "hermes.attachment",
                     "attachment": {
                         "id": f"mc-{anchor}",
@@ -3584,8 +3637,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         "state": "active",
                         "payload": {"items": trimmed},
                     },
-                },
-            ))
+                })
             return True
         except Exception:
             logger.warning("[zet_agent] memory citations push failed", exc_info=True)
@@ -3622,9 +3674,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 uuid.NAMESPACE_OID, f"ms:{session_id}"
             ).hex[:12]
             _observe_queued_attachment()
-            stream_q.put((
-                "__tool_progress__",
-                {
+            _put_progress(stream_q, {
                     "type": "hermes.attachment",
                     "attachment": {
                         "id": f"ms-{anchor}",
@@ -3633,8 +3683,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         "state": "active",
                         "payload": {"items": trimmed},
                     },
-                },
-            ))
+                })
             return True
         except Exception:
             logger.warning("[zet_agent] memory saved push failed", exc_info=True)
@@ -3693,7 +3742,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 # the authoritative record the App polls for terminal state.
                 if stream_q.qsize() > cls._DELEGATION_PROGRESS_BACKLOG_MAX:
                     return
-                stream_q.put(("__tool_progress__", payload))
+                _put_progress(stream_q, payload)
             except Exception:
                 logger.debug(
                     "[zet_agent] delegation progress push failed", exc_info=True
@@ -3735,7 +3784,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 "groups": groups,
                 "auto_execute": bool(getattr(agent, "_zet_agent_plan_auto_execute", False)),
             }
-            stream_q.put(("__tool_progress__", payload))
+            _put_progress(stream_q, payload)
 
         return _emit
 
@@ -4725,7 +4774,7 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 if prestream_timing is not None:
                     prestream_timing.observe_queued_semantic("reasoning")
-                stream_q.put(("__tool_progress__", {"type": "reasoning.delta", "text": text}))
+                _put_progress(stream_q, {"type": "reasoning.delta", "text": text})
             except Exception:
                 logger.debug("[zet_agent] reasoning_cb push failed", exc_info=True)
 
@@ -4999,13 +5048,10 @@ class ZetAgentAdapter(APIServerAdapter):
                         # mutation after emit_attachment returns.
                         safe_attachment = json.loads(encoded)
                         _observe_queued_attachment(prestream_timing)
-                        stream_q.put((
-                            "__tool_progress__",
-                            {
-                                "type": "hermes.attachment",
-                                "attachment": safe_attachment,
-                            },
-                        ))
+                        _put_progress(stream_q, {
+                            "type": "hermes.attachment",
+                            "attachment": safe_attachment,
+                        })
                         return True
                     except Exception:
                         logger.warning(
@@ -6044,7 +6090,7 @@ class ZetAgentAdapter(APIServerAdapter):
             ):
                 return False, None
             try:
-                stream_q.put(("__tool_progress__", payload))
+                _put_progress(stream_q, payload)
             except Exception as exc:
                 self._rollback_interaction_publication_locked(
                     queue_key, turn_id, interaction_generation

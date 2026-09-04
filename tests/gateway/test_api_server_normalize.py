@@ -8,6 +8,7 @@ from gateway.platforms.api_server import (
     _extract_plan_auto_execute,
     _extract_response_mode,
     _extract_turn_id,
+    MAX_TURN_ID_BYTES,
     _normalize_chat_content,
     _resolve_plan_auto_execute,
 )
@@ -187,6 +188,16 @@ class TestExtractTurnId:
 
     def test_internal_whitespace_dropped(self):
         assert _extract_turn_id({"metadata": {"turn_id": "t_a b"}}) == ""
+
+    def test_oversized_turn_id_dropped_not_truncated(self):
+        # Echoed onto every extension frame of the turn: cap the bytes, and
+        # never truncate (a truncated id would mis-correlate silently).
+        at_cap = "t" * MAX_TURN_ID_BYTES
+        assert _extract_turn_id({"metadata": {"turn_id": at_cap}}) == at_cap
+        assert _extract_turn_id({"metadata": {"turn_id": at_cap + "x"}}) == ""
+        # multibyte characters count in bytes, not code points
+        wide = "\u4e2d" * (MAX_TURN_ID_BYTES // 3 + 1)
+        assert _extract_turn_id({"metadata": {"turn_id": wide}}) == ""
 
     def test_uuid_form_preserved(self):
         tid = "t_550e8400-e29b-41d4-a716-446655440000"
