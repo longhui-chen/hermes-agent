@@ -37,7 +37,7 @@ import requests
 from agent.secret_scope import get_secret
 from tools.registry import registry
 
-_ACTIONS = {"start", "create", "set_pace", "submit_spec", "status", "cancel"}
+_ACTIONS = {"start", "create", "set_pace", "submit_spec", "revise", "status", "cancel"}
 _SESSION_HEADER = "X-Zettlab-Session-Id"
 _SCHEMA = {
     "name": "create_pipeline",
@@ -49,7 +49,10 @@ _SCHEMA = {
         "turn: action='set_pace' (run_id, pace='direct'|'ask') after the user picks a pace; "
         "action='submit_spec' (run_id, spec=<App Spec JSON object>) when you have the "
         "requirements — the platform validates it and returns either an accepted spec "
-        "(then ask the USER to reply 确认) or `problems` to fix; action='status' (run_id) to "
+        "(then ask the USER to reply 确认) or `problems` to fix; action='revise' (run_id, "
+        "note=the user's change request in one sentence) when the user asks to change the "
+        "requirements or the prototype before confirming — the platform merges it into the "
+        "spec and updates the existing prototype in place; action='status' (run_id) to "
         "report progress; action='cancel' (run_id) if the user gives up. You cannot start "
         "the build yourself: only the user's confirmation does."
     ),
@@ -59,6 +62,7 @@ _SCHEMA = {
         "run_id": {"type": "string", "maxLength": 80},
         "pace": {"type": "string", "enum": ["direct", "ask"]},
         "spec": {"type": "object", "description": "App Spec JSON object (exact keys per the platform schema block)"},
+        "note": {"type": "string", "maxLength": 2048, "description": "revise: the user's change request (their own words, or your one-sentence summary)"},
         "reason": {"type": "string", "maxLength": 512},
     }, "required": ["action"], "additionalProperties": False},
 }
@@ -192,6 +196,13 @@ def create_pipeline(args: Any = None, **_: Any) -> str:
                     return json.dumps({"ok": False, "code": "invalid_pace", "next": "pace 只能是 direct 或 ask。"}, ensure_ascii=False)
                 payload: Dict[str, Any] = {"run_id": run_id, "pace": pace}
                 path = "/set-pace"
+            elif action == "revise":
+                note = str(args.get("note", "") or "").strip()
+                if not note:
+                    return json.dumps({"ok": False, "code": "note_required",
+                                       "next": "revise 需要 note：用一句话说明用户要改什么（可直接用用户原话）。"}, ensure_ascii=False)
+                payload = {"run_id": run_id, "note": note[:2048]}
+                path = "/revise"
             elif action == "submit_spec":
                 spec = _spec_object(args.get("spec"))
                 if spec is None:
