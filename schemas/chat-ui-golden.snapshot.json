@@ -1,7 +1,7 @@
 {
   "snapshot_version": 1,
   "root_commit": null,
-  "sha256": "0e00f702b5fa8fddd71cefa2a5fd435e98e7804cade212394c2482982325915e",
+  "sha256": "60d442e5a8be4d59acaaf959d2fa2815ff52217aa741c92c78eccd1d361f3429",
   "payload": {
     "golden": {
       "events": {
@@ -2254,6 +2254,12 @@
               ],
               "reason": "Web models ui_hint as a union of hint shapes: the takeover_browser branch (browser_session_id / tab_id) belongs to tool.result.output.ui_hint (do-not-touch list), not to the ui_hint event; error_code is not consumed; source only knows overseas_connect_via_skill while local-server also emits agent_creator_via_skill. Revisit the whole ui_hint event in chat-ui-b3-content."
             }
+          },
+          "envelope": {
+            "required_mismatch": [
+              "data"
+            ],
+            "reason": "Both clients declare Envelope.data as required (every typed event carries a payload; heartbeat is a separate interface) while the Go Event struct has data omitempty. Decide in chat-ui-b1-lifecycle-error whether the wire guarantees data on every typed event or the clients go data?: D."
           }
         },
         "app": {
@@ -2298,6 +2304,12 @@
               ],
               "reason": "Never emitted; todo.update is turn-scoped. Drop in chat-ui-bt-timeline-items when todo becomes a timeline item."
             }
+          },
+          "envelope": {
+            "required_mismatch": [
+              "data"
+            ],
+            "reason": "Both clients declare Envelope.data as required (every typed event carries a payload; heartbeat is a separate interface) while the Go Event struct has data omitempty. Decide in chat-ui-b1-lifecycle-error whether the wire guarantees data on every typed event or the clients go data?: D."
           }
         }
       }
