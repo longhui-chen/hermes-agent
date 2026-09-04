@@ -38,6 +38,7 @@ Failure modes
 """
 
 import atexit
+import contextvars
 import json
 import logging
 import mimetypes
@@ -420,7 +421,14 @@ def _run_app_task_now(job: dict) -> bool:
             with _app_task_lock:
                 _app_task_running.discard(job_id)
 
-    threading.Thread(target=_worker, name=f"app-task-{job_id}", daemon=True).start()
+    # Under multiplex the active profile (HERMES_HOME override, secret scope)
+    # lives in contextvars, and a bare Thread starts with an EMPTY context: the
+    # job would then run under the default profile — no model.default, and
+    # ``mark_job_run`` cannot find the job in that profile's store. Carry the
+    # trigger's context into the worker, exactly like the scheduler's own pool
+    # does (``_submit_with_guard`` → ``copy_context().run``).
+    _ctx = contextvars.copy_context()
+    threading.Thread(target=_ctx.run, args=(_worker,), name=f"app-task-{job_id}", daemon=True).start()
     return True
 
 
