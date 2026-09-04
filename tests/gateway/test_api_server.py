@@ -1713,9 +1713,15 @@ class TestSkillsEndpoint:
             {"name": "github", "description": "GitHub workflow skill", "category": "github"},
             {"name": "ascii-art", "description": "ASCII art generation", "category": "creative"},
         ]
-        with patch(
-            "tools.skills_tool._find_all_skills",
-            return_value=list(fake_skills),
+        with (
+            patch(
+                "tools.skills_tool._find_all_skills",
+                return_value=list(fake_skills),
+            ),
+            patch(
+                "agent.skill_utils.get_connector_policy_generation",
+                return_value=23,
+            ),
         ):
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
@@ -1723,6 +1729,7 @@ class TestSkillsEndpoint:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["object"] == "list"
+                assert data["visibility_generation"] == 23
                 names = sorted(s["name"] for s in data["data"])
                 assert names == ["ascii-art", "github"]
                 for entry in data["data"]:

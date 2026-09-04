@@ -44,25 +44,26 @@ class TestSaveDisabledSkills:
 class TestIsSkillDisabled:
 
 
-    @patch("hermes_cli.config.load_config")
-    def test_platform_disabled(self, mock_load):
-        mock_load.return_value = {"skills": {
-            "disabled": [],
-            "platform_disabled": {"telegram": ["tg-skill"]}
-        }}
+    @patch(
+        "agent.skill_utils.get_disabled_skill_names",
+        return_value={"tg-skill"},
+    )
+    def test_platform_disabled(self, mock_disabled):
         from tools.skills_tool import _is_skill_disabled
         assert _is_skill_disabled("tg-skill", platform="telegram") is True
+        mock_disabled.assert_called_once_with("telegram")
 
 
 
-    @patch("hermes_cli.config.load_config")
+    @patch(
+        "agent.skill_utils.get_disabled_skill_names",
+        return_value={"discord-skill"},
+    )
     @patch.dict("os.environ", {"HERMES_PLATFORM": "discord"})
-    def test_env_var_platform(self, mock_load):
-        mock_load.return_value = {"skills": {
-            "platform_disabled": {"discord": ["discord-skill"]}
-        }}
+    def test_env_var_platform(self, mock_disabled):
         from tools.skills_tool import _is_skill_disabled
         assert _is_skill_disabled("discord-skill") is True
+        mock_disabled.assert_called_once_with(None)
 
 
 # ---------------------------------------------------------------------------

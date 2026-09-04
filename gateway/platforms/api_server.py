@@ -5231,8 +5231,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         try:
+            from agent.skill_utils import get_connector_policy_generation
             from tools.skills_tool import _find_all_skills, _sort_skills
             skills = _sort_skills(_find_all_skills(skip_disabled=False))
+            visibility_generation = get_connector_policy_generation()
         except Exception:
             logger.exception("GET /v1/skills failed")
             return web.json_response(
@@ -5243,6 +5245,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "list",
             "data": skills,
+            "visibility_generation": visibility_generation,
         })
 
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":

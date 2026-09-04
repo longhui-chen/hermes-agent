@@ -24,8 +24,9 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_skills_dir_key: Optional[str] = None
+_skill_commands_visibility_key: tuple[str, ...] = ()
 _skill_commands_cache: Dict[
-    tuple[Optional[str], Optional[str]], Dict[str, Dict[str, Any]]
+    tuple[Optional[str], Optional[str], tuple[str, ...]], Dict[str, Dict[str, Any]]
 ] = {}
 _skill_commands_generations: Dict[Optional[str], int] = {}
 _skill_commands_lock = threading.RLock()
@@ -218,10 +219,27 @@ def _resolve_skill_commands_skills_dir_key() -> Optional[str]:
         return None
 
 
-def _current_skill_commands_scope_key() -> tuple[Optional[str], Optional[str]]:
+def _resolve_skill_commands_visibility_key(
+    platform: Optional[str],
+) -> tuple[str, ...]:
+    """Scope cached slash commands to the effective disabled predicate."""
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+
+        return tuple(sorted(get_disabled_skill_names(platform)))
+    except Exception:
+        # A visibility lookup failure is fail-open for backward compatibility,
+        # while profile reload remains the recovery path for trusted config.
+        return ()
+
+
+def _current_skill_commands_scope_key(
+) -> tuple[Optional[str], Optional[str], tuple[str, ...]]:
+    platform = _resolve_skill_commands_platform()
     return (
-        _resolve_skill_commands_platform(),
+        platform,
         _resolve_skill_commands_skills_dir_key(),
+        _resolve_skill_commands_visibility_key(platform),
     )
 
 
@@ -446,8 +464,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_skills_dir_key
+    global _skill_commands_visibility_key
     scope_key = _current_skill_commands_scope_key()
-    platform_key, skills_dir_key = scope_key
+    platform_key, skills_dir_key, visibility_key = scope_key
     with _skill_commands_lock:
         scan_generation = _skill_commands_generations.get(skills_dir_key, 0)
     commands: Dict[str, Dict[str, Any]] = {}
@@ -547,6 +566,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
             return commands
         _skill_commands_platform = platform_key
         _skill_commands_skills_dir_key = skills_dir_key
+        _skill_commands_visibility_key = visibility_key
         _skill_commands = commands
         _skill_commands_cache[scope_key] = commands
     return commands
@@ -560,13 +580,15 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     slash-command cache.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_skills_dir_key
+    global _skill_commands_visibility_key
     scope_key = _current_skill_commands_scope_key()
-    platform_key, skills_dir_key = scope_key
+    platform_key, skills_dir_key, visibility_key = scope_key
     with _skill_commands_lock:
         if (
             _skill_commands
             and _skill_commands_platform == platform_key
             and _skill_commands_skills_dir_key == skills_dir_key
+            and _skill_commands_visibility_key == visibility_key
         ):
             return _skill_commands
 
@@ -574,6 +596,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
         if cached:
             _skill_commands_platform = platform_key
             _skill_commands_skills_dir_key = skills_dir_key
+            _skill_commands_visibility_key = visibility_key
             _skill_commands = cached
             return cached
 
@@ -582,20 +605,21 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
 
 def _cached_skill_commands_for_current_scope() -> Dict[str, Dict[str, Any]]:
     scope_key = _current_skill_commands_scope_key()
-    platform_key, skills_dir_key = scope_key
+    platform_key, skills_dir_key, visibility_key = scope_key
     with _skill_commands_lock:
         if (
             _skill_commands_platform == platform_key
             and _skill_commands_skills_dir_key == skills_dir_key
+            and _skill_commands_visibility_key == visibility_key
         ):
             return _skill_commands
         return _skill_commands_cache.get(scope_key, {})
 
 
 def _invalidate_other_skill_command_scopes(
-    scope_key: tuple[Optional[str], Optional[str]]
+    scope_key: tuple[Optional[str], Optional[str], tuple[str, ...]]
 ) -> None:
-    _, skills_dir_key = scope_key
+    _, skills_dir_key, _ = scope_key
     with _skill_commands_lock:
         for cached_scope in list(_skill_commands_cache):
             if cached_scope != scope_key and cached_scope[1] == skills_dir_key:
@@ -650,7 +674,7 @@ def reload_skills() -> Dict[str, Any]:
 
     with _skill_commands_reload_lock:
         scope_key = _current_skill_commands_scope_key()
-        _, skills_dir_key = scope_key
+        _, skills_dir_key, _ = scope_key
         before = _snapshot(_cached_skill_commands_for_current_scope())
 
         _bump_skill_command_generation(skills_dir_key)
