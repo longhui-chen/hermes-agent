@@ -26,6 +26,7 @@ on:
       - main
     paths:
       - 'gateway/platforms/zet_agent.py'
+      - 'gateway/platforms/api_server.py'
       - 'docs/zet-agent-sse-extension-contract.md'
       - 'schemas/chatproto.schema.json'
       - '.github/workflows/chat-ui-contract.yml'

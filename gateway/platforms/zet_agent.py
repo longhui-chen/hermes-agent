@@ -3271,6 +3271,16 @@ class ZetAgentAdapter(APIServerAdapter):
                     # turn wins over the caller's ambient HERMES_TURN_ID, so the
                     # generic wire stamp never re-attributes a legacy prompt.
                     legacy_payload["turn_id"] = turn_id
+                # Keep the source-owned interaction identity on the legacy
+                # mirror too: /pending matches mirrors by ``interaction_id`` and
+                # local-server keys the approval card by it, so a legacy frame
+                # without it can neither be replayed after a reconnect nor be
+                # correlated with the id the source queue holds.
+                interaction_id = str(
+                    approval_data.get("interaction_id", "") or ""
+                ).strip()
+                if interaction_id:
+                    legacy_payload["interaction_id"] = interaction_id
                 if approval_data.get("validation_target"):
                     legacy_payload["validation_target"] = approval_data[
                         "validation_target"

@@ -823,6 +823,31 @@ async def test_legacy_approval_post_keeps_single_phase_empty_queue_contract():
         assert await response.json() == {"resolved": 0}
 
 
+def test_legacy_projection_keeps_source_interaction_id():
+    """Callers that invoke the approval callback without a durable generation
+    (legacy path) still get a mirror that carries the source-owned
+    ``interaction_id``: /pending matches mirrors by that id and local-server
+    keys the approval card by it (codex P1 on chat-ui-b0)."""
+    adapter = _adapter()
+    queue_key = adapter._interaction_queue_key("session-1")
+    data = {
+        "approval_id": "approval-legacy",
+        "interaction_id": "interaction-legacy",
+        "command": "rm -rf build",
+        "description": "test",
+    }
+    tokens = set_turn_vars(turn_id="turn-1")
+    try:
+        adapter._make_approval_cb(queue.Queue(), "session-1", queue_key)(data)
+    finally:
+        clear_turn_vars(tokens)
+    mirrors = adapter._pending_approval[queue_key]
+    assert len(mirrors) == 1
+    assert mirrors[0]["approval_id"] == "approval-legacy"
+    assert mirrors[0]["interaction_id"] == "interaction-legacy"
+    assert mirrors[0]["turn_id"] == "turn-1"
+
+
 @pytest.mark.asyncio
 async def test_pending_approval_follows_source_fifo_not_callback_arrival_order():
     adapter = _adapter()
