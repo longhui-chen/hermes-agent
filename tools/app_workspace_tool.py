@@ -70,7 +70,7 @@ APP_WORKSPACE_SCHEMA = {
             },
             "expected_instance_id": {
                 "type": "string",
-                "description": "Required current app_instance_id from status; prevents acting on a replaced app.",
+                "description": "Current app_instance_id from status (or the app list's app_instance_id); required for every action except status, which is how you obtain it. Prevents acting on a replaced app.",
             },
             "path": {
                 "type": "string",
@@ -107,7 +107,7 @@ APP_WORKSPACE_SCHEMA = {
             "expected_schedule_revision": {"type": "integer", "minimum": 0, "description": "For update_maintenance_task: current schedule_revision returned by maintenance_tasks."},
             "enabled": {"type": "boolean", "description": "For update_maintenance_task: whether this task should run."},
         },
-        "required": ["action", "slug", "expected_instance_id"],
+        "required": ["action", "slug"],
     },
 }
 
@@ -121,6 +121,14 @@ _check_app_workspace._profile_scope_sensitive = True  # type: ignore[attr-define
 
 def _bad_request(message: str) -> str:
     return _apphost._local_error("invalid_request", message, status=_apphost._STATUS_NOT_SENT)
+
+
+def _optional_instance(args: dict) -> str:
+    """expected_instance_id 可缺省（只有 status 用）；给了就按 _required_instance 的规则校验。"""
+    raw = args.get("expected_instance_id")
+    if raw is None or str(raw).strip() == "":
+        return ""
+    return _required_instance(args)
 
 
 def _required_instance(args: dict) -> str:
@@ -174,12 +182,16 @@ def _build_request(args: dict):
     if not isinstance(action, str) or action not in _ACTIONS:
         raise _apphost._BadRequest("action 必须是声明的 App Workspace action")
     slug = _apphost._require_slug(args)
-    instance = _required_instance(args)
     root = f"/{quote(slug, safe='')}/workspace"
     base_fields = {"action", "slug", "expected_instance_id"}
     if action == "status":
+        # 起点动作：维护者就是从 status 拿 app_instance_id 的，所以它可以不带；
+        # 带了照旧透传（服务端做 CAS）。以前这里也强制要，鸡生蛋——工具永远起不了步。
         _only(args, base_fields)
-        return "GET", root + "?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
+        instance = _optional_instance(args)
+        query = "?" + urlencode({"expected_instance_id": instance}) if instance else ""
+        return "GET", root + query, None, _apphost._DEFAULT_TIMEOUT
+    instance = _required_instance(args)
     if action == "maintainer_schedule_status":
         _only(args, base_fields)
         return "GET", f"/{quote(slug, safe='')}/maintainer_schedule?" + urlencode({
