@@ -186,6 +186,11 @@ def test_zpk_python_is_explicit_target_compatible_path() -> None:
     assert "--python 3.11" not in makefile
 
 
+def test_zpk_install_does_not_write_python_bytecode_into_package_slot() -> None:
+    install_script = (REPO_ROOT / "zpk" / "install.sh").read_text(encoding="utf-8")
+    assert "export PYTHONDONTWRITEBYTECODE=1" in install_script
+
+
 def test_zpk_uv_config_matches_locked_resolver_policy() -> None:
     with (REPO_ROOT / "zpk" / "uv.toml").open("rb") as handle:
         zpk_uv = tomllib.load(handle)
