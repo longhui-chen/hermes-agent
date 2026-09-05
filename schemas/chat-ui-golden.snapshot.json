@@ -1,0 +1,2332 @@
+{
+  "snapshot_version": 1,
+  "root_commit": "38e8202a3d57533d41fc8eb622a0239ce10cd02a",
+  "sha256": "a1f5df4f21381fb04f36a73ab1bc5c75b1430e84fa75e75fb46165aabfe4d0a0",
+  "payload": {
+    "golden": {
+      "events": {
+        "agent.created": {
+          "type": "agent.created",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "event_id": "evt_demo_0001",
+            "agent_id": "agent_demo_0002",
+            "display_name": "旅行助手",
+            "revision": 1756972800000,
+            "actor_type": "user"
+          }
+        },
+        "agent.deleted": {
+          "type": "agent.deleted",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "event_id": "evt_demo_0003",
+            "agent_id": "agent_demo_0002",
+            "display_name": "",
+            "revision": 1756972800002,
+            "actor_type": "system"
+          }
+        },
+        "agent.updated": {
+          "type": "agent.updated",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "event_id": "evt_demo_0002",
+            "agent_id": "agent_demo_0002",
+            "display_name": "旅行助手 v2",
+            "revision": 1756972800001,
+            "actor_type": "user"
+          }
+        },
+        "approval": {
+          "type": "approval",
+          "turn_id": "turn_demo_0001",
+          "seq": 17,
+          "fanout_seq": 17,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "command": "rm -rf /sandbox/demo/tmp",
+            "description": "清理临时目录",
+            "pattern_key": "rm",
+            "pattern_keys": [
+              "rm",
+              "rm -rf"
+            ],
+            "approval_id": "apr_demo_0001",
+            "validation_target": "terminal",
+            "expires_at_ms": 1756973100000
+          }
+        },
+        "attachment.action.ack": {
+          "type": "attachment.action.ack",
+          "turn_id": "turn_demo_0001",
+          "seq": 38,
+          "fanout_seq": 38,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "attachment_id": "cg-proposal_demo_0001",
+            "action_token": "tok_demo_0001",
+            "accepted": true,
+            "duplicate": false,
+            "error": ""
+          }
+        },
+        "attachment.upsert": {
+          "type": "attachment.upsert",
+          "turn_id": "turn_demo_0001",
+          "seq": 37,
+          "fanout_seq": 37,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "attachment": {
+              "id": "cg-proposal_demo_0001",
+              "category": "interactive",
+              "kind": "connector.connect",
+              "v": 1,
+              "state": "active",
+              "payload": {
+                "provider": "notion",
+                "blocking": false
+              },
+              "actions": [
+                {
+                  "id": "dismiss",
+                  "style": "secondary",
+                  "requires_confirm": false,
+                  "disabled": false
+                },
+                {
+                  "id": "connect",
+                  "style": "primary",
+                  "requires_confirm": false,
+                  "disabled": false
+                }
+              ],
+              "resolution": {
+                "action_id": "connect",
+                "at": 1756972805000,
+                "result": {
+                  "connected": true
+                }
+              },
+              "dedup_key": "connector:notion",
+              "fallback_text": "连接 Notion 以继续"
+            }
+          }
+        },
+        "capabilities": {
+          "type": "capabilities",
+          "turn_id": "turn_demo_0001",
+          "seq": 20,
+          "fanout_seq": 20,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "interactive": true,
+            "steer": true,
+            "multiple_quotes": false,
+            "delegation": true,
+            "attachments": true
+          }
+        },
+        "chat.send.ack": {
+          "type": "chat.send.ack",
+          "turn_id": "turn_demo_0001",
+          "seq": 16,
+          "fanout_seq": 16,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "client_msg_id": "cmsg_demo_0001",
+            "message_id": 1002,
+            "seq": 7,
+            "accepted": true,
+            "code": "",
+            "attachments": [
+              {
+                "index": 0,
+                "name": "attachment-1.pdf",
+                "path": "/sandbox/demo/uploads/attachment-1.pdf"
+              }
+            ],
+            "duplicate": false,
+            "orig_turn_id": ""
+          }
+        },
+        "chat.send.ack.legacy": {
+          "type": "chat.send.ack",
+          "turn_id": "turn_demo_0001",
+          "seq": 39,
+          "fanout_seq": 39,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "status": "accepted",
+            "session_id": "sess_demo_0001",
+            "turn_id": "turn_demo_0001"
+          }
+        },
+        "clarify": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "周末指哪两天？",
+            "choices_offered": [
+              "上周末",
+              "本周末"
+            ],
+            "expires_at_ms": 1756973100000
+          }
+        },
+        "context.compaction": {
+          "type": "context.compaction",
+          "turn_id": "turn_demo_0001",
+          "seq": 22,
+          "fanout_seq": 22,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "state": "done",
+            "message": "上下文已压缩",
+            "old_session_id": "sess_demo_0001",
+            "new_session_id": "sess_demo_0002"
+          }
+        },
+        "conversation.title": {
+          "type": "conversation.title",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "title": "周末公园 vlog",
+            "session_id": "sess_demo_0001"
+          }
+        },
+        "delegation.status": {
+          "type": "delegation.status",
+          "turn_id": "turn_demo_0001",
+          "seq": 35,
+          "fanout_seq": 35,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "kind": "delegation",
+            "event": "subagent.tool",
+            "session_id": "sess_demo_0001",
+            "turn_id": "turn_demo_0001",
+            "task_index": 0,
+            "task_count": 1,
+            "goal": "整理素材",
+            "subagent_id": "sub_demo_0001",
+            "child_session_id": "sess_demo_child_0001",
+            "tool_count": 2,
+            "tool": "terminal",
+            "preview": "ls /sandbox/demo",
+            "status": "running",
+            "duration_seconds": 3.5
+          }
+        },
+        "delegation.summary": {
+          "type": "delegation.summary",
+          "turn_id": "turn_demo_0001",
+          "seq": 36,
+          "fanout_seq": 36,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "delegation_id": "dlg_demo_0001",
+            "kind": "delegation",
+            "task_count": 1,
+            "status": "completed",
+            "duration_seconds": 42.5,
+            "tasks": [
+              {
+                "task_index": 0,
+                "goal": "整理素材",
+                "status": "completed",
+                "duration_seconds": 42.5,
+                "child_session_id": "sess_demo_child_0001"
+              }
+            ]
+          }
+        },
+        "error": {
+          "type": "error",
+          "turn_id": "turn_demo_0001",
+          "seq": 10,
+          "fanout_seq": 10,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "code": "user_credits_insufficient",
+            "message": "积分不足",
+            "recoverable": true,
+            "reason": "credits",
+            "provider": "demo-provider",
+            "model": "demo-model",
+            "status_code": 402,
+            "provider_error_code": "insufficient_quota",
+            "provider_message": "quota exceeded",
+            "session_id": "sess_demo_0001",
+            "active_turn_id": "turn_demo_0001"
+          }
+        },
+        "goal.status": {
+          "type": "goal.status",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "goal_id": "goal_demo_0001",
+            "state": "running",
+            "session_id": "sess_demo_0001",
+            "agent_id": "agent_demo_0001",
+            "round": 1,
+            "max_rounds": 5,
+            "goal_text": "整理周末视频",
+            "summary": "第 1 轮进行中",
+            "turn_id": "turn_demo_0001",
+            "updated_at": 1756972800000
+          }
+        },
+        "heartbeat": {
+          "type": "heartbeat",
+          "ts": 1756972800000,
+          "backend": "hermes"
+        },
+        "interaction.resolved": {
+          "type": "interaction.resolved",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "session_id": "sess_demo_0001",
+            "agent_id": "agent_demo_0001",
+            "kind": "plan",
+            "interaction_id": "plan_demo_0001",
+            "resolution": "confirmed",
+            "revision_requested": false
+          }
+        },
+        "media.ref": {
+          "type": "media.ref",
+          "turn_id": "turn_demo_0001",
+          "seq": 7,
+          "fanout_seq": 7,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "uri": "/sandbox/demo/agent_output/sess_demo_0001/frame.jpg",
+            "mime": "image/jpeg",
+            "role": "assistant"
+          }
+        },
+        "message.appended": {
+          "type": "message.appended",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "msg_id": 1003,
+            "role": "assistant",
+            "content": "每周视频回忆已生成。",
+            "session_id": "sess_demo_0001",
+            "agent_id": "agent_demo_0001",
+            "kind": "",
+            "turn_id": "turn_demo_0001",
+            "error_code": "",
+            "clarify_id": "",
+            "media": [
+              "/sandbox/demo/agent_output/sess_demo_0001/frame.jpg"
+            ],
+            "attachments": [
+              {
+                "type": "file",
+                "name": "attachment-1.pdf",
+                "url": "/sandbox/demo/uploads/attachment-1.pdf",
+                "size": 20480,
+                "mimeType": "application/pdf",
+                "thumbnailColor": "#3b82f6",
+                "path": "/sandbox/demo/uploads/attachment-1.pdf"
+              }
+            ],
+            "clarify": null
+          }
+        },
+        "plan.preview": {
+          "type": "plan.preview",
+          "turn_id": "turn_demo_0001",
+          "seq": 27,
+          "fanout_seq": 27,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "title": "剪辑 vlog",
+            "groups": [
+              {
+                "icon": "🎬",
+                "label": "素材",
+                "count": 1,
+                "items": [
+                  "挑选 4 段"
+                ]
+              }
+            ],
+            "plan_id": "plan_demo_0001",
+            "status": "pending",
+            "revision_requested": false
+          }
+        },
+        "reasoning.delta": {
+          "type": "reasoning.delta",
+          "turn_id": "turn_demo_0001",
+          "seq": 3,
+          "fanout_seq": 3,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "text": "用户要剪 vlog，先确认时间范围。"
+          }
+        },
+        "search.result": {
+          "type": "search.result",
+          "turn_id": "turn_demo_0001",
+          "seq": 25,
+          "fanout_seq": 25,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "query": "上周末 公园 视频",
+            "total_count": 1,
+            "status": "done",
+            "truncated": false,
+            "items": [
+              {
+                "filename": "IMG_0001.MOV",
+                "path": "/sandbox/demo/Photos/2026-08-30/IMG_0001.MOV",
+                "is_dir": false,
+                "size": 52428800,
+                "file_type": "video",
+                "ctime": 1756886400000,
+                "mtime": 1756886400000,
+                "btime": 1756886400000,
+                "uni_key": "unikey_demo_0001",
+                "match_source": "semantic",
+                "snippet": "公园 小孩 秋千",
+                "tags": [
+                  "公园",
+                  "小孩"
+                ],
+                "video_search": {}
+              }
+            ]
+          }
+        },
+        "steer.dropped": {
+          "type": "steer.dropped",
+          "turn_id": "turn_demo_0001",
+          "seq": 31,
+          "fanout_seq": 31,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "text": "顺便加上字幕",
+            "reason": "unconsumed"
+          }
+        },
+        "steer": {
+          "type": "steer",
+          "turn_id": "turn_demo_0001",
+          "seq": 30,
+          "fanout_seq": 30,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "text": "顺便加上字幕"
+          }
+        },
+        "text.delta": {
+          "type": "text.delta",
+          "turn_id": "turn_demo_0001",
+          "seq": 2,
+          "fanout_seq": 2,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "text": "好的，我先找出上周末的视频。"
+          }
+        },
+        "text.reset": {
+          "type": "text.reset",
+          "turn_id": "turn_demo_0001",
+          "seq": 4,
+          "fanout_seq": 4,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {}
+        },
+        "todo.update": {
+          "type": "todo.update",
+          "turn_id": "turn_demo_0001",
+          "seq": 26,
+          "fanout_seq": 26,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "todos": [
+              {
+                "id": "todo_1",
+                "content": "挑选 4 段素材",
+                "status": "in_progress",
+                "group_index": 0,
+                "plan_id": "plan_demo_0001"
+              }
+            ],
+            "summary": {
+              "total": 3,
+              "pending": 2,
+              "in_progress": 1,
+              "completed": 0,
+              "cancelled": 0
+            }
+          }
+        },
+        "tool.result": {
+          "type": "tool.result",
+          "turn_id": "turn_demo_0001",
+          "seq": 6,
+          "fanout_seq": 6,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "status": "error",
+            "duration_s": 1.25,
+            "output": {
+              "total_count": 0
+            },
+            "error": "search backend unavailable",
+            "error_code": "tool_error",
+            "component_id": "browser-runtime",
+            "reference_id": "ref_demo_0001",
+            "provider": "demo-provider",
+            "status_code": 503,
+            "connector_error": {
+              "code": "connector_unavailable"
+            },
+            "browser_state": {
+              "url": "https://example.invalid/"
+            },
+            "browser_content_evidence": {
+              "text": "demo"
+            }
+          }
+        },
+        "tool.start": {
+          "type": "tool.start",
+          "turn_id": "turn_demo_0001",
+          "seq": 5,
+          "fanout_seq": 5,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "call_id": "call_demo_0001",
+            "name": "search_files",
+            "label": "搜索素材",
+            "arguments": {
+              "target": "nas",
+              "query": "上周末 公园 视频"
+            }
+          }
+        },
+        "turn.end": {
+          "type": "turn.end",
+          "turn_id": "turn_demo_0001",
+          "seq": 11,
+          "fanout_seq": 11,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "reason": "stop",
+            "final_text": "已完成 vlog 剪辑。",
+            "final_text_source": "hermes_canonical",
+            "session_id": "sess_demo_0001",
+            "produced_files": [
+              {
+                "path": "/sandbox/demo/agent_output/sess_demo_0001/vlog.mp4",
+                "name": "vlog.mp4",
+                "size": 10485760,
+                "mtime": 1756972800000,
+                "mime": "video/mp4",
+                "session_id": "sess_demo_0001",
+                "session_title": "周末公园 vlog"
+              }
+            ]
+          }
+        },
+        "turn.progress": {
+          "type": "turn.progress",
+          "turn_id": "turn_demo_0001",
+          "seq": 24,
+          "fanout_seq": 24,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "phase": "tool",
+            "tool_name": "search_files"
+          }
+        },
+        "turn.resume.ack": {
+          "type": "turn.resume.ack",
+          "turn_id": "turn_demo_0001",
+          "seq": 14,
+          "fanout_seq": 14,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "in_flight": true,
+            "turn_id": "turn_demo_0001",
+            "started_at": 1756972800000,
+            "replay_count": 12,
+            "user_content": "帮我把周末的视频剪成 vlog",
+            "display_content": "帮我把周末的视频剪成 vlog",
+            "attachments": [
+              {
+                "type": "file",
+                "name": "attachment-1.pdf",
+                "url": "/sandbox/demo/uploads/attachment-1.pdf",
+                "size": 20480,
+                "mimeType": "application/pdf",
+                "thumbnailColor": "#3b82f6",
+                "path": "/sandbox/demo/uploads/attachment-1.pdf"
+              }
+            ],
+            "quotes": [
+              {
+                "source_message_id": "1001",
+                "turn_id": "turn_demo_0000",
+                "role": "assistant",
+                "text": "上周末的视频共 6 段",
+                "meeting_id": "meeting_demo_0001",
+                "meeting_title": "周会",
+                "meeting_duration": "00:30:00"
+              }
+            ],
+            "quoted": {
+              "source_message_id": "1001",
+              "turn_id": "turn_demo_0000",
+              "role": "assistant",
+              "text": "上周末的视频共 6 段",
+              "meeting_id": "meeting_demo_0001",
+              "meeting_title": "周会",
+              "meeting_duration": "00:30:00"
+            },
+            "skill_slug": "video-edit-workflow-mini",
+            "ready": true,
+            "retry_after_ms": 0,
+            "latest_fanout_seq": 42,
+            "replay_complete": true
+          }
+        },
+        "turn.resync_required": {
+          "type": "turn.resync_required",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "session_id": "sess_demo_0001",
+            "reason": "subscriber_gap",
+            "latest_fanout_seq": 42
+          }
+        },
+        "turn.snapshot": {
+          "type": "turn.snapshot",
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "active_turns": [
+              {
+                "session_id": "sess_demo_0001",
+                "agent_id": "agent_demo_0001",
+                "turn_id": "turn_demo_0001",
+                "started_at": 1756972800000,
+                "last_activity_at": 1756972801000,
+                "phase": "tool",
+                "tool_name": "search_files"
+              }
+            ],
+            "active_goals": [
+              {
+                "goal_id": "goal_demo_0001",
+                "state": "running",
+                "session_id": "sess_demo_0001",
+                "agent_id": "agent_demo_0001",
+                "round": 1,
+                "max_rounds": 5,
+                "goal_text": "整理周末视频",
+                "summary": "第 1 轮进行中",
+                "turn_id": "turn_demo_0001",
+                "updated_at": 1756972800000
+              }
+            ],
+            "active_delegations": [
+              {
+                "session_id": "sess_demo_0001",
+                "turn_id": "turn_demo_0001",
+                "kind": "delegation",
+                "task_count": 1,
+                "updated_at": 1756972800000,
+                "tasks": [
+                  {
+                    "task_index": 0,
+                    "goal": "整理素材",
+                    "status": "running",
+                    "tool": "terminal",
+                    "tool_count": 2,
+                    "preview": "ls /sandbox/demo",
+                    "subagent_id": "sub_demo_0001",
+                    "child_session_id": "sess_demo_child_0001",
+                    "updated_at": 1756972800000
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        "turn.start": {
+          "type": "turn.start",
+          "turn_id": "turn_demo_0001",
+          "seq": 1,
+          "fanout_seq": 1,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "session_id": "sess_demo_0001",
+            "agent_id": "agent_demo_0001",
+            "model": "demo-model"
+          }
+        },
+        "typing": {
+          "type": "typing",
+          "turn_id": "turn_demo_0001",
+          "seq": 8,
+          "fanout_seq": 8,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "state": "start"
+          }
+        },
+        "ui_hint": {
+          "type": "ui_hint",
+          "turn_id": "turn_demo_0001",
+          "seq": 28,
+          "fanout_seq": 28,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "type": "open_agent",
+            "agent_id": "agent_demo_0002",
+            "agent_name": "旅行助手",
+            "error_code": "",
+            "source": "agent_creator_via_skill",
+            "has_greeting": true,
+            "platform": "",
+            "action": "",
+            "resume_pairing": false,
+            "label": "去对话"
+          }
+        },
+        "usage": {
+          "type": "usage",
+          "turn_id": "turn_demo_0001",
+          "seq": 9,
+          "fanout_seq": 9,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "total_tokens": 1500,
+            "context_used_percent": 12
+          }
+        }
+      },
+      "attachments": {
+        "agent-template.recommendation": {
+          "id": "cg-proposal_demo_0004",
+          "category": "interactive",
+          "kind": "agent-template.recommendation",
+          "v": 1,
+          "state": "active",
+          "payload": {
+            "template_id": "tpl_travel_assistant",
+            "title": "旅行助手",
+            "reason": "你正在规划一次出行"
+          },
+          "actions": [
+            {
+              "id": "dismiss"
+            },
+            {
+              "id": "open",
+              "style": "primary"
+            }
+          ],
+          "dedup_key": "agent-template:tpl_travel_assistant"
+        },
+        "artifact.recommendation": {
+          "id": "cg-proposal_demo_0003",
+          "category": "interactive",
+          "kind": "artifact.recommendation",
+          "v": 1,
+          "state": "active",
+          "payload": {
+            "title": "周报生成器",
+            "reason": "你每周都手动整理周报",
+            "confidence": 0.82,
+            "artifact_type": "skill"
+          },
+          "actions": [
+            {
+              "id": "dismiss"
+            },
+            {
+              "id": "accept",
+              "style": "primary"
+            }
+          ],
+          "dedup_key": "artifact:weekly-report"
+        },
+        "channel.connect": {
+          "id": "cg-proposal_demo_0002",
+          "category": "interactive",
+          "kind": "channel.connect",
+          "v": 1,
+          "state": "active",
+          "payload": {
+            "channel_kind": "telegram"
+          },
+          "actions": [
+            {
+              "id": "dismiss"
+            },
+            {
+              "id": "connect",
+              "style": "primary"
+            }
+          ],
+          "dedup_key": "channel:telegram"
+        },
+        "connector.connect": {
+          "id": "cg-proposal_demo_0001",
+          "category": "interactive",
+          "kind": "connector.connect",
+          "v": 1,
+          "state": "active",
+          "payload": {
+            "provider": "notion",
+            "blocking": false
+          },
+          "actions": [
+            {
+              "id": "dismiss"
+            },
+            {
+              "id": "connect",
+              "style": "primary"
+            }
+          ],
+          "dedup_key": "connector:notion"
+        },
+        "memory.citations": {
+          "id": "mc-turn_demo_0001",
+          "category": "content",
+          "kind": "memory.citations",
+          "v": 1,
+          "state": "active",
+          "payload": {
+            "items": [
+              {
+                "id": "mem_demo_0001",
+                "title": "用户偏好：vlog 风格轻快",
+                "snippet": "上次剪辑选择了轻快风格"
+              }
+            ]
+          }
+        },
+        "memory.saved": {
+          "id": "ms-turn_demo_0001",
+          "category": "content",
+          "kind": "memory.saved",
+          "v": 1,
+          "state": "active",
+          "payload": {
+            "items": [
+              {
+                "id": "mem_demo_0002",
+                "title": "偏好：60 秒竖版",
+                "snippet": "本次确认 9:16 / 60s"
+              }
+            ]
+          }
+        }
+      },
+      "hermes": {
+        "context.compaction": {
+          "type": "context.compaction",
+          "turn_id": "turn_demo_0001",
+          "state": "succeeded",
+          "message": "上下文已压缩",
+          "old_session_id": "sess_demo_0001",
+          "new_session_id": "sess_demo_0002",
+          "before_messages": 42,
+          "before_tokens": 18000,
+          "after_messages": 12,
+          "after_tokens": 6000,
+          "error": ""
+        },
+        "conversation.title": {
+          "type": "conversation.title",
+          "turn_id": "turn_demo_0001",
+          "title": "周末公园 vlog"
+        },
+        "finish-chunk": {
+          "id": "chatcmpl_demo_0001",
+          "object": "chat.completion.chunk",
+          "created": 1756972800,
+          "model": "demo-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "length"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 300,
+            "total_tokens": 1500
+          },
+          "error": {
+            "message": "Agent run did not complete.",
+            "type": "output_truncated"
+          },
+          "hermes": {
+            "completed": false,
+            "partial": true,
+            "failed": false,
+            "error": "Agent run did not complete.",
+            "error_code": "output_truncated",
+            "canonical_final_response": ""
+          }
+        },
+        "hermes-error": {
+          "message": "Agent run did not complete.",
+          "code": "output_truncated",
+          "completed": false,
+          "partial": true,
+          "failed": false,
+          "reason": "max_tokens",
+          "provider": "demo-provider",
+          "model": "demo-model",
+          "status_code": 200,
+          "provider_error_code": "length",
+          "provider_message": "max tokens reached",
+          "recoverable": false
+        },
+        "hermes.approval": {
+          "type": "hermes.approval",
+          "turn_id": "turn_demo_0001",
+          "approval_id": "apr_demo_0001",
+          "interaction_id": "ia_demo_0001",
+          "interaction_generation": 1,
+          "interaction_delivery_version": 1,
+          "command": "rm -rf /sandbox/demo/tmp",
+          "description": "清理临时目录",
+          "pattern_key": "rm",
+          "pattern_keys": [
+            "rm",
+            "rm -rf"
+          ],
+          "expires_at_ms": 1756973100000,
+          "validation_target": "terminal"
+        },
+        "hermes.attachment": {
+          "type": "hermes.attachment",
+          "turn_id": "turn_demo_0001",
+          "attachment": {
+            "id": "mc-turn_demo_0001",
+            "kind": "memory.citations",
+            "v": 1,
+            "state": "active",
+            "payload": {
+              "items": [
+                {
+                  "id": "mem_demo_0001",
+                  "title": "用户偏好：vlog 风格轻快",
+                  "snippet": "上次剪辑选择了轻快风格"
+                }
+              ]
+            }
+          }
+        },
+        "hermes.clarify": {
+          "type": "hermes.clarify",
+          "clarify_id": "ia_demo_0002",
+          "interaction_id": "ia_demo_0002",
+          "interaction_generation": 2,
+          "interaction_delivery_version": 1,
+          "question": "周末指哪两天？",
+          "choices_offered": [
+            "上周末",
+            "本周末"
+          ],
+          "expires_at_ms": 1756973100000,
+          "turn_id": "turn_demo_0001"
+        },
+        "hermes.delegation.progress": {
+          "type": "hermes.delegation.progress",
+          "turn_id": "turn_demo_0001",
+          "kind": "delegation",
+          "event": "subagent.tool",
+          "tool": "terminal",
+          "preview": "ls /sandbox/demo",
+          "task_index": 0,
+          "task_count": 1,
+          "goal": "整理素材",
+          "subagent_id": "sub_demo_0001",
+          "child_session_id": "sess_demo_child_0001",
+          "tool_count": 2,
+          "status": "running",
+          "duration_seconds": 3.5,
+          "parent_id": "sub_demo_root",
+          "depth": 1,
+          "exit_reason": ""
+        },
+        "hermes.plan": {
+          "type": "hermes.plan",
+          "turn_id": "turn_demo_0001",
+          "plan_id": "plan_demo_0001",
+          "title": "剪辑 vlog",
+          "groups": [
+            {
+              "icon": "🎬",
+              "label": "素材",
+              "count": 1,
+              "items": [
+                "挑选 4 段"
+              ]
+            }
+          ],
+          "auto_execute": false
+        },
+        "hermes.todo": {
+          "type": "hermes.todo",
+          "turn_id": "turn_demo_0001",
+          "todos": [
+            {
+              "id": "todo_1",
+              "content": "挑选 4 段素材",
+              "status": "in_progress",
+              "group_index": 0,
+              "plan_id": "plan_demo_0001"
+            }
+          ],
+          "summary": {
+            "total": 3,
+            "pending": 2,
+            "in_progress": 1,
+            "completed": 0,
+            "cancelled": 0
+          }
+        },
+        "reasoning.delta": {
+          "type": "reasoning.delta",
+          "turn_id": "turn_demo_0001",
+          "text": "用户要剪 vlog，先确认时间范围。"
+        },
+        "steer_dropped": {
+          "type": "steer_dropped",
+          "turn_id": "turn_demo_0001",
+          "text": "顺便加上字幕"
+        },
+        "tool-frame.completed": {
+          "tool": "image_generate",
+          "toolCallId": "call_demo_0002",
+          "status": "completed",
+          "outcome": "success",
+          "output": {
+            "success": true,
+            "host_image": "/sandbox/demo/agent_output/sess_demo_0001/cover.png"
+          },
+          "ui_hint": {
+            "type": "takeover_browser",
+            "agent_id": "agent_demo_0001",
+            "browser_session_id": "bs_demo_0001",
+            "tab_id": "tab_demo_0001"
+          },
+          "browserState": {
+            "url": "https://example.invalid/"
+          },
+          "browserContentEvidence": {
+            "text": "demo"
+          }
+        },
+        "tool-frame.error": {
+          "tool": "connector_call",
+          "toolCallId": "call_demo_0003",
+          "status": "completed",
+          "outcome": "error",
+          "error": "connector returned 401",
+          "errorCode": "unauthorized",
+          "statusCode": 401,
+          "provider": "google_drive",
+          "connector_error": {
+            "provider": "google_drive",
+            "status": 401,
+            "code": "unauthorized",
+            "message": "token expired",
+            "nextAction": "reconnect"
+          },
+          "output": {
+            "success": false
+          }
+        },
+        "tool-frame.running": {
+          "tool": "search_files",
+          "emoji": "🔍",
+          "label": "搜索素材",
+          "toolCallId": "call_demo_0001",
+          "status": "running"
+        }
+      }
+    },
+    "fields": {
+      "$comment": "Envelope fields and top-level data fields per chatproto event, derived from the zettlab-local-server contract manifest (schemas/chat-ui.manifest.json, reflect over internal/chatproto types; required = no omitempty; type = wire category string|number|boolean|object|array|any). Regenerate with scripts/chat-ui-contract/derive-fields.mjs. Nested objects are documented by the golden sample only.",
+      "envelope": {
+        "backend": {
+          "required": false,
+          "type": "string"
+        },
+        "data": {
+          "required": false,
+          "type": "any"
+        },
+        "fanout_seq": {
+          "required": false,
+          "type": "number"
+        },
+        "seq": {
+          "required": false,
+          "type": "number"
+        },
+        "ts": {
+          "required": true,
+          "type": "number"
+        },
+        "turn_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "attachment_wire": {
+        "actions": {
+          "required": false,
+          "type": "array"
+        },
+        "category": {
+          "required": false,
+          "type": "string"
+        },
+        "dedup_key": {
+          "required": false,
+          "type": "string"
+        },
+        "expires_at": {
+          "required": false,
+          "type": "number"
+        },
+        "fallback_text": {
+          "required": false,
+          "type": "string"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "kind": {
+          "required": true,
+          "type": "string"
+        },
+        "payload": {
+          "required": true,
+          "type": "any"
+        },
+        "resolution": {
+          "required": false,
+          "type": "object"
+        },
+        "state": {
+          "required": true,
+          "type": "string"
+        },
+        "v": {
+          "required": true,
+          "type": "number"
+        }
+      },
+      "events": {
+        "agent.created": {
+          "struct": "AgentLifecycleData",
+          "fields": {
+            "actor_type": {
+              "required": false,
+              "type": "string"
+            },
+            "agent_id": {
+              "required": true,
+              "type": "string"
+            },
+            "display_name": {
+              "required": false,
+              "type": "string"
+            },
+            "event_id": {
+              "required": false,
+              "type": "string"
+            },
+            "revision": {
+              "required": true,
+              "type": "number"
+            }
+          }
+        },
+        "agent.deleted": {
+          "struct": "AgentLifecycleData",
+          "fields": {
+            "actor_type": {
+              "required": false,
+              "type": "string"
+            },
+            "agent_id": {
+              "required": true,
+              "type": "string"
+            },
+            "display_name": {
+              "required": false,
+              "type": "string"
+            },
+            "event_id": {
+              "required": false,
+              "type": "string"
+            },
+            "revision": {
+              "required": true,
+              "type": "number"
+            }
+          }
+        },
+        "agent.updated": {
+          "struct": "AgentLifecycleData",
+          "fields": {
+            "actor_type": {
+              "required": false,
+              "type": "string"
+            },
+            "agent_id": {
+              "required": true,
+              "type": "string"
+            },
+            "display_name": {
+              "required": false,
+              "type": "string"
+            },
+            "event_id": {
+              "required": false,
+              "type": "string"
+            },
+            "revision": {
+              "required": true,
+              "type": "number"
+            }
+          }
+        },
+        "approval": {
+          "struct": "ApprovalData",
+          "fields": {
+            "approval_id": {
+              "required": false,
+              "type": "string"
+            },
+            "command": {
+              "required": true,
+              "type": "string"
+            },
+            "description": {
+              "required": true,
+              "type": "string"
+            },
+            "expires_at_ms": {
+              "required": true,
+              "type": "number"
+            },
+            "pattern_key": {
+              "required": true,
+              "type": "string"
+            },
+            "pattern_keys": {
+              "required": false,
+              "type": "array"
+            },
+            "validation_target": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "attachment.action.ack": {
+          "struct": "AttachmentActionAckData",
+          "fields": {
+            "accepted": {
+              "required": true,
+              "type": "boolean"
+            },
+            "action_token": {
+              "required": true,
+              "type": "string"
+            },
+            "attachment_id": {
+              "required": true,
+              "type": "string"
+            },
+            "duplicate": {
+              "required": false,
+              "type": "boolean"
+            },
+            "error": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "attachment.upsert": {
+          "struct": "AttachmentUpsertData",
+          "fields": {
+            "attachment": {
+              "required": true,
+              "type": "object"
+            }
+          }
+        },
+        "capabilities": {
+          "struct": "CapabilitiesData",
+          "fields": {
+            "attachments": {
+              "required": false,
+              "type": "boolean"
+            },
+            "delegation": {
+              "required": false,
+              "type": "boolean"
+            },
+            "interactive": {
+              "required": true,
+              "type": "boolean"
+            },
+            "multiple_quotes": {
+              "required": false,
+              "type": "boolean"
+            },
+            "steer": {
+              "required": false,
+              "type": "boolean"
+            }
+          }
+        },
+        "chat.send.ack": {
+          "struct": "SendAckData",
+          "fields": {
+            "accepted": {
+              "required": true,
+              "type": "boolean"
+            },
+            "attachments": {
+              "required": false,
+              "type": "array"
+            },
+            "client_msg_id": {
+              "required": false,
+              "type": "string"
+            },
+            "code": {
+              "required": false,
+              "type": "string"
+            },
+            "duplicate": {
+              "required": false,
+              "type": "boolean"
+            },
+            "message_id": {
+              "required": false,
+              "type": "number"
+            },
+            "orig_turn_id": {
+              "required": false,
+              "type": "string"
+            },
+            "seq": {
+              "required": false,
+              "type": "number"
+            }
+          }
+        },
+        "chat.send.ack.legacy": {
+          "struct": "ChatSendAckData",
+          "fields": {
+            "session_id": {
+              "required": true,
+              "type": "string"
+            },
+            "status": {
+              "required": true,
+              "type": "string"
+            },
+            "turn_id": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "clarify": {
+          "struct": "ClarifyData",
+          "fields": {
+            "choices_offered": {
+              "required": false,
+              "type": "array"
+            },
+            "clarify_id": {
+              "required": false,
+              "type": "string"
+            },
+            "expires_at_ms": {
+              "required": true,
+              "type": "number"
+            },
+            "question": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "context.compaction": {
+          "struct": "ContextCompactionData",
+          "fields": {
+            "message": {
+              "required": false,
+              "type": "string"
+            },
+            "new_session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "old_session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "state": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "conversation.title": {
+          "struct": "ConversationTitleData",
+          "fields": {
+            "session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "title": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "delegation.status": {
+          "struct": "DelegationStatusData",
+          "fields": {
+            "child_session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "duration_seconds": {
+              "required": false,
+              "type": "number"
+            },
+            "event": {
+              "required": true,
+              "type": "string"
+            },
+            "goal": {
+              "required": false,
+              "type": "string"
+            },
+            "kind": {
+              "required": false,
+              "type": "string"
+            },
+            "preview": {
+              "required": false,
+              "type": "string"
+            },
+            "session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "status": {
+              "required": false,
+              "type": "string"
+            },
+            "subagent_id": {
+              "required": false,
+              "type": "string"
+            },
+            "task_count": {
+              "required": true,
+              "type": "number"
+            },
+            "task_index": {
+              "required": true,
+              "type": "number"
+            },
+            "tool": {
+              "required": false,
+              "type": "string"
+            },
+            "tool_count": {
+              "required": false,
+              "type": "number"
+            },
+            "turn_id": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "delegation.summary": {
+          "struct": "DelegationSummaryData",
+          "fields": {
+            "delegation_id": {
+              "required": false,
+              "type": "string"
+            },
+            "duration_seconds": {
+              "required": false,
+              "type": "number"
+            },
+            "kind": {
+              "required": false,
+              "type": "string"
+            },
+            "status": {
+              "required": false,
+              "type": "string"
+            },
+            "task_count": {
+              "required": true,
+              "type": "number"
+            },
+            "tasks": {
+              "required": false,
+              "type": "array"
+            }
+          }
+        },
+        "error": {
+          "struct": "ErrorData",
+          "fields": {
+            "active_turn_id": {
+              "required": false,
+              "type": "string"
+            },
+            "code": {
+              "required": true,
+              "type": "string"
+            },
+            "message": {
+              "required": true,
+              "type": "string"
+            },
+            "model": {
+              "required": false,
+              "type": "string"
+            },
+            "provider": {
+              "required": false,
+              "type": "string"
+            },
+            "provider_error_code": {
+              "required": false,
+              "type": "string"
+            },
+            "provider_message": {
+              "required": false,
+              "type": "string"
+            },
+            "reason": {
+              "required": false,
+              "type": "string"
+            },
+            "recoverable": {
+              "required": true,
+              "type": "boolean"
+            },
+            "session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "status_code": {
+              "required": false,
+              "type": "any"
+            }
+          }
+        },
+        "goal.status": {
+          "struct": "GoalStatusData",
+          "fields": {
+            "agent_id": {
+              "required": false,
+              "type": "string"
+            },
+            "goal_id": {
+              "required": true,
+              "type": "string"
+            },
+            "goal_text": {
+              "required": false,
+              "type": "string"
+            },
+            "max_rounds": {
+              "required": false,
+              "type": "number"
+            },
+            "round": {
+              "required": false,
+              "type": "number"
+            },
+            "session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "state": {
+              "required": true,
+              "type": "string"
+            },
+            "summary": {
+              "required": false,
+              "type": "string"
+            },
+            "turn_id": {
+              "required": false,
+              "type": "string"
+            },
+            "updated_at": {
+              "required": false,
+              "type": "number"
+            }
+          }
+        },
+        "heartbeat": {
+          "struct": "",
+          "fields": {},
+          "no_data": true
+        },
+        "interaction.resolved": {
+          "struct": "InteractionResolvedData",
+          "fields": {
+            "agent_id": {
+              "required": true,
+              "type": "string"
+            },
+            "interaction_id": {
+              "required": false,
+              "type": "string"
+            },
+            "kind": {
+              "required": true,
+              "type": "string"
+            },
+            "resolution": {
+              "required": true,
+              "type": "string"
+            },
+            "revision_requested": {
+              "required": false,
+              "type": "boolean"
+            },
+            "session_id": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "media.ref": {
+          "struct": "MediaRefData",
+          "fields": {
+            "mime": {
+              "required": true,
+              "type": "string"
+            },
+            "role": {
+              "required": true,
+              "type": "string"
+            },
+            "uri": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "message.appended": {
+          "struct": "MessageAppendedData",
+          "fields": {
+            "agent_id": {
+              "required": false,
+              "type": "string"
+            },
+            "attachments": {
+              "required": false,
+              "type": "array"
+            },
+            "clarify": {
+              "required": false,
+              "type": "object"
+            },
+            "clarify_id": {
+              "required": false,
+              "type": "string"
+            },
+            "content": {
+              "required": true,
+              "type": "string"
+            },
+            "error_code": {
+              "required": false,
+              "type": "string"
+            },
+            "kind": {
+              "required": false,
+              "type": "string"
+            },
+            "media": {
+              "required": false,
+              "type": "array"
+            },
+            "msg_id": {
+              "required": true,
+              "type": "number"
+            },
+            "role": {
+              "required": true,
+              "type": "string"
+            },
+            "session_id": {
+              "required": false,
+              "type": "string"
+            },
+            "turn_id": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "plan.preview": {
+          "struct": "PlanPreviewData",
+          "fields": {
+            "groups": {
+              "required": true,
+              "type": "array"
+            },
+            "plan_id": {
+              "required": false,
+              "type": "string"
+            },
+            "revision_requested": {
+              "required": false,
+              "type": "boolean"
+            },
+            "status": {
+              "required": false,
+              "type": "string"
+            },
+            "title": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "reasoning.delta": {
+          "struct": "TextDeltaData",
+          "fields": {
+            "text": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "search.result": {
+          "struct": "model.SearchResultBlock",
+          "fields": {
+            "query": {
+              "required": false,
+              "type": "string"
+            },
+            "total_count": {
+              "required": true,
+              "type": "number"
+            },
+            "status": {
+              "required": true,
+              "type": "string"
+            },
+            "truncated": {
+              "required": false,
+              "type": "boolean"
+            },
+            "items": {
+              "required": true,
+              "type": "array"
+            }
+          }
+        },
+        "steer": {
+          "struct": "SteerData",
+          "fields": {
+            "text": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "steer.dropped": {
+          "struct": "SteerDroppedData",
+          "fields": {
+            "reason": {
+              "required": false,
+              "type": "string"
+            },
+            "text": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "text.delta": {
+          "struct": "TextDeltaData",
+          "fields": {
+            "text": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "text.reset": {
+          "struct": "struct {}",
+          "fields": {}
+        },
+        "todo.update": {
+          "struct": "TodoUpdateData",
+          "fields": {
+            "summary": {
+              "required": true,
+              "type": "object"
+            },
+            "todos": {
+              "required": true,
+              "type": "array"
+            }
+          }
+        },
+        "tool.result": {
+          "struct": "ToolResultData",
+          "fields": {
+            "browser_content_evidence": {
+              "required": false,
+              "type": "any"
+            },
+            "browser_state": {
+              "required": false,
+              "type": "any"
+            },
+            "call_id": {
+              "required": true,
+              "type": "string"
+            },
+            "component_id": {
+              "required": false,
+              "type": "string"
+            },
+            "connector_error": {
+              "required": false,
+              "type": "any"
+            },
+            "duration_s": {
+              "required": false,
+              "type": "number"
+            },
+            "error": {
+              "required": false,
+              "type": "string"
+            },
+            "error_code": {
+              "required": false,
+              "type": "string"
+            },
+            "output": {
+              "required": false,
+              "type": "any"
+            },
+            "provider": {
+              "required": false,
+              "type": "string"
+            },
+            "reference_id": {
+              "required": false,
+              "type": "string"
+            },
+            "status": {
+              "required": true,
+              "type": "string"
+            },
+            "status_code": {
+              "required": false,
+              "type": "any"
+            }
+          }
+        },
+        "tool.start": {
+          "struct": "ToolStartData",
+          "fields": {
+            "arguments": {
+              "required": false,
+              "type": "any"
+            },
+            "call_id": {
+              "required": true,
+              "type": "string"
+            },
+            "label": {
+              "required": false,
+              "type": "string"
+            },
+            "name": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "turn.end": {
+          "struct": "TurnEndData",
+          "fields": {
+            "final_text": {
+              "required": false,
+              "type": "string"
+            },
+            "final_text_source": {
+              "required": false,
+              "type": "string"
+            },
+            "produced_files": {
+              "required": false,
+              "type": "array"
+            },
+            "reason": {
+              "required": true,
+              "type": "string"
+            },
+            "session_id": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "turn.progress": {
+          "struct": "TurnProgressData",
+          "fields": {
+            "phase": {
+              "required": true,
+              "type": "string"
+            },
+            "tool_name": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "turn.resume.ack": {
+          "struct": "TurnResumeAckData",
+          "fields": {
+            "attachments": {
+              "required": false,
+              "type": "array"
+            },
+            "display_content": {
+              "required": false,
+              "type": "string"
+            },
+            "in_flight": {
+              "required": true,
+              "type": "boolean"
+            },
+            "latest_fanout_seq": {
+              "required": false,
+              "type": "number"
+            },
+            "quoted": {
+              "required": false,
+              "type": "object"
+            },
+            "quotes": {
+              "required": false,
+              "type": "array"
+            },
+            "ready": {
+              "required": false,
+              "type": "boolean"
+            },
+            "replay_complete": {
+              "required": false,
+              "type": "boolean"
+            },
+            "replay_count": {
+              "required": false,
+              "type": "number"
+            },
+            "retry_after_ms": {
+              "required": false,
+              "type": "number"
+            },
+            "skill_slug": {
+              "required": false,
+              "type": "string"
+            },
+            "started_at": {
+              "required": false,
+              "type": "number"
+            },
+            "turn_id": {
+              "required": false,
+              "type": "string"
+            },
+            "user_content": {
+              "required": false,
+              "type": "string"
+            }
+          }
+        },
+        "turn.resync_required": {
+          "struct": "TurnResyncRequiredData",
+          "fields": {
+            "latest_fanout_seq": {
+              "required": true,
+              "type": "number"
+            },
+            "reason": {
+              "required": true,
+              "type": "string"
+            },
+            "session_id": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "turn.snapshot": {
+          "struct": "TurnSnapshotData",
+          "fields": {
+            "active_delegations": {
+              "required": false,
+              "type": "array"
+            },
+            "active_goals": {
+              "required": false,
+              "type": "array"
+            },
+            "active_turns": {
+              "required": true,
+              "type": "array"
+            }
+          }
+        },
+        "turn.start": {
+          "struct": "TurnStartData",
+          "fields": {
+            "agent_id": {
+              "required": true,
+              "type": "string"
+            },
+            "model": {
+              "required": false,
+              "type": "string"
+            },
+            "session_id": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "typing": {
+          "struct": "TypingData",
+          "fields": {
+            "state": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "ui_hint": {
+          "struct": "UiHintData",
+          "fields": {
+            "action": {
+              "required": false,
+              "type": "string"
+            },
+            "agent_id": {
+              "required": false,
+              "type": "string"
+            },
+            "agent_name": {
+              "required": false,
+              "type": "string"
+            },
+            "error_code": {
+              "required": false,
+              "type": "string"
+            },
+            "has_greeting": {
+              "required": false,
+              "type": "boolean"
+            },
+            "label": {
+              "required": false,
+              "type": "string"
+            },
+            "platform": {
+              "required": false,
+              "type": "string"
+            },
+            "resume_pairing": {
+              "required": false,
+              "type": "boolean"
+            },
+            "source": {
+              "required": false,
+              "type": "string"
+            },
+            "type": {
+              "required": true,
+              "type": "string"
+            }
+          }
+        },
+        "usage": {
+          "struct": "UsageData",
+          "fields": {
+            "context_used_percent": {
+              "required": false,
+              "type": "number"
+            },
+            "input_tokens": {
+              "required": true,
+              "type": "number"
+            },
+            "output_tokens": {
+              "required": true,
+              "type": "number"
+            },
+            "total_tokens": {
+              "required": true,
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    "known": {
+      "$comment": "Explicitly declared differences the guard downgrades to warnings. Every entry names the closing batch. Fields the wire carries but a client lacks are NOT listed here: they are fixed by adding optional fields to the client types (B0 task 4.1). Only client-side phantoms (declared in TS, never emitted by local-server) live here until the batch that removes them.",
+      "hermes": {
+        "ignore_type_literals": [
+          "disabled",
+          "invalid_request_error",
+          "text"
+        ],
+        "reason": "Non-frame dict literals in zet_agent.py that also carry a \"type\" key: reasoning-config `disabled`, the OpenAI-style error body `invalid_request_error`, and `text` content blocks. Any other undotted type literal is a new frame until registered here.",
+        "frame_shape_exempt": {
+          "context.compaction": "The frame is the upstream compaction status payload forwarded as-is (dict(payload) + type); its fields are frozen by golden/hermes/context.compaction.json and asserted by tests/gateway/test_zet_agent_producer_conformance.py against the three real producer shapes."
+        }
+      },
+      "registry": {
+        "web": {
+          "missing_kinds": [],
+          "extra_kinds": [],
+          "reason": ""
+        },
+        "app": {
+          "missing_kinds": [],
+          "extra_kinds": [],
+          "reason": ""
+        }
+      },
+      "ts": {
+        "web": {
+          "events_extra": [
+            "interaction.pending"
+          ],
+          "events_extra_reason": "Web declares and subscribes to /ws/events interaction.pending (services/events-connection.ts), but no local-server producer emits that wire type (no EventType constant, no literal anywhere in internal/). Removed with the durable-receipt retirement in chat-ui-b2a-interactive-protocol.",
+          "events_missing": [],
+          "fields": {
+            "tool.start": {
+              "required_mismatch": [],
+              "extra": []
+            },
+            "message.appended": {
+              "type_mismatch": [
+                "msg_id"
+              ],
+              "reason": "Web declares msg_id as string while local-server sends the int64 chat_messages row id (App already declares number). Web keys its dedupe map by String(msg_id); align the type in chat-ui-b1-lifecycle-error together with the dedupe call sites."
+            },
+            "tool.result": {
+              "extra": [
+                "preview"
+              ],
+              "reason": "Legacy hermes-webui bridge field; never emitted by the hermes gateway translator. Drop in chat-ui-b1-lifecycle-error."
+            },
+            "turn.end": {
+              "extra": [
+                "agent_id",
+                "messages"
+              ],
+              "reason": "hermes-webui done-event shape carried over; local-server never fills them. Drop in chat-ui-b1-lifecycle-error."
+            },
+            "turn.snapshot": {
+              "extra": [
+                "pending_interactions"
+              ],
+              "reason": "Client-side projection of durable interaction receipts; local-server never fills it. Removed in chat-ui-b2a-interactive-protocol."
+            },
+            "turn.resume.ack": {
+              "extra": [
+                "agent_id",
+                "session_id",
+                "client_resume_generation"
+              ],
+              "reason": "agent_id/session_id: never emitted (resume is per-connection). client_resume_generation: ChatClient-local correlation added after parse; moves out of the wire type in chat-ui-b1-lifecycle-error."
+            },
+            "approval": {
+              "extra": [
+                "action_nonce"
+              ],
+              "reason": "Client-minted nonce echoed on the respond envelope; never on the inbound approval event. Removed with the two-phase receipt in chat-ui-b2a-interactive-protocol."
+            },
+            "capabilities": {
+              "extra": [
+                "agent_workbench_interactions"
+              ],
+              "reason": "Declared for the desktop workbench; local-server DefaultCapabilities never sets it. Decide in chat-ui-b2a-interactive-protocol."
+            },
+            "interaction.resolved": {
+              "extra": [
+                "turn_id"
+              ],
+              "reason": "Web models the resolved receipt as a union whose clarify branch omits agent_id / resolution and carries a data-level turn_id copied from the envelope; local-server always sends agent_id + resolution and only the envelope turn_id. Collapse to the wire shape with the receipt rework in chat-ui-b2a-interactive-protocol.",
+              "missing": [
+                "agent_id",
+                "resolution"
+              ]
+            },
+            "ui_hint": {
+              "missing": [
+                "error_code"
+              ],
+              "extra": [
+                "browser_session_id",
+                "tab_id"
+              ],
+              "literal_mismatch": [
+                "source"
+              ],
+              "reason": "Web models ui_hint as a union of hint shapes: the takeover_browser branch (browser_session_id / tab_id) belongs to tool.result.output.ui_hint (do-not-touch list), not to the ui_hint event; error_code is not consumed; source only knows overseas_connect_via_skill while local-server also emits agent_creator_via_skill. Revisit the whole ui_hint event in chat-ui-b3-content."
+            }
+          },
+          "envelope": {
+            "required_mismatch": [
+              "data"
+            ],
+            "reason": "Both clients declare Envelope.data as required (every typed event carries a payload; heartbeat is a separate interface) while the Go Event struct has data omitempty. Decide in chat-ui-b1-lifecycle-error whether the wire guarantees data on every typed event or the clients go data?: D."
+          }
+        },
+        "app": {
+          "events_extra": [],
+          "events_missing": [
+            "agent.created",
+            "agent.updated",
+            "agent.deleted"
+          ],
+          "events_missing_reason": "App has no consumer for agent.created / agent.updated / agent.deleted at all today (no literal anywhere outside node_modules); the list refresh relies on refetch. Declaring the types is a capability gap to close in chat-ui-b1-lifecycle-error, not a difference in transport.",
+          "fields": {
+            "tool.result": {
+              "extra": [
+                "preview"
+              ],
+              "reason": "Same legacy hermes-webui field as Web. Drop in chat-ui-b1-lifecycle-error."
+            },
+            "turn.end": {
+              "extra": [
+                "error_code",
+                "messages"
+              ],
+              "reason": "error_code never filled (error arrives on the error event); messages is the hermes-webui done shape. Drop in chat-ui-b1-lifecycle-error."
+            },
+            "turn.resume.ack": {
+              "extra": [
+                "agent_id",
+                "session_id",
+                "client_resume_generation"
+              ],
+              "reason": "Same as Web."
+            },
+            "approval": {
+              "extra": [
+                "action_nonce"
+              ],
+              "reason": "Same as Web; removed in chat-ui-b2a-interactive-protocol."
+            },
+            "todo.update": {
+              "extra": [
+                "session_id"
+              ],
+              "reason": "Never emitted; todo.update is turn-scoped. Drop in chat-ui-bt-timeline-items when todo becomes a timeline item."
+            }
+          },
+          "envelope": {
+            "required_mismatch": [
+              "data"
+            ],
+            "reason": "Both clients declare Envelope.data as required (every typed event carries a payload; heartbeat is a separate interface) while the Go Event struct has data omitempty. Decide in chat-ui-b1-lifecycle-error whether the wire guarantees data on every typed event or the clients go data?: D."
+          }
+        }
+      }
+    }
+  }
+}
