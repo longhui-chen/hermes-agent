@@ -13,6 +13,9 @@ should follow:
                either freezes it (awaiting the USER's confirmation) or returns
                structured `problems` to fix
   status       poll a run (step / guide_state / done / failed / entry_url)
+  retry        resume a FAILED run from its last good step (reuses the workspace,
+               spec and code already written) — the answer to "重试 / 重新编译 /
+               继续"; never `start` a fresh run for that
   cancel       abandon before the build starts
 
 There is deliberately NO confirm action: only the user starts the build (chat
@@ -37,7 +40,7 @@ import requests
 from agent.secret_scope import get_secret
 from tools.registry import registry
 
-_ACTIONS = {"start", "create", "set_pace", "submit_spec", "revise", "status", "cancel"}
+_ACTIONS = {"start", "create", "set_pace", "submit_spec", "revise", "status", "retry", "cancel"}
 _SESSION_HEADER = "X-Zettlab-Session-Id"
 _SCHEMA = {
     "name": "create_pipeline",
@@ -53,8 +56,12 @@ _SCHEMA = {
         "note=the user's change request in one sentence) when the user asks to change the "
         "requirements or the prototype before confirming — the platform merges it into the "
         "spec and updates the existing prototype in place; action='status' (run_id) to "
-        "report progress; action='cancel' (run_id) if the user gives up. You cannot start "
-        "the build yourself: only the user's confirmation does."
+        "report progress; action='retry' (run_id) when a run has FAILED and the user says "
+        "重试 / 重新编译 / 继续 / 再试一次 — it resumes from the last good step, reusing the "
+        "workspace, spec and code already written; NEVER answer that with a new 'start' "
+        "(only after the user closes the failed creation and explicitly wants a different "
+        "app); action='cancel' (run_id) if the user gives up. You cannot start the build "
+        "yourself: only the user's confirmation does."
     ),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": sorted(_ACTIONS)},
@@ -150,7 +157,7 @@ def create_pipeline(args: Any = None, **_: Any) -> str:
     action = str(args.get("action", "") or "").strip()
     if action not in _ACTIONS:
         return json.dumps({"ok": False, "success": False, "code": "invalid_action",
-                           "next": "action 只能是 start / set_pace / submit_spec / status / cancel。"}, ensure_ascii=False)
+                           "next": "action 只能是 start / set_pace / submit_spec / revise / status / retry / cancel。"}, ensure_ascii=False)
     if action == "create":
         action = "start"
     base = _base_url()
@@ -210,6 +217,12 @@ def create_pipeline(args: Any = None, **_: Any) -> str:
                                        "next": "spec 必须是一个 JSON 对象（按平台给出的 App Spec 键名）。"}, ensure_ascii=False)
                 payload = {"run_id": run_id, "spec": spec}
                 path = "/submit-spec"
+            elif action == "retry":
+                # 失败续跑：平台 ResumeFailed 把 run 还原到失败步的天然续跑点（复用工作区/
+                # 规格/已写代码）后台重驱动；非失败态幂等读回。09-05：用户说「重新编译」，
+                # 模型没有这个动作就 start 了一条新 run 从引导重头来——所以才补这条。
+                payload = {"run_id": run_id}
+                path = "/retry"
             else:  # cancel
                 payload = {"run_id": run_id, "reason": str(args.get("reason", "") or "")[:512]}
                 path = "/cancel"
