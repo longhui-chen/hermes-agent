@@ -97,6 +97,7 @@ import re
 import secrets
 import threading
 import time
+from gateway.platforms._chat_ui_enums import TERMINAL_STATES as _TERMINAL_STATES
 # ⚠️ _push_memory_citations / _push_memory_saved 在 turn_id 缺失时用
 # uuid.uuid5(NAMESPACE_OID, ...) 生成锚点 id。漏了这行不会炸到用户面前 ——
 # NameError 被外层 try 吞掉转成 return False，表现是**角标静默不出**，
