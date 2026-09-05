@@ -35,7 +35,7 @@ def _adapter_for_pending_callbacks() -> ZetAgentAdapter:
 def test_pending_interaction_flow_carries_exact_turn_id(monkeypatch):
     adapter = _adapter_for_pending_callbacks()
     stream_q = queue.Queue()
-    monkeypatch.setattr(zet_agent_module, "CLARIFY_RESPONSE_TIMEOUT", 0.01)
+    monkeypatch.setattr(zet_agent_module, "_clarify_timeout_seconds", lambda: 0.01)
     tokens = set_turn_vars(turn_id="turn-video-42")
     approval_data = {
         "command": "render",
@@ -53,7 +53,8 @@ def test_pending_interaction_flow_carries_exact_turn_id(monkeypatch):
         clear_turn_vars(tokens)
         approval.resolve_gateway_approval(queue_key, "deny")
 
-    assert clarify_result == ""
+    assert "state=expired" in clarify_result
+    assert "reason=timeout" in clarify_result
     approval_event = stream_q.get_nowait()[1]
     clarify_event = stream_q.get_nowait()[1]
     assert approval_event["turn_id"] == "turn-video-42"

@@ -865,6 +865,9 @@ async def test_pending_approval_follows_source_fifo_not_callback_arrival_order()
     assert response.status == 200
     assert body["approval"]["interaction_id"] == "interaction-a"
     assert body["approval"]["interaction_delivery_version"] == 1
+    assert {item["interaction_id"] for item in body["approvals"]} == {
+        "interaction-a", "interaction-b"
+    }
 
     # An old local-server ignores the additive version field and still uses
     # the legacy FIFO POST. Until this scoped session successfully prepares a
@@ -2198,16 +2201,25 @@ def test_approval_timeout_notifies_adapter_to_drop_unique_session_mirrors(
     for index in range(12):
         session_id = f"session-{index}"
         queue_key = adapter._interaction_queue_key(session_id)
+        stream = queue.Queue()
         tokens = set_turn_vars(turn_id=f"turn-{index}")
         try:
             result = approval._await_gateway_decision(
                 queue_key,
-                adapter._make_approval_cb(queue.Queue(), session_id, queue_key),
+                adapter._make_approval_cb(stream, session_id, queue_key),
                 {"command": f"command-{index}", "description": "test"},
             )
         finally:
             clear_turn_vars(tokens)
         assert result["resolved"] is False
+
+        # Timeout emits the terminal frame before the reconnect mirror is
+        # deleted, so clients cannot retain an actionable approval card.
+        frames = []
+        while not stream.empty():
+            frames.append(stream.get_nowait()[1])
+        assert frames[-1]["state"] == "expired"
+        assert frames[-1]["state_reason"] == "timeout"
 
     with adapter._pending_lock:
         assert adapter._pending_approval == {}
@@ -2253,6 +2265,31 @@ def test_interaction_interrupt_releases_source_and_mirror_accounting(monkeypatch
         assert adapter._pending_approval == {}
         assert adapter._pending_mirror_meta == {}
         assert adapter._pending_mirror_bytes == 0
+
+
+def test_interrupt_without_turn_id_does_not_scan_other_session_approvals():
+    """A missing active turn must still be scoped to the requested session."""
+    adapter = _adapter()
+    session_one = adapter._interaction_queue_key("session-1")
+    session_two = adapter._interaction_queue_key("session-2")
+    stream_one = queue.Queue()
+    stream_two = queue.Queue()
+    adapter._approval_stream_queues = {
+        session_one: stream_one,
+        session_two: stream_two,
+    }
+    adapter._pending_approval = {
+        session_one: [{"interaction_id": "approval-1", "turn_id": ""}],
+        session_two: [{"interaction_id": "approval-2", "turn_id": ""}],
+    }
+
+    adapter._interrupt_pending_interactions("session-1", session_one)
+
+    terminal = stream_one.get_nowait()[1]
+    assert terminal["interaction_id"] == "approval-1"
+    assert terminal["state"] == "cancelled"
+    assert stream_two.empty()
+    assert session_two in adapter._pending_approval
 
 
 def test_pending_mirror_ttl_prunes_stale_source_drop_fallback(monkeypatch):

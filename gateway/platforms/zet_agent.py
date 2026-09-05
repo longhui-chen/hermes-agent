@@ -97,6 +97,7 @@ import re
 import secrets
 import threading
 import time
+from gateway.platforms._chat_ui_enums import TERMINAL_STATES as _TERMINAL_STATES
 # ⚠️ _push_memory_citations / _push_memory_saved 在 turn_id 缺失时用
 # uuid.uuid5(NAMESPACE_OID, ...) 生成锚点 id。漏了这行不会炸到用户面前 ——
 # NameError 被外层 try 吞掉转成 return False，表现是**角标静默不出**，
@@ -488,11 +489,28 @@ ZET_RUNTIME_SHELL_PROMPT_INVALIDATE_TIMEOUT_SECONDS = 5.0
 # fresh sessions cannot monopolize the process before real turns arrive.
 ZET_RUNTIME_SHELL_PREWARM_MAX_TASKS = 2
 
-# How long the agent thread will block waiting for a user response to
-# a clarify prompt before giving up and returning an empty string. The
-# approval flow uses hermes' built-in timeout (``approval.gateway_timeout``,
-# default 300s) so we don't duplicate it here.
-CLARIFY_RESPONSE_TIMEOUT = 300.0
+# Clarify timeout is resolved from the profile's ``agent.clarify_timeout``.
+# Keep the fallback aligned with ``tools.clarify_gateway`` (300 seconds).
+def _clarify_timeout_seconds() -> float:
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+        value = float(get_clarify_timeout())
+        # B1 publishes a concrete client deadline; non-positive values would
+        # otherwise advertise an already-expired frame while the worker waits
+        # forever. Normalize them to the bounded default.
+        return value if value == value and value > 0 else 300.0
+    except Exception:
+        return 300.0
+
+
+def _clarify_sentinel(kind: str, request_id: str, state: str, reason: str, detail: str) -> str:
+    safe_id = request_id if len(request_id.encode("utf-8")) <= 64 else "id_too_long"
+    text = f"[{kind}:{safe_id} state={state} reason={reason}] {detail}"
+    if len(text.encode("utf-8")) > 160:
+        text = f"[{kind}:{safe_id} state={state} reason={reason}] clarify could not be delivered"
+    return text
+
+
 INTERACTION_PREPARE_TTL = 300.0
 INTERACTION_RECEIPT_TTL = 4 * 60 * 60.0
 INTERACTION_RECEIPT_CAP = 4096
@@ -531,9 +549,10 @@ def _approval_timeout_seconds() -> float:
     """
     try:
         from tools.approval import _get_approval_config
-        return float(_get_approval_config().get(
+        value = float(_get_approval_config().get(
             "gateway_timeout", DEFAULT_APPROVAL_TIMEOUT_SECONDS,
         ))
+        return value if value == value and value > 0 else DEFAULT_APPROVAL_TIMEOUT_SECONDS
     except Exception:
         return DEFAULT_APPROVAL_TIMEOUT_SECONDS
 
@@ -792,6 +811,8 @@ class _ClarifyEntry:
         "prepared_delivery_id",
         "prepared_until",
         "deferred_wake_at",
+        "terminal_emitted",
+        "stream_q",
     )
 
     def __init__(
@@ -811,6 +832,8 @@ class _ClarifyEntry:
         self.prepared_delivery_id: Optional[str] = None
         self.prepared_until = 0.0
         self.deferred_wake_at = 0.0
+        self.terminal_emitted = False
+        self.stream_q = None
 
 
 def _stamp_extension_turn_id(payload):
@@ -3322,6 +3345,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 "approval", internal_key, payload
             ):
                 raise RuntimeError("approval reconnect mirror capacity exhausted")
+            # Durable approvals also need their originating SSE queue retained
+            # for interrupt/timeout terminal frames.  The legacy projection
+            # path records this in ``_cache_approval_projection``; mirror the
+            # association here before publishing the first event.
+            with self._pending_lock:
+                stream_queues = getattr(self, "_approval_stream_queues", None)
+                if stream_queues is None:
+                    stream_queues = {}
+                    self._approval_stream_queues = stream_queues
+                stream_queues[internal_key] = stream_q
             if turn_id:
                 reserved, push_error = self._publish_interaction_event(
                     stream_q,
@@ -3360,7 +3393,46 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
-        def _source_dropped(_session_key: str, interaction_id: str) -> None:
+        def _source_dropped(
+            _session_key: str,
+            interaction_id: str,
+            reason: Optional[str] = None,
+        ) -> None:
+            # Timeout cleanup must publish the terminal frame before deleting
+            # the reconnect mirror.  Otherwise the client only sees the
+            # original pending approval and can keep an expired card alive
+            # after the source FIFO has been removed.  Resolution/interrupt
+            # paths already publish their own terminal event and therefore do
+            # not emit a duplicate here.
+            if reason == "timeout":
+                terminal_payload = None
+                terminal_stream = None
+                with self._pending_lock:
+                    for item in list(
+                        self._pending_approval.get(internal_key, []) or []
+                    ):
+                        if str(item.get("interaction_id") or "") != str(
+                            interaction_id or ""
+                        ):
+                            continue
+                        if item.get("terminal_emitted"):
+                            break
+                        item["terminal_emitted"] = True
+                        terminal_payload = dict(item)
+                        terminal_payload["state"] = "expired"
+                        terminal_payload["state_reason"] = "timeout"
+                        terminal_stream = getattr(
+                            self, "_approval_stream_queues", {}
+                        ).get(internal_key)
+                        break
+                if terminal_payload is not None and terminal_stream is not None:
+                    try:
+                        _put_progress(terminal_stream, terminal_payload)
+                    except Exception:
+                        logger.debug(
+                            "[zet_agent] approval timeout terminal push failed",
+                            exc_info=True,
+                        )
             self._remove_pending_interaction(
                 "approval", internal_key, interaction_id
             )
@@ -3404,21 +3476,23 @@ class ZetAgentAdapter(APIServerAdapter):
         ).strip()
 
         def _ask(question: str, choices: Optional[List[str]]) -> str:
+            timeout_seconds = _clarify_timeout_seconds()
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
             # clock time we will actually give up at.
-            expires_at_ms = int((time.time() + CLARIFY_RESPONSE_TIMEOUT) * 1000)
+            expires_at_ms = int((time.time() + timeout_seconds) * 1000)
             from gateway.session_context import get_session_env
             caller_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
             if (
                 owner_agent is not None
                 and captured_turn_id
+                and caller_turn_id
                 and caller_turn_id != captured_turn_id
             ):
                 logger.warning(
                     "[zet_agent] clarify callback rejected stale turn owner"
                 )
-                return ""
+                return _clarify_sentinel("clarify", "unknown", "cancelled", "caller_inactive", "caller is not an active human turn")
             turn_id = captured_turn_id or caller_turn_id
             if turn_id:
                 owner_bound = self._remember_active_turn_id(
@@ -3428,7 +3502,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.warning(
                         "[zet_agent] clarify callback rejected inactive owner"
                     )
-                    return ""
+                    return _clarify_sentinel("clarify", "unknown", "cancelled", "caller_inactive", "caller is not an active human turn")
                 self._wait_for_recovery_fence(internal_key, turn_id)
             from tools.approval import reserve_gateway_interaction_generation
 
@@ -3452,6 +3526,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     payload,
                     interaction_generation,
                 )
+                entry.stream_q = stream_q
                 with self._clarify_state_lock:
                     self._clarify_queues.setdefault(internal_key, []).append(entry)
             if not self._pin_durable_session_source(
@@ -3460,13 +3535,13 @@ class ZetAgentAdapter(APIServerAdapter):
                 logger.warning(
                     "[zet_agent] durable clarify source capacity exhausted"
                 )
-                self._discard_clarify_entry(internal_key, entry)
-                return ""
+                self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             if not self._store_pending_interaction(
                 "clarify", internal_key, payload
             ):
-                self._discard_clarify_entry(internal_key, entry)
-                return ""
+                self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             if turn_id:
                 reserved, push_error = self._publish_interaction_event(
                     stream_q,
@@ -3476,8 +3551,8 @@ class ZetAgentAdapter(APIServerAdapter):
                     interaction_generation,
                 )
                 if not reserved:
-                    self._discard_clarify_entry(internal_key, entry)
-                    return ""
+                    self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                    return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
                 if push_error is not None:
                     logger.debug(
                         "[zet_agent] clarify push failed",
@@ -3487,15 +3562,15 @@ class ZetAgentAdapter(APIServerAdapter):
                             push_error.__traceback__,
                         ),
                     )
-                    self._discard_clarify_entry(internal_key, entry)
-                    return ""
+                    self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                    return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             else:
                 try:
                     _put_progress(stream_q, payload)
                 except Exception:
                     logger.debug("[zet_agent] clarify push failed", exc_info=True)
-                    self._discard_clarify_entry(internal_key, entry)
-                    return ""
+                    self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                    return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             # Goal projection: clarify blocks the turn on user input — mirror
             # the approval hook (waiting banner; no GoalManager mutation).
             try:
@@ -3505,11 +3580,11 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
-            wait_deadline = time.monotonic() + CLARIFY_RESPONSE_TIMEOUT
+            wait_deadline = None if timeout_seconds <= 0 else time.monotonic() + timeout_seconds
             resolved = False
             while True:
-                remaining = wait_deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = 1.0 if wait_deadline is None else wait_deadline - time.monotonic()
+                if wait_deadline is not None and remaining <= 0:
                     break
                 if entry.event.wait(timeout=min(1.0, remaining)):
                     resolved = True
@@ -3524,11 +3599,14 @@ class ZetAgentAdapter(APIServerAdapter):
             if not resolved:
                 logger.warning(
                     "[zet_agent] clarify timeout after %ss session=%s",
-                    CLARIFY_RESPONSE_TIMEOUT, session_id,
+                    timeout_seconds, session_id,
                 )
-                self._discard_clarify_entry(internal_key, entry)
-                return ""
-            return entry.response or ""
+                self._discard_clarify_entry(internal_key, entry, reason="timeout")
+                return _clarify_sentinel("clarify", entry.interaction_id, "expired", "timeout", f"user did not respond within {int(timeout_seconds)}s")
+            response = entry.response
+            if response:
+                return response
+            return _clarify_sentinel("clarify", entry.interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
 
         return _ask
 
@@ -3836,10 +3914,11 @@ class ZetAgentAdapter(APIServerAdapter):
 
         return _emit
 
-    def _discard_clarify_entry(self, queue_key: str, entry: _ClarifyEntry) -> None:
+    def _discard_clarify_entry(self, queue_key: str, entry: _ClarifyEntry, *, reason: str = "delivery_failed") -> None:
         """Remove an unresolved entry (push failure or timeout). The
         respond handler removes via popleft on success; this path
         handles error rollback so the queue doesn't accumulate."""
+        self.emit_terminal_interactions(entry.turn_id, reason=reason, entries=[entry])
         with self._clarify_state_lock:
             queue = self._clarify_queues.get(queue_key)
             if queue and entry in queue:
@@ -3852,6 +3931,70 @@ class ZetAgentAdapter(APIServerAdapter):
         self._release_durable_session_source(
             queue_key, "clarify", entry.interaction_id
         )
+
+    def emit_terminal_interactions(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "turn_interrupted",
+        entries: Optional[List[_ClarifyEntry]] = None,
+        queue_key: Optional[str] = None,
+    ) -> int:
+        """Emit each pending clarify/approval terminal frame at most once."""
+        candidates = entries
+        if candidates is None:
+            with self._clarify_state_lock:
+                candidates = [
+                    e
+                    for key, q in self._clarify_queues.items()
+                    if queue_key is None or key == queue_key
+                    for e in q
+                    if not turn_id or e.turn_id == turn_id
+                ]
+        emitted = 0
+        for entry in candidates:
+            with self._clarify_state_lock:
+                if entry.terminal_emitted:
+                    continue
+                entry.terminal_emitted = True
+            state = "expired" if reason == "timeout" else "cancelled"
+            payload = dict(entry.payload)
+            payload["state"] = state
+            payload["state_reason"] = reason
+            try:
+                if entry.stream_q is not None:
+                    _put_progress(entry.stream_q, payload)
+                    emitted += 1
+            except Exception:
+                logger.debug("[zet_agent] clarify terminal push failed", exc_info=True)
+        # Approval projections use the same stream-owned terminal lane. Keep
+        # them correlated by turn_id so an interrupted approval cannot leave a
+        # dangerous card actionable after the SSE turn has ended.
+        with self._pending_lock:
+            approval_candidates = []
+            for key, raw in getattr(self, "_pending_approval", {}).items():
+                items = [raw] if isinstance(raw, dict) else list(raw or [])
+                for item in items:
+                    if (
+                        (queue_key is None or key == queue_key)
+                        and (not turn_id or str(item.get("turn_id") or "") == turn_id)
+                        and not item.get("terminal_emitted")
+                    ):
+                        approval_candidates.append((key, item))
+        for key, item in approval_candidates:
+            payload = dict(item)
+            payload["state"] = "expired" if reason == "timeout" else "cancelled"
+            payload["state_reason"] = reason
+            try:
+                stream_q = getattr(self, "_approval_stream_queues", {}).get(key)
+                if stream_q is not None:
+                    _put_progress(stream_q, payload)
+                    with self._pending_lock:
+                        item["terminal_emitted"] = True
+                    emitted += 1
+            except Exception:
+                logger.debug("[zet_agent] approval terminal push failed", exc_info=True)
+        return emitted
 
     def _remember_active_turn_id(
         self,
@@ -6947,6 +7090,11 @@ class ZetAgentAdapter(APIServerAdapter):
             choice,
             approval_id=approval_id,
         )
+        if resolved == 0 and approval_id is not None:
+            return web.json_response(
+                _openai_error("Unknown approval request", code="request_unknown"),
+                status=404,
+            )
         if resolved:
             if legacy_interaction_id:
                 self._remove_pending_interaction(
@@ -7262,6 +7410,11 @@ class ZetAgentAdapter(APIServerAdapter):
             if queue is not None and not queue:
                 self._clarify_queues.pop(queue_key, None)
         if entry is None:
+            if clarify_id:
+                return web.json_response(
+                    _openai_error("Unknown clarify request", code="request_unknown"),
+                    status=404,
+                )
             return web.json_response(
                 _openai_error(
                     f"No clarify pending for session {session_id}",
@@ -7291,10 +7444,14 @@ class ZetAgentAdapter(APIServerAdapter):
         client can re-render the modal it had open before the ws drop.
         Read-only: does not consume the entries.
 
-        Body: ``{"approval": <payload>|null, "clarify": <payload>|null}``.
-        Each payload mirrors the shape of the corresponding
-        hermes.tool.progress event ``data`` object (without the
-        ``type`` discriminator).
+        Body: ``{"approval": <payload>|null, "clarify": <payload>|null,
+        "approvals": [<payload>...], "clarifies": [<payload>...]}``.
+        The singular fields preserve the oldest/source-selected projection for
+        existing clients. The additive arrays expose every currently pending
+        interaction so reconnecting clients cannot silently lose a second
+        approval or clarify waiting behind the FIFO head. Each payload mirrors
+        the corresponding hermes.tool.progress event ``data`` object (without
+        the ``type`` discriminator).
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -7321,6 +7478,10 @@ class ZetAgentAdapter(APIServerAdapter):
         with self._pending_lock:
             approval_queue = self._pending_approval.get(queue_key, [])
             clarify_queue = self._pending_clarify.get(queue_key, [])
+            # Return snapshots, never the mutable mirror lists. Preserve FIFO
+            # order for clients that reconcile all pending interactions.
+            approvals = [dict(payload) for payload in approval_queue]
+            clarifies = [dict(payload) for payload in clarify_queue]
             ap = next(
                 (
                     payload
@@ -7350,6 +7511,8 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({
             "approval": ap,
             "clarify": cl,
+            "approvals": approvals,
+            "clarifies": clarifies,
         })
 
     async def _handle_attachment_action(self, request: "web.Request") -> "web.Response":
@@ -8257,6 +8420,16 @@ class ZetAgentAdapter(APIServerAdapter):
         # with empty response so the ask_user callback unblocks.
         with self._clarify_state_lock:
             clarify_queue = list(self._clarify_queues.pop(queue_key, []) or [])
+        # The queue is removed above so the normal discovery path in
+        # ``emit_terminal_interactions`` cannot see these entries anymore.
+        # Emit using the captured entries before waking the blocked worker;
+        # otherwise an interrupted clarify card remains actionable in the UI.
+        if clarify_queue:
+            self.emit_terminal_interactions(
+                "",
+                reason="turn_interrupted",
+                entries=clarify_queue,
+            )
         for entry in clarify_queue:
             try:
                 entry.response = ""
@@ -8274,6 +8447,13 @@ class ZetAgentAdapter(APIServerAdapter):
         # grants. A stale approval card must never authorize work after the
         # interrupted run has ended.
         try:
+            self.emit_terminal_interactions(
+                getattr(self, "_active_session_turn_ids", {}).get(
+                    self._active_turn_key(session_id), ""
+                ),
+                reason="turn_interrupted",
+                queue_key=queue_key,
+            )
             with self._pending_lock:
                 getattr(self, "_approval_session_keys", {}).pop(
                     self._active_turn_key(session_id),

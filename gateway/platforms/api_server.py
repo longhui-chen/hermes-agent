@@ -1395,6 +1395,19 @@ def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Op
     return payload
 
 
+def _derive_chat_terminal(result: Dict[str, Any]) -> tuple[str, str, Optional[Dict[str, Any]]]:
+    """Derive finish reason and error payload once for both wire channels.
+
+    zettlab-overlay(B1): keeps ``hermes.error`` and finish chunk codes in lockstep.
+    """
+    finish_reason = _chat_finish_reason_from_result(result)
+    code = _hermes_error_code(result, finish_reason)
+    payload = _chat_stream_error_payload(result, finish_reason)
+    if payload is not None:
+        payload["code"] = code
+    return finish_reason, code, payload
+
+
 def _tool_completion_payload(
     tool_call_id: str,
     function_name: str,
@@ -6697,6 +6710,20 @@ class APIServerAdapter(BasePlatformAdapter):
             def _finish_chat_stream(_fut):
                 for safe_delta in media_delta_filter.finish():
                     _stream_q.put(safe_delta)
+                # Terminal interaction frames must be queued while the SSE
+                # consumer is still draining the stream.  The ``None``
+                # sentinel closes the drain loop, so emitting afterwards
+                # would strand cards in the queue.
+                emit_terminals = getattr(self, "emit_terminal_interactions", None)
+                if callable(emit_terminals):
+                    try:
+                        terminal_turn_id = getattr(
+                            agent_ref[0], "_zettlab_active_turn_id", ""
+                        ) if agent_ref else ""
+                        if terminal_turn_id:
+                            emit_terminals(terminal_turn_id)
+                    except Exception:
+                        logger.debug("terminal interaction emission failed", exc_info=True)
                 _stream_q.put(None)
 
             agent_task.add_done_callback(_finish_chat_stream)
@@ -7136,8 +7163,18 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_err_msg = result_dict.get("error")
             err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
-            finish_reason = _chat_finish_reason_from_result(result_dict)
-            error_payload = _chat_stream_error_payload(result_dict, finish_reason)
+            finish_reason, terminal_code, error_payload = _derive_chat_terminal(result_dict)
+            # zettlab-overlay(B1): terminal interaction frames precede errors.
+            if os.environ.get("ZET_B1_TERMINAL_FRAMES", "1") not in {"0", "false", "False"}:
+                adapter = self
+                emit_terminals = getattr(adapter, "emit_terminal_interactions", None)
+                if callable(emit_terminals):
+                    try:
+                        terminal_turn_id = getattr(agent_ref[0], "_zettlab_active_turn_id", "") if agent_ref else ""
+                        if terminal_turn_id:
+                            emit_terminals(terminal_turn_id)
+                    except Exception:
+                        logger.debug("terminal interaction emission failed", exc_info=True)
             if error_payload:
                 await _emit(("__hermes_error__", error_payload))
 
@@ -7198,7 +7235,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
-                _wire_code = _hermes_error_code(result_dict, finish_reason)
+                _wire_code = terminal_code
                 if err_msg:
                     finish_chunk["error"] = {
                         "message": err_msg,

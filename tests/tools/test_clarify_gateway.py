@@ -88,8 +88,8 @@ class TestClarifyPrimitive:
             cancelled = cm.clear_session("sk7")
             assert cancelled == 1
             result = fut.result(timeout=10.0)
-            # clear_session sets response="" then the wait returns it
-            assert result == ""
+            assert result is not None
+            assert result.startswith("[clarify:id7 state=cancelled reason=session_reset]")
 
 
     def test_notify_register_unregister_clears_pending(self):
@@ -110,7 +110,8 @@ class TestClarifyPrimitive:
 
             # unregister_notify calls clear_session; thread unwinds
             result = fut.result(timeout=10.0)
-            assert result == ""
+            assert result is not None
+            assert result.startswith("[clarify:id9 state=cancelled reason=session_reset]")
 
     def test_session_index_isolation(self):
         """Entries from different sessions don't leak across get_pending lookups."""
@@ -211,12 +212,12 @@ class TestCoverageGaps:
 
 
     def test_get_clarify_timeout_exception_returns_default(self, monkeypatch):
-        """get_clarify_timeout returns 3600 when load_config raises."""
+        """get_clarify_timeout returns the B1 default when config fails."""
         from tools import clarify_gateway as cm
 
         monkeypatch.setattr("hermes_cli.config.load_config",
                             lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-        assert cm.get_clarify_timeout() == 3600
+        assert cm.get_clarify_timeout() == 300
 
 
     def test_get_notify_returns_none_when_not_registered(self):
@@ -236,13 +237,12 @@ class TestClarifyTimeoutResolution:
         assert cm.resolve_clarify_timeout({"agent": {"clarify_timeout": 900}}) == 900
 
 
-    def test_non_positive_preserved_as_unlimited_sentinel(self):
-        """<= 0 is passed through verbatim — the waiting loops read it as
-        'unlimited', so the resolver must not clamp it to a positive default."""
+    def test_non_positive_normalized_to_default(self):
+        """Configured non-positive values use the concrete B1 deadline."""
         from tools import clarify_gateway as cm
 
-        assert cm.resolve_clarify_timeout({"agent": {"clarify_timeout": 0}}) == 0
-        assert cm.resolve_clarify_timeout({"clarify": {"timeout": -1}}) == -1
+        assert cm.resolve_clarify_timeout({"agent": {"clarify_timeout": 0}}) == 300
+        assert cm.resolve_clarify_timeout({"clarify": {"timeout": -1}}) == 300
 
 
 class TestUnlimitedWait:

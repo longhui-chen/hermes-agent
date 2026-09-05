@@ -216,7 +216,11 @@ async def test_exact_clarify_response_keeps_pending_projection_on_fifo_head():
     headers = {"Authorization": "Bearer test-key-0123456789abcdef"}
     async with TestClient(TestServer(app)) as cli:
         pending = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
-        assert (await pending.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+        pending_body = await pending.json()
+        assert pending_body["clarify"]["clarify_id"] == first_payload["clarify_id"]
+        assert [item["clarify_id"] for item in pending_body["clarifies"]] == [
+            first_payload["clarify_id"], second_payload["clarify_id"]
+        ]
 
         later = await cli.post(
             "/v1/sessions/sid-two-clarifies/clarify/respond",
@@ -225,7 +229,11 @@ async def test_exact_clarify_response_keeps_pending_projection_on_fifo_head():
         )
         assert later.status == 200
         pending_after_later = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
-        assert (await pending_after_later.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+        pending_after_later_body = await pending_after_later.json()
+        assert pending_after_later_body["clarify"]["clarify_id"] == first_payload["clarify_id"]
+        assert [item["clarify_id"] for item in pending_after_later_body["clarifies"]] == [
+            first_payload["clarify_id"]
+        ]
 
         first_reply = await cli.post(
             "/v1/sessions/sid-two-clarifies/clarify/respond",

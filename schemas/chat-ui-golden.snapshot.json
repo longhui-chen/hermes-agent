@@ -1,7 +1,7 @@
 {
-  "snapshot_version": 1,
-  "root_commit": "38e8202a3d57533d41fc8eb622a0239ce10cd02a",
-  "sha256": "a1f5df4f21381fb04f36a73ab1bc5c75b1430e84fa75e75fb46165aabfe4d0a0",
+  "snapshot_version": 2,
+  "root_commit": "1c493226f71cddcd08c69e3cc0365191da598577",
+  "sha256": "c41f0efb3db1dc4a14823eb0530e0fab81ad1f89832b6e1e7aaf94fac593d8f6",
   "payload": {
     "golden": {
       "events": {
@@ -41,6 +41,94 @@
             "actor_type": "user"
           }
         },
+        "approval.cancelled.delivery_failed": {
+          "type": "approval",
+          "turn_id": "turn_demo_0001",
+          "seq": 17,
+          "fanout_seq": 17,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "command": "rm -rf /sandbox/demo/tmp",
+            "description": "清理临时目录",
+            "pattern_key": "rm",
+            "pattern_keys": [
+              "rm",
+              "rm -rf"
+            ],
+            "approval_id": "apr_demo_0001",
+            "validation_target": "terminal",
+            "expires_at_ms": 1756973100000,
+            "state": "cancelled",
+            "state_reason": "delivery_failed"
+          }
+        },
+        "approval.cancelled.session_reset": {
+          "type": "approval",
+          "turn_id": "turn_demo_0001",
+          "seq": 17,
+          "fanout_seq": 17,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "command": "rm -rf /sandbox/demo/tmp",
+            "description": "清理临时目录",
+            "pattern_key": "rm",
+            "pattern_keys": [
+              "rm",
+              "rm -rf"
+            ],
+            "approval_id": "apr_demo_0001",
+            "validation_target": "terminal",
+            "expires_at_ms": 1756973100000,
+            "state": "cancelled",
+            "state_reason": "session_reset"
+          }
+        },
+        "approval.cancelled.turn_interrupted": {
+          "type": "approval",
+          "turn_id": "turn_demo_0001",
+          "seq": 17,
+          "fanout_seq": 17,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "command": "rm -rf /sandbox/demo/tmp",
+            "description": "清理临时目录",
+            "pattern_key": "rm",
+            "pattern_keys": [
+              "rm",
+              "rm -rf"
+            ],
+            "approval_id": "apr_demo_0001",
+            "validation_target": "terminal",
+            "expires_at_ms": 1756973100000,
+            "state": "cancelled",
+            "state_reason": "turn_interrupted"
+          }
+        },
+        "approval.expired.timeout": {
+          "type": "approval",
+          "turn_id": "turn_demo_0001",
+          "seq": 17,
+          "fanout_seq": 17,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "command": "rm -rf /sandbox/demo/tmp",
+            "description": "清理临时目录",
+            "pattern_key": "rm",
+            "pattern_keys": [
+              "rm",
+              "rm -rf"
+            ],
+            "approval_id": "apr_demo_0001",
+            "validation_target": "terminal",
+            "expires_at_ms": 1756973100000,
+            "state": "expired",
+            "state_reason": "timeout"
+          }
+        },
         "approval": {
           "type": "approval",
           "turn_id": "turn_demo_0001",
@@ -58,7 +146,53 @@
             ],
             "approval_id": "apr_demo_0001",
             "validation_target": "terminal",
-            "expires_at_ms": 1756973100000
+            "expires_at_ms": 1756973100000,
+            "state": "",
+            "state_reason": ""
+          }
+        },
+        "approval.runtime_lost.gateway_restart": {
+          "type": "approval",
+          "turn_id": "turn_demo_0001",
+          "seq": 17,
+          "fanout_seq": 17,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "command": "rm -rf /sandbox/demo/tmp",
+            "description": "清理临时目录",
+            "pattern_key": "rm",
+            "pattern_keys": [
+              "rm",
+              "rm -rf"
+            ],
+            "approval_id": "apr_demo_0001",
+            "validation_target": "terminal",
+            "expires_at_ms": 1756973100000,
+            "state": "runtime_lost",
+            "state_reason": "gateway_restart"
+          }
+        },
+        "approval.runtime_lost.request_unknown": {
+          "type": "approval",
+          "turn_id": "turn_demo_0001",
+          "seq": 17,
+          "fanout_seq": 17,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "command": "rm -rf /sandbox/demo/tmp",
+            "description": "清理临时目录",
+            "pattern_key": "rm",
+            "pattern_keys": [
+              "rm",
+              "rm -rf"
+            ],
+            "approval_id": "apr_demo_0001",
+            "validation_target": "terminal",
+            "expires_at_ms": 1756973100000,
+            "state": "runtime_lost",
+            "state_reason": "request_unknown"
           }
         },
         "attachment.action.ack": {
@@ -172,6 +306,82 @@
             "turn_id": "turn_demo_0001"
           }
         },
+        "clarify.cancelled.delivery_failed": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "周末指哪两天？",
+            "choices_offered": [
+              "上周末",
+              "本周末"
+            ],
+            "expires_at_ms": 1756973100000,
+            "state": "cancelled",
+            "state_reason": "delivery_failed"
+          }
+        },
+        "clarify.cancelled.session_reset": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "周末指哪两天？",
+            "choices_offered": [
+              "上周末",
+              "本周末"
+            ],
+            "expires_at_ms": 1756973100000,
+            "state": "cancelled",
+            "state_reason": "session_reset"
+          }
+        },
+        "clarify.cancelled.turn_interrupted": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "周末指哪两天？",
+            "choices_offered": [
+              "上周末",
+              "本周末"
+            ],
+            "expires_at_ms": 1756973100000,
+            "state": "cancelled",
+            "state_reason": "turn_interrupted"
+          }
+        },
+        "clarify.expired.timeout": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "周末指哪两天？",
+            "choices_offered": [
+              "上周末",
+              "本周末"
+            ],
+            "expires_at_ms": 1756973100000,
+            "state": "expired",
+            "state_reason": "timeout"
+          }
+        },
         "clarify": {
           "type": "clarify",
           "turn_id": "turn_demo_0001",
@@ -186,7 +396,47 @@
               "上周末",
               "本周末"
             ],
-            "expires_at_ms": 1756973100000
+            "expires_at_ms": 1756973100000,
+            "state": "",
+            "state_reason": ""
+          }
+        },
+        "clarify.runtime_lost.gateway_restart": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "周末指哪两天？",
+            "choices_offered": [
+              "上周末",
+              "本周末"
+            ],
+            "expires_at_ms": 1756973100000,
+            "state": "runtime_lost",
+            "state_reason": "gateway_restart"
+          }
+        },
+        "clarify.runtime_lost.request_unknown": {
+          "type": "clarify",
+          "turn_id": "turn_demo_0001",
+          "seq": 18,
+          "fanout_seq": 18,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "clarify_id": "clr_demo_0001",
+            "question": "周末指哪两天？",
+            "choices_offered": [
+              "上周末",
+              "本周末"
+            ],
+            "expires_at_ms": 1756973100000,
+            "state": "runtime_lost",
+            "state_reason": "request_unknown"
           }
         },
         "context.compaction": {
@@ -278,7 +528,30 @@
             "provider_error_code": "insufficient_quota",
             "provider_message": "quota exceeded",
             "session_id": "sess_demo_0001",
-            "active_turn_id": "turn_demo_0001"
+            "active_turn_id": "turn_demo_0001",
+            "will_retry": false
+          }
+        },
+        "error.will_retry": {
+          "type": "error",
+          "turn_id": "turn_demo_0001",
+          "seq": 10,
+          "fanout_seq": 10,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "code": "stream_read",
+            "message": "积分不足",
+            "recoverable": true,
+            "reason": "credits",
+            "provider": "demo-provider",
+            "model": "demo-model",
+            "status_code": 402,
+            "provider_error_code": "insufficient_quota",
+            "provider_message": "quota exceeded",
+            "session_id": "sess_demo_0001",
+            "active_turn_id": "turn_demo_0001",
+            "will_retry": true
           }
         },
         "goal.status": {
@@ -568,7 +841,34 @@
                 "session_id": "sess_demo_0001",
                 "session_title": "周末公园 vlog"
               }
-            ]
+            ],
+            "truncated": false
+          }
+        },
+        "turn.end.truncated": {
+          "type": "turn.end",
+          "turn_id": "turn_demo_0001",
+          "seq": 11,
+          "fanout_seq": 11,
+          "ts": 1756972800000,
+          "backend": "hermes",
+          "data": {
+            "reason": "length",
+            "final_text": "已完成 vlog 剪辑。",
+            "final_text_source": "hermes_canonical",
+            "session_id": "sess_demo_0001",
+            "produced_files": [
+              {
+                "path": "/sandbox/demo/agent_output/sess_demo_0001/vlog.mp4",
+                "name": "vlog.mp4",
+                "size": 10485760,
+                "mtime": 1756972800000,
+                "mime": "video/mp4",
+                "session_id": "sess_demo_0001",
+                "session_title": "周末公园 vlog"
+              }
+            ],
+            "truncated": true
           }
         },
         "turn.progress": {
@@ -941,6 +1241,82 @@
           "provider_message": "max tokens reached",
           "recoverable": false
         },
+        "hermes.approval.cancelled.delivery_failed": {
+          "type": "hermes.approval",
+          "turn_id": "turn_demo_0001",
+          "approval_id": "apr_demo_0001",
+          "interaction_id": "ia_demo_0001",
+          "interaction_generation": 1,
+          "interaction_delivery_version": 1,
+          "command": "rm -rf /sandbox/demo/tmp",
+          "description": "清理临时目录",
+          "pattern_key": "rm",
+          "pattern_keys": [
+            "rm",
+            "rm -rf"
+          ],
+          "expires_at_ms": 1756973100000,
+          "validation_target": "terminal",
+          "state": "cancelled",
+          "state_reason": "delivery_failed"
+        },
+        "hermes.approval.cancelled.session_reset": {
+          "type": "hermes.approval",
+          "turn_id": "turn_demo_0001",
+          "approval_id": "apr_demo_0001",
+          "interaction_id": "ia_demo_0001",
+          "interaction_generation": 1,
+          "interaction_delivery_version": 1,
+          "command": "rm -rf /sandbox/demo/tmp",
+          "description": "清理临时目录",
+          "pattern_key": "rm",
+          "pattern_keys": [
+            "rm",
+            "rm -rf"
+          ],
+          "expires_at_ms": 1756973100000,
+          "validation_target": "terminal",
+          "state": "cancelled",
+          "state_reason": "session_reset"
+        },
+        "hermes.approval.cancelled.turn_interrupted": {
+          "type": "hermes.approval",
+          "turn_id": "turn_demo_0001",
+          "approval_id": "apr_demo_0001",
+          "interaction_id": "ia_demo_0001",
+          "interaction_generation": 1,
+          "interaction_delivery_version": 1,
+          "command": "rm -rf /sandbox/demo/tmp",
+          "description": "清理临时目录",
+          "pattern_key": "rm",
+          "pattern_keys": [
+            "rm",
+            "rm -rf"
+          ],
+          "expires_at_ms": 1756973100000,
+          "validation_target": "terminal",
+          "state": "cancelled",
+          "state_reason": "turn_interrupted"
+        },
+        "hermes.approval.expired.timeout": {
+          "type": "hermes.approval",
+          "turn_id": "turn_demo_0001",
+          "approval_id": "apr_demo_0001",
+          "interaction_id": "ia_demo_0001",
+          "interaction_generation": 1,
+          "interaction_delivery_version": 1,
+          "command": "rm -rf /sandbox/demo/tmp",
+          "description": "清理临时目录",
+          "pattern_key": "rm",
+          "pattern_keys": [
+            "rm",
+            "rm -rf"
+          ],
+          "expires_at_ms": 1756973100000,
+          "validation_target": "terminal",
+          "state": "expired",
+          "state_reason": "timeout"
+        },
         "hermes.approval": {
           "type": "hermes.approval",
           "turn_id": "turn_demo_0001",
@@ -976,6 +1352,70 @@
               ]
             }
           }
+        },
+        "hermes.clarify.cancelled.delivery_failed": {
+          "type": "hermes.clarify",
+          "clarify_id": "ia_demo_0002",
+          "interaction_id": "ia_demo_0002",
+          "interaction_generation": 2,
+          "interaction_delivery_version": 1,
+          "question": "周末指哪两天？",
+          "choices_offered": [
+            "上周末",
+            "本周末"
+          ],
+          "expires_at_ms": 1756973100000,
+          "turn_id": "turn_demo_0001",
+          "state": "cancelled",
+          "state_reason": "delivery_failed"
+        },
+        "hermes.clarify.cancelled.session_reset": {
+          "type": "hermes.clarify",
+          "clarify_id": "ia_demo_0002",
+          "interaction_id": "ia_demo_0002",
+          "interaction_generation": 2,
+          "interaction_delivery_version": 1,
+          "question": "周末指哪两天？",
+          "choices_offered": [
+            "上周末",
+            "本周末"
+          ],
+          "expires_at_ms": 1756973100000,
+          "turn_id": "turn_demo_0001",
+          "state": "cancelled",
+          "state_reason": "session_reset"
+        },
+        "hermes.clarify.cancelled.turn_interrupted": {
+          "type": "hermes.clarify",
+          "clarify_id": "ia_demo_0002",
+          "interaction_id": "ia_demo_0002",
+          "interaction_generation": 2,
+          "interaction_delivery_version": 1,
+          "question": "周末指哪两天？",
+          "choices_offered": [
+            "上周末",
+            "本周末"
+          ],
+          "expires_at_ms": 1756973100000,
+          "turn_id": "turn_demo_0001",
+          "state": "cancelled",
+          "state_reason": "turn_interrupted"
+        },
+        "hermes.clarify.expired.timeout": {
+          "type": "hermes.clarify",
+          "clarify_id": "ia_demo_0002",
+          "interaction_id": "ia_demo_0002",
+          "interaction_generation": 2,
+          "interaction_delivery_version": 1,
+          "question": "周末指哪两天？",
+          "choices_offered": [
+            "上周末",
+            "本周末"
+          ],
+          "expires_at_ms": 1756973100000,
+          "turn_id": "turn_demo_0001",
+          "state": "expired",
+          "state_reason": "timeout"
         },
         "hermes.clarify": {
           "type": "hermes.clarify",
@@ -1289,6 +1729,14 @@
               "required": false,
               "type": "array"
             },
+            "state": {
+              "required": false,
+              "type": "string"
+            },
+            "state_reason": {
+              "required": false,
+              "type": "string"
+            },
             "validation_target": {
               "required": false,
               "type": "string"
@@ -1425,6 +1873,14 @@
             },
             "question": {
               "required": true,
+              "type": "string"
+            },
+            "state": {
+              "required": false,
+              "type": "string"
+            },
+            "state_reason": {
+              "required": false,
               "type": "string"
             }
           }
@@ -1599,6 +2055,10 @@
             "status_code": {
               "required": false,
               "type": "any"
+            },
+            "will_retry": {
+              "required": false,
+              "type": "boolean"
             }
           }
         },
@@ -1788,25 +2248,25 @@
         "search.result": {
           "struct": "model.SearchResultBlock",
           "fields": {
+            "items": {
+              "required": true,
+              "type": "array"
+            },
             "query": {
               "required": false,
+              "type": "string"
+            },
+            "status": {
+              "required": true,
               "type": "string"
             },
             "total_count": {
               "required": true,
               "type": "number"
             },
-            "status": {
-              "required": true,
-              "type": "string"
-            },
             "truncated": {
               "required": false,
               "type": "boolean"
-            },
-            "items": {
-              "required": true,
-              "type": "array"
             }
           }
         },
@@ -1958,6 +2418,10 @@
             "session_id": {
               "required": false,
               "type": "string"
+            },
+            "truncated": {
+              "required": false,
+              "type": "boolean"
             }
           }
         },
@@ -2187,6 +2651,34 @@
           "extra_kinds": [],
           "reason": ""
         }
+      },
+      "enums": {
+        "state": [
+          "expired",
+          "cancelled",
+          "runtime_lost"
+        ],
+        "state_reason": [
+          "timeout",
+          "turn_interrupted",
+          "session_reset",
+          "delivery_failed",
+          "request_unknown",
+          "gateway_restart"
+        ],
+        "sentinel_reason": [
+          "timeout",
+          "turn_interrupted",
+          "session_reset",
+          "delivery_failed",
+          "request_unknown",
+          "gateway_restart",
+          "caller_inactive"
+        ],
+        "reason": "B1 lifecycle states are the closed vocabulary consumed by all four layer manifests."
+      },
+      "provider_error_code_map": {
+        "insufficient_quota": "user_credits_insufficient"
       },
       "ts": {
         "web": {
