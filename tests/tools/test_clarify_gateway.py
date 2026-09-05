@@ -237,13 +237,12 @@ class TestClarifyTimeoutResolution:
         assert cm.resolve_clarify_timeout({"agent": {"clarify_timeout": 900}}) == 900
 
 
-    def test_non_positive_preserved_as_unlimited_sentinel(self):
-        """<= 0 is passed through verbatim — the waiting loops read it as
-        'unlimited', so the resolver must not clamp it to a positive default."""
+    def test_non_positive_normalized_to_default(self):
+        """Configured non-positive values use the concrete B1 deadline."""
         from tools import clarify_gateway as cm
 
-        assert cm.resolve_clarify_timeout({"agent": {"clarify_timeout": 0}}) == 0
-        assert cm.resolve_clarify_timeout({"clarify": {"timeout": -1}}) == -1
+        assert cm.resolve_clarify_timeout({"agent": {"clarify_timeout": 0}}) == 300
+        assert cm.resolve_clarify_timeout({"clarify": {"timeout": -1}}) == 300
 
 
 class TestUnlimitedWait:
