@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import quote, urlencode
@@ -20,13 +21,22 @@ from tools.registry import registry
 
 
 _ACTIONS = frozenset({
-    "status", "checkout", "list", "read", "apply_patch", "build", "publish",
-    "discard", "maintainer_schedule_status", "maintenance_tasks",
+    "status", "checkout", "list", "read", "apply_patch", "build", "build_status",
+    "publish", "discard", "maintainer_schedule_status", "maintenance_tasks",
     "create_maintenance_task", "update_maintenance_task",
     "delete_maintenance_task", "maintenance_task_runs",
     "maintenance_task_events",
 })
 _MAX_RESPONSE_BYTES = 1024 * 1024
+# The rebuild is a background job on App Host (it queues behind other builds
+# on a device whose memory fits one). ``build`` starts it and then polls for a
+# bounded while so a fast build still answers in one call; a slower one is
+# handed back as queued/building with a ``next`` that says to poll
+# ``build_status`` — never to start another build.
+_BUILD_POLL_INTERVAL_SECONDS = 5.0
+_BUILD_WAIT_BUDGET_SECONDS = 90.0
+_BUILD_TERMINAL_STATES = frozenset({"succeeded", "failed", "interrupted"})
+_BUILD_RETRY_KINDS = frozenset({"device_busy", "out_of_memory", "timeout", "cache_invalid"})
 # App Host accepts an 8 MiB patch, but a subsequent read serializes its
 # ``[]byte`` content as base64 while this adapter intentionally caps every
 # response at 1 MiB.  Keep a 10 KiB wire-envelope margin (path + JSON) below
@@ -41,10 +51,17 @@ APP_WORKSPACE_SCHEMA = {
     "description": (
         "Edit the current version of an app only through App Host's dedicated "
         "maintainer workspace. This is a fixed checkout/list/read/replace/build/"
-        "publish/discard surface, not a terminal, general filesystem, URL, or "
-        "environment interface. Start with status, use its app_instance_id and "
-        "revision as the required compare-and-swap values, and read a file "
-        "before replacing it with apply_patch. After checkout, use list to see "
+        "build_status/publish/discard surface, not a terminal, general filesystem, "
+        "URL, or environment interface. Start with status, use its app_instance_id "
+        "and revision as the required compare-and-swap values, and read a file "
+        "before replacing it with apply_patch. build starts a background rebuild "
+        "and waits a short while: state succeeded means go on to publish; state "
+        "queued/building/waiting_memory/retry_wait means the device is busy — tell "
+        "the user where it stands (queue_position / detail), then poll build_status "
+        "until it is terminal; never call build again while one is running. "
+        "publish requires the latest build to have succeeded on the current "
+        "content (error codes build_required / build_stale: build again). "
+        "After checkout, use list to see "
         "which files exist and read only paths it returned — never guess a "
         "pathname. A generated app keeps its page source at static/index.html, "
         "its server code in main.go and any schema in migrations/, but list is "
@@ -89,6 +106,10 @@ APP_WORKSPACE_SCHEMA = {
                 "type": "integer",
                 "minimum": 0,
                 "description": "For publish only: app workspace revision returned by status, preventing a stale checkout from publishing.",
+            },
+            "build_id": {
+                "type": "string",
+                "description": "For build_status only (optional): the build_id returned by build; omitted means this workspace's current build.",
             },
             "note": {
                 "type": "string",
@@ -255,11 +276,18 @@ def _build_request(args: dict):
             "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(), "capability_digest": digest,
             "instruction": str(args["instruction"]).strip(), "enabled": args["enabled"],
         }, _apphost._DEFAULT_TIMEOUT
+    if action == "build_status":
+        _only(args, base_fields | {"build_id"})
+        build_id = str(args.get("build_id", "") or "").strip()
+        if build_id and (len(build_id) > 64 or "/" in build_id or "\\" in build_id):
+            raise _apphost._BadRequest("build_id 必须是 build 返回的 build_id")
+        suffix = f"/{quote(build_id, safe='')}" if build_id else ""
+        return "GET", f"{root}/build{suffix}?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
     if action in {"checkout", "build", "discard"}:
         _only(args, base_fields)
         method = "DELETE" if action == "discard" else "POST"
         path = root if action == "discard" else f"{root}/{action}"
-        return method, path, {"expected_instance_id": instance}, _apphost._LONG_TIMEOUT if action == "build" else _apphost._DEFAULT_TIMEOUT
+        return method, path, {"expected_instance_id": instance}, _apphost._DEFAULT_TIMEOUT
     if action == "list":
         _only(args, base_fields)
         return "POST", root + "/list", {"expected_instance_id": instance}, _apphost._DEFAULT_TIMEOUT
@@ -364,6 +392,167 @@ def _maintenance_task_response(parsed, *, action: str):
     return parsed
 
 
+class _WireFailure(Exception):
+    """A request that did not produce a usable 2xx JSON body; ``envelope`` is
+    the tool's failure envelope for it."""
+
+    def __init__(self, envelope: str):
+        super().__init__(envelope)
+        self.envelope = envelope
+
+
+def _send(base: str, token: str, method: str, path: str, body, timeout, *, action: str):
+    """One App Workspace request. Returns (status, content_type, raw) or raises
+    _WireFailure carrying the finished failure envelope."""
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    headers = {_apphost._ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
+    headers.update(_apphost._execution_headers())
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with _apphost._urlopen(request, timeout=timeout) as response:
+            return response.status, (response.headers.get("Content-Type") or "").lower(), response.read(_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(_MAX_RESPONSE_BYTES + 1) or b""
+        upstream = _apphost._parse_upstream_error(raw)
+        if upstream is not None:
+            raise _WireFailure(_apphost._fail(upstream, status=exc.code))
+        if exc.code == 404:
+            if action == "list":
+                raise _WireFailure(_apphost._local_error(
+                    "list_unsupported",
+                    "这台设备的 App Host 版本还没有列文件能力。**只有列文件这一个动作缺失**，"
+                    "status / read / apply_patch / build / publish 全都照常可用，工作区也已经检出，"
+                    "不要据此判断应用不存在、源码找不到或维护无法继续。"
+                    "改用逐个 read 探路：若这是本 skill 生成的应用，先试 static/index.html（页面）、"
+                    "main.go（后端）、migrations/ 下的 .sql（建表）——这几条只是生成应用的**候选**，"
+                    "blueprint 应用或用户自己调整过目录结构时它们可能都不在。任何一个路径 read 不到，"
+                    "只说明这个文件不存在，换一个继续试；这种情况下允许按应用类型推测路径，"
+                    "「先 list 再 read」那条要求不适用于这台设备。",
+                    status=exc.code,
+                ))
+            if action == "build_status":
+                raise _WireFailure(_apphost._local_error(
+                    "build_status_unsupported",
+                    "这台设备的 App Host 还没有后台构建状态路由：它的 build 是同步完成的，"
+                    "build 返回 ok 即已编译完成，直接 publish；不要再查 build_status。",
+                    status=exc.code,
+                ))
+            raise _WireFailure(_apphost._local_error(
+                "unsupported",
+                "设备端 App Host 尚不支持 App Workspace；没有安全的兼容路径",
+                status=exc.code,
+            ))
+        raise _WireFailure(_apphost._local_error("transport_error", f"App Workspace 请求失败（HTTP {exc.code}），未返回可解析的错误体", status=exc.code))
+    except _WireFailure:
+        raise
+    except Exception:
+        raise _WireFailure(_apphost._local_error("transport_error", "无法连接 App Workspace 服务", status=None))
+
+
+def _decode_json(status, content_type, raw, *, accept=(200,)):
+    """Return the parsed body of a JSON 2xx, or the failure envelope string."""
+    if len(raw) > _MAX_RESPONSE_BYTES:
+        return None, _apphost._local_error("transport_error", "App Workspace 返回内容过大", status=status)
+    if status not in accept or "json" not in content_type:
+        return None, _apphost._local_error("outcome_unknown", "App Workspace 返回了非合同完成状态", status=status)
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, _apphost._local_error("outcome_unknown", "App Workspace 返回了无效 JSON", status=status)
+
+
+def _build_next(state: dict) -> str:
+    """The one line that tells the maintainer what to do with a build state."""
+    st = str(state.get("state") or "")
+    detail = str(state.get("detail") or "")
+    if st == "succeeded":
+        return "构建成功；接着 publish（带 status 返回的 expected_revision）。"
+    if st in {"failed", "interrupted"}:
+        kind = str(state.get("failure_kind") or "")
+        if kind == "compile_failed":
+            return "编译失败：按 log 里的报错改源码（read → apply_patch），再 build。"
+        if kind in _BUILD_RETRY_KINDS:
+            return "设备侧失败（不是代码问题），平台已自动重试过；如实告诉用户设备忙/内存紧张，稍后再 build 一次。"
+        if kind == "interrupted":
+            return "构建被中断（服务重启或工作区被丢弃）；重新 build 一次。"
+        return "构建失败，见 message；不是代码问题时如实告诉用户。"
+    ahead = state.get("queue_position")
+    where = f"排队中（前面还有 {ahead} 个构建）" if st == "queued" and isinstance(ahead, int) and ahead > 0 else (detail or f"构建进行中（{st}）")
+    return (
+        f"{where}。构建在后台继续，不要重复 build：先把这个进度告诉用户，"
+        "稍后调 action=build_status（同一个 slug / expected_instance_id）查看，"
+        "等 state=succeeded 再 publish。"
+    )
+
+
+def _finish_build(parsed, status):
+    """Shape the build/build_status answer: the server's state plus ``next``."""
+    if not isinstance(parsed, dict):
+        return _apphost._local_error("outcome_unknown", "App Workspace 返回了不完整的构建状态", status=status)
+    if "state" not in parsed:
+        # An older App Host builds synchronously and answers with the
+        # workspace status: reaching here means the build already finished.
+        result = dict(parsed)
+        result["state"] = "succeeded"
+        result["next"] = _build_next(result)
+        return _apphost._ok(result)
+    result = dict(parsed)
+    result["next"] = _build_next(result)
+    return _apphost._ok(result)
+
+
+def _run_build(base, token, slug, instance, *, method, path, body, timeout):
+    """Start the background rebuild, then poll it for a bounded while."""
+    try:
+        status, content_type, raw = _send(base, token, method, path, body, timeout, action="build")
+    except _WireFailure as exc:
+        return exc.envelope
+    parsed, envelope = _decode_json(status, content_type, raw, accept=(200, 202))
+    if envelope is not None:
+        return envelope
+    if not isinstance(parsed, dict) or "state" not in parsed or str(parsed.get("state")) in _BUILD_TERMINAL_STATES:
+        return _finish_build(parsed, status)
+    deadline = time.monotonic() + _BUILD_WAIT_BUDGET_SECONDS
+    status_path = f"/{quote(slug, safe='')}/workspace/build?" + urlencode({"expected_instance_id": instance})
+    latest = parsed
+    while time.monotonic() < deadline:
+        time.sleep(min(_BUILD_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+        try:
+            status, content_type, raw = _send(base, token, "GET", status_path, None, _apphost._DEFAULT_TIMEOUT, action="build_status")
+        except _WireFailure:
+            break  # keep the last state we saw; the maintainer polls build_status
+        polled, envelope = _decode_json(status, content_type, raw)
+        if envelope is not None or not isinstance(polled, dict):
+            break
+        latest = polled
+        if str(polled.get("state")) in _BUILD_TERMINAL_STATES:
+            break
+    return _finish_build(latest, 200)
+
+
+def _last_build_blocks_publish(base, token, slug, instance):
+    """Publish is refused here, before any request, when the workspace's last
+    build is known not to have succeeded; the server enforces the same."""
+    path = f"/{quote(slug, safe='')}/workspace/build?" + urlencode({"expected_instance_id": instance})
+    try:
+        status, content_type, raw = _send(base, token, "GET", path, None, _apphost._DEFAULT_TIMEOUT, action="build_status")
+    except _WireFailure:
+        return None  # an older server (or no build yet): let the server judge
+    parsed, envelope = _decode_json(status, content_type, raw)
+    if envelope is not None or not isinstance(parsed, dict) or "state" not in parsed:
+        return None
+    st = str(parsed.get("state"))
+    if st == "succeeded":
+        return None
+    result = dict(parsed)
+    result["next"] = _build_next(result)
+    if st in _BUILD_TERMINAL_STATES:
+        return _apphost._fail({"code": "build_required", "message": f"最近一次构建 {st}（{result.get('failure_kind') or ''}），不能发布。" + result["next"]}, status=_apphost._STATUS_NOT_SENT)
+    return _apphost._fail({"code": "build_in_progress", "message": "构建还在进行中，不能发布。" + result["next"]}, status=_apphost._STATUS_NOT_SENT)
+
+
 def app_workspace_tool(args, **_kw) -> str:
     args = args if isinstance(args, dict) else {}
     try:
@@ -376,6 +565,13 @@ def app_workspace_tool(args, **_kw) -> str:
     token = _apphost._secret("ZETTLAB_AGENT_ACTION_TOKEN")
     if not base or not token:
         return _apphost._local_error("unsupported", "当前 Agent 未配置 App Workspace", status=_apphost._STATUS_NOT_SENT)
+    if action == "build":
+        return _run_build(base, token, str(args.get("slug")), str(args.get("expected_instance_id") or "").strip(),
+                          method=method, path=path, body=body, timeout=timeout)
+    if action == "publish":
+        blocked = _last_build_blocks_publish(base, token, str(args.get("slug")), str(args.get("expected_instance_id") or "").strip())
+        if blocked is not None:
+            return blocked
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = {_apphost._ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
     headers.update(_apphost._execution_headers())
@@ -450,6 +646,8 @@ def app_workspace_tool(args, **_kw) -> str:
         if checked is None:
             return _apphost._local_error("outcome_unknown", "maintenance task 返回了不完整的回执", status=status)
         return _apphost._ok(checked)
+    if action == "build_status":
+        return _finish_build(parsed, status)
     return _apphost._ok(_normalize_read(parsed) if action == "read" else parsed)
 
 

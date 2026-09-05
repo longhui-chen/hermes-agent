@@ -64,10 +64,11 @@ def _args(action, **extra):
 def test_schema_is_fixed_workspace_surface_not_generic_host_access():
     props = APP_WORKSPACE_SCHEMA["parameters"]["properties"]
     assert set(props["action"]["enum"]) == {
-        "status", "checkout", "list", "read", "apply_patch", "build", "publish",
-        "discard", "maintainer_schedule_status", "maintenance_tasks",
+        "status", "checkout", "list", "read", "apply_patch", "build", "build_status",
+        "publish", "discard", "maintainer_schedule_status", "maintenance_tasks",
         "create_maintenance_task", "update_maintenance_task",
         "delete_maintenance_task", "maintenance_task_runs",
+        "maintenance_task_events",
     }
     assert not {"command", "url", "host", "env", "shell", "directory"} & set(props)
     assert "relative" in props["path"]["description"]
@@ -266,3 +267,123 @@ def test_maintainer_schedule_status_rejects_absent_or_incomplete_revision(monkey
             output = json.loads(app_workspace_tool(_args("maintainer_schedule_status")))
         assert output["ok"] is False
         assert output["error"]["code"] == "outcome_unknown"
+
+
+def _sequence(seen, responses):
+    """_urlopen stand-in that answers one queued response per request and
+    records every request it saw (in order)."""
+    queue = list(responses)
+
+    def open_request(request, timeout=None):
+        seen.setdefault("requests", []).append(request)
+        if not queue:
+            raise AssertionError("more requests than scripted responses")
+        response = queue.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+    return open_request
+
+
+def test_build_starts_the_background_job_and_polls_until_terminal(monkeypatch):
+    # The device queues the rebuild behind another build; the tool must not
+    # start a second one, must poll the status route, and must hand the
+    # maintainer the queue position while it waits.
+    monkeypatch.setattr("tools.app_workspace_tool._BUILD_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr("tools.app_workspace_tool._BUILD_WAIT_BUDGET_SECONDS", 30.0)
+    seen = {}
+    responses = [
+        _Response({"build_id": "wb-1", "state": "queued", "queue_position": 2, "detail": "排队等待设备空闲（前面还有 2 个构建）", "attempt": 1, "max_attempts": 4}, status=202),
+        _Response({"build_id": "wb-1", "state": "building", "detail": "正在编译", "attempt": 1, "max_attempts": 4}),
+        _Response({"build_id": "wb-1", "state": "succeeded", "detail": "构建完成，可以发布", "attempt": 1, "max_attempts": 4, "fingerprint": "f" * 64}),
+    ]
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, responses)):
+        output = json.loads(app_workspace_tool(_args("build")))
+    assert output["ok"] is True
+    assert output["data"]["state"] == "succeeded"
+    assert "publish" in output["data"]["next"]
+    methods = [(r.method, r.full_url) for r in seen["requests"]]
+    assert methods[0] == ("POST", f"{_BASE}/{_SLUG}/workspace/build")
+    assert methods[1:] == [("GET", f"{_BASE}/{_SLUG}/workspace/build?expected_instance_id={_INSTANCE}")] * 2
+    assert json.loads(seen["requests"][0].data) == {"expected_instance_id": _INSTANCE}
+
+
+def test_build_hands_back_a_running_job_with_a_next_that_forbids_rebuilding(monkeypatch):
+    monkeypatch.setattr("tools.app_workspace_tool._BUILD_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr("tools.app_workspace_tool._BUILD_WAIT_BUDGET_SECONDS", 0.0)
+    seen = {}
+    responses = [
+        _Response({"build_id": "wb-2", "state": "queued", "queue_position": 3, "detail": "排队等待设备空闲（前面还有 3 个构建）", "attempt": 1, "max_attempts": 4}, status=202),
+    ]
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, responses)):
+        output = json.loads(app_workspace_tool(_args("build")))
+    assert output["ok"] is True
+    assert output["data"]["state"] == "queued"
+    assert output["data"]["queue_position"] == 3
+    assert "前面还有 3 个构建" in output["data"]["next"]
+    assert "build_status" in output["data"]["next"]
+    assert "不要重复 build" in output["data"]["next"]
+    assert len(seen["requests"]) == 1
+
+
+def test_build_on_an_older_synchronous_server_is_treated_as_finished(monkeypatch):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [_Response({"revision": 4})])):
+        output = json.loads(app_workspace_tool(_args("build")))
+    assert output["ok"] is True
+    assert output["data"]["state"] == "succeeded"
+    assert output["data"]["revision"] == 4
+    assert len(seen["requests"]) == 1
+
+
+def test_build_status_route_and_failure_next(monkeypatch):
+    seen = {}
+    failed = {"build_id": "wb-3", "state": "failed", "failure_kind": "compile_failed", "message": "编译失败，见 log", "log": "main.go:3:1: undefined: err", "attempt": 1, "max_attempts": 4}
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [_Response(failed)])):
+        output = json.loads(app_workspace_tool(_args("build_status", build_id="wb-3")))
+    assert output["ok"] is True
+    assert output["data"]["state"] == "failed"
+    assert "apply_patch" in output["data"]["next"]
+    request = seen["requests"][0]
+    assert request.method == "GET"
+    assert request.full_url == f"{_BASE}/{_SLUG}/workspace/build/wb-3?expected_instance_id={_INSTANCE}"
+
+    # Without an id the current build is asked for.
+    seen = {}
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [_Response(dict(failed, state="retry_wait", failure_kind="device_busy", detail="设备忙；1 分钟 后自动重试（第 2/4 次）"))])):
+        output = json.loads(app_workspace_tool(_args("build_status")))
+    assert output["ok"] is True
+    assert seen["requests"][0].full_url == f"{_BASE}/{_SLUG}/workspace/build?expected_instance_id={_INSTANCE}"
+    assert "build_status" in output["data"]["next"]
+
+
+def test_publish_is_refused_locally_while_the_last_build_is_not_succeeded(monkeypatch):
+    seen = {}
+    running = {"build_id": "wb-4", "state": "building", "detail": "正在编译", "attempt": 1, "max_attempts": 4}
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [_Response(running)])):
+        output = json.loads(app_workspace_tool(_args("publish", expected_revision=4, note="Fix title")))
+    assert output["ok"] is False
+    assert output["error"]["code"] == "build_in_progress"
+    assert output["status"] == 0
+    assert [r.method for r in seen["requests"]] == ["GET"], "publish must not have been sent"
+
+    seen = {}
+    failed = dict(running, state="failed", failure_kind="compile_failed", log="x.go:1:1: syntax error")
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [_Response(failed)])):
+        output = json.loads(app_workspace_tool(_args("publish", expected_revision=4, note="Fix title")))
+    assert output["ok"] is False
+    assert output["error"]["code"] == "build_required"
+
+    # A succeeded build lets publish through; an older server without the
+    # status route (bodyless 404) is left to judge for itself.
+    seen = {}
+    ok = dict(running, state="succeeded")
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [_Response(ok), _Response({"version_id": "v2"})])):
+        output = json.loads(app_workspace_tool(_args("publish", expected_revision=4, note="Fix title")))
+    assert output["ok"] is True and output["data"]["version_id"] == "v2"
+    assert [r.method for r in seen["requests"]] == ["GET", "POST"]
+    seen = {}
+    missing = urllib.error.HTTPError(f"{_BASE}/x", 404, "Not Found", {}, io.BytesIO(b""))
+    with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [missing, _Response({"version_id": "v3"})])):
+        output = json.loads(app_workspace_tool(_args("publish", expected_revision=4, note="Fix title")))
+    assert output["ok"] is True and output["data"]["version_id"] == "v3"
