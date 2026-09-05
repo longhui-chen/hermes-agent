@@ -2267,6 +2267,31 @@ def test_interaction_interrupt_releases_source_and_mirror_accounting(monkeypatch
         assert adapter._pending_mirror_bytes == 0
 
 
+def test_interrupt_without_turn_id_does_not_scan_other_session_approvals():
+    """A missing active turn must still be scoped to the requested session."""
+    adapter = _adapter()
+    session_one = adapter._interaction_queue_key("session-1")
+    session_two = adapter._interaction_queue_key("session-2")
+    stream_one = queue.Queue()
+    stream_two = queue.Queue()
+    adapter._approval_stream_queues = {
+        session_one: stream_one,
+        session_two: stream_two,
+    }
+    adapter._pending_approval = {
+        session_one: [{"interaction_id": "approval-1", "turn_id": ""}],
+        session_two: [{"interaction_id": "approval-2", "turn_id": ""}],
+    }
+
+    adapter._interrupt_pending_interactions("session-1", session_one)
+
+    terminal = stream_one.get_nowait()[1]
+    assert terminal["interaction_id"] == "approval-1"
+    assert terminal["state"] == "cancelled"
+    assert stream_two.empty()
+    assert session_two in adapter._pending_approval
+
+
 def test_pending_mirror_ttl_prunes_stale_source_drop_fallback(monkeypatch):
     monkeypatch.setattr(
         zet_agent_module, "INTERACTION_PENDING_MIRROR_TTL", 0

@@ -3932,12 +3932,25 @@ class ZetAgentAdapter(APIServerAdapter):
             queue_key, "clarify", entry.interaction_id
         )
 
-    def emit_terminal_interactions(self, turn_id: str, *, reason: str = "turn_interrupted", entries: Optional[List[_ClarifyEntry]] = None) -> int:
+    def emit_terminal_interactions(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "turn_interrupted",
+        entries: Optional[List[_ClarifyEntry]] = None,
+        queue_key: Optional[str] = None,
+    ) -> int:
         """Emit each pending clarify/approval terminal frame at most once."""
         candidates = entries
         if candidates is None:
             with self._clarify_state_lock:
-                candidates = [e for q in self._clarify_queues.values() for e in q if not turn_id or e.turn_id == turn_id]
+                candidates = [
+                    e
+                    for key, q in self._clarify_queues.items()
+                    if queue_key is None or key == queue_key
+                    for e in q
+                    if not turn_id or e.turn_id == turn_id
+                ]
         emitted = 0
         for entry in candidates:
             with self._clarify_state_lock:
@@ -3962,7 +3975,11 @@ class ZetAgentAdapter(APIServerAdapter):
             for key, raw in getattr(self, "_pending_approval", {}).items():
                 items = [raw] if isinstance(raw, dict) else list(raw or [])
                 for item in items:
-                    if (not turn_id or str(item.get("turn_id") or "") == turn_id) and not item.get("terminal_emitted"):
+                    if (
+                        (queue_key is None or key == queue_key)
+                        and (not turn_id or str(item.get("turn_id") or "") == turn_id)
+                        and not item.get("terminal_emitted")
+                    ):
                         approval_candidates.append((key, item))
         for key, item in approval_candidates:
             payload = dict(item)
@@ -8435,6 +8452,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     self._active_turn_key(session_id), ""
                 ),
                 reason="turn_interrupted",
+                queue_key=queue_key,
             )
             with self._pending_lock:
                 getattr(self, "_approval_session_keys", {}).pop(
