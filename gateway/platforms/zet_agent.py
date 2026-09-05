@@ -488,11 +488,25 @@ ZET_RUNTIME_SHELL_PROMPT_INVALIDATE_TIMEOUT_SECONDS = 5.0
 # fresh sessions cannot monopolize the process before real turns arrive.
 ZET_RUNTIME_SHELL_PREWARM_MAX_TASKS = 2
 
-# How long the agent thread will block waiting for a user response to
-# a clarify prompt before giving up and returning an empty string. The
-# approval flow uses hermes' built-in timeout (``approval.gateway_timeout``,
-# default 300s) so we don't duplicate it here.
-CLARIFY_RESPONSE_TIMEOUT = 300.0
+# Clarify timeout is resolved from the profile's ``agent.clarify_timeout``.
+# Keep the fallback aligned with ``tools.clarify_gateway`` (300 seconds).
+def _clarify_timeout_seconds() -> float:
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+        value = float(get_clarify_timeout())
+        return value if value == value else 300.0
+    except Exception:
+        return 300.0
+
+
+def _clarify_sentinel(kind: str, request_id: str, state: str, reason: str, detail: str) -> str:
+    safe_id = request_id if len(request_id.encode("utf-8")) <= 64 else "id_too_long"
+    text = f"[{kind}:{safe_id} state={state} reason={reason}] {detail}"
+    if len(text.encode("utf-8")) > 160:
+        text = f"[{kind}:{safe_id} state={state} reason={reason}] clarify could not be delivered"
+    return text
+
+
 INTERACTION_PREPARE_TTL = 300.0
 INTERACTION_RECEIPT_TTL = 4 * 60 * 60.0
 INTERACTION_RECEIPT_CAP = 4096
@@ -792,6 +806,8 @@ class _ClarifyEntry:
         "prepared_delivery_id",
         "prepared_until",
         "deferred_wake_at",
+        "terminal_emitted",
+        "stream_q",
     )
 
     def __init__(
@@ -811,6 +827,8 @@ class _ClarifyEntry:
         self.prepared_delivery_id: Optional[str] = None
         self.prepared_until = 0.0
         self.deferred_wake_at = 0.0
+        self.terminal_emitted = False
+        self.stream_q = None
 
 
 def _stamp_extension_turn_id(payload):
@@ -3404,21 +3422,23 @@ class ZetAgentAdapter(APIServerAdapter):
         ).strip()
 
         def _ask(question: str, choices: Optional[List[str]]) -> str:
+            timeout_seconds = _clarify_timeout_seconds()
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
             # clock time we will actually give up at.
-            expires_at_ms = int((time.time() + CLARIFY_RESPONSE_TIMEOUT) * 1000)
+            expires_at_ms = int((time.time() + timeout_seconds) * 1000)
             from gateway.session_context import get_session_env
             caller_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
             if (
                 owner_agent is not None
                 and captured_turn_id
+                and caller_turn_id
                 and caller_turn_id != captured_turn_id
             ):
                 logger.warning(
                     "[zet_agent] clarify callback rejected stale turn owner"
                 )
-                return ""
+                return _clarify_sentinel("clarify", "unknown", "cancelled", "caller_inactive", "caller is not an active human turn")
             turn_id = captured_turn_id or caller_turn_id
             if turn_id:
                 owner_bound = self._remember_active_turn_id(
@@ -3428,7 +3448,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.warning(
                         "[zet_agent] clarify callback rejected inactive owner"
                     )
-                    return ""
+                    return _clarify_sentinel("clarify", "unknown", "cancelled", "caller_inactive", "caller is not an active human turn")
                 self._wait_for_recovery_fence(internal_key, turn_id)
             from tools.approval import reserve_gateway_interaction_generation
 
@@ -3452,6 +3472,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     payload,
                     interaction_generation,
                 )
+                entry.stream_q = stream_q
                 with self._clarify_state_lock:
                     self._clarify_queues.setdefault(internal_key, []).append(entry)
             if not self._pin_durable_session_source(
@@ -3460,13 +3481,13 @@ class ZetAgentAdapter(APIServerAdapter):
                 logger.warning(
                     "[zet_agent] durable clarify source capacity exhausted"
                 )
-                self._discard_clarify_entry(internal_key, entry)
-                return ""
+                self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             if not self._store_pending_interaction(
                 "clarify", internal_key, payload
             ):
-                self._discard_clarify_entry(internal_key, entry)
-                return ""
+                self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             if turn_id:
                 reserved, push_error = self._publish_interaction_event(
                     stream_q,
@@ -3476,8 +3497,8 @@ class ZetAgentAdapter(APIServerAdapter):
                     interaction_generation,
                 )
                 if not reserved:
-                    self._discard_clarify_entry(internal_key, entry)
-                    return ""
+                    self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                    return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
                 if push_error is not None:
                     logger.debug(
                         "[zet_agent] clarify push failed",
@@ -3487,15 +3508,15 @@ class ZetAgentAdapter(APIServerAdapter):
                             push_error.__traceback__,
                         ),
                     )
-                    self._discard_clarify_entry(internal_key, entry)
-                    return ""
+                    self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                    return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             else:
                 try:
                     _put_progress(stream_q, payload)
                 except Exception:
                     logger.debug("[zet_agent] clarify push failed", exc_info=True)
-                    self._discard_clarify_entry(internal_key, entry)
-                    return ""
+                    self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
+                    return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
             # Goal projection: clarify blocks the turn on user input — mirror
             # the approval hook (waiting banner; no GoalManager mutation).
             try:
@@ -3505,11 +3526,11 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
-            wait_deadline = time.monotonic() + CLARIFY_RESPONSE_TIMEOUT
+            wait_deadline = None if timeout_seconds <= 0 else time.monotonic() + timeout_seconds
             resolved = False
             while True:
-                remaining = wait_deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = 1.0 if wait_deadline is None else wait_deadline - time.monotonic()
+                if wait_deadline is not None and remaining <= 0:
                     break
                 if entry.event.wait(timeout=min(1.0, remaining)):
                     resolved = True
@@ -3524,11 +3545,14 @@ class ZetAgentAdapter(APIServerAdapter):
             if not resolved:
                 logger.warning(
                     "[zet_agent] clarify timeout after %ss session=%s",
-                    CLARIFY_RESPONSE_TIMEOUT, session_id,
+                    timeout_seconds, session_id,
                 )
-                self._discard_clarify_entry(internal_key, entry)
-                return ""
-            return entry.response or ""
+                self._discard_clarify_entry(internal_key, entry, reason="timeout")
+                return _clarify_sentinel("clarify", entry.interaction_id, "expired", "timeout", f"user did not respond within {int(timeout_seconds)}s")
+            response = entry.response
+            if response:
+                return response
+            return _clarify_sentinel("clarify", entry.interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
 
         return _ask
 
@@ -3788,10 +3812,11 @@ class ZetAgentAdapter(APIServerAdapter):
 
         return _emit
 
-    def _discard_clarify_entry(self, queue_key: str, entry: _ClarifyEntry) -> None:
+    def _discard_clarify_entry(self, queue_key: str, entry: _ClarifyEntry, *, reason: str = "delivery_failed") -> None:
         """Remove an unresolved entry (push failure or timeout). The
         respond handler removes via popleft on success; this path
         handles error rollback so the queue doesn't accumulate."""
+        self.emit_terminal_interactions(entry.turn_id, reason=reason, entries=[entry])
         with self._clarify_state_lock:
             queue = self._clarify_queues.get(queue_key)
             if queue and entry in queue:
@@ -3804,6 +3829,30 @@ class ZetAgentAdapter(APIServerAdapter):
         self._release_durable_session_source(
             queue_key, "clarify", entry.interaction_id
         )
+
+    def emit_terminal_interactions(self, turn_id: str, *, reason: str = "turn_interrupted", entries: Optional[List[_ClarifyEntry]] = None) -> int:
+        """Emit each pending clarify terminal frame at most once."""
+        candidates = entries
+        if candidates is None:
+            with self._clarify_state_lock:
+                candidates = [e for q in self._clarify_queues.values() for e in q if not turn_id or e.turn_id == turn_id]
+        emitted = 0
+        for entry in candidates:
+            with self._clarify_state_lock:
+                if entry.terminal_emitted:
+                    continue
+                entry.terminal_emitted = True
+            state = "expired" if reason == "timeout" else "cancelled"
+            payload = dict(entry.payload)
+            payload["state"] = state
+            payload["state_reason"] = reason
+            try:
+                if entry.stream_q is not None:
+                    _put_progress(entry.stream_q, payload)
+                    emitted += 1
+            except Exception:
+                logger.debug("[zet_agent] clarify terminal push failed", exc_info=True)
+        return emitted
 
     def _remember_active_turn_id(
         self,
@@ -6933,6 +6982,11 @@ class ZetAgentAdapter(APIServerAdapter):
             choice,
             approval_id=approval_id,
         )
+        if resolved == 0 and approval_id is not None:
+            return web.json_response(
+                _openai_error("Unknown approval request", code="request_unknown"),
+                status=404,
+            )
         if resolved:
             if legacy_interaction_id:
                 self._remove_pending_interaction(
@@ -7248,6 +7302,11 @@ class ZetAgentAdapter(APIServerAdapter):
             if queue is not None and not queue:
                 self._clarify_queues.pop(queue_key, None)
         if entry is None:
+            if clarify_id:
+                return web.json_response(
+                    _openai_error("Unknown clarify request", code="request_unknown"),
+                    status=404,
+                )
             return web.json_response(
                 _openai_error(
                     f"No clarify pending for session {session_id}",

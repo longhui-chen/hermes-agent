@@ -55,6 +55,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    terminal_emitted: bool = False
 
     def signature(self) -> Dict[str, object]:
         return {
@@ -368,11 +369,7 @@ def clear_session(session_key: str) -> int:
     for entry in entries:
         if entry is None:
             continue
-        # Empty string sentinel — agent code can distinguish from a real
-        # response by inspecting the wait_for_response return value
-        # alongside its own timeout deadline.  Most callers just treat any
-        # falsy result as "user did not respond".
-        entry.response = ""
+        entry.response = f"[clarify:{entry.clarify_id} state=cancelled reason=session_reset] clarify could not be delivered"
         entry.event.set()
         cancelled += 1
     return cancelled
@@ -390,25 +387,25 @@ def resolve_clarify_timeout(config: dict) -> int:
 
     1. legacy top-level ``clarify.timeout`` if a user explicitly set it,
     2. else the canonical ``agent.clarify_timeout``,
-    3. else 3600 (1 hour).
+    3. else 300 seconds.
 
     ``<= 0`` is preserved verbatim and means *unlimited* to callers (never
     auto-skip while the user is still deciding); the waiting loops translate
-    that into a null deadline.  A non-numeric value falls back to 3600.
+    that into a null deadline.  A non-numeric value falls back to 300.
     """
     raw = (config.get("clarify") or {}).get("timeout")
     if raw is None:
-        raw = (config.get("agent") or {}).get("clarify_timeout", 3600)
+        raw = (config.get("agent") or {}).get("clarify_timeout", 300)
     try:
         return int(raw)
     except (TypeError, ValueError):
-        return 3600
+        return 300
 
 
 def get_clarify_timeout() -> int:
     """Read the clarify response timeout (seconds) from config.
 
-    Defaults to 3600 (1 hour) — long enough that a user who steps away
+    Defaults to 300 seconds — long enough for an interactive response
     (meeting, AFK, slow to read) still finds a live entry when they tap
     the button, short enough that a genuinely abandoned prompt eventually
     unblocks the agent thread instead of pinning the running-agent guard
@@ -425,7 +422,7 @@ def get_clarify_timeout() -> int:
         from hermes_cli.config import load_config
         return resolve_clarify_timeout(load_config() or {})
     except Exception:
-        return 3600
+        return 300
 
 
 # =========================================================================
