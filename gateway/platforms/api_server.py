@@ -7154,7 +7154,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 emit_terminals = getattr(adapter, "emit_terminal_interactions", None)
                 if callable(emit_terminals):
                     try:
-                        emit_terminals(getattr(agent_ref[0], "_zettlab_active_turn_id", "") if agent_ref else "")
+                        terminal_turn_id = getattr(agent_ref[0], "_zettlab_active_turn_id", "") if agent_ref else ""
+                        if terminal_turn_id:
+                            emit_terminals(terminal_turn_id)
                     except Exception:
                         logger.debug("terminal interaction emission failed", exc_info=True)
             if error_payload:
