@@ -169,7 +169,12 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Application slug. Required for install, reload, "
-                    "rollback, delete, lifecycle, logs, and call."
+                    "rollback, delete, lifecycle, logs, call, app_capabilities, "
+                    "app_operation, workflow_operation_status, "
+                    "workflow_operation_resume and maintenance_task_events — "
+                    "i.e. every action that names one app. A maintenance-task "
+                    "prompt states it as slug=\"...\"; pass that exact value on "
+                    "every call (the tool never infers it)."
                 ),
             },
             "path": {
@@ -286,7 +291,17 @@ APP_HOST_SCHEMA = {
             },
             "payload": {
                 "type": "object",
-                "description": "Required for app_operation: operation payload, passed unchanged inside App Host's closed envelope.",
+                "description": (
+                    "Required for app_operation: operation payload, passed unchanged inside "
+                    "App Host's closed envelope. One flat JSON object whose keys are exactly "
+                    "the operation's declared input fields (app_capabilities returns them as "
+                    "operations[].input when the app declares them; otherwise use the field "
+                    "names the task prompt or spec gives). Do not wrap it under an entity key "
+                    "(no {\"recording\": {...}}), do not invent extra fields (the app ignores "
+                    "or rejects them — an ignored field is a silent empty write), and do not "
+                    "put child records into a parent operation: each declared entity has its "
+                    "own operation (e.g. one todos.upsert per todo after recordings.upsert)."
+                ),
             },
             "query": {
                 "type": "object",
@@ -295,7 +310,14 @@ APP_HOST_SCHEMA = {
             },
             "idempotency_key": {
                 "type": "string",
-                "description": "Optional app_operation idempotency key declared by the app capability.",
+                "description": (
+                    "app_operation idempotency key. REQUIRED for every mode=mutation "
+                    "operation (App Host answers 400 without it); optional for reads. "
+                    "Use a stable id of the source record — for an event task the event's "
+                    "key (e.g. the meeting_id) — one key per written record, and reuse the "
+                    "same key when resending the same write; never mint a new key to get "
+                    "past a validation error, fix the payload instead."
+                ),
             },
             "capability_digest": {
                 "type": "string",
@@ -418,7 +440,10 @@ class _AutoRefreshScopeUnavailable(ValueError):
 def _require_slug(args):
     slug = str(args.get("slug", "") or "").strip()
     if not slug:
-        raise _BadRequest("该动作需要提供 slug 参数")
+        raise _BadRequest(
+            "该动作需要提供 slug 参数（应用标识；任务提示词里写作 slug=\"…\"，"
+            "app_capabilities 返回的 data.app 也是它）。补上 slug 原样重发即可"
+        )
     if not _SLUG_RE.match(slug):
         raise _BadRequest("slug 格式不合法（仅允许字母、数字、点、下划线、连字符）")
     return slug
@@ -855,6 +880,29 @@ def _build_request(action, args):
     raise _BadRequest(f"未知动作：{action}")
 
 
+def _app_operation_hint(action, status, upstream):
+    """Model-facing `next` for the two app_operation rejections a task agent
+    keeps tripping on (09-05 事件任务实测：缺幂等键 400、应用拒 payload 422 各
+    试错一轮才写成). The upstream {code, message} stays verbatim; the hint is
+    an extra key so skills branching on `code` are unaffected."""
+    if action != "app_operation" or not isinstance(upstream, dict):
+        return ""
+    message = str(upstream.get("message", "") or "")
+    if status == 400 and "idempotency_key" in message:
+        return (
+            "mutation 操作必须带 idempotency_key：用这条记录的稳定标识"
+            "（事件任务用事件 key / meeting_id），payload 原样、加上 idempotency_key 重发一次"
+        )
+    if status == 422 and upstream.get("code") == "invalid_request":
+        return (
+            "这是应用自己拒绝了 payload（括号里是应用回的 HTTP 状态）：字段名或类型不符。"
+            "对照 app_capabilities 的 operations[].input（没有就按任务提示 / 规格里的字段）"
+            "改成一层扁平对象、只放声明过的字段、id 类字段用应用自己的整数编号；"
+            "保持同一个 idempotency_key 重发，不要换 key、不要把数据套进别的键里"
+        )
+    return ""
+
+
 def _parse_upstream_error(raw_body):
     """The upstream JSON error body ({code, message}) verbatim, or None when
     the body is absent / not a JSON object (degrade to transport_error)."""
@@ -1106,6 +1154,10 @@ def _app_host_tool_dispatch(args, **_kw):
             # Verbatim pass-through: skills branch on the upstream `code`
             # string (slug_conflict / storage_full / ...), never the HTTP
             # status. Do not flatten into prose.
+            hint = _app_operation_hint(action, exc.code, upstream)
+            if hint:
+                upstream = dict(upstream)
+                upstream["next"] = hint
             return _fail(upstream, status=exc.code)
         if action in ("rollback", "publish", "call") and exc.code == 404:
             # Hermes and local-server ship as separate OTA packages, so this
