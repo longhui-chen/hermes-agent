@@ -3625,6 +3625,54 @@ class ZetAgentAdapter(APIServerAdapter):
     _ATTACHMENT_ACTION_WORKERS = 4
     _MEMORY_CITATION_MAX_ITEMS = 8
 
+    def _build_attachment_emitter(self, stream_q: Any, prestream_timing: Any = None):
+        """Return the request-local ``emit_attachment`` bound for plugins.
+
+        One frame shape (``{"type": "hermes.attachment", "attachment": …}``),
+        bounded by ``_ATTACHMENT_MAX_BYTES`` / ``_ATTACHMENT_STREAM_BACKLOG_MAX``;
+        the queued frame is a JSON round-trip copy so plugin mutation after the
+        call cannot reach the wire. Kept as a method so the producer
+        conformance tests can drive the real emitter.
+        """
+
+        def _emit_attachment(attachment: Dict[str, Any]) -> bool:
+            try:
+                if not isinstance(attachment, dict):
+                    return False
+                encoded = json.dumps(
+                    attachment,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if len(encoded) > self._ATTACHMENT_MAX_BYTES:
+                    logger.warning(
+                        "[zet_agent] attachment payload rejected: %d bytes",
+                        len(encoded),
+                    )
+                    return False
+                if stream_q.qsize() > self._ATTACHMENT_STREAM_BACKLOG_MAX:
+                    logger.warning(
+                        "[zet_agent] attachment stream backlog saturated"
+                    )
+                    return False
+                # Round-trip JSON to detach the queued frame from plugin
+                # mutation after emit_attachment returns.
+                safe_attachment = json.loads(encoded)
+                _observe_queued_attachment(prestream_timing)
+                _put_progress(stream_q, {
+                    "type": "hermes.attachment",
+                    "attachment": safe_attachment,
+                })
+                return True
+            except Exception:
+                logger.warning(
+                    "[zet_agent] attachment stream push failed",
+                    exc_info=True,
+                )
+                return False
+
+        return _emit_attachment
+
     @classmethod
     def _push_memory_citations(
         cls,
@@ -5101,41 +5149,7 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 from hermes_cli.plugins import bind_attachment_emitter
 
-                def _emit_attachment(attachment: Dict[str, Any]) -> bool:
-                    try:
-                        if not isinstance(attachment, dict):
-                            return False
-                        encoded = json.dumps(
-                            attachment,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                        if len(encoded) > self._ATTACHMENT_MAX_BYTES:
-                            logger.warning(
-                                "[zet_agent] attachment payload rejected: %d bytes",
-                                len(encoded),
-                            )
-                            return False
-                        if stream_q.qsize() > self._ATTACHMENT_STREAM_BACKLOG_MAX:
-                            logger.warning(
-                                "[zet_agent] attachment stream backlog saturated"
-                            )
-                            return False
-                        # Round-trip JSON to detach the queued frame from plugin
-                        # mutation after emit_attachment returns.
-                        safe_attachment = json.loads(encoded)
-                        _observe_queued_attachment(prestream_timing)
-                        _put_progress(stream_q, {
-                            "type": "hermes.attachment",
-                            "attachment": safe_attachment,
-                        })
-                        return True
-                    except Exception:
-                        logger.warning(
-                            "[zet_agent] attachment stream push failed",
-                            exc_info=True,
-                        )
-                        return False
+                _emit_attachment = self._build_attachment_emitter(stream_q, prestream_timing)
 
                 attachment_emitter_token = bind_attachment_emitter(
                     _emit_attachment
@@ -8330,6 +8344,16 @@ class ZetAgentAdapter(APIServerAdapter):
         # with empty response so the ask_user callback unblocks.
         with self._clarify_state_lock:
             clarify_queue = list(self._clarify_queues.pop(queue_key, []) or [])
+        # The queue is removed above so the normal discovery path in
+        # ``emit_terminal_interactions`` cannot see these entries anymore.
+        # Emit using the captured entries before waking the blocked worker;
+        # otherwise an interrupted clarify card remains actionable in the UI.
+        if clarify_queue:
+            self.emit_terminal_interactions(
+                "",
+                reason="turn_interrupted",
+                entries=clarify_queue,
+            )
         for entry in clarify_queue:
             try:
                 entry.response = ""
