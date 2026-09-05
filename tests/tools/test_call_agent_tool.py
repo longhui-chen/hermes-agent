@@ -148,6 +148,34 @@ def test_own_session_id_shapes(call_env):
         reset_current_session_key(token)
 
 
+def test_own_session_id_prefers_execution_session_key(call_env):
+    """真机主 Agent 聊天轮：approval contextvar / HERMES_SESSION_KEY 都空，只有
+    zet_agent 在执行边界冻结的 execution_session_key 有值（create_pipeline 绑 run
+    用的同一来源）。09-05 板上 call_agent 因此一律 LS 400 missing caller_session_id。"""
+    from gateway.session_context import (
+        pop_execution_session_key,
+        push_execution_session_key,
+    )
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    approval_token = set_current_session_key("default")
+    exec_token = push_execution_session_key("zettlab:9tdqrs6md0oi:main:QaNVGVs0v5Vh")
+    try:
+        assert cat._own_session_id() == "zettlab:9tdqrs6md0oi:main:QaNVGVs0v5Vh"
+    finally:
+        pop_execution_session_key(exec_token)
+        reset_current_session_key(approval_token)
+
+    # 执行边界的 key 优先于 approval contextvar（两者本应同源，前者是冻结值）
+    approval_token = set_current_session_key("zettlab:u1:agentA:7")
+    exec_token = push_execution_session_key("zettlab:u1:agentA:frozen")
+    try:
+        assert cat._own_session_id() == "zettlab:u1:agentA:frozen"
+    finally:
+        pop_execution_session_key(exec_token)
+        reset_current_session_key(approval_token)
+
+
 def test_http_error_body_surfaced(call_env, monkeypatch):
     """4xx 响应体是 LS 信封：结构化 reason + 可用名单要透传给模型自纠，
     不能裸抛 "HTTP Error 403"（真机上模型会连猜三个不存在的名字）。"""
