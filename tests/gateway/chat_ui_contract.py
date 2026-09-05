@@ -39,7 +39,7 @@ MANIFEST_GENERATED_BY = (
 # Pinned sha256 of the mirrored contract snapshot payload
 # (zettlab-product-dev: node scripts/chat-ui-contract/snapshot.mjs --print-sha).
 # Bump together with schemas/chat-ui-golden.snapshot.json on a reviewed contract change.
-CHAT_UI_GOLDEN_SNAPSHOT_SHA256 = "60d442e5a8be4d59acaaf959d2fa2815ff52217aa741c92c78eccd1d361f3429"
+CHAT_UI_GOLDEN_SNAPSHOT_SHA256 = "a1f5df4f21381fb04f36a73ab1bc5c75b1430e84fa75e75fb46165aabfe4d0a0"
 
 # Golden files under golden/hermes that are not keyed by payload.type.
 NON_TYPE_GOLDENS = ("tool-frame.running", "tool-frame.completed", "tool-frame.error", "hermes-error", "finish-chunk")
@@ -54,6 +54,9 @@ def load_snapshot() -> dict:
     raw = SNAPSHOT_PATH.read_text(encoding="utf-8")
     snap = json.loads(raw)
     assert snap.get("snapshot_version") == 1, f"snapshot_version={snap.get('snapshot_version')} want 1"
+    assert re.fullmatch(r"[0-9a-f]{40}", str(snap.get("root_commit") or "")), (
+        f"root_commit={snap.get('root_commit')!r}: the mirror must record the zettlab-product-dev commit it was taken at"
+    )
     digest = hashlib.sha256(canonical_json(snap["payload"]).encode("utf-8")).hexdigest()
     assert digest == snap["sha256"], (
         f"mirror payload sha256={digest} but file says {snap['sha256']}; the mirror was edited by hand"
@@ -132,6 +135,7 @@ def scan_payload_types(src: str | None = None) -> dict:
         "ignored_type_literals": sorted(ignored),
         "unparsed": unparsed,
         "frame_shapes": {t: {"keys": sorted(k)} for t, k in sorted(shapes.items()) if t not in partial},
+        "frame_shapes_unknown": sorted(t for t in types if t in partial or t not in shapes),
     }
 
 
@@ -157,6 +161,7 @@ def build_manifest(snapshot: dict) -> dict:
             "documented_types": documented_types(),
             "unparsed": scan["unparsed"],
             "frame_shapes": scan["frame_shapes"],
+            "frame_shapes_unknown": scan["frame_shapes_unknown"],
             "ignored_type_literals": scan["ignored_type_literals"],
         },
     }

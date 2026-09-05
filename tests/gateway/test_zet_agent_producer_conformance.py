@@ -47,9 +47,30 @@ def _take(q: "queue.Queue") -> dict:
     return frame
 
 
-def _assert_within(frame: dict, golden_frame: dict, name: str) -> None:
+def _assert_within(frame: dict, golden_frame: dict, name: str, path: str = "") -> None:
+    """Every key the producer emits exists in the golden — recursively for nested
+    objects the golden documents as objects (output, connector_error, browser*)."""
     extra = set(frame) - set(golden_frame)
-    assert extra == set(), f"{name}: producer emitted {sorted(extra)} not in golden/hermes/{name}.json"
+    assert extra == set(), f"{name}{path}: producer emitted {sorted(extra)} not in golden/hermes/{name}.json"
+    for key, value in frame.items():
+        if key == "attachment":
+            continue  # the attachment envelope is checked against the ChatAttachmentWire table, not one golden sample
+        g = golden_frame.get(key)
+        if isinstance(value, dict) and isinstance(g, dict) and g:
+            _assert_within(value, g, name, f"{path}.{key}")
+
+
+def _attachment_wire_table() -> dict:
+    return cuc.load_snapshot()["payload"]["fields"]["attachment_wire"]
+
+
+def _assert_attachment_wire(att: dict) -> None:
+    table = _attachment_wire_table()
+    extra = set(att) - set(table)
+    assert extra == set(), f"attachment carries {sorted(extra)} outside ChatAttachmentWire"
+    for f, spec in table.items():
+        if spec["required"]:
+            assert f in att, f"attachment lacks required ChatAttachmentWire field {f}"
 
 
 # ---------- context.compaction: the state enum is what the producer sends ----------
@@ -143,3 +164,100 @@ def test_put_progress_frames_stay_within_golden(golden, frame_in, name):
     frame = _take(q)
     assert frame["turn_id"] == "turn-9"
     _assert_within(frame, golden[name], name)
+
+
+# ---------- hermes.attachment: the real emitters ----------
+
+def test_plugin_attachment_emitter_frames_stay_within_golden(golden):
+    adapter = _adapter()
+    q: "queue.Queue" = queue.Queue()
+    emit = adapter._build_attachment_emitter(q)
+    att = {"id": "cg-1", "category": "interactive", "kind": "connector.connect", "v": 1, "state": "active",
+           "payload": {"provider": "notion", "blocking": False}, "actions": [{"id": "connect", "style": "primary"}]}
+    tokens = set_turn_vars(turn_id="turn-a")
+    try:
+        assert emit(att) is True
+    finally:
+        clear_turn_vars(tokens)
+    frame = _take(q)
+    assert frame["turn_id"] == "turn-a"
+    _assert_within(frame, golden["hermes.attachment"], "hermes.attachment")
+    _assert_attachment_wire(frame["attachment"])
+    # detached copy: mutating the plugin's dict after emit must not reach the queued frame
+    att["payload"]["provider"] = "changed"
+    assert frame["attachment"]["payload"]["provider"] == "notion"
+
+
+def test_plugin_attachment_emitter_rejects_oversized_and_non_dict(golden):
+    adapter = _adapter()
+    q: "queue.Queue" = queue.Queue()
+    emit = adapter._build_attachment_emitter(q)
+    assert emit("not-a-dict") is False
+    huge = {"id": "x", "kind": "memory.saved", "v": 1, "state": "active", "payload": {"blob": "x" * (adapter._ATTACHMENT_MAX_BYTES + 1)}}
+    assert emit(huge) is False
+    assert q.empty()
+
+
+@pytest.mark.parametrize("pusher,kind", [("_push_memory_citations", "memory.citations"), ("_push_memory_saved", "memory.saved")])
+def test_memory_attachment_pushers_stay_within_golden(golden, pusher, kind):
+    q: "queue.Queue" = queue.Queue()
+    items = [{"id": "m1", "source": "notes/a.md", "excerpt": "…"}]
+    tokens = set_turn_vars(turn_id="turn-m")
+    try:
+        assert getattr(ZetAgentAdapter, pusher)(q, "turn-m", "sess", items) is True
+    finally:
+        clear_turn_vars(tokens)
+    frame = _take(q)
+    assert frame["attachment"]["kind"] == kind
+    _assert_within(frame, golden["hermes.attachment"], "hermes.attachment")
+    _assert_attachment_wire(frame["attachment"])
+    assert frame["attachment"]["kind"] in golden_attachment_kinds()
+
+
+def golden_attachment_kinds() -> set:
+    return set(cuc.load_snapshot()["payload"]["golden"]["attachments"])
+
+
+# ---------- hermes.delegation.progress: the real callback, every relayed field ----------
+
+def test_delegation_progress_callback_forwards_every_identity_field(golden):
+    q: "queue.Queue" = queue.Queue()
+    cb = ZetAgentAdapter._make_delegation_progress_cb(q)
+    identity = {f: (1 if f in ("task_index", "task_count", "depth", "tool_count") else 2.5 if f == "duration_seconds" else "v")
+                for f in ZetAgentAdapter._DELEGATION_PROGRESS_FIELDS}
+    tokens = set_turn_vars(turn_id="turn-d")
+    try:
+        cb("subagent.tool", "terminal", "ls", None, **identity)
+        cb("subagent_progress", "summary text", None, None, **identity)
+        cb("not.a.delegation.event", "x", "y", None, **identity)
+    finally:
+        clear_turn_vars(tokens)
+    first = _take(q)
+    second = _take(q)
+    assert q.empty(), "unknown events must not be forwarded"
+    for frame in (first, second):
+        assert frame["type"] == "hermes.delegation.progress" and frame["turn_id"] == "turn-d"
+        _assert_within(frame, golden["hermes.delegation.progress"], "hermes.delegation.progress")
+    assert set(ZetAgentAdapter._DELEGATION_PROGRESS_FIELDS) <= set(golden["hermes.delegation.progress"]), "every relayed identity field is frozen in the golden"
+    assert second["event"] == "subagent.progress" and second["preview"] == "summary text"
+
+
+# ---------- event: hermes.error ----------
+
+@pytest.mark.parametrize("recoverable", [True, False])
+def test_chat_stream_error_payload_stays_within_golden(golden, recoverable):
+    result = {"completed": False, "partial": True, "failed": False, "error": "boom",
+              "provider_error": {"code": "rate_limited", "reason": "quota", "provider": "p", "model": "m", "status_code": 429,
+                                 "provider_error_code": "429", "provider_message": "slow down", "recoverable": recoverable}}
+    frame = api_server._chat_stream_error_payload(result, "error")
+    assert frame is not None and frame["recoverable"] is recoverable and frame["code"] == "rate_limited"
+    _assert_within(frame, golden["hermes-error"], "hermes-error")
+    truncated = api_server._chat_stream_error_payload({"completed": True, "partial": True}, "length")
+    assert truncated["code"] == "output_truncated"
+    _assert_within(truncated, golden["hermes-error"], "hermes-error")
+
+
+def test_tool_completion_failed_media_output_stays_within_golden(golden):
+    frame = api_server._tool_completion_payload("call_9", "image_generate", json.dumps({"success": False, "error": "quota"}))
+    assert frame["outcome"] == "error" and frame["output"] == {"success": False}
+    _assert_within(frame, golden["tool-frame.error"], "tool-frame.error")

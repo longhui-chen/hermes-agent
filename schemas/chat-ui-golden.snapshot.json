@@ -1,7 +1,7 @@
 {
   "snapshot_version": 1,
-  "root_commit": null,
-  "sha256": "60d442e5a8be4d59acaaf959d2fa2815ff52217aa741c92c78eccd1d361f3429",
+  "root_commit": "38e8202a3d57533d41fc8eb622a0239ce10cd02a",
+  "sha256": "a1f5df4f21381fb04f36a73ab1bc5c75b1430e84fa75e75fb46165aabfe4d0a0",
   "payload": {
     "golden": {
       "events": {
@@ -938,7 +938,8 @@
           "model": "demo-model",
           "status_code": 200,
           "provider_error_code": "length",
-          "provider_message": "max tokens reached"
+          "provider_message": "max tokens reached",
+          "recoverable": false
         },
         "hermes.approval": {
           "type": "hermes.approval",
@@ -1004,7 +1005,10 @@
           "child_session_id": "sess_demo_child_0001",
           "tool_count": 2,
           "status": "running",
-          "duration_seconds": 3.5
+          "duration_seconds": 3.5,
+          "parent_id": "sub_demo_root",
+          "depth": 1,
+          "exit_reason": ""
         },
         "hermes.plan": {
           "type": "hermes.plan",
@@ -1090,6 +1094,9 @@
             "code": "unauthorized",
             "message": "token expired",
             "nextAction": "reconnect"
+          },
+          "output": {
+            "success": false
           }
         },
         "tool-frame.running": {
@@ -2164,7 +2171,10 @@
           "invalid_request_error",
           "text"
         ],
-        "reason": "Non-frame dict literals in zet_agent.py that also carry a \"type\" key: reasoning-config `disabled`, the OpenAI-style error body `invalid_request_error`, and `text` content blocks. Any other undotted type literal is a new frame until registered here."
+        "reason": "Non-frame dict literals in zet_agent.py that also carry a \"type\" key: reasoning-config `disabled`, the OpenAI-style error body `invalid_request_error`, and `text` content blocks. Any other undotted type literal is a new frame until registered here.",
+        "frame_shape_exempt": {
+          "context.compaction": "The frame is the upstream compaction status payload forwarded as-is (dict(payload) + type); its fields are frozen by golden/hermes/context.compaction.json and asserted by tests/gateway/test_zet_agent_producer_conformance.py against the three real producer shapes."
+        }
       },
       "registry": {
         "web": {
@@ -2239,7 +2249,11 @@
               "extra": [
                 "turn_id"
               ],
-              "reason": "Web's resolved receipt carries a data-level turn_id copied from the envelope; local-server only sends the envelope turn_id. Drop with the receipt rework in chat-ui-b2a-interactive-protocol."
+              "reason": "Web models the resolved receipt as a union whose clarify branch omits agent_id / resolution and carries a data-level turn_id copied from the envelope; local-server always sends agent_id + resolution and only the envelope turn_id. Collapse to the wire shape with the receipt rework in chat-ui-b2a-interactive-protocol.",
+              "missing": [
+                "agent_id",
+                "resolution"
+              ]
             },
             "ui_hint": {
               "missing": [

@@ -300,6 +300,9 @@ Fields from `contracts/chat-ui/v1/golden/hermes/hermes.delegation.progress.json`
 | `tool_count` | number | `2` |
 | `status` | string | `"running"` |
 | `duration_seconds` | number | `3.5` |
+| `parent_id` | string | `"sub_demo_root"` |
+| `depth` | number | `1` |
+| `exit_reason` | string | `""` |
 <!-- generated:end hermes.delegation.progress -->
 
 | Field | Type | Req | Meaning |
@@ -359,6 +362,7 @@ Fields from `contracts/chat-ui/v1/golden/hermes/tool-frame.error.json` (do not e
 | `statusCode` | number | `401` |
 | `provider` | string | `"google_drive"` |
 | `connector_error` | object | `{"provider": "google_drive", "status": 401, "code": "unautho` |
+| `output` | object | `{"success": false}` |
 <!-- generated:end tool-frame.error -->
 
 Built by upstream `api_server.py` (`_on_tool_start` / `_on_tool_complete`

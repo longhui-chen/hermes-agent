@@ -27,6 +27,8 @@ on:
       - 'tests/gateway/test_zet_agent_contract_manifest.py'
       - 'tests/gateway/test_zet_agent_producer_conformance.py'
       - '.github/workflows/chat-ui-contract.yml'
+      - 'agent/conversation_compression.py'
+      - 'tests/gateway/test_zet_agent_title_flow.py'
   push:
     branches:
       - main
@@ -41,6 +43,8 @@ on:
       - 'tests/gateway/test_zet_agent_contract_manifest.py'
       - 'tests/gateway/test_zet_agent_producer_conformance.py'
       - '.github/workflows/chat-ui-contract.yml'
+      - 'agent/conversation_compression.py'
+      - 'tests/gateway/test_zet_agent_title_flow.py'
   schedule:
     - cron: '41 19 * * *' # 03:41 Asia/Shanghai
   workflow_dispatch:
@@ -65,7 +69,7 @@ jobs:
           python -m pip install --quiet --disable-pip-version-check pytest==9.1.1 pytest-asyncio==1.3.0 pytest-timeout==2.4.0 setuptools==83.0.0
           python -m pip install --quiet -e .
       - name: Contract manifest + producer conformance (no secret)
-        run: python -m pytest -q -p no:cacheprovider tests/gateway/test_zet_agent_contract_manifest.py tests/gateway/test_zet_agent_producer_conformance.py tests/gateway/test_zet_agent_extension_turn_id.py tests/gateway/test_chatproto_schema_contract.py
+        run: python -m pytest -q -p no:cacheprovider tests/gateway/test_zet_agent_contract_manifest.py tests/gateway/test_zet_agent_producer_conformance.py tests/gateway/test_zet_agent_extension_turn_id.py tests/gateway/test_zet_agent_title_flow.py tests/gateway/test_chatproto_schema_contract.py
 
   mirror-freshness:
     if: github.repository_owner == 'zettlab' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
