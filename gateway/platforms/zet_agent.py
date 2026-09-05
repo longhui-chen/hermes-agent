@@ -495,7 +495,10 @@ def _clarify_timeout_seconds() -> float:
     try:
         from tools.clarify_gateway import get_clarify_timeout
         value = float(get_clarify_timeout())
-        return value if value == value else 300.0
+        # B1 publishes a concrete client deadline; non-positive values would
+        # otherwise advertise an already-expired frame while the worker waits
+        # forever. Normalize them to the bounded default.
+        return value if value == value and value > 0 else 300.0
     except Exception:
         return 300.0
 
@@ -546,9 +549,10 @@ def _approval_timeout_seconds() -> float:
     """
     try:
         from tools.approval import _get_approval_config
-        return float(_get_approval_config().get(
+        value = float(_get_approval_config().get(
             "gateway_timeout", DEFAULT_APPROVAL_TIMEOUT_SECONDS,
         ))
+        return value if value == value and value > 0 else DEFAULT_APPROVAL_TIMEOUT_SECONDS
     except Exception:
         return DEFAULT_APPROVAL_TIMEOUT_SECONDS
 
@@ -3832,7 +3836,7 @@ class ZetAgentAdapter(APIServerAdapter):
         )
 
     def emit_terminal_interactions(self, turn_id: str, *, reason: str = "turn_interrupted", entries: Optional[List[_ClarifyEntry]] = None) -> int:
-        """Emit each pending clarify terminal frame at most once."""
+        """Emit each pending clarify/approval terminal frame at most once."""
         candidates = entries
         if candidates is None:
             with self._clarify_state_lock:
@@ -3853,6 +3857,29 @@ class ZetAgentAdapter(APIServerAdapter):
                     emitted += 1
             except Exception:
                 logger.debug("[zet_agent] clarify terminal push failed", exc_info=True)
+        # Approval projections use the same stream-owned terminal lane. Keep
+        # them correlated by turn_id so an interrupted approval cannot leave a
+        # dangerous card actionable after the SSE turn has ended.
+        with self._pending_lock:
+            approval_candidates = []
+            for key, raw in getattr(self, "_pending_approval", {}).items():
+                items = [raw] if isinstance(raw, dict) else list(raw or [])
+                for item in items:
+                    if (not turn_id or str(item.get("turn_id") or "") == turn_id) and not item.get("terminal_emitted"):
+                        approval_candidates.append((key, item))
+        for key, item in approval_candidates:
+            payload = dict(item)
+            payload["state"] = "expired" if reason == "timeout" else "cancelled"
+            payload["state_reason"] = reason
+            try:
+                stream_q = getattr(self, "_approval_stream_queues", {}).get(key)
+                if stream_q is not None:
+                    _put_progress(stream_q, payload)
+                    with self._pending_lock:
+                        item["terminal_emitted"] = True
+                    emitted += 1
+            except Exception:
+                logger.debug("[zet_agent] approval terminal push failed", exc_info=True)
         return emitted
 
     def _remember_active_turn_id(
@@ -8320,6 +8347,12 @@ class ZetAgentAdapter(APIServerAdapter):
         # grants. A stale approval card must never authorize work after the
         # interrupted run has ended.
         try:
+            self.emit_terminal_interactions(
+                getattr(self, "_active_session_turn_ids", {}).get(
+                    self._active_turn_key(session_id), ""
+                ),
+                reason="turn_interrupted",
+            )
             with self._pending_lock:
                 getattr(self, "_approval_session_keys", {}).pop(
                     self._active_turn_key(session_id),

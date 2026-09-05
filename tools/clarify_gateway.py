@@ -389,15 +389,17 @@ def resolve_clarify_timeout(config: dict) -> int:
     2. else the canonical ``agent.clarify_timeout``,
     3. else 300 seconds.
 
-    ``<= 0`` is preserved verbatim and means *unlimited* to callers (never
-    auto-skip while the user is still deciding); the waiting loops translate
-    that into a null deadline.  A non-numeric value falls back to 300.
+    Non-positive values are normalized to 300 seconds.  B1 publishes this
+    same concrete deadline to clients; an unlimited worker wait would make
+    the advertised ``expires_at_ms`` immediately stale and strand a card.
+    A non-numeric value also falls back to 300.
     """
     raw = (config.get("clarify") or {}).get("timeout")
     if raw is None:
         raw = (config.get("agent") or {}).get("clarify_timeout", 300)
     try:
-        return int(raw)
+        value = int(raw)
+        return value if value > 0 else 300
     except (TypeError, ValueError):
         return 300
 
@@ -414,9 +416,9 @@ def get_clarify_timeout() -> int:
     (#32762).
 
     Reads ``agent.clarify_timeout`` from config.yaml (see
-    :func:`resolve_clarify_timeout` for the full resolution order).  Set to
-    ``0`` (or negative) for an unlimited wait — never auto-skip while the user
-    is still deciding.
+    :func:`resolve_clarify_timeout` for the full resolution order).  Values
+    at or below zero are normalized to the 300-second default so the worker
+    deadline and the client ``expires_at_ms`` remain consistent.
     """
     try:
         from hermes_cli.config import load_config

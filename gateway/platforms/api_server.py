@@ -6708,6 +6708,20 @@ class APIServerAdapter(BasePlatformAdapter):
             def _finish_chat_stream(_fut):
                 for safe_delta in media_delta_filter.finish():
                     _stream_q.put(safe_delta)
+                # Terminal interaction frames must be queued while the SSE
+                # consumer is still draining the stream.  The ``None``
+                # sentinel closes the drain loop, so emitting afterwards
+                # would strand cards in the queue.
+                emit_terminals = getattr(self, "emit_terminal_interactions", None)
+                if callable(emit_terminals):
+                    try:
+                        terminal_turn_id = getattr(
+                            agent_ref[0], "_zettlab_active_turn_id", ""
+                        ) if agent_ref else ""
+                        if terminal_turn_id:
+                            emit_terminals(terminal_turn_id)
+                    except Exception:
+                        logger.debug("terminal interaction emission failed", exc_info=True)
                 _stream_q.put(None)
 
             agent_task.add_done_callback(_finish_chat_stream)
