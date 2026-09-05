@@ -110,7 +110,8 @@ class TestClarifyPrimitive:
 
             # unregister_notify calls clear_session; thread unwinds
             result = fut.result(timeout=10.0)
-            assert result == ""
+            assert result is not None
+            assert result.startswith("[clarify:id9 state=cancelled reason=session_reset]")
 
     def test_session_index_isolation(self):
         """Entries from different sessions don't leak across get_pending lookups."""
