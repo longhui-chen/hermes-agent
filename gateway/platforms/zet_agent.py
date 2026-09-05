@@ -3345,6 +3345,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 "approval", internal_key, payload
             ):
                 raise RuntimeError("approval reconnect mirror capacity exhausted")
+            # Durable approvals also need their originating SSE queue retained
+            # for interrupt/timeout terminal frames.  The legacy projection
+            # path records this in ``_cache_approval_projection``; mirror the
+            # association here before publishing the first event.
+            with self._pending_lock:
+                stream_queues = getattr(self, "_approval_stream_queues", None)
+                if stream_queues is None:
+                    stream_queues = {}
+                    self._approval_stream_queues = stream_queues
+                stream_queues[internal_key] = stream_q
             if turn_id:
                 reserved, push_error = self._publish_interaction_event(
                     stream_q,
