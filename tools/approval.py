@@ -4354,7 +4354,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     entry = enqueue_gateway_approval(session_key, approval_data)
     drop_notified = False
 
-    def _drop_entry() -> None:
+    def _drop_entry(reason: str | None = None) -> None:
         nonlocal drop_notified
         with _lock:
             queue = _gateway_queues.get(state_key, [])
@@ -4374,6 +4374,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 drop_cb(
                     session_key,
                     str(entry.data.get("interaction_id", "") or ""),
+                    reason,
                 )
             except Exception:
                 logger.debug(
@@ -4400,7 +4401,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             projection_cleanup = callback_result
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
-        _drop_entry()
+        _drop_entry("delivery_failed")
         return {
             "resolved": False,
             "choice": None,
@@ -4465,7 +4466,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         if touch_activity_if_due is not None:
             touch_activity_if_due(_activity_state, "waiting for user approval")
 
-    _drop_entry()
+    _drop_entry("timeout" if not resolved else "cancelled")
     if projection_cleanup is not None:
         try:
             projection_cleanup()

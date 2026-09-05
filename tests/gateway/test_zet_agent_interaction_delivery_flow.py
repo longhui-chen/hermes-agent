@@ -2198,16 +2198,25 @@ def test_approval_timeout_notifies_adapter_to_drop_unique_session_mirrors(
     for index in range(12):
         session_id = f"session-{index}"
         queue_key = adapter._interaction_queue_key(session_id)
+        stream = queue.Queue()
         tokens = set_turn_vars(turn_id=f"turn-{index}")
         try:
             result = approval._await_gateway_decision(
                 queue_key,
-                adapter._make_approval_cb(queue.Queue(), session_id, queue_key),
+                adapter._make_approval_cb(stream, session_id, queue_key),
                 {"command": f"command-{index}", "description": "test"},
             )
         finally:
             clear_turn_vars(tokens)
         assert result["resolved"] is False
+
+        # Timeout emits the terminal frame before the reconnect mirror is
+        # deleted, so clients cannot retain an actionable approval card.
+        frames = []
+        while not stream.empty():
+            frames.append(stream.get_nowait()[1])
+        assert frames[-1]["state"] == "expired"
+        assert frames[-1]["state_reason"] == "timeout"
 
     with adapter._pending_lock:
         assert adapter._pending_approval == {}

@@ -3393,7 +3393,46 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
-        def _source_dropped(_session_key: str, interaction_id: str) -> None:
+        def _source_dropped(
+            _session_key: str,
+            interaction_id: str,
+            reason: Optional[str] = None,
+        ) -> None:
+            # Timeout cleanup must publish the terminal frame before deleting
+            # the reconnect mirror.  Otherwise the client only sees the
+            # original pending approval and can keep an expired card alive
+            # after the source FIFO has been removed.  Resolution/interrupt
+            # paths already publish their own terminal event and therefore do
+            # not emit a duplicate here.
+            if reason == "timeout":
+                terminal_payload = None
+                terminal_stream = None
+                with self._pending_lock:
+                    for item in list(
+                        self._pending_approval.get(internal_key, []) or []
+                    ):
+                        if str(item.get("interaction_id") or "") != str(
+                            interaction_id or ""
+                        ):
+                            continue
+                        if item.get("terminal_emitted"):
+                            break
+                        item["terminal_emitted"] = True
+                        terminal_payload = dict(item)
+                        terminal_payload["state"] = "expired"
+                        terminal_payload["state_reason"] = "timeout"
+                        terminal_stream = getattr(
+                            self, "_approval_stream_queues", {}
+                        ).get(internal_key)
+                        break
+                if terminal_payload is not None and terminal_stream is not None:
+                    try:
+                        _put_progress(terminal_stream, terminal_payload)
+                    except Exception:
+                        logger.debug(
+                            "[zet_agent] approval timeout terminal push failed",
+                            exc_info=True,
+                        )
             self._remove_pending_interaction(
                 "approval", internal_key, interaction_id
             )
