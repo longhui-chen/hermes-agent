@@ -865,6 +865,9 @@ async def test_pending_approval_follows_source_fifo_not_callback_arrival_order()
     assert response.status == 200
     assert body["approval"]["interaction_id"] == "interaction-a"
     assert body["approval"]["interaction_delivery_version"] == 1
+    assert {item["interaction_id"] for item in body["approvals"]} == {
+        "interaction-a", "interaction-b"
+    }
 
     # An old local-server ignores the additive version field and still uses
     # the legacy FIFO POST. Until this scoped session successfully prepares a

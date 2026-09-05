@@ -7427,10 +7427,14 @@ class ZetAgentAdapter(APIServerAdapter):
         client can re-render the modal it had open before the ws drop.
         Read-only: does not consume the entries.
 
-        Body: ``{"approval": <payload>|null, "clarify": <payload>|null}``.
-        Each payload mirrors the shape of the corresponding
-        hermes.tool.progress event ``data`` object (without the
-        ``type`` discriminator).
+        Body: ``{"approval": <payload>|null, "clarify": <payload>|null,
+        "approvals": [<payload>...], "clarifies": [<payload>...]}``.
+        The singular fields preserve the oldest/source-selected projection for
+        existing clients. The additive arrays expose every currently pending
+        interaction so reconnecting clients cannot silently lose a second
+        approval or clarify waiting behind the FIFO head. Each payload mirrors
+        the corresponding hermes.tool.progress event ``data`` object (without
+        the ``type`` discriminator).
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -7457,6 +7461,10 @@ class ZetAgentAdapter(APIServerAdapter):
         with self._pending_lock:
             approval_queue = self._pending_approval.get(queue_key, [])
             clarify_queue = self._pending_clarify.get(queue_key, [])
+            # Return snapshots, never the mutable mirror lists. Preserve FIFO
+            # order for clients that reconcile all pending interactions.
+            approvals = [dict(payload) for payload in approval_queue]
+            clarifies = [dict(payload) for payload in clarify_queue]
             ap = next(
                 (
                     payload
@@ -7486,6 +7494,8 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({
             "approval": ap,
             "clarify": cl,
+            "approvals": approvals,
+            "clarifies": clarifies,
         })
 
     async def _handle_attachment_action(self, request: "web.Request") -> "web.Response":
