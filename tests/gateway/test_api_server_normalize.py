@@ -8,6 +8,8 @@ from gateway.platforms.api_server import (
     _extract_plan_auto_execute,
     _extract_response_mode,
     _extract_turn_id,
+    MAX_CANONICAL_FINAL_TURN_ID_LEN,
+    MAX_TURN_ID_LEN,
     _normalize_chat_content,
     _resolve_plan_auto_execute,
 )
@@ -187,6 +189,27 @@ class TestExtractTurnId:
 
     def test_internal_whitespace_dropped(self):
         assert _extract_turn_id({"metadata": {"turn_id": "t_a b"}}) == ""
+
+    def test_oversized_turn_id_dropped_not_truncated(self):
+        # Echoed onto every extension frame of the turn: cap the length, and
+        # never truncate (a truncated id would mis-correlate silently).
+        at_cap = "t" * MAX_TURN_ID_LEN
+        assert _extract_turn_id({"metadata": {"turn_id": at_cap}}) == at_cap
+        assert _extract_turn_id({"metadata": {"turn_id": at_cap + "x"}}) == ""
+
+    def test_turn_id_limit_matches_canonical_final(self):
+        # Regression: a 129–200 char id that canonical-final accepts must not be
+        # dropped by the shared extractor (that made canonical-final answer 400
+        # "missing turn_id" and plain chat lose its turn correlation).
+        assert MAX_TURN_ID_LEN == MAX_CANONICAL_FINAL_TURN_ID_LEN == 200
+        for n in (129, 150, 200):
+            tid = "t" * n
+            assert _extract_turn_id({"metadata": {"turn_id": tid}}) == tid
+        assert _extract_turn_id({"metadata": {"turn_id": "t" * 201}}) == ""
+        # the limit is in characters, like canonical-final's check
+        wide = "\u4e2d" * MAX_TURN_ID_LEN
+        assert _extract_turn_id({"metadata": {"turn_id": wide}}) == wide
+        assert _extract_turn_id({"metadata": {"turn_id": wide + "\u4e2d"}}) == ""
 
     def test_uuid_form_preserved(self):
         tid = "t_550e8400-e29b-41d4-a716-446655440000"

@@ -1,0 +1,140 @@
+{
+  "manifest_version": 1,
+  "repo": "hermes-agent",
+  "generated_by": "CHAT_UI_MANIFEST_UPDATE=1 python -m pytest -q tests/gateway/test_zet_agent_contract_manifest.py",
+  "snapshot_sha256": "c41f0efb3db1dc4a14823eb0530e0fab81ad1f89832b6e1e7aaf94fac593d8f6",
+  "attachment_schema_sha256": "d4da6e3b73d51b22d72051f965f6ae35244bdf579c93e0c74069bc6231201b84",
+  "hermes": {
+    "payload_types": [
+      "context.compaction",
+      "conversation.title",
+      "hermes.approval",
+      "hermes.attachment",
+      "hermes.clarify",
+      "hermes.delegation.progress",
+      "hermes.plan",
+      "hermes.todo",
+      "reasoning.delta",
+      "steer_dropped"
+    ],
+    "documented_types": [
+      "api_server.py",
+      "attachment.action.ack",
+      "chat.completion.chunk",
+      "connector_error.code",
+      "connector_error.provider",
+      "connector_error.status",
+      "context.compaction",
+      "conversation.title",
+      "ctx.emit_attachment",
+      "delta.content",
+      "finish_chunk.hermes.error_code",
+      "goal.status",
+      "hermes.approval",
+      "hermes.attachment",
+      "hermes.canonical_final_response",
+      "hermes.clarify",
+      "hermes.delegation.progress",
+      "hermes.error",
+      "hermes.error.code",
+      "hermes.plan",
+      "hermes.todo",
+      "hermes.tool.progress",
+      "message.appended",
+      "metadata.turn_id",
+      "payload.type",
+      "reasoning.delta",
+      "steer_dropped",
+      "subagent.complete",
+      "subagent.progress",
+      "subagent.start",
+      "subagent.tool",
+      "text.delta",
+      "tool.result.output.ui_hint"
+    ],
+    "unparsed": [],
+    "frame_shapes": {
+      "conversation.title": {
+        "keys": [
+          "title",
+          "type"
+        ]
+      },
+      "hermes.approval": {
+        "keys": [
+          "approval_id",
+          "command",
+          "description",
+          "expires_at_ms",
+          "interaction_delivery_version",
+          "interaction_generation",
+          "interaction_id",
+          "pattern_key",
+          "pattern_keys",
+          "type"
+        ]
+      },
+      "hermes.attachment": {
+        "keys": [
+          "attachment",
+          "type"
+        ]
+      },
+      "hermes.clarify": {
+        "keys": [
+          "choices_offered",
+          "clarify_id",
+          "expires_at_ms",
+          "interaction_delivery_version",
+          "interaction_generation",
+          "interaction_id",
+          "question",
+          "type"
+        ]
+      },
+      "hermes.delegation.progress": {
+        "keys": [
+          "event",
+          "kind",
+          "type"
+        ]
+      },
+      "hermes.plan": {
+        "keys": [
+          "auto_execute",
+          "groups",
+          "plan_id",
+          "title",
+          "type"
+        ]
+      },
+      "hermes.todo": {
+        "keys": [
+          "summary",
+          "todos",
+          "type"
+        ]
+      },
+      "reasoning.delta": {
+        "keys": [
+          "text",
+          "type"
+        ]
+      },
+      "steer_dropped": {
+        "keys": [
+          "text",
+          "type"
+        ]
+      }
+    },
+    "frame_shapes_unknown": [
+      "context.compaction"
+    ],
+    "ignored_type_literals": [
+      "disabled",
+      "invalid_request_error",
+      "text"
+    ]
+  }
+}

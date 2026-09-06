@@ -40,6 +40,7 @@
       "properties": {
         "id": { "type": "string", "minLength": 1, "maxLength": 256 },
         "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "category": { "type": "string", "maxLength": 32, "description": "Semantic UI map class (chat-ui contract v1): known values interactive | content. Optional and open: readers blank unknown values and dispatch by kind." },
         "v": { "type": "integer", "minimum": 1 },
         "state": { "type": "string", "enum": ["active", "resolved", "expired", "failed"] },
         "payload": { "$ref": "#/$defs/JSONObject" },

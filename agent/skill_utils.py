@@ -418,16 +418,20 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
-def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
-    """Read disabled skill names from config.yaml.
+_MAX_CONNECTOR_POLICY_DISABLED_SKILLS = 2048
+_CONNECTOR_POLICY_SKILL_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,127}$")
+_MAX_CONNECTOR_POLICY_GENERATION = (1 << 63) - 1
+
+
+def get_user_disabled_skill_names(platform: str | None = None) -> Set[str]:
+    """Read user/operator-owned disabled Skill names from config.yaml.
 
     Args:
         platform: Explicit platform name (e.g. ``"telegram"``).  When
             *None*, resolves from ``HERMES_PLATFORM`` or
             ``HERMES_SESSION_PLATFORM`` env vars.  Returns the global
             disabled list, unioned with the platform-specific list when a
-            platform is resolved (a globally-disabled skill stays disabled
-            on every platform).
+            platform is resolved.
 
     Reads the config file directly (no CLI config imports) to stay
     lightweight.
@@ -456,6 +460,77 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         if platform_disabled is not None:
             return global_disabled | _normalize_string_set(platform_disabled)
     return global_disabled
+
+
+def get_connector_policy_disabled_skill_names() -> Set[str]:
+    """Return the bounded machine-owned Connector visibility deny set."""
+    parsed = _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if not isinstance(skills_cfg, dict):
+        return set()
+    raw = skills_cfg.get("connector_policy_disabled")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+
+    disabled: Set[str] = set()
+    for value in raw:
+        name = str(value or "").strip()
+        if not _CONNECTOR_POLICY_SKILL_ID_RE.fullmatch(name):
+            continue
+        disabled.add(name)
+        if len(disabled) >= _MAX_CONNECTOR_POLICY_DISABLED_SKILLS:
+            break
+    return disabled
+
+
+def get_connector_policy_generation() -> int:
+    """Return the non-negative machine policy generation, or zero."""
+    parsed = _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if not isinstance(skills_cfg, dict):
+        return 0
+    try:
+        generation = int(skills_cfg.get("connector_policy_generation") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if generation < 0 or generation > _MAX_CONNECTOR_POLICY_GENERATION:
+        return 0
+    return generation
+
+
+def get_workload_attached_skill_names() -> Set[str]:
+    """Return the exact task-local Application/Cron Skill overlay."""
+    try:
+        from gateway.session_context import workload_attached_skills
+
+        return set(workload_attached_skills())
+    except Exception:
+        return set()
+
+
+def get_chat_connector_disabled_skill_names() -> Set[str]:
+    """Return the exact task-local deny set projected from Chat overrides."""
+    try:
+        from gateway.session_context import chat_connector_disabled_skills
+
+        return set(chat_connector_disabled_skills())
+    except Exception:
+        return set()
+
+
+def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
+    """Return the effective disabled set for this profile and workload.
+
+    Workload-attached Skills may bypass only ``connector_policy_disabled``.
+    User/operator ``disabled`` and ``platform_disabled`` entries always win.
+    """
+    user_disabled = get_user_disabled_skill_names(platform)
+    policy_disabled = get_connector_policy_disabled_skill_names()
+    if policy_disabled:
+        policy_disabled -= get_workload_attached_skill_names()
+    return user_disabled | policy_disabled | get_chat_connector_disabled_skill_names()
 
 
 def _normalize_string_set(values) -> Set[str]:

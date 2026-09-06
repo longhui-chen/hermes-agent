@@ -100,10 +100,15 @@ async def test_native_title_is_emitted_before_stream_task_finishes(monkeypatch):
     assert captured["billing_conversation_id"] == "zettlab:u1:main:s1"
     assert captured["billing_task_title"] == "她有什么缺点？"
     assert captured["background"] is False
-    assert stream_q.get_nowait() == (
-        "__tool_progress__",
-        {"type": "conversation.title", "title": "询问她的缺点"},
-    )
+    tag, title_frame = stream_q.get_nowait()
+    assert tag == "__tool_progress__"
+    # chat-ui contract §1.1: the title push runs inside the turn context and
+    # therefore carries the bound turn id.
+    assert title_frame == {
+        "type": "conversation.title",
+        "title": "询问她的缺点",
+        "turn_id": "turn-1",
+    }
 
 
 @pytest.mark.asyncio
@@ -348,10 +353,14 @@ async def test_onboarding_uses_deterministic_title_without_llm(monkeypatch):
     )
 
     assert got == result
-    assert stream_q.get_nowait() == (
-        "__tool_progress__",
-        {"type": "conversation.title", "title": "初始设置"},
-    )
+    tag, title_frame = stream_q.get_nowait()
+    assert tag == "__tool_progress__"
+    # turn_id is present whenever a turn is bound (chat-ui contract §1.1);
+    # this path only pins the semantic fields.
+    assert {k: v for k, v in title_frame.items() if k != "turn_id"} == {
+        "type": "conversation.title",
+        "title": "初始设置",
+    }
 
 
 def test_title_input_strips_agent_creator_routing_directive():
