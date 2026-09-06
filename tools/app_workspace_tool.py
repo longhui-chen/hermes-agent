@@ -25,7 +25,7 @@ _ACTIONS = frozenset({
     "publish", "discard", "maintainer_schedule_status", "maintenance_tasks",
     "create_maintenance_task", "update_maintenance_task",
     "delete_maintenance_task", "maintenance_task_runs",
-    "maintenance_task_events",
+    "maintenance_task_events", "register_maintenance_tasks_from_spec",
 })
 _MAX_RESPONSE_BYTES = 1024 * 1024
 # The rebuild is a background job on App Host (it queues behind other builds
@@ -79,7 +79,13 @@ APP_WORKSPACE_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": sorted(_ACTIONS),
-                "description": "One fixed App Workspace action.",
+                "description": (
+                    "One fixed App Workspace action. register_maintenance_tasks_from_spec "
+                    "registers the workspace spec.yaml's task declarations and is TWO calls: "
+                    "call it without confirm to get the plan (create / update / delete), show "
+                    "the user that plan with every deletion named, and only after an explicit "
+                    "yes call it again with confirm=true and the same plan_digest."
+                ),
             },
             "slug": {
                 "type": "string",
@@ -116,15 +122,21 @@ APP_WORKSPACE_SCHEMA = {
                 "description": "For publish only: a concise user-facing description of this version change.",
             },
             "name": {"type": "string", "description": "For create_maintenance_task: user-visible task name."},
-            "schedule": {"type": "string", "description": "For create_maintenance_task: recurring interval or cron expression."},
-            "timezone": {"type": "string", "description": "For create_maintenance_task: IANA timezone."},
+            "schedule": {"type": "string", "description": "For create_maintenance_task with trigger=schedule (the default): recurring interval or cron expression. Omit for event/manual tasks — the platform wakes them."},
+            "timezone": {"type": "string", "description": "For create_maintenance_task with trigger=schedule: IANA timezone."},
+            "trigger": {"type": "string", "enum": ["schedule", "event", "manual"], "description": "For create_maintenance_task: what wakes the task. Default schedule. event = a platform event fires; manual = the app asks for it."},
+            "event": {"type": "string", "description": "For create_maintenance_task with trigger=event: the platform event name. It must be in the platform's event dictionary — read it from the app-coding skill's PLATFORM_EVENTS.md; a name that is not in it is refused (the error lists the valid ones)."},
+            "event_path": {"type": "string", "description": "For create_maintenance_task with trigger=event: the absolute directory this subscription watches. Required only for the events the dictionary marks as directory-scoped, and refused for the others."},
             "kind": {"type": "string", "enum": ["refresh", "summary"], "description": "For create_maintenance_task: the app-scoped maintenance kind."},
             "app_operation": {"type": "string", "description": "For create_maintenance_task: declared app write operation, read from app_capabilities first."},
             "capability_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "For create_maintenance_task: exact digest from app_capabilities for app_operation."},
             "instruction": {"type": "string", "description": "For create_maintenance_task: concise user-approved collection or summary instruction."},
             "task_id": {"type": "string", "description": "For update_maintenance_task, delete_maintenance_task, maintenance_task_runs, or maintenance_task_events: the id returned by maintenance_tasks."},
             "spec_id": {"type": "string", "description": "For maintenance_task_events: the task's spec id (as named in the run prompt) when task_id is unknown."},
+            "creation_key": {"type": "string", "description": "For maintenance_task_events: the handle a task created at runtime cites instead of a spec id — its own run prompt names it (creation_key=…). Use it when the prompt gave you no spec_id."},
             "ack": {"type": "boolean", "description": "For maintenance_task_events: acknowledge (remove) the returned events; default true. Pass false to peek."},
+            "confirm": {"type": "boolean", "description": "For register_maintenance_tasks_from_spec: false/omitted returns the plan only (nothing is changed). Pass true ONLY after showing the user the plan — deletions named one by one — and getting an explicit yes."},
+            "expected_plan_digest": {"type": "string", "description": "For register_maintenance_tasks_from_spec with confirm=true: the plan_digest of the plan the user agreed to. A mismatch is refused: fetch the plan again and re-confirm."},
             "expected_schedule_revision": {"type": "integer", "minimum": 0, "description": "For update_maintenance_task: current schedule_revision returned by maintenance_tasks."},
             "enabled": {"type": "boolean", "description": "For update_maintenance_task: whether this task should run."},
         },
@@ -222,32 +234,76 @@ def _build_request(args: dict):
         _only(args, base_fields)
         return "GET", f"/{quote(slug, safe='')}/maintenance_tasks?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
     if action == "create_maintenance_task":
-        fields = base_fields | {"name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction"}
+        fields = base_fields | {"name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction", "trigger", "event", "event_path"}
         _only(args, fields)
-        required = ("name", "schedule", "timezone", "kind", "app_operation", "capability_digest", "instruction")
+        # 触发方式：不传＝定时（老调用方一个字不用改）。事件 / 按需任务由平台唤醒，
+        # 没有自己的节奏，所以不要 schedule / timezone；事件名与「哪个事件要目录
+        # 作用域」由服务端按平台事件字典判，这里不复制一份名单（两套口径会打架）。
+        trigger = str(args.get("trigger", "") or "").strip().lower() or "schedule"
+        if trigger not in {"schedule", "event", "manual"}:
+            raise _apphost._BadRequest("trigger 只能是 schedule / event / manual")
+        required = ["name", "kind", "app_operation", "capability_digest", "instruction"]
+        if trigger == "schedule":
+            required += ["schedule", "timezone"]
         if any(not isinstance(args.get(key), str) or not str(args[key]).strip() for key in required):
             raise _apphost._BadRequest("create_maintenance_task requires its declared task contract")
+        event = str(args.get("event", "") or "").strip()
+        event_path = str(args.get("event_path", "") or "").strip()
+        if trigger == "event" and not event:
+            raise _apphost._BadRequest("trigger=event 必须写 event（平台事件名，见 app-coding 技能的 PLATFORM_EVENTS.md）")
+        if trigger != "event" and (event or event_path):
+            raise _apphost._BadRequest("只有 trigger=event 的任务才写 event / event_path")
         digest = str(args["capability_digest"]).lower()
         if not _SHA256_RE.fullmatch(digest):
             raise _apphost._BadRequest("capability_digest must come from app_capabilities")
-        return "POST", f"/{quote(slug, safe='')}/maintenance_tasks", {
-            "expected_instance_id": instance, "name": str(args["name"]).strip(), "schedule": str(args["schedule"]).strip(),
-            "timezone": str(args["timezone"]).strip(), "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(),
+        body = {
+            "expected_instance_id": instance, "name": str(args["name"]).strip(),
+            "schedule": str(args.get("schedule", "") or "").strip(), "timezone": str(args.get("timezone", "") or "").strip(),
+            "kind": str(args["kind"]).strip(), "app_operation": str(args["app_operation"]).strip(),
             "capability_digest": digest, "instruction": str(args["instruction"]).strip(),
-        }, _apphost._DEFAULT_TIMEOUT
+            "trigger": trigger,
+        }
+        if trigger == "event":
+            body["event"] = event
+            if event_path:
+                body["event_path"] = event_path
+        return "POST", f"/{quote(slug, safe='')}/maintenance_tasks", body, _apphost._DEFAULT_TIMEOUT
+    if action == "register_maintenance_tasks_from_spec":
+        # 两拍：不带 confirm 只算计划（服务端不落地任何东西），带 confirm + 同一份
+        # plan_digest 才执行。技能里要求先把计划、尤其删除项念给用户听。
+        _only(args, base_fields | {"confirm", "expected_plan_digest"})
+        confirm = args.get("confirm", False)
+        if not isinstance(confirm, bool):
+            raise _apphost._BadRequest("confirm 必须是布尔值")
+        digest = str(args.get("expected_plan_digest", "") or "").strip().lower()
+        if confirm and not _SHA256_RE.fullmatch(digest):
+            raise _apphost._BadRequest("confirm=true 必须带上给用户看过的那份计划的 plan_digest")
+        if not confirm and digest:
+            raise _apphost._BadRequest("expected_plan_digest 只在 confirm=true 时用")
+        body = {"expected_instance_id": instance, "confirm": confirm}
+        if confirm:
+            body["expected_plan_digest"] = digest
+        return "POST", f"/{quote(slug, safe='')}/maintenance_tasks/register_from_spec", body, _apphost._DEFAULT_TIMEOUT
     if action == "maintenance_task_events":
-        _only(args, base_fields | {"task_id", "spec_id", "ack"})
+        _only(args, base_fields | {"task_id", "spec_id", "creation_key", "ack"})
         query = {"expected_instance_id": instance}
         task_id = str(args.get("task_id", "") or "").strip()
         spec_id = str(args.get("spec_id", "") or "").strip()
+        # 运行期建出来的任务没有 spec_id：它的唤醒提示词给的是 creation_key
+        # （提示词写在 hermes 之外，由 App Host 生成，这里只负责把句柄透过去）。
+        creation_key = str(args.get("creation_key", "") or "").strip()
         if task_id:
             query["task_id"] = _required_task_id(args)
         elif spec_id:
             if len(spec_id) > 64 or "/" in spec_id or "\\" in spec_id:
                 raise _apphost._BadRequest("spec_id 必须是任务的 spec id")
             query["spec_id"] = spec_id
+        elif creation_key:
+            if not _SHA256_RE.fullmatch(creation_key):
+                raise _apphost._BadRequest("creation_key 必须照抄本任务唤醒提示词里的那一串")
+            query["creation_key"] = creation_key.lower()
         else:
-            raise _apphost._BadRequest("maintenance_task_events 需要 task_id 或 spec_id")
+            raise _apphost._BadRequest("maintenance_task_events 需要 task_id、spec_id 或 creation_key（照抄本任务唤醒提示词里给的那个）")
         ack = args.get("ack", True)
         if not isinstance(ack, bool):
             raise _apphost._BadRequest("ack 必须是布尔值")
@@ -387,6 +443,15 @@ def _maintenance_task_response(parsed, *, action: str):
         return parsed
     if action == "maintenance_task_events":
         if not isinstance(parsed, dict) or not isinstance(parsed.get("events"), list):
+            return None
+        return parsed
+    if action == "register_maintenance_tasks_from_spec":
+        # 没有 plan_digest / applied 就不是这个动作的回执：Agent 绝不能凭一个说不清
+        # 的 200 去跟用户说「已按规格登记」。三张清单也要在，缺一张读的人会以为
+        # 「没有要删的」，而其实是服务端没回答。
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("plan_digest"), str) or not isinstance(parsed.get("applied"), bool):
+            return None
+        if any(not isinstance(parsed.get(key), list) for key in ("create", "update", "delete")):
             return None
         return parsed
     return parsed
@@ -641,7 +706,7 @@ def app_workspace_tool(args, **_kw) -> str:
                 status=status,
             )
         return _apphost._ok(checked)
-    if action in {"maintenance_tasks", "create_maintenance_task", "update_maintenance_task", "maintenance_task_runs"}:
+    if action in {"maintenance_tasks", "create_maintenance_task", "update_maintenance_task", "maintenance_task_runs", "register_maintenance_tasks_from_spec"}:
         checked = _maintenance_task_response(parsed, action=action)
         if checked is None:
             return _apphost._local_error("outcome_unknown", "maintenance task 返回了不完整的回执", status=status)

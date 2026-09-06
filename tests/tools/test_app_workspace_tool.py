@@ -68,7 +68,7 @@ def test_schema_is_fixed_workspace_surface_not_generic_host_access():
         "publish", "discard", "maintainer_schedule_status", "maintenance_tasks",
         "create_maintenance_task", "update_maintenance_task",
         "delete_maintenance_task", "maintenance_task_runs",
-        "maintenance_task_events",
+        "maintenance_task_events", "register_maintenance_tasks_from_spec",
     }
     assert not {"command", "url", "host", "env", "shell", "directory"} & set(props)
     assert "relative" in props["path"]["description"]
@@ -96,7 +96,7 @@ def test_workspace_routes_and_wire_shapes(monkeypatch):
         ("publish", {"expected_revision": 4, "note": "Fix title"}, "POST", f"/{_SLUG}/workspace/publish", {"expected_instance_id": _INSTANCE, "expected_revision": 4, "note": "Fix title"}, {"version_id": "v2"}),
         ("maintainer_schedule_status", {}, "GET", f"/{_SLUG}/maintainer_schedule?expected_instance_id={_INSTANCE}", None, {"app_instance_id": _INSTANCE, "schedule": "0 9 * * *", "timezone": "Asia/Shanghai", "enabled": False, "schedule_revision": 4}),
         ("maintenance_tasks", {}, "GET", f"/{_SLUG}/maintenance_tasks?expected_instance_id={_INSTANCE}", None, {"tasks": []}),
-        ("create_maintenance_task", {"name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data."}, "POST", f"/{_SLUG}/maintenance_tasks", {"expected_instance_id": _INSTANCE, "name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data."}, {"id": "job-2"}),
+        ("create_maintenance_task", {"name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data."}, "POST", f"/{_SLUG}/maintenance_tasks", {"expected_instance_id": _INSTANCE, "name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data.", "trigger": "schedule"}, {"id": "job-2"}),
         ("maintenance_task_runs", {"task_id": "job-2"}, "GET", f"/{_SLUG}/maintenance_tasks/job-2/runs?expected_instance_id={_INSTANCE}", None, {"occurrences": []}),
         ("update_maintenance_task", {"task_id": "job-2", "expected_schedule_revision": 4, "name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data.", "enabled": False}, "PATCH", f"/{_SLUG}/maintenance_tasks/job-2", {"expected_instance_id": _INSTANCE, "expected_schedule_revision": 4, "name": "Hourly summary", "schedule": "every 30m", "timezone": "Asia/Shanghai", "kind": "summary", "app_operation": "weather.summarize", "capability_digest": _SHA, "instruction": "Summarize the latest weather data.", "enabled": False}, {"id": "job-2"}),
     ]
@@ -387,3 +387,113 @@ def test_publish_is_refused_locally_while_the_last_build_is_not_succeeded(monkey
     with mux_profile_scope(monkeypatch, _SCOPE), patch("tools.app_workspace_tool._apphost._urlopen", _sequence(seen, [missing, _Response({"version_id": "v3"})])):
         output = json.loads(app_workspace_tool(_args("publish", expected_revision=4, note="Fix title")))
     assert output["ok"] is True and output["data"]["version_id"] == "v3"
+
+
+def test_event_task_creation_is_reachable_and_scheduled_stays_the_default(monkeypatch):
+    """规格 3.2 事件触发：任务面以前只收定时任务，事件订阅在已发布应用上补建不出来。
+
+    这里锁三件事：不传 trigger 仍是定时（老调用方一个字不用改，见上面的 cases）；
+    事件任务不必给 schedule / timezone（平台唤醒它，没有自己的节奏）；事件名与
+    目录作用域由服务端按平台事件字典判——工具面不复制一份名单，只把字段透过去。
+    """
+    seen = {}
+    args = _args(
+        "create_maintenance_task",
+        name="转录完成就整理",
+        kind="refresh",
+        app_operation="notes.import",
+        capability_digest=_SHA,
+        instruction="读刚转录完成的会议并整理写回",
+        trigger="event",
+        event="meeting.done",
+    )
+    with mux_profile_scope(monkeypatch, _SCOPE), patch(
+        "tools.app_workspace_tool._apphost._urlopen", _capture(seen, _Response({"id": "job-9"}))
+    ):
+        output = json.loads(app_workspace_tool(args))
+    assert output["ok"] is True
+    body = json.loads(seen["request"].data)
+    assert body["trigger"] == "event" and body["event"] == "meeting.done"
+    assert body["schedule"] == "" and body["timezone"] == ""
+    assert "event_path" not in body
+
+    # 目录作用域的事件带上 event_path 原样透传
+    seen = {}
+    scoped = dict(args, event="file.added", event_path="/volume1/subvol/data/inbox")
+    with mux_profile_scope(monkeypatch, _SCOPE), patch(
+        "tools.app_workspace_tool._apphost._urlopen", _capture(seen, _Response({"id": "job-10"}))
+    ):
+        output = json.loads(app_workspace_tool(scoped))
+    assert output["ok"] is True
+    assert json.loads(seen["request"].data)["event_path"] == "/volume1/subvol/data/inbox"
+
+    # 本地就能判死的两种写法不必打扰服务端
+    for bad, why in (
+        (dict(args, event=""), "trigger=event 少了 event"),
+        (dict(_args("create_maintenance_task", name="x", schedule="every 30m", timezone="Asia/Shanghai",
+                    kind="refresh", app_operation="notes.import", capability_digest=_SHA,
+                    instruction="y"), event="meeting.done"), "定时任务不该带 event"),
+    ):
+        with mux_profile_scope(monkeypatch, _SCOPE):
+            output = json.loads(app_workspace_tool(bad))
+        assert output["ok"] is False, why
+        assert output["error"]["code"] == "invalid_request", why
+
+
+def test_register_from_spec_is_two_beats_with_a_plan_digest(monkeypatch):
+    """按 spec.yaml 登记：第一拍只算计划，第二拍必须带用户看过那份计划的指纹。"""
+    plan = {
+        "plan_digest": "b" * 64, "applied": False,
+        "create": [{"spec_id": "ingest", "name": "收件整理"}], "update": [], "delete": [],
+        "unchanged": [], "duplicates": [], "detail": "这是计划，还没有执行", "failures": 0,
+    }
+    seen = {}
+    with mux_profile_scope(monkeypatch, _SCOPE), patch(
+        "tools.app_workspace_tool._apphost._urlopen", _capture(seen, _Response(plan))
+    ):
+        output = json.loads(app_workspace_tool(_args("register_maintenance_tasks_from_spec")))
+    assert output["ok"] is True and output["data"]["applied"] is False
+    assert seen["request"].full_url == _BASE + f"/{_SLUG}/maintenance_tasks/register_from_spec"
+    assert json.loads(seen["request"].data) == {"expected_instance_id": _INSTANCE, "confirm": False}
+
+    seen = {}
+    applied = dict(plan, applied=True, detail="已按规格登记")
+    with mux_profile_scope(monkeypatch, _SCOPE), patch(
+        "tools.app_workspace_tool._apphost._urlopen", _capture(seen, _Response(applied))
+    ):
+        output = json.loads(app_workspace_tool(_args(
+            "register_maintenance_tasks_from_spec", confirm=True, expected_plan_digest="B" * 64)))
+    assert output["ok"] is True and output["data"]["applied"] is True
+    assert json.loads(seen["request"].data)["expected_plan_digest"] == "b" * 64
+
+    # 点头却说不出用户看的是哪一份计划：本地就拒，不发出去
+    with mux_profile_scope(monkeypatch, _SCOPE):
+        output = json.loads(app_workspace_tool(_args("register_maintenance_tasks_from_spec", confirm=True)))
+    assert output["ok"] is False and output["error"]["code"] == "invalid_request"
+
+    # 缺三张清单的回执不算回执：Agent 不能凭它说「已按规格登记」
+    with mux_profile_scope(monkeypatch, _SCOPE), patch(
+        "tools.app_workspace_tool._apphost._urlopen",
+        _capture({}, _Response({"plan_digest": "b" * 64, "applied": True})),
+    ):
+        output = json.loads(app_workspace_tool(_args("register_maintenance_tasks_from_spec")))
+    assert output["ok"] is False and output["error"]["code"] == "outcome_unknown"
+
+
+def test_event_inbox_can_be_addressed_by_creation_key(monkeypatch):
+    """运行期建的事件任务没有 spec_id，它的唤醒提示词给的是 creation_key。
+
+    09-06 板上 app-a849d28b 每 15 分钟一次 maintenance_task_events → 404：没有句柄
+    对得上。工具面必须认这第三个句柄，否则事件任务建出来也是哑弹。
+    """
+    seen = {}
+    with mux_profile_scope(monkeypatch, _SCOPE), patch(
+        "tools.app_workspace_tool._apphost._urlopen", _capture(seen, _Response({"events": []}))
+    ):
+        output = json.loads(app_workspace_tool(_args("maintenance_task_events", creation_key=_SHA)))
+    assert output["ok"] is True
+    assert f"creation_key={_SHA}" in seen["request"].full_url
+
+    with mux_profile_scope(monkeypatch, _SCOPE):
+        output = json.loads(app_workspace_tool(_args("maintenance_task_events")))
+    assert output["ok"] is False and output["error"]["code"] == "invalid_request"
