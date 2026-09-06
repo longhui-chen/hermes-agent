@@ -18,6 +18,12 @@ should follow:
                继续"; never `start` a fresh run for that
   cancel       abandon before the build starts
 
+A run that reaches step="done" (the app is LIVE) or a failed run the user
+walks away from is TERMINAL for this tool. A later "fix those defects / change
+it" request is a MODIFICATION: app-dispatch routes it to the app's dedicated
+maintainer agent through call_agent. The 3-round repair budget is scoped to one
+run and dies with it — it is never a reason to refuse a change request.
+
 There is deliberately NO confirm action: only the user starts the build (chat
 text the platform recognizes, or the creation page button). Loopback-only, same
 trust model as app_host. `create` is kept as an alias of `start` for older skill
@@ -61,7 +67,14 @@ _SCHEMA = {
         "workspace, spec and code already written; NEVER answer that with a new 'start' "
         "(only after the user closes the failed creation and explicitly wants a different "
         "app); action='cancel' (run_id) if the user gives up. You cannot start the build "
-        "yourself: only the user's confirmation does."
+        "yourself: only the user's confirmation does. A run at step='done' (the app is LIVE) "
+        "is TERMINAL for this tool: a later 'fix those defects / change it' request is a "
+        "MODIFICATION — route it to the app's dedicated maintainer agent via call_agent (see the "
+        "app-dispatch skill), never revise/retry/start here. The 3-round repair budget "
+        "(coding/preflight/compile/selftest/acceptance, surfaced as attempts_left or a timeline note "
+        "「修复轮次已用完（3/3）」) is scoped to THAT run alone and dies with it: NEVER cite it to refuse a "
+        "user's change request, and never tell the user to go re-ask in the app sidebar instead of "
+        "dispatching for them."
     ),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": sorted(_ACTIONS)},
