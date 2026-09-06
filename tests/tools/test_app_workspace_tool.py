@@ -64,7 +64,8 @@ def _args(action, **extra):
 def test_schema_is_fixed_workspace_surface_not_generic_host_access():
     props = APP_WORKSPACE_SCHEMA["parameters"]["properties"]
     assert set(props["action"]["enum"]) == {
-        "status", "checkout", "list", "read", "apply_patch", "build", "build_status",
+        "status", "checkout", "list", "read", "apply_patch", "sync_capabilities",
+        "build", "build_status",
         "publish", "discard", "maintainer_schedule_status", "maintenance_tasks",
         "create_maintenance_task", "update_maintenance_task",
         "delete_maintenance_task", "maintenance_task_runs",
