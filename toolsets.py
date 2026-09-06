@@ -309,7 +309,7 @@ TOOLSETS = {
     # the model's schema (found on a real device).
     "zettlab_apphost": {
         "description": "Manage device-hosted generated applications and their owner-scoped data (zettlab)",
-        "tools": ["app_host", "app_data"],
+        "tools": ["app_host", "app_data", "create_pipeline"],
         "includes": []
     },
 
@@ -578,7 +578,7 @@ TOOLSETS = {
         # tools are scoped to the active generated-app profile and must not be
         # advertised by messaging or Cron platforms.
         "tools": _HERMES_CORE_TOOLS + [
-            "call_agent", "app_host", "app_data", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "coding_agent_host", "ssh_control"
+            "call_agent", "app_host", "app_data", "create_pipeline", "desktop_pet_creator", "pc_node_status", "pc_file", "pc_ui", "coding_agent_host", "ssh_control"
         ],
         "includes": []
     },

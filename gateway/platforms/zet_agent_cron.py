@@ -38,6 +38,7 @@ Failure modes
 """
 
 import atexit
+import contextvars
 import json
 import logging
 import mimetypes
@@ -385,6 +386,86 @@ def _governor_refresh_defer(job: Optional[dict]) -> Optional[tuple]:
         return None
 
 
+# ── On-demand app tasks (local-server maintenance tasks with trigger manual /
+# event). Their hermes job is created paused with a placeholder schedule and
+# tagged ``source="app_task"``; it must only ever run when local-server
+# triggers it. hermes' own ``trigger_job`` re-enables the job (enabled=True +
+# next_run_at=now) which would let the placeholder schedule fire on its own
+# later, so for these jobs the trigger runs ``run_one_job`` directly in a
+# background thread and leaves the job paused. One run per job at a time.
+_APP_TASK_SOURCE = "app_task"
+_app_task_running: set = set()
+_app_task_lock = threading.Lock()
+
+
+def _run_app_task_now(job: dict) -> bool:
+    """Fire an on-demand app task in the background. Returns False when the
+    same job is already running (the platform's inbox keeps the events; the
+    run in flight drains them)."""
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return False
+    with _app_task_lock:
+        if job_id in _app_task_running:
+            _dbg(f"app task {job_id} already running; trigger folded")
+            return False
+        _app_task_running.add(job_id)
+
+    def _worker():
+        try:
+            from cron.scheduler import run_one_job
+            run_one_job(job, verbose=False, triggered_at=_now_iso())
+        except Exception as e:  # noqa: BLE001 — a failed run must not kill the trigger thread silently
+            logger.warning("zet_agent_cron: on-demand app task %s failed: %s", job_id, e)
+        finally:
+            with _app_task_lock:
+                _app_task_running.discard(job_id)
+
+    # Under multiplex the active profile (HERMES_HOME override, secret scope)
+    # lives in contextvars, and a bare Thread starts with an EMPTY context: the
+    # job would then run under the default profile — no model.default, and
+    # ``mark_job_run`` cannot find the job in that profile's store. Carry the
+    # trigger's context into the worker, exactly like the scheduler's own pool
+    # does (``_submit_with_guard`` → ``copy_context().run``).
+    _ctx = contextvars.copy_context()
+    threading.Thread(target=_ctx.run, args=(_worker,), name=f"app-task-{job_id}", daemon=True).start()
+    return True
+
+
+def _install_app_task_trigger() -> None:
+    """Patch cron.jobs.trigger_job so an app_task job runs without being
+    re-enabled. api_server binds ``trigger_job`` by name at import time, so the
+    already-imported module attribute is patched as well."""
+    try:
+        import cron.jobs as _jobs
+    except ImportError:
+        return
+    if getattr(_jobs.trigger_job, _PATCH_SENTINEL, False):
+        return
+    _orig_trigger = _jobs.trigger_job
+
+    def _wrapped_trigger(job_id):
+        try:
+            job = _jobs.resolve_job_ref(job_id)
+        except Exception:
+            job = None
+        if isinstance(job, dict) and job.get("source") == _APP_TASK_SOURCE:
+            _run_app_task_now(job)
+            return job
+        return _orig_trigger(job_id)
+
+    setattr(_wrapped_trigger, _PATCH_SENTINEL, True)
+    _jobs.trigger_job = _wrapped_trigger
+    try:
+        import sys as _sys
+        api_server = _sys.modules.get("gateway.platforms.api_server")
+        if api_server is not None and getattr(api_server, "_cron_trigger", None) is _orig_trigger:
+            api_server._cron_trigger = _wrapped_trigger
+    except Exception:
+        pass
+    _dbg("install() patched cron.jobs.trigger_job for app_task jobs")
+
+
 def _gate_run_one_job(orig_run_one_job, job, **kwargs):
     """Governor refresh gate around one job firing.
 
@@ -399,7 +480,7 @@ def _gate_run_one_job(orig_run_one_job, job, **kwargs):
     # tool) that must never be postponed by a profile-level governor decision —
     # a defer would silently skip time-sensitive one-shots. The refresh job is
     # tagged ``source="app_refresh"`` by local-server at creation.
-    if not (isinstance(job, dict) and job.get("source") == "app_refresh"):
+    if not (isinstance(job, dict) and job.get("source") in ("app_refresh", _APP_TASK_SOURCE)):
         return orig_run_one_job(job, **kwargs)
     defer_info = _governor_refresh_defer(job)
     if defer_info is not None:
@@ -1001,6 +1082,11 @@ def install() -> None:
     _sched.mark_job_run = _wrapped_mark
     _sched._record_silent_run = _wrapped_record_silent
     _dbg("install() patched mark_job_run + save_job_output + _record_silent_run OK")
+
+    try:
+        _install_app_task_trigger()
+    except Exception as e:
+        _dbg(f"install() app task trigger patch FAILED: {e!r}")
 
     # ── run_job retry wrapper — auto-retry clean transient failures.
     try:

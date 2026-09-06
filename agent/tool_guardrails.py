@@ -263,6 +263,20 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
+    # Mirror of display._detect_tool_failure: a JSON object is judged by its
+    # own verdict/error fields, never by the substring heuristic (see there).
+    data = safe_json_loads(result)
+    if isinstance(data, dict):
+        err = data.get("error") or data.get("message")
+        if err and (data.get("success") is False or "error" in data):
+            return True, " [error]"
+        verdict = data.get("ok")
+        if not isinstance(verdict, bool):
+            verdict = data.get("success")
+        if isinstance(verdict, bool):
+            return (not verdict), ("" if verdict else " [error]")
+        return False, ""
+
     lower = result[:500].lower()
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
         return True, " [error]"

@@ -931,9 +931,20 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # One exception: the sample is produced by a byte-bounded
+            # ``head -c``, so a multi-byte UTF-8 character sitting on the cut
+            # boundary decodes into a single *trailing* U+FFFD. That is an
+            # artefact of the sampling, not of the file \u2014 a Go/HTML source
+            # with Chinese comments hit it on every read and was reported as
+            # "binary" (the coding agent then re-implemented helpers it could
+            # not see and broke the build). Ignore replacement chars only when
+            # they sit at the very end of the sample; anywhere else they still
+            # mean undecodable bytes.
+            sample = content_sample[:1000]
+            if "\ufffd" in sample.rstrip("\ufffd"):
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
         
@@ -3021,7 +3032,19 @@ class ShellFileOperations(FileOperations):
         
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.
+        #
+        # GNU grep applies --exclude-dir to the *command-line* directory as
+        # well, matching the glob against every "name suffix" of the argument
+        # (and `*` spans `/` there). So a search root that merely lives under a
+        # hidden directory — e.g. .../output/.pipeline/<run>/app — is skipped
+        # wholesale and every search reports 0 matches. To keep the hidden-dir
+        # exclusion only for the recursion, a directory root is searched from
+        # *inside* it (`cd root && grep ... -- *`): the arguments are then the
+        # root's own non-hidden children, and the relative results are
+        # re-prefixed with the root below.
         cmd_parts.append("--exclude-dir='.*'")
+        root_is_dir = self._exec(f"test -d {self._escape_shell_arg(path)}").exit_code == 0
+        result_prefix = ""
         
         # Add context if requested
         if context > 0:
@@ -3039,7 +3062,17 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        if root_is_dir:
+            # `set -- *` expands to the non-hidden children; when the directory
+            # is empty the glob stays literal and `[ -e "$1" ]` fails, which
+            # ends the pipeline with exit 1 (= no matches) instead of a grep
+            # error about a file named "*".
+            root = path.rstrip("/") or "/"
+            result_prefix = "" if root == "/" else root + "/"
+            cmd_parts = ["cd", self._escape_shell_arg(root), "&&", "set", "--", "*",
+                         "&&", "[", "-e", "\"$1\"", "]", "&&"] + cmd_parts + ["--", "\"$@\""]
+        else:
+            cmd_parts.append(self._escape_shell_arg(path))
         
         # Fetch generously so we can compute total before slicing
         fetch_limit = limit + offset + (200 if context > 0 else 0)
@@ -3050,7 +3083,14 @@ class ShellFileOperations(FileOperations):
         # A truncating head makes grep exit 141 (SIGPIPE) on an otherwise
         # successful search; the strict `== 2` guard below ignores that, so
         # pipefail does not turn truncated results into false errors.
-        cmd = "set -o pipefail; " + " ".join(cmd_parts)
+        #
+        # Pin a UTF-8 locale for grep: under the C/POSIX locale GNU grep
+        # (>= 2.21) treats any file with bytes that are not valid in the
+        # current encoding as *binary* and silently drops its matches — a
+        # plain Go/HTML source with Chinese comments then reports "0 matches".
+        # C.UTF-8 exists on glibc/musl hosts; where it does not, setlocale
+        # falls back to C and behaves exactly as before.
+        cmd = "set -o pipefail; LC_ALL=C.UTF-8 " + " ".join(cmd_parts)
         result = self._exec(cmd, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
@@ -3067,6 +3107,15 @@ class ShellFileOperations(FileOperations):
         if result.exit_code == 2 and not payload.strip():
             error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
             return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
+
+        if result_prefix:
+            # Results came back relative to the root (see the cd above);
+            # restore the absolute paths the caller asked about. Context-mode
+            # group separators ("--") are left untouched.
+            payload = "\n".join(
+                (result_prefix + line) if line and line != "--" else line
+                for line in payload.split("\n")
+            )
 
         stdout = payload
         if output_mode == "files_only":

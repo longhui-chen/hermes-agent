@@ -90,11 +90,29 @@ def _own_session_id() -> str:
 
     Empty for CLI/unknown contexts (the endpoint then rejects: no owner).
     """
+    key = ""
+    # 首选：zet_agent 在执行边界冻结的会话 key（gateway.session_context，
+    # push_execution_session_key）。这是 create_pipeline 绑定创建 run 用的同一来源，
+    # 真机上主 Agent 的聊天轮次里它一定有值。09-05 板上实测：approval contextvar 与
+    # HERMES_SESSION_KEY（多路复用下 fail-closed 不读进程环境）在主 Agent 聊天轮里
+    # 都是空的，call_agent 一律 LS 400「missing caller_session_id」，修改派发从没成功过。
     try:
-        from tools.approval import get_current_session_key
+        from gateway.session_context import execution_session_key
 
-        key = str(get_current_session_key("") or "")
+        key = str(execution_session_key() or "").strip()
     except Exception:
+        key = ""
+    if not key:
+        try:
+            from tools.approval import get_current_session_key
+
+            key = str(get_current_session_key("") or "")
+        except Exception:
+            key = ""
+    if not key:
+        # contextvar 在某些执行路径（线程池里跑的工具调用等）拿不到，退回进程环境。
+        key = str(_scoped_env("HERMES_SESSION_KEY", "") or "").strip()
+    if not key:
         return ""
     marker = ":zet_agent:"
     idx = key.find(marker)

@@ -20,7 +20,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from agent.credential_broker import request_app_auto_refresh_token
 from agent.secret_scope import get_secret
@@ -100,6 +100,10 @@ _HTTP_ACTIONS = (
     # operation journal: the former invokes a declared app capability, the
     # latter only reads the state of an already accepted workflow.
     "app_capabilities", "app_operation", "workflow_operation_status", "workflow_operation_resume",
+    # The platform-event inbox of one maintenance task (规范 3.2 事件触发). A
+    # read, scoped by the maintainer binding — so it lives on the app_host
+    # face that cron turns keep, not on the interactive-only app_workspace.
+    "maintenance_task_events",
 )
 _ACTIONS = _HTTP_ACTIONS + ("build_env",)
 
@@ -165,7 +169,12 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Application slug. Required for install, reload, "
-                    "rollback, delete, lifecycle, logs, and call."
+                    "rollback, delete, lifecycle, logs, call, app_capabilities, "
+                    "app_operation, workflow_operation_status, "
+                    "workflow_operation_resume and maintenance_task_events — "
+                    "i.e. every action that names one app. A maintenance-task "
+                    "prompt states it as slug=\"...\"; pass that exact value on "
+                    "every call (the tool never infers it)."
                 ),
             },
             "path": {
@@ -282,7 +291,17 @@ APP_HOST_SCHEMA = {
             },
             "payload": {
                 "type": "object",
-                "description": "Required for app_operation: operation payload, passed unchanged inside App Host's closed envelope.",
+                "description": (
+                    "Required for app_operation: operation payload, passed unchanged inside "
+                    "App Host's closed envelope. One flat JSON object whose keys are exactly "
+                    "the operation's declared input fields (app_capabilities returns them as "
+                    "operations[].input when the app declares them; otherwise use the field "
+                    "names the task prompt or spec gives). Do not wrap it under an entity key "
+                    "(no {\"recording\": {...}}), do not invent extra fields (the app ignores "
+                    "or rejects them — an ignored field is a silent empty write), and do not "
+                    "put child records into a parent operation: each declared entity has its "
+                    "own operation (e.g. one todos.upsert per todo after recordings.upsert)."
+                ),
             },
             "query": {
                 "type": "object",
@@ -291,7 +310,14 @@ APP_HOST_SCHEMA = {
             },
             "idempotency_key": {
                 "type": "string",
-                "description": "Optional app_operation idempotency key declared by the app capability.",
+                "description": (
+                    "app_operation idempotency key. REQUIRED for every mode=mutation "
+                    "operation (App Host answers 400 without it); optional for reads. "
+                    "Use a stable id of the source record — for an event task the event's "
+                    "key (e.g. the meeting_id) — one key per written record, and reuse the "
+                    "same key when resending the same write; never mint a new key to get "
+                    "past a validation error, fix the payload instead."
+                ),
             },
             "capability_digest": {
                 "type": "string",
@@ -304,6 +330,22 @@ APP_HOST_SCHEMA = {
             "operation_id": {
                 "type": "string",
                 "description": "Required for workflow_operation_status: App Host operation journal receipt id.",
+            },
+            "spec_id": {
+                "type": "string",
+                "description": "For maintenance_task_events: the maintenance task's spec id (as named in the run prompt). Either spec_id or task_id is required.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "For maintenance_task_events: the maintenance task's job id, when known instead of spec_id.",
+            },
+            "ack": {
+                "type": "boolean",
+                "description": "For maintenance_task_events: acknowledge (remove) the returned events; default true. Pass false to peek without draining.",
+            },
+            "expected_instance_id": {
+                "type": "string",
+                "description": "For maintenance_task_events: optional current app_instance_id (from list); omit to read the current instance.",
             },
         },
         "required": ["action"],
@@ -398,7 +440,10 @@ class _AutoRefreshScopeUnavailable(ValueError):
 def _require_slug(args):
     slug = str(args.get("slug", "") or "").strip()
     if not slug:
-        raise _BadRequest("该动作需要提供 slug 参数")
+        raise _BadRequest(
+            "该动作需要提供 slug 参数（应用标识；任务提示词里写作 slug=\"…\"，"
+            "app_capabilities 返回的 data.app 也是它）。补上 slug 原样重发即可"
+        )
     if not _SLUG_RE.match(slug):
         raise _BadRequest("slug 格式不合法（仅允许字母、数字、点、下划线、连字符）")
     return slug
@@ -781,6 +826,31 @@ def _build_request(action, args):
         if lifecycle_action not in _LIFECYCLE_ACTIONS:
             raise _BadRequest("lifecycle 需要 lifecycle_action 参数（start/stop/restart）")
         return "POST", f"/{slug}/lifecycle", {"action": lifecycle_action}, timeout
+    if action == "maintenance_task_events":
+        slug = _require_slug(args)
+        query = {}
+        task_id = str(args.get("task_id", "") or "").strip()
+        spec_id = str(args.get("spec_id", "") or "").strip()
+        if task_id:
+            if len(task_id) > 64 or not re.fullmatch(r"[A-Za-z0-9_.-]+", task_id):
+                raise _BadRequest("task_id 必须是任务的 job id")
+            query["task_id"] = task_id
+        elif spec_id:
+            if len(spec_id) > 64 or "/" in spec_id or "\\" in spec_id or any(ord(ch) < 0x20 for ch in spec_id):
+                raise _BadRequest("spec_id 必须是任务的 spec id")
+            query["spec_id"] = spec_id
+        else:
+            raise _BadRequest("maintenance_task_events 需要 spec_id 或 task_id")
+        ack = args.get("ack", True)
+        if not isinstance(ack, bool):
+            raise _BadRequest("ack 必须是布尔值")
+        query["ack"] = "true" if ack else "false"
+        instance = str(args.get("expected_instance_id", "") or "").strip()
+        if instance:
+            if len(instance) > 256 or any(ord(ch) < 0x20 for ch in instance):
+                raise _BadRequest("expected_instance_id 必须是合法的当前 app_instance_id")
+            query["expected_instance_id"] = instance
+        return "GET", f"/{slug}/maintenance_task_events?" + urlencode(query), None, timeout
     if action == "logs":
         slug = _require_slug(args)
         tail = args.get("tail", _DEFAULT_LOG_TAIL)
@@ -808,6 +878,29 @@ def _build_request(action, args):
             body["body"] = args["body"]
         return "POST", f"/{slug}/call", body, timeout
     raise _BadRequest(f"未知动作：{action}")
+
+
+def _app_operation_hint(action, status, upstream):
+    """Model-facing `next` for the two app_operation rejections a task agent
+    keeps tripping on (09-05 事件任务实测：缺幂等键 400、应用拒 payload 422 各
+    试错一轮才写成). The upstream {code, message} stays verbatim; the hint is
+    an extra key so skills branching on `code` are unaffected."""
+    if action != "app_operation" or not isinstance(upstream, dict):
+        return ""
+    message = str(upstream.get("message", "") or "")
+    if status == 400 and "idempotency_key" in message:
+        return (
+            "mutation 操作必须带 idempotency_key：用这条记录的稳定标识"
+            "（事件任务用事件 key / meeting_id），payload 原样、加上 idempotency_key 重发一次"
+        )
+    if status == 422 and upstream.get("code") == "invalid_request":
+        return (
+            "这是应用自己拒绝了 payload（括号里是应用回的 HTTP 状态）：字段名或类型不符。"
+            "对照 app_capabilities 的 operations[].input（没有就按任务提示 / 规格里的字段）"
+            "改成一层扁平对象、只放声明过的字段、id 类字段用应用自己的整数编号；"
+            "保持同一个 idempotency_key 重发，不要换 key、不要把数据套进别的键里"
+        )
+    return ""
 
 
 def _parse_upstream_error(raw_body):
@@ -845,11 +938,40 @@ def _build_env_result():
     return _ok({"vendor_dir": vendor_dir, "ready": ready})
 
 
+def _resolve_current_instance(slug):
+    """Return the current app_instance_id of ``slug`` from its capability
+    contract (the one read a bound maintainer may always make — the
+    owner-scoped list is closed to it), or "" when it cannot be determined
+    (the caller then sends the request without it and lets App Host answer)."""
+    if not slug or not _SLUG_RE.match(slug):
+        return ""
+    base = _base_url()
+    token = _secret("ZETTLAB_AGENT_ACTION_TOKEN")
+    if not base or not token:
+        return ""
+    headers = {_ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
+    try:
+        headers.update(_execution_headers())
+    except Exception:
+        pass
+    req = urllib.request.Request(base + f"/{quote(slug, safe='')}/capabilities", headers=headers, method="GET")
+    try:
+        with _urlopen(req, timeout=_DEFAULT_TIMEOUT) as resp:
+            raw = resp.read(_MAX_RESPONSE_BYTES + 1)
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return ""
+    if isinstance(parsed, dict):
+        return str(parsed.get("app_instance_id", "") or "").strip()
+    return ""
+
+
 _COMPLETION_STATUS = {
     "probe": {200}, "list": {200}, "app_capabilities": {200},
     "app_operation": {200}, "acquire_slot": {200}, "release_slot": {204},
     "publish": {200, 202}, "install": {200, 202}, "reload": {200, 202}, "rollback": {200},
     "delete": {204}, "lifecycle": {200}, "logs": {200}, "call": {200},
+    "maintenance_task_events": {200},
     "workflow_operation_status": {200, 202}, "workflow_operation_resume": {200, 202},
 }
 
@@ -974,6 +1096,15 @@ def _app_host_tool_dispatch(args, **_kw):
         # Pure local check — no HTTP request, no credentials leave the tool.
         return _build_env_result()
 
+    if action == "maintenance_task_events" and not str(args.get("expected_instance_id", "") or "").strip():
+        # The wake-up prompt names the app by slug only; local-servers before
+        # the inbox relaxation refuse the read without the current instance id
+        # (404), so resolve it from the owner-scoped list before asking.
+        resolved = _resolve_current_instance(str(args.get("slug", "") or "").strip())
+        if resolved:
+            args = dict(args)
+            args["expected_instance_id"] = resolved
+
     try:
         method, path, body, timeout = _build_request(action, args)
         execution_headers = _execution_headers()
@@ -1023,6 +1154,10 @@ def _app_host_tool_dispatch(args, **_kw):
             # Verbatim pass-through: skills branch on the upstream `code`
             # string (slug_conflict / storage_full / ...), never the HTTP
             # status. Do not flatten into prose.
+            hint = _app_operation_hint(action, exc.code, upstream)
+            if hint:
+                upstream = dict(upstream)
+                upstream["next"] = hint
             return _fail(upstream, status=exc.code)
         if action in ("rollback", "publish", "call") and exc.code == 404:
             # Hermes and local-server ship as separate OTA packages, so this
