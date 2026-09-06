@@ -136,6 +136,53 @@ def test_app_slug_job_with_zero_import_attempts_is_hard_error(monkeypatch):
     assert err == "no import attempted in this run"
 
 
+def test_no_import_verdict_is_stamped_back_onto_the_saved_doc(monkeypatch, tmp_path):
+    """The doc is saved before the import verdict runs, so without a
+    write-back it keeps reading as a clean run while the job record says
+    error — the client's run history (which parses the doc) and the task
+    card (which reads the job record) then disagree. The verdict must be
+    mirrored onto the doc in the same shape run_job uses for in-run failures:
+    "(FAILED)" in the title and an "## Error" section with the reason."""
+    calls = _patch_pipeline(monkeypatch, success=True, final="[SILENT]", import_attempts=[])
+    doc = tmp_path / "2026-09-06_18-00-24.md"
+    doc.write_text("# Cron Job: sync\n\n**Job ID:** j\n\n## Response\n\n[SILENT]\n", encoding="utf-8")
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: str(doc))
+
+    s.run_one_job({"id": "j-app-stamp", "name": "sync", "app_slug": "hangzhou-weather-live"})
+
+    _, _, ok, err = _mark_call(calls)
+    assert ok is False and err == "no import attempted in this run"
+    text = doc.read_text(encoding="utf-8")
+    assert text.splitlines()[0] == "# Cron Job: sync (FAILED)"
+    assert "## Error\n\n```\nno import attempted in this run\n```" in text
+    # the original body is kept, only the verdict is added
+    assert "## Response\n\n[SILENT]" in text
+
+
+def test_confirmed_import_leaves_the_saved_doc_untouched(monkeypatch, tmp_path):
+    calls = _patch_pipeline(
+        monkeypatch, success=True, final="done",
+        import_attempts=[{"operation": "data.import", "ok": True}],
+    )
+    doc = tmp_path / "run.md"
+    original = "# Cron Job: sync\n\n## Response\n\ndone\n"
+    doc.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: str(doc))
+
+    s.run_one_job({"id": "j-app-clean", "name": "sync", "app_slug": "hangzhou-weather-live"})
+
+    assert _mark_call(calls)[2] is True
+    assert doc.read_text(encoding="utf-8") == original
+
+
+def test_stamp_failure_is_idempotent_and_safe_on_missing_doc(tmp_path):
+    doc = tmp_path / "run.md"
+    doc.write_text("# Cron Job: sync (FAILED)\n\n## Error\n\n```\nboom\n```\n", encoding="utf-8")
+    assert s._stamp_failure_on_output(str(doc), {"id": "j"}, "boom") is False
+    assert s._stamp_failure_on_output(str(tmp_path / "missing.md"), {"id": "j"}, "boom") is False
+    assert s._stamp_failure_on_output(None, {"id": "j"}, "boom") is False
+
+
 def test_app_slug_job_uses_the_last_failed_attempt_reason(monkeypatch):
     """Multiple failed attempts this round (e.g. retry-after-rejection) — the
     verdict must report the LAST failure, not the first."""
