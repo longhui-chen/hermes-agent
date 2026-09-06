@@ -21,7 +21,8 @@ from tools.registry import registry
 
 
 _ACTIONS = frozenset({
-    "status", "checkout", "list", "read", "apply_patch", "build", "build_status",
+    "status", "checkout", "list", "read", "apply_patch", "sync_capabilities",
+    "build", "build_status",
     "publish", "discard", "maintainer_schedule_status", "maintenance_tasks",
     "create_maintenance_task", "update_maintenance_task",
     "delete_maintenance_task", "maintenance_task_runs",
@@ -61,6 +62,15 @@ APP_WORKSPACE_SCHEMA = {
         "until it is terminal; never call build again while one is running. "
         "publish requires the latest build to have succeeded on the current "
         "content (error codes build_required / build_stale: build again). "
+        "sync_capabilities installs, from the platform presets, the capability "
+        "files the workspace spec.yaml declares (capabilities.ai -> appai.go "
+        "with platformAISummarize/platformAIChoose; cron/events/agent_tasks -> "
+        "apptasks.go) and grants them in metadata; run it after editing "
+        "spec.yaml capabilities and before build. The platform always offers a "
+        "stateless AI face to apps — never tell the user no AI model is "
+        "available; declare ai in spec.yaml, sync_capabilities, then call the "
+        "appai.go helpers. A 404 from sync_capabilities means this device's "
+        "App Host predates the route: say so and stop, do not hand-copy files. "
         "After checkout, use list to see "
         "which files exist and read only paths it returned — never guess a "
         "pathname. A generated app keeps its page source at static/index.html, "
@@ -283,7 +293,7 @@ def _build_request(args: dict):
             raise _apphost._BadRequest("build_id 必须是 build 返回的 build_id")
         suffix = f"/{quote(build_id, safe='')}" if build_id else ""
         return "GET", f"{root}/build{suffix}?" + urlencode({"expected_instance_id": instance}), None, _apphost._DEFAULT_TIMEOUT
-    if action in {"checkout", "build", "discard"}:
+    if action in {"checkout", "build", "discard", "sync_capabilities"}:
         _only(args, base_fields)
         method = "DELETE" if action == "discard" else "POST"
         path = root if action == "discard" else f"{root}/{action}"
