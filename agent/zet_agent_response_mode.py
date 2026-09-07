@@ -1725,6 +1725,11 @@ def _camera_runtime_argv(
         return None
     if not all(isinstance(value, str) for value in argv):
         return None
+    # The shared terminal parser also recognizes scheduled semantic helpers.
+    # Those use Cron execution identity and device policy authorization, not a
+    # Chat camsnap receipt. Never classify them as manual camera operations.
+    if Path(argv[1]).name != "camera_connector.py":
+        return None
     return list(argv)
 
 

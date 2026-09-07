@@ -52,8 +52,14 @@ def runtime(monkeypatch, tmp_path):
 
 
 def test_terminal_semantic_flow_uses_private_fds(runtime):
+    from types import SimpleNamespace
+    from agent.zet_agent_response_mode import trusted_skill_operation_block_message
+
     profile, _ = runtime
     with execution_scope("job-a", "run-a", profile):
+        assert trusted_skill_operation_block_message(
+            SimpleNamespace(), function_name="terminal", function_args={"command": COMMAND}
+        ) is None
         result = json.loads(terminal.terminal_tool(command=COMMAND, task_id="semantic-fd-flow"))
     assert result["camera_runtime_direct"] is True
     assert result["exit_code"] == 0
@@ -187,3 +193,27 @@ def test_generic_subprocess_scrubs_execution_identity(runtime):
     _apply_profile_secret_scope_env(env, inject=True)
     assert "ZETTLAB_CAMERA_JOB_ID" not in env
     assert "ZETTLAB_CAMERA_EXECUTION_ID" not in env
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_real_middleware_preserves_semantic_runner_authorization(runtime, monkeypatch, scheduled):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from agent import tool_executor
+
+    monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *a, **k: None)
+    agent = SimpleNamespace(
+        platform="zet_agent", session_id="semantic-session",
+        _tool_guardrails=SimpleNamespace(before_call=lambda *a: SimpleNamespace(allows_execution=True)),
+    )
+    context = execution_scope("job-a", "run-a", runtime[0]) if scheduled else nullcontext()
+    with context:
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent, function_name="terminal", function_args={"command": COMMAND},
+            effective_task_id="semantic-middleware", tool_call_id="semantic-call",
+            execute=lambda args: terminal.terminal_tool(**args, task_id="semantic-middleware"),
+        )
+    assert not outcome.blocked
+    result = json.loads(outcome.result)
+    assert result["camera_runtime_direct"] is True
+    assert result["exit_code"] == (0 if scheduled else -1)

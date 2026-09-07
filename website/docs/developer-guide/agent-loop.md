@@ -160,6 +160,14 @@ if scope still cannot be established, clarify the requested operation instead
 of repeatedly invoking the same blocked helper. Existing policy event error
 types are preserved for compatibility.
 
+This manual `camsnap` admission check must only classify `camera_connector.py`.
+The shared terminal parser also accepts `camera_semantic_monitor.py`, but that
+background helper uses the Cron-bound direct runner and device policy checks,
+not a Chat receipt. Excluding it from manual-camera classification grants no
+authority: without a matching scheduler/profile context its runner rejects it.
+The existing silent-automation and other active Skill scope restrictions remain
+in force.
+
 ### Agent-Level Tools
 
 Some tools are intercepted by `run_agent.py` *before* reaching `handle_function_call()`:
