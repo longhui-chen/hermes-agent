@@ -673,6 +673,28 @@ def test_camera_media_intent_is_not_inventory_only():
     assert not task.camera_inventory_only
 
 
+@pytest.mark.parametrize("message", [
+    "我已经授权了摄像头，再试下",
+    "摄像头已经打开，重试",
+    "摄像头开关打开了，重试刚才的操作",
+])
+def test_camera_authorization_retry_is_inventory_only(message):
+    task = response_mode._skill_direct_task_context(_FakeAgent(), message)
+    assert task.camera_applicable
+    assert task.camera_inventory_only
+
+
+@pytest.mark.parametrize("message", [
+    "再试下",
+    "总结“我已经授权了摄像头，再试下”这句话",
+    "我已经授权了摄像头，再试下并开始持续监控",
+    "我没有授权摄像头，再试下",
+])
+def test_camera_retry_does_not_infer_authority_from_unrelated_text(message):
+    task = response_mode._skill_direct_task_context(_FakeAgent(), message)
+    assert not task.camera_applicable
+
+
 def test_camera_inventory_command_policy_allows_list_but_blocks_capture(
     monkeypatch,
 ):
@@ -1139,14 +1161,15 @@ def test_hardware_enrollment_fallback_ignores_non_app_and_failed_turns():
 
 
 @pytest.mark.parametrize(
-    ("message", "explicit_skill_slug"),
+    ("message", "explicit_skill_slug", "inventory_only"),
     [
-        ("拍一张快照", ""),
-        ("返回当前最新的一张图片", "camsnap"),
+        ("拍一张快照", "", False),
+        ("返回当前最新的一张图片", "camsnap", False),
+        ("我已经授权了摄像头，再试下", "", True),
     ],
 )
 def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
-    tmp_path, monkeypatch, message, explicit_skill_slug
+    tmp_path, monkeypatch, message, explicit_skill_slug, inventory_only
 ):
     from agent import secret_scope as secret_scope_module
     from gateway.session_context import clear_session_vars, set_session_vars
@@ -1286,6 +1309,14 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
             function_args=list_args,
             dispatch=_dispatch_list,
         )
+
+        if inventory_only:
+            assert trusted_skill_operation_block_message(
+                agent, function_name="terminal", function_args={
+                    "command": "python3 camera_connector.py snap --camera-id cam_front",
+                },
+            ) is not None
+            return
 
         invented_error = trusted_skill_operation_block_message(
             agent,
