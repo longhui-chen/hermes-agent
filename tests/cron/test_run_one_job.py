@@ -11,6 +11,7 @@ the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
 import cron.scheduler as s
+import pytest
 from datetime import datetime, timezone
 
 
@@ -65,6 +66,39 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_run_one_job_binds_private_execution_only_during_run(monkeypatch, tmp_path, raises):
+    from cron.execution_context import current_execution
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(s, "create_execution", lambda *a, **k: {"id": "actual-run"})
+    running = []
+    observed = []
+    monkeypatch.setattr(s, "mark_execution_running", lambda eid: running.append(eid))
+
+    def run(job, **kwargs):
+        identity = current_execution()
+        assert running == ["actual-run"]
+        assert identity is not None
+        assert (identity.job_id, identity.execution_id, identity.profile_home) == (
+            "scoped-job", "actual-run", tmp_path
+        )
+        observed.append(identity)
+        if raises:
+            raise RuntimeError("test run failure")
+        return True, "output", "final", None
+
+    def deliver(*args, **kwargs):
+        assert current_execution() is None
+
+    monkeypatch.setattr(s, "run_job", run)
+    monkeypatch.setattr(s, "_deliver_result", deliver)
+    assert s.run_one_job({"id": "scoped-job", "_connector_execution_id": "forged"}) is not raises
+    assert len(observed) == 1
+    assert current_execution() is None
 
 
 def test_run_one_job_silent_skips_delivery(monkeypatch):

@@ -173,6 +173,15 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 
 ### Fresh Session Isolation
 
+`run_one_job` also binds a private immutable job/execution/profile identity in
+`cron.execution_context` after the durable running transition. It is scoped to
+`run_job`, restored even on exceptions, and never sourced from shell environment
+variables or Chat routing metadata. Normal `copy_context()` workers inherit the
+identity, but it is not a grant: hardware consumers must independently check the
+active execution ledger and their resource policy at the service boundary.
+Unsupported legacy IDs leave this private identity unavailable without stopping
+ordinary Cron jobs. Delivery runs outside this execution scope.
+
 Each cron job runs in a completely fresh agent session:
 
 - No conversation history from previous runs
