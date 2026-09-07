@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -217,3 +218,98 @@ def test_real_middleware_preserves_semantic_runner_authorization(runtime, monkey
     result = json.loads(outcome.result)
     assert result["camera_runtime_direct"] is True
     assert result["exit_code"] == (0 if scheduled else -1)
+
+
+@pytest.mark.parametrize("matched", [False, True])
+def test_real_presets_helper_candidate_and_commit(runtime, matched):
+    """Opt-in cross-repo contract flow; never substitute an embedded helper.
+
+    Run with HERMES_TEST_CAMERA_PRESETS_SOURCE pointing at the Presets
+    script under test. The HTTP camera service and media are fixtures, while
+    Python isolation, private FDs, script execution, HTTP and file IO are real.
+    """
+    import base64
+    import hashlib
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from agent.secret_scope import current_secret_scope
+
+    source = os.environ.get("HERMES_TEST_CAMERA_PRESETS_SOURCE")
+    if not source:
+        pytest.skip("explicit Presets source is required for cross-repo flow")
+    profile, script = runtime
+    raw = Path(source).read_bytes()
+    assert raw and len(raw) < 1024 * 1024
+    script.write_bytes(raw)
+    output = profile / "output"
+    output.mkdir(mode=0o700)
+    image = b"\xff\xd8fixture-media\xff\xd9"
+    capability = "c" * 48
+    times = [f"2026-09-07T12:00:{second:02d}Z" for second in (0, 4, 8, 12)]
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append((self.path, body, self.headers.get("X-Zettlab-Agent-Action-Token")))
+            if self.path.endswith("/semantic-candidates"):
+                data = {
+                    "capability": capability, "evidence_ref": "window-frame-0.jpg",
+                    "frame_times": times, "subject_kind": "person", "subject_ref": "",
+                    "predicate": "lingers", "zone_id": "", "min_duration_seconds": 10,
+                    "image_data_uri": "data:image/jpeg;base64," + base64.b64encode(image).decode(),
+                }
+            else:
+                data = {"matched": body["verdict"]["matched"]}
+            response = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    values = dict(current_secret_scope())
+    values["ZET_CHAT_APPEND_URL"] = f"http://127.0.0.1:{server.server_port}/api/v1/internal/chat/append"
+    token = set_secret_scope(values)
+    try:
+        with execution_scope("job-a", "run-a", profile):
+            candidate = json.loads(terminal.terminal_tool(command=COMMAND, timeout=60, task_id="real-presets-candidate"))
+            assert candidate["exit_code"] == 0, candidate
+            data = json.loads(candidate["output"])["data"]
+            attachment = Path(data["attachment_path"])
+            assert attachment.parent == output
+            assert attachment.read_bytes() == image
+            assert attachment.stat().st_mode & 0o777 == 0o600
+            assert data["frame_times"] == times
+            assert "image_data_uri" not in data
+            verdict = {"matched": matched}
+            commit = f'python3 "$ZETTLAB_PRESETS_DIR/{SCRIPT}" commit --capability {data["capability"]} --matched {str(matched).lower()}'
+            if matched:
+                commit += " --subject-kind person --predicate lingers --duration-seconds 12 --evidence-ref " + data["evidence_ref"]
+                verdict.update(subject_kind="person", subject_ref="", predicate="lingers",
+                               zone_id="", duration_seconds=12, evidence_ref=data["evidence_ref"])
+            result = json.loads(terminal.terminal_tool(command=commit, task_id="real-presets-commit"))
+            assert result["exit_code"] == 0, result
+            assert json.loads(result["output"]) == {"data": {"matched": matched}}
+        assert len(requests) == 2
+        for path, body, bearer in requests:
+            assert path.startswith("/api/v1/agent/hardware-connectors/cameras/semantic-")
+            assert body["job_id"] == "job-a" and body["execution_id"] == "run-a"
+            assert bearer == "a" * 64
+        assert requests[1][1] == {
+            "job_id": "job-a", "execution_id": "run-a", "capability": capability,
+            "verdict": verdict,
+        }
+        assert terminal._CONNECTOR_RUNTIME_ROOT_ANCHOR.file_digests[SCRIPT] == hashlib.sha256(raw).hexdigest()
+    finally:
+        reset_secret_scope(token)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
