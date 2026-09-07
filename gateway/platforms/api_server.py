@@ -780,30 +780,6 @@ def _extract_connector_policy_disabled_skills(body: Dict[str, Any]) -> tuple[str
     return tuple(out)
 
 
-def _extract_turn_cage(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Platform turn cage: ``metadata.tool_face`` (list of tool names) and
-    ``metadata.max_iterations`` (int) narrow ONE chat turn to the platform's
-    whitelist — local-server sets them for a session bound to a create-pipeline
-    run in its guide stage. They ride the same ``_bounded_step`` override the
-    bounded-step endpoint uses, so the narrowing is allowlist-only (it can never
-    widen the agent's tools). Absent / malformed → empty dict (uncaged turn)."""
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
-        return {}
-    cage: Dict[str, Any] = {}
-    raw_face = metadata.get("tool_face", metadata.get("toolFace"))
-    if isinstance(raw_face, list):
-        face = [str(t).strip() for t in raw_face if isinstance(t, str) and str(t).strip()]
-        if face:
-            cage["tool_face"] = face
-    if "tool_face" not in cage:
-        return {}
-    raw_max = metadata.get("max_iterations", metadata.get("maxIterations"))
-    if isinstance(raw_max, int) and not isinstance(raw_max, bool) and raw_max >= 1:
-        cage["max_iterations"] = raw_max
-    return cage
-
-
 def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
     """Remove only the App quick-pick token from a string user task."""
     if not isinstance(user_message, str) or not skill_slug:
@@ -3449,11 +3425,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "/v1/chat/completions/canonical-final-v1",
                 self._handle_canonical_final_chat_completions,
             ),
-            (
-                "POST",
-                "/v1/chat/completions/bounded-step-v1",
-                self._handle_bounded_step_chat_completions,
-            ),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -4238,10 +4209,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "/p/{profile}/v1/chat/completions/canonical-final-v1",
             self._profile_handler(self._handle_canonical_final_chat_completions),
         )
-        router.add_post(
-            "/p/{profile}/v1/chat/completions/bounded-step-v1",
-            self._profile_handler(self._handle_bounded_step_chat_completions),
-        )
 
         router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
         router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
@@ -4654,15 +4621,6 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         Create an AIAgent instance using the gateway's runtime config.
 
-        Bounded-step primitive (POST /v1/chat/completions/bounded-step-v1):
-        the platform's create-pipeline drives one model step with a narrowed
-        tool face and a hard turn cap. The config rides in
-        ``request_overrides["_bounded_step"] = {"tool_face": [...],
-        "max_iterations": N}`` — request_overrides already threads endpoint →
-        _run_agent → _create_agent, so no signature/threading changes are
-        needed (and zet_agent's duplicated override picks it up the same way).
-        Absent the key, behaviour is unchanged.
-
         Uses _resolve_runtime_agent_kwargs() to pick up model, api_key,
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
@@ -4951,16 +4909,7 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
-        # 受限单步（bounded-step 原语）的按步配置，随 request_overrides 穿进来。
-        _bounded_step = (request_overrides or {}).get("_bounded_step") or {}
-        bounded_tool_allowlist = _bounded_step.get("tool_face")
-        bounded_max_iterations = _bounded_step.get("max_iterations")
-
         max_iterations = _current_max_iterations()
-        if bounded_max_iterations is not None:
-            # 受限单步：平台按步指定轮数上限。夹到 [1, 配置上限]：保证至少一轮，
-            # 又绝不超过设备已配的上限（HR#1 端侧 2 GB 预算）。
-            max_iterations = max(1, min(int(bounded_max_iterations), max_iterations))
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -4976,8 +4925,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # plan policy hint into AIAgent or an LLM request body.
         agent_request_overrides.pop("_zet_plan_auto_execute", None)
         agent_request_overrides.pop("_zet_execution_policy", None)
-        # 受限单步的私有配置：只在 _create_agent 内消费，绝不进 AIAgent / LLM 请求体。
-        agent_request_overrides.pop("_bounded_step", None)
 
         agent_kwargs = {
             "model": model,
@@ -5009,18 +4956,6 @@ class APIServerAdapter(BasePlatformAdapter):
             # transports without an OpenAI-compatible tool_choice parameter.
             agent.tools = []
             agent.valid_tool_names = set()
-            agent._skip_mcp_refresh = True
-        elif bounded_tool_allowlist is not None:
-            # 受限单步（bounded-step 原语）：只放行平台指定的工具白名单。与 disable_tools
-            # 同为 API 层的工具面收窄（HR#3 显式 allowlist）；disable_tools（全关）优先。
-            # 同时滤 agent.tools（模型看不到白名单外工具的 schema）与 valid_tool_names
-            # （conversation_loop 用它 gate 调用，白名单外的调用被拒）。空白名单=全关。
-            _allow = {str(t).strip() for t in bounded_tool_allowlist if str(t).strip()}
-            agent.tools = [
-                t for t in getattr(agent, "tools", [])
-                if isinstance(t, dict) and (t.get("function") or {}).get("name") in _allow
-            ]
-            agent.valid_tool_names = {t["function"]["name"] for t in agent.tools}
             agent._skip_mcp_refresh = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
@@ -6245,151 +6180,6 @@ class APIServerAdapter(BasePlatformAdapter):
         return await self._handle_chat_completions(request)
 
     @_admit_api_agent_request
-    async def _handle_bounded_step_chat_completions(
-        self, request: "web.Request"
-    ) -> "web.Response":
-        """POST /v1/chat/completions/bounded-step-v1 — 平台编排的“受限单步”原语。
-
-        平台（local-server 的 create-pipeline）驱动一个模型步：注入 step-prompt、
-        把工具面收窄到白名单、限定轮数、要求结构化输出，跑一个受限单轮，返回结构化
-        结果。请求体（在标准 chat completion 字段之外）：
-          - instructions / system_message : step-prompt（注入为 ephemeral system prompt）
-          - input                         : 本步输入上下文（也接受 messages 里最后一条 user）
-          - tool_face   : List[str]       本步放行的工具白名单（只收窄、不新增 → HR#3 安全）
-          - max_iterations : int          本步轮数上限（夹到设备配置上限内 → HR#1）
-          - response_format : json_schema 强制结构化输出（仅 chat_completions provider 生效）
-        返回 OpenAI chat.completion 外形（HR#4）；choices[0].message.content 即结构化输出。
-        """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-        gateway_session_key, key_err = self._parse_session_key_header(request)
-        if key_err is not None:
-            return key_err
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-        if not isinstance(body, dict):
-            return web.json_response(
-                _openai_error("Request body must be a JSON object"), status=400
-            )
-
-        step_prompt = body.get("instructions") or body.get("system_message")
-        if not isinstance(step_prompt, str) or not step_prompt.strip():
-            return web.json_response(
-                _openai_error(
-                    "bounded-step requires a non-empty 'instructions' step-prompt",
-                    code="invalid_step_prompt",
-                ),
-                status=400,
-            )
-
-        raw_input = body.get("input")
-        if isinstance(raw_input, str) and raw_input.strip():
-            user_message = raw_input
-        else:
-            user_message = ""
-            messages = body.get("messages")
-            if isinstance(messages, list):
-                for _m in reversed(messages):
-                    if (
-                        isinstance(_m, dict)
-                        and _m.get("role") == "user"
-                        and isinstance(_m.get("content"), str)
-                        and _m["content"].strip()
-                    ):
-                        user_message = _m["content"]
-                        break
-        if not user_message:
-            return web.json_response(
-                _openai_error(
-                    "bounded-step requires 'input' (the step context) or a user message",
-                    code="invalid_input",
-                ),
-                status=400,
-            )
-
-        tool_face = body.get("tool_face")
-        if tool_face is not None and (
-            not isinstance(tool_face, list)
-            or not all(isinstance(t, str) for t in tool_face)
-        ):
-            return web.json_response(
-                _openai_error(
-                    "'tool_face' must be a list of tool-name strings",
-                    code="invalid_tool_face",
-                ),
-                status=400,
-            )
-
-        max_iters = body.get("max_iterations")
-        if max_iters is not None and (
-            isinstance(max_iters, bool)
-            or not isinstance(max_iters, int)
-            or max_iters < 1
-        ):
-            return web.json_response(
-                _openai_error(
-                    "'max_iterations' must be a positive integer",
-                    code="invalid_max_iterations",
-                ),
-                status=400,
-            )
-
-        bounded: Dict[str, Any] = {}
-        if tool_face is not None:
-            bounded["tool_face"] = tool_face
-        if max_iters is not None:
-            bounded["max_iterations"] = max_iters
-        overrides: Dict[str, Any] = {"_bounded_step": bounded}
-        response_format = body.get("response_format")
-        if response_format is not None:
-            overrides["response_format"] = response_format
-
-        agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
-        route = self._resolve_route(body.get("model"))
-        try:
-            result, usage = await self._run_agent(
-                user_message=user_message,
-                conversation_history=[],
-                ephemeral_system_prompt=step_prompt,
-                gateway_session_key=gateway_session_key,
-                route=route,
-                request_overrides=overrides,
-                **agent_overrides,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[api_server] bounded-step failed")
-            return web.json_response(
-                _openai_error(
-                    _boundary_error_text("bounded step", exc),
-                    err_type="server_error",
-                ),
-                status=500,
-            )
-
-        final_response = (
-            result.get("final_response", "") if isinstance(result, dict) else ""
-        )
-        return web.json_response(
-            {
-                "object": "chat.completion",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": final_response},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": usage if isinstance(usage, dict) else {},
-            }
-        )
-
-    @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         prestream_ingress_at = time.monotonic()
@@ -6701,13 +6491,6 @@ class APIServerAdapter(BasePlatformAdapter):
         request_overrides: Dict[str, Any] = {}
         if execution_policy != "silent_automation" and body.get("tool_choice") == "none":
             request_overrides["tool_choice"] = "none"
-        # Platform turn cage (local-server create-pipeline conversational guide):
-        # narrow THIS turn's tools to the platform whitelist via the bounded-step
-        # override. Silent automation already carries its own policy; skip there.
-        if execution_policy != "silent_automation":
-            turn_cage = _extract_turn_cage(body)
-            if turn_cage:
-                request_overrides["_bounded_step"] = turn_cage
         response_format = body.get("response_format")
         if execution_policy != "silent_automation" and response_format is not None:
             response_format_error = _validate_chat_response_format(response_format)
