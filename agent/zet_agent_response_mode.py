@@ -2028,6 +2028,13 @@ def _silent_skill_view_scope_block_message(
     )
 
 
+class CameraTaskScopeMissing(str):
+    """String-compatible policy rejection with additive machine-readable facts."""
+
+    code = "camera_task_scope_missing"
+    authorization_status = "not_checked"
+
+
 def trusted_skill_operation_block_message(
     agent: Any,
     *,
@@ -2112,10 +2119,15 @@ def trusted_skill_operation_block_message(
                     "zet_agent: blocked camera runtime command without a current "
                     "trusted camsnap scope"
                 )
-                return (
+                return CameraTaskScopeMissing(
                     "Trusted camera commands require a current request-bound "
                     "scope minted by the attested `camsnap` skill_view result. "
-                    "Load that trusted skill and retry the exact operation."
+                    "The command was not dispatched; device and Chat grants "
+                    "were not checked. Do not claim that camera permission is "
+                    "disabled or has not synced. Load the trusted skill for "
+                    "the current camera task. If it cannot establish scope, "
+                    "request an explicit camera operation instead of retrying "
+                    "the same blocked command."
                 )
             if (
                 function_name == "terminal"

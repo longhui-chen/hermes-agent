@@ -35,6 +35,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.zet_agent_response_mode import (
+    CameraTaskScopeMissing,
     apply_trusted_skill_execution,
     dispatch_trusted_skill_operation,
     trusted_skill_operation_block_message,
@@ -570,7 +571,13 @@ def _run_agent_tool_execution_middleware(
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                error_payload = {"error": block_message}
+                if isinstance(block_message, CameraTaskScopeMissing):
+                    error_payload.update(
+                        code=block_message.code,
+                        authorization_status=block_message.authorization_status,
+                    )
+                result = json.dumps(error_payload, ensure_ascii=False)
                 error_type = block_error_type
                 error_message = block_message
             else:
