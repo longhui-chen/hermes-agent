@@ -2143,6 +2143,8 @@ AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 })
 HARDWARE_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
+    "ZETTLAB_CAMERA_JOB_ID",
+    "ZETTLAB_CAMERA_EXECUTION_ID",
 })
 # These names belonged to the removed video BusinessExecution transport.  Keep
 # them in the scrub set (built from fragments so the retirement guard cannot
@@ -2477,6 +2479,55 @@ def build_overseas_connect_runtime_env() -> tuple[dict[str, str], str]:
             raise RuntimeError("overseas-connect turn id invalid")
         env["ZETTLAB_TURN_ID"] = turn_id
     return env, token
+
+
+def build_camera_semantic_runtime_env() -> dict[str, str]:
+    """Supply only a scheduler-bound profile's camera execution metadata.
+
+    This is not Chat authority. The device rechecks its execution ledger and
+    policy binding on candidate creation and verdict commit.
+    """
+    from agent.secret_scope import current_secret_scope
+    from cron.execution_context import current_execution
+    from hermes_constants import get_hermes_home
+
+    execution = current_execution()
+    scope = current_secret_scope()
+    if (
+        execution is None
+        or scope is None
+        or execution.profile_home != get_hermes_home()
+    ):
+        raise PermissionError("camera scheduler profile context unavailable")
+    # Read the installed profile mapping directly: never fall back to ambient
+    # environment values, including on a single-profile deployment.
+    token = str(scope.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
+    output = str(scope.get("ZET_AGENT_OUTPUT_DIR", "") or "").strip()
+    callback = str(scope.get("ZET_CHAT_APPEND_URL", "") or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", token) is None:
+        raise PermissionError("camera profile action token unavailable")
+    if not output or "\x00" in output or len(output.encode("utf-8")) > 4096 or not Path(output).is_absolute():
+        raise PermissionError("camera profile output directory unavailable")
+    try:
+        parsed = urlsplit(callback)
+        valid_url = (
+            parsed.scheme == "http"
+            and ipaddress.ip_address(parsed.hostname or "").is_loopback
+            and parsed.port is not None
+            and not parsed.username and not parsed.password
+            and not parsed.query and not parsed.fragment
+        )
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise PermissionError("camera local service callback unavailable")
+    return {
+        "ZETTLAB_AGENT_ACTION_TOKEN": token,
+        "ZETTLAB_CAMERA_JOB_ID": execution.job_id,
+        "ZETTLAB_CAMERA_EXECUTION_ID": execution.execution_id,
+        "ZET_AGENT_OUTPUT_DIR": output,
+        "ZETTLAB_LOCAL_SERVER_URL": urlunsplit((parsed.scheme, parsed.netloc, "", "", "")),
+    }
 
 
 def build_camera_runtime_env() -> dict[str, str]:

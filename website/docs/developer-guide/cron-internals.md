@@ -182,6 +182,18 @@ active execution ledger and their resource policy at the service boundary.
 Unsupported legacy IDs leave this private identity unavailable without stopping
 ordinary Cron jobs. Delivery runs outside this execution scope.
 
+The camera direct runner accepts the pinned Presets
+`skills/camera-semantic-evaluation/scripts/camera_semantic_monitor.py` with
+only `candidate` and `commit` arguments. It reuses the camera package digest,
+manifest capability, fixed foreground Python dispatch, timeout, and redaction
+boundary. The current Cron identity must match the current profile home;
+profile action token, job ID, and execution ID travel via private FDs, not a
+generic shell. Missing profile values fail closed, with no ambient environment
+fallback. The local-server URL is derived only from a loopback profile callback.
+This runner does not authorize recording or replace the device's per-policy
+checks. End-to-end Skill admission, actual camera evidence, vision, and delivery
+must be verified separately from runner tests.
+
 Each cron job runs in a completely fresh agent session:
 
 - No conversation history from previous runs
