@@ -4262,38 +4262,6 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def _stamp_failure_on_output(output_file, job: dict, error: str) -> bool:
-    """Rewrite a saved run doc so it carries a verdict reached *after* it was
-    saved: "(FAILED)" in the title line and an "## Error" section with the
-    reason — the exact shape run_job writes for in-run failures and the shape
-    the client's run-history parser reads. Idempotent; a doc already marked
-    failed is left alone. Never raises: the verdict is already recorded on
-    the job, the doc is only a mirror of it.
-    """
-    if not output_file or not error:
-        return False
-    try:
-        path = Path(str(output_file))
-        if not path.is_file():
-            return False
-        text = path.read_text(encoding="utf-8")
-        lines = text.split("\n", 1)
-        title = lines[0]
-        if title.startswith("# Cron Job:") and "(FAILED)" in title:
-            return False
-        if title.startswith("# Cron Job:"):
-            title = f"{title.rstrip()} (FAILED)"
-            text = title + ("\n" + lines[1] if len(lines) > 1 else "\n")
-        if not text.endswith("\n"):
-            text += "\n"
-        text += f"\n## Error\n\n```\n{error}\n```\n"
-        path.write_text(text, encoding="utf-8")
-        return True
-    except Exception as exc:  # pragma: no cover - mirror only, never fatal
-        logger.warning("Job '%s': could not stamp failure on output %s: %s", job.get("id"), output_file, exc)
-        return False
-
-
 def run_one_job(
     job: dict,
     *,
@@ -4544,15 +4512,6 @@ def run_one_job(
             else:
                 success = False
                 error = "no import attempted in this run"
-
-        # The output doc was saved before the post-run verdicts above could
-        # flip `success` (empty-response guard, app_slug import verdict), so a
-        # run the job record calls "error" would still read as a clean run
-        # to everything that judges by the doc (the client's run history
-        # parses the "(FAILED)" title / "## Error" section). Stamp the final
-        # verdict back onto the saved doc so the two never disagree.
-        if not success and error:
-            _stamp_failure_on_output(output_file, job, error)
 
         # Publish only once `success` is final: the empty-response guard, the
         # interrupted check and the app_slug import verdict above all still
