@@ -473,13 +473,16 @@ def test_packaged_probe_uses_fixed_argv_and_returns_inode_identity(
     captured: dict = {}
 
     def run(command, *, env, timeout, pass_fds):
+        pin = Path(command[3])
         captured.update(
             command=command,
             env=env,
             timeout=timeout,
             pass_fds=pass_fds,
             script_inode=os.fstat(pass_fds[0]).st_ino,
-            source_inode=os.fstat(pass_fds[1]).st_ino,
+            pin_parent=pin.parent,
+            pin_inode=os.stat(pin, follow_symlinks=False).st_ino,
+            pin_nlink=os.stat(source).st_nlink,
         )
         payload = {
             "ok": True,
@@ -504,15 +507,23 @@ def test_packaged_probe_uses_fixed_argv_and_returns_inode_identity(
     assert captured["command"][0] == sys.executable
     assert captured["command"][1] != str(script)
     assert captured["command"][1].endswith(f"/{captured['pass_fds'][0]}")
-    assert captured["command"][3].endswith(f"/{captured['pass_fds'][1]}")
+    # The media is handed over as a private hard-link pin inside the
+    # local-server task-cache subtree, never through /proc/<pid>/fd, so a
+    # non-dumpable gateway without CAP_SYS_PTRACE can still be probed.
+    assert captured["pin_parent"] == tmp_path / ".cache" / "tasks" / "hermes-video-inspect"
+    assert Path(captured["command"][3]).name.startswith(".hermes-video-inspect-")
+    assert captured["pin_inode"] == source.stat().st_ino
+    assert captured["pin_nlink"] == 2
     assert captured["script_inode"] == script.stat().st_ino
-    assert captured["source_inode"] == source.stat().st_ino
     assert captured["command"][2] == "--inspect-input"
     assert len(captured["command"]) == 4
-    assert len(captured["pass_fds"]) == 2
+    assert len(captured["pass_fds"]) == 1
     assert captured["timeout"] == normalizer.MEDIA_INSPECTION_TIMEOUT_SECONDS
     assert "ZETTLAB_AGENT_ACTION_TOKEN" not in captured["env"]
     assert not list(tmp_path.glob(".hermes-video-input-*"))
+    assert not list(tmp_path.rglob(".hermes-video-inspect-*"))
+    assert not (tmp_path / ".cache").exists()
+    assert source.stat().st_nlink == 1
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fd path requires procfs")
