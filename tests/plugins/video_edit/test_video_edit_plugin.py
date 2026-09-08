@@ -1081,13 +1081,18 @@ def test_upload_retry_keeps_admission_identity_after_transient_failure(
 
     _install_trusted_normalizer(tmp_path, monkeypatch)
     monkeypatch.setattr(normalizer, "inspect_files", _REAL_INSPECT_FILES)
-    admission_ctimes = []
+    admission_pins = []
 
     def inspect(command, *, env, timeout, pass_fds):
-        assert len(pass_fds) == 2
+        # Only the trusted script descriptor is inherited; the media is
+        # handed over as a private hard-link pin beside the source.
+        assert len(pass_fds) == 1
         assert command[1].endswith(f"/{pass_fds[0]}")
-        assert command[3].endswith(f"/{pass_fds[1]}")
-        admission_ctimes.append(source.stat().st_ctime_ns)
+        pin = Path(command[3])
+        assert pin.parent == _pin_dir(source)
+        assert pin.name.startswith(".hermes-video-inspect-")
+        assert os.stat(pin).st_ino == os.stat(source).st_ino
+        admission_pins.append(pin)
         payload = {
             "ok": True,
             "items": [{"category": "direct_only", "direct_ok": True}],
@@ -1129,7 +1134,7 @@ def test_upload_retry_keeps_admission_identity_after_transient_failure(
             return None
 
     monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
-    initial_ctime = source.stat().st_ctime_ns
+    initial_fingerprint = tools._source_fingerprint([source])
     transient = json.loads(
         tools.handle_upload_assets(
             {"workflow_id": workflow, "files": [str(source)]},
@@ -1140,7 +1145,7 @@ def test_upload_retry_keeps_admission_identity_after_transient_failure(
     assert transient["reason_code"] == "transient_failure"
     assert transient["retryable"] is True
     checkpoint = tools.state.get(workflow, "agent-a")
-    assert checkpoint["source_fingerprint"] == tools._source_fingerprint([source])
+    assert checkpoint["source_fingerprint"] == initial_fingerprint
 
     retried = json.loads(
         tools.handle_upload_assets(
@@ -1151,11 +1156,331 @@ def test_upload_retry_keeps_admission_identity_after_transient_failure(
 
     assert retried["ok"] is True
     assert retried["uploaded"] == 1
-    assert admission_ctimes and len(admission_ctimes) == 2
-    assert admission_ctimes[0] == initial_ctime
-    assert admission_ctimes[1] == initial_ctime
+    assert len(admission_pins) == 2
+    # Pin churn only touches ctime, which the checkpoint fingerprint ignores,
+    # so the retry still matches the persisted source identity.
+    assert tools._source_fingerprint([source]) == initial_fingerprint
+    assert all(not pin.exists() for pin in admission_pins)
+    assert not (source.parent / ".cache").exists()
+    assert os.stat(source).st_nlink == 1
     assert connection_attempts == 2
     assert tools.state.get(workflow, "agent-a")["object_keys"] == ["asset-1"]
+
+
+def _iso_video_sample_with_track() -> bytes:
+    """QuickTime sample whose moov carries a video handler, provable locally."""
+
+    def box(kind: bytes, payload: bytes) -> bytes:
+        return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+    ftyp = box(b"ftyp", b"qt  " + b"\x00\x00\x00\x00" + b"qt  ")
+    hdlr = box(b"hdlr", b"\x00" * 8 + b"vide" + b"\x00" * 12)
+    return ftyp + box(b"moov", box(b"trak", box(b"mdia", hdlr)))
+
+
+def _inspection_ok(command, **_kwargs):
+    payload = {"ok": True, "items": [{"category": "direct_only", "direct_ok": True}]}
+    return subprocess.CompletedProcess(command, 0, json.dumps(payload), ""), False
+
+
+def _leftover_pins(directory: Path) -> list[Path]:
+    return sorted(directory.rglob(".hermes-video-inspect-*"))
+
+
+def _pin_dir(source: Path) -> Path:
+    return source.parent / ".cache" / "tasks" / "hermes-video-inspect"
+
+
+def test_inspect_files_hands_helper_a_hard_link_pin(monkeypatch, tmp_path):
+    source = tmp_path / "media" / "clip.mov"
+    source.parent.mkdir()
+    _write_video(source, b"pinned")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    seen = {}
+
+    def fake_run(command, *, env, timeout, pass_fds):
+        pin = Path(command[command.index("--inspect-input") + 1])
+        seen["pass_fds"] = pass_fds
+        seen["pin"] = pin
+        seen["pin_ino"] = os.stat(pin).st_ino
+        seen["nlink_during_probe"] = os.stat(source).st_nlink
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
+    identities = _REAL_INSPECT_FILES([source], "vew_pin")
+
+    assert len(seen["pass_fds"]) == 1
+    # The pin sits in the local-server task-cache subtree the file watcher
+    # skips, so the indexer never re-stamps (and ctime-bumps) the inode.
+    assert seen["pin"].parent == _pin_dir(source)
+    assert seen["pin"].name.startswith(".hermes-video-inspect-")
+    assert seen["pin_ino"] == os.stat(source).st_ino
+    assert seen["nlink_during_probe"] == 2
+    assert not seen["pin"].exists()
+    assert _leftover_pins(source.parent) == []
+    assert not (source.parent / ".cache").exists()
+    assert os.stat(source).st_nlink == 1
+    assert identities == [client._stat_identity(os.stat(source))]
+
+
+def test_inspect_files_falls_back_to_descriptor_handoff_when_pin_unavailable(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "media" / "readonly.mov"
+    source.parent.mkdir()
+    _write_video(source, b"readonly")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def refuse_link(*_args, **_kwargs):
+        raise PermissionError(30, "Read-only file system")
+
+    monkeypatch.setattr(normalizer, "_create_snapshot_link", refuse_link)
+    monkeypatch.setattr(
+        normalizer, "_inspection_fd_path", lambda descriptor: f"/proc/self/fd/{descriptor}"
+    )
+    seen = {}
+
+    def fake_run(command, *, env, timeout, pass_fds):
+        seen["pass_fds"] = pass_fds
+        seen["input"] = command[command.index("--inspect-input") + 1]
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
+    identities = _REAL_INSPECT_FILES([source], "vew_fallback")
+
+    assert len(seen["pass_fds"]) == 2
+    assert seen["input"] == f"/proc/self/fd/{seen['pass_fds'][1]}"
+    assert _leftover_pins(source.parent) == []
+    assert not (source.parent / ".cache").exists()
+    assert identities == [client._stat_identity(os.stat(source))]
+
+
+def test_inspect_files_rejects_metadata_touch_on_pinned_inode(monkeypatch, tmp_path):
+    """A ctime-only transition while the helper reads is still a tampered
+    handoff: the pin lives where the indexer cannot touch it, so nothing
+    legitimate moves the inode during the probe."""
+    source = tmp_path / "media" / "touched.mov"
+    source.parent.mkdir()
+    _write_video(source, b"touched")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    before = os.stat(source)
+
+    def touch_metadata(command, *, env, timeout, pass_fds):
+        pin = Path(command[command.index("--inspect-input") + 1])
+        os.chmod(pin, (before.st_mode & 0o7777) ^ 0o001)
+        os.chmod(pin, before.st_mode & 0o7777)
+        if os.stat(pin).st_ctime_ns == before.st_ctime_ns:
+            pytest.skip("filesystem ctime resolution too coarse for this check")
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", touch_metadata)
+
+    with pytest.raises(normalizer.NormalizeError, match="input changed"):
+        _REAL_INSPECT_FILES([source], "vew_touch")
+    assert _leftover_pins(source.parent) == []
+    assert not (source.parent / ".cache").exists()
+
+
+def test_inspect_files_keeps_preexisting_task_cache_dirs(monkeypatch, tmp_path):
+    source = tmp_path / "media" / "shared-cache.mov"
+    source.parent.mkdir()
+    _write_video(source, b"shared")
+    existing = source.parent / ".cache" / "tasks"
+    existing.mkdir(parents=True)
+    (existing / "task-1").mkdir()
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", _inspection_ok)
+
+    identities = _REAL_INSPECT_FILES([source], "vew_shared")
+
+    assert identities == [client._stat_identity(os.stat(source))]
+    assert (existing / "task-1").is_dir()
+    assert not (existing / "hermes-video-inspect").exists()
+    assert _leftover_pins(source.parent) == []
+
+
+def test_inspect_files_refuses_symlinked_cache_dir_and_falls_back(monkeypatch, tmp_path):
+    source = tmp_path / "media" / "symlinked.mov"
+    source.parent.mkdir()
+    _write_video(source, b"symlinked")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (source.parent / ".cache").symlink_to(elsewhere, target_is_directory=True)
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        normalizer, "_inspection_fd_path", lambda descriptor: f"/proc/self/fd/{descriptor}"
+    )
+    seen = {}
+
+    def fake_run(command, *, env, timeout, pass_fds):
+        seen["pass_fds"] = pass_fds
+        seen["input"] = command[command.index("--inspect-input") + 1]
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
+    identities = _REAL_INSPECT_FILES([source], "vew_symlink")
+
+    assert seen["input"] == f"/proc/self/fd/{seen['pass_fds'][1]}"
+    assert list(elsewhere.rglob("*")) == []
+    assert (source.parent / ".cache").is_symlink()
+    assert identities == [client._stat_identity(os.stat(source))]
+
+
+def test_inspect_files_rejects_source_rewritten_during_probe(monkeypatch, tmp_path):
+    source = tmp_path / "media" / "rewritten.mov"
+    source.parent.mkdir()
+    _write_video(source, b"first")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def rewrite_in_place(command, *, env, timeout, pass_fds):
+        with open(source, "r+b") as handle:
+            handle.write(b"\x00")
+        os.utime(source, ns=(time.time_ns(), os.stat(source).st_mtime_ns + 1_000_000_000))
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", rewrite_in_place)
+
+    with pytest.raises(normalizer.NormalizeError, match="input changed"):
+        _REAL_INSPECT_FILES([source], "vew_rewrite")
+    assert _leftover_pins(source.parent) == []
+
+
+def test_inspect_files_rejects_source_replaced_during_probe(monkeypatch, tmp_path):
+    source = tmp_path / "media" / "swapped.mov"
+    source.parent.mkdir()
+    _write_video(source, b"original")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def swap_source(command, *, env, timeout, pass_fds):
+        source.unlink()
+        _write_video(source, b"replacement")
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", swap_source)
+
+    with pytest.raises(normalizer.NormalizeError, match="input changed"):
+        _REAL_INSPECT_FILES([source], "vew_swap")
+    assert _leftover_pins(source.parent) == []
+
+
+def test_inspect_files_rejects_pin_removed_during_probe(monkeypatch, tmp_path):
+    source = tmp_path / "media" / "unpinned.mov"
+    source.parent.mkdir()
+    _write_video(source, b"unpinned")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def remove_pin(command, *, env, timeout, pass_fds):
+        Path(command[command.index("--inspect-input") + 1]).unlink()
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", remove_pin)
+
+    with pytest.raises(normalizer.NormalizeError, match="input changed"):
+        _REAL_INSPECT_FILES([source], "vew_unpin")
+    assert _leftover_pins(source.parent) == []
+    assert os.stat(source).st_nlink == 1
+
+
+def test_inspect_files_removes_pin_when_helper_fails(monkeypatch, tmp_path):
+    source = tmp_path / "media" / "rejected.mov"
+    source.parent.mkdir()
+    _write_video(source, b"rejected")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def failing_helper(command, **_kwargs):
+        payload = {
+            "ok": True,
+            "items": [{"category": "unsupported", "reason": "INPUT_CHANGED"}],
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), ""), False
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", failing_helper)
+
+    with pytest.raises(normalizer.NormalizeError, match="inspection failed"):
+        _REAL_INSPECT_FILES([source], "vew_reject")
+    assert _leftover_pins(source.parent) == []
+    assert os.stat(source).st_nlink == 1
+
+
+def test_raw_direct_upload_succeeds_without_parent_descriptor_access(
+    isolated_video_home,
+    monkeypatch,
+    tmp_path,
+):
+    """Regression: a non-dumpable gateway without CAP_SYS_PTRACE cannot let the
+    helper read /proc/<pid>/fd, so raw_direct uploads must not depend on it."""
+    source = isolated_video_home[1] / "agent-a" / "IMG_0016.MOV"
+    source.parent.mkdir(parents=True)
+    _write_video(source, b"single-small-clip")
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {"task_id": "raw-direct-no-ptrace"}, agent_id="agent-a"
+        )
+    )["workflow_id"]
+
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(normalizer, "inspect_files", _REAL_INSPECT_FILES)
+
+    def proc_unreadable(_descriptor):
+        raise AssertionError("parent descriptor handoff must not be used")
+
+    monkeypatch.setattr(normalizer, "_inspection_fd_path", proc_unreadable)
+    helper_inputs = []
+
+    def fake_run(command, *, env, timeout, pass_fds):
+        assert len(pass_fds) == 1
+        helper_inputs.append(Path(command[command.index("--inspect-input") + 1]))
+        # The helper (and its ffprobe child) reopen the pin by ordinary path.
+        assert helper_inputs[-1].read_bytes() == source.read_bytes()
+        return _inspection_ok(command)
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-raw"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+    uploaded = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert uploaded["ok"] is True
+    assert uploaded["strategy"] == "raw_direct"
+    assert uploaded["uploaded"] == 1
+    assert len(helper_inputs) == 1
+    assert helper_inputs[0].parent == _pin_dir(source)
+    assert not helper_inputs[0].exists()
+    assert _leftover_pins(source.parent) == []
+    assert not (source.parent / ".cache").exists()
+    assert tools.state.get(workflow, "agent-a")["object_keys"] == ["asset-raw"]
 
 
 def test_incomplete_upload_same_source_path_replacement_requires_new_task(
@@ -4213,3 +4538,191 @@ def test_file_evidence_rejects_non_video_and_describes_valid_media(tmp_path):
     invalid.write_bytes(b"not-a-video")
     with pytest.raises(client.VideoClientError, match="not a valid video result"):
         client.file_evidence(invalid)
+
+
+def test_inspect_files_reports_post_pin_identities_when_helper_lacks_capability(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "media" / "old-helper.mov"
+    source.parent.mkdir()
+    _write_video(source, b"old-helper")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    before = os.stat(source)
+
+    def old_helper(command, **_kwargs):
+        return (
+            subprocess.CompletedProcess(
+                command,
+                2,
+                "",
+                "usage: normalize.py [-h]\nnormalize.py: error: unrecognized arguments: --inspect-input",
+            ),
+            False,
+        )
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", old_helper)
+
+    with pytest.raises(normalizer.NormalizerUnavailableError) as raised:
+        _REAL_INSPECT_FILES([source], "vew_old_helper")
+
+    after = os.stat(source)
+    # The pin lifecycle moved ctime; the exception carries the verified
+    # post-pin identity so the client can re-anchor its strict boundary.
+    assert raised.value.identities == [client._stat_identity(after)]
+    assert client._stat_identity(after)[:4] == client._stat_identity(before)[:4]
+    assert _leftover_pins(source.parent) == []
+    assert not (source.parent / ".cache").exists()
+
+
+def test_inspect_files_leaves_sources_untouched_when_script_is_unavailable(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "media" / "no-script.mov"
+    source.parent.mkdir()
+    _write_video(source, b"no-script")
+    monkeypatch.setattr(normalizer, "_PRESETS_ANCHOR", None)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "missing-presets"))
+    before = os.stat(source)
+
+    with pytest.raises(normalizer.NormalizerUnavailableError) as raised:
+        _REAL_INSPECT_FILES([source], "vew_no_script")
+
+    assert raised.value.identities is None
+    assert client._stat_identity(os.stat(source)) == client._stat_identity(before)
+    assert not (source.parent / ".cache").exists()
+
+
+def test_inspect_files_reports_capability_gap_when_pin_and_descriptor_handoff_fail(
+    monkeypatch, tmp_path
+):
+    """Read-only share on a non-dumpable gateway without CAP_SYS_PTRACE: the
+    helper could only read zero bytes, so the gap is reported up front with
+    identities the client can anchor its local proof on."""
+    source = tmp_path / "media" / "readonly-hardened.mov"
+    source.parent.mkdir()
+    _write_video(source, b"hardened")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+
+    def refuse_link(*_args, **_kwargs):
+        raise PermissionError(30, "Read-only file system")
+
+    monkeypatch.setattr(normalizer, "_create_snapshot_link", refuse_link)
+    monkeypatch.setattr(normalizer, "_parent_descriptor_handoff_usable", lambda: False)
+    helper_started = []
+    monkeypatch.setattr(
+        normalizer,
+        "_run_bounded_subprocess",
+        lambda command, **_kwargs: helper_started.append(command) or _inspection_ok(command),
+    )
+
+    with pytest.raises(normalizer.NormalizerUnavailableError) as raised:
+        _REAL_INSPECT_FILES([source], "vew_hardened")
+
+    assert helper_started == []
+    assert raised.value.identities == [client._stat_identity(os.stat(source))]
+    assert not (source.parent / ".cache").exists()
+
+
+def test_raw_direct_upload_uses_local_proof_when_source_cannot_be_pinned_on_hardened_gateway(
+    isolated_video_home,
+    monkeypatch,
+    tmp_path,
+):
+    source = isolated_video_home[1] / "agent-a" / "share-clip.mov"
+    source.parent.mkdir(parents=True)
+    # The local proof needs a bounded, structurally valid video track; the
+    # generic sample is deliberately inconclusive so the boundary fails closed.
+    source.write_bytes(_iso_video_sample_with_track())
+    workflow = json.loads(
+        tools.handle_preferences_resolve(
+            {"task_id": "raw-direct-readonly-share"}, agent_id="agent-a"
+        )
+    )["workflow_id"]
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    monkeypatch.setattr(normalizer, "inspect_files", _REAL_INSPECT_FILES)
+
+    def refuse_link(*_args, **_kwargs):
+        raise PermissionError(30, "Read-only file system")
+
+    monkeypatch.setattr(normalizer, "_create_snapshot_link", refuse_link)
+    monkeypatch.setattr(normalizer, "_parent_descriptor_handoff_usable", lambda: False)
+    monkeypatch.setattr(
+        normalizer,
+        "_run_bounded_subprocess",
+        lambda command, **_kwargs: pytest.fail("helper must not run without a readable handoff"),
+    )
+
+    class Response:
+        status = 200
+
+        def read(self, _size):
+            return b'{"data":{"uploads":[{"object_key":"asset-share"}]}}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def putrequest(self, *_args):
+            return None
+
+        def putheader(self, *_args):
+            return None
+
+        def endheaders(self):
+            return None
+
+        def send(self, _chunk):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(client.http.client, "HTTPConnection", Connection)
+    uploaded = json.loads(
+        tools.handle_upload_assets(
+            {"workflow_id": workflow, "files": [str(source)]},
+            agent_id="agent-a",
+        )
+    )
+
+    assert uploaded["ok"] is True
+    assert uploaded["strategy"] == "raw_direct"
+    assert tools.state.get(workflow, "agent-a")["object_keys"] == ["asset-share"]
+
+
+def test_inspect_files_prunes_shared_pin_directory_after_last_source(monkeypatch, tmp_path):
+    first = tmp_path / "media" / "clip-a.mov"
+    second = tmp_path / "media" / "clip-b.mov"
+    first.parent.mkdir()
+    _write_video(first, b"clip-a")
+    _write_video(second, b"clip-b")
+    _install_trusted_normalizer(tmp_path, monkeypatch)
+    seen = {}
+
+    def fake_run(command, *, env, timeout, pass_fds):
+        pins = [Path(value) for value in command[3::2]]
+        seen["parents"] = {pin.parent for pin in pins}
+        seen["inodes"] = [os.stat(pin).st_ino for pin in pins]
+        payload = {
+            "ok": True,
+            "items": [
+                {"category": "direct_only", "direct_ok": True},
+                {"category": "direct_only", "direct_ok": True},
+            ],
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), ""), False
+
+    monkeypatch.setattr(normalizer, "_run_bounded_subprocess", fake_run)
+    identities = _REAL_INSPECT_FILES([first, second], "vew_shared_dir")
+
+    assert seen["parents"] == {_pin_dir(first)}
+    assert seen["inodes"] == [os.stat(first).st_ino, os.stat(second).st_ino]
+    assert identities == [
+        client._stat_identity(os.stat(first)),
+        client._stat_identity(os.stat(second)),
+    ]
+    assert _leftover_pins(first.parent) == []
+    assert not (first.parent / ".cache").exists()

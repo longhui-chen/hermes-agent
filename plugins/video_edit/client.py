@@ -302,7 +302,9 @@ def _inspect_opened_sources(
         # downgrade helper-reported media/metadata failures.
         if not _is_normalizer_unavailable(exc):
             raise
-        return _inspect_locally_proven_sources(opened)
+        return _inspect_locally_proven_sources(
+            _reanchor_after_pins(opened, getattr(exc, "identities", None))
+        )
     if len(identities) != len(opened):
         raise VideoClientError("video media inspection is invalid")
 
@@ -341,6 +343,38 @@ def _admit_normalized_outputs(
             ) from exc
         admitted.append((path, descriptor, current))
     return admitted
+
+
+def _reanchor_after_pins(
+    opened: list[tuple[Path, int, os.stat_result]],
+    identities: object,
+) -> list[tuple[Path, int, os.stat_result]]:
+    """Adopt the helper's post-pin identities before the local fallback.
+
+    When the packaged probe only reported a capability gap after running, its
+    hard-link pins have already moved every source ctime.  The normalizer
+    verified each inode untouched through that lifecycle and returns the
+    post-pin identities; anchoring on them keeps the strict boundary intact.
+    Without identities nothing was pinned and the opened stat still holds.
+    """
+    if identities is None:
+        return opened
+    try:
+        values = list(identities)  # type: ignore[arg-type]
+    except TypeError:
+        raise VideoClientError("video media inspection is invalid") from None
+    if len(values) != len(opened):
+        raise VideoClientError("video media inspection is invalid")
+    anchored: list[tuple[Path, int, os.stat_result]] = []
+    for (path, descriptor, _), identity in zip(opened, values):
+        try:
+            current = os.fstat(descriptor)
+        except OSError as exc:
+            raise VideoClientError("video upload source changed") from exc
+        if not _probe_identity_matches(current, identity):
+            raise VideoClientError("video upload source changed")
+        anchored.append((path, descriptor, current))
+    return anchored
 
 
 def _is_normalizer_unavailable(exc: normalizer.NormalizeError) -> bool:
