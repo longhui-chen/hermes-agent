@@ -16,6 +16,7 @@ Two fixes, both covered here:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -51,6 +52,19 @@ def _hold_init_lock(db_path: Path):
     t.start()
     assert holding.wait(timeout=5), "holder thread never acquired the lock"
     return release, t
+
+
+def test_init_lock_is_owner_only_under_permissive_umask(kanban_home):
+    db_path = kb.kanban_db_path(board="default")
+    old_umask = os.umask(0)
+    try:
+        with kb._cross_process_init_lock(db_path):
+            pass
+    finally:
+        os.umask(old_umask)
+
+    lock_path = db_path.parent / f"{db_path.name}.init.lock"
+    assert lock_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_initialized_path_connect_skips_init_lock(kanban_home):

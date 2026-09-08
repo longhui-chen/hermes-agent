@@ -1686,10 +1686,17 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     # Open through THIS module's sqlite3.connect so callers (and tests) that
     # patch hermes_state.sqlite3.connect keep control of connection creation;
     # the helper still owns tracking.
+    read_only_uri = bool(
+        kwargs.get("uri")
+        and isinstance(path, str)
+        and path.startswith("file:")
+        and "mode=ro" in path
+    )
     return connect_tracked(
         path,
         tracking_path=tracking_path,
         connect_fn=sqlite3.connect,
+        private_mode=None if read_only_uri else 0o600,
         **kwargs,
     )
 

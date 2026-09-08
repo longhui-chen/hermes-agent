@@ -85,6 +85,18 @@ fi
 "$APP_ROOT/prepare-claw-service.sh"
 "$APP_ROOT/bin/hermes" --version
 
+# The version probe imports Python modules and can create __pycache__ using
+# the installer's inherited umask. Normalize after the probe so the installed
+# venv starts from the same deterministic permission contract as the ZPK.
+chmod 0700 "$HERMES_SRC/venv"
+find "$HERMES_SRC/venv" -mindepth 1 -type d -exec chmod 0755 {} +
+find "$HERMES_SRC/venv" -type f -perm /0111 -exec chmod 0755 {} +
+find "$HERMES_SRC/venv" -type f ! -perm /0111 -exec chmod 0644 {} +
+if [ -f "$HERMES_SRC/venv/.lock" ]; then
+    chown root:root "$HERMES_SRC/venv/.lock"
+    chmod 0600 "$HERMES_SRC/venv/.lock"
+fi
+
 mkdir -p "$(dirname "$HERMES_LINK")"
 ln -sfn "$APP_BASE/current/bin/hermes" "$HERMES_LINK"
 

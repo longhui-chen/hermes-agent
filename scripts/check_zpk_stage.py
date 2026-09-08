@@ -7,8 +7,10 @@ import argparse
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
+from itertools import chain
 from pathlib import Path
 
 
@@ -42,6 +44,29 @@ MAX_REPORTED_PATHS = 50
 PYTHON_RELATIVE_PATH = Path("venv/bin/python")
 PYTHON_CONFIG_RELATIVE_PATH = Path("venv/pyvenv.cfg")
 ELF_MACHINE_AARCH64 = 183
+
+
+def find_invalid_venv_permissions(stage_root: Path) -> list[tuple[Path, int, int]]:
+    """Return staged venv paths whose modes violate the package contract."""
+    venv_root = stage_root / "venv"
+    invalid: list[tuple[Path, int, int]] = []
+    for path in chain((venv_root,), venv_root.rglob("*")):
+        if path.is_symlink():
+            continue
+        actual = stat.S_IMODE(path.stat().st_mode)
+        if path == venv_root:
+            expected = 0o700
+        elif path.is_dir():
+            expected = 0o755
+        elif path == venv_root / ".lock":
+            expected = 0o600
+        elif path.is_file():
+            expected = 0o755 if actual & 0o111 else 0o644
+        else:
+            continue
+        if actual != expected:
+            invalid.append((path.relative_to(stage_root), expected, actual))
+    return invalid
 
 
 def _is_intentionally_excluded(relative_path: Path) -> bool:
@@ -247,6 +272,17 @@ def main() -> int:
             print(f"  - {relative_path.as_posix()}")
         if len(missing) > MAX_REPORTED_PATHS:
             print(f"  - ... and {len(missing) - MAX_REPORTED_PATHS} more")
+        return 1
+
+    invalid_permissions = find_invalid_venv_permissions(stage_root)
+    if invalid_permissions:
+        print("ZPK stage check failed: invalid venv permissions")
+        for relative_path, expected, actual in invalid_permissions[:MAX_REPORTED_PATHS]:
+            print(f"  - {relative_path.as_posix()}: {actual:04o}, expected {expected:04o}")
+        if len(invalid_permissions) > MAX_REPORTED_PATHS:
+            print(
+                f"  - ... and {len(invalid_permissions) - MAX_REPORTED_PATHS} more"
+            )
         return 1
 
     try:
