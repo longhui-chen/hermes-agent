@@ -371,13 +371,13 @@ wiki = "<WIKI_PATH>"
 
 ```bash
 # Find pages by content
-search_files "transformer" path="$WIKI" file_glob="*.md"
+search_files "transformer" scope="workspace" modes=["content"] path="$WIKI" file_glob="*.md"
 
 # Find pages by filename
-search_files "*.md" target="files" path="$WIKI"
+search_files "*.md" scope="workspace" modes=["name"] path="$WIKI"
 
 # Find pages by tag
-search_files "tags:.*alignment" path="$WIKI" file_glob="*.md"
+search_files "tags:.*alignment" scope="workspace" modes=["content"] path="$WIKI" file_glob="*.md"
 
 # Recent activity
 read_file "$WIKI/log.md" offset=<last 20 lines>

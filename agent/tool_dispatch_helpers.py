@@ -284,7 +284,7 @@ def _extract_parallel_scope_paths(
 
     # NAS search injects chat preview cards via local-server (side effect,
     # not a workspace read): empty scope → sequential barrier.
-    if tool_name == "search_files" and (function_args.get("target") or "") == "nas":
+    if tool_name == "search_files" and (function_args.get("scope") or "") == "nas":
         return []
 
     raw_paths: List[str] = []
