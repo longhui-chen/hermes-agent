@@ -416,9 +416,9 @@ _TOOL_STUBS = {
     ),
     "search_files": (
         "search_files",
-        'pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0',
-        '"""Search file contents (target="content") or find files by name (target="files"). Returns dict with "matches"."""',
-        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context}',
+        'pattern: str, scope: str, modes: list, path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, media_type: str = "", region: str = "", path_prefix: str = "", return_references: bool = False',
+        '"""Search explicit NAS/workspace scope and name/content/semantic modes. NAS region and media_type are hard filters; pattern="", modes=[] performs metadata-only search. Inspect complete/status/issues; never broaden conditions."""',
+        '{"pattern": pattern, "scope": scope, "modes": modes, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "media_type": media_type, "region": region, "path_prefix": path_prefix, "return_references": return_references}',
     ),
     "patch": (
         "patch",
@@ -2137,8 +2137,10 @@ _TOOL_DOC_LINES = [
      "  write_file(path: str, content: str) -> dict\n"
      "    Always overwrites the entire file."),
     ("search_files",
-     "  search_files(pattern: str, scope: str, modes: list[str], path=\".\", file_glob=None, limit=50) -> dict\n"
-     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
+     "  search_files(pattern: str, scope: str, modes: list, path=\".\", file_glob=None, limit=50, media_type=\"\", region=\"\", path_prefix=\"\", return_references=False) -> dict\n"
+     "    scope: \"workspace\" or \"nas\". modes: [\"name\"], [\"content\"], or [\"semantic\"] as supported by the scope.\n"
+     "    Empty pattern with modes=[] performs metadata filtering only. media_type and region remain required filters when supplied.\n"
+     "    Returns matches/files with total_count; NAS also reports complete/status/issues. An incomplete result is not proof of no matches."),
     ("patch",
      "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
      "    Replaces old_string with new_string in the file."),
