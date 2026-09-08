@@ -2895,3 +2895,13 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+def test_search_summary_preserves_incomplete_location_evidence():
+    result = json.dumps({"total_count": 0, "complete": False, "status": "partial",
+                         "issues": [{"source": "semantic:video", "reason": "candidate_limit"}]})
+    summary = _summarize_tool_result("search_files", json.dumps({
+        "scope": "nas", "pattern": "海边", "modes": ["semantic"],
+        "region": "北京", "media_type": "media"}), result)
+    assert "北京" in summary and "candidate_limit" in summary
+    assert "complete=False" in summary and "status=partial" in summary

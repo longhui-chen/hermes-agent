@@ -317,7 +317,7 @@ class TestSearchHandler:
         mock_get.return_value = mock_ops
 
         from tools.file_tools import search_tool
-        result = json.loads(search_tool(pattern="TODO", target="content", path="."))
+        result = json.loads(search_tool(pattern="TODO", scope="workspace", modes=["content"], path="."))
         assert "matches" in result
         mock_ops.search.assert_called_once()
 
@@ -327,7 +327,7 @@ class TestSearchHandler:
         mock_get.side_effect = RuntimeError("no terminal")
 
         from tools.file_tools import search_tool
-        result = json.loads(search_tool(pattern="x"))
+        result = json.loads(search_tool(scope="workspace", modes=["content"], pattern="x"))
         assert "error" in result
 
 
@@ -426,7 +426,7 @@ class TestSearchHints:
         mock_get.return_value = mock_ops
 
         from tools.file_tools import search_tool
-        raw = search_tool(pattern="foo", offset=0, limit=50)
+        raw = search_tool(scope="workspace", modes=["content"], pattern="foo", offset=0, limit=50)
         assert "[Hint:" in raw
         assert "offset=50" in raw
 
@@ -444,7 +444,7 @@ class TestSearchHints:
         mock_get.return_value = mock_ops
 
         from tools.file_tools import search_tool
-        raw = search_tool(pattern="foo", offset=50, limit=50)
+        raw = search_tool(scope="workspace", modes=["content"], pattern="foo", offset=50, limit=50)
         assert "[Hint:" in raw
         assert "offset=100" in raw
 
@@ -772,7 +772,7 @@ class TestSensitivePathCheck:
                 result = json.loads(file_tools.read_file_tool(str(target)))
             elif tool_name == "search":
                 result = json.loads(
-                    file_tools.search_tool("private", path=str(sibling))
+                    file_tools.search_tool("private", scope="workspace", modes=["content"], path=str(sibling))
                 )
             elif tool_name == "write":
                 result = json.loads(
@@ -1252,11 +1252,11 @@ class TestNotFoundCache:
         tid = "neg-cache-search-3"
         _read_tracker.pop(tid, None)
 
-        first = json.loads(search_tool("foo", path="/tmp/does-not-exist-search-3", task_id=tid))
+        first = json.loads(search_tool("foo", scope="workspace", modes=["content"], path="/tmp/does-not-exist-search-3", task_id=tid))
         assert "Path not found" in first["error"]
         assert mock_ops.search.call_count == 1
 
-        second = json.loads(search_tool("foo", path="/tmp/does-not-exist-search-3", task_id=tid))
+        second = json.loads(search_tool("foo", scope="workspace", modes=["content"], path="/tmp/does-not-exist-search-3", task_id=tid))
         assert "Path not found" in second["error"]
         assert mock_ops.search.call_count == 1, (
             "Search negative cache hit must skip the subprocess on retry"
@@ -1289,7 +1289,7 @@ class TestNotFoundCache:
         _read_tracker.pop(tid, None)
 
         read_file_tool("/tmp/does-not-exist-namespace-4", task_id=tid)
-        search_tool("foo", path="/tmp/does-not-exist-namespace-4", task_id=tid)
+        search_tool("foo", scope="workspace", modes=["content"], path="/tmp/does-not-exist-namespace-4", task_id=tid)
         # Both ops must hit their own caller (namespacing prevents read's
         # error JSON from being returned to search).
         assert mock_ops.read_file.call_count == 1

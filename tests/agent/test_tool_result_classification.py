@@ -29,3 +29,9 @@ def test_side_effect_classification_keeps_session_mutations():
     assert tool_may_have_side_effect("mcp_unknown") is True
     assert tool_may_have_side_effect("read_file") is False
     assert tool_may_have_side_effect("web_search") is False
+
+
+def test_explicit_nas_search_remains_card_side_effect():
+    from agent.tool_result_classification import tool_may_have_side_effect
+    assert tool_may_have_side_effect("search_files", {"scope": "nas", "pattern": "", "modes": [], "region": "北京"})
+    assert not tool_may_have_side_effect("search_files", {"scope": "workspace", "pattern": "x", "modes": ["name"]})

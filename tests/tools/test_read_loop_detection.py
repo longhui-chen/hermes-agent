@@ -165,15 +165,15 @@ class TestSearchLoopDetection(unittest.TestCase):
 
     @patch("tools.file_tools._get_file_ops", return_value=_make_fake_file_ops())
     def test_first_search_no_warning(self, _mock_ops):
-        result = json.loads(search_tool("def main", task_id="t1"))
+        result = json.loads(search_tool("def main", scope="workspace", modes=["content"], task_id="t1"))
         self.assertNotIn("_warning", result)
         self.assertNotIn("error", result)
 
     @patch("tools.file_tools._get_file_ops", return_value=_make_fake_file_ops())
     def test_second_consecutive_search_no_warning(self, _mock_ops):
         """2nd consecutive search should NOT warn (threshold is 3)."""
-        search_tool("def main", task_id="t1")
-        result = json.loads(search_tool("def main", task_id="t1"))
+        search_tool("def main", scope="workspace", modes=["content"], task_id="t1")
+        result = json.loads(search_tool("def main", scope="workspace", modes=["content"], task_id="t1"))
         self.assertNotIn("_warning", result)
         self.assertNotIn("error", result)
 
@@ -182,8 +182,8 @@ class TestSearchLoopDetection(unittest.TestCase):
     def test_fourth_consecutive_search_is_blocked(self, _mock_ops):
         """4th consecutive identical search is BLOCKED."""
         for _ in range(3):
-            search_tool("def main", task_id="t1")
-        result = json.loads(search_tool("def main", task_id="t1"))
+            search_tool("def main", scope="workspace", modes=["content"], task_id="t1")
+        result = json.loads(search_tool("def main", scope="workspace", modes=["content"], task_id="t1"))
         self.assertIn("error", result)
         self.assertIn("BLOCKED", result["error"])
         self.assertNotIn("matches", result)
@@ -193,18 +193,18 @@ class TestSearchLoopDetection(unittest.TestCase):
     def test_pagination_offset_does_not_count_as_repeat(self, _mock_ops):
         """Paginating truncated results should not be blocked as a repeat search."""
         for offset in (0, 50, 100, 150):
-            result = json.loads(search_tool("def main", task_id="t1", offset=offset, limit=50))
+            result = json.loads(search_tool("def main", scope="workspace", modes=["content"], task_id="t1", offset=offset, limit=50))
             self.assertNotIn("_warning", result)
             self.assertNotIn("error", result)
 
     @patch("tools.file_tools._get_file_ops", return_value=_make_fake_file_ops())
     def test_read_between_searches_resets_consecutive(self, _mock_ops):
         """A read_file call between searches resets search consecutive counter."""
-        search_tool("def main", task_id="t1")
-        search_tool("def main", task_id="t1")
+        search_tool("def main", scope="workspace", modes=["content"], task_id="t1")
+        search_tool("def main", scope="workspace", modes=["content"], task_id="t1")
         # A read changes the last_key, resetting consecutive for the search
         read_file_tool("/tmp/test.py", task_id="t1")
-        result = json.loads(search_tool("def main", task_id="t1"))
+        result = json.loads(search_tool("def main", scope="workspace", modes=["content"], task_id="t1"))
         self.assertNotIn("_warning", result)
         self.assertNotIn("error", result)
 

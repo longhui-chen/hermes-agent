@@ -2384,15 +2384,21 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return tool_error(str(e))
 
 
-def search_tool(pattern: str, target: str = "content", path: str = ".",
-                file_glob: str = None, limit: int = 50, offset: int = 0,
-                output_mode: str = "content", context: int = 0,
-                semantic: bool = False, video_semantic: bool = False,
-                path_prefix: str = "",
-                task_id: str = "default",
-                return_references: bool = False) -> str:
+def search_tool(pattern: str, scope: str = None, modes: list[str] = None,
+                path: str = ".", file_glob: str = None, limit: int = 50,
+                offset: int = 0, output_mode: str = "content", context: int = 0,
+                media_type: str = "", region: str = "", path_prefix: str = "",
+                task_id: str = "default", return_references: bool = False) -> str:
     """Search for content or files."""
     try:
+        from tools.search_contract import normalize_search_query
+        pattern, modes, media_type, region = normalize_search_query(
+            scope, pattern, modes, media_type, region)
+        if scope == "nas" and (offset or path != "." or file_glob or context or output_mode != "content"):
+            return tool_error("NAS uses path_prefix and limit; workspace-only parameters are not supported.")
+        if scope == "workspace" and (path_prefix or return_references):
+            return tool_error("path_prefix and return_references are NAS-only parameters.")
+        target = "nas" if scope == "nas" else ("files" if modes == ["name"] else "content")
         offset, limit = normalize_search_pagination(offset, limit)
 
         # Track searches to detect *consecutive* repeated search loops.
@@ -2407,8 +2413,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             file_glob or "",
             limit,
             offset,
-            bool(semantic),
-            bool(video_semantic),
+            tuple(modes),
+            media_type,
+            region,
             str(path_prefix or ""),
             nas_return_references,
         )
@@ -2441,11 +2448,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             nas_search = getattr(file_ops, "nas_search", None)
             if nas_search is None:
                 return tool_error(
-                    "NAS search (target='nas') is not available in this environment."
+                    "NAS search (scope='nas') is not available in this environment."
                 )
-            result = nas_search(pattern=pattern, limit=limit,
-                                semantic=bool(semantic),
-                                video_semantic=bool(video_semantic),
+            result = nas_search(pattern=pattern, modes=modes, limit=limit,
+                                media_type=media_type, region=region,
                                 path_prefix=str(path_prefix or ""),
                                 return_references=nas_return_references)
             return json.dumps(result.to_dict(densify=True), ensure_ascii=False)
@@ -2623,28 +2629,78 @@ PATCH_SCHEMA = {
     },
 }
 
-SEARCH_FILES_SCHEMA = {
-    "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g. '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.\n\nNAS library search (target='nas', Zettlab devices only): searches the user's personal NAS files/photos/videos/documents. Hits render automatically as tappable preview cards in the chat — do NOT re-list them; reply with a short summary only. Set return_references=true only when the same turn must pass a bounded list of matched paths to another native tool. Set semantic=true for image-only visual matching. Set video_semantic=true, without semantic, when the query describes actions or objects inside videos; this searches videos only and returns the best matching timestamp. The first semantic call may take ~30s. pattern is plain keywords (not regex); path/file_glob/output_mode/context are ignored.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "pattern": {"type": "string", "description": "Regex pattern for content search, glob pattern (e.g., '*.py') for file search, or plain keywords for NAS search"},
-            "target": {"type": "string", "enum": ["content", "files", "nas"], "description": "'content' searches inside file contents, 'files' searches for files by name, 'nas' searches the user's NAS library (Zettlab devices; results become chat preview cards)", "default": "content"},
-            "semantic": {"type": "boolean", "description": "NAS search only: also run on-device AI visual matching (images). Use for photo/visual queries; first call may take ~30s.", "default": False},
-            "video_semantic": {"type": "boolean", "description": "NAS search only: search videos by actions or objects in their visual content and return the best matching timestamp. Use without semantic; first call may take ~30s.", "default": False},
-            "return_references": {"type": "boolean", "description": "NAS search only: return a bounded files list of matched path references for a same-turn downstream native tool call. This is an output mode; it does not grant access or authorize downstream use.", "default": False},
-            "path_prefix": {"type": "string", "description": "NAS search only: absolute directory to scope hits to (e.g. the folder you just located), so the preview cards match exactly what you told the user. Must be inside the device's search roots."},
-            "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
-            "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
-            "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
-            "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
-            "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
-        },
-        "required": ["pattern"]
-    }
-}
+SEARCH_FILES_SCHEMA = {'name': 'search_files',
+ 'description': 'Search files with explicit scope and matching modes. NAS hits render as preview cards; do '
+                'not repeat them when carded=true. Scope, media type and capture region are hard filters; '
+                'selected modes are OR alternatives. Never broaden an empty search. For Beijing photos use '
+                'scope=nas, pattern="", modes=[], region="北京", media_type=image. For beach photos taken in '
+                'Beijing use pattern="海边", modes=[semantic] with the same filters. Report partial/failed '
+                'queries using complete, issues and truncated.',
+ 'parameters': {'type': 'object',
+                'properties': {'pattern': {'type': 'string',
+                                           'description': 'Query text. NAS: filename keywords/glob, parsed '
+                                                          'text (including OCR), or visual description '
+                                                          'according to modes. Empty only with modes=[] for '
+                                                          'metadata enumeration. Workspace: name glob or '
+                                                          'content regex.'},
+                               'return_references': {'type': 'boolean',
+                                                     'description': 'NAS search only: return a bounded files '
+                                                                    'list of matched path references for a '
+                                                                    'same-turn downstream native tool call. '
+                                                                    'This is an output mode; it does not '
+                                                                    'grant access or authorize downstream '
+                                                                    'use.',
+                                                     'default': False},
+                               'path_prefix': {'type': 'string',
+                                               'description': 'NAS only: absolute directory inside '
+                                                              'authorized search roots.'},
+                               'path': {'type': 'string',
+                                        'description': 'Directory or file to search in (default: current '
+                                                       'working directory)',
+                                        'default': '.'},
+                               'file_glob': {'type': 'string',
+                                             'description': 'Filter files by pattern in grep mode (e.g., '
+                                                            "'*.py' to only search Python files)"},
+                               'limit': {'type': 'integer',
+                                         'description': 'Maximum number of results to return (default: 50)',
+                                         'default': 50},
+                               'offset': {'type': 'integer',
+                                          'description': 'Workspace only: skip matches. NAS does not support '
+                                                         'offset.',
+                                          'default': 0},
+                               'output_mode': {'type': 'string',
+                                               'enum': ['content', 'files_only', 'count'],
+                                               'description': "Output format for grep mode: 'content' shows "
+                                                              'matching lines with line numbers, '
+                                                              "'files_only' lists file paths, 'count' shows "
+                                                              'match counts per file',
+                                               'default': 'content'},
+                               'context': {'type': 'integer',
+                                           'description': 'Number of context lines before and after each '
+                                                          'match (grep mode only)',
+                                           'default': 0},
+                               'scope': {'type': 'string',
+                                         'enum': ['nas', 'workspace'],
+                                         'description': 'Search scope. NAS searches the user library; '
+                                                        'workspace searches local working files. Never '
+                                                        'switch scope automatically.'},
+                               'modes': {'type': 'array',
+                                         'items': {'type': 'string', 'enum': ['name', 'content', 'semantic']},
+                                         'description': 'Explicit matching modes, OR merged. [] with empty '
+                                                        'pattern means NAS metadata-only enumeration. '
+                                                        'Workspace supports exactly one of name/content.'},
+                               'media_type': {'type': 'string',
+                                              'enum': ['image', 'video', 'media'],
+                                              'description': 'NAS type filter: images, videos, or both. '
+                                                             'Required for semantic mode; omit for all file '
+                                                             'types in name/content queries.'},
+                               'region': {'type': 'string',
+                                          'description': 'NAS capture administrative division, e.g. 北京. Uses '
+                                                         'saved location metadata, not account region or '
+                                                         'visual similarity. Files without resolved location '
+                                                         'cannot match.'}},
+                'required': ['scope', 'pattern', 'modes'],
+                'additionalProperties': False}}
 
 
 def _handle_read_file(args, **kw):
@@ -2691,17 +2747,15 @@ def _handle_patch(args, **kw):
 
 
 def _handle_search_files(args, **kw):
-    tid = kw.get("task_id") or "default"
-    target_map = {"grep": "content", "find": "files"}
-    raw_target = args.get("target", "content")
-    target = target_map.get(raw_target, raw_target)
+    if any(key in args for key in ("target", "semantic", "video_semantic")):
+        return tool_error("Use scope and explicit modes, with media_type for semantic search; target/semantic/video_semantic were removed.")
     return search_tool(
-        pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
-        file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
+        pattern=args.get("pattern"), scope=args.get("scope"), modes=args.get("modes"),
+        path=args.get("path", "."), file_glob=args.get("file_glob"),
+        limit=args.get("limit", 50), offset=args.get("offset", 0),
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
-        semantic=bool(args.get("semantic", False)),
-        video_semantic=bool(args.get("video_semantic", False)),
-        path_prefix=str(args.get("path_prefix") or ""), task_id=tid,
+        media_type=args.get("media_type", ""), region=args.get("region", ""),
+        path_prefix=args.get("path_prefix", ""), task_id=kw.get("task_id") or "default",
         return_references=bool(args.get("return_references", False)))
 
 

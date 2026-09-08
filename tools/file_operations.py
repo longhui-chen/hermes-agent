@@ -277,6 +277,10 @@ class SearchResult:
     # None = unknown (old server / non-NAS search), omitted from to_dict so
     # downstream card compensation can distinguish the two generations.
     carded: Optional[bool] = None
+    complete: Optional[bool] = None
+    status: Optional[str] = None
+    filters: Optional[dict] = None
+    issues: Optional[list] = None
 
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
@@ -346,6 +350,10 @@ class SearchResult:
             result["note"] = self.note
         if self.carded is not None:
             result["carded"] = self.carded
+        for key in ("complete", "status", "filters", "issues"):
+            value = getattr(self, key)
+            if value is not None:
+                result[key] = value
         return result
 
 
@@ -2170,63 +2178,126 @@ class ShellFileOperations(FileOperations):
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
-        """Search workspace; on Zettlab devices fall back to NAS agent-search when empty."""
-        result = self._search_workspace(
+        """Search only the selected workspace; never widen to the NAS."""
+        return self._search_workspace(
             pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context,
         )
-        # Only fall back when the workspace search genuinely found nothing.
-        # An errored result (path not found, bad regex, rg/grep hard failure)
-        # also has total_count == 0, but routing it to NAS would mask the real
-        # error behind an unrelated NAS hit — surface the workspace error.
-        if (result.total_count == 0 and not result.error
-                and get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "")):
-            nas = self._zettlab_nas_fallback(pattern, limit)
-            if nas is not None and nas.total_count > 0:
-                return nas
-        return result
 
-    def nas_search(self, pattern: str, limit: int = 60,
-                   semantic: bool = False, video_semantic: bool = False,
-                   path_prefix: str = "",
+    def nas_search(self, pattern: str, modes: list[str], limit: int = 60,
+                   media_type: str = "", region: str = "", path_prefix: str = "",
                    return_references: bool = False) -> SearchResult:
-        """First-class NAS library search (search_files target='nas').
-
-        Same wire path as the empty-workspace fallback, but callable directly
-        so the model can search the user's NAS files/photos without first
-        running a doomed workspace search, can opt into either the semantic
-        (image-embedding) leg for photo/visual queries or the video-semantic
-        leg for actions/objects inside videos, and can scope hits to one folder
-        via path_prefix (server validates it against SearchRoots; older
-        local-server builds ignore the field — unscoped results).
-        ``return_references`` adds a bounded path list from this same
-        authenticated request for same-turn native-tool handoff; it does not
-        alter card rendering or authorize the downstream operation.
-        Unlike the fallback, unavailability and zero hits return a
-        SearchResult the model can act on instead of a silent None.
-        """
-        query = (pattern or "").strip()
-        if not query:
-            return SearchResult(total_count=0, error="Empty NAS search query.")
+        """Execute explicit modes with hard metadata predicates and native cards."""
+        from tools.search_contract import normalize_search_query
+        try:
+            query, modes, media_type, region = normalize_search_query(
+                "nas", pattern, modes, media_type, region)
+        except ValueError as exc:
+            return SearchResult(error=str(exc), complete=False, status="error")
         token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "")
-        if not token or not self._zettlab_agent_search_url():
-            return SearchResult(total_count=0, error=(
-                "NAS search is unavailable: this agent has no local-server "
-                "credential (not running on a Zettlab device?)."
-            ))
-        result = self._zettlab_nas_fallback(
-            query, limit, semantic=semantic, video_semantic=video_semantic,
-            path_prefix=path_prefix, explicit=True,
-            return_references=return_references)
-        if result is not None:
-            return result
-        return SearchResult(total_count=0, note=(
-            "No NAS files matched this query (or the device search service "
-            "did not respond). Try different keywords"
-            + ("" if semantic or video_semantic
-               else ", or semantic=true for photo/visual queries")
-            + "."
-        ))
+        url = self._zettlab_agent_search_url()
+        if not token or not url:
+            return SearchResult(error="NAS search is unavailable: missing local runtime credential.",
+                                complete=False, status="error")
+        payload_req = {"scope": "nas", "pattern": query, "modes": modes,
+                       "limit": min(max(int(limit or 50), 1), 200)}
+        if media_type:
+            payload_req["media_type"] = media_type
+        if region:
+            payload_req["region"] = region
+        prefix = str(path_prefix or "").strip()
+        if prefix:
+            if not posixpath.isabs(prefix) or ".." in PurePosixPath(prefix).parts or "\x00" in prefix:
+                return SearchResult(error="path_prefix must be an absolute path without traversal.",
+                                    complete=False, status="error")
+            prefix = posixpath.normpath(prefix)
+            payload_req["path_prefix"] = prefix
+        headers = {"Content-Type": "application/json", "X-Zettlab-Agent-Action-Token": token}
+        turn_id = self._zettlab_turn_id()
+        if turn_id:
+            headers["X-Zettlab-Turn-Id"] = turn_id
+        request = urllib.request.Request(url, data=json.dumps(payload_req).encode("utf-8"),
+                                         headers=headers, method="POST")
+        try:
+            with urlopen_hardened(request, timeout=(90 if "semantic" in modes else 10)) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(payload, dict) or payload.get("code") != 200:
+                code = payload.get("code") if isinstance(payload, dict) else "invalid_response"
+                if code == 60033:
+                    return SearchResult(error="Location index is not ready; retain all requested constraints.",
+                                        complete=False, status="error", filters=payload_req,
+                                        issues=[{"source": "region", "reason": "index_not_ready", "code": code}])
+                return SearchResult(error=f"NAS query failed (code={code}); retain all requested constraints.",
+                                    complete=False, status="error")
+            data = payload.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("complete"), bool):
+                raise ValueError("Missing search completion state")
+            filters = data.get("filters")
+            if not isinstance(filters, dict) or any(
+                filters.get(k, "") != payload_req.get(k, "")
+                for k in ("scope", "pattern", "modes", "region", "media_type", "path_prefix")
+            ):
+                raise ValueError("Search did not confirm all requested conditions")
+            items = data.get("items")
+            issues = data.get("issues")
+            if not isinstance(items, list) or not isinstance(issues, list):
+                raise ValueError("Invalid search result")
+            paths = []
+            for item in items:
+                raw = item.get("path") if isinstance(item, dict) else None
+                if (not isinstance(raw, str) or not posixpath.isabs(raw)
+                        or raw != posixpath.normpath(raw) or "\x00" in raw
+                        or ".." in PurePosixPath(raw).parts):
+                    raise ValueError("Invalid result path")
+                if prefix and posixpath.commonpath((raw, prefix)) != prefix:
+                    raise ValueError("Result escaped requested directory")
+                if raw not in paths:
+                    paths.append(raw)
+            if len(paths) != len(items) or data.get("total_count") != len(paths):
+                raise ValueError("Inconsistent result count")
+            carded = data.get("carded")
+            if not isinstance(carded, bool):
+                raise ValueError("Missing card delivery state")
+            complete = data["complete"]
+            truncated = data.get("truncated") is True
+            status = data.get("status")
+            if status not in ("done", "empty", "partial") or (complete and (truncated or issues)):
+                raise ValueError("Inconsistent search completion state")
+            if not complete and status != "partial":
+                raise ValueError("Incomplete query reported as complete")
+        except Exception:
+            return SearchResult(error="NAS query failed or returned an invalid response; do not broaden conditions.",
+                                complete=False, status="error")
+        selected_sources = set(modes) - {"semantic"}
+        if "semantic" in modes:
+            selected_sources.update("semantic:" + kind for kind in (
+                ("image", "video") if media_type == "media" else (media_type,)))
+        if not selected_sources:
+            selected_sources.add("metadata")
+        failed_sources = {issue.get("source") for issue in issues
+                          if isinstance(issue, dict) and issue.get("reason") == "query_failed"}
+        if not paths and selected_sources <= failed_sources:
+            return SearchResult(error="All selected search sources failed; retain all conditions.",
+                                complete=False, status="error", filters=filters, issues=issues)
+        visible_paths = paths[:self._NAS_UNCARDED_LIST_CAP] if return_references or not carded else []
+        if (return_references or not carded) and len(visible_paths) < len(paths):
+            complete = False
+            truncated = True
+            status = "partial"
+            issues = [*issues, {"source": "references", "reason": "reference_limit"}]
+        if not complete:
+            note = "Search is incomplete; explain issues and retain all conditions. Do not claim absence or a complete total."
+        elif not paths:
+            note = "No files matched these explicit conditions. Do not remove filters or add search modes."
+        else:
+            note = "Files matched the explicit conditions."
+        if carded:
+            note += " Preview cards are displayed; do not repeat the file list."
+        elif paths:
+            note += " NO preview cards were displayed; briefly list the returned files."
+        return SearchResult(total_count=len(paths), returned_count=len(paths), files=visible_paths,
+                            truncated=truncated, complete=complete, status=status, filters=filters,
+                            issues=issues, carded=carded, note=note)
 
     @staticmethod
     def _zettlab_agent_search_url() -> Optional[str]:
@@ -2264,249 +2335,6 @@ class ShellFileOperations(FileOperations):
     # When the server says the block was NOT carded (carded=false), the model
     # must be able to present something — return this many paths at most.
     _NAS_UNCARDED_LIST_CAP = 20
-
-    def _zettlab_nas_fallback(self, pattern: str, limit: int,
-                              semantic: bool = False,
-                              video_semantic: bool = False,
-                              path_prefix: str = "",
-                              explicit: bool = False,
-                              return_references: bool = False) -> Optional[SearchResult]:
-        """Query local-server NAS agent-search; returns None on any error.
-
-        On a hit, local-server injects the matches as preview cards into this
-        agent's current chat turn (rendered in App/Web). The tool therefore
-        returns only a count + a note — never the raw file list: the paths are
-        filename/semantic-level hits (no line numbers / content), so listing them
-        would (a) be misread as content matches and (b) duplicate the cards the
-        user already sees.
-
-        Exception: newer local-server builds report ``carded`` in the response.
-        ``carded=false`` means NO card reached the chat (unattributed call or the
-        turn already ended) — then the paths ARE returned (capped) with a note
-        telling the model to list them briefly itself, because claiming "shown
-        above" would be a lie the user can see.
-
-        An explicit NAS call may also request the same bounded path references
-        while cards render normally. Implicit workspace fallback never returns
-        those references, even if the flag is supplied accidentally.
-        """
-        token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "")
-        query = (pattern or "").strip()
-        url = self._zettlab_agent_search_url()
-        if not token or not query or not url:
-            return None
-        # Default to name+content only (matches local-server's own default).
-        # Semantic legs are opt-in: forcing one here would drag every
-        # empty-workspace search behind the c-engine cold start (~30s) instead
-        # of returning the fast FTS hits. Video semantic is intentionally a
-        # video-only query: filename/document hits would dilute content-based
-        # video retrieval and do not carry a matching timestamp.
-        modes = (["video_semantic"] if video_semantic else
-                 ["name", "content"] + (["semantic"] if semantic else []))
-        payload_req = {
-            "q": query,
-            "modes": modes,
-            "limit": min(max(int(limit or 50), 1), 200),
-        }
-        # Folder scoping (newer local-server; older builds ignore the field).
-        # Omit when empty so the request body stays byte-identical for the
-        # common case.
-        prefix = str(path_prefix or "").strip()
-        if prefix:
-            payload_req["path_prefix"] = prefix
-        normalized_prefix = posixpath.normpath(prefix) if prefix else ""
-        prefix_is_valid = bool(
-            normalized_prefix
-            and posixpath.isabs(normalized_prefix)
-            and "\x00" not in normalized_prefix
-            and ".." not in PurePosixPath(prefix).parts
-        )
-        body = json.dumps(payload_req).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "X-Zettlab-Agent-Action-Token": token,
-        }
-        # Echo back the turn local-server tagged this completion with (request
-        # body metadata.turn_id, plumbed onto the session context). local-server
-        # pins the result card to this exact turn (ByTurnIDForAgent); absent it,
-        # it guesses the agent's newest turn (ActiveByAgent), which races with
-        # concurrent same-agent turns. Empty when local-server didn't send one.
-        turn_id = self._zettlab_turn_id()
-        if turn_id:
-            headers["X-Zettlab-Turn-Id"] = turn_id
-        req = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers=headers,
-        )
-        try:
-            with urlopen_hardened(
-                    req, timeout=45 if semantic or video_semantic else 10) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            # Parse inside the try so any malformed reply (non-dict payload,
-            # non-dict items, non-numeric total_count) degrades to None rather
-            # than turning a valid empty search into a tool error.
-            if not isinstance(payload, dict):
-                return None
-            data = payload.get("data")
-            if not isinstance(data, dict):
-                return None
-            item_paths = [
-                str(it.get("path") or it.get("filename"))
-                for it in (data.get("items") or [])
-                if isinstance(it, dict) and (it.get("path") or it.get("filename"))
-            ]
-            raw_reference_paths = [
-                str(it.get("path"))
-                for it in (data.get("items") or [])
-                if isinstance(it, dict) and it.get("path")
-            ]
-            hits = len(item_paths)
-            if not hits:
-                return None
-            total = int(data.get("total_count") or hits)
-            raw_returned = data.get("returned_count")
-            if raw_returned is None:
-                returned = hits
-            else:
-                try:
-                    returned = int(raw_returned)
-                except (TypeError, ValueError):
-                    return None
-                if returned < 0:
-                    return None
-            raw_limit_reason = data.get("limit_reason")
-            if raw_limit_reason is not None and not isinstance(raw_limit_reason, str):
-                return None
-            server_limit_reason = (raw_limit_reason or "").strip() or None
-            server_truncated = data.get("truncated") is True
-            carded = data.get("carded")
-            reference_paths = []
-            rejected_references = 0
-            seen_references = set()
-            for raw_path in raw_reference_paths:
-                if not prefix:
-                    reference_paths.append(raw_path)
-                    continue
-                normalized_path = posixpath.normpath(raw_path)
-                valid_path = bool(
-                    raw_path == raw_path.strip()
-                    and "\x00" not in raw_path
-                    and posixpath.isabs(normalized_path)
-                    and raw_path == normalized_path
-                    and ".." not in PurePosixPath(raw_path).parts
-                )
-                if valid_path:
-                    try:
-                        valid_path = bool(
-                            prefix_is_valid
-                            and normalized_path != normalized_prefix
-                            and posixpath.commonpath(
-                                (normalized_path, normalized_prefix)
-                            ) == normalized_prefix
-                        )
-                    except (OSError, ValueError):
-                        valid_path = False
-                # A missing ``carded`` field identifies the compatibility
-                # server that ignores path_prefix. Keep its cards/count, but
-                # never turn its unscoped paths into downstream references.
-                if valid_path and carded is None:
-                    valid_path = False
-                if not valid_path:
-                    rejected_references += 1
-                    continue
-                if normalized_path not in seen_references:
-                    seen_references.add(normalized_path)
-                    reference_paths.append(normalized_path)
-            references_truncated = bool(
-                explicit
-                and return_references
-                and (
-                    data.get("truncated") is True
-                    or rejected_references > 0
-                    or len(reference_paths) > self._NAS_UNCARDED_LIST_CAP
-                    or total > len(reference_paths)
-                )
-            )
-            if references_truncated and prefix and carded is None:
-                reference_limit_reason = (
-                    "NAS reference list is unavailable because this device "
-                    "could not verify the requested path scope; do not use "
-                    "the unscoped matches as downstream references."
-                )
-            elif references_truncated:
-                reference_limit_reason = (
-                    "NAS reference list is incomplete; narrow the search "
-                    "before treating the returned paths as the full "
-                    "candidate set."
-                )
-            else:
-                reference_limit_reason = None
-            effective_truncated = server_truncated or references_truncated
-            effective_limit_reason = server_limit_reason or reference_limit_reason
-        except Exception:
-            return None
-        if carded is False:
-            # The server confirmed no card reached the chat; never claim
-            # "shown above". Paths go back only on an explicit NAS search —
-            # the implicit workspace fallback must not surface personal file
-            # names the user never asked about.
-            if not explicit:
-                return SearchResult(
-                    total_count=total,
-                    returned_count=returned,
-                    truncated=effective_truncated,
-                    limit_reason=effective_limit_reason,
-                    carded=False,
-                    note=(
-                        f"{hits} NAS file(s) matched but NO preview cards were "
-                        "shown in the chat. Do NOT claim results are displayed; "
-                        "offer an explicit NAS search (target='nas') if the user "
-                        "wants them."
-                    ),
-                )
-            return SearchResult(
-                total_count=total,
-                returned_count=returned,
-                files=(reference_paths if return_references else item_paths)[
-                    :self._NAS_UNCARDED_LIST_CAP
-                ],
-                truncated=effective_truncated,
-                limit_reason=effective_limit_reason,
-                carded=False,
-                note=(
-                    f"{hits} NAS file(s) matched but NO preview cards were shown "
-                    "in the chat (the call was not attributed to a live turn). "
-                    "Do NOT claim the results are displayed — briefly list the "
-                    "matched files (name + one-line reason) for the user instead."
-                ),
-            )
-        note = (
-            f"{hits} NAS file(s) matched and were rendered as preview cards in "
-            "the chat — the user already sees them. Do not list, repeat, or "
-            "describe these results; just continue with the user's request."
-        )
-        # No carded key in the reply = older local-server, which also ignores
-        # path_prefix: the count is library-wide, not folder-scoped. Say so
-        # instead of letting the model present it as the folder's contents.
-        if prefix and carded is None:
-            note += (
-                " NOTE: this device build ignored path_prefix — the results "
-                "cover the whole library, not only the requested folder."
-            )
-        return SearchResult(
-            total_count=total,
-            returned_count=returned,
-            files=(reference_paths[:self._NAS_UNCARDED_LIST_CAP]
-                   if explicit and return_references else []),
-            truncated=effective_truncated,
-            limit_reason=effective_limit_reason,
-            # True = server confirmed; None (old server) = omitted, so the
-            # chat-side collector keeps its legacy derived-card compensation.
-            carded=(True if carded is True else None),
-            note=note,
-        )
 
     def _search_workspace(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,

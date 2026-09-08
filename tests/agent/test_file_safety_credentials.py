@@ -89,7 +89,7 @@ def test_search_tool_blocks_direct_auth_json_path(fake_home, monkeypatch):
     monkeypatch.setattr(ft, "_get_file_ops", fail_if_called)
 
     out = json.loads(
-        ft.search_tool(
+        ft.search_tool(scope="workspace", modes=["content"],
             pattern="SEARCH_DIRECT_AUTH_SECRET",
             path=str(auth),
             task_id="search-direct-auth-json",
@@ -144,7 +144,7 @@ def test_search_tool_filters_credential_results(fake_home, tmp_path, monkeypatch
         terminal_tool, "_session_cwd", {}
     )
 
-    search_response = ft.search_tool(
+    search_response = ft.search_tool(scope="workspace", modes=["content"],
         pattern="SEARCH",
         path=str(fake_home),
         task_id="search-filter-credentials",
