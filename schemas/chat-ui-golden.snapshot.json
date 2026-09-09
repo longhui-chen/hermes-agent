@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "df617b38251814064f6fb2409122e88f14a80fa1",
-  "sha256": "d1c50fd61eec8730a1e100274148667b9084c414f8bccb6407fc27576a85b253",
+  "root_commit": "67828e6fe51058f14fa51543bf0cfbcd346b3dc9",
+  "sha256": "fddcae3942c4cbbeb37749bdb9dd427c7278812c8588b38fcf9df9631e977bd6",
   "payload": {
     "golden": {
       "events": {
@@ -1561,6 +1561,92 @@
           "toolCallId": "call_demo_0001",
           "status": "running"
         }
+      },
+      "http": {
+        "session-history.delta": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "snapshot_seq": 44,
+          "next_since": {
+            "updated_seq": 44,
+            "row_key": "aa:8"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0001",
+            "live_seq": 9,
+            "unsettled": true
+          },
+          "messages": [],
+          "activities": [
+            {
+              "activity_id": "act_demo_0001",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "turn_id": "turn_demo_0001",
+              "status": "streaming",
+              "updated_seq": 44,
+              "last_fanout_seq": 9
+            }
+          ],
+          "truncated": false
+        },
+        "session-history.tail": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "snapshot_seq": 42,
+          "next_since": {
+            "updated_seq": 41,
+            "row_key": "ma:7"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0001",
+            "live_seq": 7,
+            "phase": "tool",
+            "tool_name": "search_files",
+            "unsettled": false
+          },
+          "messages": [
+            {
+              "id": 7,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "好的，我先找出上周末的视频。",
+              "status": "streaming",
+              "updated_seq": 41,
+              "last_fanout_seq": 2
+            }
+          ],
+          "activities": [
+            {
+              "activity_id": "act_demo_0001",
+              "call_id": "thinking:0",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "turn_id": "turn_demo_0001",
+              "kind": "thinking",
+              "content": "用户要剪 vlog，先确认时间范围。",
+              "status": "streaming",
+              "created_seq": 40,
+              "updated_seq": 40,
+              "last_fanout_seq": 3
+            }
+          ],
+          "truncated": false
+        },
+        "session-history.turn-activities": {
+          "activities": [
+            {
+              "activity_id": "act_demo_0001",
+              "call_id": "thinking:0",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "turn_id": "turn_demo_0001",
+              "kind": "thinking",
+              "status": "done",
+              "created_seq": 40,
+              "updated_seq": 45,
+              "last_fanout_seq": 9
+            }
+          ],
+          "truncated": false
+        }
       }
     },
     "fields": {
@@ -2267,7 +2353,7 @@
               "type": "string"
             },
             "item_id": {
-              "required": true,
+              "required": false,
               "type": "string"
             }
           }
@@ -2658,6 +2744,233 @@
               "required": true,
               "type": "number"
             }
+          }
+        }
+      }
+    },
+    "http": {
+      "$comment": "HTTP response fields for BP U3a. Shapes are derived from SessionHistoryResponse and its nested row/active-turn types; all additions are optional on existing /history responses.",
+      "session-history.tail": {
+        "response": {
+          "agent_id": {
+            "required": true,
+            "type": "string"
+          },
+          "session_id": {
+            "required": true,
+            "type": "string"
+          },
+          "capabilities": {
+            "required": false,
+            "type": "object"
+          },
+          "has_more": {
+            "required": false,
+            "type": "boolean"
+          },
+          "oldest_id": {
+            "required": false,
+            "type": "number"
+          },
+          "has_more_newer": {
+            "required": false,
+            "type": "boolean"
+          },
+          "newest_id": {
+            "required": false,
+            "type": "number"
+          },
+          "history_truncated": {
+            "required": false,
+            "type": "boolean"
+          },
+          "snapshot_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "next_since": {
+            "required": false,
+            "type": "object"
+          },
+          "active_turn": {
+            "required": false,
+            "type": "object"
+          },
+          "messages": {
+            "required": true,
+            "type": "array"
+          },
+          "activities": {
+            "required": true,
+            "type": "array"
+          },
+          "truncated": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "session-history.delta": {
+        "response": {
+          "agent_id": {
+            "required": true,
+            "type": "string"
+          },
+          "session_id": {
+            "required": true,
+            "type": "string"
+          },
+          "capabilities": {
+            "required": false,
+            "type": "object"
+          },
+          "has_more": {
+            "required": false,
+            "type": "boolean"
+          },
+          "oldest_id": {
+            "required": false,
+            "type": "number"
+          },
+          "has_more_newer": {
+            "required": false,
+            "type": "boolean"
+          },
+          "newest_id": {
+            "required": false,
+            "type": "number"
+          },
+          "history_truncated": {
+            "required": false,
+            "type": "boolean"
+          },
+          "snapshot_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "next_since": {
+            "required": false,
+            "type": "object"
+          },
+          "active_turn": {
+            "required": false,
+            "type": "object"
+          },
+          "messages": {
+            "required": true,
+            "type": "array"
+          },
+          "activities": {
+            "required": true,
+            "type": "array"
+          },
+          "truncated": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "session-history.turn-activities": {
+        "response": {
+          "activities": {
+            "required": true,
+            "type": "array"
+          },
+          "next_cursor": {
+            "required": false,
+            "type": "string"
+          },
+          "truncated": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "active_turn": {
+        "fields": {
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "live_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "phase": {
+            "required": false,
+            "type": "string"
+          },
+          "tool_name": {
+            "required": false,
+            "type": "string"
+          },
+          "unsettled": {
+            "required": true,
+            "type": "boolean"
+          }
+        }
+      },
+      "message_row": {
+        "fields": {
+          "id": {
+            "required": true,
+            "type": "number"
+          },
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "updated_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "visible": {
+            "required": false,
+            "type": "boolean"
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "status": {
+            "required": false,
+            "type": "string"
+          }
+        }
+      },
+      "activity_row": {
+        "fields": {
+          "activity_id": {
+            "required": false,
+            "type": "string"
+          },
+          "call_id": {
+            "required": false,
+            "type": "string"
+          },
+          "item_id": {
+            "required": false,
+            "type": "string"
+          },
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "created_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "updated_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number"
+          },
+          "status": {
+            "required": true,
+            "type": "string"
           }
         }
       }
