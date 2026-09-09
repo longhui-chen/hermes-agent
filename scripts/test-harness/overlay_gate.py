@@ -172,11 +172,13 @@ def parse_hunks(diff_text: str) -> List[Hunk]:
             current = None
             current_path = None
             continue
-        if raw.startswith("+++ "):
+        if current is None and raw.startswith("+++ "):
+            # file headers are only recognised outside a hunk: inside one, `+++ x` is an
+            # added line whose content starts with `++`
             target = raw[4:].strip()
             current_path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
             continue
-        if raw.startswith("--- "):
+        if current is None and raw.startswith("--- "):
             continue
         match = _HUNK_RE.match(raw)
         if match:
@@ -284,7 +286,9 @@ def should_skip(head_ref: str, config: dict, labels: Sequence[str] = (), head_re
     label = config.get("skip_label", "")
     if label and label not in set(labels or ()):
         return False
-    if head_repo and base_repo and head_repo != base_repo:
+    # fail closed: both repository names must be present and identical (a deleted fork
+    # reports an empty head repo and must not pass as "same repo")
+    if not head_repo or not base_repo or head_repo != base_repo:
         return False
     return True
 

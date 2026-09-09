@@ -68,6 +68,19 @@ def test_parse_hunks_separates_added_and_deleted():
     hunks = gate.parse_hunks(diff)
     assert [h.new_start for h in hunks] == [11, 22]
     assert [h.path for h in hunks] == ["run_agent.py", "run_agent.py"]
+
+
+def test_parse_hunks_treats_plus_plus_lines_inside_hunk_as_content():
+    diff = (
+        "diff --git a/agent/loop.py b/agent/loop.py\n"
+        "--- a/agent/loop.py\n+++ b/agent/loop.py\n"
+        "@@ -1,0 +2,2 @@\n"
+        '+++ __import__("os").system("id")\n'
+        "+--- not a header either\n"
+    )
+    hunks = gate.parse_hunks(diff)
+    assert len(hunks) == 1 and hunks[0].added_nonblank == 2
+    assert hunks[0].added[0].startswith("++ ")
     assert hunks[0].added_nonblank == 1
     assert hunks[1].added_nonblank == 0 and hunks[1].removed == 2
 
@@ -112,6 +125,8 @@ def test_skip_upstream_sync_branches(config):
     assert not gate.should_skip("sync/upstream-v2026.9.1", config)
     assert not gate.should_skip("sync/upstream-v2026.9.1", config, labels=["other"], head_repo="zettlab/hermes-agent", base_repo="zettlab/hermes-agent")
     assert not gate.should_skip("sync/upstream-v2026.9.1", config, labels=["upstream-sync"], head_repo="evil/hermes-agent", base_repo="zettlab/hermes-agent")
+    # deleted fork: empty head repo must fail closed
+    assert not gate.should_skip("sync/upstream-v2026.9.1", config, labels=["upstream-sync"], head_repo="", base_repo="zettlab/hermes-agent")
 
 
 # ---------------------------------------------------------------- flow

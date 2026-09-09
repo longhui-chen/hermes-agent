@@ -16,7 +16,8 @@ name: Zettlab Overlay Gate
 # definition, the script, its config and its self-test all come from the BASE branch;
 # the PR head is only fetched as data for `git diff` / `git show` and is never checked
 # out or executed. Mark `overlay-gate` as a required status check in branch protection.
-# `edited` is included so the PR-body checks (upstream-pr) re-run when the body changes.
+# `edited` re-runs the PR-body checks (upstream-pr); `labeled` / `unlabeled` re-run the
+# sync-branch exemption after upstream-release-pr.yml adds the `upstream-sync` label.
 # This file deliberately has NO other trigger and NO other job: a same-named job that
 # gets skipped on another event would count as a successful `overlay-gate` context and
 # satisfy branch protection. The PR-side self-test lives in
@@ -24,7 +25,7 @@ name: Zettlab Overlay Gate
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 permissions:
   contents: read
