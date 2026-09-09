@@ -79,6 +79,31 @@ def test_provider_entry_consumes_batch_without_dropped():
     ]
 
 
+def test_short_circuit_closes_unconsumed_inflight_with_dropped():
+    agent = _agent()
+    stream_q = queue.Queue()
+    ZetAgentAdapter._bind_steer_producer(
+        agent,
+        turn_id="turn-1",
+        stream_q=stream_q,
+    )
+    steer_id = agent._zettlab_admit_steer("middleware short circuit", "turn-1")[
+        "steer_id"
+    ]
+    messages = [{"role": "tool", "content": "done", "tool_call_id": "c"}]
+
+    drain_steer_for_next_api_call(agent, messages)
+    assert agent._steer_admission_hook.provider_entered is False
+    assert agent._drain_pending_steer(close=True) is None
+
+    items = _payloads(stream_q)
+    assert [item[1]["type"] for item in items] == [
+        "steer_accepted",
+        "steer_dropped",
+    ]
+    assert items[-1][1]["steer_id"] == steer_id
+
+
 def test_terminal_enqueue_failure_hands_back_once_and_never_leaks_next_turn():
     class _BrokenTerminalQueue(queue.Queue):
         def put_nowait(self, item):

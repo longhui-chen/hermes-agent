@@ -331,6 +331,8 @@ class _SteerProducer:
 
     def close(self, pending: list[tuple[str | None, str]]) -> list[tuple[str, str]]:
         self.closed = True
+        if not self.provider_entered and self.inflight:
+            pending = [*self.inflight, *pending]
         handback: list[tuple[str, str]] = []
         for index, (steer_id, text) in enumerate(pending):
             if not steer_id:
