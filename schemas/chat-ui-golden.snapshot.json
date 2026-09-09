@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "67828e6fe51058f14fa51543bf0cfbcd346b3dc9",
-  "sha256": "fddcae3942c4cbbeb37749bdb9dd427c7278812c8588b38fcf9df9631e977bd6",
+  "root_commit": "821dea8e5baff6dfae63f8a9a5c24b2ad74d6cfc",
+  "sha256": "ebbdd2f433896c06ddf4706d060958b6b97ac263eaaff43e618d989ea2d5b212",
   "payload": {
     "golden": {
       "events": {
@@ -2905,7 +2905,7 @@
             "type": "string"
           },
           "unsettled": {
-            "required": true,
+            "required": false,
             "type": "boolean"
           }
         }
