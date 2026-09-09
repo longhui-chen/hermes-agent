@@ -24,7 +24,7 @@ Use `read_file` with the resolved absolute path to the note. Prefer this over `c
 
 ## List notes
 
-Use `search_files` with `target: "files"` and the resolved vault path. Prefer this over `find` or `ls`.
+Use `search_files` with `scope: "workspace", modes: ["name"]` and the resolved vault path. Prefer this over `find` or `ls`.
 
 - To list all markdown notes, use `pattern: "*.md"` under the vault path.
 - To list a subfolder, search under that subfolder's absolute path.
@@ -33,8 +33,8 @@ Use `search_files` with `target: "files"` and the resolved vault path. Prefer th
 
 Use `search_files` for both filename and content searches. Prefer this over `grep`, `find`, or `ls`.
 
-- For filenames, use `search_files` with `target: "files"` and a filename `pattern`.
-- For note contents, use `search_files` with `target: "content"`, the content regex as `pattern`, and `file_glob: "*.md"` when you want to restrict matches to markdown notes.
+- For filenames, use `search_files` with `scope: "workspace", modes: ["name"]` and a filename `pattern`.
+- For note contents, use `search_files` with `scope: "workspace", modes: ["content"]`, the content regex as `pattern`, and `file_glob: "*.md"` when you want to restrict matches to markdown notes.
 
 ## Create a note
 

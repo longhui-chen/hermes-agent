@@ -173,6 +173,37 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 
 ### Fresh Session Isolation
 
+`run_one_job` also binds a private immutable job/execution/profile identity in
+`cron.execution_context` after the durable running transition. It is scoped to
+`run_job`, restored even on exceptions, and never sourced from shell environment
+variables or Chat routing metadata. Normal `copy_context()` workers inherit the
+identity, but it is not a grant: hardware consumers must independently check the
+active execution ledger and their resource policy at the service boundary.
+Unsupported legacy IDs leave this private identity unavailable without stopping
+ordinary Cron jobs. Delivery runs outside this execution scope.
+
+The camera direct runner accepts the pinned Presets
+`skills/camera-semantic-evaluation/scripts/camera_semantic_monitor.py` with
+only `candidate` and `commit` arguments. It reuses the camera package digest,
+manifest capability, fixed foreground Python dispatch, timeout, and redaction
+boundary. The current Cron identity must match the current profile home;
+profile action token, job ID, and execution ID travel via private FDs, not a
+generic shell. Missing profile values fail closed, with no ambient environment
+fallback. The local-server URL is derived only from a loopback profile callback.
+This runner does not authorize recording or replace the device's per-policy
+checks. End-to-end Skill admission, actual camera evidence, vision, and delivery
+must be verified separately from runner tests.
+
+To verify the actual Presets helper against this runner, set
+`HERMES_TEST_CAMERA_PRESETS_SOURCE` to its source file and run
+`scripts/run_tests.sh tests/tools/test_terminal_camera_semantic_runner.py -q`.
+The opt-in tests run candidate and positive/negative commit through a real
+isolated Python child, private FDs, a loopback fixture HTTP service, and private
+attachment file IO. They use fixture media and service responses, not actual
+camera capture, identity matching, model inference, or device authorization.
+Without an explicit source these cross-repository cases are skipped; other
+runner tests still run. A nonexistent supplied source fails rather than skips.
+
 Each cron job runs in a completely fresh agent session:
 
 - No conversation history from previous runs

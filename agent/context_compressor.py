@@ -1187,10 +1187,21 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
     if tool_name == "search_files":
         pattern = args.get("pattern", "?")
         path = args.get("path", ".")
-        target = args.get("target", "content")
+        target = f"{args.get('scope', '?')}/{args.get('modes', [])} region={args.get('region', '')} type={args.get('media_type', '')}"
         match_count = re.search(r'"total_count"\s*:\s*(\d+)', content)
         count = match_count.group(1) if match_count else "?"
-        return f"[search_files] {target} search for '{pattern}' in {path} -> {count} matches"
+        state = ""
+        try:
+            result = json.loads(content)
+            if isinstance(result, dict):
+                state = f" status={result.get('status', '?')} complete={result.get('complete', '?')}"
+                if result.get("issues"):
+                    state += f" issues={result['issues']}"
+                if result.get("error"):
+                    state += f" error={result['error']}"
+        except (ValueError, TypeError):
+            state = " completion unknown"
+        return f"[search_files] {target} search for '{pattern}' in {path} -> {count} returned matches{state}"
 
     if tool_name == "patch":
         path = args.get("path", "?")
