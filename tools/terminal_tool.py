@@ -2690,49 +2690,9 @@ def _camera_runtime_arguments_allowed(arguments: list[str]) -> bool:
 
 
 def _camera_semantic_arguments_allowed(arguments: list[str]) -> bool:
-    if not arguments or len(arguments) % 2 != 1:
-        return False
-    fields = dict(zip(arguments[1::2], arguments[2::2]))
-    if len(fields) != (len(arguments) - 1) // 2:
-        return False
-    if arguments[0] == "candidate":
-        return set(fields) == {"--policy-id"} and re.fullmatch(
-            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
-            fields["--policy-id"],
-        ) is not None
-    if arguments[0] != "commit" or not re.fullmatch(
-        r"[A-Za-z0-9_-]{32,128}", fields.get("--capability", "")
-    ):
-        return False
-    required = {"--capability", "--matched"}
-    if fields.get("--matched") == "false":
-        return set(fields) <= required | {"--unknown"} and fields.get("--unknown", "false") in {"true", "false"}
-    required |= {"--subject-kind", "--predicate", "--duration-seconds", "--evidence-ref"}
-    if (
-        fields.get("--matched") != "true"
-        or not required <= fields.keys()
-        or fields.keys() - required - {"--subject-ref", "--zone-id", "--frame-states", "--track-ids"}
-        or fields["--subject-kind"] not in {"person", "object"}
-        or fields["--predicate"] not in {"appears", "disappears", "enters_zone", "leaves_zone", "lingers"}
-        or re.fullmatch(r"[0-9]{1,4}", fields["--duration-seconds"]) is None
-        or int(fields["--duration-seconds"]) > 3600
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", fields["--evidence-ref"]) is None
-    ):
-        return False
-    if "--frame-states" in fields or "--track-ids" in fields:
-        states = fields.get("--frame-states", "").split(",")
-        tracks = fields.get("--track-ids", "").split(",")
-        if (
-            not 3 <= len(states) <= 8 or len(states) != len(tracks)
-            or any(state not in {"present", "absent", "inside", "outside", "unknown"} for state in states)
-            or any(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", track) is None for track in tracks)
-        ):
-            return False
-    return all(
-        len(fields.get(key, "").encode("utf-8")) <= limit
-        and not any(ord(c) < 0x20 for c in fields.get(key, ""))
-        for key, limit in (("--subject-ref", 120), ("--zone-id", 64))
-    )
+    # zettlab-overlay(ac432-observe): Delegate semantic argv checks to the adapter; upstream: none
+    from gateway.platforms.zet_agent_camera_semantic_arguments import semantic_arguments_allowed
+    return semantic_arguments_allowed(arguments)
 
 
 def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeCommand]:
@@ -4415,6 +4375,11 @@ def _run_camera_runtime_command_if_allowed(
         from tools.environments.local import build_camera_runtime_env, build_camera_semantic_runtime_env
         from tools.trusted_direct_runner import run_trusted_python_script
 
+        # zettlab-overlay(ac432-observe): Preserve ordinary limits and validate finite execution budget; upstream: none
+        from gateway.platforms.zet_agent_camera_semantic_arguments import semantic_execution_timeout
+        run_timeout = semantic_execution_timeout(
+            parsed.argv[2:] if semantic else [], timeout, FOREGROUND_MAX_TIMEOUT, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS,
+        )
         trusted_env = build_camera_semantic_runtime_env() if semantic else build_camera_runtime_env()
         trusted_secrets = {
             key: trusted_env.pop(key)
@@ -4436,7 +4401,8 @@ def _run_camera_runtime_command_if_allowed(
             base_env={},
             injected_env=trusted_env,
             injected_secrets=trusted_secrets,
-            timeout=max(1, min(timeout, _CAMERA_RUNTIME_MAX_TIMEOUT_SECONDS)),
+            # zettlab-overlay(ac432-observe): Use the adapter-validated deadline without shortening capture; upstream: none
+            timeout=run_timeout,
             secret_values=secret_values,
             script_bytes=script_bytes,
             stdlib_only=True,

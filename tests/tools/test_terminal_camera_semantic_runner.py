@@ -110,6 +110,36 @@ def test_candidate_and_commit_have_separate_parameter_allowlists(runtime):
     assert terminal._parse_camera_runtime_command(positive + proof + " --unknown true") is None
 
 
+@pytest.mark.parametrize("budget", ["0", "-1", "nan", "2.5", "2147483648", "01"])
+def test_observation_parser_rejects_invalid_budget(runtime, budget):
+    command = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds " + budget
+    assert terminal._parse_camera_runtime_command(command) is None
+
+
+@pytest.mark.parametrize("requested,limit,budget,expected", [
+    (600, 600, 590, 595), (3600, 3600, 3500, 3505),
+    (80, 600, 590, None), (600, 600, 600, None), (3600, 600, 3500, None),
+])
+def test_observation_budget_is_never_silently_clamped(requested, limit, budget, expected):
+    from gateway.platforms.zet_agent_camera_semantic_arguments import semantic_execution_timeout
+    args = ["observe", "--policy-id", "12345678-1234-1234-1234-123456789abc", "--timeout-seconds", str(budget)]
+    if expected is None:
+        with pytest.raises(ValueError):
+            semantic_execution_timeout(args, requested, limit, 80)
+    else:
+        assert semantic_execution_timeout(args, requested, limit, 80) == expected
+    assert semantic_execution_timeout(["candidate"], requested, limit, 80) == 80
+    assert semantic_execution_timeout([], requested, limit, 80) == 80
+
+
+def test_observation_rejects_insufficient_tool_timeout_before_child(runtime, monkeypatch):
+    monkeypatch.setattr("tools.trusted_direct_runner.run_trusted_python_script", lambda **_: pytest.fail("must not spawn"))
+    command = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds 590"
+    with execution_scope("job-a", "run-a", runtime[0]):
+        result = json.loads(terminal.terminal_tool(command=command, timeout=80, task_id="observe-short"))
+    assert result["exit_code"] == -1
+
+
 def test_changed_package_is_rejected(runtime):
     profile, script = runtime
     assert terminal._parse_camera_runtime_command(COMMAND) is not None
@@ -268,6 +298,8 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
                     "predicate": "lingers", "zone_id": "", "min_duration_seconds": 10,
                     "image_data_uri": "data:image/jpeg;base64," + base64.b64encode(image).decode(),
                 }
+            elif self.path.endswith("/semantic-observations"):
+                data = {"analysis_complete": True, "analysis": {"unknown_batches": 1, "created_events": 0}}
             else:
                 data = {"matched": body["verdict"]["matched"]}
             response = json.dumps({"data": data}).encode()
@@ -305,7 +337,13 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
             result = json.loads(terminal.terminal_tool(command=commit, task_id="real-presets-commit"))
             assert result["exit_code"] == 0, result
             assert json.loads(result["output"]) == {"data": {"matched": matched}}
-        assert len(requests) == 2
+            observe = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds 590"
+            observed = json.loads(terminal.terminal_tool(command=observe, timeout=600, task_id="real-presets-observe"))
+            assert observed["exit_code"] == 0, observed
+            assert json.loads(observed["output"]) == {"data": {
+                "analysis_complete": True, "analysis": {"unknown_batches": 1, "created_events": 0},
+            }}
+        assert len(requests) == 3
         for path, body, bearer in requests:
             assert path.startswith("/api/v1/agent/hardware-connectors/cameras/semantic-")
             assert body["job_id"] == "job-a" and body["execution_id"] == "run-a"
@@ -313,6 +351,10 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
         assert requests[1][1] == {
             "job_id": "job-a", "execution_id": "run-a", "capability": capability,
             "verdict": verdict,
+        }
+        assert requests[2][1] == {
+            "policy_id": "12345678-1234-1234-1234-123456789abc",
+            "execution_timeout_seconds": 590, "job_id": "job-a", "execution_id": "run-a",
         }
         assert terminal._CONNECTOR_RUNTIME_ROOT_ANCHOR.file_digests[SCRIPT] == hashlib.sha256(raw).hexdigest()
     finally:

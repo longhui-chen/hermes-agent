@@ -184,7 +184,7 @@ ordinary Cron jobs. Delivery runs outside this execution scope.
 
 The camera direct runner accepts the pinned Presets
 `skills/camera-semantic-evaluation/scripts/camera_semantic_monitor.py` with
-only `candidate` and `commit` arguments. It reuses the camera package digest,
+only `candidate`, `commit`, and `observe` arguments. It reuses the camera package digest,
 manifest capability, fixed foreground Python dispatch, timeout, and redaction
 boundary. The current Cron identity must match the current profile home;
 profile action token, job ID, and execution ID travel via private FDs, not a
@@ -193,6 +193,19 @@ fallback. The local-server URL is derived only from a loopback profile callback.
 This runner does not authorize recording or replace the device's per-policy
 checks. End-to-end Skill admission, actual camera evidence, vision, and delivery
 must be verified separately from runner tests.
+
+`observe --policy-id UUID --timeout-seconds N` runs an already-confirmed finite
+policy through the same foreground process. Its explicit execution budget must
+fit inside the requested tool timeout and configured foreground maximum, with
+five seconds of process/HTTP cleanup headroom. Insufficient budgets are rejected,
+never clamped. The service also reserves first-frame and analysis time before
+starting the full policy duration. Ordinary camera and printer commands retain
+their 80-second cap. Cron inactivity cancellation and the existing trusted-runner
+interrupt cleanup remain authoritative; no detached observation worker is added.
+The default skill uses 590 seconds within a 600-second tool call. This is an
+execution limit, not permission to shorten a longer policy. A longer platform
+limit must be explicitly configured through existing runtime controls before use.
+An incomplete analysis or zero events is not proof of absence.
 
 To verify the actual Presets helper against this runner, set
 `HERMES_TEST_CAMERA_PRESETS_SOURCE` to its source file and run
