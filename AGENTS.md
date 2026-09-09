@@ -84,8 +84,11 @@ assess all rules, including “no impact” where appropriate.
    the PR body carries `upstream-pr:`, and no Zettlab business state (binding
    tokens, senders, ledgers, handback lists, reject counters) lives in the
    kernel — that belongs in `gateway/platforms/zet_agent.py`. CI job
-   `Zettlab Overlay Gate` (`scripts/test-harness/overlay_gate.py`) enforces this
-   on every PR; upstream sync branches (`sync/upstream-*`) are exempt.
+   `Zettlab Overlay Gate` / `overlay-gate` (`scripts/test-harness/overlay_gate.py`)
+   enforces this on every PR from the base branch via `pull_request_target` (the PR
+   head is only diff input) and must stay a required status check in branch
+   protection; upstream sync branches (`sync/upstream-*`) are exempt from the gate
+   and instead get a manual upstream-diff review against the overlay registry.
 9. **HR-T1 dependency freeze:** while the parent freeze is active, do not add,
    upgrade, or downgrade Microsoft/Azure dependency families (`Azure`,
    `Microsoft`, `@azure`, `@microsoft`, `azure-*`, `msal*`). Existing pinned
