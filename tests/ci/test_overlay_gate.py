@@ -306,6 +306,28 @@ def test_flow_untokenizable_protected_file_is_rejected(tmp_path, config):
     assert "untokenizable" in {v.kind for v in result.violations}
 
 
+def test_flow_newline_in_kernel_filename_is_still_gated(tmp_path, config):
+    repo = _repo(tmp_path)
+    weird = repo / "agent" / "evil\nmodule.py"
+    weird.write_text("agent._binding_token = None\n", encoding="utf-8")
+    _commit(repo)
+    result = _run(repo, config)
+    assert result.protected_files == ["agent/evil\nmodule.py"]
+    assert {"marker", "business-state"} <= {v.kind for v in result.violations}
+
+
+def test_flow_symlinked_kernel_directory_is_rejected(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / "impl_agent").mkdir()
+    (repo / "impl_agent" / "loop.py").write_text(f"{MARKER}\nagent._binding_token = None\n", encoding="utf-8")
+    (repo / "agent" / "loop.py").unlink()
+    (repo / "agent").rmdir()
+    (repo / "agent").symlink_to("impl_agent")
+    _commit(repo)
+    result = _run(repo, config)
+    assert "symlink" in {v.kind for v in result.violations}
+
+
 def test_flow_upstream_sync_branch_skipped(tmp_path, config):
     repo = _repo(tmp_path)
     (repo / "agent" / "loop.py").write_text("x = 1\ny = 2\n", encoding="utf-8")

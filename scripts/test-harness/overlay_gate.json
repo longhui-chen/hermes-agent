@@ -3,7 +3,9 @@
   "protected": [
     "run_agent.py",
     "hermes_state.py",
+    "agent",
     "agent/**",
+    "tools",
     "tools/**",
     "gateway/run.py",
     "gateway/platforms/base.py",

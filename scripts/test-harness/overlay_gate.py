@@ -28,7 +28,8 @@ Checks (all must pass):
    defence in depth; the marker and the budget are the primary controls).
 5. **LF only** — an added kernel line containing a bare CR fails: Python treats CR as a
    line terminator while git diff counts it as one line.
-6. **Real files, real comments** — a protected path that is a symlink at head fails; for
+6. **Real files, real comments** — a protected path that is a symlink at head, or that
+   sits under a symlinked directory, fails; for
    ``.py`` files the marker must sit on a line that ``tokenize`` reports as a COMMENT
    token (a marker inside a string literal does not count), and a file that does not
    tokenize fails.
@@ -146,10 +147,18 @@ def _git(repo: Path, *args: str) -> str:
     return proc.stdout.decode("utf-8", "replace")
 
 
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    proc = subprocess.run(["git", "-C", str(repo), *args], check=False, capture_output=True)
+    if proc.returncode != 0:
+        raise SystemExit(f"git {' '.join(args)} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+    return proc.stdout
+
+
 def changed_files(repo: Path, base: str, head: str) -> List[str]:
+    """Changed paths, NUL-separated so a newline or quote inside a file name cannot hide it."""
     merge_base = _git(repo, "merge-base", base, head).strip()
-    out = _git(repo, "diff", "--name-only", merge_base, head)
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    out = _git_bytes(repo, "diff", "--name-only", "-z", merge_base, head)
+    return [part.decode("utf-8", "surrogateescape") for part in out.split(b"\0") if part]
 
 
 def parse_hunks(diff_text: str) -> List[Hunk]:
@@ -193,8 +202,22 @@ def new_file_lines(repo: Path, head: str, path: str) -> List[str]:
 
 def head_file_mode(repo: Path, head: str, path: str) -> str:
     """Return the git tree mode of ``path`` at ``head`` (``120000`` = symlink), or ''."""
-    out = _git(repo, "ls-tree", head, "--", path)
-    return out.split(" ", 1)[0].strip() if out.strip() else ""
+    try:
+        out = _git_bytes(repo, "ls-tree", "-z", head, "--", path.encode("utf-8", "surrogateescape").decode("utf-8", "surrogateescape"))
+    except SystemExit:
+        return ""
+    entry = out.split(b"\0", 1)[0]
+    return entry.split(b" ", 1)[0].decode("ascii", "replace") if entry.strip() else ""
+
+
+def symlinked_ancestor(repo: Path, head: str, path: str) -> Optional[str]:
+    """First ancestor directory (or the path itself) that is a symlink at ``head``."""
+    parts = path.split("/")
+    for depth in range(1, len(parts) + 1):
+        candidate = "/".join(parts[:depth])
+        if head_file_mode(repo, head, candidate) == "120000":
+            return candidate
+    return None
 
 
 def comment_line_numbers(source_lines: Sequence[str]) -> Optional[set]:
@@ -285,9 +308,10 @@ def run_gate(repo: Path, base: str, head: str, pr_body: str, head_ref: str, conf
     hunks = parse_hunks(diff_text)
 
     for path in files:
-        mode = head_file_mode(repo, head, path)
-        if mode == "120000":
-            result.violations.append(Violation("symlink", path, "protected path is a symlink at head; kernel files must be regular blobs"))
+        link = symlinked_ancestor(repo, head, path)
+        if link:
+            what = "is a symlink" if link == path else f"has a symlinked ancestor {link!r}"
+            result.violations.append(Violation("symlink", path, f"protected path {what} at head; kernel files and their directories must be regular tree entries"))
 
     file_cache: dict = {}
     comment_cache: dict = {}
