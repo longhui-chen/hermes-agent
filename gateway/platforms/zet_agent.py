@@ -3496,6 +3496,11 @@ class ZetAgentAdapter(APIServerAdapter):
                     raise ValueError("connector_setup_unavailable")
                 from tools.connector_setup_intent import normalize_connector_setup
                 connector_setup = normalize_connector_setup(connector_setup)
+                # Keep publication closed until the dedicated consumer capability
+                # and both confirmation controls are connected. Never downgrade
+                # an observation into ordinary hardware setup on an older client.
+                if connector_setup.get("observation") is not None:
+                    raise ValueError("camera_observation_input_unavailable")
             timeout_seconds = _clarify_timeout_seconds()
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-

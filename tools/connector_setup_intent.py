@@ -6,6 +6,9 @@ existing clarify interaction owns delivery, cancellation and task continuation.
 
 import json
 
+# zettlab-overlay(ac432-observation-intent): delegate camera proposal validation to adapter; upstream: none
+from gateway.platforms.zet_agent_camera_observation_intent import CAMERA_OBSERVATION_SCHEMA, normalize_camera_observation_setup
+
 # zettlab-overlay(connector-guidance): validate private template addresses without DNS; upstream: none
 import ipaddress
 import re
@@ -19,6 +22,8 @@ CONNECTOR_SETUP_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        # zettlab-overlay(ac432-observation-intent): optional camera proposal schema only; upstream: none
+        "observation": CAMERA_OBSERVATION_SCHEMA,
         "resource_kind": {"type": "string", "enum": list(_KINDS)},
         "template_id": {"type": "string", "maxLength": 128},
         "provider_id": {"type": "string", "maxLength": 128},
@@ -43,6 +48,9 @@ CONNECTOR_SETUP_SCHEMA = {
 
 def normalize_connector_setup(value: object) -> dict:
     """Reject unknown fields rather than forwarding arbitrary configuration."""
+    # zettlab-overlay(ac432-observation-intent): no execution or consent in the proposal; upstream: none
+    if isinstance(value, dict) and "observation" in value:
+        return normalize_camera_observation_setup(value)
     if not isinstance(value, dict) or set(value) - _FIELDS:
         raise ValueError("connector_setup_invalid")
     if any(not isinstance(item, str) for key, item in value.items() if key != "variables"):

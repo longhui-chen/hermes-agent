@@ -30,6 +30,22 @@ def test_old_client_fails_before_publishing_an_input_request():
     assert not runtime._clarify_queues
 
 
+def test_observation_publication_stays_closed_until_confirmation_consumers_are_ready():
+    runtime = adapter()
+    stream = queue.Queue()
+    callback = runtime._make_clarify_cb(stream, "s", connector_input_capable=True)
+    result = clarify_tool("ignored", connector_setup={"resource_kind": "camera", "observation": {
+        "camera_id": "cam-1", "duration_seconds": 60, "subject_kind": "person", "predicate": "appears",
+    }}, callback=callback)
+    assert "connector_setup_unavailable" in result
+    with pytest.raises(ValueError, match="camera_observation_input_unavailable"):
+        callback("ignored", None, connector_setup={"resource_kind": "camera", "observation": {
+            "camera_id": "cam-1", "duration_seconds": 60, "subject_kind": "person", "predicate": "appears",
+        }})
+    assert stream.empty()
+    assert not runtime._clarify_queues
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["cancelled", "submitted"])
 async def test_setup_uses_existing_pending_and_response_flow(status):
