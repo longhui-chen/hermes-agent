@@ -4126,34 +4126,19 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
     # visible here (leave the slot for interrupt()/the finalizer to
     # surface as steer_dropped) or the drain happened strictly before
     # the interrupt (a legal pre-stop injection).
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if getattr(agent, "_interrupt_requested", False):
-                return
-            raw_pending = getattr(agent, "_pending_steer", [])
-            if isinstance(raw_pending, str):
-                pending = [("", raw_pending)] if raw_pending else []
-            else:
-                pending = list(raw_pending or [])
-            agent._pending_steer = []
-            agent._steer_pending_bytes = 0
-            agent._steer_inflight_batch = pending
-            agent._steer_provider_entered = False
-    else:
+    # zettlab-overlay(U2d): drain identity tuples before joining at model feed; upstream: none
+    with agent._pending_steer_lock:
         if getattr(agent, "_interrupt_requested", False):
             return
-        raw_pending = getattr(agent, "_pending_steer", [])
-        if isinstance(raw_pending, str):
-            pending = [("", raw_pending)] if raw_pending else []
-        else:
-            pending = list(raw_pending or [])
+        raw_pending = agent._pending_steer
+        pending = [] if raw_pending is None else [(None, raw_pending)] if isinstance(raw_pending, str) else list(raw_pending)
         agent._pending_steer = []
-        agent._steer_inflight_batch = pending
-        agent._steer_provider_entered = False
-    if not pending:
-        return
+        hook = getattr(agent, "_steer_admission_hook", None)
+        if callable(getattr(hook, "on_drain", None)):
+            hook.on_drain(pending)
     steer_text = "\n".join(text for _, text in pending)
+    if not steer_text:
+        return
     steer_msg = format_steer_user_message(steer_text)
     tail = messages[-1] if isinstance(messages[-1], dict) else None
     if tail is not None and tail.get("role") == "user":
@@ -4255,29 +4240,11 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     tail = messages[-1]
     if not (isinstance(tail, dict) and tail.get("role") == "user"):
         return
+    # zettlab-overlay(U2d): let adapter decide whether the drained batch reached provider; upstream: none
+    hook = getattr(agent, "_steer_admission_hook", None)
+    if callable(getattr(hook, "consumed", None)) and hook.consumed():
+        return
     content = tail.get("content")
-    inflight = list(getattr(agent, "_steer_inflight_batch", []) or [])
-    if inflight and getattr(agent, "_steer_provider_entered", False):
-        consumed_text = "\n".join(item[1] for item in inflight)
-        consumed_suffix = STEER_USER_PREFIX + consumed_text
-        consumed_in_tail = (
-            isinstance(content, str)
-            and (
-                content == consumed_suffix
-                or content.endswith("\n\n" + consumed_suffix)
-            )
-        ) or (
-            isinstance(content, list)
-            and bool(content)
-            and isinstance(content[-1], dict)
-            and content[-1].get("type") == "text"
-            and content[-1].get("text") == consumed_suffix
-        )
-        if consumed_in_tail:
-            # The provider request has begun, so the named steer was consumed.
-            # Keep the model transcript and its durable merge row intact; this
-            # helper only reclaims the pre-provider window.
-            return
     reclaimed: list = []
     if isinstance(content, str):
         if content.startswith(STEER_USER_PREFIX):
@@ -4337,10 +4304,6 @@ def reclaim_tail_steer(agent, messages: list) -> None:
                             )
                     break
     text = "\n".join(reclaimed)
-    if inflight and "\n".join(item[1] for item in inflight) == text:
-        restash_items = inflight
-    else:
-        restash_items = [("", item) for item in reclaimed]
     # Restash-unless-interrupted, mirroring the drain's atomic guard: a
     # hard interrupt supersedes the steer (interrupt() drops the slot by
     # design), and these early-return paths bypass finalize_turn's
@@ -4348,18 +4311,12 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     # resurrect an instruction the user already cancelled.
     def _restash_unless_interrupted() -> bool:
         if getattr(agent, "_interrupt_requested", False):
-            agent._steer_inflight_batch = []
             return False
-        existing = list(getattr(agent, "_pending_steer", []) or [])
-        agent._pending_steer = restash_items + existing
-        item_size = getattr(agent, "_steer_item_size", None)
-        if callable(item_size):
-            agent._steer_pending_bytes = sum(
-                item_size(steer_id, item_text)
-                for steer_id, item_text in agent._pending_steer
-                if steer_id
-            )
-        agent._steer_inflight_batch = []
+        # zettlab-overlay(U2d): restash identity tuples through the adapter hook; upstream: none
+        raw_existing = getattr(agent, "_pending_steer", [])
+        existing = [(None, raw_existing)] if isinstance(raw_existing, str) else list(raw_existing or [])
+        restash = hook.reclaim(text) if callable(getattr(hook, "reclaim", None)) else [(None, text)]
+        agent._pending_steer = restash + existing
         return True
 
     _lock = getattr(agent, "_pending_steer_lock", None)

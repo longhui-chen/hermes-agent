@@ -14,6 +14,7 @@ import pytest
 
 from agent.agent_runtime_helpers import repair_message_sequence
 from agent.prompt_builder import STEER_USER_PREFIX, format_steer_user_message
+from gateway.platforms.zet_agent import _SteerProducer
 from run_agent import AIAgent
 
 
@@ -49,7 +50,7 @@ class TestSteerAcceptance:
     def test_accepts_non_empty_text(self):
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
-        assert agent._pending_steer == [("", "go ahead and check the logs")]
+        assert agent._pending_steer == [(None, "go ahead and check the logs")]
 
 
 
@@ -187,7 +188,7 @@ class TestActiveTurnRedirect:
 
         assert agent.redirect("also check migrations") is True
         assert agent._pending_redirect is None
-        assert agent._pending_steer == [("", "also check migrations")]
+        assert agent._pending_steer == [(None, "also check migrations")]
         assert agent._interrupt_requested is False
 
 
@@ -358,7 +359,7 @@ class TestSteerInjection:
         messages: list = []
         agent._drain_steer_for_next_api_call(messages)
         assert messages == []
-        assert agent._pending_steer == [("", "steer")]
+        assert agent._pending_steer == [(None, "steer")]
 
     def test_adjacent_str_user_is_merged_not_appended(self):
         """First-iteration edge: the tail is already a user turn. Strict
@@ -479,7 +480,7 @@ class TestSteerClearedOnInterrupt:
         # 直接拒收，见 test_steer_refused_while_interrupt_pending）。
         agent.steer("will be dropped")
         agent._pending_redirect = "also drop this"
-        assert agent._pending_steer == [("", "will be dropped")]
+        assert agent._pending_steer == [(None, "will be dropped")]
         agent._interrupt_requested = True
 
         agent.clear_interrupt()
@@ -496,9 +497,17 @@ class TestSteerClearedOnInterrupt:
         steer_id = "01998f2d-7c00-7000-8000-000000000001"
         dropped = []
         agent._pending_steer = [(steer_id, "keep me")]
-        agent._steer_pending_bytes = agent._steer_item_size(steer_id, "keep me")
-        agent._steer_binding_turn_id = "turn-1"
-        agent._steer_terminal_sender = dropped.append
+        producer = _SteerProducer(
+            agent,
+            turn_id="turn-1",
+            stream_q=__import__("queue").Queue(),
+            binding_token=object(),
+            accepted_sender=lambda _payload: None,
+            terminal_sender=dropped.append,
+            stream_backlog_max=2000,
+        )
+        agent._steer_admission_hook = producer
+        agent._pending_steer = [(steer_id, "keep me")]
         agent._interrupt_requested = True
 
         agent.clear_interrupt()
@@ -610,21 +619,21 @@ class TestSteerClosedWindow:
         assert agent._drain_pending_steer(close=True) == "early"
         # 关闭后拒收 —— 端点据此回 rejected/not_running，LS 转 dropped。
         assert agent.steer("late") is False
-        assert agent._pending_steer == []
+        assert agent._pending_steer is None
 
     def test_plain_drain_keeps_slot_open(self):
         agent = _bare_agent()
         agent.steer("first")
         assert agent._drain_pending_steer() == "first"
         assert agent.steer("second") is True
-        assert agent._pending_steer == [("", "second")]
+        assert agent._pending_steer == [(None, "second")]
 
     def test_new_turn_reopens_slot(self):
         agent = _bare_agent()
         agent._drain_pending_steer(close=True)
         assert agent.steer("x") is False
         # run_conversation 入口的复位语义。
-        agent._steer_closed = False
+        agent._pending_steer = []
         assert agent.steer("x") is True
 
 
@@ -645,7 +654,7 @@ class TestSteerInterruptRace:
         agent._drain_steer_for_next_api_call(messages)
         # 不注入；槽位保留给 interrupt() 丢弃或 finalizer 转 dropped。
         assert len(messages) == 2
-        assert agent._pending_steer == [("", "change direction")]
+        assert agent._pending_steer == [(None, "change direction")]
 
     def test_steer_refused_while_interrupt_pending(self):
         # 第十一轮 review：/interrupt 之后、agent_task 结束前的停止窗口，
@@ -664,7 +673,7 @@ class TestSteerInterruptRace:
         assert agent.steer("x") is False
         agent._interrupt_requested = False
         assert agent.steer("新一轮改向") is True
-        assert agent._pending_steer == [("", "新一轮改向")]
+        assert agent._pending_steer == [(None, "新一轮改向")]
 
     def test_injection_proceeds_without_interrupt(self):
         agent = _bare_agent()
@@ -699,7 +708,7 @@ class TestReclaimTailSteer:
 
         assert len(messages) == 2  # steer 消息已弹出
         assert messages[-1]["role"] == "tool"
-        assert agent._pending_steer == [("", "换个方向")]
+        assert agent._pending_steer == [(None, "换个方向")]
 
     def test_no_op_when_tail_is_not_a_steer(self):
         from agent.agent_runtime_helpers import reclaim_tail_steer
@@ -726,7 +735,7 @@ class TestReclaimTailSteer:
         messages = [format_steer_user_message("先到的")]
         agent.steer("后到的")
         reclaim_tail_steer(agent, messages)
-        assert agent._pending_steer == [("", "先到的"), ("", "后到的")]
+        assert agent._pending_steer == [(None, "先到的"), (None, "后到的")]
 
     def test_interrupt_discards_instead_of_restash(self):
         # 第十轮 review：注入后用户 /stop（interrupt 清槽置旗标），随后同轮
@@ -850,7 +859,7 @@ class TestReclaimMergedShapes:
         reclaim_tail_steer(agent, messages)
 
         assert messages[0]["content"] == "首轮问题"  # 原文恢复
-        assert agent._pending_steer == [("", "改个方向")]
+        assert agent._pending_steer == [(None, "改个方向")]
 
     def test_reclaims_multimodal_text_block(self):
         from agent.agent_runtime_helpers import reclaim_tail_steer
@@ -869,7 +878,7 @@ class TestReclaimMergedShapes:
         reclaim_tail_steer(agent, messages)
 
         assert len(messages[0]["content"]) == 2  # steer block 已拆出
-        assert agent._pending_steer == [("", "看看颜色")]
+        assert agent._pending_steer == [(None, "看看颜色")]
 
     def test_plain_user_without_steer_untouched(self):
         from agent.agent_runtime_helpers import reclaim_tail_steer
@@ -939,7 +948,7 @@ class TestReclaimUndoesMergedDbRow:
 
         assert db.deleted == [("sess-1", 1)]
         assert agent._steer_merged_db_rows == []
-        assert agent._pending_steer == [("", "换个方向")]
+        assert agent._pending_steer == [(None, "换个方向")]
 
     def test_consumed_merge_row_survives(self):
         # 模型已消费（tail 变 assistant）→ reclaim 不触碰，行保留。
@@ -1014,7 +1023,7 @@ class TestReclaimAndHandback:
         handed = reclaim_and_handback_steer(agent, messages)
 
         assert handed == "换个方向"
-        assert agent._pending_steer == []
+        assert agent._pending_steer is None
         assert messages[-1]["role"] == "tool"
         # 槽位已关（与 finalizer 同契约）：turn 已终局，晚到 steer 拒收，
         # 由调用方转排队。

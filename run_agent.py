@@ -40,7 +40,6 @@ import logging
 logger = logging.getLogger(__name__)
 import os
 import re
-import secrets
 import sys
 import tempfile
 import time
@@ -3373,196 +3372,14 @@ class AIAgent:
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a
         # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                pending = list(getattr(self, "_pending_steer", []) or [])
-                # U2d named steers have already produced an authoritative
-                # accepted frame. Keep them for the terminal close+drain so
-                # clients receive one ID-aware dropped receipt. Legacy
-                # text-only producers retain the historical interrupt
-                # supersession behavior and are discarded here.
-                self._pending_steer = [item for item in pending if item[0]]
-                self._steer_pending_bytes = sum(
-                    self._steer_item_size(steer_id, text)
-                    for steer_id, text in self._pending_steer
-                )
-                self._steer_inflight_batch = []
-                self._steer_provider_entered = False
+        # zettlab-overlay(U2d): let the adapter close named pending steers; upstream: none
+        hook = getattr(self, "_steer_admission_hook", None)
+        if hook is not None and callable(getattr(hook, "on_interrupt", None)):
+            hook.on_interrupt()
+        else:
+            with self._pending_steer_lock:
+                self._pending_steer = []
         return True
-
-    @staticmethod
-    def _new_steer_id() -> str:
-        """Return a canonical lowercase UUIDv7 without requiring Python 3.14."""
-        unix_ms = int(time.time() * 1000) & ((1 << 48) - 1)
-        rand_a = secrets.randbits(12)
-        rand_b = secrets.randbits(62)
-        value = (
-            (unix_ms << 80)
-            | (0x7 << 76)
-            | (rand_a << 64)
-            | (0x2 << 62)
-            | rand_b
-        )
-        return str(uuid.UUID(int=value))
-
-    @staticmethod
-    def _steer_item_size(steer_id: str, text: str) -> int:
-        return len(
-            json.dumps(
-                {"steer_id": steer_id, "text": text},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-
-    def _count_steer_rejection(self, reason: str) -> None:
-        rollback = getattr(self, "_steer_usage_rollback", None)
-        if callable(rollback):
-            try:
-                rollback()
-            except Exception:
-                logger.debug("steer usage rollback failed", exc_info=True)
-        counter = getattr(self, "_steer_reject_counter", None)
-        if callable(counter):
-            try:
-                counter(reason)
-            except Exception:
-                logger.debug("steer rejection counter failed", exc_info=True)
-
-    def _bind_steer_turn(
-        self,
-        turn_id: str,
-        stream_q: Any,
-        binding_token: Any,
-        accepted_sender: callable,
-        terminal_sender: callable = None,
-        reject_counter: callable = None,
-        stream_backlog_max: int = 2000,
-    ) -> None:
-        """Atomically bind the current ZetAgent turn before opening admission."""
-        with self._pending_steer_lock:
-            self._steer_closed = True
-            self._steer_binding_turn_id = str(turn_id or "")
-            self._steer_stream_q = stream_q
-            self._steer_binding_token = binding_token
-            self._steer_accepted_sender = accepted_sender
-            self._steer_terminal_sender = terminal_sender
-            self._steer_reject_counter = reject_counter
-            self._steer_stream_backlog_max = max(1, int(stream_backlog_max))
-            self._steer_pending_bytes = sum(
-                self._steer_item_size(steer_id, text)
-                for steer_id, text in self._pending_steer
-                if steer_id
-            )
-            self._steer_inflight_batch = []
-            self._steer_provider_entered = False
-            self._steer_terminal_handback = []
-            self._steer_closed = not bool(
-                self._steer_binding_turn_id
-                and stream_q is not None
-                and binding_token is not None
-                and callable(accepted_sender)
-            )
-
-    def _start_steer_turn(self, turn_id: str) -> None:
-        """Open legacy producers, or verify the already-bound ZetAgent turn."""
-        with self._pending_steer_lock:
-            bound = bool(
-                self._steer_binding_turn_id
-                or self._steer_stream_q is not None
-                or self._steer_binding_token is not None
-            )
-            if not bound:
-                self._steer_closed = False
-                return
-            self._steer_closed = not bool(
-                str(turn_id or "") == self._steer_binding_turn_id
-                and self._steer_stream_q is not None
-                and self._steer_binding_token is not None
-                and callable(self._steer_accepted_sender)
-            )
-
-    def _admit_steer(
-        self,
-        text: str,
-        *,
-        turn_id: str,
-        stream_q: Any,
-        binding_token: Any,
-    ) -> Dict[str, Any]:
-        """Admit one ID-aware steer and enqueue its accepted frame atomically."""
-        with self._pending_steer_lock:
-            if (
-                str(turn_id or "") != self._steer_binding_turn_id
-                or stream_q is not self._steer_stream_q
-                or binding_token is not self._steer_binding_token
-            ):
-                self._count_steer_rejection("upstream_rejected")
-                return {"accepted": False, "reason": "upstream_rejected"}
-            if self._steer_closed or self._interrupt_requested:
-                self._count_steer_rejection("upstream_rejected")
-                return {"accepted": False, "reason": "upstream_rejected"}
-            if not isinstance(text, str) or not text.strip():
-                self._count_steer_rejection("steer_text_malformed")
-                return {"accepted": False, "reason": "steer_text_malformed"}
-            try:
-                text_bytes = text.encode("utf-8")
-            except UnicodeEncodeError:
-                self._count_steer_rejection("steer_text_malformed")
-                return {"accepted": False, "reason": "steer_text_malformed"}
-            if len(text_bytes) > 64 * 1024:
-                self._count_steer_rejection("steer_text_malformed")
-                return {"accepted": False, "reason": "steer_text_malformed"}
-            if not callable(getattr(stream_q, "put_nowait", None)):
-                self._count_steer_rejection("stream_send_unavailable")
-                return {"accepted": False, "reason": "stream_send_unavailable"}
-            try:
-                if stream_q.qsize() >= getattr(
-                    self, "_steer_stream_backlog_max", 2000
-                ):
-                    self._count_steer_rejection("stream_backpressure")
-                    return {"accepted": False, "reason": "stream_backpressure"}
-            except Exception:
-                self._count_steer_rejection("stream_unavailable")
-                return {"accepted": False, "reason": "stream_unavailable"}
-
-            named_count = sum(1 for steer_id, _ in self._pending_steer if steer_id)
-            if named_count >= 64:
-                self._count_steer_rejection("pending_limit")
-                return {"accepted": False, "reason": "pending_limit"}
-
-            steer_id = self._new_steer_id()
-            item_bytes = self._steer_item_size(steer_id, text)
-            if self._steer_pending_bytes + item_bytes > 64 * 1024:
-                self._count_steer_rejection("pending_limit")
-                return {"accepted": False, "reason": "pending_limit"}
-
-            item = (steer_id, text)
-            self._pending_steer.append(item)
-            self._steer_pending_bytes += item_bytes
-            payload = {
-                "type": "steer_accepted",
-                "turn_id": self._steer_binding_turn_id,
-                "steer_id": steer_id,
-                "text": text,
-            }
-            try:
-                self._steer_accepted_sender(payload)
-            except Exception:
-                self._pending_steer.pop()
-                self._steer_pending_bytes -= item_bytes
-                self._count_steer_rejection("stream_enqueue_failed")
-                return {"accepted": False, "reason": "stream_enqueue_failed"}
-            return {"accepted": True, "steer_id": steer_id}
-
-    def _mark_steer_batch_provider_entered(self) -> None:
-        """Commit the current drained batch once provider execution begins."""
-        with self._pending_steer_lock:
-            # Keep the batch identity until the next drain so early-return
-            # reclaim paths can distinguish a provider-consumed steer from a
-            # pre-provider handback. It is not a second queue or ledger.
-            self._steer_provider_entered = bool(self._steer_inflight_batch)
 
     def steer(self, text: str) -> bool:
         """
@@ -3588,39 +3405,16 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            if getattr(self, "_steer_closed", False):
+        # zettlab-overlay(U2d): route bound steer admission to the adapter; upstream: none
+        hook = getattr(self, "_steer_admission_hook", None)
+        if callable(hook):
+            outcome = hook(cleaned)
+            return bool(outcome.get("accepted")) if isinstance(outcome, dict) else bool(outcome)
+        # zettlab-overlay(U2d): append legacy text as an identity-free tuple; upstream: none
+        with self._pending_steer_lock:
+            if self._pending_steer is None or self._interrupt_requested:
                 return False
-            if getattr(self, "_interrupt_requested", False):
-                return False
-            existing = getattr(self, "_pending_steer", None)
-            if not isinstance(existing, list):
-                existing = []
-            existing.append(("", cleaned))
-            self._pending_steer = existing
-            return True
-        with _lock:
-            # After the turn finalizer's closing drain there is no consumer
-            # left for this slot (the SSE task may linger for a moment, so
-            # task.done() alone can't catch this window) — refuse so the
-            # caller re-delivers the text as a normal next-turn message
-            # instead of it vanishing.
-            if getattr(self, "_steer_closed", False):
-                return False
-            # A hard interrupt is winding the turn down: the pre-API drain
-            # refuses to inject while the flag is up, and the finalizer's
-            # interrupted branch discards leftovers WITHOUT a steer_dropped
-            # receipt (stop supersedes steer by design) — text accepted in
-            # this window would vanish silently. Refuse so callers re-queue.
-            if getattr(self, "_interrupt_requested", False):
-                return False
-            if not isinstance(getattr(self, "_pending_steer", None), list):
-                self._pending_steer = []
-            self._pending_steer.append(("", cleaned))
+            self._pending_steer.append((None, cleaned))
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3735,8 +3529,9 @@ class AIAgent:
             self._pending_redirect = None
         return text
 
+    # zettlab-overlay(U2d): expose generic close hook for adapter state; upstream: none
     def _drain_pending_steer(self, close: bool = False) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot.
+        """Return pending steer text after the optional adapter close hook.
 
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
@@ -3749,55 +3544,14 @@ class AIAgent:
                 ``run_conversation`` reopens the slot at the next turn's
                 start.
         """
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            pending = list(getattr(self, "_pending_steer", []) or [])
-            self._pending_steer = []
-            if close:
-                self._steer_closed = True
-            return "\n".join(text for _, text in pending) or None
-        with _lock:
-            raw_pending = getattr(self, "_pending_steer", None)
-            if isinstance(raw_pending, str):
-                pending = [("", raw_pending)] if raw_pending else []
-            else:
-                pending = list(raw_pending or [])
-            if close:
-                self._steer_closed = True
-                handback: List[tuple[str, str]] = []
-                sender = getattr(self, "_steer_terminal_sender", None)
-                for index, (steer_id, text) in enumerate(pending):
-                    if not steer_id:
-                        handback.append((steer_id, text))
-                        continue
-                    if not callable(sender):
-                        handback.extend(pending[index:])
-                        break
-                    try:
-                        sender({
-                            "type": "steer_dropped",
-                            "turn_id": self._steer_binding_turn_id,
-                            "steer_id": steer_id,
-                            "text": text,
-                        })
-                    except Exception:
-                        self._count_steer_rejection("stream_terminal_enqueue_failed")
-                        handback.extend(pending[index:])
-                        break
-                self._pending_steer = []
-                self._steer_pending_bytes = 0
-                self._steer_terminal_handback = [item for item in handback if item[0]]
-                self._steer_binding_turn_id = ""
-                self._steer_stream_q = None
-                self._steer_binding_token = None
-                self._steer_accepted_sender = None
-                self._steer_terminal_sender = None
-                self._steer_inflight_batch = []
-                self._steer_provider_entered = False
-                pending = handback
-            else:
-                self._pending_steer = []
-                self._steer_pending_bytes = 0
+        # zettlab-overlay(U2d): close through the adapter hook and return text; upstream: none
+        with self._pending_steer_lock:
+            raw_pending = self._pending_steer
+            pending = [] if raw_pending is None else [(None, raw_pending)] if isinstance(raw_pending, str) else list(raw_pending)
+            hook = getattr(self, "_steer_admission_hook", None)
+            self._pending_steer = [] if close and hook is not None else None if close else []
+            if close and hook is not None and callable(getattr(hook, "close", None)):
+                pending = hook.close(pending)
         return "\n".join(text for _, text in pending) or None
 
     def _record_file_mutation_result(

@@ -2325,6 +2325,20 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # zettlab-overlay(U2d): reopen unbound legacy text-only steer after close; upstream: none
+    if getattr(agent, "_steer_admission_hook", None) is None and agent._pending_steer is None:
+        agent._pending_steer = []
+
+    # zettlab-overlay(U2d): retain generic steer goal and persistence hooks; upstream: none
+    # Consumed-steer marker for the goal hook: a steer the model already
+    # saw this turn means the user intervened — the post-turn goal judge
+    # must evaluate it as user-initiated, not as an untouched auto-
+    # continuation round.
+    agent._turn_last_steer_text = None
+    # Per-turn ledger of crash-resilience rows written for merged steers
+    # (see _persist_merged_steer_row / reclaim_tail_steer). Stale entries
+    # from a finished turn must never be deletable by a later reclaim.
+    agent._steer_merged_db_rows = []
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -2363,33 +2377,6 @@ def run_conversation(
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
-    # Open only after ZetAgent has atomically bound this turn's queue/token.
-    # Legacy CLI/TUI agents have no transport binding and reopen normally.
-    _start_steer_turn = getattr(agent, "_start_steer_turn", None)
-    if callable(_start_steer_turn):
-        # U2d binds chat.steer to the public HERMES_TURN_ID carried by the
-        # local-server request. ``turn_id`` above is Hermes' internal relay
-        # identity and intentionally differs from that wire correlation id.
-        steer_turn_id = str(getattr(agent, "_zettlab_active_turn_id", "") or "")
-        if not steer_turn_id:
-            try:
-                from gateway.session_context import get_session_env
-
-                steer_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
-            except Exception:
-                steer_turn_id = ""
-        _start_steer_turn(steer_turn_id)
-    else:
-        agent._steer_closed = False
-    # Consumed-steer marker for the goal hook: a steer the model already
-    # saw this turn means the user intervened — the post-turn goal judge
-    # must evaluate it as user-initiated, not as an untouched auto-
-    # continuation round.
-    agent._turn_last_steer_text = None
-    # Per-turn ledger of crash-resilience rows written for merged steers
-    # (see _persist_merged_steer_row / reclaim_tail_steer). Stale entries
-    # from a finished turn must never be deletable by a later reclaim.
-    agent._steer_merged_db_rows = []
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
@@ -3541,11 +3528,6 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    mark_steer_entered = getattr(
-                        agent, "_mark_steer_batch_provider_entered", None
-                    )
-                    if callable(mark_steer_entered):
-                        mark_steer_entered()
                     if getattr(agent, "_onboarding_lightweight", False):
                         _upstream_started = time.monotonic()
                         agent._onboarding_upstream_started_mono = _upstream_started
@@ -3570,6 +3552,10 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    # zettlab-overlay(U2d): mark steer consumed only at provider call; upstream: none
+                    _steer_hook = getattr(agent, "_steer_admission_hook", None)
+                    if callable(getattr(_steer_hook, "on_provider_entered", None)):
+                        _steer_hook.on_provider_entered()
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner

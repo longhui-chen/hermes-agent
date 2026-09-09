@@ -14,17 +14,6 @@ def _agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = []
     agent._pending_steer_lock = threading.Lock()
-    agent._steer_closed = True
-    agent._steer_binding_turn_id = ""
-    agent._steer_stream_q = None
-    agent._steer_binding_token = None
-    agent._steer_accepted_sender = None
-    agent._steer_terminal_sender = None
-    agent._steer_reject_counter = None
-    agent._steer_stream_backlog_max = 2000
-    agent._steer_pending_bytes = 0
-    agent._steer_inflight_batch = []
-    agent._steer_terminal_handback = []
     agent._interrupt_requested = False
     agent._turn_last_steer_text = None
     agent._steer_merged_db_rows = []
@@ -82,7 +71,7 @@ def test_provider_entry_consumes_batch_without_dropped():
     messages = [{"role": "tool", "content": "done", "tool_call_id": "c"}]
 
     drain_steer_for_next_api_call(agent, messages)
-    agent._mark_steer_batch_provider_entered()
+    agent._steer_admission_hook.on_provider_entered()
     assert agent._drain_pending_steer(close=True) is None
 
     assert [item[1]["type"] for item in _payloads(stream_q)] == [
@@ -111,8 +100,9 @@ def test_terminal_enqueue_failure_hands_back_once_and_never_leaks_next_turn():
     assert result["accepted"] is True
 
     assert agent._drain_pending_steer(close=True) == "hand back"
+    agent._steer_admission_hook.on_interrupt()
     assert agent._pending_steer == []
-    assert agent._steer_terminal_handback == [
+    assert agent._steer_admission_hook.terminal_handback == [
         (result["steer_id"], "hand back")
     ]
 
@@ -123,7 +113,7 @@ def test_terminal_enqueue_failure_hands_back_once_and_never_leaks_next_turn():
         stream_q=next_q,
     )
     assert agent._pending_steer == []
-    assert agent._steer_terminal_handback == []
+    assert agent._steer_admission_hook.terminal_handback == []
 
 
 def test_old_turn_binding_and_generic_reserved_progress_are_rejected():

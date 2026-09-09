@@ -216,6 +216,168 @@ def _put_named_steer_progress(
         stream_q.put(item)
 
 
+class _SteerProducer:
+    """ZetAgent-owned identity, admission, and terminal steer state."""
+
+    def __init__(
+        self,
+        agent: Any,
+        *,
+        turn_id: str,
+        stream_q: Any,
+        binding_token: Any,
+        accepted_sender: Any,
+        terminal_sender: Any,
+        stream_backlog_max: int,
+    ) -> None:
+        self.agent = agent
+        self.turn_id = str(turn_id or "")
+        self.stream_q = stream_q
+        self.binding_token = binding_token
+        self.accepted_sender = accepted_sender
+        self.terminal_sender = terminal_sender
+        self.stream_backlog_max = max(1, int(stream_backlog_max))
+        self.pending_bytes = 0
+        self.inflight: list[tuple[str | None, str]] = []
+        self.provider_entered = False
+        self.terminal_handback: list[tuple[str, str]] = []
+        self.closed = False
+        self.usage_rollback = getattr(agent, "_steer_usage_rollback", None)
+
+    def __call__(self, text: str, requested_turn_id: str | None = None) -> Dict[str, Any]:
+        with self.agent._pending_steer_lock:
+            return self._admit_locked(text, requested_turn_id)
+
+    def _reject(self, reason: str) -> Dict[str, Any]:
+        if callable(self.usage_rollback):
+            try:
+                self.usage_rollback()
+            except Exception:
+                logger.debug("steer usage rollback failed", exc_info=True)
+        _count_steer_rejection(reason)
+        return {"accepted": False, "reason": reason}
+
+    def _admit_locked(self, text: str, requested_turn_id: str | None) -> Dict[str, Any]:
+        if getattr(self.agent, "api_mode", None) == "codex_app_server":
+            _count_steer_rejection("steer_runtime_unsupported")
+            return {"accepted": False, "reason": "upstream_rejected"}
+        if str(requested_turn_id or self.turn_id) != self.turn_id:
+            return self._reject("upstream_rejected")
+        if self.closed or getattr(self.agent, "_interrupt_requested", False):
+            return self._reject("upstream_rejected")
+        if not isinstance(text, str) or not text.strip():
+            return self._reject("steer_text_malformed")
+        try:
+            text_bytes = text.encode("utf-8")
+        except UnicodeEncodeError:
+            return self._reject("steer_text_malformed")
+        if len(text_bytes) > 64 * 1024:
+            return self._reject("steer_text_malformed")
+        if not callable(getattr(self.stream_q, "put_nowait", None)):
+            return self._reject("stream_send_unavailable")
+        try:
+            if self.stream_q.qsize() >= self.stream_backlog_max:
+                return self._reject("stream_backpressure")
+        except Exception:
+            return self._reject("stream_unavailable")
+        named_count = sum(1 for steer_id, _ in self.agent._pending_steer if steer_id)
+        if named_count >= 64:
+            return self._reject("pending_limit")
+        steer_id = _new_steer_id()
+        item_bytes = _steer_item_size(steer_id, text)
+        if self.pending_bytes + item_bytes > 64 * 1024:
+            return self._reject("pending_limit")
+        self.agent._pending_steer.append((steer_id, text))
+        self.pending_bytes += item_bytes
+        try:
+            self.accepted_sender({
+                "type": "steer_accepted",
+                "turn_id": self.turn_id,
+                "steer_id": steer_id,
+                "text": text,
+            })
+        except Exception:
+            self.agent._pending_steer.pop()
+            self.pending_bytes -= item_bytes
+            return self._reject("stream_enqueue_failed")
+        return {"accepted": True, "steer_id": steer_id}
+
+    def on_drain(self, pending: list[tuple[str | None, str]]) -> None:
+        self.inflight = list(pending)
+        self.pending_bytes = 0
+        self.provider_entered = False
+
+    def on_provider_entered(self) -> None:
+        self.provider_entered = bool(self.inflight)
+
+    def consumed(self) -> bool:
+        return bool(self.inflight and self.provider_entered)
+
+    def reclaim(self, text: str) -> list[tuple[str | None, str]]:
+        if self.inflight and "\n".join(item[1] for item in self.inflight) == text:
+            items = list(self.inflight)
+        else:
+            items = [(None, text)]
+        self.inflight = []
+        self.pending_bytes = sum(_steer_item_size(*item) for item in items if item[0])
+        return items
+
+    def on_interrupt(self) -> None:
+        with self.agent._pending_steer_lock:
+            self.agent._pending_steer = [item for item in self.agent._pending_steer if item[0]]
+            self.pending_bytes = sum(_steer_item_size(*item) for item in self.agent._pending_steer)
+            self.inflight = []
+            self.provider_entered = False
+
+    def close(self, pending: list[tuple[str | None, str]]) -> list[tuple[str, str]]:
+        self.closed = True
+        handback: list[tuple[str, str]] = []
+        for index, (steer_id, text) in enumerate(pending):
+            if not steer_id:
+                handback.append(("", text))
+                continue
+            if not callable(self.terminal_sender):
+                handback.extend(pending[index:])
+                break
+            try:
+                self.terminal_sender({
+                    "type": "steer_dropped",
+                    "turn_id": self.turn_id,
+                    "steer_id": steer_id,
+                    "text": text,
+                })
+            except Exception:
+                _count_steer_rejection("stream_terminal_enqueue_failed")
+                handback.extend(pending[index:])
+                break
+        self.pending_bytes = 0
+        self.inflight = []
+        self.provider_entered = False
+        self.terminal_handback = [item for item in handback if item[0]]
+        return handback
+
+    def take_terminal_handback(self) -> list[tuple[str, str]]:
+        handback = self.terminal_handback
+        self.terminal_handback = []
+        return handback
+
+    def invalidate(self) -> None:
+        self.closed = True
+
+
+def _new_steer_id() -> str:
+    """Return a canonical lowercase UUIDv7 without requiring Python 3.14."""
+    unix_ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+    value = (unix_ms << 80) | (0x7 << 76) | (rand_a << 64) | (0x2 << 62) | rand_b
+    return str(uuid.UUID(int=value))
+
+
+def _steer_item_size(steer_id: str, text: str) -> int:
+    return len(json.dumps({"steer_id": steer_id, "text": text}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
 def _observe_queued_attachment(
     prestream_timing: Optional[PrestreamTiming] = None,
 ) -> None:
@@ -2993,8 +3155,6 @@ class ZetAgentAdapter(APIServerAdapter):
             _count_steer_rejection("stream_unavailable")
             return False
 
-        binding_token = object()
-
         def _send_accepted(payload: Dict[str, Any]) -> None:
             _put_named_steer_progress(
                 stream_q,
@@ -3011,25 +3171,23 @@ class ZetAgentAdapter(APIServerAdapter):
                 nonblocking=False,
             )
 
-        agent._bind_steer_turn(
-            turn_id,
-            stream_q,
-            binding_token,
-            _send_accepted,
-            _send_dropped,
-            _count_steer_rejection,
-            cls._ATTACHMENT_STREAM_BACKLOG_MAX,
+        old_hook = getattr(agent, "_steer_admission_hook", None)
+        if callable(getattr(old_hook, "invalidate", None)):
+            old_hook.invalidate()
+        with agent._pending_steer_lock:
+            if agent._pending_steer is None:
+                agent._pending_steer = []
+        producer = _SteerProducer(
+            agent,
+            turn_id=turn_id,
+            stream_q=stream_q,
+            binding_token=object(),
+            accepted_sender=_send_accepted,
+            terminal_sender=_send_dropped,
+            stream_backlog_max=cls._ATTACHMENT_STREAM_BACKLOG_MAX,
         )
-
-        def _admit(text: str, requested_turn_id: str) -> Dict[str, Any]:
-            return agent._admit_steer(
-                text,
-                turn_id=requested_turn_id,
-                stream_q=stream_q,
-                binding_token=binding_token,
-            )
-
-        agent._zettlab_admit_steer = _admit
+        agent._steer_admission_hook = producer
+        agent._zettlab_admit_steer = producer
         return True
 
     def _make_status_cb(
@@ -5499,13 +5657,14 @@ class ZetAgentAdapter(APIServerAdapter):
                     and isinstance(result[0], dict)
                     and not result[0].get("pending_steer")
                 ):
+                    _hook = getattr(_salvage_agent, "_steer_admission_hook", None)
                     _terminal_handback = list(
-                        getattr(_salvage_agent, "_steer_terminal_handback", [])
-                        or []
+                        _hook.take_terminal_handback()
+                        if callable(getattr(_hook, "take_terminal_handback", None))
+                        else []
                     )
                     if _terminal_handback:
                         _leftover = "\n".join(text for _, text in _terminal_handback)
-                        _salvage_agent._steer_terminal_handback = []
                     else:
                         _leftover = _salvage_agent._drain_pending_steer(close=True)
                     if _leftover:
