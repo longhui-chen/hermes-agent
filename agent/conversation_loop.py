@@ -2326,13 +2326,11 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
-    # Reopen the steer slot: the previous turn's finalizer closed it after
-    # its last drain (see _drain_pending_steer(close=True)); a cached agent
-    # starting a new turn must accept /steer again.
-    _steer_lock = getattr(agent, "_pending_steer_lock", None)
-    if _steer_lock is not None:
-        with _steer_lock:
-            agent._steer_closed = False
+    # Open only after ZetAgent has atomically bound this turn's queue/token.
+    # Legacy CLI/TUI agents have no transport binding and reopen normally.
+    _start_steer_turn = getattr(agent, "_start_steer_turn", None)
+    if callable(_start_steer_turn):
+        _start_steer_turn(turn_id)
     else:
         agent._steer_closed = False
     # Consumed-steer marker for the goal hook: a steer the model already
@@ -3533,6 +3531,11 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    mark_steer_entered = getattr(
+                        agent, "_mark_steer_batch_provider_entered", None
+                    )
+                    if callable(mark_steer_entered):
+                        mark_steer_entered()
                     if getattr(agent, "_onboarding_lightweight", False):
                         _upstream_started = time.monotonic()
                         agent._onboarding_upstream_started_mono = _upstream_started

@@ -29,6 +29,9 @@ on:
       - '.github/workflows/chat-ui-contract.yml'
       - 'agent/conversation_compression.py'
       - 'tests/gateway/test_zet_agent_title_flow.py'
+      - 'scripts/test-harness/invariant-gated-packages.txt'
+      - 'scripts/test-harness/invariant_gate.sh'
+      - 'tests/run_agent/test_steer_u2d.py'
   push:
     branches:
       - main
@@ -45,6 +48,9 @@ on:
       - '.github/workflows/chat-ui-contract.yml'
       - 'agent/conversation_compression.py'
       - 'tests/gateway/test_zet_agent_title_flow.py'
+      - 'scripts/test-harness/invariant-gated-packages.txt'
+      - 'scripts/test-harness/invariant_gate.sh'
+      - 'tests/run_agent/test_steer_u2d.py'
   schedule:
     - cron: '41 19 * * *' # 03:41 Asia/Shanghai
   workflow_dispatch:
@@ -70,6 +76,10 @@ jobs:
           python -m pip install --quiet -e .
       - name: Contract manifest + producer conformance (no secret)
         run: python -m pytest -q -p no:cacheprovider tests/gateway/test_zet_agent_contract_manifest.py tests/gateway/test_zet_agent_producer_conformance.py tests/gateway/test_zet_agent_extension_turn_id.py tests/gateway/test_zet_agent_title_flow.py tests/gateway/test_chatproto_schema_contract.py
+      - name: HR7 invariant gate
+        env:
+          HERMES_PYTHON: python
+        run: bash scripts/test-harness/invariant_gate.sh
 
   mirror-freshness:
     if: github.repository_owner == 'zettlab' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)

@@ -4131,15 +4131,27 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
         with _lock:
             if getattr(agent, "_interrupt_requested", False):
                 return
-            steer_text = agent._pending_steer
-            agent._pending_steer = None
+            raw_pending = getattr(agent, "_pending_steer", [])
+            if isinstance(raw_pending, str):
+                pending = [("", raw_pending)] if raw_pending else []
+            else:
+                pending = list(raw_pending or [])
+            agent._pending_steer = []
+            agent._steer_pending_bytes = 0
+            agent._steer_inflight_batch = pending
     else:
         if getattr(agent, "_interrupt_requested", False):
             return
-        steer_text = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = None
-    if not steer_text:
+        raw_pending = getattr(agent, "_pending_steer", [])
+        if isinstance(raw_pending, str):
+            pending = [("", raw_pending)] if raw_pending else []
+        else:
+            pending = list(raw_pending or [])
+        agent._pending_steer = []
+        agent._steer_inflight_batch = pending
+    if not pending:
         return
+    steer_text = "\n".join(text for _, text in pending)
     steer_msg = format_steer_user_message(steer_text)
     tail = messages[-1] if isinstance(messages[-1], dict) else None
     if tail is not None and tail.get("role") == "user":
@@ -4301,6 +4313,11 @@ def reclaim_tail_steer(agent, messages: list) -> None:
                             )
                     break
     text = "\n".join(reclaimed)
+    inflight = list(getattr(agent, "_steer_inflight_batch", []) or [])
+    if inflight and "\n".join(item[1] for item in inflight) == text:
+        restash_items = inflight
+    else:
+        restash_items = [("", item) for item in reclaimed]
     # Restash-unless-interrupted, mirroring the drain's atomic guard: a
     # hard interrupt supersedes the steer (interrupt() drops the slot by
     # design), and these early-return paths bypass finalize_turn's
@@ -4308,9 +4325,18 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     # resurrect an instruction the user already cancelled.
     def _restash_unless_interrupted() -> bool:
         if getattr(agent, "_interrupt_requested", False):
+            agent._steer_inflight_batch = []
             return False
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (text + "\n" + existing) if existing else text
+        existing = list(getattr(agent, "_pending_steer", []) or [])
+        agent._pending_steer = restash_items + existing
+        item_size = getattr(agent, "_steer_item_size", None)
+        if callable(item_size):
+            agent._steer_pending_bytes = sum(
+                item_size(steer_id, item_text)
+                for steer_id, item_text in agent._pending_steer
+                if steer_id
+            )
+        agent._steer_inflight_batch = []
         return True
 
     _lock = getattr(agent, "_pending_steer_lock", None)

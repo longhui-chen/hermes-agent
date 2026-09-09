@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "repo": "hermes-agent",
   "generated_by": "CHAT_UI_MANIFEST_UPDATE=1 python -m pytest -q tests/gateway/test_zet_agent_contract_manifest.py",
-  "snapshot_sha256": "c41f0efb3db1dc4a14823eb0530e0fab81ad1f89832b6e1e7aaf94fac593d8f6",
+  "snapshot_sha256": "5167e26ae1b0160b4ef5a84b55f98f39b1bd4c384847cd23c4631b1c050c4ba9",
   "attachment_schema_sha256": "d4da6e3b73d51b22d72051f965f6ae35244bdf579c93e0c74069bc6231201b84",
   "hermes": {
     "payload_types": [
@@ -15,6 +15,7 @@
       "hermes.plan",
       "hermes.todo",
       "reasoning.delta",
+      "steer_accepted",
       "steer_dropped"
     ],
     "documented_types": [
@@ -44,6 +45,7 @@
       "metadata.turn_id",
       "payload.type",
       "reasoning.delta",
+      "steer_accepted",
       "steer_dropped",
       "subagent.complete",
       "subagent.progress",
@@ -121,9 +123,20 @@
           "type"
         ]
       },
+      "steer_accepted": {
+        "keys": [
+          "steer_id",
+          "text",
+          "turn_id",
+          "type"
+        ]
+      },
       "steer_dropped": {
         "keys": [
+          "reason",
+          "steer_id",
           "text",
+          "turn_id",
           "type"
         ]
       }
@@ -135,6 +148,7 @@
       "disabled",
       "invalid_request_error",
       "text"
-    ]
+    ],
+    "snapshot_sha256": "5167e26ae1b0160b4ef5a84b55f98f39b1bd4c384847cd23c4631b1c050c4ba9"
   }
 }

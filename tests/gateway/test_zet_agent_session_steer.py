@@ -58,9 +58,11 @@ class _FakeAgent:
         self.accept = accept
         self.steered = []
 
-    def steer(self, text):
-        self.steered.append(text)
-        return self.accept
+    def _zettlab_admit_steer(self, text, turn_id):
+        self.steered.append((turn_id, text))
+        if self.accept:
+            return {"accepted": True, "steer_id": "01998f2d-7c00-7000-8000-000000000001"}
+        return {"accepted": False, "reason": "upstream_rejected"}
 
 
 def _adapter(monkeypatch):
@@ -78,12 +80,17 @@ async def test_steer_hits_active_agent_via_scoped_key(monkeypatch):
     adapter._register_active_session_turn("s1", [agent], _FakeTask())
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "把 PDF 也算上"}, match_info={"session_id": "s1"})
+        _FakeRequest({"turn_id": "turn-1", "text": "把 PDF 也算上"}, match_info={"session_id": "s1"})
     )
 
     assert resp.status == 200
-    assert resp.payload == {"session_id": "s1", "status": "steering", "accepted": True}
-    assert agent.steered == ["把 PDF 也算上"]
+    assert resp.payload == {
+        "session_id": "s1",
+        "status": "steering",
+        "accepted": True,
+        "steer_id": "01998f2d-7c00-7000-8000-000000000001",
+    }
+    assert agent.steered == [("turn-1", "把 PDF 也算上")]
 
 
 @pytest.mark.asyncio
@@ -94,12 +101,17 @@ async def test_steer_hits_active_agent_via_bare_sid_fallback(monkeypatch):
     adapter._active_session_tasks["s1"] = _FakeTask()
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "把 PDF 也算上"}, match_info={"session_id": "s1"})
+        _FakeRequest({"turn_id": "turn-1", "text": "把 PDF 也算上"}, match_info={"session_id": "s1"})
     )
 
     assert resp.status == 200
-    assert resp.payload == {"session_id": "s1", "status": "steering", "accepted": True}
-    assert agent.steered == ["把 PDF 也算上"]
+    assert resp.payload == {
+        "session_id": "s1",
+        "status": "steering",
+        "accepted": True,
+        "steer_id": "01998f2d-7c00-7000-8000-000000000001",
+    }
+    assert agent.steered == [("turn-1", "把 PDF 也算上")]
 
 
 @pytest.mark.asyncio
@@ -113,7 +125,7 @@ async def test_steer_refused_when_task_done(monkeypatch):
     adapter._active_session_tasks["s1"] = _FakeTask(done=True)
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "hello"}, match_info={"session_id": "s1"})
+        _FakeRequest({"turn_id": "turn-1", "text": "hello"}, match_info={"session_id": "s1"})
     )
 
     assert resp.status == 200
@@ -130,7 +142,7 @@ async def test_steer_refused_when_task_missing(monkeypatch):
     adapter._active_session_agents["s1"] = [agent]
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "hello"}, match_info={"session_id": "s1"})
+        _FakeRequest({"turn_id": "turn-1", "text": "hello"}, match_info={"session_id": "s1"})
     )
 
     assert resp.status == 200
@@ -143,7 +155,7 @@ async def test_steer_not_running_is_idempotent(monkeypatch):
     adapter = _adapter(monkeypatch)
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "hello"}, match_info={"session_id": "nope"})
+        _FakeRequest({"turn_id": "turn-1", "text": "hello"}, match_info={"session_id": "nope"})
     )
 
     assert resp.status == 200
@@ -162,7 +174,7 @@ async def test_steer_agent_ref_not_yet_filled_is_not_running(monkeypatch):
     adapter._active_session_agents["s1"] = [None]
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "hi"}, match_info={"session_id": "s1"})
+        _FakeRequest({"turn_id": "turn-1", "text": "hi"}, match_info={"session_id": "s1"})
     )
 
     assert resp.status == 200
@@ -209,14 +221,14 @@ async def test_steer_agent_exception_reports_rejected(monkeypatch):
     adapter = _adapter(monkeypatch)
 
     class _Boom:
-        def steer(self, text):
+        def _zettlab_admit_steer(self, text, turn_id):
             raise RuntimeError("boom")
 
     adapter._active_session_agents["s1"] = [_Boom()]
     adapter._active_session_tasks["s1"] = _FakeTask()
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "hi"}, match_info={"session_id": "s1"})
+        _FakeRequest({"turn_id": "turn-1", "text": "hi"}, match_info={"session_id": "s1"})
     )
 
     assert resp.status == 200
@@ -228,15 +240,11 @@ async def test_steer_agent_exception_reports_rejected(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_push_steer_dropped_emits_progress_event():
+def test_generic_progress_rejects_reserved_steer_frame():
     q = queue.Queue()
     ZetAgentAdapter._push_steer_dropped_if_any(
         q, ({"final_response": "done", "pending_steer": "漏掉的插话"}, None)
     )
-
-    kind, payload = q.get_nowait()
-    assert kind == "__tool_progress__"
-    assert payload == {"type": "steer_dropped", "text": "漏掉的插话"}
     assert q.empty()
 
 
@@ -421,11 +429,16 @@ async def test_steer_closed_slot_reports_not_running(monkeypatch):
     adapter._active_session_tasks["s1"] = _FakeTask()
 
     resp = await adapter._handle_session_steer(
-        _FakeRequest({"text": "收尾窗口的引导"}, match_info={"session_id": "s1"})
+            _FakeRequest({"turn_id": "turn-1", "text": "收尾窗口的引导"}, match_info={"session_id": "s1"})
     )
 
     assert resp.status == 200
-    assert resp.payload == {"session_id": "s1", "status": "not_running", "accepted": False}
+    assert resp.payload == {
+        "session_id": "s1",
+        "status": "not_running",
+        "accepted": False,
+        "reason": "upstream_rejected",
+    }
 
 
 @pytest.mark.asyncio

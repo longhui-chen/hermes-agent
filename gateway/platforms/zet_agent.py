@@ -104,7 +104,7 @@ from gateway.platforms._chat_ui_enums import TERMINAL_STATES as _TERMINAL_STATES
 # 比抛异常更难查。
 import uuid
 import weakref
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -156,6 +156,64 @@ from gateway.platforms import zet_agent_cron as _zet_agent_cron
 _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
+
+_STEER_SOURCE_TOKEN = object()
+_RESERVED_STEER_PROGRESS_TYPES = frozenset({"steer_accepted", "steer_dropped"})
+_STEER_REJECTION_COUNTS: Counter[str] = Counter()
+_STEER_REJECTION_LOCK = threading.Lock()
+
+
+def _count_steer_rejection(reason: str) -> None:
+    with _STEER_REJECTION_LOCK:
+        _STEER_REJECTION_COUNTS[str(reason)] += 1
+
+
+def _put_named_steer_progress(
+    stream_q: Any,
+    payload: Dict[str, Any],
+    *,
+    source_token: Any,
+    nonblocking: bool,
+) -> None:
+    """Send one reserved steer frame from the private producer only."""
+    if source_token is not _STEER_SOURCE_TOKEN:
+        _count_steer_rejection("steer_source_rejected")
+        raise PermissionError("reserved steer frame source rejected")
+    frame_type = payload.get("type") if isinstance(payload, dict) else None
+    if frame_type not in _RESERVED_STEER_PROGRESS_TYPES:
+        _count_steer_rejection("steer_source_rejected")
+        raise ValueError("invalid reserved steer frame type")
+    frame = dict(payload)
+    steer_id = frame.get("steer_id")
+    text = frame.get("text")
+    try:
+        parsed_id = uuid.UUID(steer_id) if isinstance(steer_id, str) else None
+    except (ValueError, AttributeError):
+        parsed_id = None
+    if (
+        parsed_id is None
+        or parsed_id.version != 7
+        or str(parsed_id) != steer_id
+        or len(steer_id.encode("ascii", errors="ignore")) != 36
+    ):
+        _count_steer_rejection("steer_id_malformed")
+        raise ValueError("invalid steer_id")
+    if not isinstance(text, str) or not text.strip():
+        _count_steer_rejection("steer_text_malformed")
+        raise ValueError("invalid steer text")
+    try:
+        text_bytes = text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        _count_steer_rejection("steer_text_malformed")
+        raise ValueError("invalid steer text") from exc
+    if len(text_bytes) > 64 * 1024:
+        _count_steer_rejection("steer_text_malformed")
+        raise ValueError("invalid steer text")
+    item = ("__tool_progress__", _stamp_extension_turn_id(frame))
+    if nonblocking:
+        stream_q.put_nowait(item)
+    else:
+        stream_q.put(item)
 
 
 def _observe_queued_attachment(
@@ -858,7 +916,7 @@ def _stamp_extension_turn_id(payload):
     return payload
 
 
-def _put_progress(stream_q, payload) -> None:
+def _put_progress(stream_q, payload) -> bool:
     """Push one extension frame onto the request stream (single emit point).
 
     Stamps a shallow copy: callers keep caching / replaying their own dict
@@ -866,7 +924,11 @@ def _put_progress(stream_q, payload) -> None:
     observe the wire-only ``turn_id`` being written into it.
     """
     frame = dict(payload) if isinstance(payload, dict) else payload
+    if isinstance(frame, dict) and frame.get("type") in _RESERVED_STEER_PROGRESS_TYPES:
+        _count_steer_rejection("steer_source_rejected")
+        return False
     stream_q.put(("__tool_progress__", _stamp_extension_turn_id(frame)))
+    return True
 
 
 class ZetAgentAdapter(APIServerAdapter):
@@ -2903,26 +2965,72 @@ class ZetAgentAdapter(APIServerAdapter):
 
     @staticmethod
     def _push_steer_dropped_if_any(stream_q: Any, run_result: Any) -> None:
-        """Surface an unconsumed /steer as a ``steer_dropped`` progress event.
+        """Legacy hook retained as a no-op after ID-aware terminal drain.
 
-        ``run_result`` is base ``_run_agent``'s ``(result_dict, usage)``
-        tuple; the finalizer puts leftover steer text under
-        ``result_dict["pending_steer"]``. Read-only — the dict is returned
-        to the caller untouched. Best-effort: a push failure must never
-        fail the turn that just completed.
+        Named dropped frames are emitted while the pending lock is closed so
+        they retain their ID and precede the stream sentinel. A text-only
+        ``pending_steer`` result has no identity and must use the existing
+        caller handback path instead of forging a reserved frame here.
         """
-        if stream_q is None:
-            return
-        try:
-            result_dict = run_result[0] if isinstance(run_result, tuple) else run_result
-            if not isinstance(result_dict, dict):
-                return
-            leftover = result_dict.get("pending_steer")
-            if not leftover or not str(leftover).strip():
-                return
-            _put_progress(stream_q, {"type": "steer_dropped", "text": str(leftover)})
-        except Exception:
-            logger.debug("[zet_agent] steer_dropped push failed", exc_info=True)
+        return None
+
+    @classmethod
+    def _bind_steer_producer(
+        cls,
+        agent: Any,
+        *,
+        turn_id: str,
+        stream_q: Any,
+    ) -> bool:
+        """Bind the sole producer allowed to emit reserved steer frames."""
+        if (
+            agent is None
+            or not str(turn_id or "").strip()
+            or stream_q is None
+            or not callable(getattr(stream_q, "put_nowait", None))
+            or not callable(getattr(stream_q, "put", None))
+        ):
+            _count_steer_rejection("stream_unavailable")
+            return False
+
+        binding_token = object()
+
+        def _send_accepted(payload: Dict[str, Any]) -> None:
+            _put_named_steer_progress(
+                stream_q,
+                payload,
+                source_token=_STEER_SOURCE_TOKEN,
+                nonblocking=True,
+            )
+
+        def _send_dropped(payload: Dict[str, Any]) -> None:
+            _put_named_steer_progress(
+                stream_q,
+                payload,
+                source_token=_STEER_SOURCE_TOKEN,
+                nonblocking=False,
+            )
+
+        agent._bind_steer_turn(
+            turn_id,
+            stream_q,
+            binding_token,
+            _send_accepted,
+            _send_dropped,
+            _count_steer_rejection,
+            cls._ATTACHMENT_STREAM_BACKLOG_MAX,
+        )
+
+        def _admit(text: str, requested_turn_id: str) -> Dict[str, Any]:
+            return agent._admit_steer(
+                text,
+                turn_id=requested_turn_id,
+                stream_q=stream_q,
+                binding_token=binding_token,
+            )
+
+        agent._zettlab_admit_steer = _admit
+        return True
 
     def _make_status_cb(
         self,
@@ -4949,6 +5057,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._sniff_warned = True
             return agent
 
+        self._bind_steer_producer(
+            agent,
+            turn_id=extension_turn_id,
+            stream_q=stream_q,
+        )
+
         interaction_queue_key = (
             self._interaction_queue_key(session_id)
             if session_id
@@ -5320,40 +5434,53 @@ class ZetAgentAdapter(APIServerAdapter):
         runtime_shell_reusable = False
 
         try:
-            result = await super()._run_agent(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                requested_model=requested_model,
-                requested_provider=requested_provider,
-                model_options=model_options,
-                route=route,
-                session_model=session_model,
-                requested_runtime=requested_runtime,
-                route_source=route_source,
-                confirmed_runtime_lock=confirmed_runtime_lock,
-                response_mode=response_mode,
-                plan_ack=plan_ack,
-                plan_auto_execute=plan_auto_execute,
-                turn_id=turn_id,
-                connector_route_capability=connector_route_capability,
-                creation_action_receipt_transport=creation_action_receipt_transport,
-                hardware_execution_token=scoped_hardware_execution_token,
-                execution_policy=scoped_execution_policy,
-                current_turn_reference_image=current_turn_reference_image,
-                request_overrides=request_overrides,
-                trusted_user_message=trusted_user_message,
-                trusted_skill_slug=trusted_skill_slug,
-                connector_policy_disabled_skills=connector_policy_disabled_skills,
-                prestream_timing=prestream_timing,
-            )
+            try:
+                result = await super()._run_agent(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    agent_ref=agent_ref,
+                    gateway_session_key=gateway_session_key,
+                    requested_model=requested_model,
+                    requested_provider=requested_provider,
+                    model_options=model_options,
+                    route=route,
+                    session_model=session_model,
+                    requested_runtime=requested_runtime,
+                    route_source=route_source,
+                    confirmed_runtime_lock=confirmed_runtime_lock,
+                    response_mode=response_mode,
+                    plan_ack=plan_ack,
+                    plan_auto_execute=plan_auto_execute,
+                    turn_id=turn_id,
+                    connector_route_capability=connector_route_capability,
+                    creation_action_receipt_transport=creation_action_receipt_transport,
+                    hardware_execution_token=scoped_hardware_execution_token,
+                    execution_policy=scoped_execution_policy,
+                    current_turn_reference_image=current_turn_reference_image,
+                    request_overrides=request_overrides,
+                    trusted_user_message=trusted_user_message,
+                    trusted_skill_slug=trusted_skill_slug,
+                    connector_policy_disabled_skills=connector_policy_disabled_skills,
+                    prestream_timing=prestream_timing,
+                )
+            except BaseException:
+                _failed_agent = agent_ref[0] if agent_ref else None
+                _close_steer = getattr(_failed_agent, "_drain_pending_steer", None)
+                if callable(_close_steer):
+                    try:
+                        _close_steer(close=True)
+                    except Exception:
+                        logger.debug(
+                            "[zet_agent] exceptional steer close failed",
+                            exc_info=True,
+                        )
+                raise
             # Early-return steer salvage: many conversation_loop retry/error
             # paths return without running finalize_turn, so the closing
             # drain never happens — a steer accepted in those windows would
@@ -5372,7 +5499,15 @@ class ZetAgentAdapter(APIServerAdapter):
                     and isinstance(result[0], dict)
                     and not result[0].get("pending_steer")
                 ):
-                    _leftover = _salvage_agent._drain_pending_steer(close=True)
+                    _terminal_handback = list(
+                        getattr(_salvage_agent, "_steer_terminal_handback", [])
+                        or []
+                    )
+                    if _terminal_handback:
+                        _leftover = "\n".join(text for _, text in _terminal_handback)
+                        _salvage_agent._steer_terminal_handback = []
+                    else:
+                        _leftover = _salvage_agent._drain_pending_steer(close=True)
                     if _leftover:
                         result[0]["pending_steer"] = _leftover
                         logger.info(
@@ -8329,7 +8464,7 @@ class ZetAgentAdapter(APIServerAdapter):
         ``_run_agent`` so the caller can re-deliver the text as a normal
         message instead of it being silently lost.
 
-        Body: ``{"text": "..."}`` — required, non-empty after strip.
+        Body: ``{"turn_id": "...", "text": "..."}`` — both required.
 
         Returns 200 ``{accepted: true, status: "steering"}`` when the text
         was stashed onto a live agent; ``{accepted: false, status:
@@ -8348,9 +8483,15 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
         text = body.get("text") if isinstance(body, dict) else None
+        turn_id = body.get("turn_id") if isinstance(body, dict) else None
         if not isinstance(text, str) or not text.strip():
             return web.json_response(
                 _openai_error("steer requires a non-empty 'text' field"),
+                status=400,
+            )
+        if not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 256:
+            return web.json_response(
+                _openai_error("steer requires a bounded non-empty 'turn_id' field"),
                 status=400,
             )
 
@@ -8381,25 +8522,29 @@ class ZetAgentAdapter(APIServerAdapter):
                 {"session_id": session_id, "status": "not_running", "accepted": False}
             )
 
+        outcome: Dict[str, Any] = {}
         try:
-            accepted = bool(agent.steer(text))
-            # text is non-empty (validated above), so a normal False here
-            # means the turn finalizer already closed the slot OR a hard
-            # interrupt is winding the turn down (steer() refuses in the
-            # stop window — an accepted steer there would be discarded by
-            # the finalizer's interrupted branch with no receipt). Either
-            # way the turn is effectively over: report not_running (the
-            # contract's re-queue signal), not "rejected" — callers only
-            # fall back to next-turn queueing on a re-queueable status.
-            status = "steering" if accepted else "not_running"
+            admit = getattr(agent, "_zettlab_admit_steer", None)
+            if not callable(admit):
+                outcome = {"accepted": False, "reason": "stream_unavailable"}
+            else:
+                outcome = admit(text, turn_id)
+            accepted = bool(outcome.get("accepted")) if isinstance(outcome, dict) else False
+            reason = str(outcome.get("reason") or "") if isinstance(outcome, dict) else ""
+            status = "steering" if accepted else (
+                "not_running" if reason == "upstream_rejected" else "rejected"
+            )
         except Exception:
-            logger.debug("[zet_agent] session steer: agent.steer failed", exc_info=True)
+            logger.debug("[zet_agent] session steer admission failed", exc_info=True)
             accepted = False
             status = "rejected"
 
-        return web.json_response(
-            {"session_id": session_id, "status": status, "accepted": accepted}
-        )
+        payload = {"session_id": session_id, "status": status, "accepted": accepted}
+        if accepted and isinstance(outcome, dict):
+            payload["steer_id"] = outcome.get("steer_id")
+        elif isinstance(outcome, dict) and outcome.get("reason"):
+            payload["reason"] = outcome["reason"]
+        return web.json_response(payload)
 
     def _interrupt_pending_interactions(self, session_id: str, scoped_session_key: Optional[str] = None) -> None:
         """Best-effort cleanup of agent-thread blockers for ``session_id``.

@@ -808,12 +808,23 @@ def init_agent(
     # last tool result's content so the model sees it on its next
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
-    agent._pending_steer: Optional[str] = None
+    agent._pending_steer: List[tuple[str, str]] = []
     agent._pending_steer_lock = threading.Lock()
     # Closed by the turn finalizer's last drain (steer() refuses while set);
     # reopened at the next run_conversation start. Guards the SSE-teardown
     # window where a stashed steer would have no consumer left.
     agent._steer_closed = False
+    agent._steer_binding_turn_id = ""
+    agent._steer_stream_q = None
+    agent._steer_binding_token = None
+    agent._steer_accepted_sender = None
+    agent._steer_terminal_sender = None
+    agent._steer_reject_counter = None
+    agent._steer_usage_rollback = None
+    agent._steer_stream_backlog_max = 2000
+    agent._steer_pending_bytes = 0
+    agent._steer_inflight_batch: List[tuple[str, str]] = []
+    agent._steer_terminal_handback: List[tuple[str, str]] = []
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn
