@@ -77,12 +77,22 @@ _PUBLISH_MODES = ("install", "reload")
 # silence — the skill text asks for it, and the run still walks past it and
 # ships a dashboard with a manual button after the user asked for a daily
 # fetch. A skill can be out-argued by another skill; a required tool argument
-# cannot. "user_confirmed_auto" is also recorded server-side, so an app the
-# user asked to self-refresh that never got a maintainer is a fact someone can
-# query later instead of a promise that quietly evaporated.
-_DATA_REFRESH_CHOICES = (
-    "static", "external_unconfirmed", "user_confirmed_auto", "user_declined"
-)
+# cannot.
+#
+# "user_confirmed_auto" is not one of the answers, because it is not an answer
+# a model gets to give. The dedicated maintenance agent is retired: the
+# platform registers an app's scheduled / event / on-demand tasks itself from
+# the spec.yaml inside the app package, and it stamps user_confirmed_auto on
+# the publication once that registration succeeds. local-server rejects a
+# caller that declares it, so advertising it here only buys the model a turn
+# spent on a 400.
+_DATA_REFRESH_CHOICES = ("static", "external_unconfirmed", "user_declined")
+# What this tool accepts on the wire, deliberately wider than what a model may
+# answer: a publication can still carry the platform's own user_confirmed_auto
+# and the receiving side reads it (see _auto_refresh_scope_token). The schema
+# enum and every model-facing hint use _DATA_REFRESH_CHOICES; only request
+# validation uses this.
+_DATA_REFRESH_ACCEPTED = _DATA_REFRESH_CHOICES + ("user_confirmed_auto",)
 # The hidden maintainer gets one write capability, not the app's whole HTTP
 # surface. Generated apps expose POST /api/refresh as the user-confirmed data
 # maintenance verb; every other write path stays unavailable to model calls.
@@ -221,10 +231,18 @@ APP_HOST_SCHEMA = {
                     "external_unconfirmed = the data comes from outside, but "
                     "the device could not ask for refresh consent because the "
                     "optional capability was unavailable. "
-                    "user_confirmed_auto = the data comes from outside and the "
-                    "user agreed to a schedule — it requires publish(mode=install) "
-                    "with a complete operation; legacy install is forbidden. "
                     "user_declined = you asked and the user said no. "
+                    "A user who agreed to a scheduled refresh does not get a "
+                    "fourth value: the schedule is not declared on this call "
+                    "at all. The platform registers this app's scheduled / "
+                    "event / on-demand tasks itself from the spec.yaml inside "
+                    "the app package (capabilities.cron / events / "
+                    "agent_tasks) and reports what it registered in the "
+                    "publish result's maintenance field — so do not hand-build "
+                    "an operation or a maintenance block for them, and never "
+                    "send data_refresh=user_confirmed_auto: that value is the "
+                    "platform's own stamp, written after the registration "
+                    "succeeds, and a request that declares it is rejected. "
                     "Answer from what the user actually said, not from what the "
                     "app could get away with: an app that shows prices, weather "
                     "or rates and only has a manual refresh button is not static."
@@ -685,7 +703,7 @@ def _build_request(action, args):
         # it never rewrites who created the app.
         if mode == "install":
             data_refresh = str(args.get("data_refresh", "") or "").strip()
-            if data_refresh not in _DATA_REFRESH_CHOICES:
+            if data_refresh not in _DATA_REFRESH_ACCEPTED:
                 raise _BadRequest(
                     "publish(mode=install) 需要 data_refresh 参数（"
                     + "/".join(_DATA_REFRESH_CHOICES)
@@ -700,7 +718,7 @@ def _build_request(action, args):
             if not isinstance(operation, dict):
                 raise _BadRequest("operation 必须是 object")
             operation_data_refresh = str(operation.get("data_refresh", "") or "").strip()
-            if operation_data_refresh not in _DATA_REFRESH_CHOICES:
+            if operation_data_refresh not in _DATA_REFRESH_ACCEPTED:
                 raise _BadRequest("operation 需要有效 data_refresh")
             outer_data_refresh = str(body.get("data_refresh", "") or "").strip()
             if outer_data_refresh and outer_data_refresh != operation_data_refresh:
@@ -711,8 +729,14 @@ def _build_request(action, args):
             body["data_refresh"] = operation_data_refresh
             body["operation"] = operation
         elif body.get("data_refresh") == "user_confirmed_auto":
+            # 专属维护 Agent 已退役：调用方不再自带自动维护意图，平台按应用包里的
+            # spec.yaml 自己登记任务。拦在这里，省掉一趟必被 local-server 拒的发布。
             raise _BadRequest(
-                "自动维护必须通过 publish 提供完整 operation，才能原子创建维护者和定时任务"
+                "不要自带 data_refresh=user_confirmed_auto：应用的定时 / 事件 / 按需任务"
+                "由平台自己从应用包里的 spec.yaml 登记（capabilities 下的 cron / events / "
+                "agent_tasks），登记成功后平台会把这次发布标成 user_confirmed_auto。改法："
+                "data_refresh 按实情填 " + "/".join(_DATA_REFRESH_CHOICES) + "，不要自带 "
+                "operation / maintenance，把任务写进 spec.yaml 再发布"
             )
         return "POST", "/publish", body, _LONG_TIMEOUT
     if action == "install":
@@ -722,7 +746,7 @@ def _build_request(action, args):
             # publish(mode=install) so App Host can drive the transaction.
             raise _BadRequest("legacy install 不支持 operation；请使用 publish(mode=install)")
         data_refresh = str(args.get("data_refresh", "") or "").strip()
-        if data_refresh not in _DATA_REFRESH_CHOICES:
+        if data_refresh not in _DATA_REFRESH_ACCEPTED:
             raise _BadRequest(
                 "install 需要 data_refresh 参数（"
                 + "/".join(_DATA_REFRESH_CHOICES)
