@@ -1094,6 +1094,10 @@ _CAMERA_RUNTIME_RELATIVE_PATH = Path(
 )
 _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH = Path("skills/camsnap/manifest.yaml")
 _CAMERA_RUNTIME_CAPABILITY = "zettlab.camera.actions.v1"
+_CAMERA_SEMANTIC_SCRIPT = "camera_semantic_monitor.py"
+_CAMERA_SEMANTIC_PATH = Path(
+    "skills/camera-semantic-evaluation/scripts/camera_semantic_monitor.py"
+)
 _PRINTER3D_RUNTIME_SCRIPTS = frozenset({
     "printer3d_connector.py",
     "printer3d_control.py",
@@ -2642,8 +2646,12 @@ class _SmartHomeRuntimeCommand:
 
 
 def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
+    relative_path = {
+        _CAMERA_RUNTIME_SCRIPT: _CAMERA_RUNTIME_RELATIVE_PATH,
+        _CAMERA_SEMANTIC_SCRIPT: _CAMERA_SEMANTIC_PATH,
+    }.get(Path(raw_path).name)
     anchor = _capture_connector_runtime_root()
-    if anchor is None:
+    if anchor is None or relative_path is None:
         return None
     relative_text: Optional[str] = None
     for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
@@ -2658,9 +2666,9 @@ def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
                 break
             except ValueError:
                 continue
-    if relative_text is None or Path(relative_text) != _CAMERA_RUNTIME_RELATIVE_PATH:
+    if relative_text is None or Path(relative_text) != relative_path:
         return None
-    candidate = anchor.resolved_root / _CAMERA_RUNTIME_RELATIVE_PATH
+    candidate = anchor.resolved_root / relative_path
     try:
         resolved = candidate.resolve(strict=True)
         resolved.relative_to(anchor.resolved_root)
@@ -2701,6 +2709,52 @@ def _camera_runtime_arguments_allowed(arguments: list[str]) -> bool:
     return False
 
 
+def _camera_semantic_arguments_allowed(arguments: list[str]) -> bool:
+    if not arguments or len(arguments) % 2 != 1:
+        return False
+    fields = dict(zip(arguments[1::2], arguments[2::2]))
+    if len(fields) != (len(arguments) - 1) // 2:
+        return False
+    if arguments[0] == "candidate":
+        return set(fields) == {"--policy-id"} and re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+            fields["--policy-id"],
+        ) is not None
+    if arguments[0] != "commit" or not re.fullmatch(
+        r"[A-Za-z0-9_-]{32,128}", fields.get("--capability", "")
+    ):
+        return False
+    required = {"--capability", "--matched"}
+    if fields.get("--matched") == "false":
+        return set(fields) <= required | {"--unknown"} and fields.get("--unknown", "false") in {"true", "false"}
+    required |= {"--subject-kind", "--predicate", "--duration-seconds", "--evidence-ref"}
+    if (
+        fields.get("--matched") != "true"
+        or not required <= fields.keys()
+        or fields.keys() - required - {"--subject-ref", "--zone-id", "--frame-states", "--track-ids"}
+        or fields["--subject-kind"] not in {"person", "object"}
+        or fields["--predicate"] not in {"appears", "disappears", "enters_zone", "leaves_zone", "lingers"}
+        or re.fullmatch(r"[0-9]{1,4}", fields["--duration-seconds"]) is None
+        or int(fields["--duration-seconds"]) > 3600
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", fields["--evidence-ref"]) is None
+    ):
+        return False
+    if "--frame-states" in fields or "--track-ids" in fields:
+        states = fields.get("--frame-states", "").split(",")
+        tracks = fields.get("--track-ids", "").split(",")
+        if (
+            not 3 <= len(states) <= 8 or len(states) != len(tracks)
+            or any(state not in {"present", "absent", "inside", "outside", "unknown"} for state in states)
+            or any(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", track) is None for track in tracks)
+        ):
+            return False
+    return all(
+        len(fields.get(key, "").encode("utf-8")) <= limit
+        and not any(ord(c) < 0x20 for c in fields.get(key, ""))
+        for key, limit in (("--subject-ref", 120), ("--zone-id", 64))
+    )
+
+
 def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeCommand]:
     lexer = shlex.shlex(
         command.strip(),
@@ -2717,12 +2771,16 @@ def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeComman
     if (
         len(tokens) < 3
         or not _is_python_executable_token(tokens[0])
-        or Path(tokens[1]).name != _CAMERA_RUNTIME_SCRIPT
+        or Path(tokens[1]).name not in {_CAMERA_RUNTIME_SCRIPT, _CAMERA_SEMANTIC_SCRIPT}
         or any(
             token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
             for token in tokens
         )
-        or not _camera_runtime_arguments_allowed(tokens[2:])
+        or not (
+            _camera_semantic_arguments_allowed(tokens[2:])
+            if Path(tokens[1]).name == _CAMERA_SEMANTIC_SCRIPT
+            else _camera_runtime_arguments_allowed(tokens[2:])
+        )
     ):
         return None
     script = _resolve_camera_runtime_script(tokens[1])
@@ -2740,11 +2798,17 @@ def _parse_camera_runtime_command(command: str) -> Optional[_CameraRuntimeComman
     )
 
 
-def _camera_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool:
-    manifest = anchor.resolved_root / _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH
+def _camera_runtime_manifest_allows(
+    anchor: _ConnectorRuntimeRootAnchor, *, semantic: bool = False
+) -> bool:
+    manifest_path = (
+        _CAMERA_SEMANTIC_PATH.parent.parent / "manifest.yaml"
+        if semantic else _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH
+    )
+    manifest = anchor.resolved_root / manifest_path
     try:
         manifest_digest = anchor.file_digests.get(
-            _CAMERA_RUNTIME_MANIFEST_RELATIVE_PATH.as_posix()
+            manifest_path.as_posix()
         )
         if manifest_digest is None or not _connector_runtime_path_is_trusted(
             manifest,
@@ -2764,9 +2828,9 @@ def _camera_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool
         loaded = yaml.safe_load(raw.decode("utf-8"))
         return bool(
             isinstance(loaded, dict)
-            and loaded.get("id") == "camsnap"
+            and loaded.get("id") == ("camera-semantic-evaluation" if semantic else "camsnap")
             and loaded.get("required_scopes") == ["hardware.camera:read"]
-            and _CAMERA_RUNTIME_CAPABILITY
+            and ("zettlab.camera.semantic.v1" if semantic else _CAMERA_RUNTIME_CAPABILITY)
             in (loaded.get("runtime_capabilities") or [])
         )
     except (OSError, UnicodeError, ValueError, TypeError):
@@ -2774,7 +2838,7 @@ def _camera_runtime_manifest_allows(anchor: _ConnectorRuntimeRootAnchor) -> bool
 
 
 def _camera_runtime_shell_guard_result(command: str) -> Optional[str]:
-    if _CAMERA_RUNTIME_SCRIPT not in command:
+    if not any(name in command for name in (_CAMERA_RUNTIME_SCRIPT, _CAMERA_SEMANTIC_SCRIPT)):
         return None
     return json.dumps({
         "output": "",
@@ -4334,6 +4398,7 @@ def _run_camera_runtime_command_if_allowed(
 
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
     script = Path(parsed.argv[1])
+    semantic = script.name == _CAMERA_SEMANTIC_SCRIPT
     expected_digest: Optional[str] = None
     try:
         expected_digest = anchor.file_digests.get(
@@ -4349,7 +4414,7 @@ def _run_camera_runtime_command_if_allowed(
                 anchor.resolved_root,
                 expected_root_identity=parsed.root_identity,
             )
-            and _camera_runtime_manifest_allows(anchor)
+            and _camera_runtime_manifest_allows(anchor, semantic=semantic)
         )
     except (OSError, AttributeError):
         identities_match = False
@@ -4367,16 +4432,20 @@ def _run_camera_runtime_command_if_allowed(
             expected_identity=parsed.script_identity,
             expected_digest=expected_digest,
         )
-        from tools.environments.local import build_camera_runtime_env
+        from tools.environments.local import build_camera_runtime_env, build_camera_semantic_runtime_env
         from tools.trusted_direct_runner import run_trusted_python_script
 
-        trusted_env = build_camera_runtime_env()
+        trusted_env = build_camera_semantic_runtime_env() if semantic else build_camera_runtime_env()
         trusted_secrets = {
             key: trusted_env.pop(key)
-            for key in (
+            for key in ((
+                "ZETTLAB_AGENT_ACTION_TOKEN",
+                "ZETTLAB_CAMERA_JOB_ID",
+                "ZETTLAB_CAMERA_EXECUTION_ID",
+            ) if semantic else (
                 "ZETTLAB_AGENT_ACTION_TOKEN",
                 "ZETTLAB_HARDWARE_EXECUTION_TOKEN",
-            )
+            ))
         }
         secret_values = list(trusted_secrets.values())
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()

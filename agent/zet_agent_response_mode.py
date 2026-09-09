@@ -73,6 +73,17 @@ _CAMERA_INVENTORY_INTENT_RE = re.compile(
     r"|(?:检查|状态|连接情况|是否连接|是否可用|可用状态|check|status|connected|available|online).{0,48}(?:摄像头|镜头|camera)",
     re.IGNORECASE | re.DOTALL,
 )
+# A grant acknowledgement does not identify which media action to repeat.
+# Admit a fresh inventory only; device/Agent/session authorization remains
+# authoritative in CameraService. Whole-message matching excludes quotations
+# and requests that append background monitoring or recording instructions.
+_CAMERA_AUTHORIZATION_RETRY_RE = re.compile(
+    r"(?:我)?(?:"
+    r"(?:已经|已)?(?:授权|打开|开启)(?:了)?摄像头(?:权限|开关)?"
+    r"|摄像头(?:权限|开关)?(?:已经|已)?(?:授权|打开|开启)(?:了)?"
+    r")[，,。\s]*(?:请)?(?:再试|重试|重新试)(?:一下|下|一次)?"
+    r"(?:刚才的操作)?[。！!\s]*",
+)
 _HARDWARE_INVENTORY_INTENT_RE = re.compile(
     r"(?:(?:所有|全部|当前|整体|已连接(?:的)?)(?:硬件|设备|连接器).{0,32}(?:检查|查看|列出|有哪些|状态|连接情况|是否可用)"
     r"|(?:检查|查看|列出).{0,32}(?:所有|全部|当前|整体|已连接(?:的)?)(?:硬件|设备|连接器)"
@@ -1416,6 +1427,9 @@ def _skill_direct_task_context(
         else normalized
     )
     hardware_inventory = bool(_HARDWARE_INVENTORY_INTENT_RE.search(normalized))
+    camera_authorization_retry = bool(
+        _CAMERA_AUTHORIZATION_RETRY_RE.fullmatch(normalized)
+    )
     return _SkillDirectTaskContext(
         task_sha256=hashlib.sha256(task_binding.encode("utf-8")).hexdigest(),
         turn_identity=_current_skill_direct_turn_identity(),
@@ -1424,6 +1438,7 @@ def _skill_direct_task_context(
             or bool(_CAMERA_INTENT_RE.search(normalized))
             or bool(_CAMERA_INVENTORY_INTENT_RE.search(normalized))
             or hardware_inventory
+            or camera_authorization_retry
             or bool(_CAMERA_DIRECT_SNAPSHOT_INTENT_RE.fullmatch(normalized))
             or camera_resumed
         ),
@@ -1434,6 +1449,7 @@ def _skill_direct_task_context(
             and (
                 _CAMERA_INVENTORY_INTENT_RE.search(normalized)
                 or hardware_inventory
+                or camera_authorization_retry
             )
             and not _CAMERA_INTENT_RE.search(normalized)
         ),
@@ -1708,6 +1724,11 @@ def _camera_runtime_argv(
     if not isinstance(argv, list) or len(argv) < 3:
         return None
     if not all(isinstance(value, str) for value in argv):
+        return None
+    # The shared terminal parser also recognizes scheduled semantic helpers.
+    # Those use Cron execution identity and device policy authorization, not a
+    # Chat camsnap receipt. Never classify them as manual camera operations.
+    if Path(argv[1]).name != "camera_connector.py":
         return None
     return list(argv)
 
@@ -2012,6 +2033,13 @@ def _silent_skill_view_scope_block_message(
     )
 
 
+class CameraTaskScopeMissing(str):
+    """String-compatible policy rejection with additive machine-readable facts."""
+
+    code = "camera_task_scope_missing"
+    authorization_status = "not_checked"
+
+
 def trusted_skill_operation_block_message(
     agent: Any,
     *,
@@ -2096,10 +2124,15 @@ def trusted_skill_operation_block_message(
                     "zet_agent: blocked camera runtime command without a current "
                     "trusted camsnap scope"
                 )
-                return (
+                return CameraTaskScopeMissing(
                     "Trusted camera commands require a current request-bound "
                     "scope minted by the attested `camsnap` skill_view result. "
-                    "Load that trusted skill and retry the exact operation."
+                    "The command was not dispatched; device and Chat grants "
+                    "were not checked. Do not claim that camera permission is "
+                    "disabled or has not synced. Load the trusted skill for "
+                    "the current camera task. If it cannot establish scope, "
+                    "request an explicit camera operation instead of retrying "
+                    "the same blocked command."
                 )
             if (
                 function_name == "terminal"

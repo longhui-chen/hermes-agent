@@ -147,6 +147,27 @@ for each tool_call in response.tool_calls:
     6. Append {"role": "tool", "content": result} to history
 ```
 
+### Camera pre-dispatch scope errors
+
+In Zettlab App turns, a registered Camera helper without an attested current
+`camsnap` scope is rejected before dispatch. Its tool result retains the `error`
+string and adds `code: "camera_task_scope_missing"` and
+`authorization_status: "not_checked"`. This is not evidence that the camera,
+Agent grant, or Chat grant is disabled: device authorization has not run.
+Consumers must tolerate these optional fields and must not reset a confirmed
+grant in response. Load the trusted skill for an explicit current Camera task;
+if scope still cannot be established, clarify the requested operation instead
+of repeatedly invoking the same blocked helper. Existing policy event error
+types are preserved for compatibility.
+
+This manual `camsnap` admission check must only classify `camera_connector.py`.
+The shared terminal parser also accepts `camera_semantic_monitor.py`, but that
+background helper uses the Cron-bound direct runner and device policy checks,
+not a Chat receipt. Excluding it from manual-camera classification grants no
+authority: without a matching scheduler/profile context its runner rejects it.
+The existing silent-automation and other active Skill scope restrictions remain
+in force.
+
 ### Agent-Level Tools
 
 Some tools are intercepted by `run_agent.py` *before* reaching `handle_function_call()`:
