@@ -23,6 +23,7 @@ def _agent() -> AIAgent:
     agent._steer_binding_token = None
     agent._steer_pending_bytes = 0
     agent._steer_inflight_batch = []
+    agent._steer_provider_entered = False
     agent._steer_terminal_handback = []
     agent._interrupt_requested = False
     agent._turn_last_steer_text = None
@@ -187,6 +188,23 @@ def test_fifo_join_happens_only_at_model_feed_and_reclaim_preserves_ids():
     assert agent._steer_pending_bytes == sum(
         _encoded_size(item) for item in agent._pending_steer
     )
+
+
+def test_provider_entered_steer_is_not_reclaimed_as_unconsumed():
+    agent = _agent()
+    stream_q = queue.Queue()
+    token = object()
+    agent._bind_steer_turn("wire-turn", stream_q, token, lambda _payload: None)
+    agent._admit_steer("already sent", turn_id="wire-turn", stream_q=stream_q, binding_token=token)
+    messages = [{"role": "tool", "content": "done", "tool_call_id": "c"}]
+
+    drain_steer_for_next_api_call(agent, messages)
+    agent._mark_steer_batch_provider_entered()
+    before = [dict(messages[0]), dict(messages[-1])]
+    reclaim_tail_steer(agent, messages)
+
+    assert messages == before
+    assert agent._pending_steer == []
 
 
 def test_random_admit_consume_close_never_exceeds_pending_envelope():

@@ -4139,6 +4139,7 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
             agent._pending_steer = []
             agent._steer_pending_bytes = 0
             agent._steer_inflight_batch = pending
+            agent._steer_provider_entered = False
     else:
         if getattr(agent, "_interrupt_requested", False):
             return
@@ -4149,6 +4150,7 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
             pending = list(raw_pending or [])
         agent._pending_steer = []
         agent._steer_inflight_batch = pending
+        agent._steer_provider_entered = False
     if not pending:
         return
     steer_text = "\n".join(text for _, text in pending)
@@ -4254,6 +4256,28 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     if not (isinstance(tail, dict) and tail.get("role") == "user"):
         return
     content = tail.get("content")
+    inflight = list(getattr(agent, "_steer_inflight_batch", []) or [])
+    if inflight and getattr(agent, "_steer_provider_entered", False):
+        consumed_text = "\n".join(item[1] for item in inflight)
+        consumed_suffix = STEER_USER_PREFIX + consumed_text
+        consumed_in_tail = (
+            isinstance(content, str)
+            and (
+                content == consumed_suffix
+                or content.endswith("\n\n" + consumed_suffix)
+            )
+        ) or (
+            isinstance(content, list)
+            and bool(content)
+            and isinstance(content[-1], dict)
+            and content[-1].get("type") == "text"
+            and content[-1].get("text") == consumed_suffix
+        )
+        if consumed_in_tail:
+            # The provider request has begun, so the named steer was consumed.
+            # Keep the model transcript and its durable merge row intact; this
+            # helper only reclaims the pre-provider window.
+            return
     reclaimed: list = []
     if isinstance(content, str):
         if content.startswith(STEER_USER_PREFIX):
@@ -4313,7 +4337,6 @@ def reclaim_tail_steer(agent, messages: list) -> None:
                             )
                     break
     text = "\n".join(reclaimed)
-    inflight = list(getattr(agent, "_steer_inflight_batch", []) or [])
     if inflight and "\n".join(item[1] for item in inflight) == text:
         restash_items = inflight
     else:

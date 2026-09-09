@@ -2367,7 +2367,18 @@ def run_conversation(
     # Legacy CLI/TUI agents have no transport binding and reopen normally.
     _start_steer_turn = getattr(agent, "_start_steer_turn", None)
     if callable(_start_steer_turn):
-        _start_steer_turn(turn_id)
+        # U2d binds chat.steer to the public HERMES_TURN_ID carried by the
+        # local-server request. ``turn_id`` above is Hermes' internal relay
+        # identity and intentionally differs from that wire correlation id.
+        steer_turn_id = str(getattr(agent, "_zettlab_active_turn_id", "") or "")
+        if not steer_turn_id:
+            try:
+                from gateway.session_context import get_session_env
+
+                steer_turn_id = get_session_env("HERMES_TURN_ID", "").strip()
+            except Exception:
+                steer_turn_id = ""
+        _start_steer_turn(steer_turn_id)
     else:
         agent._steer_closed = False
     # Consumed-steer marker for the goal hook: a steer the model already

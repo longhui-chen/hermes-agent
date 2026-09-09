@@ -3388,6 +3388,7 @@ class AIAgent:
                     for steer_id, text in self._pending_steer
                 )
                 self._steer_inflight_batch = []
+                self._steer_provider_entered = False
         return True
 
     @staticmethod
@@ -3455,6 +3456,7 @@ class AIAgent:
                 if steer_id
             )
             self._steer_inflight_batch = []
+            self._steer_provider_entered = False
             self._steer_terminal_handback = []
             self._steer_closed = not bool(
                 self._steer_binding_turn_id
@@ -3557,7 +3559,10 @@ class AIAgent:
     def _mark_steer_batch_provider_entered(self) -> None:
         """Commit the current drained batch once provider execution begins."""
         with self._pending_steer_lock:
-            self._steer_inflight_batch = []
+            # Keep the batch identity until the next drain so early-return
+            # reclaim paths can distinguish a provider-consumed steer from a
+            # pre-provider handback. It is not a second queue or ledger.
+            self._steer_provider_entered = bool(self._steer_inflight_batch)
 
     def steer(self, text: str) -> bool:
         """
@@ -3788,6 +3793,7 @@ class AIAgent:
                 self._steer_accepted_sender = None
                 self._steer_terminal_sender = None
                 self._steer_inflight_batch = []
+                self._steer_provider_entered = False
                 pending = handback
             else:
                 self._pending_steer = []

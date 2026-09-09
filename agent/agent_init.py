@@ -824,6 +824,7 @@ def init_agent(
     agent._steer_stream_backlog_max = 2000
     agent._steer_pending_bytes = 0
     agent._steer_inflight_batch: List[tuple[str, str]] = []
+    agent._steer_provider_entered = False
     agent._steer_terminal_handback: List[tuple[str, str]] = []
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
