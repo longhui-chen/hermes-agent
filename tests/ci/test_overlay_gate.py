@@ -68,6 +68,8 @@ def test_parse_hunks_separates_added_and_deleted():
     hunks = gate.parse_hunks(diff)
     assert [h.new_start for h in hunks] == [11, 22]
     assert [h.path for h in hunks] == ["run_agent.py", "run_agent.py"]
+    assert hunks[0].added_nonblank == 1
+    assert hunks[1].added_nonblank == 0 and hunks[1].removed == 2
 
 
 def test_parse_hunks_treats_plus_plus_lines_inside_hunk_as_content():
@@ -81,8 +83,6 @@ def test_parse_hunks_treats_plus_plus_lines_inside_hunk_as_content():
     hunks = gate.parse_hunks(diff)
     assert len(hunks) == 1 and hunks[0].added_nonblank == 2
     assert hunks[0].added[0].startswith("++ ")
-    assert hunks[0].added_nonblank == 1
-    assert hunks[1].added_nonblank == 0 and hunks[1].removed == 2
 
 
 def test_hunk_marker_lookback(config):
