@@ -249,7 +249,15 @@ def test_business_state_pattern_variants(config):
         "agent.ledger = {}",
     ):
         assert pattern.search(line), line
-    for line in ("self.tokenizer = Tokenizer()", "self._pending_steer = []", "agent.context_tokens = 0", "x = self.binding_token"):
+    for line in ("self.tokenizer = Tokenizer()", "self._pending_steer = []", "agent.context_tokens = 0", "x = self.binding_token", "self.token_limit = 1", "self.max_tokens = 4096"):
+        assert not pattern.search(line), line
+
+
+def test_business_state_subscript_pattern(config):
+    pattern = re.compile(config["forbidden_added_patterns"][1]["pattern"])
+    for line in ('self._state["binding_token"] = token', "agent.slots['sender'] = cb", 'ctx["ledger"]: dict = {}', 'st["steer_source_token"] = t'):
+        assert pattern.search(line), line
+    for line in ('x = self._state["binding_token"]', 'self._state["tokens_used"] = 0', 'cfg["token_limit"] = 1', 'cfg["max_tokens"] = 1'):
         assert not pattern.search(line), line
 
 

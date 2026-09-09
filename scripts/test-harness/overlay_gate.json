@@ -25,8 +25,12 @@
   ],
   "forbidden_added_patterns": [
     {
-      "pattern": "^\\s*(self|agent)\\._*(?:[A-Za-z0-9]+_+)*(binding|token|sender|ledger|handback|inflight|reject_counter|usage_rollback)(?:_+[A-Za-z0-9_]*)?\\s*[:=]",
-      "reason": "Zettlab 业务状态字段进入上游核心（HR8）；binding / token / sender / ledger / handback / inflight / reject_counter / usage_rollback 状态属于 gateway/platforms/zet_agent.py 适配层（启发式纵深防御，主控制是标记与行数预算）"
+      "pattern": "^\\s*(self|agent)\\._*(?:[A-Za-z0-9]+_+)*(binding|binding_token|source_token|sender|ledger|handback|inflight|reject_counter|usage_rollback)(?:_+[A-Za-z0-9_]*)?\\s*[:=]",
+      "reason": "Zettlab 业务状态字段进入上游核心（HR8）；binding / sender / ledger / handback / inflight / reject_counter / usage_rollback 状态属于 gateway/platforms/zet_agent.py 适配层（启发式纵深防御，主控制是标记与行数预算）"
+    },
+    {
+      "pattern": "[\\\"']_*(?:[A-Za-z0-9]+_+)*(binding|binding_token|source_token|sender|ledger|handback|inflight|reject_counter|usage_rollback)(?:_+[A-Za-z0-9_]*)?[\\\"']\\s*\\]\\s*[:=]",
+      "reason": "Zettlab 业务状态经下标 / 映射键写入上游核心（HR8）；同上，属于 gateway/platforms/zet_agent.py 适配层"
     }
   ]
 }
