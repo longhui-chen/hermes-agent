@@ -133,12 +133,17 @@ def test_camera_runtime_parser_accepts_only_fixed_actions(monkeypatch, tmp_path)
         'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" snap --camera-id cam_front',
         'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" doctor --camera-id cam_front',
         'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" clip --camera-id cam_front --duration 60',
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" history --camera-id cam_front --start 2000-01-01T00:00:00Z --end 2000-01-01T00:00:30Z',
     ]
     rejected = [
         accepted[1] + " --host 192.168.1.2",
         accepted[1] + " --password secret",
         accepted[1] + " --out /tmp/frame.jpg",
         accepted[1] + "; id",
+        accepted[-1] + " --duration 60",
+        accepted[-1].replace("00:00:30Z", "00:01:00Z"),
+        accepted[-1].replace("2000-01-01", "9999-01-01"),
+        accepted[-1].replace("cam_front", "../../private"),
         'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" watch --camera-id cam_front',
         'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" clip --camera-id cam_front --duration 61',
         'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" snap --camera-id ../../secret',
@@ -203,6 +208,24 @@ def test_camera_runtime_env_is_request_and_profile_scoped():
         }
     finally:
         _clear_receipt(tokens)
+
+
+def test_history_runtime_direct_runner_flow(monkeypatch, tmp_path):
+    _write_camera_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    tokens = _bind_receipt()
+    try:
+        result = json.loads(terminal_tool_module._run_camera_runtime_command_if_allowed(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/camera_connector.py" history --camera-id cam_front --start 2000-01-01T00:00:00Z --end 2000-01-01T00:00:30Z',
+            cwd=str(tmp_path), timeout=5,
+        ))
+    finally:
+        _clear_receipt(tokens)
+    assert result["exit_code"] == 0
+    assert result["camera_runtime_direct"] is True
+    assert json.loads(result["output"])["argv"] == ["history", "--camera-id", "cam_front", "--start", "2000-01-01T00:00:00Z", "--end", "2000-01-01T00:00:30Z"]
+    assert ACTION_TOKEN not in result["output"]
+    assert HARDWARE_TOKEN not in result["output"]
 
 
 def test_camera_runtime_direct_runner_flow_uses_secret_fds(monkeypatch, tmp_path):

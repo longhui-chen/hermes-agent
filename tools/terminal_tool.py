@@ -2684,29 +2684,9 @@ def _resolve_camera_runtime_script(raw_path: str) -> Optional[Path]:
 
 
 def _camera_runtime_arguments_allowed(arguments: list[str]) -> bool:
-    if arguments == ["list"]:
-        return True
-    if (
-        len(arguments) == 3
-        and arguments[0] in {"snap", "doctor"}
-        and arguments[1] == "--camera-id"
-        and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
-    ):
-        return True
-    if (
-        len(arguments) in {3, 5}
-        and arguments[0] == "clip"
-        and arguments[1] == "--camera-id"
-        and _CAMERA_ID_RE.fullmatch(arguments[2]) is not None
-    ):
-        if len(arguments) == 3:
-            return True
-        return (
-            arguments[3] == "--duration"
-            and arguments[4].isdigit()
-            and 1 <= int(arguments[4]) <= 60
-        )
-    return False
+    # zettlab-overlay(ac432-history): Delegate camera argv validation to the adapter; upstream: none
+    from gateway.platforms.zet_agent_camera_arguments import camera_arguments_allowed
+    return camera_arguments_allowed(arguments)
 
 
 def _camera_semantic_arguments_allowed(arguments: list[str]) -> bool:
