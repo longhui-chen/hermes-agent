@@ -41,3 +41,11 @@ PR #1052 quality-tests (4) repair: synchronized snapshot 34669c8bd776. The root 
 验证：两端类型/准备单测和 Jira 地址→凭据→创建流程、Hermes callback 与 metadata 单测、LS clarify JSON roundtrip、presets 引导与 catalog check。未运行本地全量 QA/build；本轮未部署，不能将上一轮 AC 部署结果当成本轮真实 GUI/模型验证。
 
 HR1 无常驻内存变化；HR2 无新增请求/重试机制；HR3 无凭据字段/新增 scope，不允许公网 HTTP、loopback 或 link-local HTTP；HR4 wire 字段保持不变，四端同步校验，旧端拒绝未支持地址；HR5 保留传输确认；HR6 无配置修改；HR7 无新增共享状态；HR-T1 无依赖变更。GitNexus 因缺少 libssl.3.dylib 未完成。Hermes upstream-pr: none。
+
+### Agent dispatch regression (2026-09-09)
+
+Both agent execution paths must forward optional `connector_setup` into the clarify tool. Testing the registry/tool directly misses the intercepted sequential and concurrent execution branches. Regression tests cover actual AIAgent dispatch and gateway pending/respond with credential-free receipts.
+
+Deployment must inspect the profile's actual `skill_view` source, not only `current`: local-server pins immutable profile paths. Refresh its profile environment before restarting Hermes after a presets switch.
+
+HR1: no resident-memory increase. HR2: existing bounded pending/recovery. HR3: metadata normalized; no secrets in responses. HR4: existing optional field and capability gate. HR5: no trade-off. HR6: no configuration change. HR7: no new state. HR8: two minimal marked forwarding overlays; upstream-pr: none. HR-T1: no dependency change.

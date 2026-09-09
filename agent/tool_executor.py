@@ -1787,6 +1787,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
+                    # zettlab-overlay(connector-dispatch): preserve protected clarify metadata; upstream: none
+                    connector_setup=next_args.get("connector_setup"),
                 )
             function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,

@@ -10,6 +10,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.zet_agent import ZetAgentAdapter
 from tools.clarify_tool import clarify_tool
+from agent.agent_runtime_helpers import invoke_tool
+from tests.run_agent.test_tool_call_guardrail_runtime import _make_agent
 
 
 def adapter():
@@ -39,7 +41,9 @@ async def test_setup_uses_existing_pending_and_response_flow(status):
     app.router.add_post('/v1/sessions/{session_id}/clarify/respond', runtime._handle_clarify_respond)
     headers = {"Authorization": "Bearer test-key"}
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(clarify_tool, "ignored", callback=callback, connector_setup={"resource_kind": "tv"})
+        agent = _make_agent("clarify")
+        agent.clarify_callback = callback
+        future = pool.submit(invoke_tool, agent, "clarify", {"question": "ignored", "connector_setup": {"resource_kind": "tv"}}, "setup-flow")
         event = stream.get(timeout=5)
         # Progress queue envelope is owned by the adapter, not model prose.
         payload = event[1] if isinstance(event, tuple) else event
