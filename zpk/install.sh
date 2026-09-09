@@ -88,7 +88,9 @@ fi
 # The version probe imports Python modules and can create __pycache__ using
 # the installer's inherited umask. Normalize after the probe so the installed
 # venv starts from the same deterministic permission contract as the ZPK.
-chmod 0700 "$HERMES_SRC/venv"
+# Managed connector workers drop to isolated UIDs, so the root remains
+# traversable without allowing those workers to list it.
+chmod 0711 "$HERMES_SRC/venv"
 find "$HERMES_SRC/venv" -mindepth 1 -type d -exec chmod 0755 {} +
 find "$HERMES_SRC/venv" -type f -perm /0111 -exec chmod 0755 {} +
 find "$HERMES_SRC/venv" -type f ! -perm /0111 -exec chmod 0644 {} +

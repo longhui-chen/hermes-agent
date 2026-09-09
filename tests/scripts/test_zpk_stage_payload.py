@@ -73,7 +73,7 @@ def _write_fake_python(root: Path) -> None:
         "version_info = 3.11.2\n",
         encoding="utf-8",
     )
-    venv.chmod(0o700)
+    venv.chmod(0o711)
 
 
 def _load_check_module():
@@ -105,15 +105,15 @@ def test_private_runtime_permission_contract() -> None:
     ).read_text(encoding="utf-8")
 
     assert 'chmod 0600 "$(ZPK_SRC_DIR)/venv/.lock"' in makefile
-    assert 'chmod 0700 "$(ZPK_SRC_DIR)/venv"' in makefile
+    assert 'chmod 0711 "$(ZPK_SRC_DIR)/venv"' in makefile
     assert '-mindepth 1 -type d -exec chmod 0755 {} +' in makefile
     assert '-type f ! -perm /0111 -exec chmod 0644 {} +' in makefile
-    assert 'chmod 0700 "$HERMES_SRC/venv"' in install
+    assert 'chmod 0711 "$HERMES_SRC/venv"' in install
     assert '-mindepth 1 -type d -exec chmod 0755 {} +' in install
     assert '-type f ! -perm /0111 -exec chmod 0644 {} +' in install
     assert "zpk/start-claw-service.sh" in makefile
     assert install.index('"$APP_ROOT/bin/hermes" --version') < install.index(
-        'chmod 0700 "$HERMES_SRC/venv"'
+        'chmod 0711 "$HERMES_SRC/venv"'
     )
     assert 'chown root:root "$HERMES_SRC/venv/.lock"' in install
     assert 'chmod 0600 "$HERMES_SRC/venv/.lock"' in install
@@ -142,6 +142,8 @@ def test_find_invalid_venv_permissions_enforces_package_contract(
     lock = venv / ".lock"
     lock.write_text("", encoding="utf-8")
 
+    # A private root blocks managed workers running under isolated UIDs from
+    # traversing the known Python package path.
     venv.chmod(0o700)
     for directory in (venv / "lib", venv / "lib" / "python3.11", package.parent):
         directory.chmod(0o755)
@@ -156,6 +158,7 @@ def test_find_invalid_venv_permissions_enforces_package_contract(
     }
 
     assert invalid == {
+        "venv": (0o711, 0o700),
         "venv/.lock": (0o600, 0o644),
         "venv/lib/python3.11/site-packages/example": (0o755, 0o777),
         "venv/lib/python3.11/site-packages/example/module.py": (0o644, 0o600),

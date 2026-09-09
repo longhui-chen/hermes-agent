@@ -227,7 +227,7 @@ zpk-stage: zpk-venv
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3"; \
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
-	@chmod 0700 "$(ZPK_SRC_DIR)/venv"
+	@chmod 0711 "$(ZPK_SRC_DIR)/venv"
 	@find "$(ZPK_SRC_DIR)/venv" -mindepth 1 -type d -exec chmod 0755 {} +
 	@find "$(ZPK_SRC_DIR)/venv" -type f -perm /0111 -exec chmod 0755 {} +
 	@find "$(ZPK_SRC_DIR)/venv" -type f ! -perm /0111 -exec chmod 0644 {} +

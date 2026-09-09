@@ -55,7 +55,9 @@ def find_invalid_venv_permissions(stage_root: Path) -> list[tuple[Path, int, int
             continue
         actual = stat.S_IMODE(path.stat().st_mode)
         if path == venv_root:
-            expected = 0o700
+            # Managed connector workers use isolated UIDs and need to traverse
+            # the known site-packages path without listing the venv root.
+            expected = 0o711
         elif path.is_dir():
             expected = 0o755
         elif path == venv_root / ".lock":
