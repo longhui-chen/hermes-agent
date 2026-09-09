@@ -4,6 +4,17 @@ from datetime import datetime, timedelta, timezone
 import re
 
 
+def camera_result_has_image(data: object) -> bool:
+    """Classify trusted runner results; the caller still validates artifact scope."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("action") == "snap":
+        return data.get("status") == "ok"
+    return data.get("action") == "history" and data.get("status") in (
+        "sampled", "insufficient_evidence",
+    )
+
+
 def camera_arguments_allowed(arguments: list[str]) -> bool:
     if arguments == ["list"]:
         return True

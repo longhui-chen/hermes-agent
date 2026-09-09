@@ -1828,7 +1828,8 @@ def _trusted_camera_attachment_path(raw_path: Any) -> str | None:
 def _camera_attachment_path_from_terminal_result(
     result: Mapping[str, Any],
 ) -> str | None:
-    """Extract the exact trusted attachment emitted by one successful snap."""
+    # zettlab-overlay(ac432-history): Include scoped history image artifacts; upstream: none
+    """Extract the exact trusted camera attachment under the active output root."""
     output = result.get("output")
     if not isinstance(output, str) or len(output.encode("utf-8")) > 1024 * 1024:
         return None
@@ -1837,11 +1838,9 @@ def _camera_attachment_path_from_terminal_result(
     except (TypeError, ValueError):
         return None
     data = payload.get("data") if isinstance(payload, dict) else None
-    if (
-        not isinstance(data, dict)
-        or data.get("action") != "snap"
-        or data.get("status") != "ok"
-    ):
+    # zettlab-overlay(ac432-history): Classify camera artifacts in the adapter; upstream: none
+    from gateway.platforms.zet_agent_camera_arguments import camera_result_has_image
+    if not camera_result_has_image(data):
         return None
     return _trusted_camera_attachment_path(data.get("attachment_path"))
 

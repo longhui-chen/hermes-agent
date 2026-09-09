@@ -848,7 +848,8 @@ def test_camera_list_result_extracts_response_bounded_valid_id_snapshot():
     assert response_mode._camera_ids_from_terminal_result(oversized_output) is None
 
 
-def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path):
+@pytest.mark.parametrize("action,status", [("snap", "ok"), ("history", "sampled"), ("history", "insufficient_evidence")])
+def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path, action, status):
     from agent import secret_scope as secret_scope_module
 
     output_root = tmp_path / "output"
@@ -867,8 +868,8 @@ def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path):
             "output": json.dumps(
                 {
                     "data": {
-                        "action": "snap",
-                        "status": "ok",
+                        "action": action,
+                        "status": status,
                         "attachment_path": str(frame),
                     }
                 }
@@ -879,6 +880,16 @@ def test_camera_snapshot_attachment_stays_under_active_output_root(tmp_path):
         ) == str(frame.resolve())
         assert response_mode._trusted_camera_attachment_path(str(outside)) is None
         assert response_mode._trusted_camera_attachment_path(str(symlink)) is None
+        for path in (outside, symlink):
+            rejected = {"output": json.dumps({"data": {
+                "action": action, "status": status, "attachment_path": str(path),
+            }})}
+            assert response_mode._camera_attachment_path_from_terminal_result(rejected) is None
+        for invalid_action, invalid_status in (("history", "failed"), ("history", "ok"), ("clip", "ok")):
+            rejected = {"output": json.dumps({"data": {
+                "action": invalid_action, "status": invalid_status, "attachment_path": str(frame),
+            }})}
+            assert response_mode._camera_attachment_path_from_terminal_result(rejected) is None
     finally:
         secret_scope_module.reset_secret_scope(scope_token)
 
@@ -1183,8 +1194,9 @@ def test_hardware_enrollment_fallback_ignores_non_app_and_failed_turns():
         ("我已经授权了摄像头，再试下", "", True),
     ],
 )
+@pytest.mark.parametrize("capture_action,capture_status", [("snap", "ok"), ("history", "sampled"), ("history", "insufficient_evidence")])
 def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
-    tmp_path, monkeypatch, message, explicit_skill_slug, inventory_only
+    tmp_path, monkeypatch, message, explicit_skill_slug, inventory_only, capture_action, capture_status
 ):
     from agent import secret_scope as secret_scope_module
     from gateway.session_context import clear_session_vars, set_session_vars
@@ -1209,6 +1221,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
         command = str(args.get("command") or "")
         if command.endswith(" list"):
             return ["python3", "camera_connector.py", "list"]
+        if " history --camera-id " in command:
+            return command.split()
         if " snap --camera-id " in command:
             return [
                 "python3",
@@ -1346,7 +1360,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
 
         snap_args = {
             "command": (
-                "python3 camera_connector.py snap --camera-id cam_front"
+                f"python3 camera_connector.py {capture_action} --camera-id cam_front"
+                + (" --start 2026-01-01T00:00:00Z --end 2026-01-01T00:00:30Z" if capture_action == "history" else "")
             ),
             "workdir": "agent_output",
         }
@@ -1363,8 +1378,8 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
                     "output": json.dumps(
                         {
                             "data": {
-                                "action": "snap",
-                                "status": "ok",
+                                "action": capture_action,
+                                "status": capture_status,
                                 "camera_id": "cam_front",
                                 "attachment_path": "/trusted/output/current.jpg",
                             }
