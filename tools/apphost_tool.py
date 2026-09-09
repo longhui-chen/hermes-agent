@@ -233,8 +233,7 @@ APP_HOST_SCHEMA = {
                     "the device could not ask for refresh consent because the "
                     "optional capability was unavailable. "
                     "user_declined = you asked and the user said no. "
-                    # zettlab-overlay(apphost-publish-description): explain that
-                    # task registration is platform-owned after publication; upstream: none
+                    # zettlab-overlay(apphost-publish-description): task registration is platform-owned after publication; upstream: none
                     "A user who agreed to a scheduled refresh does not get a "
                     "fourth value: the schedule is not declared on this call "
                     "at all. The platform registers this app's scheduled / "
@@ -706,8 +705,7 @@ def _build_request(action, args):
         # it never rewrites who created the app.
         if mode == "install":
             data_refresh = str(args.get("data_refresh", "") or "").strip()
-            # zettlab-overlay(apphost-publish-wire-compat): keep the receiving
-            # side compatible with platform-stamped legacy requests; upstream: none
+            # zettlab-overlay(apphost-publish-wire-compat): keep the receiving side compatible with platform-stamped legacy requests; upstream: none
             if data_refresh not in _DATA_REFRESH_ACCEPTED:
                 raise _BadRequest(
                     "publish(mode=install) 需要 data_refresh 参数（"
@@ -723,8 +721,7 @@ def _build_request(action, args):
             if not isinstance(operation, dict):
                 raise _BadRequest("operation 必须是 object")
             operation_data_refresh = str(operation.get("data_refresh", "") or "").strip()
-            # zettlab-overlay(apphost-publish-operation-wire-compat): preserve
-            # the platform's internal legacy operation shape; upstream: none
+            # zettlab-overlay(apphost-publish-operation-wire-compat): preserve the platform's internal legacy operation shape; upstream: none
             if operation_data_refresh not in _DATA_REFRESH_ACCEPTED:
                 raise _BadRequest("operation 需要有效 data_refresh")
             outer_data_refresh = str(body.get("data_refresh", "") or "").strip()
@@ -735,8 +732,7 @@ def _build_request(action, args):
             # source of truth, so callers never need to duplicate it for reload.
             body["data_refresh"] = operation_data_refresh
             body["operation"] = operation
-        # zettlab-overlay(apphost-publish-auto-rejection): reject model-owned
-        # automatic maintenance requests before credential minting; upstream: none
+        # zettlab-overlay(apphost-publish-auto-rejection): reject model-owned automatic maintenance requests before credential minting; upstream: none
         elif body.get("data_refresh") == "user_confirmed_auto":
             # 专属维护 Agent 已退役：调用方不再自带自动维护意图，平台按应用包里的
             # spec.yaml 自己登记任务。拦在这里，省掉一趟必被 local-server 拒的发布。
@@ -756,8 +752,7 @@ def _build_request(action, args):
             # publish(mode=install) so App Host can drive the transaction.
             raise _BadRequest("legacy install 不支持 operation；请使用 publish(mode=install)")
         data_refresh = str(args.get("data_refresh", "") or "").strip()
-        # zettlab-overlay(apphost-legacy-install-compat): keep legacy wire
-        # validation separate from the model-facing publish choices; upstream: none
+        # zettlab-overlay(apphost-legacy-install-compat): keep legacy wire validation separate from the model-facing publish choices; upstream: none
         if data_refresh not in _DATA_REFRESH_ACCEPTED:
             raise _BadRequest(
                 "install 需要 data_refresh 参数（"
