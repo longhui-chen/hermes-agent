@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "2d15a67537bf4a3691720cf1015721a8c3f38163",
-  "sha256": "419081664db55ece1bf611cd47e9b5934ce2596cb48d589d2d14cf1fd784e7c7",
+  "root_commit": "5d74afbf77dff3b08eca4826f95584222130e657",
+  "sha256": "34669c8bd776eb1e3914b37de8a1d46927c3a45f725f8ea5da524b0b72073b0b",
   "payload": {
     "golden": {
       "events": {
@@ -2723,10 +2723,14 @@
               "extra": []
             },
             "message.appended": {
+              "extra": [
+                "reason",
+                "truncated"
+              ],
               "type_mismatch": [
                 "msg_id"
               ],
-              "reason": "Web declares msg_id as string while local-server sends the int64 chat_messages row id (App already declares number). Web keys its dedupe map by String(msg_id); align the type in chat-ui-b1-lifecycle-error together with the dedupe call sites."
+              "reason": "Web already tolerantly reads optional reason/truncated in stores/chat/events.ts for truncation replay, but current LS MessageAppendedData emits neither. Preserve compatibility; close these two extras in chat-ui-b1-lifecycle-error when producer and golden are aligned (zettlab-web PR #1052 CI repair). Web declares msg_id as string while local-server sends the int64 chat_messages row id (App already declares number). Web keys its dedupe map by String(msg_id); align the type in chat-ui-b1-lifecycle-error together with the dedupe call sites."
             },
             "tool.result": {
               "extra": [
