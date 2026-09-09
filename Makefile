@@ -227,13 +227,19 @@ zpk-stage: zpk-venv
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3"; \
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
+	@chmod 0711 "$(ZPK_SRC_DIR)/venv"
+	@find "$(ZPK_SRC_DIR)/venv" -mindepth 1 -type d -exec chmod 0755 {} +
+	@find "$(ZPK_SRC_DIR)/venv" -type f -perm /0111 -exec chmod 0755 {} +
+	@find "$(ZPK_SRC_DIR)/venv" -type f ! -perm /0111 -exec chmod 0644 {} +
+	@if [ -f "$(ZPK_SRC_DIR)/venv/.lock" ]; then chmod 0600 "$(ZPK_SRC_DIR)/venv/.lock"; fi
 	@find "$(ZPK_SRC_DIR)" -type l -delete
 	@python3 scripts/check_zpk_stage.py "$(ZPK_SRC_DIR)" \
 		--target-arch arm64 --python-version "$(ZPK_PYTHON_VERSION)" \
 		--python-home "$$(dirname "$$(readlink -f "$(ZPK_PYTHON)")")"
 	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes \
 		zpk/libexec/hermes-secure-launcher.py zpk/zpk-systemd.sh \
-		zpk/prepare-claw-service.sh zpk/init.d/start.sh zpk/init.d/stop.sh
+		zpk/prepare-claw-service.sh zpk/start-claw-service.sh \
+		zpk/init.d/start.sh zpk/init.d/stop.sh
 	@python3 scripts/check_zpk_secrets.py zpk
 	@echo "zettlab-claw ZPK payload staged at $(ZPK_SRC_DIR)"
 

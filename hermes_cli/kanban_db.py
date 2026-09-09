@@ -1436,6 +1436,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     conn = connect_tracked(
         path,
         connect_fn=sqlite3.connect,
+        private_mode=0o600,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
@@ -1444,6 +1445,23 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
+
+
+def _open_private_lock_file(path: Path):
+    """Open an appendable lock file without exposing it to other users."""
+    flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
+        return os.fdopen(fd, "a+b")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 @contextlib.contextmanager
@@ -1472,7 +1490,7 @@ def _cross_process_init_lock(path: Path):
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".init.lock")
-    handle = lock_path.open("a+b")
+    handle = _open_private_lock_file(lock_path)
     acquired = False
     try:
         deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
@@ -1566,7 +1584,7 @@ def _dispatch_tick_lock(db_path: Path):
     acquired = False
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("a+b")
+        handle = _open_private_lock_file(lock_path)
         if _IS_WINDOWS:
             try:
                 import msvcrt

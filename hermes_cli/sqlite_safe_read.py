@@ -212,6 +212,7 @@ def connect_tracked(
     *,
     tracking_path: Path | str | None = None,
     connect_fn=None,
+    private_mode: int | None = None,
     **kwargs,
 ) -> sqlite3.Connection:
     """``sqlite3.connect`` that registers the connection for the lifetime of the fd.
@@ -238,11 +239,29 @@ def connect_tracked(
     file-backed connection still cannot be tracked,
     :class:`UntrackableConnectionError` is raised rather than handing back a
     connection whose database has quietly lost byte-probe protection.
+
+    ``private_mode`` atomically creates a missing file with that mode and
+    normalizes an existing file before SQLite opens it. The preparation runs
+    under ``_live_lock`` and never opens an existing database, preserving the
+    POSIX lock-safety contract documented by this module.
     """
     opener = connect_fn if connect_fn is not None else sqlite3.connect
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
 
     with _live_lock:
+        if private_mode is not None:
+            private_path = Path(tracking_path if tracking_path is not None else path)
+            try:
+                fd = os.open(
+                    private_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    private_mode,
+                )
+            except FileExistsError:
+                pass
+            else:
+                os.close(fd)
+            os.chmod(private_path, private_mode)
         conn = opener(str(path), **kwargs)
         try:
             resolved = (

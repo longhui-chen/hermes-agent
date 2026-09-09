@@ -235,6 +235,41 @@ def test_environment_file_parser_matches_systemd_quoting_rules(tmp_path: Path):
     ]
 
 
+def test_prepare_claw_service_secures_existing_runtime_state_files(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    hermes_home.mkdir(parents=True)
+    names = (
+        "state.db",
+        "state.db-wal",
+        "state.db-shm",
+        "kanban.db",
+        "kanban.db-wal",
+        "kanban.db-shm",
+        "kanban.db.init.lock",
+        "kanban.db.dispatch.lock",
+        ".update_check",
+        "gateway-starts.log",
+        "gateway.pid",
+    )
+    for name in names:
+        path = hermes_home / name
+        path.write_text("test", encoding="utf-8")
+        path.chmod(0o666)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    for name in (*names, "gateway.lock"):
+        assert (hermes_home / name).stat().st_mode & 0o777 == 0o600
+
+
 def test_prepare_claw_service_leaves_config_untouched_and_removes_legacy_multiplex_env(
     tmp_path: Path,
 ):

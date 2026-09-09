@@ -57,7 +57,8 @@ def _create_protected_trees(root: Path) -> None:
 
 
 def _write_fake_python(root: Path) -> None:
-    python = root / "venv" / "bin" / "python"
+    venv = root / "venv"
+    python = venv / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text(
         "#!/bin/sh\n"
@@ -66,12 +67,13 @@ def _write_fake_python(root: Path) -> None:
         encoding="utf-8",
     )
     python.chmod(0o755)
-    (root / "venv" / "pyvenv.cfg").write_text(
+    (venv / "pyvenv.cfg").write_text(
         "home = /usr/bin\n"
         "include-system-site-packages = false\n"
         "version_info = 3.11.2\n",
         encoding="utf-8",
     )
+    venv.chmod(0o711)
 
 
 def _load_check_module():
@@ -93,6 +95,74 @@ def _is_gnu_tar() -> bool:
         check=False,
     )
     return "GNU tar" in result.stdout
+
+
+def test_private_runtime_permission_contract() -> None:
+    makefile = MAKEFILE.read_text(encoding="utf-8")
+    install = (REPO_ROOT / "zpk" / "install.sh").read_text(encoding="utf-8")
+    service = (
+        REPO_ROOT / "zpk" / "init.d" / "zettlab-claw.service"
+    ).read_text(encoding="utf-8")
+
+    assert 'chmod 0600 "$(ZPK_SRC_DIR)/venv/.lock"' in makefile
+    assert 'chmod 0711 "$(ZPK_SRC_DIR)/venv"' in makefile
+    assert '-mindepth 1 -type d -exec chmod 0755 {} +' in makefile
+    assert '-type f ! -perm /0111 -exec chmod 0644 {} +' in makefile
+    assert 'chmod 0711 "$HERMES_SRC/venv"' in install
+    assert '-mindepth 1 -type d -exec chmod 0755 {} +' in install
+    assert '-type f ! -perm /0111 -exec chmod 0644 {} +' in install
+    assert "zpk/start-claw-service.sh" in makefile
+    assert install.index('"$APP_ROOT/bin/hermes" --version') < install.index(
+        'chmod 0711 "$HERMES_SRC/venv"'
+    )
+    assert 'chown root:root "$HERMES_SRC/venv/.lock"' in install
+    assert 'chmod 0600 "$HERMES_SRC/venv/.lock"' in install
+    assert "RuntimeDirectoryMode=0700" in service
+    prepare = (REPO_ROOT / "zpk" / "prepare-claw-service.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "secure_runtime_state_files" in prepare
+    assert "state.db state.db-shm state.db-wal" in prepare
+    assert "kanban.db kanban.db-shm kanban.db-wal" in prepare
+    assert "kanban.db.init.lock kanban.db.dispatch.lock" in prepare
+
+
+def test_find_invalid_venv_permissions_enforces_package_contract(
+    tmp_path: Path,
+) -> None:
+    module = _load_check_module()
+    venv = tmp_path / "venv"
+    package = venv / "lib" / "python3.11" / "site-packages" / "example"
+    package.mkdir(parents=True)
+    executable = venv / "bin" / "example"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    regular = package / "module.py"
+    regular.write_text("", encoding="utf-8")
+    lock = venv / ".lock"
+    lock.write_text("", encoding="utf-8")
+
+    # A private root blocks managed workers running under isolated UIDs from
+    # traversing the known Python package path.
+    venv.chmod(0o700)
+    for directory in (venv / "lib", venv / "lib" / "python3.11", package.parent):
+        directory.chmod(0o755)
+    package.chmod(0o777)
+    executable.chmod(0o755)
+    regular.chmod(0o600)
+    lock.chmod(0o644)
+
+    invalid = {
+        path.as_posix(): (expected, actual)
+        for path, expected, actual in module.find_invalid_venv_permissions(tmp_path)
+    }
+
+    assert invalid == {
+        "venv": (0o711, 0o700),
+        "venv/.lock": (0o600, 0o644),
+        "venv/lib/python3.11/site-packages/example": (0o755, 0o777),
+        "venv/lib/python3.11/site-packages/example/module.py": (0o644, 0o600),
+    }
 
 
 def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs(
