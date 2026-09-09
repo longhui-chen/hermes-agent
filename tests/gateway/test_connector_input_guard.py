@@ -6,6 +6,8 @@ from gateway.platforms.connector_input_guard import requests_secret_input
 @pytest.mark.parametrize('question', [
     '请在安全连接卡片的受保护输入框中填写新 PAT 并保存，不要把凭据发送到聊天中。',
     '请输入 API Token',
+    '请在安全连接卡中完成公司 Jira 的连接配置。',
+    'Complete the setup in the secure connection card.',
     'Paste your API key in the secure card',
     'Enter the camera password',
     '请提供打印机的 LAN 访问码',

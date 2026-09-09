@@ -61,12 +61,13 @@ async def test_setup_uses_existing_pending_and_response_flow(status):
 
 
 @pytest.mark.parametrize('capable', [False, True])
-def test_ordinary_clarify_cannot_impersonate_a_secure_input_flow(capable):
+@pytest.mark.parametrize('question', ['请在安全连接卡片的受保护输入框中填写新 PAT 并保存。', '请在安全连接卡中完成公司 Jira 的连接配置。'])
+def test_ordinary_clarify_cannot_impersonate_a_secure_input_flow(capable, question):
     runtime = adapter()
     stream = queue.Queue()
     callback = runtime._make_clarify_cb(stream, 's', connector_input_capable=capable)
     result = clarify_tool(
-        '请在安全连接卡片的受保护输入框中填写新 PAT 并保存，不要把凭据发送到聊天中。',
+        question,
         callback=callback,
     )
     assert 'connector_setup_required' in result

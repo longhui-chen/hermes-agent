@@ -30,3 +30,14 @@ Optional `custom_api.variables` carries only base_url, endpoint_path, method, to
 Validation: App/Web parser and preparation suites each 23 tests passed; Hermes trusted clarify suite 24 passed; Go TestConnectorSetup in chatproto/backend translation passed. Manual acceptance: known URL/path → only credential requested; rejected token variable → no input dispatch or create. GUI/live service E2E and local full QA/build unrun. HR1 bounded payload/no background memory; HR2 existing lifecycle/retry; HR3 strict public-key validation; HR4 additive nested object; HR5 fail closed; HR6 no config; HR7 no additional state mechanism; HR-T1 no dependencies.
 
 PR #1052 quality-tests (4) repair: synchronized snapshot 34669c8bd776. The root contract explicitly registers only existing optional Web message.appended reason/truncated compatibility reads as warnings, with closure in chat-ui-b1-lifecycle-error. No producer fields are invented; unknown extras still fail. Web plan-ack capability test now includes connector_direct_input. Web three affected files: 9 tests passed; root scoped exception test and cross-repo verify passed (0 errors, 90 explicit warnings); LS manifest and Hermes pinned manifest passed. App contract suite passed; combined App contract/flow run had 9 pass / 1 pre-existing failure in reverse context.compaction producer coverage. Its test and compare.mjs are byte-identical to HEAD and unchanged by this repair. No claim of App full flow success. HR1–7/T1 unchanged: metadata/pins only, no runtime/API/permission/config/dependency changes. Local full QA/build unrun; CI shard rerun pending.
+
+
+## Jira 引导修复（2026-09-09）
+
+已知 base_url 复用 HTTPS 或 RFC1918 私有 IPv4 HTTP（无 userinfo/query/fragment）；只在 catalog 的 connector_url 类型允许私网 HTTP，https_url 保持 HTTPS。远程 MCP 仍只允许 HTTPS。元数据不授予目标访问能力，运行时仍走既有模板校验、私网设备执行和明文传输确认。
+
+普通 clarify 不得以“在安全连接卡中完成配置”代替结构化 connector_setup；运行时会在发布空泛澄清前拒绝。双端凭据提示包含可信模板名称，Jira 示例显示 PAT；具体缺失字段由现有输入模型决定。Skill 0.6.1 提供复用已知地址的真实调用例子。
+
+验证：两端类型/准备单测和 Jira 地址→凭据→创建流程、Hermes callback 与 metadata 单测、LS clarify JSON roundtrip、presets 引导与 catalog check。未运行本地全量 QA/build；本轮未部署，不能将上一轮 AC 部署结果当成本轮真实 GUI/模型验证。
+
+HR1 无常驻内存变化；HR2 无新增请求/重试机制；HR3 无凭据字段/新增 scope，不允许公网 HTTP、loopback 或 link-local HTTP；HR4 wire 字段保持不变，四端同步校验，旧端拒绝未支持地址；HR5 保留传输确认；HR6 无配置修改；HR7 无新增共享状态；HR-T1 无依赖变更。GitNexus 因缺少 libssl.3.dylib 未完成。Hermes upstream-pr: none。

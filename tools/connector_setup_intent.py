@@ -5,6 +5,9 @@ existing clarify interaction owns delivery, cancellation and task continuation.
 """
 
 import json
+
+# zettlab-overlay(connector-guidance): validate private template addresses without DNS; upstream: none
+import ipaddress
 import re
 from urllib.parse import urlsplit
 
@@ -97,7 +100,15 @@ def _normalize_variables(raw: object) -> dict:
         if key == "base_url":
             try:
                 url = urlsplit(value)
-                valid = url.scheme == "https" and url.hostname and not url.username and not url.password and not url.query and not url.fragment
+                # zettlab-overlay(connector-guidance): match connector_url metadata envelope; upstream: none
+                private_http = False
+                if url.scheme == "http":
+                    try:
+                        ip = ipaddress.IPv4Address(url.hostname)
+                        private_http = any(ip in ipaddress.IPv4Network(net) for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+                    except (ValueError, TypeError):
+                        pass
+                valid = (url.scheme == "https" or private_http) and url.hostname and not url.username and not url.password and not url.query and not url.fragment
                 _ = url.port
             except ValueError:
                 valid = False

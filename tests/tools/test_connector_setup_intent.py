@@ -90,3 +90,13 @@ def test_submitted_receipt_is_explicitly_not_a_credential_exposure():
     assert 'contains no credentials' in result['next_step']
     assert 'Do not request revocation solely' in result['next_step']
     assert 'not a grant' in result['next_step']
+
+
+@pytest.mark.parametrize("url, valid", [('http://192.168.1.20/jira', True), ('http://10.1.2.3:8080', True), ('http://172.31.1.2', True), ('http://172.32.1.2', False), ('http://127.0.0.1', False), ('http://169.254.169.254', False), ('http://example.test', False), ('http://192.168.1.20?token=fake', False)])
+def test_private_http_metadata_matches_connector_template_address_envelope(url, valid):
+    intent = {"resource_kind": "custom_api", "template_id": "jira-data-center-pat-api", "variables": {"base_url": url}}
+    if valid:
+        assert normalize_connector_setup(intent) == intent
+    else:
+        with pytest.raises(ValueError):
+            normalize_connector_setup(intent)

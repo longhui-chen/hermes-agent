@@ -15,4 +15,7 @@ _REQUEST = re.compile(
 
 def requests_secret_input(question: str) -> bool:
     """Conservative guard for explicit secret requests, not secret detection."""
-    return bool(_REQUEST.search(question))
+    return bool(_REQUEST.search(question) or re.search(
+        r"安全连接卡|安全卡片|受保护输入|安全输入框|protected input|secure (?:connection )?(?:card|input)",
+        question, re.IGNORECASE,
+    ))
