@@ -1,3 +1,4 @@
+import asyncio
 import json
 import queue
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +31,31 @@ def test_old_client_fails_before_publishing_an_input_request():
     assert not runtime._clarify_queues
 
 
+@pytest.mark.asyncio
+async def test_camera_presentation_capability_is_request_local_and_resets_on_failure(monkeypatch):
+    from gateway.platforms.zet_agent import _zettlab_camera_observation_input_capable
+
+    runtime = adapter()
+
+    async def handle(request, _handler):
+        expected = request.headers.get("X-Zettlab-Camera-Observation-Input") == "1"
+        assert _zettlab_camera_observation_input_capable.get() is expected
+        await asyncio.sleep(0)
+        assert _zettlab_camera_observation_input_capable.get() is expected
+        if request.headers.get("Fail"):
+            raise RuntimeError("request_failed")
+        return web.Response()
+
+    monkeypatch.setattr(runtime, "_handle_with_zettlab_identity", handle)
+    await asyncio.gather(*[
+        runtime._handle_chat_completions(SimpleNamespace(headers=headers))
+        for headers in [{}, {"X-Zettlab-Camera-Observation-Input": "1"}, {"X-Zettlab-Camera-Observation-Input": "true"}]
+    ])
+    with pytest.raises(RuntimeError, match="request_failed"):
+        await runtime._handle_chat_completions(SimpleNamespace(headers={"X-Zettlab-Camera-Observation-Input": "1", "Fail": "1"}))
+    assert _zettlab_camera_observation_input_capable.get() is False
+
+
 def test_observation_publication_stays_closed_until_confirmation_consumers_are_ready():
     runtime = adapter()
     stream = queue.Queue()
@@ -48,10 +74,14 @@ def test_observation_publication_stays_closed_until_confirmation_consumers_are_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["cancelled", "submitted"])
-async def test_setup_uses_existing_pending_and_response_flow(status):
+@pytest.mark.parametrize("observation", [False, True])
+async def test_setup_uses_existing_pending_and_response_flow(status, observation):
     runtime = adapter()
     stream = queue.Queue()
-    callback = runtime._make_clarify_cb(stream, "s", connector_input_capable=True)
+    callback = runtime._make_clarify_cb(stream, "s", connector_input_capable=True, camera_observation_input_capable=observation)
+    setup = {"resource_kind": "camera", "observation": {
+        "camera_id": "cam-1", "duration_seconds": 60, "subject_kind": "person", "predicate": "appears",
+    }} if observation else {"resource_kind": "tv"}
     app = web.Application()
     app.router.add_get('/v1/sessions/{session_id}/pending', runtime._handle_pending)
     app.router.add_post('/v1/sessions/{session_id}/clarify/respond', runtime._handle_clarify_respond)
@@ -59,16 +89,16 @@ async def test_setup_uses_existing_pending_and_response_flow(status):
     with ThreadPoolExecutor(max_workers=1) as pool:
         agent = _make_agent("clarify")
         agent.clarify_callback = callback
-        future = pool.submit(invoke_tool, agent, "clarify", {"question": "ignored", "connector_setup": {"resource_kind": "tv"}}, "setup-flow")
+        future = pool.submit(invoke_tool, agent, "clarify", {"question": "ignored", "connector_setup": setup}, "setup-flow")
         event = stream.get(timeout=5)
         # Progress queue envelope is owned by the adapter, not model prose.
         payload = event[1] if isinstance(event, tuple) else event
         if isinstance(payload, str):
             payload = json.loads(payload)
-        assert payload["connector_setup"] == {"resource_kind": "tv"}
+        assert payload["connector_setup"] == setup
         async with TestClient(TestServer(app)) as client:
             pending = await (await client.get('/v1/sessions/s/pending', headers=headers)).json()
-            assert pending["clarify"]["connector_setup"] == {"resource_kind": "tv"}
+            assert pending["clarify"]["connector_setup"] == setup
             response = await client.post('/v1/sessions/s/clarify/respond', headers=headers, json={
                 "clarify_id": payload["clarify_id"], "response": json.dumps({"status": status}),
             })

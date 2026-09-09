@@ -173,6 +173,9 @@ def _observe_queued_attachment(
 _zettlab_connector_input_capable: ContextVar[bool] = ContextVar(
     "zettlab_connector_input_capable", default=False
 )
+_zettlab_camera_observation_input_capable: ContextVar[bool] = ContextVar(
+    "zettlab_camera_observation_input_capable", default=False
+)
 _zettlab_request_account_id: ContextVar[str] = ContextVar(
     "zettlab_request_account_id", default=""
 )
@@ -2087,11 +2090,15 @@ class ZetAgentAdapter(APIServerAdapter):
         connector_input_token = _zettlab_connector_input_capable.set(
             request.headers.get("X-Zettlab-Connector-Direct-Input", "") == "1"
         )
+        camera_observation_token = _zettlab_camera_observation_input_capable.set(
+            request.headers.get("X-Zettlab-Camera-Observation-Input", "") == "1"
+        )
         try:
             return await self._handle_with_zettlab_identity(
                 request, super()._handle_chat_completions
             )
         finally:
+            _zettlab_camera_observation_input_capable.reset(camera_observation_token)
             _zettlab_connector_input_capable.reset(connector_input_token)
             pop_zettlab_browser_session_token(token)
 
@@ -3462,6 +3469,7 @@ class ZetAgentAdapter(APIServerAdapter):
         owner_agent: Any = None,
         bound_turn_id: str = "",
         connector_input_capable: bool = False,
+        camera_observation_input_capable: bool = False,
     ):
         """Return a sync ``(question, choices) -> str`` callback.
 
@@ -3496,10 +3504,9 @@ class ZetAgentAdapter(APIServerAdapter):
                     raise ValueError("connector_setup_unavailable")
                 from tools.connector_setup_intent import normalize_connector_setup
                 connector_setup = normalize_connector_setup(connector_setup)
-                # Keep publication closed until the dedicated consumer capability
-                # and both confirmation controls are connected. Never downgrade
-                # an observation into ordinary hardware setup on an older client.
-                if connector_setup.get("observation") is not None:
+                # Presentation support is not camera or background-vision consent.
+                # Older clients must not treat observations as connection setup.
+                if connector_setup.get("observation") is not None and not camera_observation_input_capable:
                     raise ValueError("camera_observation_input_unavailable")
             timeout_seconds = _clarify_timeout_seconds()
             # Stamp the deadline using the same constant the agent
@@ -4294,6 +4301,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # or non-plan callers) → None → manual (safe default).
         agent_request_overrides = dict(request_overrides or {})
         connector_input_capable = agent_request_overrides.pop("_zettlab_connector_input_capable", False) is True
+        camera_observation_input_capable = agent_request_overrides.pop("_zettlab_camera_observation_input_capable", False) is True
         from gateway.session_context import zettlab_auth_principal
 
         # This is transport authority minted by local-server for exactly one
@@ -5029,6 +5037,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     agent,
                     bound_turn_id=extension_turn_id,
                     connector_input_capable=connector_input_capable,
+                    camera_observation_input_capable=camera_observation_input_capable,
                 )
             except Exception:
                 logger.warning("[zet_agent] failed to attach clarify_callback", exc_info=True)
@@ -5174,6 +5183,7 @@ class ZetAgentAdapter(APIServerAdapter):
         from gateway.session_context import zettlab_auth_principal
         request_overrides = dict(request_overrides or {})
         request_overrides["_zettlab_connector_input_capable"] = _zettlab_connector_input_capable.get()
+        request_overrides["_zettlab_camera_observation_input_capable"] = _zettlab_camera_observation_input_capable.get()
         # Private bootstrap metadata consumed and removed by this adapter's
         # _create_agent. It selects the ordinary video plugin toolset for a
         # silent task and never reaches AIAgent or a provider request.
