@@ -8332,6 +8332,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
     def _register_profile_api_routes(self, router, *, chat_handler=None) -> None:
         super()._register_profile_api_routes(router, chat_handler=chat_handler)
+        self._register_camera_vision_route(router)
         router.add_post(
             "/p/{profile}/api/sessions/import",
             self._profile_handler(self._handle_session_import),
@@ -8339,6 +8340,17 @@ class ZetAgentAdapter(APIServerAdapter):
         router.add_post(
             "/p/{profile}/api/memory/import",
             self._profile_handler(self._handle_memory_import),
+        )
+
+    def _register_camera_vision_route(self, router) -> None:
+        from gateway.platforms.zet_agent_camera_vision import handle_camera_vision
+
+        async def handle(request):
+            return await handle_camera_vision(self, request)
+
+        router.add_post(
+            "/p/{profile}/internal/v1/camera/vision",
+            self._profile_handler(handle),
         )
 
     async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
@@ -9784,6 +9796,7 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
             self._register_base_http_routes(self._app.router)
+            self._register_camera_vision_route(self._app.router)
             self._app.router.add_post(
                 "/api/sessions/import", self._handle_session_import,
             )
