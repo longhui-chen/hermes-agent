@@ -30,6 +30,70 @@ def verdict(**overrides):
     return json.dumps({"success": True, "analysis": json.dumps(result)})
 
 
+def zone_payload():
+    request = payload()
+    request.update(zone_id="door", predicate="enters_zone", zone_context={
+        "reference": {"x": 0, "y": 0, "width": 960, "height": 540},
+        "frames": [{"x": (i % 2)*960, "y": 960 + (i // 2)*960, "width": 640, "height": 360} for i in range(3)],
+        "polygon": [{"x": .1, "y": .1}, {"x": .8, "y": .1}, {"x": .8, "y": .8}],
+    })
+    return request
+
+
+@pytest.mark.parametrize("mode", ["missing", "reference_as_sample", "padding", "count", "polygon", "boolean_coordinate"])
+def test_zone_context_requires_original_content_bounds(mode):
+    request = zone_payload()
+    context = request["zone_context"]
+    if mode == "missing":
+        request.pop("zone_context")
+    elif mode == "reference_as_sample":
+        context["frames"][0]["y"] = 0
+    elif mode == "padding":
+        context["frames"][0]["width"] = 1920
+    elif mode == "count":
+        context["frames"].pop()
+    elif mode == "polygon":
+        context["polygon"] = [{"x": 1, "y": 1}]
+    else:
+        context["polygon"][0]["x"] = True
+    with pytest.raises(ValueError):
+        bridge.validate_payload(request)
+
+
+@pytest.mark.parametrize("position", [{"x": .5}, {"x": .5, "y": float("nan")}, {"x": True, "y": .5}, {"x": 100, "y": .5}, {"x": 10**1000, "y": .5}])
+def test_zone_verdict_rejects_incomplete_or_non_normalized_positions(position):
+    frames = [{"state": "present", "track_id": "a", "view_aligned": True, "position": position}] * 3
+    with pytest.raises(bridge.VisionUnavailable):
+        bridge.parse_verdict(verdict(frames=frames), zone_payload())
+
+
+def test_zone_old_provider_does_not_default_to_aligned():
+    result = bridge.parse_verdict(verdict(), zone_payload())
+    assert all(frame["view_aligned"] is False for frame in result["frames"])
+
+
+@pytest.mark.asyncio
+async def test_zone_flow_uses_existing_vision_with_reference_not_counted_as_sample(monkeypatch):
+    from tools import vision_tools
+
+    frames = [{"state": "present", "track_id": "a", "view_aligned": True, "position": {"x": x, "y": .5}} for x in (.9, .5, .4)]
+    provider = AsyncMock(return_value=verdict(frames=frames))
+    monkeypatch.setattr(vision_tools, "vision_analyze_tool", provider)
+    request = zone_payload()
+    result = await bridge.analyze_batch(request)
+    assert result["frames"] == frames
+    assert result["zone_id"] == "door"
+    assert "zone_context" not in result
+    image, prompt = provider.await_args.args
+    assert image == request["image_data_uri"]
+    assert "not an observation or timestamp" in prompt
+    assert "content rectangle, not the combined image or cell" in prompt
+    assert "never verified personal identity" in prompt
+    condition = json.loads(prompt.rsplit("\n", 1)[1])
+    assert condition["zone_context"]["frames"][0]["width"] == pytest.approx(640 / 1920)
+    assert request["zone_context"]["frames"][0]["width"] == 640
+
+
 @pytest.mark.parametrize("field,value", [
     ("subject_kind", []), ("predicate", "execute"), ("min_duration_seconds", True),
     ("image_data_uri", "https://example.com/image.jpg"),
