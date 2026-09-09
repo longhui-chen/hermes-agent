@@ -1,0 +1,55 @@
+import json
+import queue
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.config import PlatformConfig
+from gateway.platforms.zet_agent import ZetAgentAdapter
+from tools.clarify_tool import clarify_tool
+
+
+def adapter():
+    result = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    result._goals = lambda: SimpleNamespace(on_interaction_pending=lambda *a, **k: None, on_interaction_resolved=lambda *a, **k: None)
+    return result
+
+
+def test_old_client_fails_before_publishing_an_input_request():
+    runtime = adapter()
+    stream = queue.Queue()
+    callback = runtime._make_clarify_cb(stream, "s")
+    result = clarify_tool("ignored", connector_setup={"resource_kind": "camera"}, callback=callback)
+    assert "connector_setup_unavailable" in result
+    assert stream.empty()
+    assert not runtime._clarify_queues
+
+
+@pytest.mark.asyncio
+async def test_setup_uses_existing_pending_and_response_flow():
+    runtime = adapter()
+    stream = queue.Queue()
+    callback = runtime._make_clarify_cb(stream, "s", connector_input_capable=True)
+    app = web.Application()
+    app.router.add_get('/v1/sessions/{session_id}/pending', runtime._handle_pending)
+    app.router.add_post('/v1/sessions/{session_id}/clarify/respond', runtime._handle_clarify_respond)
+    headers = {"Authorization": "Bearer test-key"}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(clarify_tool, "ignored", callback=callback, connector_setup={"resource_kind": "tv"})
+        event = stream.get(timeout=5)
+        # Progress queue envelope is owned by the adapter, not model prose.
+        payload = event[1] if isinstance(event, tuple) else event
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        assert payload["connector_setup"] == {"resource_kind": "tv"}
+        async with TestClient(TestServer(app)) as client:
+            pending = await (await client.get('/v1/sessions/s/pending', headers=headers)).json()
+            assert pending["clarify"]["connector_setup"] == {"resource_kind": "tv"}
+            response = await client.post('/v1/sessions/s/clarify/respond', headers=headers, json={
+                "clarify_id": payload["clarify_id"], "response": '{"status":"cancelled"}',
+            })
+            assert response.status == 200
+        assert json.loads(future.result(timeout=5)) == {"status": "cancelled"}
