@@ -2326,23 +2326,6 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
-    # Open only after ZetAgent has atomically bound this turn's queue/token.
-    # Legacy CLI/TUI agents have no transport binding and reopen normally.
-    _start_steer_turn = getattr(agent, "_start_steer_turn", None)
-    if callable(_start_steer_turn):
-        _start_steer_turn(turn_id)
-    else:
-        agent._steer_closed = False
-    # Consumed-steer marker for the goal hook: a steer the model already
-    # saw this turn means the user intervened — the post-turn goal judge
-    # must evaluate it as user-initiated, not as an untouched auto-
-    # continuation round.
-    agent._turn_last_steer_text = None
-    # Per-turn ledger of crash-resilience rows written for merged steers
-    # (see _persist_merged_steer_row / reclaim_tail_steer). Stale entries
-    # from a finished turn must never be deletable by a later reclaim.
-    agent._steer_merged_db_rows = []
-
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -2380,6 +2363,22 @@ def run_conversation(
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
+    # Open only after ZetAgent has atomically bound this turn's queue/token.
+    # Legacy CLI/TUI agents have no transport binding and reopen normally.
+    _start_steer_turn = getattr(agent, "_start_steer_turn", None)
+    if callable(_start_steer_turn):
+        _start_steer_turn(turn_id)
+    else:
+        agent._steer_closed = False
+    # Consumed-steer marker for the goal hook: a steer the model already
+    # saw this turn means the user intervened — the post-turn goal judge
+    # must evaluate it as user-initiated, not as an untouched auto-
+    # continuation round.
+    agent._turn_last_steer_text = None
+    # Per-turn ledger of crash-resilience rows written for merged steers
+    # (see _persist_merged_steer_row / reclaim_tail_steer). Stale entries
+    # from a finished turn must never be deletable by a later reclaim.
+    agent._steer_merged_db_rows = []
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
