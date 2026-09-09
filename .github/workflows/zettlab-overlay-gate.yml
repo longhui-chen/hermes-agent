@@ -9,7 +9,8 @@ name: Zettlab Overlay Gate
 #     or declare `overlay-budget-exception: <reason>` in the PR body),
 # (3) carry an `upstream-pr:` line in the PR body,
 # (4) never add Zettlab business state fields to the kernel, and
-# (5) use LF only. Upstream sync branches (sync/upstream-*) are skipped by the script.
+# (5) use LF only. Upstream sync PRs are skipped only when the sync/upstream-* branch
+#     name, the `upstream-sync` label (write access) and a same-repo head all agree.
 #
 # Trust model: the `overlay-gate` job runs on `pull_request_target`, so the workflow
 # definition, the script, its config and its self-test all come from the BASE branch;
@@ -58,9 +59,13 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr_body.txt"
           python scripts/test-harness/overlay_gate.py \
             --repo "$GITHUB_WORKSPACE" \
             --base "origin/${BASE_REF}" --head refs/remotes/pr/head \
-            --pr-body-file "$RUNNER_TEMP/pr_body.txt" --head-ref "$HEAD_REF"
+            --pr-body-file "$RUNNER_TEMP/pr_body.txt" --head-ref "$HEAD_REF" \
+            --pr-labels "$PR_LABELS" --head-repo "$HEAD_REPO" --base-repo "$BASE_REPO"

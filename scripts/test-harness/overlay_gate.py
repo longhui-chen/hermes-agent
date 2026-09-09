@@ -34,8 +34,9 @@ Checks (all must pass):
    token (a marker inside a string literal does not count), and a file that does not
    tokenize fails.
 
-Upstream sync branches (``skip_head_ref_prefixes``) are skipped: they exist to move
-the kernel *towards* upstream.
+Upstream sync PRs are skipped only when the branch prefix (``skip_head_ref_prefixes``),
+the ``skip_label`` (write access needed) and a same-repo head all agree: they exist to
+move the kernel *towards* upstream, and a bare branch name is attacker-controlled.
 
 CI runs this script from the base branch via ``pull_request_target`` (workflow, script and
 config all come from base; the PR head is only fetched as diff input and never executed),
@@ -269,16 +270,40 @@ def pr_body_budget_exception(pr_body: str, config: dict) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 
-def should_skip(head_ref: str, config: dict) -> bool:
+def should_skip(head_ref: str, config: dict, labels: Sequence[str] = (), head_repo: str = "", base_repo: str = "") -> bool:
+    """Upstream sync PRs are exempt only when three trusted signals agree.
+
+    Branch names are attacker-controlled (any fork can push ``sync/upstream-x``), so the
+    prefix alone never skips: the PR must also carry ``skip_label`` (adding a label needs
+    write access; ``upstream-release-pr.yml`` adds it automatically) and come from the
+    same repository, not a fork.
+    """
     ref = (head_ref or "").strip()
-    return any(ref.startswith(prefix) for prefix in config["skip_head_ref_prefixes"]) if ref else False
+    if not ref or not any(ref.startswith(prefix) for prefix in config["skip_head_ref_prefixes"]):
+        return False
+    label = config.get("skip_label", "")
+    if label and label not in set(labels or ()):
+        return False
+    if head_repo and base_repo and head_repo != base_repo:
+        return False
+    return True
 
 
-def run_gate(repo: Path, base: str, head: str, pr_body: str, head_ref: str, config: dict) -> GateResult:
+def run_gate(
+    repo: Path,
+    base: str,
+    head: str,
+    pr_body: str,
+    head_ref: str,
+    config: dict,
+    labels: Sequence[str] = (),
+    head_repo: str = "",
+    base_repo: str = "",
+) -> GateResult:
     result = GateResult()
-    if should_skip(head_ref, config):
+    if should_skip(head_ref, config, labels, head_repo, base_repo):
         result.skipped = True
-        result.skip_reason = f"head ref {head_ref!r} is an upstream sync branch"
+        result.skip_reason = f"head ref {head_ref!r} is a labelled same-repo upstream sync branch"
         return result
 
     files = [path for path in changed_files(repo, base, head) if is_protected(path, config)]
@@ -389,12 +414,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--pr-body-file", type=Path, default=None)
     parser.add_argument("--head-ref", default="")
+    parser.add_argument("--pr-labels", default="", help="comma-separated PR label names")
+    parser.add_argument("--head-repo", default="", help="owner/name of the PR head repository")
+    parser.add_argument("--base-repo", default="", help="owner/name of the base repository")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
     pr_body = args.pr_body_file.read_text(encoding="utf-8") if args.pr_body_file and args.pr_body_file.exists() else ""
-    result = run_gate(args.repo.resolve(), args.base, args.head, pr_body, args.head_ref, config)
+    labels = [item.strip() for item in args.pr_labels.split(",") if item.strip()]
+    result = run_gate(args.repo.resolve(), args.base, args.head, pr_body, args.head_ref, config, labels, args.head_repo, args.base_repo)
 
     if result.skipped:
         print(f"overlay gate: SKIP ({result.skip_reason})")

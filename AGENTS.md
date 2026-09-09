@@ -90,8 +90,10 @@ assess all rules, including “no impact” where appropriate.
    protection — never add another job or trigger with that name, a skipped
    same-named job would satisfy the check; a PR that first introduces or
    rewrites the gate must not touch kernel files itself (the gate only runs
-   from base after merge); upstream sync branches (`sync/upstream-*`) are exempt from the gate
-   and instead get a manual upstream-diff review against the overlay registry.
+   from base after merge); upstream sync PRs are exempt only when the `sync/upstream-*` branch name,
+   the `upstream-sync` label (write access; added by `upstream-release-pr.yml`)
+   and a same-repo head all agree, and they get a manual upstream-diff review
+   against the overlay registry instead.
 9. **HR-T1 dependency freeze:** while the parent freeze is active, do not add,
    upgrade, or downgrade Microsoft/Azure dependency families (`Azure`,
    `Microsoft`, `@azure`, `@microsoft`, `azure-*`, `msal*`). Existing pinned

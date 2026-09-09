@@ -102,11 +102,16 @@ def test_pr_body_parsers(config):
 
 
 def test_skip_upstream_sync_branches(config):
-    assert gate.should_skip("sync/upstream-v2026.9.1", config)
-    assert not gate.should_skip("feat/chat-ui-u2d", config)
-    assert not gate.should_skip("upstream-bypass", config)
-    assert not gate.should_skip("upstream", config)
-    assert not gate.should_skip("", config)
+    same = dict(labels=["upstream-sync"], head_repo="zettlab/hermes-agent", base_repo="zettlab/hermes-agent")
+    assert gate.should_skip("sync/upstream-v2026.9.1", config, **same)
+    assert not gate.should_skip("feat/chat-ui-u2d", config, **same)
+    assert not gate.should_skip("upstream-bypass", config, **same)
+    assert not gate.should_skip("upstream", config, **same)
+    assert not gate.should_skip("", config, **same)
+    # branch name alone is attacker-controlled: label and same-repo head are required
+    assert not gate.should_skip("sync/upstream-v2026.9.1", config)
+    assert not gate.should_skip("sync/upstream-v2026.9.1", config, labels=["other"], head_repo="zettlab/hermes-agent", base_repo="zettlab/hermes-agent")
+    assert not gate.should_skip("sync/upstream-v2026.9.1", config, labels=["upstream-sync"], head_repo="evil/hermes-agent", base_repo="zettlab/hermes-agent")
 
 
 # ---------------------------------------------------------------- flow
@@ -339,12 +344,14 @@ def test_flow_symlinked_kernel_directory_is_rejected(tmp_path, config):
     assert "symlink" in {v.kind for v in result.violations}
 
 
-def test_flow_upstream_sync_branch_skipped(tmp_path, config):
+def test_flow_upstream_sync_branch_skipped_only_with_trusted_signals(tmp_path, config):
     repo = _repo(tmp_path)
     (repo / "agent" / "loop.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
     _commit(repo)
-    result = _run(repo, config, pr_body="", head_ref="sync/upstream-v2026.9.1")
-    assert result.skipped and result.ok
+    trusted = gate.run_gate(repo, "base", "HEAD", "", "sync/upstream-v2026.9.1", config, ["upstream-sync"], "zettlab/hermes-agent", "zettlab/hermes-agent")
+    assert trusted.skipped and trusted.ok
+    spoofed = gate.run_gate(repo, "base", "HEAD", "", "sync/upstream-v2026.9.1", config, [], "evil/hermes-agent", "zettlab/hermes-agent")
+    assert not spoofed.skipped and not spoofed.ok
 
 
 def test_cli_exit_codes(tmp_path, config):

@@ -34,5 +34,6 @@
       "pattern": "[\\\"']_*(?:[A-Za-z0-9]+_+)*(binding|binding_token|source_token|sender|ledger|handback|inflight|reject_counter|usage_rollback)(?:_+[A-Za-z0-9_]*)?[\\\"']\\s*\\]\\s*[:=]",
       "reason": "Zettlab 业务状态经下标 / 映射键写入上游核心（HR8）；同上，属于 gateway/platforms/zet_agent.py 适配层"
     }
-  ]
+  ],
+  "skip_label": "upstream-sync"
 }
