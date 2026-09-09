@@ -238,6 +238,31 @@ def test_flow_gitattributes_nodiff_cannot_hide_kernel_hunks(tmp_path, config):
     assert {"marker", "business-state"} <= kinds
 
 
+def test_business_state_pattern_variants(config):
+    pattern = re.compile(config["forbidden_added_patterns"][0]["pattern"])
+    for line in (
+        "agent._steer_binding_token = None",
+        "self.binding_token = token",
+        "agent.binding_token = token",
+        "self._steer_inflight_batch: List[tuple[str, str]] = []",
+        "    self._accepted_sender = cb",
+        "agent.ledger = {}",
+    ):
+        assert pattern.search(line), line
+    for line in ("self.tokenizer = Tokenizer()", "self._pending_steer = []", "agent.context_tokens = 0", "x = self.binding_token"):
+        assert not pattern.search(line), line
+
+
+def test_flow_cr_only_kernel_file_is_rejected(tmp_path, config):
+    repo = _repo(tmp_path)
+    payload = (MARKER + "\r" + "agent._binding_token = None\r" + "y = 2\r").encode("utf-8")
+    (repo / "agent" / "loop.py").write_bytes(b"x = 1\n" + payload)
+    _commit(repo)
+    result = _run(repo, config)
+    kinds = {v.kind for v in result.violations}
+    assert "bare-cr" in kinds and "business-state" in kinds
+
+
 def test_flow_upstream_sync_branch_skipped(tmp_path, config):
     repo = _repo(tmp_path)
     (repo / "agent" / "loop.py").write_text("x = 1\ny = 2\n", encoding="utf-8")

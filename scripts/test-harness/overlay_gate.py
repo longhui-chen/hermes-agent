@@ -24,13 +24,18 @@ Checks (all must pass):
    an ``upstream-pr: <https://github.com/... | #n | none - <reason>>`` line, and every marker must carry its
    own ``upstream:`` field (enforced by the marker regex).
 4. **No business state in core** — added lines matching any
-   ``forbidden_added_patterns`` entry fail with the configured reason.
+   ``forbidden_added_patterns`` entry fail with the configured reason (heuristic
+   defence in depth; the marker and the budget are the primary controls).
+5. **LF only** — an added kernel line containing a bare CR fails: Python treats CR as a
+   line terminator while git diff counts it as one line.
 
 Upstream sync branches (``skip_head_ref_prefixes``) are skipped: they exist to move
 the kernel *towards* upstream.
 
-CI runs the gate, its config and its self-test from the *base* ref (trusted copy) and
-only uses the PR head as diff input, so a PR cannot disable the gate it is subject to.
+CI runs this script from the base branch via ``pull_request_target`` (workflow, script and
+config all come from base; the PR head is only fetched as diff input and never executed),
+so a PR cannot disable the gate it is subject to. The ``overlay-gate`` job is the one to
+mark as a required check in branch protection.
 
 Usage::
 
@@ -127,16 +132,12 @@ def is_protected(path: str, config: dict) -> bool:
 
 
 def _git(repo: Path, *args: str) -> str:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    # Bytes in, manual decode: text mode would translate a bare CR into a newline and
+    # let a CR-only kernel file hide many logical lines inside one diff line.
+    proc = subprocess.run(["git", "-C", str(repo), *args], check=False, capture_output=True)
     if proc.returncode != 0:
-        raise SystemExit(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout
+        raise SystemExit(f"git {' '.join(args)} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+    return proc.stdout.decode("utf-8", "replace")
 
 
 def changed_files(repo: Path, base: str, head: str) -> List[str]:
@@ -150,7 +151,7 @@ def parse_hunks(diff_text: str) -> List[Hunk]:
     hunks: List[Hunk] = []
     current_path: Optional[str] = None
     current: Optional[Hunk] = None
-    for raw in diff_text.splitlines():
+    for raw in diff_text.split("\n"):  # LF only: a bare CR is content, not a record separator
         if raw.startswith("diff --git "):
             current = None
             current_path = None
@@ -179,7 +180,7 @@ def parse_hunks(diff_text: str) -> List[Hunk]:
 
 def new_file_lines(repo: Path, head: str, path: str) -> List[str]:
     try:
-        return _git(repo, "show", f"{head}:{path}").splitlines()
+        return _git(repo, "show", f"{head}:{path}").split("\n")
     except SystemExit:
         return []
 
@@ -258,9 +259,14 @@ def run_gate(repo: Path, base: str, head: str, pr_body: str, head_ref: str, conf
                 )
             )
         for line in hunk.added:
-            for pattern, reason in forbidden:
-                if pattern.search(line):
-                    result.violations.append(Violation("business-state", hunk.path, f"{line.strip()!r}: {reason}"))
+            if "\r" in line:
+                result.violations.append(
+                    Violation("bare-cr", hunk.path, "added line contains a bare CR; kernel files must use LF so every logical line is a diff line")
+                )
+            for logical in line.split("\r"):  # a bare CR still separates logical lines for Python
+                for pattern, reason in forbidden:
+                    if pattern.search(logical):
+                        result.violations.append(Violation("business-state", hunk.path, f"{logical.strip()!r}: {reason}"))
 
     budget = int(config["added_lines_budget"])
     if result.added_total > budget:
