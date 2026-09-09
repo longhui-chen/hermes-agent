@@ -257,7 +257,8 @@ def test_real_middleware_preserves_semantic_runner_authorization(runtime, monkey
 
 
 @pytest.mark.parametrize("matched", [False, True])
-def test_real_presets_helper_candidate_and_commit(runtime, matched):
+@pytest.mark.parametrize("observation_failure", [False, True])
+def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_failure):
     """Opt-in cross-repo contract flow; never substitute an embedded helper.
 
     Run with HERMES_TEST_CAMERA_PRESETS_SOURCE pointing at the Presets
@@ -299,11 +300,11 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
                     "image_data_uri": "data:image/jpeg;base64," + base64.b64encode(image).decode(),
                 }
             elif self.path.endswith("/semantic-observations"):
-                data = {"analysis_complete": True, "analysis": {"unknown_batches": 1, "created_events": 0}}
+                data = {"analysis_complete": not observation_failure, "analysis": {"unknown_batches": 1, "created_events": 0}}
             else:
                 data = {"matched": body["verdict"]["matched"]}
             response = json.dumps({"data": data}).encode()
-            self.send_response(200)
+            self.send_response(503 if observation_failure and self.path.endswith("/semantic-observations") else 200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
@@ -339,9 +340,9 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
             assert json.loads(result["output"]) == {"data": {"matched": matched}}
             observe = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds 590"
             observed = json.loads(terminal.terminal_tool(command=observe, timeout=600, task_id="real-presets-observe"))
-            assert observed["exit_code"] == 0, observed
+            assert observed["exit_code"] == (2 if observation_failure else 0), observed
             assert json.loads(observed["output"]) == {"data": {
-                "analysis_complete": True, "analysis": {"unknown_batches": 1, "created_events": 0},
+                "analysis_complete": not observation_failure, "analysis": {"unknown_batches": 1, "created_events": 0},
             }}
         assert len(requests) == 3
         for path, body, bearer in requests:
