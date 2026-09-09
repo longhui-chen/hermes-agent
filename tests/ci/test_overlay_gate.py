@@ -67,6 +67,7 @@ def test_parse_hunks_separates_added_and_deleted():
     )
     hunks = gate.parse_hunks(diff)
     assert [h.new_start for h in hunks] == [11, 22]
+    assert [h.path for h in hunks] == ["run_agent.py", "run_agent.py"]
     assert hunks[0].added_nonblank == 1
     assert hunks[1].added_nonblank == 0 and hunks[1].removed == 2
 
@@ -314,6 +315,16 @@ def test_flow_newline_in_kernel_filename_is_still_gated(tmp_path, config):
     result = _run(repo, config)
     assert result.protected_files == ["agent/evil\nmodule.py"]
     assert {"marker", "business-state"} <= {v.kind for v in result.violations}
+
+
+def test_flow_newline_filename_with_fake_string_marker_still_fails(tmp_path, config):
+    repo = _repo(tmp_path)
+    weird = repo / "agent" / "evil\nmodule.py"
+    weird.write_text(f'msg = """\n{MARKER}\n"""\nagent._binding_token = None\n', encoding="utf-8")
+    _commit(repo)
+    result = _run(repo, config)
+    kinds = {v.kind for v in result.violations}
+    assert "marker" in kinds and "business-state" in kinds and "untokenizable" not in kinds
 
 
 def test_flow_symlinked_kernel_directory_is_rejected(tmp_path, config):

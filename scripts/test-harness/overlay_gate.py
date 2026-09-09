@@ -181,7 +181,7 @@ def parse_hunks(diff_text: str) -> List[Hunk]:
         if match:
             new_start = int(match.group(3))
             new_count = int(match.group(4) or "1")
-            current = Hunk(path=current_path or "", new_start=new_start, new_count=new_count)
+            current = Hunk(path=current_path or "?", new_start=new_start, new_count=new_count)
             hunks.append(current)
             continue
         if current is None:
@@ -190,14 +190,15 @@ def parse_hunks(diff_text: str) -> List[Hunk]:
             current.added.append(raw[1:])
         elif raw.startswith("-"):
             current.removed += 1
-    return [hunk for hunk in hunks if hunk.path]
+    return hunks
 
 
 def new_file_lines(repo: Path, head: str, path: str) -> List[str]:
     try:
-        return _git(repo, "show", f"{head}:{path}").split("\n")
+        raw = _git_bytes(repo, "show", f"{head}:{path.encode('utf-8', 'surrogateescape').decode('utf-8', 'surrogateescape')}")
     except SystemExit:
         return []
+    return raw.decode("utf-8", "replace").split("\n")
 
 
 def head_file_mode(repo: Path, head: str, path: str) -> str:
@@ -289,23 +290,29 @@ def run_gate(repo: Path, base: str, head: str, pr_body: str, head_ref: str, conf
     forbidden = [(re.compile(item["pattern"]), item["reason"]) for item in config["forbidden_added_patterns"]]
     lookback = int(config["marker_lookback_lines"])
     merge_base = _git(repo, "merge-base", base, head).strip()
-    # Force a textual diff: a PR-supplied .gitattributes (`agent/** -diff`, textconv, external
-    # diff) must not be able to turn kernel hunks into "Binary files differ".
-    diff_text = _git(
-        repo,
-        "-c",
-        "core.attributesFile=/dev/null",
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--text",
-        "-U0",
-        merge_base,
-        head,
-        "--",
-        *files,
-    )
-    hunks = parse_hunks(diff_text)
+    # One diff per protected path so hunks are attributed by the NUL-safe path we already
+    # hold, never by parsing the (possibly C-quoted) `+++` patch header. Force a textual diff:
+    # a PR-supplied .gitattributes (`agent/** -diff`, textconv, external diff) must not be
+    # able to turn kernel hunks into "Binary files differ".
+    hunks: List[Hunk] = []
+    for path in files:
+        diff_text = _git_bytes(
+            repo,
+            "-c",
+            "core.attributesFile=/dev/null",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--text",
+            "-U0",
+            merge_base,
+            head,
+            "--",
+            path.encode("utf-8", "surrogateescape").decode("utf-8", "surrogateescape"),
+        ).decode("utf-8", "replace")
+        for hunk in parse_hunks(diff_text):
+            hunk.path = path
+            hunks.append(hunk)
 
     for path in files:
         link = symlinked_ancestor(repo, head, path)
@@ -321,9 +328,14 @@ def run_gate(repo: Path, base: str, head: str, pr_body: str, head_ref: str, conf
         result.added_total += hunk.added_nonblank
         lines = file_cache.setdefault(hunk.path, new_file_lines(repo, head, hunk.path))
         if hunk.path not in comment_cache:
-            comment_cache[hunk.path] = comment_line_numbers(lines) if hunk.path.endswith(".py") else None
-            if hunk.path.endswith(".py") and comment_cache[hunk.path] is None:
-                result.violations.append(Violation("untokenizable", hunk.path, "protected Python file does not tokenize at head; markers cannot be verified as comments"))
+            if hunk.path.endswith(".py"):
+                comment_cache[hunk.path] = comment_line_numbers(lines) if lines else None
+                if comment_cache[hunk.path] is None:
+                    # fail closed: a kernel file we cannot read or tokenize cannot have its markers verified
+                    result.violations.append(Violation("untokenizable", hunk.path, "protected Python file cannot be read or tokenized at head; markers cannot be verified as comments"))
+                    comment_cache[hunk.path] = set()
+            else:
+                comment_cache[hunk.path] = None
         if not hunk_has_marker(hunk, lines, marker, lookback, comment_cache[hunk.path]):
             result.violations.append(
                 Violation(
