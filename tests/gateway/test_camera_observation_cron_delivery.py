@@ -17,7 +17,9 @@ def test_camera_summary_survives_many_frames_in_source_memo(tmp_path, monkeypatc
     for index in range(40):
         (bucket / f"camera-a{index:03}-frame.jpg").write_bytes(b"frame")
     summary = bucket / "camera-z-summary.json"
-    result = {"analysis_complete": success, "summary_path": str(summary), "coverage": {"frames": 120}}
+    events = bucket / "camera-z-events.json"
+    events.write_text(json.dumps({"events": [{"event_id": "hit", "occurred_at": "2026-09-09T12:00:00Z"}], "analysis_complete": success}))
+    result = {"analysis_complete": success, "summary_path": str(summary), "coverage": {"frames": 120}, "analysis": {"events_path": str(events)}}
     summary.write_text(json.dumps(result))
     db = hermes_state.SessionDB()
     sid = "cron_observe_20260909_120000"
@@ -33,6 +35,8 @@ def test_camera_summary_survives_many_frames_in_source_memo(tmp_path, monkeypatc
     assert len(attachments) <= cron._CRON_ATTACHMENT_LIMIT
     assert attachments[0]["path"] == str(summary.resolve())
     assert attachments[0]["mime"] == "application/json"
+    assert attachments[1]["path"] == str(events.resolve())
+    assert attachments[1]["mime"] == "application/json"
     assert metadata["last_run_result"] == ("success" if success else "failed")
 
 
