@@ -53,6 +53,9 @@ def test_marker_regex_requires_upstream_field(config):
     assert marker.search("# zettlab-overlay(BT): hook; upstream: #42")
     assert not marker.search("# zettlab-overlay(B1): missing upstream field")
     assert not marker.search("# zettlab-overlay(B1) no colon; upstream: none")
+    # must be a comment, not a string literal or docstring fragment
+    assert not marker.search('marker = "zettlab-overlay(TEST): not a comment; upstream: none"')
+    assert marker.search("    # zettlab-overlay(TEST): indented comment is fine; upstream: none")
 
 
 def test_parse_hunks_separates_added_and_deleted():
@@ -79,6 +82,11 @@ def test_hunk_marker_lookback(config):
 def test_pr_body_parsers(config):
     assert gate.pr_body_has_upstream("## HR\nupstream-pr: none - generic hook, PR later", config)
     assert not gate.pr_body_has_upstream("no field here", config)
+    assert gate.pr_body_has_upstream("upstream-pr: https://github.com/NousResearch/hermes-agent/pull/12", config)
+    assert gate.pr_body_has_upstream("upstream-pr: #12", config)
+    assert not gate.pr_body_has_upstream("upstream-pr: x", config)
+    assert not gate.pr_body_has_upstream("upstream-pr: none", config)
+    assert not gate.pr_body_has_upstream("upstream-pr: none - short", config)
     assert gate.pr_body_budget_exception("overlay-budget-exception: 上游 rebase 一次性同步三处 hook", config)
     assert gate.pr_body_budget_exception("overlay-budget-exception: short", config) is None
 
@@ -120,7 +128,7 @@ def _commit(repo: Path, msg: str = "change") -> None:
     _git(repo, "commit", "-q", "-m", msg)
 
 
-def _run(repo: Path, config: dict, pr_body: str = "upstream-pr: none - test", head_ref: str = "feat/x"):
+def _run(repo: Path, config: dict, pr_body: str = "upstream-pr: none - unit test fixture", head_ref: str = "feat/x"):
     return gate.run_gate(repo, "base", "HEAD", pr_body, head_ref, config)
 
 
@@ -175,7 +183,7 @@ def test_flow_budget_exceeded_requires_exception(tmp_path, config):
     _commit(repo)
     result = _run(repo, config)
     assert {v.kind for v in result.violations} == {"budget"}
-    result = _run(repo, config, pr_body="upstream-pr: none - test\noverlay-budget-exception: one-off upstream rebase alignment")
+    result = _run(repo, config, pr_body="upstream-pr: none - unit test fixture\noverlay-budget-exception: one-off upstream rebase alignment")
     assert result.ok, [str(v) for v in result.violations]
 
 
@@ -210,6 +218,26 @@ def test_flow_new_zet_file_in_kernel_dir_is_gated(tmp_path, config):
     assert {"marker", "business-state"} <= kinds
 
 
+def test_flow_marker_inside_string_literal_is_not_a_marker(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / "agent" / "loop.py").write_text(
+        'x = 1\nmarker = "zettlab-overlay(TEST): not a comment; upstream: none"\ny = 2\n', encoding="utf-8"
+    )
+    _commit(repo)
+    result = _run(repo, config)
+    assert {v.kind for v in result.violations} == {"marker"}
+
+
+def test_flow_gitattributes_nodiff_cannot_hide_kernel_hunks(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / ".gitattributes").write_text("agent/** -diff\n", encoding="utf-8")
+    (repo / "agent" / "loop.py").write_text("x = 1\nagent._binding_token = None\n", encoding="utf-8")
+    _commit(repo)
+    result = _run(repo, config)
+    kinds = {v.kind for v in result.violations}
+    assert {"marker", "business-state"} <= kinds
+
+
 def test_flow_upstream_sync_branch_skipped(tmp_path, config):
     repo = _repo(tmp_path)
     (repo / "agent" / "loop.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
@@ -223,7 +251,7 @@ def test_cli_exit_codes(tmp_path, config):
     (repo / "agent" / "loop.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
     _commit(repo)
     body = tmp_path / "body.txt"
-    body.write_text("upstream-pr: none - test", encoding="utf-8")
+    body.write_text("upstream-pr: none - unit test fixture", encoding="utf-8")
     proc = subprocess.run(
         ["python3", str(SCRIPT), "--repo", str(repo), "--base", "base", "--head", "HEAD", "--pr-body-file", str(body), "--config", str(CONFIG)],
         capture_output=True,

@@ -12,7 +12,7 @@ Checks (all must pass):
 
 1. **Marker per hunk** — every diff hunk that *adds* lines to a protected file must
    carry, in the added lines or in the ``marker_lookback_lines`` lines above the
-   hunk in the new file, a marker matching ``marker_regex``::
+   hunk in the new file, a *comment* marker matching ``marker_regex``::
 
        # zettlab-overlay(U2d): keep pending steers as (id, text); upstream: none
 
@@ -21,13 +21,16 @@ Checks (all must pass):
    protected files in total. Exceeding it requires an
    ``overlay-budget-exception: <reason>`` line (>= 20 chars) in the PR body.
 3. **Upstream field** — when any protected file is touched the PR body must carry
-   an ``upstream-pr: <url | none - reason>`` line, and every marker must carry its
+   an ``upstream-pr: <https://github.com/... | #n | none - <reason>>`` line, and every marker must carry its
    own ``upstream:`` field (enforced by the marker regex).
 4. **No business state in core** — added lines matching any
    ``forbidden_added_patterns`` entry fail with the configured reason.
 
 Upstream sync branches (``skip_head_ref_prefixes``) are skipped: they exist to move
 the kernel *towards* upstream.
+
+CI runs the gate, its config and its self-test from the *base* ref (trusted copy) and
+only uses the PR head as diff input, so a PR cannot disable the gate it is subject to.
 
 Usage::
 
@@ -221,7 +224,22 @@ def run_gate(repo: Path, base: str, head: str, pr_body: str, head_ref: str, conf
     forbidden = [(re.compile(item["pattern"]), item["reason"]) for item in config["forbidden_added_patterns"]]
     lookback = int(config["marker_lookback_lines"])
     merge_base = _git(repo, "merge-base", base, head).strip()
-    diff_text = _git(repo, "diff", "-U0", merge_base, head, "--", *files)
+    # Force a textual diff: a PR-supplied .gitattributes (`agent/** -diff`, textconv, external
+    # diff) must not be able to turn kernel hunks into "Binary files differ".
+    diff_text = _git(
+        repo,
+        "-c",
+        "core.attributesFile=/dev/null",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--text",
+        "-U0",
+        merge_base,
+        head,
+        "--",
+        *files,
+    )
     hunks = parse_hunks(diff_text)
 
     file_cache: dict = {}

@@ -16,9 +16,9 @@
     "gateway/platforms/ui_map/**"
   ],
   "added_lines_budget": 60,
-  "marker_regex": "zettlab-overlay\\(([A-Za-z0-9._-]+)\\):\\s*\\S[^;]*;\\s*upstream:\\s*(https://github\\.com/\\S+|#\\d+|none)\\b",
+  "marker_regex": "^\\s*#\\s*zettlab-overlay\\(([A-Za-z0-9._-]+)\\):\\s*\\S[^;]*;\\s*upstream:\\s*(https://github\\.com/\\S+|#\\d+|none)\\b",
   "marker_lookback_lines": 5,
-  "pr_body_upstream_regex": "(?im)^\\s*upstream-pr:\\s*\\S",
+  "pr_body_upstream_regex": "(?im)^\\s*upstream-pr:\\s*(https://github\\.com/\\S+|#\\d+|none\\s*-\\s*\\S.{7,})\\s*$",
   "pr_body_budget_exception_regex": "(?im)^\\s*overlay-budget-exception:\\s*(\\S.{19,})$",
   "skip_head_ref_prefixes": [
     "sync/upstream-"
