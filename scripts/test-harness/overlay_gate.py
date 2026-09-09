@@ -28,6 +28,10 @@ Checks (all must pass):
    defence in depth; the marker and the budget are the primary controls).
 5. **LF only** — an added kernel line containing a bare CR fails: Python treats CR as a
    line terminator while git diff counts it as one line.
+6. **Real files, real comments** — a protected path that is a symlink at head fails; for
+   ``.py`` files the marker must sit on a line that ``tokenize`` reports as a COMMENT
+   token (a marker inside a string literal does not count), and a file that does not
+   tokenize fails.
 
 Upstream sync branches (``skip_head_ref_prefixes``) are skipped: they exist to move
 the kernel *towards* upstream.
@@ -51,8 +55,10 @@ import argparse
 import fnmatch
 import json
 import re
+import io
 import subprocess
 import sys
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
@@ -185,14 +191,49 @@ def new_file_lines(repo: Path, head: str, path: str) -> List[str]:
         return []
 
 
-def hunk_has_marker(hunk: Hunk, file_lines: Sequence[str], marker: re.Pattern, lookback: int) -> bool:
-    if any(marker.search(line) for line in hunk.added):
-        return True
+def head_file_mode(repo: Path, head: str, path: str) -> str:
+    """Return the git tree mode of ``path`` at ``head`` (``120000`` = symlink), or ''."""
+    out = _git(repo, "ls-tree", head, "--", path)
+    return out.split(" ", 1)[0].strip() if out.strip() else ""
+
+
+def comment_line_numbers(source_lines: Sequence[str]) -> Optional[set]:
+    """1-based line numbers that carry a real Python COMMENT token.
+
+    A marker inside a string literal / docstring is not a comment and does not count.
+    Returns None when the file does not tokenize (the caller treats that as a violation).
+    """
+    text = "\n".join(source_lines)
+    numbers: set = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                numbers.add(tok.start[0])
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return None
+    return numbers
+
+
+def hunk_has_marker(
+    hunk: Hunk,
+    file_lines: Sequence[str],
+    marker: re.Pattern,
+    lookback: int,
+    comment_lines: Optional[set] = None,
+) -> bool:
+    """True when a marker sits in the hunk or in the ``lookback`` lines above it.
+
+    When ``comment_lines`` is given (1-based numbers of real COMMENT tokens), a marker
+    only counts if its line is one of them — text inside a string literal is ignored.
+    """
     if not file_lines:
-        return False
+        return any(marker.search(line) for line in hunk.added)
     start = max(0, hunk.new_start - 1 - lookback)
     end = min(len(file_lines), hunk.new_start - 1 + max(hunk.new_count, 1))
-    return any(marker.search(line) for line in file_lines[start:end])
+    for index in range(start, end):
+        if marker.search(file_lines[index]) and (comment_lines is None or (index + 1) in comment_lines):
+            return True
+    return False
 
 
 def pr_body_has_upstream(pr_body: str, config: dict) -> bool:
@@ -243,13 +284,23 @@ def run_gate(repo: Path, base: str, head: str, pr_body: str, head_ref: str, conf
     )
     hunks = parse_hunks(diff_text)
 
+    for path in files:
+        mode = head_file_mode(repo, head, path)
+        if mode == "120000":
+            result.violations.append(Violation("symlink", path, "protected path is a symlink at head; kernel files must be regular blobs"))
+
     file_cache: dict = {}
+    comment_cache: dict = {}
     for hunk in hunks:
         if hunk.added_nonblank == 0:
             continue  # deletion-only: converging to upstream needs no marker
         result.added_total += hunk.added_nonblank
         lines = file_cache.setdefault(hunk.path, new_file_lines(repo, head, hunk.path))
-        if not hunk_has_marker(hunk, lines, marker, lookback):
+        if hunk.path not in comment_cache:
+            comment_cache[hunk.path] = comment_line_numbers(lines) if hunk.path.endswith(".py") else None
+            if hunk.path.endswith(".py") and comment_cache[hunk.path] is None:
+                result.violations.append(Violation("untokenizable", hunk.path, "protected Python file does not tokenize at head; markers cannot be verified as comments"))
+        if not hunk_has_marker(hunk, lines, marker, lookback, comment_cache[hunk.path]):
             result.violations.append(
                 Violation(
                     "marker",

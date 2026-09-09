@@ -77,6 +77,15 @@ def test_hunk_marker_lookback(config):
     hunk = gate.Hunk(path="run_agent.py", new_start=4, new_count=1, added=["c"])
     assert gate.hunk_has_marker(hunk, file_lines, marker, lookback=5)
     assert not gate.hunk_has_marker(hunk, file_lines, marker, lookback=1)
+    # with tokenize info the marker line must be a real comment
+    assert gate.hunk_has_marker(hunk, file_lines, marker, lookback=5, comment_lines={2})
+    assert not gate.hunk_has_marker(hunk, file_lines, marker, lookback=5, comment_lines={9})
+
+
+def test_comment_line_numbers_ignores_strings():
+    src = ["x = 1", MARKER, 'msg = """', MARKER, '"""', "y = 2"]
+    assert gate.comment_line_numbers(src) == {2}
+    assert gate.comment_line_numbers(["def f(:"]) is None
 
 
 def test_pr_body_parsers(config):
@@ -269,6 +278,32 @@ def test_flow_cr_only_kernel_file_is_rejected(tmp_path, config):
     result = _run(repo, config)
     kinds = {v.kind for v in result.violations}
     assert "bare-cr" in kinds and "business-state" in kinds
+
+
+def test_flow_marker_inside_triple_quoted_string_is_not_a_marker(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / "agent" / "loop.py").write_text(f'x = 1\nmsg = """\n{MARKER}\n"""\ny = 2\n', encoding="utf-8")
+    _commit(repo)
+    result = _run(repo, config)
+    assert {v.kind for v in result.violations} == {"marker"}
+
+
+def test_flow_symlinked_protected_file_is_rejected(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / "impl.py").write_text(f"{MARKER}\nagent._binding_token = None\n", encoding="utf-8")
+    (repo / "run_agent.py").unlink()
+    (repo / "run_agent.py").symlink_to("impl.py")
+    _commit(repo)
+    result = _run(repo, config)
+    assert "symlink" in {v.kind for v in result.violations}
+
+
+def test_flow_untokenizable_protected_file_is_rejected(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / "agent" / "loop.py").write_text(f"x = 1\n{MARKER}\ndef broken(:\n", encoding="utf-8")
+    _commit(repo)
+    result = _run(repo, config)
+    assert "untokenizable" in {v.kind for v in result.violations}
 
 
 def test_flow_upstream_sync_branch_skipped(tmp_path, config):

@@ -88,7 +88,9 @@ assess all rules, including “no impact” where appropriate.
    enforces this on every PR from the base branch via `pull_request_target` (the PR
    head is only diff input) and must stay a required status check in branch
    protection — never add another job or trigger with that name, a skipped
-   same-named job would satisfy the check; upstream sync branches (`sync/upstream-*`) are exempt from the gate
+   same-named job would satisfy the check; a PR that first introduces or
+   rewrites the gate must not touch kernel files itself (the gate only runs
+   from base after merge); upstream sync branches (`sync/upstream-*`) are exempt from the gate
    and instead get a manual upstream-diff review against the overlay registry.
 9. **HR-T1 dependency freeze:** while the parent freeze is active, do not add,
    upgrade, or downgrade Microsoft/Azure dependency families (`Azure`,
