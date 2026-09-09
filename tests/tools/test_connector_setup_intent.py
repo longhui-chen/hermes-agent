@@ -83,3 +83,10 @@ def test_known_public_configuration_survives_trusted_clarify_flow():
         assert connector_setup == intent
         return '{"status":"submitted","target_id":"created-api"}'
     assert json.loads(clarify_tool("ignored", connector_setup=intent, callback=callback))["status"] == "submitted"
+
+
+def test_submitted_receipt_is_explicitly_not_a_credential_exposure():
+    result = json.loads(connector_setup_result('{"status":"submitted","target_id":"jira-test"}'))
+    assert 'contains no credentials' in result['next_step']
+    assert 'Do not request revocation solely' in result['next_step']
+    assert 'not a grant' in result['next_step']

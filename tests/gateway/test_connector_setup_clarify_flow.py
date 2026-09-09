@@ -29,7 +29,8 @@ def test_old_client_fails_before_publishing_an_input_request():
 
 
 @pytest.mark.asyncio
-async def test_setup_uses_existing_pending_and_response_flow():
+@pytest.mark.parametrize("status", ["cancelled", "submitted"])
+async def test_setup_uses_existing_pending_and_response_flow(status):
     runtime = adapter()
     stream = queue.Queue()
     callback = runtime._make_clarify_cb(stream, "s", connector_input_capable=True)
@@ -49,7 +50,25 @@ async def test_setup_uses_existing_pending_and_response_flow():
             pending = await (await client.get('/v1/sessions/s/pending', headers=headers)).json()
             assert pending["clarify"]["connector_setup"] == {"resource_kind": "tv"}
             response = await client.post('/v1/sessions/s/clarify/respond', headers=headers, json={
-                "clarify_id": payload["clarify_id"], "response": '{"status":"cancelled"}',
+                "clarify_id": payload["clarify_id"], "response": json.dumps({"status": status}),
             })
             assert response.status == 200
-        assert json.loads(future.result(timeout=5)) == {"status": "cancelled"}
+        result = json.loads(future.result(timeout=5))
+        assert result["status"] == status
+        assert "user_response" not in result
+        if status == "submitted":
+            assert "contains no credentials" in result["next_step"]
+
+
+@pytest.mark.parametrize('capable', [False, True])
+def test_ordinary_clarify_cannot_impersonate_a_secure_input_flow(capable):
+    runtime = adapter()
+    stream = queue.Queue()
+    callback = runtime._make_clarify_cb(stream, 's', connector_input_capable=capable)
+    result = clarify_tool(
+        '请在安全连接卡片的受保护输入框中填写新 PAT 并保存，不要把凭据发送到聊天中。',
+        callback=callback,
+    )
+    assert 'connector_setup_required' in result
+    assert stream.empty()
+    assert not runtime._clarify_queues

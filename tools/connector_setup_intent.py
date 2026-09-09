@@ -133,5 +133,6 @@ def connector_setup_result(raw: object) -> str:
             return json.dumps({"status": "cancelled"})
         result["target_id"] = payload["target_id"]
     if result["status"] == "submitted":
-        result["next_step"] = "Verify current connector availability and session authorization before claiming success or resuming the original authorized task. This is a client submission receipt, not a grant."
+        # zettlab-overlay(connector-input): status receipts are not credential messages; upstream: none
+        result["next_step"] = "This protected-input receipt contains no credentials. Do not request revocation solely because this receipt arrived. Verify current connector availability and session authorization before claiming success or resuming the original authorized task. This is a client submission receipt, not a grant."
     return json.dumps(result)
