@@ -1,5 +1,5 @@
 {
-  "$comment": "HR8 upstream-core overlay gate (zettlab-product-dev 总方案 §1.3 / 附录 H). `protected` = Hermes upstream core files that must track NousResearch upstream; every hunk that adds lines there must carry a `zettlab-overlay(<batch>): <one line>; upstream: <PR url | #n | none>` marker, the whole PR may add at most `added_lines_budget` lines to protected files, and the PR body must carry an `upstream-pr:` line. `exempt` = fork-owned files that live inside protected directories.",
+  "$comment": "HR8 upstream-core overlay gate (zettlab-product-dev 总方案 §1.3 / 附录 H). `protected` = Hermes upstream core files that must track NousResearch upstream; every hunk that adds lines there must carry a `zettlab-overlay(<batch>): <one line>; upstream: <PR url | #n | none>` marker, the whole PR may add at most `added_lines_budget` lines to protected files, and the PR body must carry an `upstream-pr:` line. `exempt` = the fork-owned adapter layer only (gateway/platforms/zet_agent*.py, ui_map/**, tests/**); no wildcard exemptions inside agent/** or tools/** — Zettlab state must live in the adapter, not in a new kernel file.",
   "protected": [
     "run_agent.py",
     "hermes_state.py",
@@ -13,16 +13,16 @@
     "tests/**",
     "gateway/platforms/zet_agent.py",
     "gateway/platforms/zet_agent_*.py",
-    "gateway/platforms/ui_map/**",
-    "agent/zet_agent_*.py",
-    "tools/zet_*.py"
+    "gateway/platforms/ui_map/**"
   ],
   "added_lines_budget": 60,
   "marker_regex": "zettlab-overlay\\(([A-Za-z0-9._-]+)\\):\\s*\\S[^;]*;\\s*upstream:\\s*(https://github\\.com/\\S+|#\\d+|none)\\b",
   "marker_lookback_lines": 5,
   "pr_body_upstream_regex": "(?im)^\\s*upstream-pr:\\s*\\S",
   "pr_body_budget_exception_regex": "(?im)^\\s*overlay-budget-exception:\\s*(\\S.{19,})$",
-  "skip_head_ref_prefixes": ["sync/upstream-", "upstream"],
+  "skip_head_ref_prefixes": [
+    "sync/upstream-"
+  ],
   "forbidden_added_patterns": [
     {
       "pattern": "^\\s*(self|agent)\\._[a-z0-9_]*(binding|token|sender|ledger|handback|inflight|reject_counter|usage_rollback)[a-z0-9_]*\\s*[:=]",

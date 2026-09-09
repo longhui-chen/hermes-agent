@@ -41,6 +41,9 @@ def test_protected_and_exempt_globs(config):
     assert not gate.is_protected("gateway/platforms/ui_map/projector.py", config)
     assert not gate.is_protected("tests/agent/test_x.py", config)
     assert not gate.is_protected("README.md", config)
+    # no wildcard exemptions inside the kernel directories
+    assert gate.is_protected("tools/zet_overlay_state.py", config)
+    assert gate.is_protected("agent/zet_agent_bridge.py", config)
 
 
 def test_marker_regex_requires_upstream_field(config):
@@ -83,6 +86,8 @@ def test_pr_body_parsers(config):
 def test_skip_upstream_sync_branches(config):
     assert gate.should_skip("sync/upstream-v2026.9.1", config)
     assert not gate.should_skip("feat/chat-ui-u2d", config)
+    assert not gate.should_skip("upstream-bypass", config)
+    assert not gate.should_skip("upstream", config)
     assert not gate.should_skip("", config)
 
 
@@ -183,6 +188,26 @@ def test_flow_business_state_in_core_fails(tmp_path, config):
     result = _run(repo, config)
     kinds = [v.kind for v in result.violations]
     assert kinds.count("business-state") == 2 and "marker" not in kinds
+
+
+def test_flow_upstream_lookalike_branch_not_skipped(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / "agent" / "loop.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
+    _commit(repo)
+    result = _run(repo, config, pr_body="", head_ref="upstream-bypass")
+    assert not result.skipped and not result.ok
+    assert {v.kind for v in result.violations} == {"marker", "upstream-pr"}
+
+
+def test_flow_new_zet_file_in_kernel_dir_is_gated(tmp_path, config):
+    repo = _repo(tmp_path)
+    (repo / "tools").mkdir()
+    (repo / "tools" / "zet_overlay_state.py").write_text("agent._steer_binding_token = None\n", encoding="utf-8")
+    _commit(repo)
+    result = _run(repo, config)
+    kinds = {v.kind for v in result.violations}
+    assert result.protected_files == ["tools/zet_overlay_state.py"]
+    assert {"marker", "business-state"} <= kinds
 
 
 def test_flow_upstream_sync_branch_skipped(tmp_path, config):

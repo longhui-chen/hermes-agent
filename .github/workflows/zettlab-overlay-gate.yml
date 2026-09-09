@@ -12,19 +12,7 @@ name: Zettlab Overlay Gate
 # Upstream sync branches (sync/upstream-*) are skipped by the script itself.
 
 on:
-  pull_request:
-    paths:
-      - "run_agent.py"
-      - "hermes_state.py"
-      - "agent/**"
-      - "tools/**"
-      - "gateway/run.py"
-      - "gateway/platforms/base.py"
-      - "gateway/platforms/api_server.py"
-      - "scripts/test-harness/overlay_gate.py"
-      - "scripts/test-harness/overlay_gate.json"
-      - "tests/ci/test_overlay_gate.py"
-      - ".github/workflows/zettlab-overlay-gate.yml"
+  pull_request:  # no paths filter: GitHub only evaluates the first 300 changed files, so a large PR could hide kernel edits; the script fast-passes when no kernel file is touched
   workflow_dispatch:
 
 permissions:
