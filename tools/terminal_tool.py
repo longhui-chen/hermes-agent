@@ -2726,12 +2726,12 @@ def _camera_semantic_arguments_allowed(arguments: list[str]) -> bool:
         return False
     required = {"--capability", "--matched"}
     if fields.get("--matched") == "false":
-        return set(fields) == required
+        return set(fields) <= required | {"--unknown"} and fields.get("--unknown", "false") in {"true", "false"}
     required |= {"--subject-kind", "--predicate", "--duration-seconds", "--evidence-ref"}
     if (
         fields.get("--matched") != "true"
         or not required <= fields.keys()
-        or fields.keys() - required - {"--subject-ref", "--zone-id"}
+        or fields.keys() - required - {"--subject-ref", "--zone-id", "--frame-states", "--track-ids"}
         or fields["--subject-kind"] not in {"person", "object"}
         or fields["--predicate"] not in {"appears", "disappears", "enters_zone", "leaves_zone", "lingers"}
         or re.fullmatch(r"[0-9]{1,4}", fields["--duration-seconds"]) is None
@@ -2739,6 +2739,15 @@ def _camera_semantic_arguments_allowed(arguments: list[str]) -> bool:
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", fields["--evidence-ref"]) is None
     ):
         return False
+    if "--frame-states" in fields or "--track-ids" in fields:
+        states = fields.get("--frame-states", "").split(",")
+        tracks = fields.get("--track-ids", "").split(",")
+        if (
+            not 3 <= len(states) <= 8 or len(states) != len(tracks)
+            or any(state not in {"present", "absent", "inside", "outside", "unknown"} for state in states)
+            or any(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", track) is None for track in tracks)
+        ):
+            return False
     return all(
         len(fields.get(key, "").encode("utf-8")) <= limit
         and not any(ord(c) < 0x20 for c in fields.get(key, ""))

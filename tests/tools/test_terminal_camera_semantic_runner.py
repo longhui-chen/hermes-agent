@@ -102,6 +102,12 @@ def test_candidate_and_commit_have_separate_parameter_allowlists(runtime):
     assert terminal._parse_camera_runtime_command(positive) is not None
     assert terminal._parse_camera_runtime_command(positive.replace("seconds 10", "seconds 3601")) is None
     assert terminal._parse_camera_runtime_command(positive + " --matched false") is None
+    assert terminal._parse_camera_runtime_command(prefix + " --matched false --unknown true") is not None
+    proof = " --frame-states present,present,present,present --track-ids t,t,t,t"
+    assert terminal._parse_camera_runtime_command(positive + proof) is not None
+    assert terminal._parse_camera_runtime_command(positive + proof.replace("t,t,t,t", "t,t,/private,t")) is None
+    assert terminal._parse_camera_runtime_command(positive + proof.replace("t,t,t,t", "t,t,t")) is None
+    assert terminal._parse_camera_runtime_command(positive + proof + " --unknown true") is None
 
 
 def test_changed_package_is_rejected(runtime):
@@ -292,8 +298,10 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
             commit = f'python3 "$ZETTLAB_PRESETS_DIR/{SCRIPT}" commit --capability {data["capability"]} --matched {str(matched).lower()}'
             if matched:
                 commit += " --subject-kind person --predicate lingers --duration-seconds 12 --evidence-ref " + data["evidence_ref"]
+                commit += " --frame-states present,present,present,present --track-ids t,t,t,t"
                 verdict.update(subject_kind="person", subject_ref="", predicate="lingers",
                                zone_id="", duration_seconds=12, evidence_ref=data["evidence_ref"])
+                verdict["frames"] = [{"state": "present", "track_id": "t"} for _ in range(4)]
             result = json.loads(terminal.terminal_tool(command=commit, task_id="real-presets-commit"))
             assert result["exit_code"] == 0, result
             assert json.loads(result["output"]) == {"data": {"matched": matched}}
