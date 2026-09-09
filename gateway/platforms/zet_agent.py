@@ -316,6 +316,10 @@ class _SteerProducer:
     def reclaim(self, text: str) -> list[tuple[str | None, str]]:
         if self.inflight and "\n".join(item[1] for item in self.inflight) == text:
             items = list(self.inflight)
+        elif self.inflight:
+            # zettlab-overlay(U2d): preserve the provider batch identity on a
+            # shape mismatch; upstream: none
+            items = list(self.inflight)
         else:
             items = [(None, text)]
         self.inflight = []
@@ -324,7 +328,10 @@ class _SteerProducer:
 
     def on_interrupt(self) -> None:
         with self.agent._pending_steer_lock:
-            self.agent._pending_steer = [item for item in self.agent._pending_steer if item[0]]
+            pending = [item for item in self.agent._pending_steer if item[0]]
+            if not self.provider_entered and self.inflight:
+                pending = [*self.inflight, *pending]
+            self.agent._pending_steer = pending
             self.pending_bytes = sum(_steer_item_size(*item) for item in self.agent._pending_steer)
             self.inflight = []
             self.provider_entered = False

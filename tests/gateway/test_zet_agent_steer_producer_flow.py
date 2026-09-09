@@ -104,6 +104,39 @@ def test_short_circuit_closes_unconsumed_inflight_with_dropped():
     assert items[-1][1]["steer_id"] == steer_id
 
 
+def test_interrupt_preserves_unconsumed_inflight_for_terminal_drop():
+    agent = _agent()
+    stream_q = queue.Queue()
+    ZetAgentAdapter._bind_steer_producer(agent, turn_id="turn-1", stream_q=stream_q)
+    steer_id = agent._zettlab_admit_steer("cancel me", "turn-1")["steer_id"]
+    messages = [{"role": "tool", "content": "done", "tool_call_id": "c"}]
+
+    drain_steer_for_next_api_call(agent, messages)
+    agent._steer_admission_hook.on_interrupt()
+    assert agent._pending_steer == [(steer_id, "cancel me")]
+    assert agent._drain_pending_steer(close=True) is None
+
+    items = _payloads(stream_q)
+    assert [item[1]["type"] for item in items] == [
+        "steer_accepted",
+        "steer_dropped",
+    ]
+    assert items[-1][1]["steer_id"] == steer_id
+
+
+def test_reclaim_keeps_identity_when_joined_text_shape_differs():
+    agent = _agent()
+    stream_q = queue.Queue()
+    ZetAgentAdapter._bind_steer_producer(agent, turn_id="turn-1", stream_q=stream_q)
+    steer_id = agent._zettlab_admit_steer("original", "turn-1")["steer_id"]
+    messages = [{"role": "tool", "content": "done", "tool_call_id": "c"}]
+
+    drain_steer_for_next_api_call(agent, messages)
+    assert agent._steer_admission_hook.reclaim("different rendering") == [
+        (steer_id, "original")
+    ]
+
+
 def test_terminal_enqueue_failure_hands_back_once_and_never_leaks_next_turn():
     class _BrokenTerminalQueue(queue.Queue):
         def put_nowait(self, item):
