@@ -22,3 +22,9 @@
 | HR6 | 不改设备配置 |
 | HR7 | 不新增共享预算、CAS、队列或数据库；复用既有生命周期 |
 | HR-T1 | 无依赖变更 |
+
+## Reuse known public API configuration
+
+Optional `custom_api.variables` carries only base_url, endpoint_path, method, tool_name and header_name (at most five strings of 2048 characters). URLs reject userinfo/query/fragment; paths reject query/fragment; control characters and backslashes are rejected. Clients additionally require each key in the selected trusted template and prefer an explicit correction over the intent. Credentials and hardware details remain excluded. Existing clients can ignore this optional object.
+
+Validation: App/Web parser and preparation suites each 23 tests passed; Hermes trusted clarify suite 24 passed; Go TestConnectorSetup in chatproto/backend translation passed. Manual acceptance: known URL/path → only credential requested; rejected token variable → no input dispatch or create. GUI/live service E2E and local full QA/build unrun. HR1 bounded payload/no background memory; HR2 existing lifecycle/retry; HR3 strict public-key validation; HR4 additive nested object; HR5 fail closed; HR6 no config; HR7 no additional state mechanism; HR-T1 no dependencies.

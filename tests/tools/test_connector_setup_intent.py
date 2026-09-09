@@ -64,3 +64,22 @@ def test_flow_provider_exception_is_not_echoed():
     result = clarify_tool("ignored", connector_setup={"resource_kind": "camera"}, callback=callback)
     assert "private-token" not in result
     assert "connector_setup_unavailable" in result
+
+
+@pytest.mark.parametrize("variables", [
+    {"token": "secret"}, {"base_url": "https://example.test?token=secret"},
+    {"endpoint_path": "/items?key=secret"}, {"method": "TRACE"},
+    {"base_url": "https://user:pass@example.test"}, {"header_name": "X-Key\r\nInjected"},
+])
+def test_private_or_invalid_template_variables_are_rejected(variables):
+    with pytest.raises(ValueError):
+        normalize_connector_setup({"resource_kind": "custom_api", "template_id": "rest-bearer-token", "variables": variables})
+
+
+def test_known_public_configuration_survives_trusted_clarify_flow():
+    intent = {"resource_kind": "custom_api", "template_id": "rest-bearer-token",
+              "variables": {"base_url": "https://example.test", "endpoint_path": "/v1/items", "method": "GET"}}
+    def callback(question, choices, *, connector_setup):
+        assert connector_setup == intent
+        return '{"status":"submitted","target_id":"created-api"}'
+    assert json.loads(clarify_tool("ignored", connector_setup=intent, callback=callback))["status"] == "submitted"

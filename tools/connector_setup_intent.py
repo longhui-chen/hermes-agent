@@ -9,7 +9,7 @@ import re
 from urllib.parse import urlsplit
 
 _KINDS = ("custom_api", "custom_mcp", "saas", "camera", "printer3d", "tv", "pc_node")
-_FIELDS = {"resource_kind", "template_id", "provider_id", "url", "auth_kind"}
+_FIELDS = {"resource_kind", "template_id", "provider_id", "url", "auth_kind", "variables"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 CONNECTOR_SETUP_SCHEMA = {
@@ -21,14 +21,17 @@ CONNECTOR_SETUP_SCHEMA = {
         "provider_id": {"type": "string", "maxLength": 128},
         "url": {"type": "string", "maxLength": 2048},
         "auth_kind": {"type": "string", "enum": ["none", "bearer", "basic", "header"]},
+        "variables": {"type": "object", "additionalProperties": False, "maxProperties": 5,
+                      "properties": {key: {"type": "string", "maxLength": 2048} for key in
+                                     ("base_url", "endpoint_path", "method", "tool_name", "header_name")}},
     },
     "required": ["resource_kind"],
     "description": (
         "Optional Memo connector handoff. Ask the trusted client to collect only "
         "missing configuration in the current composer. Never put passwords, "
         "tokens, hardware addresses or serial numbers here. Custom API requires "
-        "a published template_id; SaaS requires provider_id. Only remote MCP may "
-        "include a credential-free URL. The client must support this interaction; "
+        "a published template_id; SaaS requires provider_id. Custom API variables may reuse known public URL/path/method/tool/header names; "
+        "never credentials. Remote MCP may include a credential-free URL. The client must support this interaction; "
         "otherwise the tool fails without asking the user to enter credentials. "
         "Do not ask for a secret in prose before this handoff."
     ),
@@ -39,7 +42,7 @@ def normalize_connector_setup(value: object) -> dict:
     """Reject unknown fields rather than forwarding arbitrary configuration."""
     if not isinstance(value, dict) or set(value) - _FIELDS:
         raise ValueError("connector_setup_invalid")
-    if any(not isinstance(item, str) for item in value.values()):
+    if any(not isinstance(item, str) for key, item in value.items() if key != "variables"):
         raise ValueError("connector_setup_invalid")
     kind = value.get("resource_kind")
     if kind not in _KINDS:
@@ -47,10 +50,12 @@ def normalize_connector_setup(value: object) -> dict:
     result = {"resource_kind": kind}
     allowed = {"resource_kind"}
     if kind == "custom_api":
-        allowed.add("template_id")
+        allowed.update(("template_id", "variables"))
         if not _ID.fullmatch(value.get("template_id", "")):
             raise ValueError("connector_setup_template_required")
         result["template_id"] = value["template_id"]
+        if "variables" in value:
+            result["variables"] = _normalize_variables(value["variables"])
     elif kind == "saas":
         allowed.add("provider_id")
         if not _ID.fullmatch(value.get("provider_id", "")):
@@ -77,6 +82,38 @@ def normalize_connector_setup(value: object) -> dict:
             result["auth_kind"] = value["auth_kind"]
     if set(value) - allowed:
         raise ValueError("connector_setup_invalid")
+    return result
+
+
+
+def _normalize_variables(raw: object) -> dict:
+    if not isinstance(raw, dict) or len(raw) > 5:
+        raise ValueError("connector_setup_variables_invalid")
+    result = {}
+    for key, value in raw.items():
+        valid = isinstance(value, str) and 0 < len(value) <= 2048 and not re.search(r"[\s\\]", value) and not any(ord(c) < 33 or ord(c) == 127 for c in value)
+        if not valid:
+            raise ValueError("connector_setup_variables_invalid")
+        if key == "base_url":
+            try:
+                url = urlsplit(value)
+                valid = url.scheme == "https" and url.hostname and not url.username and not url.password and not url.query and not url.fragment
+                _ = url.port
+            except ValueError:
+                valid = False
+        elif key == "endpoint_path":
+            valid = value.startswith("/") and "?" not in value and "#" not in value
+        elif key == "method":
+            valid = value in ("GET", "POST", "PUT", "PATCH", "DELETE")
+        elif key == "tool_name":
+            valid = re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value)
+        elif key == "header_name":
+            valid = re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,127}", value)
+        else:
+            valid = False
+        if not valid:
+            raise ValueError("connector_setup_variables_invalid")
+        result[key] = value
     return result
 
 
