@@ -1112,6 +1112,21 @@ def test_hardware_status_turn_strips_model_authored_enrollment_card():
     assert response == "摄像头在线，打印机当前会话未授权。"
 
 
+def test_direct_input_client_never_receives_legacy_enrollment_card():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    agent._zettlab_connector_direct_input = True
+    for original in (
+        "继续连接。",
+        '继续连接。\n```zettlab-hardware-enrollment-intent\n{"schema_version":"1","kind":"hardware","requested_types":["camera"]}\n```',
+    ):
+        response = response_mode.ensure_hardware_enrollment_intent(
+            agent, user_message="帮我连接摄像头", response_text=original,
+            completed=True, failed=False, interrupted=False, structured_output=False,
+        )
+        assert response == "继续连接。"
+
+
 def test_hardware_enrollment_fallback_ignores_non_app_and_failed_turns():
     agent = _FakeAgent()
     agent.platform = "telegram"
