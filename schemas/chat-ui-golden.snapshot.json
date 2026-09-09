@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "821dea8e5baff6dfae63f8a9a5c24b2ad74d6cfc",
-  "sha256": "ebbdd2f433896c06ddf4706d060958b6b97ac263eaaff43e618d989ea2d5b212",
+  "root_commit": "fd0461f8e73234f131fbb9cbb5452c5aa8cc44ef",
+  "sha256": "933562a845e1cfb30a451836aebf2021d8e93ed027dfb2b9fdbfe1ac69ad57be",
   "payload": {
     "golden": {
       "events": {
@@ -1582,6 +1582,7 @@
               "activity_id": "act_demo_0001",
               "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
               "turn_id": "turn_demo_0001",
+              "kind": "thinking",
               "status": "streaming",
               "updated_seq": 44,
               "last_fanout_seq": 9
@@ -2920,6 +2921,14 @@
             "required": true,
             "type": "string"
           },
+          "role": {
+            "required": true,
+            "type": "string"
+          },
+          "content": {
+            "required": true,
+            "type": "string"
+          },
           "updated_seq": {
             "required": false,
             "type": "number"
@@ -2954,6 +2963,14 @@
           },
           "turn_id": {
             "required": true,
+            "type": "string"
+          },
+          "kind": {
+            "required": true,
+            "type": "string"
+          },
+          "content": {
+            "required": false,
             "type": "string"
           },
           "created_seq": {
