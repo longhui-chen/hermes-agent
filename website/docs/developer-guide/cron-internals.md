@@ -74,6 +74,16 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 
 ### Backward Compatibility
 
+`cron.jobs.create_job(..., enabled=False)` publishes a job in the existing
+`paused` state in its first atomic store write. This is for callers that must
+finish binding an external policy before triggering execution; creating an active
+job and then pausing it is not equivalent. Omitted `enabled` retains the old
+scheduled behavior. Only booleans are accepted. Paused one-shots do not consume
+their repeat count when their planned time passes. After binding, use the existing
+explicit `trigger_job` operation for a newly confirmed relative observation;
+do not use it to silently move an expired absolute-time request. This internal
+argument is not yet exposed by the HTTP create endpoint or the model tool.
+
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
 ## Scheduler Runtime
