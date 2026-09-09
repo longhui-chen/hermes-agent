@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "04748d441e5c9fc20bb31cec76236ff115b4c4c1",
-  "sha256": "5167e26ae1b0160b4ef5a84b55f98f39b1bd4c384847cd23c4631b1c050c4ba9",
+  "root_commit": "df617b38251814064f6fb2409122e88f14a80fa1",
+  "sha256": "d1c50fd61eec8730a1e100274148667b9084c414f8bccb6407fc27576a85b253",
   "payload": {
     "golden": {
       "events": {
@@ -630,7 +630,9 @@
                 "path": "/sandbox/demo/uploads/attachment-1.pdf"
               }
             ],
-            "clarify": null
+            "clarify": null,
+            "reason": "",
+            "truncated": false
           }
         },
         "plan.preview": {
@@ -665,7 +667,8 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "text": "用户要剪 vlog，先确认时间范围。"
+            "text": "用户要剪 vlog，先确认时间范围。",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90"
           }
         },
         "search.result": {
@@ -957,6 +960,8 @@
                 "session_id": "sess_demo_0001",
                 "agent_id": "agent_demo_0001",
                 "turn_id": "turn_demo_0001",
+                "live_seq": 3,
+                "unsettled": false,
                 "started_at": 1756972800000,
                 "last_activity_at": 1756972801000,
                 "phase": "tool",
@@ -2211,6 +2216,10 @@
               "required": true,
               "type": "string"
             },
+            "reason": {
+              "required": false,
+              "type": "string"
+            },
             "session_id": {
               "required": false,
               "type": "string"
@@ -2218,6 +2227,10 @@
             "turn_id": {
               "required": false,
               "type": "string"
+            },
+            "truncated": {
+              "required": false,
+              "type": "boolean"
             }
           }
         },
@@ -2247,9 +2260,13 @@
           }
         },
         "reasoning.delta": {
-          "struct": "TextDeltaData",
+          "struct": "ReasoningDeltaData",
           "fields": {
             "text": {
+              "required": true,
+              "type": "string"
+            },
+            "item_id": {
               "required": true,
               "type": "string"
             }
