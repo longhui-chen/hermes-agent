@@ -220,6 +220,18 @@ execution limit, not permission to shorten a longer policy. A longer platform
 limit must be explicitly configured through existing runtime controls before use.
 An incomplete analysis or zero events is not proof of absence.
 
+The same command optionally accepts `--mode finite|periodic`; absence preserves
+the finite wire request. `--mode periodic --timeout-seconds 65` (tool timeout 75)
+executes one already-bound periodic policy round, using the device's original
+one-minute capture context. App/Web opt new jobs in only after the device declares
+`monitoring_periodic_observation`. Mode is not authorization: the original profile,
+running Cron identity, policy, Memo, camera grant and explicit visual-purpose
+checks still apply. The runner rejects unknown/duplicate modes and added job,
+duration or output arguments. It never changes a finite policy into a periodic
+one, retries a failed round, or launches a background worker. Supplemental frames
+are context, not extra matching claims; one round cannot prove absence between
+Cron triggers.
+
 To verify the actual Presets helper against this runner, set
 `HERMES_TEST_CAMERA_PRESETS_SOURCE` to its source file and run
 `scripts/run_tests.sh tests/tools/test_terminal_camera_semantic_runner.py -q`.

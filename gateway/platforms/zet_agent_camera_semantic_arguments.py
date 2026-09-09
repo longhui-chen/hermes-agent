@@ -11,7 +11,8 @@ def semantic_arguments_allowed(arguments: list[str]) -> bool:
         return False
     if arguments[0] == "observe":
         return (
-            set(fields) == {"--policy-id", "--timeout-seconds"}
+            set(fields) in ({"--policy-id", "--timeout-seconds"}, {"--policy-id", "--timeout-seconds", "--mode"})
+            and fields.get("--mode", "finite") in {"finite", "periodic"}
             and re.fullmatch(r"[1-9][0-9]{0,9}", fields["--timeout-seconds"]) is not None
             and int(fields["--timeout-seconds"]) <= 2**31 - 1
             and semantic_arguments_allowed(["candidate", "--policy-id", fields["--policy-id"]])

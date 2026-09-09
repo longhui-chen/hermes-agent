@@ -52,16 +52,18 @@ def runtime(monkeypatch, tmp_path):
         reset_secret_scope(token)
 
 
-def test_terminal_semantic_flow_uses_private_fds(runtime):
+@pytest.mark.parametrize("periodic", [False, True])
+def test_terminal_semantic_flow_uses_private_fds(runtime, periodic):
     from types import SimpleNamespace
     from agent.zet_agent_response_mode import trusted_skill_operation_block_message
 
     profile, _ = runtime
+    command = COMMAND.replace(" candidate ", " observe ") + " --mode periodic --timeout-seconds 65" if periodic else COMMAND
     with execution_scope("job-a", "run-a", profile):
         assert trusted_skill_operation_block_message(
-            SimpleNamespace(), function_name="terminal", function_args={"command": COMMAND}
+            SimpleNamespace(), function_name="terminal", function_args={"command": command}
         ) is None
-        result = json.loads(terminal.terminal_tool(command=COMMAND, task_id="semantic-fd-flow"))
+        result = json.loads(terminal.terminal_tool(command=command, timeout=75, task_id="semantic-fd-flow"))
     assert result["camera_runtime_direct"] is True
     assert result["exit_code"] == 0
     payload = json.loads(result["output"])
@@ -74,15 +76,17 @@ def test_terminal_semantic_flow_uses_private_fds(runtime):
 
 
 @pytest.mark.parametrize("scope_kind", ["missing", "wrong-profile"])
-def test_runner_rejects_missing_or_mismatched_task(runtime, monkeypatch, scope_kind):
+@pytest.mark.parametrize("periodic", [False, True])
+def test_runner_rejects_missing_or_mismatched_task(runtime, monkeypatch, scope_kind, periodic):
     profile, _ = runtime
     monkeypatch.setenv("ZETTLAB_CAMERA_JOB_ID", "job-a")
     monkeypatch.setenv("ZETTLAB_CAMERA_EXECUTION_ID", "run-a")
+    command = COMMAND.replace(" candidate ", " observe ") + " --mode periodic --timeout-seconds 65" if periodic else COMMAND
     if scope_kind == "missing":
-        result = terminal._run_camera_runtime_command_if_allowed(COMMAND, cwd=str(profile), timeout=5)
+        result = terminal._run_camera_runtime_command_if_allowed(command, cwd=str(profile), timeout=75)
     else:
         with execution_scope("job-a", "run-a", Path("/wrong-profile")):
-            result = terminal._run_camera_runtime_command_if_allowed(COMMAND, cwd=str(profile), timeout=5)
+            result = terminal._run_camera_runtime_command_if_allowed(command, cwd=str(profile), timeout=75)
     assert json.loads(result)["exit_code"] == -1
 
 
@@ -366,13 +370,17 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_
             result = json.loads(terminal.terminal_tool(command=commit, task_id="real-presets-commit"))
             assert result["exit_code"] == 0, result
             assert json.loads(result["output"]) == {"data": {"matched": matched}}
-            observe = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds 590"
-            observed = json.loads(terminal.terminal_tool(command=observe, timeout=600, task_id="real-presets-observe"))
-            assert observed["exit_code"] == (2 if observation_failure else 0), observed
-            assert json.loads(observed["output"]) == {"data": {
-                "analysis_complete": not observation_failure, "analysis": {"unknown_batches": 1, "created_events": 0},
-            }}
-        assert len(requests) == 3
+            for mode in (None, "finite", "periodic"):
+                budget = 65 if mode == "periodic" else 590
+                observe = COMMAND.replace(" candidate ", " observe ") + f" --timeout-seconds {budget}"
+                if mode:
+                    observe += f" --mode {mode}"
+                observed = json.loads(terminal.terminal_tool(command=observe, timeout=budget + 10, task_id="real-presets-observe"))
+                assert observed["exit_code"] == (2 if observation_failure else 0), observed
+                assert json.loads(observed["output"]) == {"data": {
+                    "analysis_complete": not observation_failure, "analysis": {"unknown_batches": 1, "created_events": 0},
+                }}
+        assert len(requests) == 5
         for path, body, bearer in requests:
             assert path.startswith("/api/v1/agent/hardware-connectors/cameras/semantic-")
             assert body["job_id"] == "job-a" and body["execution_id"] == "run-a"
@@ -381,10 +389,14 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_
             "job_id": "job-a", "execution_id": "run-a", "capability": capability,
             "verdict": verdict,
         }
-        assert requests[2][1] == {
-            "policy_id": "12345678-1234-1234-1234-123456789abc",
-            "execution_timeout_seconds": 590, "job_id": "job-a", "execution_id": "run-a",
-        }
+        for (path, body, _), mode in zip(requests[2:], (None, "finite", "periodic")):
+            assert path.endswith("/semantic-observations")
+            assert body == {
+                "policy_id": "12345678-1234-1234-1234-123456789abc",
+                "execution_timeout_seconds": 65 if mode == "periodic" else 590,
+                "job_id": "job-a", "execution_id": "run-a",
+                **({"mode": mode} if mode else {}),
+            }
         assert terminal._CONNECTOR_RUNTIME_ROOT_ANCHOR.file_digests[SCRIPT] == hashlib.sha256(raw).hexdigest()
     finally:
         reset_secret_scope(token)
