@@ -8595,6 +8595,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["app_slug"] = app_slug
             if import_operation is not None:
                 kwargs["import_operation"] = import_operation
+            # zettlab-overlay(ac432-paused-create): forward optional initial scheduling state; upstream: none
+            if "enabled" in body:
+                kwargs["enabled"] = body["enabled"]
 
             if _cron_job_requires_live_chat_authorization(skills):
                 return web.json_response(

@@ -81,8 +81,11 @@ job and then pausing it is not equivalent. Omitted `enabled` retains the old
 scheduled behavior. Only booleans are accepted. Paused one-shots do not consume
 their repeat count when their planned time passes. After binding, use the existing
 explicit `trigger_job` operation for a newly confirmed relative observation;
-do not use it to silently move an expired absolute-time request. This internal
-argument is not yet exposed by the HTTP create endpoint or the model tool.
+do not use it to silently move an expired absolute-time request. The HTTP create
+endpoint accepts the optional boolean with the same semantics; the model tool
+does not expose it. Clients must verify `enabled:false` and `state:paused` in the
+creation response before binding and triggering, because older servers may ignore
+the optional field. A Cron state is never a resource/vision authorization grant.
 
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
