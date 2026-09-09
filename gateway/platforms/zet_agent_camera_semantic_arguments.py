@@ -32,13 +32,16 @@ def semantic_arguments_allowed(arguments: list[str]) -> bool:
     if (
         fields.get("--matched") != "true"
         or not required <= fields.keys()
-        or fields.keys() - required - {"--subject-ref", "--zone-id", "--frame-states", "--track-ids"}
+        or fields.keys() - required - {"--subject-ref", "--zone-id", "--frame-states", "--track-ids", "--frame-positions", "--view-aligned"}
         or fields["--subject-kind"] not in {"person", "object"}
         or fields["--predicate"] not in {"appears", "disappears", "enters_zone", "leaves_zone", "lingers"}
         or re.fullmatch(r"[0-9]{1,4}", fields["--duration-seconds"]) is None
         or int(fields["--duration-seconds"]) > 3600
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", fields["--evidence-ref"]) is None
     ):
+        return False
+    geometry = "--frame-positions" in fields or "--view-aligned" in fields
+    if geometry and (not fields.get("--zone-id") or "--frame-states" not in fields or "--track-ids" not in fields):
         return False
     if "--frame-states" in fields or "--track-ids" in fields:
         states = fields.get("--frame-states", "").split(",")
@@ -49,6 +52,17 @@ def semantic_arguments_allowed(arguments: list[str]) -> bool:
             or any(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", track) is None for track in tracks)
         ):
             return False
+        if geometry:
+            positions = fields.get("--frame-positions", "")
+            aligned = fields.get("--view-aligned", "")
+            if len(positions) > 200 or len(aligned) > 48:
+                return False
+            positions, aligned = positions.split(","), aligned.split(",")
+            coordinate = r"(?:0(?:\.[0-9]{1,9})?|1(?:\.0{1,9})?)"
+            if (len(positions) != len(states) or len(aligned) != len(states)
+                    or any(value not in {"true", "false"} for value in aligned)
+                    or any(point != "null" and re.fullmatch(coordinate + ":" + coordinate, point) is None for point in positions)):
+                return False
     return all(
         len(fields.get(key, "").encode("utf-8")) <= limit
         and not any(ord(c) < 0x20 for c in fields.get(key, ""))

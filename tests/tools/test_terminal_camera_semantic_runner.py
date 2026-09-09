@@ -110,6 +110,21 @@ def test_candidate_and_commit_have_separate_parameter_allowlists(runtime):
     assert terminal._parse_camera_runtime_command(positive + proof + " --unknown true") is None
 
 
+def test_zone_coordinate_arguments_remain_bounded(runtime):
+    base = f'python3 "$ZETTLAB_PRESETS_DIR/{SCRIPT}" commit --capability ' + "a" * 32
+    base += " --matched true --subject-kind person --predicate enters_zone --duration-seconds 0 --evidence-ref frame-a --zone-id door"
+    temporal = " --frame-states unknown,present,present,present --track-ids t,t,t,t"
+    geometry = " --frame-positions null,0.1:0.2,0.5:0.6,1:1 --view-aligned false,true,true,true"
+    assert terminal._parse_camera_runtime_command(base + temporal + geometry) is not None
+    for invalid in [geometry.replace("0.1:0.2", "nan:0"), geometry.replace("1:1", "1.01:1"),
+                    geometry.replace("null,", ""), geometry.replace("false,", ""),
+                    geometry.replace("false", "yes"), geometry.split(" --view-aligned")[0],
+                    geometry + " --output /tmp/escape"]:
+        assert terminal._parse_camera_runtime_command(base + temporal + invalid) is None
+    assert terminal._parse_camera_runtime_command(base + geometry) is None
+    assert terminal._parse_camera_runtime_command(base.replace(" --zone-id door", "") + temporal + geometry) is None
+
+
 @pytest.mark.parametrize("budget", ["0", "-1", "nan", "2.5", "2147483648", "01"])
 def test_observation_parser_rejects_invalid_budget(runtime, budget):
     command = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds " + budget
@@ -258,7 +273,8 @@ def test_real_middleware_preserves_semantic_runner_authorization(runtime, monkey
 
 @pytest.mark.parametrize("matched", [False, True])
 @pytest.mark.parametrize("observation_failure", [False, True])
-def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_failure):
+@pytest.mark.parametrize("zone", [False, True])
+def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_failure, zone):
     """Opt-in cross-repo contract flow; never substitute an embedded helper.
 
     Run with HERMES_TEST_CAMERA_PRESETS_SOURCE pointing at the Presets
@@ -283,6 +299,9 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_
     image = b"\xff\xd8fixture-media\xff\xd9"
     capability = "c" * 48
     times = [f"2026-09-07T12:00:{second:02d}Z" for second in (0, 4, 8, 12)]
+    zone_context = {"reference": {"x": 0, "y": 0, "width": 960, "height": 540},
+                    "frames": [{"x": (i % 2) * 960, "y": 960 + (i // 2) * 960, "width": 960, "height": 540} for i in range(4)],
+                    "polygon": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1}]}
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -296,9 +315,11 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_
                 data = {
                     "capability": capability, "evidence_ref": "window-frame-0.jpg",
                     "frame_times": times, "subject_kind": "person", "subject_ref": "",
-                    "predicate": "lingers", "zone_id": "", "min_duration_seconds": 10,
+                    "predicate": "lingers", "zone_id": "door" if zone else "", "min_duration_seconds": 10,
                     "image_data_uri": "data:image/jpeg;base64," + base64.b64encode(image).decode(),
                 }
+                if zone:
+                    data["zone_context"] = zone_context
             elif self.path.endswith("/semantic-observations"):
                 data = {"analysis_complete": not observation_failure, "analysis": {"unknown_batches": 1, "created_events": 0}}
             else:
@@ -327,6 +348,8 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_
             assert attachment.stat().st_mode & 0o777 == 0o600
             assert data["frame_times"] == times
             assert "image_data_uri" not in data
+            if zone:
+                assert data["zone_context"] == zone_context
             verdict = {"matched": matched}
             commit = f'python3 "$ZETTLAB_PRESETS_DIR/{SCRIPT}" commit --capability {data["capability"]} --matched {str(matched).lower()}'
             if matched:
@@ -335,6 +358,11 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_
                 verdict.update(subject_kind="person", subject_ref="", predicate="lingers",
                                zone_id="", duration_seconds=12, evidence_ref=data["evidence_ref"])
                 verdict["frames"] = [{"state": "present", "track_id": "t"} for _ in range(4)]
+                if zone:
+                    commit += " --zone-id door --frame-positions 0.1:0.2,0.1:0.2,0.1:0.2,0.1:0.2 --view-aligned true,true,true,true"
+                    verdict["zone_id"] = "door"
+                    for frame in verdict["frames"]:
+                        frame.update(position={"x": 0.1, "y": 0.2}, view_aligned=True)
             result = json.loads(terminal.terminal_tool(command=commit, task_id="real-presets-commit"))
             assert result["exit_code"] == 0, result
             assert json.loads(result["output"]) == {"data": {"matched": matched}}
