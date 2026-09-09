@@ -8,6 +8,7 @@ by weak models (deepseek-v4-flash, 2026-07-13).
 """
 from __future__ import annotations
 
+import queue
 import threading
 
 import pytest
@@ -620,6 +621,22 @@ class TestSteerClosedWindow:
         # 关闭后拒收 —— 端点据此回 rejected/not_running，LS 转 dropped。
         assert agent.steer("late") is False
         assert agent._pending_steer is None
+
+    def test_bound_closing_drain_keeps_empty_slot_for_interrupt_cleanup(self):
+        agent = _bare_agent()
+        agent._steer_admission_hook = _SteerProducer(
+            agent,
+            turn_id="turn-1",
+            stream_q=queue.Queue(),
+            binding_token=object(),
+            accepted_sender=lambda _payload: None,
+            terminal_sender=lambda _payload: None,
+            stream_backlog_max=2000,
+        )
+
+        assert agent._drain_pending_steer(close=True) is None
+        agent.clear_interrupt()
+        assert agent._pending_steer == []
 
     def test_plain_drain_keeps_slot_open(self):
         agent = _bare_agent()
