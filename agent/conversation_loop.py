@@ -4815,6 +4815,10 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                # zettlab-overlay(U2d-error): return failed provider batch before retry; upstream: none
+                _steer_hook = getattr(agent, "_steer_admission_hook", None)
+                if callable(getattr(_steer_hook, "on_provider_failed", None)):
+                    _steer_hook.on_provider_failed()
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:

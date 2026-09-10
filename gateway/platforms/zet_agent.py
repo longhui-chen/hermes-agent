@@ -311,8 +311,22 @@ class _SteerProducer:
         self.provider_entered = bool(self.inflight)
 
     def on_provider_failed(self) -> None:
-        """Return the current provider batch to the terminal drop path."""
-        self.provider_entered = False
+        """Return the failed provider batch to retry or terminal close."""
+        with self.agent._pending_steer_lock:
+            if self.inflight:
+                pending = (
+                    list(self.agent._pending_steer)
+                    if isinstance(self.agent._pending_steer, list)
+                    else []
+                )
+                self.agent._pending_steer = [*self.inflight, *pending]
+                self.pending_bytes = sum(
+                    _steer_item_size(*item)
+                    for item in self.agent._pending_steer
+                    if item[0]
+                )
+                self.inflight = []
+            self.provider_entered = False
 
     def consumed(self) -> bool:
         return bool(self.inflight and self.provider_entered)
