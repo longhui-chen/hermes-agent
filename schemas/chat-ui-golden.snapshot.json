@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "ab586fca17d76a95b9009c7deb23bbbb798fa377",
-  "sha256": "599a0e8877871d52e61cbf87a013fd434b9ea1a5baffea0c61eb88fef766e508",
+  "root_commit": "a3d10b6d78c12b265937d8c0a1808549ac022944",
+  "sha256": "7ba3abd01660baf70232977123e2b87f24a52cbb441e5b0d727b6cb57b383647",
   "payload": {
     "golden": {
       "events": {
@@ -1631,7 +1631,6 @@
           "agent_id": "agent_demo_0001",
           "session_id": "sess_demo_0001",
           "snapshot_seq": 41,
-          "truncated": false,
           "next_since": {
             "updated_seq": 41,
             "row_key": "ma:7"
@@ -1639,7 +1638,6 @@
           "active_turn": {
             "turn_id": "turn_demo_0003",
             "live_seq": 0,
-            "unsettled": false,
             "started_at": 1756972800000
           },
           "messages": [
@@ -1648,15 +1646,19 @@
               "turn_id": "turn_demo_0003",
               "role": "assistant",
               "content": "",
-              "status": "streaming",
-              "last_fanout_seq": 0
+              "status": "streaming"
             }
           ]
         },
         "session-history.tail.registry-evicted": {
           "agent_id": "agent_demo_0001",
           "session_id": "sess_demo_0001",
+          "snapshot_seq": 52,
           "truncated": true,
+          "next_since": {
+            "updated_seq": 52,
+            "row_key": "ma:11"
+          },
           "active_turn": {
             "turn_id": "turn_demo_0004",
             "unsettled": true,
@@ -3217,7 +3219,13 @@
           },
           "status": {
             "required": false,
-            "type": "string"
+            "type": "string",
+            "literals": [
+              "done",
+              "error",
+              "aborted",
+              "streaming"
+            ]
           },
           "steer": {
             "required": false,
