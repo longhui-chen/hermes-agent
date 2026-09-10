@@ -271,6 +271,7 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+# zettlab-overlay(H4-B2b): 计划模式工具拦截与硬件助手作用域文案，B2b 删除; upstream: none
 def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args: dict) -> Optional[str]:
     """Block legacy markdown plan-mode paths in Zettlab App sessions."""
     if (getattr(agent, "platform", "") or "") != "zet_agent":
@@ -526,6 +527,7 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            # zettlab-overlay(H4-B2b): 工具执行前套用计划模式拦截，B2b 删除; upstream: none
             block_message = _zet_agent_plan_mode_block_message(
                 agent, function_name, final_args
             )
@@ -607,6 +609,7 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
+        # zettlab-overlay(H4-B2b): 工具分发期连接器路由能力仅在本次调用内可见（附录 H 归属待 B2b 复核）; upstream: none
         # The dispatch is the narrowest common boundary for sequential and
         # concurrent tool execution.  Keep the fallback private to this call:
         # the trusted connector runner may read it, but middleware, the model,
@@ -1822,6 +1825,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+        # zettlab-overlay(H4-B2b): 顺序路径 present_plan 分发与播种元数据，B2b 删除; upstream: none
         elif function_name == "present_plan":
             from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta
 

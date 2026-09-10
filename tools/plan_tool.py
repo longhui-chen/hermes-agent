@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# zettlab-overlay(H1-B2b): present_plan 计划卡工具整文件为 fork 新增，B2b 删文件; upstream: none
 """
 Plan Tool Module - Structured Plan Presentation
 
