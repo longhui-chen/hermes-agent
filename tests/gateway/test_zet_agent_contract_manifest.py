@@ -7,6 +7,7 @@ means a stale, hand-edited JSON file cannot make the contract job green.
 """
 
 import json
+import os
 from pathlib import Path
 
 
@@ -20,6 +21,10 @@ PRODUCER_FILES = (
 def test_manifest_is_pinned_to_committed_golden_snapshot():
     manifest = json.loads((ROOT / "schemas/chat-ui.manifest.json").read_text())
     snapshot = json.loads((ROOT / "schemas/chat-ui-golden.snapshot.json").read_text())
+    update = os.environ.get("CHAT_UI_MANIFEST_UPDATE") == "1"
+    if update:
+        # Refresh provenance only; producer facts below must validate before writing.
+        manifest["snapshot_sha256"] = snapshot["sha256"]
     hermes = manifest["hermes"]
     golden = snapshot["payload"]["golden"]["hermes"]
     assert manifest["manifest_version"] == 1
@@ -46,4 +51,9 @@ def test_manifest_is_pinned_to_committed_golden_snapshot():
         golden_keys = set(golden[payload_type])
         assert declared_keys <= golden_keys, (
             f"manifest fields for {payload_type} are not covered by its golden sample"
+        )
+
+    if update:
+        (ROOT / "schemas/chat-ui.manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
         )

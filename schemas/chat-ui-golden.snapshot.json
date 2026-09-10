@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "a684bbcf020cab51eb8cb6629c37796ddb31fdbc",
-  "sha256": "933562a845e1cfb30a451836aebf2021d8e93ed027dfb2b9fdbfe1ac69ad57be",
+  "root_commit": "04e9bd74bfcf5ff54a7f1700298d435cf2a9fbdd",
+  "sha256": "7708021ed30255d5788f5cc25d6103d02ab5132d73986acbfd88073f9fb82812",
   "payload": {
     "golden": {
       "events": {
@@ -1574,12 +1574,13 @@
           "active_turn": {
             "turn_id": "turn_demo_0001",
             "live_seq": 9,
-            "unsettled": true
+            "unsettled": true,
+            "started_at": 1756972800000
           },
           "messages": [],
           "activities": [
             {
-              "activity_id": "act_demo_0001",
+              "activity_id": 40,
               "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
               "turn_id": "turn_demo_0001",
               "kind": "thinking",
@@ -1593,7 +1594,6 @@
         "session-history.tail": {
           "agent_id": "agent_demo_0001",
           "session_id": "sess_demo_0001",
-          "snapshot_seq": 42,
           "next_since": {
             "updated_seq": 41,
             "row_key": "ma:7"
@@ -1603,7 +1603,8 @@
             "live_seq": 7,
             "phase": "tool",
             "tool_name": "search_files",
-            "unsettled": false
+            "unsettled": false,
+            "started_at": 1756972800000
           },
           "messages": [
             {
@@ -1612,30 +1613,24 @@
               "role": "assistant",
               "content": "好的，我先找出上周末的视频。",
               "status": "streaming",
-              "updated_seq": 41,
               "last_fanout_seq": 2
-            }
-          ],
-          "activities": [
+            },
             {
-              "activity_id": "act_demo_0001",
-              "call_id": "thinking:0",
-              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "id": 7,
               "turn_id": "turn_demo_0001",
-              "kind": "thinking",
-              "content": "用户要剪 vlog，先确认时间范围。",
+              "role": "assistant",
+              "content": "",
+              "reasoning": "用户要剪 vlog，先确认时间范围。",
               "status": "streaming",
-              "created_seq": 40,
-              "updated_seq": 40,
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
               "last_fanout_seq": 3
             }
-          ],
-          "truncated": false
+          ]
         },
         "session-history.turn-activities": {
           "activities": [
             {
-              "activity_id": "act_demo_0001",
+              "activity_id": 40,
               "call_id": "thinking:0",
               "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
               "turn_id": "turn_demo_0001",
@@ -2750,14 +2745,172 @@
       }
     },
     "http": {
-      "$comment": "HTTP response fields for BP U3a. Shapes are derived from SessionHistoryResponse and its nested row/active-turn types; all additions are optional on existing /history responses.",
-      "session-history.tail": {
-        "response": {
-          "agent_id": {
+      "$comment": "HTTP DTO facts derived from local-server service types: tail uses the existing response and SessionMessage; delta and turn-activities declare U3b shapes without implementing endpoints.",
+      "active_turn": {
+        "fields": {
+          "live_seq": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          },
+          "phase": {
+            "required": false,
+            "type": "string"
+          },
+          "started_at": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          },
+          "tool_name": {
+            "required": false,
+            "type": "string"
+          },
+          "turn_id": {
             "required": true,
             "type": "string"
           },
-          "session_id": {
+          "unsettled": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "activity_row": {
+        "fields": {
+          "activity_id": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          },
+          "call_id": {
+            "required": false,
+            "type": "string"
+          },
+          "content": {
+            "required": false,
+            "type": "string"
+          },
+          "created_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "item_id": {
+            "required": false,
+            "type": "string",
+            "nullable": true
+          },
+          "kind": {
+            "required": true,
+            "type": "string"
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "status": {
+            "required": true,
+            "type": "string",
+            "literals": [
+              "streaming",
+              "running",
+              "success",
+              "error",
+              "aborted",
+              "done",
+              "superseded",
+              "accepted"
+            ]
+          },
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "updated_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          }
+        }
+      },
+      "message_row": {
+        "fields": {
+          "content": {
+            "required": true,
+            "type": "string"
+          },
+          "id": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "role": {
+            "required": true,
+            "type": "string"
+          },
+          "status": {
+            "required": false,
+            "type": "string",
+            "literals": [
+              "done",
+              "error",
+              "aborted",
+              "streaming"
+            ]
+          },
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "updated_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "visible": {
+            "required": false,
+            "type": "boolean",
+            "nullable": true
+          }
+        }
+      },
+      "next_since": {
+        "fields": {
+          "row_key": {
+            "required": true,
+            "type": "string"
+          },
+          "updated_seq": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          }
+        }
+      },
+      "session-history.delta": {
+        "response": {
+          "active_turn": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "activities": {
+            "required": true,
+            "type": "array"
+          },
+          "agent_id": {
             "required": true,
             "type": "string"
           },
@@ -2769,41 +2922,41 @@
             "required": false,
             "type": "boolean"
           },
-          "oldest_id": {
-            "required": false,
-            "type": "number"
-          },
           "has_more_newer": {
             "required": false,
             "type": "boolean"
-          },
-          "newest_id": {
-            "required": false,
-            "type": "number"
           },
           "history_truncated": {
             "required": false,
             "type": "boolean"
           },
-          "snapshot_seq": {
-            "required": false,
-            "type": "number"
-          },
-          "next_since": {
-            "required": false,
-            "type": "object"
-          },
-          "active_turn": {
-            "required": false,
-            "type": "object"
-          },
           "messages": {
             "required": true,
             "type": "array"
           },
-          "activities": {
+          "newest_id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "next_since": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "oldest_id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "session_id": {
             "required": true,
-            "type": "array"
+            "type": "string"
+          },
+          "snapshot_seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
           },
           "truncated": {
             "required": false,
@@ -2811,13 +2964,14 @@
           }
         }
       },
-      "session-history.delta": {
+      "session-history.tail": {
         "response": {
-          "agent_id": {
-            "required": true,
-            "type": "string"
+          "active_turn": {
+            "required": false,
+            "type": "object",
+            "nullable": true
           },
-          "session_id": {
+          "agent_id": {
             "required": true,
             "type": "string"
           },
@@ -2829,45 +2983,36 @@
             "required": false,
             "type": "boolean"
           },
-          "oldest_id": {
-            "required": false,
-            "type": "number"
-          },
           "has_more_newer": {
             "required": false,
             "type": "boolean"
-          },
-          "newest_id": {
-            "required": false,
-            "type": "number"
           },
           "history_truncated": {
             "required": false,
             "type": "boolean"
           },
-          "snapshot_seq": {
-            "required": false,
-            "type": "number"
-          },
-          "next_since": {
-            "required": false,
-            "type": "object"
-          },
-          "active_turn": {
-            "required": false,
-            "type": "object"
-          },
           "messages": {
             "required": true,
             "type": "array"
           },
-          "activities": {
-            "required": true,
-            "type": "array"
-          },
-          "truncated": {
+          "newest_id": {
             "required": false,
-            "type": "boolean"
+            "type": "number",
+            "integer": true
+          },
+          "next_since": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "oldest_id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "session_id": {
+            "required": true,
+            "type": "string"
           }
         }
       },
@@ -2887,107 +3032,160 @@
           }
         }
       },
-      "active_turn": {
+      "tail_message_row": {
         "fields": {
-          "turn_id": {
+          "activity_text_boundaries": {
+            "required": false,
+            "type": "array"
+          },
+          "app_element": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "attachments": {
+            "required": false,
+            "type": "array"
+          },
+          "browser_turn_summary": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "chat_attachments": {
+            "required": false,
+            "type": "array"
+          },
+          "clarify": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "clarify_id": {
+            "required": false,
+            "type": "string"
+          },
+          "content": {
             "required": true,
             "type": "string"
           },
-          "live_seq": {
+          "context_compaction": {
             "required": false,
-            "type": "number"
+            "type": "object",
+            "nullable": true
           },
-          "phase": {
+          "delegation_summary": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "error": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "goal_id": {
             "required": false,
             "type": "string"
           },
-          "tool_name": {
+          "goal_round": {
             "required": false,
-            "type": "string"
+            "type": "number",
+            "integer": true
           },
-          "unsettled": {
-            "required": false,
-            "type": "boolean"
-          }
-        }
-      },
-      "message_row": {
-        "fields": {
           "id": {
-            "required": true,
-            "type": "number"
+            "required": false,
+            "type": "number",
+            "integer": true
           },
-          "turn_id": {
-            "required": true,
+          "item_id": {
+            "required": false,
+            "type": "string"
+          },
+          "kind": {
+            "required": false,
+            "type": "string"
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "media": {
+            "required": false,
+            "type": "array"
+          },
+          "plan_preview": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "produced_files": {
+            "required": false,
+            "type": "array"
+          },
+          "quoted": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "quotes": {
+            "required": false,
+            "type": "array"
+          },
+          "reasoning": {
+            "required": false,
             "type": "string"
           },
           "role": {
             "required": true,
             "type": "string"
           },
-          "content": {
-            "required": true,
+          "search_result": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "separator": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "skill_slug": {
+            "required": false,
             "type": "string"
-          },
-          "updated_seq": {
-            "required": false,
-            "type": "number"
-          },
-          "visible": {
-            "required": false,
-            "type": "boolean"
-          },
-          "last_fanout_seq": {
-            "required": false,
-            "type": "number"
           },
           "status": {
             "required": false,
             "type": "string"
-          }
-        }
-      },
-      "activity_row": {
-        "fields": {
-          "activity_id": {
-            "required": false,
-            "type": "string"
           },
-          "call_id": {
+          "steer": {
             "required": false,
-            "type": "string"
+            "type": "object",
+            "nullable": true
           },
-          "item_id": {
+          "todo_list": {
             "required": false,
-            "type": "string"
+            "type": "object",
+            "nullable": true
+          },
+          "tool_call": {
+            "required": false,
+            "type": "object",
+            "nullable": true
           },
           "turn_id": {
-            "required": true,
-            "type": "string"
-          },
-          "kind": {
-            "required": true,
-            "type": "string"
-          },
-          "content": {
             "required": false,
             "type": "string"
           },
-          "created_seq": {
+          "ui_hint": {
             "required": false,
-            "type": "number"
-          },
-          "updated_seq": {
-            "required": false,
-            "type": "number"
-          },
-          "last_fanout_seq": {
-            "required": false,
-            "type": "number"
-          },
-          "status": {
-            "required": true,
-            "type": "string"
+            "type": "any"
           }
         }
       }
@@ -3184,6 +3382,35 @@
           }
         }
       }
+    },
+    "fixture_relations": {
+      "version": 1,
+      "segments": [
+        {
+          "turn_id": "turn_demo_0001",
+          "segment_key": "reasoning-1",
+          "live": [
+            {
+              "sample": "reasoning.delta"
+            }
+          ],
+          "history": [
+            {
+              "sample": "session-history.tail",
+              "pointer": "/messages/1",
+              "representation": "message"
+            },
+            {
+              "sample": "session-history.delta",
+              "pointer": "/activities/0"
+            },
+            {
+              "sample": "session-history.turn-activities",
+              "pointer": "/activities/0"
+            }
+          ]
+        }
+      ]
     }
   }
 }
