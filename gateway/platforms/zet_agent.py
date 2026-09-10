@@ -310,6 +310,10 @@ class _SteerProducer:
     def on_provider_entered(self) -> None:
         self.provider_entered = bool(self.inflight)
 
+    def on_provider_failed(self) -> None:
+        """Return the current provider batch to the terminal drop path."""
+        self.provider_entered = False
+
     def consumed(self) -> bool:
         return bool(self.inflight and self.provider_entered)
 
