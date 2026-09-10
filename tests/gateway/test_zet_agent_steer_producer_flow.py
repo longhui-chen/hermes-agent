@@ -124,6 +124,50 @@ def test_interrupt_preserves_unconsumed_inflight_for_terminal_drop():
     assert items[-1][1]["steer_id"] == steer_id
 
 
+def test_provider_error_reclaims_inflight_for_terminal_drop():
+    agent = _agent()
+    stream_q = queue.Queue()
+    ZetAgentAdapter._bind_steer_producer(agent, turn_id="turn-1", stream_q=stream_q)
+    steer_id = agent._zettlab_admit_steer("provider error", "turn-1")["steer_id"]
+    messages = [{"role": "tool", "content": "done", "tool_call_id": "c"}]
+
+    drain_steer_for_next_api_call(agent, messages)
+    agent._steer_admission_hook.on_provider_entered()
+    agent._steer_admission_hook.on_provider_failed()
+    assert agent._drain_pending_steer(close=True) is None
+
+    items = _payloads(stream_q)
+    assert [item[1]["type"] for item in items] == [
+        "steer_accepted",
+        "steer_dropped",
+    ]
+    assert items[-1][1]["steer_id"] == steer_id
+
+
+def test_provider_error_retry_preserves_identity_until_terminal_drop():
+    agent = _agent()
+    stream_q = queue.Queue()
+    ZetAgentAdapter._bind_steer_producer(agent, turn_id="turn-1", stream_q=stream_q)
+    steer_id = agent._zettlab_admit_steer("retry me", "turn-1")["steer_id"]
+    messages = [{"role": "tool", "content": "done", "tool_call_id": "c"}]
+
+    drain_steer_for_next_api_call(agent, messages)
+    agent._steer_admission_hook.on_provider_entered()
+    agent._steer_admission_hook.on_provider_failed()
+    assert agent._pending_steer == [(steer_id, "retry me")]
+
+    drain_steer_for_next_api_call(agent, messages)
+    agent._steer_admission_hook.on_provider_failed()
+    assert agent._drain_pending_steer(close=True) is None
+
+    items = _payloads(stream_q)
+    assert [item[1]["type"] for item in items] == [
+        "steer_accepted",
+        "steer_dropped",
+    ]
+    assert items[-1][1]["steer_id"] == steer_id
+
+
 def test_reclaim_keeps_identity_when_joined_text_shape_differs():
     agent = _agent()
     stream_q = queue.Queue()

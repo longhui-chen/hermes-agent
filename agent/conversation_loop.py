@@ -3755,6 +3755,10 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    # zettlab-overlay(U2d-error): reset named steer on provider failure; upstream: none
+                    _steer_hook = getattr(agent, "_steer_admission_hook", None)
+                    if callable(getattr(_steer_hook, "on_provider_failed", None)):
+                        _steer_hook.on_provider_failed()
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -4811,6 +4815,10 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                # zettlab-overlay(U2d-error): return failed provider batch before retry; upstream: none
+                _steer_hook = getattr(agent, "_steer_admission_hook", None)
+                if callable(getattr(_steer_hook, "on_provider_failed", None)):
+                    _steer_hook.on_provider_failed()
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -8886,6 +8894,12 @@ def run_conversation(
             _hit_api = bool(tb_module_names & _API_CALL_MODULES)
 
             _is_local_processing_error = _hit_local and not _hit_api
+
+            if not _is_local_processing_error:
+                # zettlab-overlay(U2d-error): reset named steer on provider exception; upstream: none
+                _steer_hook = getattr(agent, "_steer_admission_hook", None)
+                if callable(getattr(_steer_hook, "on_provider_failed", None)):
+                    _steer_hook.on_provider_failed()
 
             if _is_local_processing_error:
                 error_msg = (
