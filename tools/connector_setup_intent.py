@@ -8,6 +8,8 @@ import json
 
 # zettlab-overlay(ac432-observation-intent): delegate camera proposal validation to adapter; upstream: none
 from gateway.platforms.zet_agent_camera_observation_intent import CAMERA_OBSERVATION_SCHEMA, normalize_camera_observation_setup
+# zettlab-overlay(ac432-chat-camera-layers): keep all camera Chat proposals credential-free; upstream: none
+from gateway.platforms.zet_agent_camera_chat_intent import CAMERA_LIVE_SCHEMA, CAMERA_RECORDING_SCHEMA, normalize_camera_live_setup, normalize_camera_recording_setup
 
 # zettlab-overlay(connector-guidance): validate private template addresses without DNS; upstream: none
 import ipaddress
@@ -15,7 +17,7 @@ import re
 from urllib.parse import urlsplit
 
 _KINDS = ("custom_api", "custom_mcp", "saas", "camera", "printer3d", "tv", "pc_node")
-_FIELDS = {"resource_kind", "template_id", "provider_id", "url", "auth_kind", "variables"}
+_FIELDS = {"resource_kind", "template_id", "provider_id", "url", "auth_kind", "variables", "observation", "live", "recording"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 CONNECTOR_SETUP_SCHEMA = {
@@ -24,6 +26,8 @@ CONNECTOR_SETUP_SCHEMA = {
     "properties": {
         # zettlab-overlay(ac432-observation-intent): optional camera proposal schema only; upstream: none
         "observation": CAMERA_OBSERVATION_SCHEMA,
+        "live": CAMERA_LIVE_SCHEMA,
+        "recording": CAMERA_RECORDING_SCHEMA,
         "resource_kind": {"type": "string", "enum": list(_KINDS)},
         "template_id": {"type": "string", "maxLength": 128},
         "provider_id": {"type": "string", "maxLength": 128},
@@ -49,8 +53,13 @@ CONNECTOR_SETUP_SCHEMA = {
 def normalize_connector_setup(value: object) -> dict:
     """Reject unknown fields rather than forwarding arbitrary configuration."""
     # zettlab-overlay(ac432-observation-intent): no execution or consent in the proposal; upstream: none
-    if isinstance(value, dict) and "observation" in value:
-        return normalize_camera_observation_setup(value)
+    if isinstance(value, dict):
+        if "observation" in value:
+            return normalize_camera_observation_setup(value)
+        if "live" in value:
+            return normalize_camera_live_setup(value)
+        if "recording" in value:
+            return normalize_camera_recording_setup(value)
     if not isinstance(value, dict) or set(value) - _FIELDS:
         raise ValueError("connector_setup_invalid")
     if any(not isinstance(item, str) for key, item in value.items() if key != "variables"):

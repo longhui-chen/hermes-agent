@@ -36,3 +36,17 @@ def test_ordinary_setup_remains_unchanged_and_observation_is_camera_only():
     assert normalize_connector_setup({"resource_kind": "camera"}) == {"resource_kind": "camera"}
     with pytest.raises(ValueError):
         normalize_connector_setup({**VALID, "resource_kind": "printer3d"})
+
+
+def test_chat_live_and_recording_proposals_are_bounded():
+    assert normalize_connector_setup({"resource_kind": "camera", "live": {"camera_id": "cam-1"}}) == {
+        "resource_kind": "camera", "live": {"camera_id": "cam-1"}}
+    assert normalize_connector_setup({"resource_kind": "camera", "recording": {"camera_id": "cam-1", "retention_days": 7}}) == {
+        "resource_kind": "camera", "recording": {"camera_id": "cam-1", "retention_days": 7}}
+    for value in (
+        {"resource_kind": "camera", "live": {"camera_id": "cam-1", "url": "rtsp://secret"}},
+        {"resource_kind": "camera", "recording": {"camera_id": "cam-1", "retention_days": 2}},
+        {"resource_kind": "camera", "live": {"camera_id": "cam-1"}, "recording": {"camera_id": "cam-1"}},
+    ):
+        with pytest.raises(ValueError):
+            normalize_connector_setup(value)
