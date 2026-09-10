@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "a3d10b6d78c12b265937d8c0a1808549ac022944",
-  "sha256": "7ba3abd01660baf70232977123e2b87f24a52cbb441e5b0d727b6cb57b383647",
+  "root_commit": "f33ba1c9edb9a4d9ce20c6c7a0debefe015a2bab",
+  "sha256": "2ca3ee6f0a5ca40427a672c45392fe3759cf5c338b7eb2b797a05c749fc1e464",
   "payload": {
     "golden": {
       "events": {
@@ -1693,7 +1693,7 @@
       }
     },
     "fields": {
-      "$comment": "Envelope fields and top-level data fields per chatproto event, derived from the zettlab-local-server contract manifest (schemas/chat-ui.manifest.json, reflect over internal/chatproto types; required = no omitempty; type = wire category string|number|boolean|object|array|any). Regenerate with scripts/chat-ui-contract/derive-fields.mjs. Nested objects are documented by the golden sample only.",
+      "$comment": "Envelope fields and top-level data fields per chatproto event, derived from the zettlab-local-server contract manifest (schemas/chat-ui.manifest.json, reflect over internal/chatproto types; required = no omitempty; type = wire category string|number|boolean|object|array|any). Regenerate with scripts/chat-ui-contract/derive-fields.mjs. Arrays whose element is a struct additionally carry `items: {struct, fields}` derived from the same reflection; other nested objects are documented by the golden sample only.",
       "envelope": {
         "backend": {
           "required": false,
@@ -1727,7 +1727,28 @@
       "attachment_wire": {
         "actions": {
           "required": false,
-          "type": "array"
+          "type": "array",
+          "items": {
+            "struct": "ChatAttachmentActionSpec",
+            "fields": {
+              "disabled": {
+                "required": false,
+                "type": "boolean"
+              },
+              "id": {
+                "required": true,
+                "type": "string"
+              },
+              "requires_confirm": {
+                "required": false,
+                "type": "boolean"
+              },
+              "style": {
+                "required": false,
+                "type": "string"
+              }
+            }
+          }
         },
         "category": {
           "required": false,
@@ -1955,7 +1976,24 @@
             },
             "attachments": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "AckAttachment",
+                "fields": {
+                  "index": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "client_msg_id": {
               "required": false,
@@ -2149,7 +2187,32 @@
             },
             "tasks": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "DelegationSummaryTask",
+                "fields": {
+                  "child_session_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "duration_seconds": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "goal": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "status": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "task_index": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             }
           }
         },
@@ -2311,7 +2374,40 @@
             },
             "attachments": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "MessageAttachment",
+                "fields": {
+                  "mimeType": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "thumbnailColor": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "type": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "url": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "clarify": {
               "required": false,
@@ -2341,25 +2437,25 @@
               "required": true,
               "type": "number"
             },
-            "role": {
-              "required": true,
-              "type": "string"
-            },
             "reason": {
               "required": false,
+              "type": "string"
+            },
+            "role": {
+              "required": true,
               "type": "string"
             },
             "session_id": {
               "required": false,
               "type": "string"
             },
-            "turn_id": {
-              "required": false,
-              "type": "string"
-            },
             "truncated": {
               "required": false,
               "type": "boolean"
+            },
+            "turn_id": {
+              "required": false,
+              "type": "string"
             }
           }
         },
@@ -2368,7 +2464,28 @@
           "fields": {
             "groups": {
               "required": true,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "PlanGroup",
+                "fields": {
+                  "count": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "icon": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "items": {
+                    "required": true,
+                    "type": "array"
+                  },
+                  "label": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "plan_id": {
               "required": false,
@@ -2391,12 +2508,12 @@
         "reasoning.delta": {
           "struct": "ReasoningDeltaData",
           "fields": {
-            "text": {
-              "required": true,
-              "type": "string"
-            },
             "item_id": {
               "required": false,
+              "type": "string"
+            },
+            "text": {
+              "required": true,
               "type": "string"
             }
           }
@@ -2478,7 +2595,32 @@
             },
             "todos": {
               "required": true,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "TodoItem",
+                "fields": {
+                  "content": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "group_index": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "plan_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "status": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },
@@ -2573,7 +2715,40 @@
             },
             "produced_files": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "ProducedFile",
+                "fields": {
+                  "mime": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "mtime": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "session_title": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "reason": {
               "required": true,
@@ -2607,7 +2782,40 @@
           "fields": {
             "attachments": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "MessageAttachment",
+                "fields": {
+                  "mimeType": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "thumbnailColor": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "type": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "url": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "display_content": {
               "required": false,
@@ -2627,7 +2835,40 @@
             },
             "quotes": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "QuotedMessage",
+                "fields": {
+                  "meeting_duration": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_title": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "role": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "source_message_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "text": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "ready": {
               "required": false,
@@ -2685,15 +2926,171 @@
           "fields": {
             "active_delegations": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "DelegationSessionSnapshot",
+                "fields": {
+                  "kind": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "task_count": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "tasks": {
+                    "required": false,
+                    "type": "array",
+                    "items": {
+                      "struct": "DelegationTaskSnapshot",
+                      "fields": {
+                        "child_session_id": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "goal": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "preview": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "status": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "subagent_id": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "task_index": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "tool": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "tool_count": {
+                          "required": false,
+                          "type": "number"
+                        },
+                        "updated_at": {
+                          "required": false,
+                          "type": "number"
+                        }
+                      }
+                    }
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "required": false,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "active_goals": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "GoalStatusData",
+                "fields": {
+                  "agent_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "goal_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "goal_text": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "max_rounds": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "round": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "session_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "state": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "summary": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "required": false,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "active_turns": {
               "required": true,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "ActiveTurnInfo",
+                "fields": {
+                  "agent_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "last_activity_at": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "live_seq": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "phase": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "started_at": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "tool_name": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "unsettled": {
+                    "required": true,
+                    "type": "boolean"
+                  }
+                }
+              }
             }
           }
         },
