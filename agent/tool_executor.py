@@ -609,7 +609,7 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        # zettlab-overlay(H4-B2b): 工具分发期连接器路由能力仅在本次调用内可见（附录 H 归属待 B2b 复核）; upstream: none
+        # zettlab-overlay(H4b-unowned): 工具分发期连接器路由能力仅在本次调用内可见，与计划模式无关，不随 B2b 删除; upstream: none
         # The dispatch is the narrowest common boundary for sequential and
         # concurrent tool execution.  Keep the fallback private to this call:
         # the trusted connector runner may read it, but middleware, the model,
