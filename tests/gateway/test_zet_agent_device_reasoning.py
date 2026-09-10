@@ -10,6 +10,7 @@ These tests pin the pure decision function and the request assembly around it.
 import pytest
 
 from gateway.platforms.zet_agent import (
+    _device_reasoning_config,
     _device_reasoning_fast_path,
     _is_local_ai_proxy_base_url,
     _onboarding_deepseek_fast_path,
@@ -185,3 +186,93 @@ def test_openrouter_assembly_is_unchanged_end_to_end():
     )
     assert applied is False
     assert overrides == {"extra_body": {"provider": {"order": ["x"]}}}
+
+
+# ---------- P1 3981058281: resolve reasoning_config against the FINAL model ----------
+
+def _per_model_loader(table):
+    """Stand-in for GatewayRunner._load_reasoning_config's per-model behaviour."""
+    return lambda model: table.get(model)
+
+
+def test_config_is_reloaded_for_the_final_model():
+    # config.yaml: lite disables reasoning, pro asks for high.  The runtime
+    # loads the config for the default model (lite) before the session
+    # /model override switches to pro.
+    resolved = _device_reasoning_config(
+        request_reasoning_config=None,
+        load_for_model=_per_model_loader({"lite": {"enabled": False}, "pro": {"enabled": True, "effort": "high"}}),
+        model="pro",
+    )
+    overrides, applied = _device_reasoning_fast_path(
+        profile="main",
+        provider="custom",
+        base_url=LOCAL_PROXY,
+        reasoning_config=resolved,
+        request_overrides=None,
+    )
+    assert applied is True
+    assert overrides == {"extra_body": {"reasoning": {"enabled": True, "effort": "high"}}}
+
+
+def test_switching_to_a_disabled_model_sends_thinking_disabled():
+    resolved = _device_reasoning_config(
+        request_reasoning_config=None,
+        load_for_model=_per_model_loader({"lite": {"enabled": False}, "pro": {"enabled": True, "effort": "high"}}),
+        model="lite",
+    )
+    overrides, applied = _device_reasoning_fast_path(
+        profile="main",
+        provider="custom",
+        base_url=LOCAL_PROXY,
+        reasoning_config=resolved,
+        request_overrides=None,
+    )
+    assert applied is True
+    assert overrides == {"extra_body": {"thinking": {"type": "disabled"}}}
+
+
+def test_explicit_request_reasoning_still_wins_over_per_model_config():
+    # The client stated model_options.reasoning for this turn; it must not be
+    # overwritten by whatever config.yaml says about the resolved model.
+    resolved = _device_reasoning_config(
+        request_reasoning_config={"enabled": True, "effort": "low"},
+        load_for_model=_per_model_loader({"pro": {"enabled": False}}),
+        model="pro",
+    )
+    assert resolved == {"enabled": True, "effort": "low"}
+    overrides, applied = _device_reasoning_fast_path(
+        profile="main",
+        provider="custom",
+        base_url=LOCAL_PROXY,
+        reasoning_config=resolved,
+        request_overrides=None,
+    )
+    assert overrides == {"extra_body": {"reasoning": {"enabled": True, "effort": "low"}}}
+
+
+def test_missing_per_model_config_falls_back_to_the_default_effort():
+    resolved = _device_reasoning_config(
+        request_reasoning_config=None,
+        load_for_model=_per_model_loader({}),
+        model="max",
+    )
+    assert resolved is None
+    overrides, applied = _device_reasoning_fast_path(
+        profile="main",
+        provider="custom",
+        base_url=LOCAL_PROXY,
+        reasoning_config=resolved,
+        request_overrides=None,
+    )
+    assert overrides == {"extra_body": {"reasoning": {"enabled": True, "effort": "medium"}}}
+
+
+def test_real_loader_honours_per_model_reasoning_effort():
+    # Pins the assumption the fix rests on: the shared chokepoint really does
+    # resolve per-model overrides, so passing the final model changes the answer.
+    from hermes_constants import resolve_reasoning_config
+
+    cfg = {"agent": {"reasoning_effort": "none", "reasoning_overrides": {"pro": "high"}}}
+    assert resolve_reasoning_config(cfg, "pro") == {"enabled": True, "effort": "high"}
+    assert resolve_reasoning_config(cfg, "lite") == {"enabled": False}
