@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "04748d441e5c9fc20bb31cec76236ff115b4c4c1",
-  "sha256": "5167e26ae1b0160b4ef5a84b55f98f39b1bd4c384847cd23c4631b1c050c4ba9",
+  "root_commit": "e1dfb90c2e6563bcf62a42066e8b45a065fe1bd7",
+  "sha256": "303b6d4baef38e23ce596a9167c9e7630bfacdd1be2dd56d5334fe153fe2426e",
   "payload": {
     "golden": {
       "events": {
@@ -630,7 +630,9 @@
                 "path": "/sandbox/demo/uploads/attachment-1.pdf"
               }
             ],
-            "clarify": null
+            "clarify": null,
+            "reason": "",
+            "truncated": false
           }
         },
         "plan.preview": {
@@ -665,7 +667,8 @@
           "ts": 1756972800000,
           "backend": "hermes",
           "data": {
-            "text": "用户要剪 vlog，先确认时间范围。"
+            "text": "用户要剪 vlog，先确认时间范围。",
+            "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90"
           }
         },
         "search.result": {
@@ -686,7 +689,7 @@
                 "path": "/sandbox/demo/Photos/2026-08-30/IMG_0001.MOV",
                 "is_dir": false,
                 "size": 52428800,
-                "file_type": "video",
+                "file_type": 2,
                 "ctime": 1756886400000,
                 "mtime": 1756886400000,
                 "btime": 1756886400000,
@@ -694,10 +697,21 @@
                 "match_source": "semantic",
                 "snippet": "公园 小孩 秋千",
                 "tags": [
-                  "公园",
-                  "小孩"
+                  {
+                    "id": 11,
+                    "name": "公园"
+                  },
+                  {
+                    "id": 12,
+                    "name": "小孩"
+                  }
                 ],
-                "video_search": {}
+                "video_search": {
+                  "file_id": "file_demo_0001",
+                  "chunk_start": 12.5,
+                  "chunk_end": 18.25,
+                  "distance": 0.21
+                }
               }
             ]
           }
@@ -957,6 +971,8 @@
                 "session_id": "sess_demo_0001",
                 "agent_id": "agent_demo_0001",
                 "turn_id": "turn_demo_0001",
+                "live_seq": 3,
+                "unsettled": false,
                 "started_at": 1756972800000,
                 "last_activity_at": 1756972801000,
                 "phase": "tool",
@@ -1556,10 +1572,139 @@
           "toolCallId": "call_demo_0001",
           "status": "running"
         }
+      },
+      "http": {
+        "session-history.delta": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "snapshot_seq": 44,
+          "next_since": {
+            "updated_seq": 44,
+            "row_key": "aa:8"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0001",
+            "live_seq": 9,
+            "unsettled": true,
+            "started_at": 1756972800000
+          },
+          "messages": [],
+          "activities": [
+            {
+              "activity_id": 40,
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "turn_id": "turn_demo_0001",
+              "kind": "thinking",
+              "status": "streaming",
+              "updated_seq": 44,
+              "last_fanout_seq": 9
+            }
+          ],
+          "truncated": false
+        },
+        "session-history.tail": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "next_since": {
+            "updated_seq": 41,
+            "row_key": "ma:7"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0001",
+            "live_seq": 7,
+            "phase": "tool",
+            "tool_name": "search_files",
+            "unsettled": false,
+            "started_at": 1756972800000
+          },
+          "messages": [
+            {
+              "id": 7,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "好的，我先找出上周末的视频。",
+              "status": "streaming",
+              "last_fanout_seq": 2
+            },
+            {
+              "id": 7,
+              "turn_id": "turn_demo_0001",
+              "role": "assistant",
+              "content": "",
+              "reasoning": "用户要剪 vlog，先确认时间范围。",
+              "status": "streaming",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "last_fanout_seq": 3
+            }
+          ]
+        },
+        "session-history.tail.live-seq-zero": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "snapshot_seq": 41,
+          "next_since": {
+            "updated_seq": 41,
+            "row_key": "ma:7"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0003",
+            "live_seq": 0,
+            "started_at": 1756972800000
+          },
+          "messages": [
+            {
+              "id": 9,
+              "turn_id": "turn_demo_0003",
+              "role": "assistant",
+              "content": "",
+              "status": "streaming"
+            }
+          ]
+        },
+        "session-history.tail.registry-evicted": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "snapshot_seq": 52,
+          "truncated": true,
+          "next_since": {
+            "updated_seq": 52,
+            "row_key": "ma:11"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0004",
+            "unsettled": true,
+            "started_at": 1756972800000
+          },
+          "messages": [
+            {
+              "id": 11,
+              "turn_id": "turn_demo_0004",
+              "role": "assistant",
+              "content": "上一次回答被中断了。",
+              "status": "streaming"
+            }
+          ]
+        },
+        "session-history.turn-activities": {
+          "activities": [
+            {
+              "activity_id": 40,
+              "call_id": "thinking:0",
+              "item_id": "01996f2e-7b6a-7c31-9f8e-4a3d6c1b2e90",
+              "turn_id": "turn_demo_0001",
+              "kind": "thinking",
+              "status": "done",
+              "created_seq": 40,
+              "updated_seq": 45,
+              "last_fanout_seq": 9
+            }
+          ],
+          "truncated": false
+        }
       }
     },
     "fields": {
-      "$comment": "Envelope fields and top-level data fields per chatproto event, derived from the zettlab-local-server contract manifest (schemas/chat-ui.manifest.json, reflect over internal/chatproto types; required = no omitempty; type = wire category string|number|boolean|object|array|any). Regenerate with scripts/chat-ui-contract/derive-fields.mjs. Nested objects are documented by the golden sample only.",
+      "$comment": "Envelope fields and top-level data fields per chatproto event, derived from the zettlab-local-server contract manifest (schemas/chat-ui.manifest.json, reflect over internal/chatproto types; required = no omitempty; type = wire category string|number|boolean|object|array|any). Regenerate with scripts/chat-ui-contract/derive-fields.mjs. Arrays whose element is a struct additionally carry `items: {struct, fields}` derived from the same reflection; other nested objects are documented by the golden sample only.",
       "envelope": {
         "backend": {
           "required": false,
@@ -1593,7 +1738,28 @@
       "attachment_wire": {
         "actions": {
           "required": false,
-          "type": "array"
+          "type": "array",
+          "items": {
+            "struct": "ChatAttachmentActionSpec",
+            "fields": {
+              "disabled": {
+                "required": false,
+                "type": "boolean"
+              },
+              "id": {
+                "required": true,
+                "type": "string"
+              },
+              "requires_confirm": {
+                "required": false,
+                "type": "boolean"
+              },
+              "style": {
+                "required": false,
+                "type": "string"
+              }
+            }
+          }
         },
         "category": {
           "required": false,
@@ -1625,7 +1791,24 @@
         },
         "resolution": {
           "required": false,
-          "type": "object"
+          "type": "object",
+          "items": {
+            "struct": "ChatAttachmentResolution",
+            "fields": {
+              "action_id": {
+                "required": true,
+                "type": "string"
+              },
+              "at": {
+                "required": true,
+                "type": "number"
+              },
+              "result": {
+                "required": false,
+                "type": "any"
+              }
+            }
+          }
         },
         "state": {
           "required": true,
@@ -1783,7 +1966,94 @@
           "fields": {
             "attachment": {
               "required": true,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "ChatAttachmentWire",
+                "fields": {
+                  "actions": {
+                    "required": false,
+                    "type": "array",
+                    "items": {
+                      "struct": "ChatAttachmentActionSpec",
+                      "fields": {
+                        "disabled": {
+                          "required": false,
+                          "type": "boolean"
+                        },
+                        "id": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "requires_confirm": {
+                          "required": false,
+                          "type": "boolean"
+                        },
+                        "style": {
+                          "required": false,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "category": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "dedup_key": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "expires_at": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "fallback_text": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "kind": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "payload": {
+                    "required": true,
+                    "type": "any"
+                  },
+                  "resolution": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "ChatAttachmentResolution",
+                      "fields": {
+                        "action_id": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "at": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "result": {
+                          "required": false,
+                          "type": "any"
+                        }
+                      }
+                    }
+                  },
+                  "state": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "v": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             }
           }
         },
@@ -1821,7 +2091,24 @@
             },
             "attachments": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "AckAttachment",
+                "fields": {
+                  "index": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "client_msg_id": {
               "required": false,
@@ -2015,7 +2302,32 @@
             },
             "tasks": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "DelegationSummaryTask",
+                "fields": {
+                  "child_session_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "duration_seconds": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "goal": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "status": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "task_index": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             }
           }
         },
@@ -2177,11 +2489,73 @@
             },
             "attachments": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "MessageAttachment",
+                "fields": {
+                  "mimeType": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "thumbnailColor": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "type": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "url": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "clarify": {
               "required": false,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "ClarifyData",
+                "fields": {
+                  "choices_offered": {
+                    "required": false,
+                    "type": "array"
+                  },
+                  "clarify_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "expires_at_ms": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "question": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "state": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "state_reason": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "clarify_id": {
               "required": false,
@@ -2207,6 +2581,10 @@
               "required": true,
               "type": "number"
             },
+            "reason": {
+              "required": false,
+              "type": "string"
+            },
             "role": {
               "required": true,
               "type": "string"
@@ -2214,6 +2592,10 @@
             "session_id": {
               "required": false,
               "type": "string"
+            },
+            "truncated": {
+              "required": false,
+              "type": "boolean"
             },
             "turn_id": {
               "required": false,
@@ -2226,7 +2608,28 @@
           "fields": {
             "groups": {
               "required": true,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "PlanGroup",
+                "fields": {
+                  "count": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "icon": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "items": {
+                    "required": true,
+                    "type": "array"
+                  },
+                  "label": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "plan_id": {
               "required": false,
@@ -2247,8 +2650,12 @@
           }
         },
         "reasoning.delta": {
-          "struct": "TextDeltaData",
+          "struct": "ReasoningDeltaData",
           "fields": {
+            "item_id": {
+              "required": false,
+              "type": "string"
+            },
             "text": {
               "required": true,
               "type": "string"
@@ -2258,25 +2665,124 @@
         "search.result": {
           "struct": "model.SearchResultBlock",
           "fields": {
+            "items": {
+              "required": true,
+              "type": "array",
+              "items": {
+                "struct": "FileListItem",
+                "fields": {
+                  "btime": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "ctime": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "file_type": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "filename": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "is_dir": {
+                    "required": true,
+                    "type": "boolean"
+                  },
+                  "match_source": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "mtime": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "path": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "snippet": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "tags": {
+                    "required": false,
+                    "type": "array",
+                    "items": {
+                      "struct": "TagView",
+                      "fields": {
+                        "color": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "count": {
+                          "required": false,
+                          "type": "number"
+                        },
+                        "id": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "name": {
+                          "required": true,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "uni_key": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "video_search": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "VideoSearchMetadata",
+                      "fields": {
+                        "chunk_end": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "chunk_start": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "distance": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "file_id": {
+                          "required": true,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
             "query": {
               "required": false,
+              "type": "string"
+            },
+            "status": {
+              "required": true,
               "type": "string"
             },
             "total_count": {
               "required": true,
               "type": "number"
             },
-            "status": {
-              "required": true,
-              "type": "string"
-            },
             "truncated": {
               "required": false,
               "type": "boolean"
-            },
-            "items": {
-              "required": true,
-              "type": "array"
             }
           }
         },
@@ -2328,11 +2834,61 @@
           "fields": {
             "summary": {
               "required": true,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "TodoSummary",
+                "fields": {
+                  "cancelled": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "completed": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "in_progress": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "pending": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "total": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "todos": {
               "required": true,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "TodoItem",
+                "fields": {
+                  "content": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "group_index": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "plan_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "status": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },
@@ -2427,7 +2983,40 @@
             },
             "produced_files": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "ProducedFile",
+                "fields": {
+                  "mime": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "mtime": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "session_title": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "reason": {
               "required": true,
@@ -2461,7 +3050,40 @@
           "fields": {
             "attachments": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "MessageAttachment",
+                "fields": {
+                  "mimeType": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "name": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "path": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "thumbnailColor": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "type": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "url": {
+                    "required": true,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "display_content": {
               "required": false,
@@ -2477,11 +3099,77 @@
             },
             "quoted": {
               "required": false,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "QuotedMessage",
+                "fields": {
+                  "meeting_duration": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_title": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "role": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "source_message_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "text": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "quotes": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "QuotedMessage",
+                "fields": {
+                  "meeting_duration": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_title": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "role": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "source_message_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "text": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "ready": {
               "required": false,
@@ -2539,15 +3227,171 @@
           "fields": {
             "active_delegations": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "DelegationSessionSnapshot",
+                "fields": {
+                  "kind": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "task_count": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "tasks": {
+                    "required": false,
+                    "type": "array",
+                    "items": {
+                      "struct": "DelegationTaskSnapshot",
+                      "fields": {
+                        "child_session_id": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "goal": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "preview": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "status": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "subagent_id": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "task_index": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "tool": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "tool_count": {
+                          "required": false,
+                          "type": "number"
+                        },
+                        "updated_at": {
+                          "required": false,
+                          "type": "number"
+                        }
+                      }
+                    }
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "required": false,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "active_goals": {
               "required": false,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "GoalStatusData",
+                "fields": {
+                  "agent_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "goal_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "goal_text": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "max_rounds": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "round": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "session_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "state": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "summary": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "updated_at": {
+                    "required": false,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "active_turns": {
               "required": true,
-              "type": "array"
+              "type": "array",
+              "items": {
+                "struct": "ActiveTurnInfo",
+                "fields": {
+                  "agent_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "last_activity_at": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "live_seq": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "phase": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "started_at": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "tool_name": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "unsettled": {
+                    "required": true,
+                    "type": "boolean"
+                  }
+                }
+              }
             }
           }
         },
@@ -2641,6 +3485,468 @@
               "required": true,
               "type": "number"
             }
+          }
+        }
+      }
+    },
+    "http": {
+      "$comment": "HTTP DTO facts derived from local-server service types: tail uses the existing response and SessionMessage; delta and turn-activities declare U3b shapes without implementing endpoints. Fields declared here but not yet assigned by a handler (tail snapshot_seq / truncated) freeze the shape only; U3b 4.2/4.3 wires the values.",
+      "active_turn": {
+        "fields": {
+          "live_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "phase": {
+            "required": false,
+            "type": "string"
+          },
+          "started_at": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          },
+          "tool_name": {
+            "required": false,
+            "type": "string"
+          },
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "unsettled": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "activity_row": {
+        "fields": {
+          "activity_id": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          },
+          "call_id": {
+            "required": false,
+            "type": "string"
+          },
+          "content": {
+            "required": false,
+            "type": "string"
+          },
+          "created_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "item_id": {
+            "required": false,
+            "type": "string",
+            "nullable": true
+          },
+          "kind": {
+            "required": true,
+            "type": "string"
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "status": {
+            "required": true,
+            "type": "string",
+            "literals": [
+              "streaming",
+              "running",
+              "success",
+              "error",
+              "aborted",
+              "done",
+              "superseded",
+              "accepted"
+            ]
+          },
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "updated_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          }
+        }
+      },
+      "message_row": {
+        "fields": {
+          "content": {
+            "required": true,
+            "type": "string"
+          },
+          "id": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "role": {
+            "required": true,
+            "type": "string"
+          },
+          "status": {
+            "required": false,
+            "type": "string",
+            "literals": [
+              "done",
+              "error",
+              "aborted",
+              "streaming"
+            ]
+          },
+          "turn_id": {
+            "required": true,
+            "type": "string"
+          },
+          "updated_seq": {
+            "required": false,
+            "type": "number",
+            "nullable": true,
+            "integer": true
+          },
+          "visible": {
+            "required": false,
+            "type": "boolean",
+            "nullable": true
+          }
+        }
+      },
+      "next_since": {
+        "fields": {
+          "row_key": {
+            "required": true,
+            "type": "string"
+          },
+          "updated_seq": {
+            "required": true,
+            "type": "number",
+            "integer": true
+          }
+        }
+      },
+      "session-history.delta": {
+        "response": {
+          "active_turn": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "activities": {
+            "required": true,
+            "type": "array"
+          },
+          "agent_id": {
+            "required": true,
+            "type": "string"
+          },
+          "capabilities": {
+            "required": false,
+            "type": "object"
+          },
+          "has_more": {
+            "required": false,
+            "type": "boolean"
+          },
+          "has_more_newer": {
+            "required": false,
+            "type": "boolean"
+          },
+          "history_truncated": {
+            "required": false,
+            "type": "boolean"
+          },
+          "messages": {
+            "required": true,
+            "type": "array"
+          },
+          "newest_id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "next_since": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "oldest_id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "session_id": {
+            "required": true,
+            "type": "string"
+          },
+          "snapshot_seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "truncated": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "session-history.tail": {
+        "response": {
+          "active_turn": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "agent_id": {
+            "required": true,
+            "type": "string"
+          },
+          "capabilities": {
+            "required": false,
+            "type": "object"
+          },
+          "has_more": {
+            "required": false,
+            "type": "boolean"
+          },
+          "has_more_newer": {
+            "required": false,
+            "type": "boolean"
+          },
+          "history_truncated": {
+            "required": false,
+            "type": "boolean"
+          },
+          "messages": {
+            "required": true,
+            "type": "array"
+          },
+          "newest_id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "next_since": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "oldest_id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "session_id": {
+            "required": true,
+            "type": "string"
+          },
+          "snapshot_seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "truncated": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "session-history.turn-activities": {
+        "response": {
+          "activities": {
+            "required": true,
+            "type": "array"
+          },
+          "next_cursor": {
+            "required": false,
+            "type": "string"
+          },
+          "truncated": {
+            "required": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "tail_message_row": {
+        "fields": {
+          "activity_text_boundaries": {
+            "required": false,
+            "type": "array"
+          },
+          "app_element": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "attachments": {
+            "required": false,
+            "type": "array"
+          },
+          "browser_turn_summary": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "chat_attachments": {
+            "required": false,
+            "type": "array"
+          },
+          "clarify": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "clarify_id": {
+            "required": false,
+            "type": "string"
+          },
+          "content": {
+            "required": true,
+            "type": "string"
+          },
+          "context_compaction": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "delegation_summary": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "error": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "goal_id": {
+            "required": false,
+            "type": "string"
+          },
+          "goal_round": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "id": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "item_id": {
+            "required": false,
+            "type": "string"
+          },
+          "kind": {
+            "required": false,
+            "type": "string"
+          },
+          "last_fanout_seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "media": {
+            "required": false,
+            "type": "array"
+          },
+          "plan_preview": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "produced_files": {
+            "required": false,
+            "type": "array"
+          },
+          "quoted": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "quotes": {
+            "required": false,
+            "type": "array"
+          },
+          "reasoning": {
+            "required": false,
+            "type": "string"
+          },
+          "role": {
+            "required": true,
+            "type": "string"
+          },
+          "search_result": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "separator": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "skill_slug": {
+            "required": false,
+            "type": "string"
+          },
+          "status": {
+            "required": false,
+            "type": "string",
+            "literals": [
+              "done",
+              "error",
+              "aborted",
+              "streaming"
+            ]
+          },
+          "steer": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "todo_list": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "tool_call": {
+            "required": false,
+            "type": "object",
+            "nullable": true
+          },
+          "turn_id": {
+            "required": false,
+            "type": "string"
+          },
+          "ui_hint": {
+            "required": false,
+            "type": "any"
           }
         }
       }
@@ -2837,6 +4143,35 @@
           }
         }
       }
+    },
+    "fixture_relations": {
+      "version": 1,
+      "segments": [
+        {
+          "turn_id": "turn_demo_0001",
+          "segment_key": "reasoning-1",
+          "live": [
+            {
+              "sample": "reasoning.delta"
+            }
+          ],
+          "history": [
+            {
+              "sample": "session-history.tail",
+              "pointer": "/messages/1",
+              "representation": "message"
+            },
+            {
+              "sample": "session-history.delta",
+              "pointer": "/activities/0"
+            },
+            {
+              "sample": "session-history.turn-activities",
+              "pointer": "/activities/0"
+            }
+          ]
+        }
+      ]
     }
   }
 }
