@@ -974,6 +974,9 @@ def test_camera_vision_scope_is_bound_to_exact_current_attachment(monkeypatch):
         ("查看下硬件连接中的电脑", ()),
         ("查看硬件连接中的电脑有哪些文件", ()),
         ("查看已连接的电脑", ()),
+        ("调用 camera doctor，检查当前 Agent 的摄像头授权、设备连接和可用能力", ()),
+        ("调用 camera list，列出当前摄像头、授权状态和可用能力", ()),
+        ("检查并连接摄像头", ("camera",)),
         ("Show connected computers", ()),
         ("Show the computer connection status", ()),
         ("帮我重新连接电脑", ("pc_node",)),
@@ -1143,6 +1146,27 @@ def test_hardware_status_turn_strips_model_authored_enrollment_card():
     )
 
     assert response == "摄像头在线，打印机当前会话未授权。"
+
+
+def test_hardware_diagnostic_turn_strips_model_authored_connector_enrollment_card():
+    agent = _FakeAgent()
+    agent.platform = "zet_agent"
+    response = response_mode.ensure_hardware_enrollment_intent(
+        agent,
+        user_message="调用 camera doctor，检查当前 Agent 的摄像头授权、设备连接和可用能力",
+        response_text=(
+            "摄像头已授权，设备连接正常。\n\n"
+            "```zettlab-connector-enrollment-intent\n"
+            '{"schema_version":"2","kind":"connector_enrollment",'
+            '"items":[{"resource_kind":"camera"}],"setup_requested":true}\n```'
+        ),
+        completed=True,
+        failed=False,
+        interrupted=False,
+        structured_output=False,
+    )
+
+    assert response == "摄像头已授权，设备连接正常。"
 
 
 def test_direct_input_client_never_receives_legacy_enrollment_card():
