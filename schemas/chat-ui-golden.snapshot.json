@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "04e9bd74bfcf5ff54a7f1700298d435cf2a9fbdd",
-  "sha256": "7708021ed30255d5788f5cc25d6103d02ab5132d73986acbfd88073f9fb82812",
+  "root_commit": "ab586fca17d76a95b9009c7deb23bbbb798fa377",
+  "sha256": "599a0e8877871d52e61cbf87a013fd434b9ea1a5baffea0c61eb88fef766e508",
   "payload": {
     "golden": {
       "events": {
@@ -1627,6 +1627,51 @@
             }
           ]
         },
+        "session-history.tail.live-seq-zero": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "snapshot_seq": 41,
+          "truncated": false,
+          "next_since": {
+            "updated_seq": 41,
+            "row_key": "ma:7"
+          },
+          "active_turn": {
+            "turn_id": "turn_demo_0003",
+            "live_seq": 0,
+            "unsettled": false,
+            "started_at": 1756972800000
+          },
+          "messages": [
+            {
+              "id": 9,
+              "turn_id": "turn_demo_0003",
+              "role": "assistant",
+              "content": "",
+              "status": "streaming",
+              "last_fanout_seq": 0
+            }
+          ]
+        },
+        "session-history.tail.registry-evicted": {
+          "agent_id": "agent_demo_0001",
+          "session_id": "sess_demo_0001",
+          "truncated": true,
+          "active_turn": {
+            "turn_id": "turn_demo_0004",
+            "unsettled": true,
+            "started_at": 1756972800000
+          },
+          "messages": [
+            {
+              "id": 11,
+              "turn_id": "turn_demo_0004",
+              "role": "assistant",
+              "content": "上一次回答被中断了。",
+              "status": "streaming"
+            }
+          ]
+        },
         "session-history.turn-activities": {
           "activities": [
             {
@@ -2745,12 +2790,13 @@
       }
     },
     "http": {
-      "$comment": "HTTP DTO facts derived from local-server service types: tail uses the existing response and SessionMessage; delta and turn-activities declare U3b shapes without implementing endpoints.",
+      "$comment": "HTTP DTO facts derived from local-server service types: tail uses the existing response and SessionMessage; delta and turn-activities declare U3b shapes without implementing endpoints. Fields declared here but not yet assigned by a handler (tail snapshot_seq / truncated) freeze the shape only; U3b 4.2/4.3 wires the values.",
       "active_turn": {
         "fields": {
           "live_seq": {
-            "required": true,
+            "required": false,
             "type": "number",
+            "nullable": true,
             "integer": true
           },
           "phase": {
@@ -3013,6 +3059,15 @@
           "session_id": {
             "required": true,
             "type": "string"
+          },
+          "snapshot_seq": {
+            "required": false,
+            "type": "number",
+            "integer": true
+          },
+          "truncated": {
+            "required": false,
+            "type": "boolean"
           }
         }
       },
