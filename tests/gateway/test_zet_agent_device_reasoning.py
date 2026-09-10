@@ -121,6 +121,19 @@ def test_other_routes_are_untouched(provider, base_url):
         ("http://192.168.32.98:19090/api/v1/ai-proxy/v1", False),
         ("http://127.0.0.1:19090/v1", False),
         ("", False),
+        # P1 3981215371: bracketed IPv6 loopback, with and without a port.
+        ("http://[::1]:19090/api/v1/ai-proxy/v1", True),
+        ("http://[::1]/api/v1/ai-proxy/v1", True),
+        ("http://[0:0:0:0:0:0:0:1]:19090/api/v1/ai-proxy/v1", True),
+        ("http://127.0.0.2:19090/api/v1/ai-proxy/v1", True),
+        # A remote IPv6 host must not match even on the proxy path.
+        ("http://[2001:db8::1]:19090/api/v1/ai-proxy/v1", False),
+        # userinfo must not be able to spoof the host.
+        ("http://127.0.0.1@evil.example.com/api/v1/ai-proxy/v1", False),
+        # the path must really be the proxy path, not a query string.
+        ("http://127.0.0.1:19090/v1?x=/api/v1/ai-proxy/", False),
+        # non-http schemes are not the device proxy.
+        ("ftp://127.0.0.1:19090/api/v1/ai-proxy/v1", False),
     ],
 )
 def test_local_proxy_matching_is_host_and_path(url, expected):
