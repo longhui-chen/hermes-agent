@@ -230,6 +230,29 @@ def _is_local_ai_proxy_base_url(base_url: str) -> bool:
     return False
 
 
+def _device_reasoning_config(
+    *,
+    request_reasoning_config: Optional[Dict[str, Any]],
+    load_for_model: Any,
+    model: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve reasoning config against the *final* model.
+
+    ``_resolve_provider_runtime`` loads ``reasoning_config`` before the session
+    ``/model`` override and the request/route selection have run, so by the
+    time the device override is built that config may describe a different
+    model than the one actually being called.  ``_load_reasoning_config``
+    already accepts a model and honours per-model ``reasoning_effort``
+    overrides; this simply asks it again once the model is known.
+
+    An explicit per-request ``model_options.reasoning`` still wins, because the
+    client stated it for this turn.
+    """
+    if request_reasoning_config is not None:
+        return request_reasoning_config
+    return load_for_model(model or "")
+
+
 def _device_reasoning_fast_path(
     *,
     profile: str,
@@ -4665,7 +4688,11 @@ class ZetAgentAdapter(APIServerAdapter):
             profile=active_profile,
             provider=str(runtime_kwargs.get("provider") or ""),
             base_url=str(runtime_kwargs.get("base_url") or ""),
-            reasoning_config=reasoning_config,
+            reasoning_config=_device_reasoning_config(
+                request_reasoning_config=request_reasoning_config,
+                load_for_model=GatewayRunner._load_reasoning_config,
+                model=model or "",
+            ),
             request_overrides=agent_request_overrides,
         )
         if device_reasoning_applied:
