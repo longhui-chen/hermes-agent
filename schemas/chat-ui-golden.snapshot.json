@@ -1,7 +1,7 @@
 {
   "snapshot_version": 2,
-  "root_commit": "ef08104c88a278aff578f1cf1d6d214239599adb",
-  "sha256": "2ca3ee6f0a5ca40427a672c45392fe3759cf5c338b7eb2b797a05c749fc1e464",
+  "root_commit": "e1dfb90c2e6563bcf62a42066e8b45a065fe1bd7",
+  "sha256": "303b6d4baef38e23ce596a9167c9e7630bfacdd1be2dd56d5334fe153fe2426e",
   "payload": {
     "golden": {
       "events": {
@@ -689,7 +689,7 @@
                 "path": "/sandbox/demo/Photos/2026-08-30/IMG_0001.MOV",
                 "is_dir": false,
                 "size": 52428800,
-                "file_type": "video",
+                "file_type": 2,
                 "ctime": 1756886400000,
                 "mtime": 1756886400000,
                 "btime": 1756886400000,
@@ -697,10 +697,21 @@
                 "match_source": "semantic",
                 "snippet": "公园 小孩 秋千",
                 "tags": [
-                  "公园",
-                  "小孩"
+                  {
+                    "id": 11,
+                    "name": "公园"
+                  },
+                  {
+                    "id": 12,
+                    "name": "小孩"
+                  }
                 ],
-                "video_search": {}
+                "video_search": {
+                  "file_id": "file_demo_0001",
+                  "chunk_start": 12.5,
+                  "chunk_end": 18.25,
+                  "distance": 0.21
+                }
               }
             ]
           }
@@ -1780,7 +1791,24 @@
         },
         "resolution": {
           "required": false,
-          "type": "object"
+          "type": "object",
+          "items": {
+            "struct": "ChatAttachmentResolution",
+            "fields": {
+              "action_id": {
+                "required": true,
+                "type": "string"
+              },
+              "at": {
+                "required": true,
+                "type": "number"
+              },
+              "result": {
+                "required": false,
+                "type": "any"
+              }
+            }
+          }
         },
         "state": {
           "required": true,
@@ -1938,7 +1966,94 @@
           "fields": {
             "attachment": {
               "required": true,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "ChatAttachmentWire",
+                "fields": {
+                  "actions": {
+                    "required": false,
+                    "type": "array",
+                    "items": {
+                      "struct": "ChatAttachmentActionSpec",
+                      "fields": {
+                        "disabled": {
+                          "required": false,
+                          "type": "boolean"
+                        },
+                        "id": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "requires_confirm": {
+                          "required": false,
+                          "type": "boolean"
+                        },
+                        "style": {
+                          "required": false,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "category": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "dedup_key": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "expires_at": {
+                    "required": false,
+                    "type": "number"
+                  },
+                  "fallback_text": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "id": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "kind": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "payload": {
+                    "required": true,
+                    "type": "any"
+                  },
+                  "resolution": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "ChatAttachmentResolution",
+                      "fields": {
+                        "action_id": {
+                          "required": true,
+                          "type": "string"
+                        },
+                        "at": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "result": {
+                          "required": false,
+                          "type": "any"
+                        }
+                      }
+                    }
+                  },
+                  "state": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "v": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             }
           }
         },
@@ -2411,7 +2526,36 @@
             },
             "clarify": {
               "required": false,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "ClarifyData",
+                "fields": {
+                  "choices_offered": {
+                    "required": false,
+                    "type": "array"
+                  },
+                  "clarify_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "expires_at_ms": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "question": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "state": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "state_reason": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "clarify_id": {
               "required": false,
@@ -2521,25 +2665,124 @@
         "search.result": {
           "struct": "model.SearchResultBlock",
           "fields": {
+            "items": {
+              "required": true,
+              "type": "array",
+              "items": {
+                "struct": "FileListItem",
+                "fields": {
+                  "btime": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "ctime": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "file_type": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "filename": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "is_dir": {
+                    "required": true,
+                    "type": "boolean"
+                  },
+                  "match_source": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "mtime": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "path": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "size": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "snippet": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "tags": {
+                    "required": false,
+                    "type": "array",
+                    "items": {
+                      "struct": "TagView",
+                      "fields": {
+                        "color": {
+                          "required": false,
+                          "type": "string"
+                        },
+                        "count": {
+                          "required": false,
+                          "type": "number"
+                        },
+                        "id": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "name": {
+                          "required": true,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "uni_key": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "video_search": {
+                    "required": false,
+                    "type": "object",
+                    "items": {
+                      "struct": "VideoSearchMetadata",
+                      "fields": {
+                        "chunk_end": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "chunk_start": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "distance": {
+                          "required": true,
+                          "type": "number"
+                        },
+                        "file_id": {
+                          "required": true,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
             "query": {
               "required": false,
+              "type": "string"
+            },
+            "status": {
+              "required": true,
               "type": "string"
             },
             "total_count": {
               "required": true,
               "type": "number"
             },
-            "status": {
-              "required": true,
-              "type": "string"
-            },
             "truncated": {
               "required": false,
               "type": "boolean"
-            },
-            "items": {
-              "required": true,
-              "type": "array"
             }
           }
         },
@@ -2591,7 +2834,32 @@
           "fields": {
             "summary": {
               "required": true,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "TodoSummary",
+                "fields": {
+                  "cancelled": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "completed": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "in_progress": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "pending": {
+                    "required": true,
+                    "type": "number"
+                  },
+                  "total": {
+                    "required": true,
+                    "type": "number"
+                  }
+                }
+              }
             },
             "todos": {
               "required": true,
@@ -2831,7 +3099,40 @@
             },
             "quoted": {
               "required": false,
-              "type": "object"
+              "type": "object",
+              "items": {
+                "struct": "QuotedMessage",
+                "fields": {
+                  "meeting_duration": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "meeting_title": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "role": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "source_message_id": {
+                    "required": false,
+                    "type": "string"
+                  },
+                  "text": {
+                    "required": true,
+                    "type": "string"
+                  },
+                  "turn_id": {
+                    "required": false,
+                    "type": "string"
+                  }
+                }
+              }
             },
             "quotes": {
               "required": false,
