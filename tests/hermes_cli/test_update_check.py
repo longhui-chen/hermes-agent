@@ -33,6 +33,22 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     mock_run.assert_not_called()
 
 
+def test_check_for_updates_creates_private_cache(tmp_path, monkeypatch):
+    import hermes_cli.banner as banner
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REVISION", "test-revision")
+    monkeypatch.setattr(banner, "_check_via_rev", lambda _revision: 0)
+
+    old_umask = os.umask(0)
+    try:
+        assert banner.check_for_updates() == 0
+    finally:
+        os.umask(old_umask)
+
+    assert (tmp_path / ".update_check").stat().st_mode & 0o777 == 0o600
+
+
 
 
 

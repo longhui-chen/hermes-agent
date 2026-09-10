@@ -2184,6 +2184,7 @@ class ShellFileOperations(FileOperations):
             limit=limit, offset=offset, output_mode=output_mode, context=context,
         )
 
+    # zettlab-overlay(H27-B3): nas_search NAS 回退，B3 改造后长期迁插件工具; upstream: none
     def nas_search(self, pattern: str, modes: list[str], limit: int = 60,
                    media_type: str = "", region: str = "", path_prefix: str = "",
                    return_references: bool = False) -> SearchResult:

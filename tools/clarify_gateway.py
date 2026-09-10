@@ -55,6 +55,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    # zettlab-overlay(H10-B1): 终态帧只发一次的标记，B1 保留; upstream: none
     terminal_emitted: bool = False
 
     def signature(self) -> Dict[str, object]:
@@ -369,6 +370,7 @@ def clear_session(session_key: str) -> int:
     for entry in entries:
         if entry is None:
             continue
+        # zettlab-overlay(H10-B1): 会话重置用取消哨兵替代空串，B1 保留; upstream: none
         entry.response = f"[clarify:{entry.clarify_id} state=cancelled reason=session_reset] clarify could not be delivered"
         entry.event.set()
         cancelled += 1
@@ -379,6 +381,7 @@ def clear_session(session_key: str) -> int:
 # Config
 # =========================================================================
 
+# zettlab-overlay(H10-B1): 澄清超时默认 300 s 且非正数归一，上游「0 = 无限」语义变更需同步复查; upstream: none
 def resolve_clarify_timeout(config: dict) -> int:
     """Resolve the clarify timeout (seconds) from an already-loaded config dict.
 

@@ -170,6 +170,9 @@ def _observe_queued_attachment(
         return
 
 
+_zettlab_connector_input_capable: ContextVar[bool] = ContextVar(
+    "zettlab_connector_input_capable", default=False
+)
 _zettlab_request_account_id: ContextVar[str] = ContextVar(
     "zettlab_request_account_id", default=""
 )
@@ -2081,11 +2084,15 @@ class ZetAgentAdapter(APIServerAdapter):
         token = push_zettlab_browser_session_token(
             request.headers.get("X-Zettlab-Browser-Session-Token", "")
         )
+        connector_input_token = _zettlab_connector_input_capable.set(
+            request.headers.get("X-Zettlab-Connector-Direct-Input", "") == "1"
+        )
         try:
             return await self._handle_with_zettlab_identity(
                 request, super()._handle_chat_completions
             )
         finally:
+            _zettlab_connector_input_capable.reset(connector_input_token)
             pop_zettlab_browser_session_token(token)
 
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
@@ -3454,6 +3461,7 @@ class ZetAgentAdapter(APIServerAdapter):
         queue_key: Optional[str] = None,
         owner_agent: Any = None,
         bound_turn_id: str = "",
+        connector_input_capable: bool = False,
     ):
         """Return a sync ``(question, choices) -> str`` callback.
 
@@ -3475,7 +3483,12 @@ class ZetAgentAdapter(APIServerAdapter):
             or ""
         ).strip()
 
-        def _ask(question: str, choices: Optional[List[str]]) -> str:
+        def _ask(question: str, choices: Optional[List[str]], *, connector_setup: Optional[dict] = None) -> str:
+            if connector_setup is not None:
+                if not connector_input_capable:
+                    raise ValueError("connector_setup_unavailable")
+                from tools.connector_setup_intent import normalize_connector_setup
+                connector_setup = normalize_connector_setup(connector_setup)
             timeout_seconds = _clarify_timeout_seconds()
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
@@ -3518,6 +3531,8 @@ class ZetAgentAdapter(APIServerAdapter):
                     "choices_offered": list(choices or []),
                     "expires_at_ms": expires_at_ms,
                 }
+                if connector_setup is not None:
+                    payload["connector_setup"] = connector_setup
                 if turn_id:
                     payload["turn_id"] = turn_id
                 entry = _ClarifyEntry(
@@ -4266,6 +4281,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # matches the turn's confirm/auto behaviour. Absent (async /v1/runs path,
         # or non-plan callers) → None → manual (safe default).
         agent_request_overrides = dict(request_overrides or {})
+        connector_input_capable = agent_request_overrides.pop("_zettlab_connector_input_capable", False) is True
         from gateway.session_context import zettlab_auth_principal
 
         # This is transport authority minted by local-server for exactly one
@@ -4993,12 +5009,14 @@ class ZetAgentAdapter(APIServerAdapter):
         # it is just a closure allocation.
         if session_id:
             try:
+                agent._zettlab_connector_direct_input = connector_input_capable
                 agent.clarify_callback = self._make_clarify_cb(
                     stream_q,
                     session_id,
                     interaction_queue_key,
                     agent,
                     bound_turn_id=extension_turn_id,
+                    connector_input_capable=connector_input_capable,
                 )
             except Exception:
                 logger.warning("[zet_agent] failed to attach clarify_callback", exc_info=True)
@@ -5143,6 +5161,7 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         from gateway.session_context import zettlab_auth_principal
         request_overrides = dict(request_overrides or {})
+        request_overrides["_zettlab_connector_input_capable"] = _zettlab_connector_input_capable.get()
         # Private bootstrap metadata consumed and removed by this adapter's
         # _create_agent. It selects the ordinary video plugin toolset for a
         # silent task and never reaches AIAgent or a provider request.

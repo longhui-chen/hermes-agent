@@ -335,9 +335,11 @@ def check_for_updates() -> Optional[int]:
             behind = _check_via_local_git(repo_dir)
 
     try:
-        cache_file.write_text(
+        from utils import atomic_write_text
+
+        atomic_write_text(
+            cache_file,
             json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
         )
     except Exception:
         pass

@@ -1607,6 +1607,7 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
+    # zettlab-overlay(H6-B2b): 子代理强制 plan_auto_execute，B2b 删除; upstream: none
     # A child has no user to confirm a plan: clarify is blocked and no plan
     # card reaches any UI (plan_emit_callback is never wired for children).
     # Without this, present_plan returns "stop and wait for the user's

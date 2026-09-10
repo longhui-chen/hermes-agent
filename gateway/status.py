@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
 from typing import Any, Callable, NamedTuple, Optional
-from utils import atomic_json_write
+from utils import atomic_json_write, atomic_write_text
 
 if sys.platform == "win32":
     import msvcrt
@@ -109,11 +109,10 @@ def record_start_and_check_storm(
         keep = max(max_starts * 4, 40)
         to_write = existing[-keep:]
 
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(
+        atomic_write_text(
+            path,
             "\n".join(repr(ts) for ts in to_write) + "\n", encoding="utf-8"
         )
-        os.replace(tmp, path)
 
         if len(recent) > max_starts:
             backoff = min(
@@ -865,6 +864,22 @@ def _release_file_lock(handle) -> None:
         pass
 
 
+def _open_private_runtime_lock(path: Path):
+    flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
+        return os.fdopen(fd, "a+", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def acquire_gateway_runtime_lock() -> bool:
     """Claim the cross-process runtime lock for the gateway.
 
@@ -878,7 +893,7 @@ def acquire_gateway_runtime_lock() -> bool:
     path = _get_gateway_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        handle = open(path, "a+", encoding="utf-8")
+        handle = _open_private_runtime_lock(path)
     except PermissionError:
         # Stale root-owned lock file from a previous launchd Background
         # session that ran as root (same failure mode handled in
@@ -890,7 +905,7 @@ def acquire_gateway_runtime_lock() -> bool:
         except OSError:
             return False
         try:
-            handle = open(path, "a+", encoding="utf-8")
+            handle = _open_private_runtime_lock(path)
         except OSError:
             return False
     if not _try_acquire_file_lock(handle):
@@ -962,7 +977,7 @@ def write_pid_file() -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record = json.dumps(_build_pid_record())
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         raise  # Let caller decide: another gateway is racing us
     try:

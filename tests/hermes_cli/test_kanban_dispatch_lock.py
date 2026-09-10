@@ -12,6 +12,7 @@ empty ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,19 @@ def kanban_home(tmp_path, monkeypatch):
 def conn(kanban_home):
     with kb.connect() as c:
         yield c
+
+
+def test_dispatch_lock_is_owner_only_under_permissive_umask(kanban_home):
+    db_path = kb.kanban_db_path(board="default")
+    old_umask = os.umask(0)
+    try:
+        with kb._dispatch_tick_lock(db_path) as held:
+            assert held is True
+    finally:
+        os.umask(old_umask)
+
+    lock_path = db_path.parent / f"{db_path.name}.dispatch.lock"
+    assert lock_path.stat().st_mode & 0o777 == 0o600
 
 
 

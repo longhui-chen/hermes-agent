@@ -741,7 +741,7 @@ def test_managed_service_keeps_filesystem_open_for_root_commands():
     assert "ReadOnlyPaths=" not in service
     assert "ReadWritePaths=" not in service
     assert "RuntimeDirectory=zettlab-claw" in service
-    assert "RuntimeDirectoryMode=0755" in service
+    assert "RuntimeDirectoryMode=0700" in service
     assert (
         "EnvironmentFile=-/volume1/system/zettos-main-data/"
         "com.zettlab.claw/secrets/zettlab-claw.env"

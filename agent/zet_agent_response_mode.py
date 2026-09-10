@@ -1,3 +1,4 @@
+# zettlab-overlay(H21-unowned): 响应模式与可信技能执行策略状态机整文件为 fork 新增，收敛时迁适配层; upstream: none
 """Bind trusted high-risk skill execution to an exact App turn."""
 
 from __future__ import annotations
@@ -2907,6 +2908,10 @@ def ensure_hardware_enrollment_intent(
     trusted canonical card.
     """
     text = str(response_text or "")
+    if getattr(agent, "_zettlab_connector_direct_input", False):
+        # Composer-capable clients use the trusted clarify handoff. Do not
+        # append a second legacy enrollment card after that interaction.
+        return _strip_model_hardware_enrollment_blocks(text).strip()
     if (
         (getattr(agent, "platform", "") or "") != "zet_agent"
         or not completed
