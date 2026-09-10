@@ -107,8 +107,10 @@ import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from agent.prestream_timing import PrestreamTiming
 
@@ -209,7 +211,6 @@ def _onboarding_deepseek_fast_path(
 
 
 _LOCAL_AI_PROXY_PATH = "/api/v1/ai-proxy/"
-_LOCAL_AI_PROXY_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
 _DEFAULT_DEVICE_REASONING_EFFORT = "medium"
 
 
@@ -218,16 +219,30 @@ def _is_local_ai_proxy_base_url(base_url: str) -> bool:
 
     Matching is on the loopback host plus the proxy path so a remote provider
     that merely shares a path prefix can never pick up the device override.
+    Parsing is left to the stdlib rather than hand-rolled string splitting:
+    ``urlsplit`` strips the port, the userinfo and the IPv6 brackets, and
+    ``ipaddress`` decides what "loopback" means.  That covers every spelling
+    of it -- ``127.0.0.1``, any other ``127.0.0.0/8`` address, ``[::1]`` and
+    its expanded ``[0:0:0:0:0:0:0:1]`` form -- without a literal host list
+    that silently misses one.
     """
-    url = str(base_url or "").strip().lower()
-    if _LOCAL_AI_PROXY_PATH not in url:
+    try:
+        parts = urlsplit(str(base_url or "").strip())
+        if parts.scheme.lower() not in ("http", "https"):
+            return False
+        host = parts.hostname
+    except ValueError:
         return False
-    for scheme in ("http://", "https://"):
-        if url.startswith(scheme):
-            host = url[len(scheme):].split("/", 1)[0].split("@")[-1]
-            host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-            return host in _LOCAL_AI_PROXY_HOSTS
-    return False
+    if not host:
+        return False
+    host = host.lower()
+    if host != "localhost":
+        try:
+            if not ip_address(host).is_loopback:
+                return False
+        except ValueError:
+            return False
+    return _LOCAL_AI_PROXY_PATH in parts.path.lower()
 
 
 def _device_reasoning_config(
