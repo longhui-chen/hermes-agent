@@ -107,8 +107,10 @@ import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from agent.prestream_timing import PrestreamTiming
 
@@ -206,6 +208,111 @@ def _onboarding_deepseek_fast_path(
     extra_body["reasoning_effort"] = "none"
     overrides["extra_body"] = extra_body
     return {"enabled": False}, overrides, True
+
+
+_LOCAL_AI_PROXY_PATH = "/api/v1/ai-proxy/"
+_DEFAULT_DEVICE_REASONING_EFFORT = "medium"
+
+
+def _is_local_ai_proxy_base_url(base_url: str) -> bool:
+    """True for the device's own local-server AI proxy, and nothing else.
+
+    Matching is on the loopback host plus the proxy path so a remote provider
+    that merely shares a path prefix can never pick up the device override.
+    Parsing is left to the stdlib rather than hand-rolled string splitting:
+    ``urlsplit`` strips the port, the userinfo and the IPv6 brackets, and
+    ``ipaddress`` decides what "loopback" means.  That covers every spelling
+    of it -- ``127.0.0.1``, any other ``127.0.0.0/8`` address, ``[::1]`` and
+    its expanded ``[0:0:0:0:0:0:0:1]`` form -- without a literal host list
+    that silently misses one.
+    """
+    try:
+        parts = urlsplit(str(base_url or "").strip())
+        if parts.scheme.lower() not in ("http", "https"):
+            return False
+        host = parts.hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.lower()
+    if host != "localhost":
+        try:
+            if not ip_address(host).is_loopback:
+                return False
+        except ValueError:
+            return False
+    return _LOCAL_AI_PROXY_PATH in parts.path.lower()
+
+
+def _device_reasoning_config(
+    *,
+    request_reasoning_config: Optional[Dict[str, Any]],
+    load_for_model: Any,
+    model: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve reasoning config against the *final* model.
+
+    ``_resolve_provider_runtime`` loads ``reasoning_config`` before the session
+    ``/model`` override and the request/route selection have run, so by the
+    time the device override is built that config may describe a different
+    model than the one actually being called.  ``_load_reasoning_config``
+    already accepts a model and honours per-model ``reasoning_effort``
+    overrides; this simply asks it again once the model is known.
+
+    An explicit per-request ``model_options.reasoning`` still wins, because the
+    client stated it for this turn.
+    """
+    if request_reasoning_config is not None:
+        return request_reasoning_config
+    return load_for_model(model or "")
+
+
+def _device_reasoning_fast_path(
+    *,
+    profile: str,
+    provider: str,
+    base_url: str,
+    reasoning_config: Optional[Dict[str, Any]],
+    request_overrides: Optional[Dict[str, Any]],
+) -> tuple[Dict[str, Any], bool]:
+    """Ask the device's own AI proxy for reasoning explicitly.
+
+    Since 2026-09-03 the cloud gateway behind ``/api/v1/ai-proxy/`` returns
+    ``reasoning_content`` only when the request carries ``reasoning`` (or
+    ``thinking``); without it the field is simply absent, so the device shows
+    no thinking process at all.  ``AIAgent._supports_reasoning_extra_body()``
+    returns False for a loopback custom provider — that gate is about
+    OpenRouter forwarding unknown fields to arbitrary upstreams and is not
+    ours to change — so the request override is set here, at the one place
+    that already knows this is the device's own proxy.
+
+    Scope is deliberately narrow: system onboarding keeps its disable
+    fast path, and every other provider/route is untouched.  Disabling is
+    expressed as ``thinking: {"type": "disabled"}`` because that is the
+    signal the same gateway accepts; ``reasoning.enabled=false`` is not.
+    """
+    overrides = dict(request_overrides or {})
+    if str(profile or "main").strip().lower() == "onboarding":
+        return overrides, False
+    if str(provider or "").strip().lower() != "custom":
+        return overrides, False
+    if not _is_local_ai_proxy_base_url(base_url):
+        return overrides, False
+
+    extra_body = dict(overrides.get("extra_body") or {})
+    disabled = isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False
+    if disabled:
+        extra_body.pop("reasoning", None)
+        extra_body["thinking"] = {"type": "disabled"}
+    else:
+        effort = _DEFAULT_DEVICE_REASONING_EFFORT
+        if isinstance(reasoning_config, dict):
+            effort = str(reasoning_config.get("effort") or "").strip().lower() or effort
+        extra_body.pop("thinking", None)
+        extra_body["reasoning"] = {"enabled": True, "effort": effort}
+    overrides["extra_body"] = extra_body
+    return overrides, True
 
 
 _ONBOARDING_LIGHTWEIGHT_SYSTEM_PROMPT = """\
@@ -4592,6 +4699,25 @@ class ZetAgentAdapter(APIServerAdapter):
                 request_overrides=agent_request_overrides,
             )
         )
+        agent_request_overrides, device_reasoning_applied = _device_reasoning_fast_path(
+            profile=active_profile,
+            provider=str(runtime_kwargs.get("provider") or ""),
+            base_url=str(runtime_kwargs.get("base_url") or ""),
+            reasoning_config=_device_reasoning_config(
+                request_reasoning_config=request_reasoning_config,
+                load_for_model=GatewayRunner._load_reasoning_config,
+                model=model or "",
+            ),
+            request_overrides=agent_request_overrides,
+        )
+        if device_reasoning_applied:
+            logger.info(
+                "zet_agent device reasoning override applied: profile=%s model=%s effort=%s",
+                active_profile,
+                model or "",
+                (agent_request_overrides.get("extra_body") or {}).get("reasoning", {}).get("effort")
+                or "disabled",
+            )
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
