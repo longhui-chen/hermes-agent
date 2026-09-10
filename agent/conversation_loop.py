@@ -3755,6 +3755,7 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    # zettlab-overlay(U2d-error): reset named steer on provider failure; upstream: none
                     _steer_hook = getattr(agent, "_steer_admission_hook", None)
                     if callable(getattr(_steer_hook, "on_provider_failed", None)):
                         _steer_hook.on_provider_failed()
@@ -8891,6 +8892,7 @@ def run_conversation(
             _is_local_processing_error = _hit_local and not _hit_api
 
             if not _is_local_processing_error:
+                # zettlab-overlay(U2d-error): reset named steer on provider exception; upstream: none
                 _steer_hook = getattr(agent, "_steer_admission_hook", None)
                 if callable(getattr(_steer_hook, "on_provider_failed", None)):
                     _steer_hook.on_provider_failed()
