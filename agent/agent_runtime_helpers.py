@@ -4126,18 +4126,17 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
     # visible here (leave the slot for interrupt()/the finalizer to
     # surface as steer_dropped) or the drain happened strictly before
     # the interrupt (a legal pre-stop injection).
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if getattr(agent, "_interrupt_requested", False):
-                return
-            steer_text = agent._pending_steer
-            agent._pending_steer = None
-    else:
+    # zettlab-overlay(U2d): drain identity tuples before joining at model feed; upstream: none
+    with agent._pending_steer_lock:
         if getattr(agent, "_interrupt_requested", False):
             return
-        steer_text = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = None
+        raw_pending = agent._pending_steer
+        pending = [] if raw_pending is None else [(None, raw_pending)] if isinstance(raw_pending, str) else list(raw_pending)
+        agent._pending_steer = []
+        hook = getattr(agent, "_steer_admission_hook", None)
+        if callable(getattr(hook, "on_drain", None)):
+            hook.on_drain(pending)
+    steer_text = "\n".join(text for _, text in pending)
     if not steer_text:
         return
     steer_msg = format_steer_user_message(steer_text)
@@ -4241,6 +4240,10 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     tail = messages[-1]
     if not (isinstance(tail, dict) and tail.get("role") == "user"):
         return
+    # zettlab-overlay(U2d): let adapter decide whether the drained batch reached provider; upstream: none
+    hook = getattr(agent, "_steer_admission_hook", None)
+    if callable(getattr(hook, "consumed", None)) and hook.consumed():
+        return
     content = tail.get("content")
     reclaimed: list = []
     if isinstance(content, str):
@@ -4309,8 +4312,11 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     def _restash_unless_interrupted() -> bool:
         if getattr(agent, "_interrupt_requested", False):
             return False
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (text + "\n" + existing) if existing else text
+        # zettlab-overlay(U2d): restash identity tuples through the adapter hook; upstream: none
+        raw_existing = getattr(agent, "_pending_steer", [])
+        existing = [(None, raw_existing)] if isinstance(raw_existing, str) else list(raw_existing or [])
+        restash = hook.reclaim(text) if callable(getattr(hook, "reclaim", None)) else [(None, text)]
+        agent._pending_steer = restash + existing
         return True
 
     _lock = getattr(agent, "_pending_steer_lock", None)

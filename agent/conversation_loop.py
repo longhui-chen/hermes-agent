@@ -2325,16 +2325,11 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # zettlab-overlay(U2d): reopen unbound legacy text-only steer after close; upstream: none
+    if getattr(agent, "_steer_admission_hook", None) is None and agent._pending_steer is None:
+        agent._pending_steer = []
 
-    # Reopen the steer slot: the previous turn's finalizer closed it after
-    # its last drain (see _drain_pending_steer(close=True)); a cached agent
-    # starting a new turn must accept /steer again.
-    _steer_lock = getattr(agent, "_pending_steer_lock", None)
-    if _steer_lock is not None:
-        with _steer_lock:
-            agent._steer_closed = False
-    else:
-        agent._steer_closed = False
+    # zettlab-overlay(U2d): retain generic steer goal and persistence hooks; upstream: none
     # Consumed-steer marker for the goal hook: a steer the model already
     # saw this turn means the user intervened — the post-turn goal judge
     # must evaluate it as user-initiated, not as an untouched auto-
@@ -3557,6 +3552,10 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    # zettlab-overlay(U2d): mark steer consumed only at provider call; upstream: none
+                    _steer_hook = getattr(agent, "_steer_admission_hook", None)
+                    if callable(getattr(_steer_hook, "on_provider_entered", None)):
+                        _steer_hook.on_provider_entered()
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
