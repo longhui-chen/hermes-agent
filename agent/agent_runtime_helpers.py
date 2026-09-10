@@ -3132,6 +3132,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    # zettlab-overlay(H4-B2b): 并发路径 present_plan 分发与播种元数据，B2b 删除; upstream: none
     elif function_name == "present_plan":
         def _execute(next_args: dict) -> Any:
             from tools.plan_tool import present_plan_with_meta as _present_plan_with_meta

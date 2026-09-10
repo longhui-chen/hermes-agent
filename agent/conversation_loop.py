@@ -349,6 +349,7 @@ def _ra():
     return run_agent
 
 
+# zettlab-overlay(H2-B2b): 计划模式判定与工具可见性门控，B2b 回退到上游; upstream: none
 def _should_force_present_plan_tool_choice(agent: Any, _user_message: str) -> bool:
     """Return True when a Zettlab App turn carries structured Plan mode metadata.
 
@@ -565,6 +566,7 @@ def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None
     api_kwargs.pop("reasoning_effort", None)
 
 
+# zettlab-overlay(H2-B2b): 计划轮闭合文案与等待确认的结束条件，B2b 回退到上游; upstream: none
 # 计划轮尾部闭合文案：播种追加 todo 工具对后，历史不能以 tool 结尾（下一轮
 # 会变成 tool -> user，严格 provider 拒绝），也不能用空 assistant content
 # （Moonshot/Kimi 同样拒绝）。这条短文案只做结构闭合，不进 UI（App 走 plan 卡）。
@@ -583,6 +585,7 @@ def _should_end_after_present_plan(agent: Any) -> bool:
     )
 
 
+# zettlab-overlay(H3-unowned): 可信技能任务消息消费，收敛时迁 gateway/platforms/zet_agent.py; upstream: none
 def _consume_trusted_skill_task_message(agent: Any, fallback: Any) -> Any:
     """Return the transport-preserved user task once, then clear it."""
     marker = object()
@@ -656,6 +659,7 @@ def _tool_call_name(tool_call: Any) -> str:
     return ""
 
 
+# zettlab-overlay(H2-B2b): 计划交互单工具收敛，B2b 回退到上游; upstream: none
 def _enforce_single_plan_interaction_tool_call(
     agent: Any, assistant_message: Any
 ) -> bool:
@@ -722,6 +726,7 @@ def _enforce_single_plan_interaction_tool_call(
     return True
 
 
+# zettlab-overlay(H3-unowned): provider 重放工具调用过滤，上游 PR 候选; upstream: none
 def _filter_provider_replay_tool_calls(
     assistant_message: Any, selected_tool_call: Any
 ) -> None:
@@ -1022,6 +1027,7 @@ def _compact_lightweight_api_messages(
     return compacted or api_messages
 
 
+# zettlab-overlay(H2-B2b): 计划模式协议提示与违规重试账本，B2b 回退到上游; upstream: none
 def _apply_plan_mode_protocol_instruction(api_kwargs: Dict[str, Any]) -> None:
     """Inject the Plan decision protocol into the API-only system message.
 
@@ -2423,6 +2429,7 @@ def run_conversation(
         explicit_skill_slug=trusted_skill_slug,
         tool_execution_allowed=not tools_disabled_for_request,
     )
+    # zettlab-overlay(H2-B2b): 每轮计划模式状态初始化与前置校验，B2b 回退到上游; upstream: none
     # Zettlab App plan 模式：本轮每次模型调用只允许 clarify / present_plan。
     agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(
         agent, original_user_message
@@ -3356,6 +3363,7 @@ def run_conversation(
                         _api_messages_for_attempt,
                         tools_for_api=_tools_for_attempt,
                     )
+                # zettlab-overlay(H2-B2b): 每次模型调用前施加计划模式工具门控，B2b 回退到上游; upstream: none
                 _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
                 _apply_forced_present_plan_tool_choice(agent, api_kwargs)
                 if agent._force_ascii_payload:
@@ -3595,6 +3603,7 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                # zettlab-overlay(H24-unowned): 图片理解降级用的 provisional stream 缓冲开启，上游 PR 或删; upstream: none
                 _buffer_image_stream = bool(
                     _current_turn_has_user_image and _use_streaming
                 )
@@ -3623,6 +3632,7 @@ def run_conversation(
                         middleware_trace=list(_llm_middleware_trace),
                     )
                 finally:
+                    # zettlab-overlay(H24-unowned): provisional stream 在 finally 中收口，上游 PR 或删; upstream: none
                     if _image_stream_token is not None:
                         agent._end_provisional_stream(_image_stream_token)
                     if _redirect_lock is not None:
@@ -3652,6 +3662,7 @@ def run_conversation(
                         interrupted = True
                     break
 
+                # zettlab-overlay(H24-unowned): 响应可信后释放 provisional stream 缓冲事件，上游 PR 或删; upstream: none
                 if _buffer_image_stream and not _image_fallback_requires_text:
                     agent._release_provisional_stream(
                         _buffered_image_stream_events
@@ -5108,6 +5119,7 @@ def run_conversation(
                     )
                     continue
 
+                # zettlab-overlay(H2-B2b): 强制工具选择被 provider 拒绝时的两级降级重试，B2b 回退到上游; upstream: none
                 if (
                     (
                         getattr(agent, "_zet_agent_plan_mode_active", False) is True
@@ -7170,6 +7182,7 @@ def run_conversation(
                 _replace_with_image_fallback_clarification(assistant_message)
                 finish_reason = "stop"
 
+            # zettlab-overlay(H2-B2b): 计划交互并行工具裁剪与未审正文清空，B2b 回退到上游; upstream: none
             _enforce_single_plan_interaction_tool_call(agent, assistant_message)
             _guarded_interaction_tool_response = bool(
                 (
@@ -7860,6 +7873,7 @@ def run_conversation(
                         },
                     )
 
+                # zettlab-overlay(H2-B2b): present_plan 成功后播种 TodoStore，B2b 删除; upstream: none
                 # 计划播种：present_plan 本批次成功呈现后，用同一份计划骨架
                 # 播种 TodoStore + 合成 todo 调用消息对（跨 turn 存活）。必须
                 # 在批次收尾后、present_plan break 之前——manual 确认卡模式
@@ -8150,6 +8164,7 @@ def run_conversation(
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
+                    # zettlab-overlay(H2-B2b): 空或仅推理响应的计划协议违规出口，B2b 回退到上游; upstream: none
                     if (
                         getattr(agent, "_zet_agent_plan_mode_active", False)
                         and not getattr(agent, "_zet_agent_plan_presented", False)
@@ -8560,6 +8575,7 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+                # zettlab-overlay(H2-B2b): 纯文本响应的计划协议违规出口，B2b 回退到上游; upstream: none
                 if (
                     getattr(agent, "_zet_agent_plan_mode_active", False)
                     and not getattr(agent, "_zet_agent_plan_presented", False)
@@ -8833,6 +8849,7 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # zettlab-overlay(H2-B2b): turn 末计划取消回执与残留状态校正，B2b 删除; upstream: none
                 # 计划播种清单的宿主端收尾（顺序：先取消回执、后状态校正）：
                 # - 取消回执（plan_ack cancelled）：把播种待办整体置 cancelled 并
                 #   持久化，否则下一轮 hydration 把已取消计划恢复成待执行（codex P1）。
