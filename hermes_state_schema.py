@@ -570,6 +570,7 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    # zettlab-overlay(H32-unowned): 日历投递幂等索引契约校验与迁移，收敛时隔离到 provider; upstream: none
     @staticmethod
     def _calendar_delivery_index_is_valid(conn: sqlite3.Connection) -> bool:
         """Return whether the calendar idempotency index has its exact contract."""
