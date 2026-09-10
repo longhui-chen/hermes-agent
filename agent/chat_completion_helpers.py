@@ -35,6 +35,7 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
+# zettlab-overlay(H20-unowned): provider dispatch 观测导入，收敛时 hook 化或迁出稳定层; upstream: none
 from agent.prestream_timing import observe_provider_dispatch
 from agent.message_sanitization import (
     _sanitize_surrogates,
@@ -65,6 +66,7 @@ def _context_thread_target(callback):
     return lambda: context.run(callback)
 
 
+# zettlab-overlay(H32-unowned): 汇总请求的 Zettlab 路由计费头，收敛时隔离到适配层; upstream: none
 def _apply_zettlab_summary_headers(summary_kwargs: Dict[str, Any], agent: Any) -> None:
     """Stamp Zettlab routing/billing headers on manual summary Chat calls."""
     try:

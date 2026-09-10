@@ -1,3 +1,4 @@
+# zettlab-overlay(H20-unowned): prestream 观测整文件为 fork 新增，收敛时迁出稳定层; upstream: none
 """Bounded, fail-open timing summary for one public streaming turn.
 
 The observer intentionally owns only scalar milestones for one call stack.  It
