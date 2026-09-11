@@ -52,16 +52,18 @@ def runtime(monkeypatch, tmp_path):
         reset_secret_scope(token)
 
 
-def test_terminal_semantic_flow_uses_private_fds(runtime):
+@pytest.mark.parametrize("periodic", [False, True])
+def test_terminal_semantic_flow_uses_private_fds(runtime, periodic):
     from types import SimpleNamespace
     from agent.zet_agent_response_mode import trusted_skill_operation_block_message
 
     profile, _ = runtime
+    command = COMMAND.replace(" candidate ", " observe ") + " --mode periodic --timeout-seconds 65" if periodic else COMMAND
     with execution_scope("job-a", "run-a", profile):
         assert trusted_skill_operation_block_message(
-            SimpleNamespace(), function_name="terminal", function_args={"command": COMMAND}
+            SimpleNamespace(), function_name="terminal", function_args={"command": command}
         ) is None
-        result = json.loads(terminal.terminal_tool(command=COMMAND, task_id="semantic-fd-flow"))
+        result = json.loads(terminal.terminal_tool(command=command, timeout=75, task_id="semantic-fd-flow"))
     assert result["camera_runtime_direct"] is True
     assert result["exit_code"] == 0
     payload = json.loads(result["output"])
@@ -74,15 +76,17 @@ def test_terminal_semantic_flow_uses_private_fds(runtime):
 
 
 @pytest.mark.parametrize("scope_kind", ["missing", "wrong-profile"])
-def test_runner_rejects_missing_or_mismatched_task(runtime, monkeypatch, scope_kind):
+@pytest.mark.parametrize("periodic", [False, True])
+def test_runner_rejects_missing_or_mismatched_task(runtime, monkeypatch, scope_kind, periodic):
     profile, _ = runtime
     monkeypatch.setenv("ZETTLAB_CAMERA_JOB_ID", "job-a")
     monkeypatch.setenv("ZETTLAB_CAMERA_EXECUTION_ID", "run-a")
+    command = COMMAND.replace(" candidate ", " observe ") + " --mode periodic --timeout-seconds 65" if periodic else COMMAND
     if scope_kind == "missing":
-        result = terminal._run_camera_runtime_command_if_allowed(COMMAND, cwd=str(profile), timeout=5)
+        result = terminal._run_camera_runtime_command_if_allowed(command, cwd=str(profile), timeout=75)
     else:
         with execution_scope("job-a", "run-a", Path("/wrong-profile")):
-            result = terminal._run_camera_runtime_command_if_allowed(COMMAND, cwd=str(profile), timeout=5)
+            result = terminal._run_camera_runtime_command_if_allowed(command, cwd=str(profile), timeout=75)
     assert json.loads(result)["exit_code"] == -1
 
 
@@ -108,6 +112,51 @@ def test_candidate_and_commit_have_separate_parameter_allowlists(runtime):
     assert terminal._parse_camera_runtime_command(positive + proof.replace("t,t,t,t", "t,t,/private,t")) is None
     assert terminal._parse_camera_runtime_command(positive + proof.replace("t,t,t,t", "t,t,t")) is None
     assert terminal._parse_camera_runtime_command(positive + proof + " --unknown true") is None
+
+
+def test_zone_coordinate_arguments_remain_bounded(runtime):
+    base = f'python3 "$ZETTLAB_PRESETS_DIR/{SCRIPT}" commit --capability ' + "a" * 32
+    base += " --matched true --subject-kind person --predicate enters_zone --duration-seconds 0 --evidence-ref frame-a --zone-id door"
+    temporal = " --frame-states unknown,present,present,present --track-ids t,t,t,t"
+    geometry = " --frame-positions null,0.1:0.2,0.5:0.6,1:1 --view-aligned false,true,true,true"
+    assert terminal._parse_camera_runtime_command(base + temporal + geometry) is not None
+    for invalid in [geometry.replace("0.1:0.2", "nan:0"), geometry.replace("1:1", "1.01:1"),
+                    geometry.replace("null,", ""), geometry.replace("false,", ""),
+                    geometry.replace("false", "yes"), geometry.split(" --view-aligned")[0],
+                    geometry + " --output /tmp/escape"]:
+        assert terminal._parse_camera_runtime_command(base + temporal + invalid) is None
+    assert terminal._parse_camera_runtime_command(base + geometry) is None
+    assert terminal._parse_camera_runtime_command(base.replace(" --zone-id door", "") + temporal + geometry) is None
+
+
+@pytest.mark.parametrize("budget", ["0", "-1", "nan", "2.5", "2147483648", "01"])
+def test_observation_parser_rejects_invalid_budget(runtime, budget):
+    command = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds " + budget
+    assert terminal._parse_camera_runtime_command(command) is None
+
+
+@pytest.mark.parametrize("requested,limit,budget,expected", [
+    (600, 600, 590, 595), (3600, 3600, 3500, 3505),
+    (80, 600, 590, None), (600, 600, 600, None), (3600, 600, 3500, None),
+])
+def test_observation_budget_is_never_silently_clamped(requested, limit, budget, expected):
+    from gateway.platforms.zet_agent_camera_semantic_arguments import semantic_execution_timeout
+    args = ["observe", "--policy-id", "12345678-1234-1234-1234-123456789abc", "--timeout-seconds", str(budget)]
+    if expected is None:
+        with pytest.raises(ValueError):
+            semantic_execution_timeout(args, requested, limit, 80)
+    else:
+        assert semantic_execution_timeout(args, requested, limit, 80) == expected
+    assert semantic_execution_timeout(["candidate"], requested, limit, 80) == 80
+    assert semantic_execution_timeout([], requested, limit, 80) == 80
+
+
+def test_observation_rejects_insufficient_tool_timeout_before_child(runtime, monkeypatch):
+    monkeypatch.setattr("tools.trusted_direct_runner.run_trusted_python_script", lambda **_: pytest.fail("must not spawn"))
+    command = COMMAND.replace(" candidate ", " observe ") + " --timeout-seconds 590"
+    with execution_scope("job-a", "run-a", runtime[0]):
+        result = json.loads(terminal.terminal_tool(command=command, timeout=80, task_id="observe-short"))
+    assert result["exit_code"] == -1
 
 
 def test_changed_package_is_rejected(runtime):
@@ -227,7 +276,9 @@ def test_real_middleware_preserves_semantic_runner_authorization(runtime, monkey
 
 
 @pytest.mark.parametrize("matched", [False, True])
-def test_real_presets_helper_candidate_and_commit(runtime, matched):
+@pytest.mark.parametrize("observation_failure", [False, True])
+@pytest.mark.parametrize("zone", [False, True])
+def test_real_presets_helper_candidate_and_commit(runtime, matched, observation_failure, zone):
     """Opt-in cross-repo contract flow; never substitute an embedded helper.
 
     Run with HERMES_TEST_CAMERA_PRESETS_SOURCE pointing at the Presets
@@ -252,6 +303,9 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
     image = b"\xff\xd8fixture-media\xff\xd9"
     capability = "c" * 48
     times = [f"2026-09-07T12:00:{second:02d}Z" for second in (0, 4, 8, 12)]
+    zone_context = {"reference": {"x": 0, "y": 0, "width": 960, "height": 540},
+                    "frames": [{"x": (i % 2) * 960, "y": 960 + (i // 2) * 960, "width": 960, "height": 540} for i in range(4)],
+                    "polygon": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1}]}
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -265,13 +319,17 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
                 data = {
                     "capability": capability, "evidence_ref": "window-frame-0.jpg",
                     "frame_times": times, "subject_kind": "person", "subject_ref": "",
-                    "predicate": "lingers", "zone_id": "", "min_duration_seconds": 10,
+                    "predicate": "lingers", "zone_id": "door" if zone else "", "min_duration_seconds": 10,
                     "image_data_uri": "data:image/jpeg;base64," + base64.b64encode(image).decode(),
                 }
+                if zone:
+                    data["zone_context"] = zone_context
+            elif self.path.endswith("/semantic-observations"):
+                data = {"analysis_complete": not observation_failure, "analysis": {"unknown_batches": 1, "created_events": 0}}
             else:
                 data = {"matched": body["verdict"]["matched"]}
             response = json.dumps({"data": data}).encode()
-            self.send_response(200)
+            self.send_response(503 if observation_failure and self.path.endswith("/semantic-observations") else 200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
@@ -294,6 +352,8 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
             assert attachment.stat().st_mode & 0o777 == 0o600
             assert data["frame_times"] == times
             assert "image_data_uri" not in data
+            if zone:
+                assert data["zone_context"] == zone_context
             verdict = {"matched": matched}
             commit = f'python3 "$ZETTLAB_PRESETS_DIR/{SCRIPT}" commit --capability {data["capability"]} --matched {str(matched).lower()}'
             if matched:
@@ -302,10 +362,25 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
                 verdict.update(subject_kind="person", subject_ref="", predicate="lingers",
                                zone_id="", duration_seconds=12, evidence_ref=data["evidence_ref"])
                 verdict["frames"] = [{"state": "present", "track_id": "t"} for _ in range(4)]
+                if zone:
+                    commit += " --zone-id door --frame-positions 0.1:0.2,0.1:0.2,0.1:0.2,0.1:0.2 --view-aligned true,true,true,true"
+                    verdict["zone_id"] = "door"
+                    for frame in verdict["frames"]:
+                        frame.update(position={"x": 0.1, "y": 0.2}, view_aligned=True)
             result = json.loads(terminal.terminal_tool(command=commit, task_id="real-presets-commit"))
             assert result["exit_code"] == 0, result
             assert json.loads(result["output"]) == {"data": {"matched": matched}}
-        assert len(requests) == 2
+            for mode in (None, "finite", "periodic"):
+                budget = 65 if mode == "periodic" else 590
+                observe = COMMAND.replace(" candidate ", " observe ") + f" --timeout-seconds {budget}"
+                if mode:
+                    observe += f" --mode {mode}"
+                observed = json.loads(terminal.terminal_tool(command=observe, timeout=budget + 10, task_id="real-presets-observe"))
+                assert observed["exit_code"] == (2 if observation_failure else 0), observed
+                assert json.loads(observed["output"]) == {"data": {
+                    "analysis_complete": not observation_failure, "analysis": {"unknown_batches": 1, "created_events": 0},
+                }}
+        assert len(requests) == 5
         for path, body, bearer in requests:
             assert path.startswith("/api/v1/agent/hardware-connectors/cameras/semantic-")
             assert body["job_id"] == "job-a" and body["execution_id"] == "run-a"
@@ -314,6 +389,14 @@ def test_real_presets_helper_candidate_and_commit(runtime, matched):
             "job_id": "job-a", "execution_id": "run-a", "capability": capability,
             "verdict": verdict,
         }
+        for (path, body, _), mode in zip(requests[2:], (None, "finite", "periodic")):
+            assert path.endswith("/semantic-observations")
+            assert body == {
+                "policy_id": "12345678-1234-1234-1234-123456789abc",
+                "execution_timeout_seconds": 65 if mode == "periodic" else 590,
+                "job_id": "job-a", "execution_id": "run-a",
+                **({"mode": mode} if mode else {}),
+            }
         assert terminal._CONNECTOR_RUNTIME_ROOT_ANCHOR.file_digests[SCRIPT] == hashlib.sha256(raw).hexdigest()
     finally:
         reset_secret_scope(token)

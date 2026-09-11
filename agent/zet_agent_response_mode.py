@@ -159,7 +159,16 @@ _HARDWARE_ENROLLMENT_ACTION_RE = re.compile(
 _HARDWARE_ENROLLMENT_CONNECTION_STATE_RE = re.compile(
     r"(?:已(?:经)?|正在|正|当前|尚未|未|没有)连接(?:到|上|着|过|好|成功)?(?:的)?"
     r"|连接(?:中|的|状态|列表|信息|详情)"
+    # zettlab-overlay(connector-enrollment-guard): classify device status as diagnostics; upstream: none
+    r"|(?:设备|硬件|摄像头|打印机|电脑|电视)(?:访问)?(?:权限|授权|状态|能力|可用性|连接)"
     r"|\b(?:connected|connecting|connection)\b",
+    re.IGNORECASE,
+)
+# zettlab-overlay(connector-enrollment-guard): keep diagnostics out of setup intent; upstream: none
+_HARDWARE_ENROLLMENT_DIAGNOSTIC_RE = re.compile(
+    r"(?:检查|查看|查询|诊断|验证|列出|授权|权限|能力|可用|状态|区域)"
+    r"|(?:\bdoctor\b|\blist\b|\bstatus\b|\bcapabilit(?:y|ies)\b|"
+    r"\bpermission\b|\baccess\b|\bhealth\b|\binspect\b|\bverify\b)",
     re.IGNORECASE,
 )
 _HARDWARE_ENROLLMENT_META_OR_DIAG_RE = re.compile(
@@ -1829,7 +1838,8 @@ def _trusted_camera_attachment_path(raw_path: Any) -> str | None:
 def _camera_attachment_path_from_terminal_result(
     result: Mapping[str, Any],
 ) -> str | None:
-    """Extract the exact trusted attachment emitted by one successful snap."""
+    # zettlab-overlay(ac432-history): Include scoped history image artifacts; upstream: none
+    """Extract the exact trusted camera attachment under the active output root."""
     output = result.get("output")
     if not isinstance(output, str) or len(output.encode("utf-8")) > 1024 * 1024:
         return None
@@ -1838,11 +1848,9 @@ def _camera_attachment_path_from_terminal_result(
     except (TypeError, ValueError):
         return None
     data = payload.get("data") if isinstance(payload, dict) else None
-    if (
-        not isinstance(data, dict)
-        or data.get("action") != "snap"
-        or data.get("status") != "ok"
-    ):
+    # zettlab-overlay(ac432-history): Classify camera artifacts in the adapter; upstream: none
+    from gateway.platforms.zet_agent_camera_arguments import camera_result_has_image
+    if not camera_result_has_image(data):
         return None
     return _trusted_camera_attachment_path(data.get("attachment_path"))
 
@@ -2818,6 +2826,15 @@ def _hardware_enrollment_requested_types(
         or len(normalized) > 320
         or not _HARDWARE_ENROLLMENT_ACTION_RE.search(action_text)
         or _HARDWARE_ENROLLMENT_META_OR_DIAG_RE.search(normalized)
+    ):
+        return ()
+    # zettlab-overlay(connector-enrollment-guard): preserve explicit connect intent; upstream: none
+    # Diagnostic/status requests may mention a noun phrase such as “设备连接”
+    # or “摄像头权限”. Those are not a request to enroll a connector. Keep an
+    # explicit connection verb actionable, but reject diagnostic-only turns.
+    if (
+        _HARDWARE_ENROLLMENT_DIAGNOSTIC_RE.search(normalized)
+        and not _HARDWARE_ENROLLMENT_ACTION_RE.search(action_text)
     ):
         return ()
 

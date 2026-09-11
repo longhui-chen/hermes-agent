@@ -2303,6 +2303,13 @@ def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dic
                     break
             if path:
                 _add(path, require_mtime=True, allow_external=True)
+    # Explicit result references precede discovered side effects. Otherwise a
+    # frame-heavy run can exhaust the attachment limit before its final report.
+    # Keep the same scope, age, type and count checks for both sources.
+    for path in path_hints:
+        _add(path, require_mtime=True, allow_external=True)
+        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+            break
     for root in output_roots:
         if len(produced) >= _CRON_ATTACHMENT_LIMIT:
             break
@@ -2310,10 +2317,6 @@ def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dic
             _add(str(path), require_mtime=True)
             if len(produced) >= _CRON_ATTACHMENT_LIMIT:
                 break
-    for path in path_hints:
-        _add(path, require_mtime=True, allow_external=True)
-        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
-            break
     return produced
 
 

@@ -202,6 +202,12 @@ def check_clarify_requirements() -> bool:
 CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
+        # zettlab-overlay(connector-input): distinguish trusted input from ordinary clarify; upstream: none
+        "SECURITY: Ordinary clarify answers are sent to the model and chat history. "
+        "Never request a password, PAT, API key or other credential in question/choices, "
+        "even when calling the panel secure. For supported Connector setup use the "
+        "connector_setup parameter; only that path collects credentials outside chat. "
+        "A submitted setup receipt contains no credential; do not infer exposure from it. "
         "Ask the user a question when you need clarification, feedback, or a "
         "decision before proceeding. Supports three modes:\n\n"
         "1. **Single-select multiple choice** — provide up to 4 choices. The user picks one "

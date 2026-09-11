@@ -83,3 +83,31 @@ def test_known_public_configuration_survives_trusted_clarify_flow():
         assert connector_setup == intent
         return '{"status":"submitted","target_id":"created-api"}'
     assert json.loads(clarify_tool("ignored", connector_setup=intent, callback=callback))["status"] == "submitted"
+
+
+def test_submitted_receipt_is_explicitly_not_a_credential_exposure():
+    result = json.loads(connector_setup_result('{"status":"submitted","target_id":"jira-test"}'))
+    assert 'contains no credentials' in result['next_step']
+    assert 'Do not request revocation solely' in result['next_step']
+    assert 'not a grant' in result['next_step']
+
+
+@pytest.mark.parametrize("url, valid", [('http://192.168.1.20/jira', True), ('http://10.1.2.3:8080', True), ('http://172.31.1.2', True), ('http://172.32.1.2', False), ('http://127.0.0.1', False), ('http://169.254.169.254', False), ('http://example.test', False), ('http://192.168.1.20?token=fake', False)])
+def test_private_http_metadata_matches_connector_template_address_envelope(url, valid):
+    intent = {"resource_kind": "custom_api", "template_id": "jira-data-center-pat-api", "variables": {"base_url": url}}
+    if valid:
+        assert normalize_connector_setup(intent) == intent
+    else:
+        with pytest.raises(ValueError):
+            normalize_connector_setup(intent)
+
+
+def test_legacy_imports_share_the_adapter_contract():
+    from gateway.platforms import zet_agent_connector_setup_intent as adapter
+    from tools import connector_setup_intent as legacy
+    from tools.clarify_tool import CLARIFY_SCHEMA
+
+    assert legacy.normalize_connector_setup is adapter.normalize_connector_setup
+    assert legacy.connector_setup_result is adapter.connector_setup_result
+    assert legacy.CONNECTOR_SETUP_SCHEMA is adapter.CONNECTOR_SETUP_SCHEMA
+    assert CLARIFY_SCHEMA["parameters"]["properties"]["connector_setup"] is adapter.CONNECTOR_SETUP_SCHEMA
