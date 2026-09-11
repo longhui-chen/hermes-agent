@@ -49,6 +49,7 @@ from agent.tool_dispatch_helpers import (
     make_tool_result_message,
 )
 from agent.tool_result_classification import tool_may_have_side_effect
+from agent.tool_guardrails import ToolGuardrailDecision
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -579,6 +580,15 @@ def _run_agent_tool_execution_middleware(
                         code=block_message.code,
                         authorization_status=block_message.authorization_status,
                     )
+                    # zettlab-overlay(camera-scope-halt): stop the turn after a
+                    # trusted camera scope miss; upstream: none
+                    agent._set_tool_guardrail_halt(ToolGuardrailDecision(
+                        action="halt",
+                        code=block_message.code,
+                        message=str(block_message),
+                        tool_name=function_name,
+                        count=1,
+                    ))
                 result = json.dumps(error_payload, ensure_ascii=False)
                 error_type = block_error_type
                 error_message = block_message
