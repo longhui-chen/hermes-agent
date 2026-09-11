@@ -45,45 +45,93 @@ def test_only_the_two_known_keys_can_introduce_a_chain():
     assert get_fallback_chain({"fallbacks": [{"model": "m"}], "fallback": "m"}) == []
 
 
+APPENDIX_H = (
+    "总方案附录 H 条目 H33（内核侧待上游）；上游 issue "
+    "https://github.com/NousResearch/hermes-agent/issues/107836"
+)
+_FAIL_HINT = (
+    "设备侧 reasoning override 由 gateway/platforms/zet_agent.py 注入 "
+    "agent.request_overrides['extra_body']，而 try_activate_fallback() 不按路由把它归位。"
+    "在打包配置里引入 fallback 链会让该 override 在故障转移时发往备用 provider。"
+    f"先按 {APPENDIX_H} 归位该 override，再引入 fallback 链。"
+)
+
+
 def _zpk_files():
     if not ZPK_DIR.is_dir():
         pytest.skip("no zpk/ tree in this checkout")
     return [p for p in ZPK_DIR.rglob("*") if p.is_file()]
 
 
+def _chain_keys_in(text: str):
+    return [k for k in FALLBACK_KEYS if k in text]
+
+
+def test_zpk_config_yaml_defines_no_fallback_chain():
+    """`zpk/config/*.yaml` is the packaged config surface named by HR6.
+
+    It does not exist in this repo today (the device profile config is created
+    at install/runtime under $HERMES_HOME), and that fact is asserted rather
+    than assumed: if someone starts shipping config with the package, this test
+    starts checking it instead of silently passing over an empty glob.
+    """
+    cfg_dir = ZPK_DIR / "config"
+    shipped = sorted(cfg_dir.glob("*.yaml")) + sorted(cfg_dir.glob("*.yml")) if cfg_dir.is_dir() else []
+    if not shipped:
+        assert not cfg_dir.is_dir() or not any(cfg_dir.iterdir()), (
+            "zpk/config/ exists with content but no YAML was matched — widen this guard"
+        )
+        return
+    offenders = []
+    for path in shipped:
+        for key in _chain_keys_in(path.read_text(encoding="utf-8")):
+            offenders.append(f"{path.relative_to(REPO_ROOT)}: {key}")
+    assert not offenders, f"打包配置不得含 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
+
+
 def test_zpk_package_ships_no_fallback_chain():
-    """Nothing the device package ships or writes may define a fallback chain."""
+    """Nothing the device package ships or writes may define a chain.
+
+    Broader than the `zpk/config/*.yaml` check above on purpose: install and
+    service scripts can write config too, so the whole packaged tree is read.
+    """
     offenders = []
     for path in _zpk_files():
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue  # binary payloads carry no config keys
-        for key in FALLBACK_KEYS:
-            if key in text:
-                offenders.append(f"{path.relative_to(REPO_ROOT)}: {key}")
+        for key in _chain_keys_in(text):
+            offenders.append(f"{path.relative_to(REPO_ROOT)}: {key}")
     assert not offenders, (
-        "the device package must not introduce a fallback chain while the "
-        "device reasoning override is injected by the zet_agent adapter; "
-        "re-scope the override before adding one. Offenders: " + "; ".join(offenders)
+        f"设备包不得引入 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
     )
 
 
-def test_any_shipped_config_documents_has_no_chain():
-    """Any YAML/JSON under zpk/ must parse to a mapping without the chain keys."""
-    checked = 0
-    for path in _zpk_files():
-        if path.suffix.lower() not in (".json",):
+def test_profile_template_defines_no_fallback_chain():
+    """No repo-shipped file may seed a profile config that carries a chain.
+
+    `hermes_cli.profiles.create_profile` clones an existing profile rather than
+    rendering a static template, so there is no template file today. Any YAML
+    that ships outside tests/locales/CI and mentions the chain keys would be a
+    new seeding surface and must fail here.
+    """
+    candidates = []
+    for path in REPO_ROOT.rglob("*.y*ml"):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel.startswith(("tests/", ".github/", "locales/", "node_modules/", ".venv/")):
+            continue
+        if not path.is_file():
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (ValueError, UnicodeDecodeError, OSError):
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
             continue
-        checked += 1
-        if isinstance(data, dict):
-            for key in FALLBACK_KEYS:
-                assert key not in data, f"{path.relative_to(REPO_ROOT)} defines {key}"
-    assert checked >= 0  # the scan itself is the assertion; zero JSON files is fine
+        for key in _chain_keys_in(text):
+            candidates.append(f"{rel}: {key}")
+    assert not candidates, (
+        f"仓内随包分发的配置 / profile 模板不得含 fallback 链：{'; '.join(candidates)}。{_FAIL_HINT}"
+    )
 
 
 # ---------------------------------------------------------------------------
