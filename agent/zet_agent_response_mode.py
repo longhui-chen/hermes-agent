@@ -159,6 +159,7 @@ _HARDWARE_ENROLLMENT_ACTION_RE = re.compile(
 _HARDWARE_ENROLLMENT_CONNECTION_STATE_RE = re.compile(
     r"(?:已(?:经)?|正在|正|当前|尚未|未|没有)连接(?:到|上|着|过|好|成功)?(?:的)?"
     r"|连接(?:中|的|状态|列表|信息|详情)"
+    # zettlab-overlay(connector-enrollment-guard): classify device status as diagnostics; upstream: none
     r"|(?:设备|硬件|摄像头|打印机|电脑|电视)(?:访问)?(?:权限|授权|状态|能力|可用性|连接)"
     r"|\b(?:connected|connecting|connection)\b",
     re.IGNORECASE,
