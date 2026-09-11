@@ -2231,6 +2231,7 @@ _MAX_PERMANENT_APPROVAL_PROFILES = 4096
 _permanent_approved_by_profile: dict[str, set] = {}
 _permanent_loaded_profiles: set[str] = set()
 _permanent_load_lock = threading.Lock()
+# zettlab-overlay(H9-unowned): deferred 审批后台清扫与按 profile 作用域的审批状态，上游 PR 候选; upstream: none
 _deferred_sweeper_started = False
 _deferred_sweeper_start_lock = threading.Lock()
 
@@ -2315,6 +2316,7 @@ def _approval_raw_session_key(state_key: _ApprovalStateKey) -> str:
     return state_key[1] if isinstance(state_key, tuple) else state_key
 
 
+# zettlab-overlay(H9-unowned): deferred 审批文本有界存储，上游 PR 候选; upstream: none
 def _bounded_deferred_text(value: object, limit: int) -> str:
     text = str(value or "")
     if len(text) <= limit:
@@ -2538,6 +2540,7 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # resolves every pending approval in the session.
 
 
+# zettlab-overlay(H7-B2a): 网关审批条目与两阶段回执状态，B2a 删除; upstream: none
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
     __slots__ = ("event", "data", "result", "reason")
@@ -2601,6 +2604,7 @@ def _prune_gateway_prepared_locked(now: Optional[float] = None) -> None:
             _gateway_prepared.pop(key, None)
 
 
+# zettlab-overlay(H8-B2a): 会话级审批通知注册与 cancel_gateway_approvals，B2a 复审保留范围; upstream: none
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
@@ -2806,6 +2810,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
     return 1
 
 
+# zettlab-overlay(H7-B2a): 两阶段 prepare / finalize 与 300 s 栅栏，B2a 删除; upstream: none
 def prepare_gateway_approval(
     session_key: str,
     interaction_id: str,
@@ -2932,6 +2937,7 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(state_key))
 
 
+# zettlab-overlay(H8-B2a): 审批读接口 peek / list / submit_pending，B2a 复审保留范围; upstream: none
 def peek_gateway_approval(session_key: str) -> Optional[dict]:
     """Return the exact oldest queued approval data without consuming it."""
     state_key = _approval_state_key(session_key)
@@ -3177,6 +3183,7 @@ def clear_session(session_key: str) -> None:
     _release_permission_mode_dependents(session_key)
 
 
+# zettlab-overlay(H9-unowned): 卸载 profile 时回收审批能力，上游 PR 候选; upstream: none
 def purge_profile_approval_state(profile_owner: str) -> dict[str, int]:
     """Revoke every approval capability owned by an unloaded profile."""
 

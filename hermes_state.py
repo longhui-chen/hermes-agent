@@ -8955,6 +8955,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, sid)
         return count
 
+    # zettlab-overlay(H32-unowned): zettlab: 会话根按 agent 递归删除，收敛时隔离到 provider; upstream: none
     def delete_sessions_for_agent(self, agent_id: str, sessions_dir: Optional[Path] = None) -> int:
         """Delete every session belonging to *agent_id* (roots + descendants) atomically.
 

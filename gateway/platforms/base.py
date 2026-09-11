@@ -47,6 +47,7 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# zettlab-overlay(H31-unowned): pending 事件队列上限与飞书引用租约硬期限，硬化类整体上游 PR; upstream: none
 # 与 GatewayRunner 的 busy queue 共用同一硬上限；head event 也计一格。
 PENDING_EVENT_QUEUE_MAX = 32
 # 🔴 **引用租约的等待必须有独立硬期限。**
@@ -895,6 +896,7 @@ def _resolve_cache_dir(constant_name: str, new_subpath: str, old_name: str) -> P
 # photos/voice notes/short clips while still bounding a hostile upload.
 # ---------------------------------------------------------------------------
 DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+# zettlab-overlay(H31-unowned): 媒体缓存总量与文件数上界，硬化类整体上游 PR; upstream: none
 # 共享媒体缓存最多保留 4 个“单附件上限”的总量；四类目录合计计算，
 # ⛔ 不是每类各放 512 MiB。1024 文件是同一预算下的小文件/inode 后门：
 # 512 MiB / 512 KiB = 1024。达到任一上限都淘汰最旧文件。
@@ -2854,6 +2856,7 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        # zettlab-overlay(H31-unowned): pending 事件合并按发送者与 profile 收窄，硬化类整体上游 PR; upstream: none
         existing_source = getattr(existing, "source", None)
         incoming_source = getattr(event, "source", None)
         existing_sender = (

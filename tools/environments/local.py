@@ -2126,6 +2126,8 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # profile by local-server and live in <profile>/.env under the multiplex
     # gateway, so subprocesses must receive the current profile's scope instead
     # of whatever os.environ/shell snapshot happened to contain.
+    # zettlab-overlay(connector-session): Authenticate the profile independently of a turn; upstream: none
+    "ZETTLAB_AGENT_ACTION_TOKEN",
     "ZETTLAB_CONNECTORS_URL",
     "ZETTLAB_CONNECTOR_SESSION_INVOKE_V1",
     "ZET_AGENT_ID",
@@ -2263,11 +2265,12 @@ def _apply_profile_secret_scope_env(
             env[SKILLHUB_CATALOG_TOKEN_ENV_KEY] = catalog_token
 
 
+# zettlab-overlay(connector-session): Keep profile authentication separate from session selection; upstream: none
 def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     """Build env for the dedicated connector_runtime.py runner.
 
     This is intentionally separate from the generic terminal env. The
-    allowlisted runner receives only the current session route capability;
+    allowlisted runner receives profile identity and stable session selection;
     provider credentials remain Server-side and never enter a subprocess.
     """
     # ⛔ 起手底座**不继承进程环境**。这里原先是
@@ -2313,6 +2316,20 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
         route_capability = zettlab_connector_route_capability()
     except Exception:
         route_capability = ""
+    # zettlab-overlay(connector-session): Carry stable selection without an active-turn grant; upstream: none
+    env.pop("ZETTLAB_CONNECTOR_SESSION_ID", None)
+    env.pop("ZETTLAB_TURN_ID", None)
+    env.pop("HERMES_SESSION_KEY", None)
+    try:
+        from gateway.session_context import get_session_env, zettlab_turn_id
+
+        env["ZETTLAB_TURN_ID"] = str(zettlab_turn_id() or "")
+        session_id = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+        is_cron = bool(get_session_env("HERMES_CRON_SESSION", ""))
+    except Exception:
+        session_id, is_cron = "", False
+    if session_id and not is_cron:
+        env["ZETTLAB_CONNECTOR_SESSION_ID"] = session_id
     if route_capability:
         # Reuse the legacy runner header transport without exposing the real
         # session key as selection authority. Generic terminal subprocesses

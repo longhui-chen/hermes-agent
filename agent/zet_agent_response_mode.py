@@ -1,3 +1,4 @@
+# zettlab-overlay(H21-unowned): 响应模式与可信技能执行策略状态机整文件为 fork 新增，收敛时迁适配层; upstream: none
 """Bind trusted high-risk skill execution to an exact App turn."""
 
 from __future__ import annotations
