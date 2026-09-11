@@ -19,6 +19,7 @@ See 总方案附录 H (kernel-side pending-upstream entry) for the tracking item
 """
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -45,45 +46,171 @@ def test_only_the_two_known_keys_can_introduce_a_chain():
     assert get_fallback_chain({"fallbacks": [{"model": "m"}], "fallback": "m"}) == []
 
 
+APPENDIX_H = (
+    "总方案附录 H 条目 H33（内核侧待上游）；上游 issue "
+    "https://github.com/NousResearch/hermes-agent/issues/107836"
+)
+_FAIL_HINT = (
+    "设备侧 reasoning override 由 gateway/platforms/zet_agent.py 注入 "
+    "agent.request_overrides['extra_body']，而 try_activate_fallback() 不按路由把它归位。"
+    "在打包配置里引入 fallback 链会让该 override 在故障转移时发往备用 provider。"
+    f"先按 {APPENDIX_H} 归位该 override，再引入 fallback 链。"
+)
+
+
 def _zpk_files():
     if not ZPK_DIR.is_dir():
         pytest.skip("no zpk/ tree in this checkout")
     return [p for p in ZPK_DIR.rglob("*") if p.is_file()]
 
 
+def _chain_keys_in(text: str):
+    return [k for k in FALLBACK_KEYS if k in text]
+
+
+def test_zpk_config_yaml_defines_no_fallback_chain():
+    """`zpk/config/*.yaml` is the config surface HR6 names as authoritative.
+
+    hermes-agent does not ship one: its `zpk/` scripts only prepare
+    `$HERMES_HOME` and the service environment (no script writes a
+    `config.yaml`), and the device's profile config is created at
+    onboarding/runtime under that root, seeded from `cli-config.yaml.example`.
+
+    Absence is therefore recorded as a checked fact, never as proof of safety
+    (CR #457 3985625592): the guard asserts that the artifact which *does*
+    reach the device is covered, so this branch can never make the suite
+    vacuous. If someone starts shipping `zpk/config/`, it is scanned from then
+    on.
+    """
+    cfg_dir = ZPK_DIR / "config"
+    shipped = (sorted(cfg_dir.glob("*.yaml")) + sorted(cfg_dir.glob("*.yml"))) if cfg_dir.is_dir() else []
+    if not shipped:
+        assert not cfg_dir.is_dir() or not any(cfg_dir.iterdir()), (
+            "zpk/config/ exists with content but no YAML matched — widen this guard"
+        )
+        # Non-vacuity: the real artifact must still be under guard.
+        covered = [seed for seed in CONFIG_SEEDS if (REPO_ROOT / seed).is_file()]
+        assert covered, (
+            "zpk/config/ is absent AND no config seed is present — nothing is "
+            "actually being checked. Point the guard at whatever now provides "
+            f"the device config. {_FAIL_HINT}"
+        )
+        return
+    offenders = []
+    for path in shipped:
+        for key in _chain_keys_in(path.read_text(encoding="utf-8")):
+            offenders.append(f"{path.relative_to(REPO_ROOT)}: {key}")
+    assert not offenders, f"打包配置不得含 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
+
+
 def test_zpk_package_ships_no_fallback_chain():
-    """Nothing the device package ships or writes may define a fallback chain."""
+    """Nothing the device package ships or writes may define a chain.
+
+    Broader than the `zpk/config/*.yaml` check above on purpose: install and
+    service scripts can write config too, so the whole packaged tree is read.
+    """
     offenders = []
     for path in _zpk_files():
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue  # binary payloads carry no config keys
-        for key in FALLBACK_KEYS:
-            if key in text:
-                offenders.append(f"{path.relative_to(REPO_ROOT)}: {key}")
+        for key in _chain_keys_in(text):
+            offenders.append(f"{path.relative_to(REPO_ROOT)}: {key}")
     assert not offenders, (
-        "the device package must not introduce a fallback chain while the "
-        "device reasoning override is injected by the zet_agent adapter; "
-        "re-scope the override before adding one. Offenders: " + "; ".join(offenders)
+        f"设备包不得引入 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
     )
 
 
-def test_any_shipped_config_documents_has_no_chain():
-    """Any YAML/JSON under zpk/ must parse to a mapping without the chain keys."""
-    checked = 0
-    for path in _zpk_files():
-        if path.suffix.lower() not in (".json",):
+# Files an install path copies verbatim to $HERMES_HOME/config.yaml. This is the
+# real profile seed -- `create_profile` clones an existing profile, so the seed is
+# what a *fresh* device starts from.
+CONFIG_SEEDS = ("cli-config.yaml.example",)
+# Install/bootstrap paths that consume the seed. Pinned so a rename cannot quietly
+# leave the guard pointing at a file nobody uses any more.
+SEED_CONSUMERS = (
+    "docker/stage2-hook.sh",
+    "scripts/install.sh",
+    "scripts/install.ps1",
+    "hermes_cli/doctor.py",
+)
+# Config-ish suffixes, including the `.example` seeds that a plain `*.y*ml` glob
+# silently skips (CR #457 3985590592).
+_CONFIG_SUFFIXES = (".yaml", ".yml", ".yaml.example", ".yml.example")
+# Excluded by *path component*, not prefix: a nested `apps/desktop/node_modules`
+# must be skipped too (CR #457 3985590587).
+_EXCLUDED_PARTS = frozenset({
+    "tests", ".github", "locales", "node_modules", ".venv", "datagen-config-examples",
+})
+
+
+def _tracked_config_files():
+    """Git-tracked config files only.
+
+    Enumerating the index rather than walking the filesystem keeps the result
+    independent of workspace state: an installed `node_modules` (at any depth)
+    or other generated tree can no longer turn this guard red.
+    """
+    out = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    ).stdout
+    files = []
+    for rel in out.split("\0"):
+        if not rel:
             continue
+        parts = rel.split("/")
+        if _EXCLUDED_PARTS.intersection(parts):
+            continue
+        if rel.endswith(_CONFIG_SUFFIXES):
+            files.append(rel)
+    return files
+
+
+def test_config_seed_is_still_where_the_installers_look():
+    """Pin the seed itself, so a rename cannot hollow out the next test."""
+    for seed in CONFIG_SEEDS:
+        assert (REPO_ROOT / seed).is_file(), f"config seed {seed} is missing — update CONFIG_SEEDS"
+    for consumer in SEED_CONSUMERS:
+        path = REPO_ROOT / consumer
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        assert any(seed in text for seed in CONFIG_SEEDS), (
+            f"{consumer} no longer references {CONFIG_SEEDS} — the seed moved, "
+            "point CONFIG_SEEDS at the new one"
+        )
+
+
+def test_config_seed_defines_no_fallback_chain():
+    """A fresh install must not start life with a fallback chain.
+
+    `cli-config.yaml.example` is copied verbatim to `$HERMES_HOME/config.yaml`
+    by docker/stage2-hook.sh, scripts/install.sh, scripts/install.ps1 and
+    hermes_cli.doctor.
+    """
+    offenders = []
+    for seed in CONFIG_SEEDS:
+        path = REPO_ROOT / seed
+        for key in _chain_keys_in(path.read_text(encoding="utf-8")):
+            offenders.append(f"{seed}: {key}")
+    assert not offenders, (
+        f"配置种子不得含 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
+    )
+
+
+def test_profile_template_defines_no_fallback_chain():
+    """Safety net over every tracked config file, seeds included."""
+    offenders = []
+    for rel in _tracked_config_files():
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (ValueError, UnicodeDecodeError, OSError):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
             continue
-        checked += 1
-        if isinstance(data, dict):
-            for key in FALLBACK_KEYS:
-                assert key not in data, f"{path.relative_to(REPO_ROOT)} defines {key}"
-    assert checked >= 0  # the scan itself is the assertion; zero JSON files is fine
+        for key in _chain_keys_in(text):
+            offenders.append(f"{rel}: {key}")
+    assert not offenders, (
+        f"仓内随包分发的配置 / profile 模板不得含 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
+    )
 
 
 # ---------------------------------------------------------------------------
