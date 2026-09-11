@@ -19,6 +19,7 @@ See 总方案附录 H (kernel-side pending-upstream entry) for the tracking item
 """
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -108,29 +109,94 @@ def test_zpk_package_ships_no_fallback_chain():
     )
 
 
-def test_profile_template_defines_no_fallback_chain():
-    """No repo-shipped file may seed a profile config that carries a chain.
+# Files an install path copies verbatim to $HERMES_HOME/config.yaml. This is the
+# real profile seed -- `create_profile` clones an existing profile, so the seed is
+# what a *fresh* device starts from.
+CONFIG_SEEDS = ("cli-config.yaml.example",)
+# Install/bootstrap paths that consume the seed. Pinned so a rename cannot quietly
+# leave the guard pointing at a file nobody uses any more.
+SEED_CONSUMERS = (
+    "docker/stage2-hook.sh",
+    "scripts/install.sh",
+    "scripts/install.ps1",
+    "hermes_cli/doctor.py",
+)
+# Config-ish suffixes, including the `.example` seeds that a plain `*.y*ml` glob
+# silently skips (CR #457 3985590592).
+_CONFIG_SUFFIXES = (".yaml", ".yml", ".yaml.example", ".yml.example")
+# Excluded by *path component*, not prefix: a nested `apps/desktop/node_modules`
+# must be skipped too (CR #457 3985590587).
+_EXCLUDED_PARTS = frozenset({
+    "tests", ".github", "locales", "node_modules", ".venv", "datagen-config-examples",
+})
 
-    `hermes_cli.profiles.create_profile` clones an existing profile rather than
-    rendering a static template, so there is no template file today. Any YAML
-    that ships outside tests/locales/CI and mentions the chain keys would be a
-    new seeding surface and must fail here.
+
+def _tracked_config_files():
+    """Git-tracked config files only.
+
+    Enumerating the index rather than walking the filesystem keeps the result
+    independent of workspace state: an installed `node_modules` (at any depth)
+    or other generated tree can no longer turn this guard red.
     """
-    candidates = []
-    for path in REPO_ROOT.rglob("*.y*ml"):
-        rel = path.relative_to(REPO_ROOT).as_posix()
-        if rel.startswith(("tests/", ".github/", "locales/", "node_modules/", ".venv/")):
+    out = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    ).stdout
+    files = []
+    for rel in out.split("\0"):
+        if not rel:
             continue
+        parts = rel.split("/")
+        if _EXCLUDED_PARTS.intersection(parts):
+            continue
+        if rel.endswith(_CONFIG_SUFFIXES):
+            files.append(rel)
+    return files
+
+
+def test_config_seed_is_still_where_the_installers_look():
+    """Pin the seed itself, so a rename cannot hollow out the next test."""
+    for seed in CONFIG_SEEDS:
+        assert (REPO_ROOT / seed).is_file(), f"config seed {seed} is missing — update CONFIG_SEEDS"
+    for consumer in SEED_CONSUMERS:
+        path = REPO_ROOT / consumer
         if not path.is_file():
             continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        assert any(seed in text for seed in CONFIG_SEEDS), (
+            f"{consumer} no longer references {CONFIG_SEEDS} — the seed moved, "
+            "point CONFIG_SEEDS at the new one"
+        )
+
+
+def test_config_seed_defines_no_fallback_chain():
+    """A fresh install must not start life with a fallback chain.
+
+    `cli-config.yaml.example` is copied verbatim to `$HERMES_HOME/config.yaml`
+    by docker/stage2-hook.sh, scripts/install.sh, scripts/install.ps1 and
+    hermes_cli.doctor.
+    """
+    offenders = []
+    for seed in CONFIG_SEEDS:
+        path = REPO_ROOT / seed
+        for key in _chain_keys_in(path.read_text(encoding="utf-8")):
+            offenders.append(f"{seed}: {key}")
+    assert not offenders, (
+        f"配置种子不得含 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
+    )
+
+
+def test_profile_template_defines_no_fallback_chain():
+    """Safety net over every tracked config file, seeds included."""
+    offenders = []
+    for rel in _tracked_config_files():
         try:
-            text = path.read_text(encoding="utf-8")
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
         for key in _chain_keys_in(text):
-            candidates.append(f"{rel}: {key}")
-    assert not candidates, (
-        f"仓内随包分发的配置 / profile 模板不得含 fallback 链：{'; '.join(candidates)}。{_FAIL_HINT}"
+            offenders.append(f"{rel}: {key}")
+    assert not offenders, (
+        f"仓内随包分发的配置 / profile 模板不得含 fallback 链：{'; '.join(offenders)}。{_FAIL_HINT}"
     )
 
 
