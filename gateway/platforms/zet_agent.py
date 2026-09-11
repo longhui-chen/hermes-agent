@@ -150,6 +150,12 @@ from gateway.zet_agent_runtime_cache import (
     RuntimeShellLease,
 )
 from gateway.deep_memory_identity import bounded_identity_header as _bounded_identity_header
+from gateway.platforms.zet_agent_metrics import (
+    clarify_rejected as _metric_clarify_rejected,
+    interaction_answered as _metric_interaction_answered,
+    interaction_opened as _metric_interaction_opened,
+    interaction_terminal as _metric_interaction_terminal,
+)
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -3512,6 +3518,7 @@ class ZetAgentAdapter(APIServerAdapter):
         if should_emit:
             try:
                 _put_progress(stream_q, payload)
+                _metric_interaction_opened()
             except Exception:
                 self._remove_approval_projection(
                     scoped_session_key, str(payload.get("approval_id") or "")
@@ -3783,6 +3790,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         "approval", internal_key, interaction_id
                     )
                     raise RuntimeError("approval notify push failed") from exc
+            _metric_interaction_opened()
             # Goal projection: a blocked approval means the loop is waiting
             # on the user — surface it on the App's goal banner (HR#3: goal
             # rounds never auto-approve). No-op for non-goal sessions.
@@ -3821,6 +3829,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         terminal_payload = dict(item)
                         terminal_payload["state"] = "expired"
                         terminal_payload["state_reason"] = "timeout"
+                        _metric_interaction_terminal("expired")
                         terminal_stream = getattr(
                             self, "_approval_stream_queues", {}
                         ).get(internal_key)
@@ -3892,6 +3901,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 logger.warning(
                     "[zet_agent] clarify callback rejected stale turn owner"
                 )
+                _metric_clarify_rejected("caller_inactive")
                 return _clarify_sentinel("clarify", "unknown", "cancelled", "caller_inactive", "caller is not an active human turn")
             turn_id = captured_turn_id or caller_turn_id
             if turn_id:
@@ -3902,6 +3912,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.warning(
                         "[zet_agent] clarify callback rejected inactive owner"
                     )
+                    _metric_clarify_rejected("caller_inactive")
                     return _clarify_sentinel("clarify", "unknown", "cancelled", "caller_inactive", "caller is not an active human turn")
                 self._wait_for_recovery_fence(internal_key, turn_id)
             from tools.approval import reserve_gateway_interaction_generation
@@ -3964,9 +3975,11 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
                     self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
                     return _clarify_sentinel("clarify", interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
+                _metric_interaction_opened()
             else:
                 try:
                     _put_progress(stream_q, payload)
+                    _metric_interaction_opened()
                 except Exception:
                     logger.debug("[zet_agent] clarify push failed", exc_info=True)
                     self._discard_clarify_entry(internal_key, entry, reason="delivery_failed")
@@ -4005,6 +4018,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 return _clarify_sentinel("clarify", entry.interaction_id, "expired", "timeout", f"user did not respond within {int(timeout_seconds)}s")
             response = entry.response
             if response:
+                _metric_interaction_answered()
                 return response
             return _clarify_sentinel("clarify", entry.interaction_id, "cancelled", "delivery_failed", "clarify could not be delivered")
 
@@ -4358,6 +4372,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     continue
                 entry.terminal_emitted = True
             state = "expired" if reason == "timeout" else "cancelled"
+            _metric_interaction_terminal(state)
             payload = dict(entry.payload)
             payload["state"] = state
             payload["state_reason"] = reason
@@ -4389,6 +4404,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 stream_q = getattr(self, "_approval_stream_queues", {}).get(key)
                 if stream_q is not None:
                     _put_progress(stream_q, payload)
+                    _metric_interaction_terminal(payload["state"])
                     with self._pending_lock:
                         item["terminal_emitted"] = True
                     emitted += 1
@@ -7491,6 +7507,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         "[zet_agent] goal resolved projection failed", exc_info=True
                     )
             assert response is not None
+            _metric_interaction_answered()
             return response
 
         with self._delivery_lock:
@@ -7543,6 +7560,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=404,
             )
         if resolved:
+            _metric_interaction_answered()
             if legacy_interaction_id:
                 self._remove_pending_interaction(
                     "approval", approval_queue_key, legacy_interaction_id
