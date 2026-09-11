@@ -100,3 +100,14 @@ def test_private_http_metadata_matches_connector_template_address_envelope(url, 
     else:
         with pytest.raises(ValueError):
             normalize_connector_setup(intent)
+
+
+def test_legacy_imports_share_the_adapter_contract():
+    from gateway.platforms import zet_agent_connector_setup_intent as adapter
+    from tools import connector_setup_intent as legacy
+    from tools.clarify_tool import CLARIFY_SCHEMA
+
+    assert legacy.normalize_connector_setup is adapter.normalize_connector_setup
+    assert legacy.connector_setup_result is adapter.connector_setup_result
+    assert legacy.CONNECTOR_SETUP_SCHEMA is adapter.CONNECTOR_SETUP_SCHEMA
+    assert CLARIFY_SCHEMA["parameters"]["properties"]["connector_setup"] is adapter.CONNECTOR_SETUP_SCHEMA
