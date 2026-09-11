@@ -74,7 +74,7 @@ def test_observation_publication_stays_closed_until_confirmation_consumers_are_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["cancelled", "submitted"])
-@pytest.mark.parametrize("observation", [False, True])
+@pytest.mark.parametrize("observation", [False, True, "recording"])
 async def test_setup_uses_existing_pending_and_response_flow(status, observation):
     runtime = adapter()
     stream = queue.Queue()
@@ -82,6 +82,8 @@ async def test_setup_uses_existing_pending_and_response_flow(status, observation
     setup = {"resource_kind": "camera", "observation": {
         "camera_id": "cam-1", "duration_seconds": 60, "subject_kind": "person", "predicate": "appears",
     }} if observation else {"resource_kind": "tv"}
+    if observation == "recording":
+        setup = {"resource_kind": "camera", "recording": {"camera_id": "cam-1"}}
     app = web.Application()
     app.router.add_get('/v1/sessions/{session_id}/pending', runtime._handle_pending)
     app.router.add_post('/v1/sessions/{session_id}/clarify/respond', runtime._handle_clarify_respond)
@@ -89,7 +91,28 @@ async def test_setup_uses_existing_pending_and_response_flow(status, observation
     with ThreadPoolExecutor(max_workers=1) as pool:
         agent = _make_agent("clarify")
         agent.clarify_callback = callback
-        future = pool.submit(invoke_tool, agent, "clarify", {"question": "ignored", "connector_setup": setup}, "setup-flow")
+        def invoke_with_camera_scope():
+            from gateway.session_context import set_turn_vars, clear_turn_vars
+            import agent.zet_agent_response_mode as mode
+
+            tokens = set_turn_vars(turn_id="confirmation-flow")
+            try:
+                if observation == "recording":
+                    agent.platform = "zet_agent"
+                    task = mode._skill_direct_task_context(agent, "为摄像头准备持续录像")
+                    agent._zet_agent_skill_direct_task = task
+                    agent._zet_agent_skill_direct_scope = mode._SkillDirectScope(
+                        relative_path=mode._CAMERA_SKILL_PATH,
+                        task_sha256=task.task_sha256,
+                        turn_identity=task.turn_identity,
+                        allowed_tools=mode._CAMERA_DIRECT_TOOLS,
+                        camera_ids=frozenset({"cam-1"}),
+                    )
+                return invoke_tool(agent, "clarify", {"question": "ignored", "connector_setup": setup}, "setup-flow")
+            finally:
+                clear_turn_vars(tokens)
+
+        future = pool.submit(invoke_with_camera_scope)
         event = stream.get(timeout=5)
         # Progress queue envelope is owned by the adapter, not model prose.
         payload = event[1] if isinstance(event, tuple) else event
